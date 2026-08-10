@@ -14,9 +14,22 @@ function requestUserId(request: NextRequest) {
 
 export async function GET(request: NextRequest) {
   const query = request.nextUrl.searchParams.get('q') || undefined;
-  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 200, max: 500 });
-  const skills = store.listSkills(query, requestUserId(request), limit);
-  return apiJson(request, { skills });
+  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 50, max: 100 });
+  const page = store.listSkills(query, requestUserId(request), limit + 1, {
+    beforeId: request.nextUrl.searchParams.get('beforeId') || undefined,
+    beforeUpdatedAt: request.nextUrl.searchParams.get('beforeUpdatedAt') || undefined,
+  });
+  const skills = page.slice(0, limit);
+  const last = skills.at(-1);
+  return apiJson(request, {
+    skills,
+    page: {
+      hasMore: page.length > limit,
+      next: page.length > limit && last
+        ? { beforeId: last.id, beforeUpdatedAt: last.updatedAt }
+        : undefined,
+    },
+  });
 }
 
 export async function POST(request: NextRequest) {

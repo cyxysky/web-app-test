@@ -10,6 +10,7 @@ const {
   mountTicketClaims,
   requestIdentity,
 } = require('./webpilot-identity');
+const { createRealtimeRefreshHub } = require('./realtime-refresh-hub');
 
 function normalizeBasePath(value) {
   const normalized = String(value || '').trim().replace(/^\/+|\/+$/g, '');
@@ -224,6 +225,7 @@ async function main() {
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
+  process.env.WEBPILOT_REALTIME_PUBLISH_TOKEN ||= randomBytes(32).toString('base64url');
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
 
   // Load the complete build-time configuration before loading Next itself.
@@ -253,11 +255,17 @@ async function main() {
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
 
+  const refreshHub = createRealtimeRefreshHub({ appDir });
   const server = http.createServer((request, response) => {
     void (async () => {
       removeUntrustedProxyHeaders(request);
       const requestUrl = new URL(request.url || '/', `http://${request.headers.host || `${hostname}:${port}`}`);
       const pathname = stripBasePath(requestUrl.pathname, basePath);
+
+      if (requestUrl.pathname === '/_webpilot/realtime/publish') {
+        await refreshHub.handlePublish(request, response);
+        return;
+      }
 
       if (
         unsafeCrossOriginRequest(request)
@@ -313,13 +321,7 @@ async function main() {
       proxyUpgrade(request, socket, head, internalPort(process.env.BROWSER_CHAT_PREVIEW_WS_PORT, 18021), target.target);
       return;
     }
-    proxyUpgrade(
-      request,
-      socket,
-      head,
-      internalPort(process.env.AI_REFRESH_WS_PORT || process.env.AI_WEB_TEST_REFRESH_WS_PORT, 17991),
-      target.target,
-    );
+    refreshHub.acceptUpgrade(request, socket, requestUrl);
   });
 
   server.listen(port, hostname, () => {
@@ -327,6 +329,7 @@ async function main() {
   });
 
   const close = () => {
+    refreshHub.close();
     server.close(() => {
       process.exit(0);
     });

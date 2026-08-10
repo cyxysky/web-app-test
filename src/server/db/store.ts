@@ -187,8 +187,13 @@ function writeConfigData(data: ConfigStoreData) {
 }
 
 export const store = {
-  listSkills(query?: string, userId?: string | number, limit?: number) {
-    return readSkills(normalizeApplicationUserId(userId), { query, limit })
+  listSkills(
+    query?: string,
+    userId?: string | number,
+    limit?: number,
+    cursor: { beforeId?: string; beforeUpdatedAt?: string } = {},
+  ) {
+    return readSkills(normalizeApplicationUserId(userId), { ...cursor, query, limit })
       .map(normalizeSkillRecord);
   },
   getSkill(skillId: string, userId?: string | number) {

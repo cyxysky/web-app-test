@@ -5,6 +5,7 @@ import {
   SIDEBAR_COLLAPSED_COOKIE_NAME,
   sidebarCollapsedFromCookie,
 } from '@/lib/sidebar-collapse';
+import '../styles/domains/automation-workspace.css';
 
 export const dynamic = 'force-dynamic';
 

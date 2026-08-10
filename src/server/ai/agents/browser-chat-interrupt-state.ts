@@ -4,6 +4,7 @@ export type InterruptibleBrowserChatRuntime = {
   pendingToolConfirmation?: unknown;
   busy: boolean;
   status: 'idle' | 'running' | 'closed' | 'error';
+  turnState?: 'idle' | 'running' | 'awaiting_confirmation' | 'awaiting_human' | 'stopping' | 'completed' | 'failed' | 'interrupted' | 'closed';
   error?: string;
   updatedAt: string;
 };
@@ -108,6 +109,7 @@ export function revokeBrowserChatTurn(
   session.pendingToolConfirmation = undefined;
   session.busy = false;
   if (session.status !== 'closed') session.status = 'idle';
+  if (session.status !== 'closed') session.turnState = 'interrupted';
   session.error = undefined;
   session.updatedAt = timestamp;
 

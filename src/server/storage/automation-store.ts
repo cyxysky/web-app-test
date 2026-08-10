@@ -17,6 +17,7 @@ import {
   type UpdateAutomationScheduleInput,
 } from '@/server/automation/automation.schema';
 import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from '@/server/storage/sqlite-database';
+import { publishRealtimeRefreshEvent, type RefreshEntityType } from '@/server/realtime/ws-refresh';
 
 type JsonRow = { record_json: string };
 
@@ -35,6 +36,20 @@ function now() {
 
 function newId(prefix: 'case' | 'run' | 'schedule') {
   return `automation_${prefix}_${randomUUID()}`;
+}
+
+function publishAutomationRecord(
+  entityType: Extract<RefreshEntityType, 'automationCase' | 'automationRun' | 'automationSchedule'>,
+  record: AutomationCaseRecord | AutomationRunRecord | AutomationScheduleRecord,
+  deleted = false,
+) {
+  void publishRealtimeRefreshEvent({
+    entityType,
+    id: record.id,
+    userId: record.userId,
+    updatedAt: record.updatedAt,
+    ...(deleted ? { deleted: true } : { patch: record }),
+  }).catch(() => undefined);
 }
 
 function normalizedLimit(value: number | undefined, fallback = 100) {
@@ -213,11 +228,12 @@ export function createAutomationCase(input: CreateAutomationCaseInput) {
     record.createdAt,
     record.updatedAt,
   );
+  publishAutomationRecord('automationCase', record);
   return record;
 }
 
 export function updateAutomationCase(id: string, patch: UpdateAutomationCaseInput, userId?: string) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     const current = readCase(database, id, userId);
     if (!current) return undefined;
     const record = automationCaseRecordSchema.parse({
@@ -244,14 +260,19 @@ export function updateAutomationCase(id: string, patch: UpdateAutomationCaseInpu
     );
     return record;
   });
+  if (record) publishAutomationRecord('automationCase', record);
+  return record;
 }
 
 export function deleteAutomationCase(id: string, userId?: string) {
+  const record = readCase(getSqliteDatabase(), id, userId);
   const statement = userId === undefined
     ? getSqliteDatabase().prepare('DELETE FROM automation_case WHERE id = ?')
     : getSqliteDatabase().prepare('DELETE FROM automation_case WHERE id = ? AND user_id = ?');
   const result = userId === undefined ? statement.run(id) : statement.run(id, userId);
-  return Number(result.changes) > 0;
+  const deleted = Number(result.changes) > 0;
+  if (deleted && record) publishAutomationRecord('automationCase', record, true);
+  return deleted;
 }
 
 export type AutomationRunListOptions = {
@@ -291,7 +312,7 @@ export function getAutomationRun(id: string, userId?: string) {
 }
 
 export function createAutomationRun(input: CreateAutomationRunInput) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     ensureCaseOwner(database, input.caseId, input.userId);
     const timestamp = now();
     const status = input.status || 'queued';
@@ -309,6 +330,8 @@ export function createAutomationRun(input: CreateAutomationRunInput) {
     insertRun(database, record);
     return record;
   });
+  publishAutomationRecord('automationRun', record);
+  return record;
 }
 
 function automationRunWithPatch(
@@ -351,13 +374,15 @@ function automationRunWithPatch(
 }
 
 export function updateAutomationRun(id: string, patch: UpdateAutomationRunInput, userId?: string) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     const current = readRun(database, id, userId);
     if (!current) return undefined;
     const record = automationRunWithPatch(current, patch);
     persistRun(database, record);
     return record;
   });
+  if (record) publishAutomationRecord('automationRun', record);
+  return record;
 }
 
 /** Atomically update a run only while it is in one of the expected states. */
@@ -368,7 +393,7 @@ export function updateAutomationRunIfStatus(
   userId?: string,
   expectedLeaseOwner?: string,
 ) {
-  return runSqliteTransaction((database) => {
+  const result = runSqliteTransaction((database) => {
     const current = readRun(database, id, userId);
     if (!current) return undefined;
     if (
@@ -381,14 +406,19 @@ export function updateAutomationRunIfStatus(
     persistRun(database, record);
     return { updated: true, run: record };
   });
+  if (result?.updated) publishAutomationRecord('automationRun', result.run);
+  return result;
 }
 
 export function deleteAutomationRun(id: string, userId?: string) {
+  const record = readRun(getSqliteDatabase(), id, userId);
   const statement = userId === undefined
     ? getSqliteDatabase().prepare('DELETE FROM automation_run WHERE id = ?')
     : getSqliteDatabase().prepare('DELETE FROM automation_run WHERE id = ? AND user_id = ?');
   const result = userId === undefined ? statement.run(id) : statement.run(id, userId);
-  return Number(result.changes) > 0;
+  const deleted = Number(result.changes) > 0;
+  if (deleted && record) publishAutomationRecord('automationRun', record, true);
+  return deleted;
 }
 
 export function claimAutomationRunLease(
@@ -399,7 +429,7 @@ export function claimAutomationRunLease(
 ) {
   if (!owner.trim()) throw new Error('A lease owner is required.');
   if (!Number.isFinite(ttlMs) || ttlMs <= 0) throw new Error('Lease TTL must be greater than zero.');
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     const current = readRun(database, runId, userId);
     if (!current || terminalRunStatuses.has(current.status)) return undefined;
     const timestamp = now();
@@ -423,10 +453,12 @@ export function claimAutomationRunLease(
     persistRun(database, record);
     return record;
   });
+  if (record) publishAutomationRecord('automationRun', record);
+  return record;
 }
 
 export function releaseAutomationRunLease(runId: string, owner: string, userId?: string) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     const current = readRun(database, runId, userId);
     if (!current?.lease || current.lease.owner !== owner) return undefined;
     const withoutLease: Partial<AutomationRunRecord> = { ...current };
@@ -435,6 +467,8 @@ export function releaseAutomationRunLease(runId: string, owner: string, userId?:
     persistRun(database, record);
     return record;
   });
+  if (record) publishAutomationRecord('automationRun', record);
+  return record;
 }
 
 export type AutomationScheduleListOptions = {
@@ -474,7 +508,7 @@ export function getAutomationSchedule(id: string, userId?: string) {
 }
 
 export function createAutomationSchedule(input: CreateAutomationScheduleInput) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     ensureCaseOwner(database, input.caseId, input.userId);
     const timestamp = now();
     const record = automationScheduleRecordSchema.parse({
@@ -502,6 +536,8 @@ export function createAutomationSchedule(input: CreateAutomationScheduleInput) {
     );
     return record;
   });
+  publishAutomationRecord('automationSchedule', record);
+  return record;
 }
 
 export function updateAutomationSchedule(
@@ -509,7 +545,7 @@ export function updateAutomationSchedule(
   patch: UpdateAutomationScheduleInput,
   userId?: string,
 ) {
-  return runSqliteTransaction((database) => {
+  const record = runSqliteTransaction((database) => {
     const current = readSchedule(database, id, userId);
     if (!current) return undefined;
     if (patch.caseId && patch.caseId !== current.caseId) {
@@ -530,14 +566,19 @@ export function updateAutomationSchedule(
     persistSchedule(database, record);
     return record;
   });
+  if (record) publishAutomationRecord('automationSchedule', record);
+  return record;
 }
 
 export function deleteAutomationSchedule(id: string, userId?: string) {
+  const record = readSchedule(getSqliteDatabase(), id, userId);
   const statement = userId === undefined
     ? getSqliteDatabase().prepare('DELETE FROM automation_schedule WHERE id = ?')
     : getSqliteDatabase().prepare('DELETE FROM automation_schedule WHERE id = ? AND user_id = ?');
   const result = userId === undefined ? statement.run(id) : statement.run(id, userId);
-  return Number(result.changes) > 0;
+  const deleted = Number(result.changes) > 0;
+  if (deleted && record) publishAutomationRecord('automationSchedule', record, true);
+  return deleted;
 }
 
 export type DueAutomationScheduleOptions = {
@@ -588,7 +629,7 @@ export type CreateAutomationScheduleOccurrenceResult = {
 export function createAutomationScheduleOccurrence(
   input: CreateAutomationScheduleOccurrenceInput,
 ): CreateAutomationScheduleOccurrenceResult | undefined {
-  return runSqliteTransaction((database) => {
+  const occurrence = runSqliteTransaction<CreateAutomationScheduleOccurrenceResult | undefined>((database) => {
     const schedule = readSchedule(database, input.scheduleId, input.userId);
     if (!schedule) return undefined;
     const occurrenceAt = input.expectedNextRunAt || schedule.nextRunAt;
@@ -650,4 +691,9 @@ export function createAutomationScheduleOccurrence(
     }
     return { created: true, schedule: advancedSchedule, run };
   });
+  if (occurrence?.created && occurrence.run) {
+    publishAutomationRecord('automationRun', occurrence.run);
+    publishAutomationRecord('automationSchedule', occurrence.schedule);
+  }
+  return occurrence;
 }

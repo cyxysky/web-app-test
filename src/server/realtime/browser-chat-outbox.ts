@@ -1,4 +1,4 @@
-import { publishBrowserChatRefreshEvent } from '@/server/realtime/ws-refresh';
+import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
   markBrowserChatRealtimeOutboxDelivered,
   markBrowserChatRealtimeOutboxFailed,
@@ -9,6 +9,7 @@ import {
 type BrowserChatOutboxRuntimeState = {
   flush?: Promise<void>;
   requested?: boolean;
+  retryAttempt?: number;
   retryTimer?: ReturnType<typeof setTimeout>;
 };
 
@@ -16,7 +17,13 @@ const runtimeState = ((globalThis as typeof globalThis & {
   __browserChatOutboxRuntimeState?: BrowserChatOutboxRuntimeState;
 }).__browserChatOutboxRuntimeState ??= {});
 
-const retryDelayMs = 1_000;
+const retryDelayBaseMs = 1_000;
+const retryDelayMaxMs = 30_000;
+
+export function browserChatOutboxRetryDelay(attempt: number) {
+  const normalizedAttempt = Number.isFinite(attempt) ? Math.max(0, Math.trunc(attempt)) : 0;
+  return Math.min(retryDelayMaxMs, retryDelayBaseMs * (2 ** normalizedAttempt));
+}
 
 async function publishPendingBrowserChatRealtimeEvents() {
   while (true) {
@@ -27,7 +34,7 @@ async function publishPendingBrowserChatRealtimeEvents() {
     }
     for (const record of records) {
       try {
-        await publishBrowserChatRefreshEvent(record.payload);
+        await publishRealtimeRefreshEvent(record.payload);
         markBrowserChatRealtimeOutboxDelivered(record.id);
       } catch (error) {
         markBrowserChatRealtimeOutboxFailed(
@@ -52,6 +59,7 @@ export function flushBrowserChatRealtimeOutbox() {
       runtimeState.requested = false;
       await publishPendingBrowserChatRealtimeEvents();
     } while (runtimeState.requested);
+    runtimeState.retryAttempt = 0;
   })().finally(() => {
     runtimeState.flush = undefined;
   });
@@ -59,13 +67,21 @@ export function flushBrowserChatRealtimeOutbox() {
 }
 
 export function scheduleBrowserChatRealtimeOutboxFlush() {
-  void flushBrowserChatRealtimeOutbox().catch(() => {
-    if (runtimeState.retryTimer) return;
-    runtimeState.retryTimer = setTimeout(() => {
-      runtimeState.retryTimer = undefined;
-      scheduleBrowserChatRealtimeOutboxFlush();
-    }, retryDelayMs);
-  });
+  runtimeState.requested = true;
+  if (runtimeState.retryTimer || runtimeState.flush) return;
+  void flushBrowserChatRealtimeOutbox().then(
+    () => undefined,
+    () => {
+      if (runtimeState.retryTimer) return;
+      const retryAttempt = runtimeState.retryAttempt || 0;
+      runtimeState.retryAttempt = retryAttempt + 1;
+      runtimeState.retryTimer = setTimeout(() => {
+        runtimeState.retryTimer = undefined;
+        scheduleBrowserChatRealtimeOutboxFlush();
+      }, browserChatOutboxRetryDelay(retryAttempt));
+      runtimeState.retryTimer.unref?.();
+    },
+  );
 }
 
 const startupFlush = setTimeout(scheduleBrowserChatRealtimeOutboxFlush, 0);

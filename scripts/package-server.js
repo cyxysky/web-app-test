@@ -95,6 +95,7 @@ const productionPackagePaths = copyProductionRuntime(root, serverRoot);
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
 copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverRoot, 'webpilot-server.js'));
 copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverRoot, 'webpilot-identity.js'));
+copyInto(path.join(root, 'server', 'realtime-refresh-hub.js'), path.join(serverRoot, 'realtime-refresh-hub.js'));
 copyBrowserSessionExtension();
 copyPlaywrightChromium();
 
@@ -103,6 +104,7 @@ if (
   || !fs.existsSync(path.join(serverRoot, '.next', 'required-server-files.json'))
   || !fs.existsSync(path.join(serverRoot, 'webpilot-server.js'))
   || !fs.existsSync(path.join(serverRoot, 'webpilot-identity.js'))
+  || !fs.existsSync(path.join(serverRoot, 'realtime-refresh-hub.js'))
   || !fs.existsSync(path.join(serverRoot, 'node_modules', 'next', 'package.json'))
 ) {
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');

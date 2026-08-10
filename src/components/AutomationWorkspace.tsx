@@ -32,10 +32,11 @@ import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
-import type { Language } from '@/i18n/translations';
+import type { Language } from '@/i18n/language';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
+import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import { asRecord } from '@/lib/unknown-value';
 import {
   readSidebarCollapsedPreference,
@@ -605,9 +606,39 @@ export function AutomationWorkspace({
   }, [loadAll]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => void loadAll(true), 12_000);
-    return () => window.clearInterval(timer);
-  }, [loadAll]);
+    return subscribeRealtimeRefresh((event) => {
+      if (event.entityType === 'automationCase') {
+        if (event.deleted) {
+          setCases((current) => current.filter((item) => item.id !== event.id));
+          return;
+        }
+        const record = normalizeCase(event.patch, t);
+        if (!record) return;
+        setCases((current) => [record, ...current.filter((item) => item.id !== record.id)]);
+        return;
+      }
+      if (event.entityType === 'automationSchedule') {
+        if (event.deleted) {
+          setSchedules((current) => current.filter((item) => item.id !== event.id));
+          return;
+        }
+        const record = normalizeSchedule(event.patch, t);
+        if (!record) return;
+        setSchedules((current) => [record, ...current.filter((item) => item.id !== record.id)]);
+        return;
+      }
+      if (event.entityType !== 'automationRun') return;
+      if (event.deleted) {
+        setRuns((current) => current.filter((item) => item.id !== event.id));
+        return;
+      }
+      const record = normalizeRun(event.patch, t);
+      if (!record) return;
+      setRuns((current) => [record, ...current.filter((item) => item.id !== record.id)]);
+    }, {
+      onResync: () => loadAll(true),
+    });
+  }, [loadAll, t]);
 
   useEffect(() => {
     if (!cases.length) return;

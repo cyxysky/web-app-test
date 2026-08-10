@@ -2,7 +2,6 @@ import { NextRequest } from 'next/server';
 import { sendBrowserChatMessage } from '@/server/ai/agents/browser-chat.service';
 import { sendBrowserChatMessageRequestSchema } from '@/server/http/browser-chat-request.schema';
 import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
-import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 
 export const dynamic = 'force-dynamic';
@@ -21,24 +20,18 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const body = await parseJsonRequest(request, sendBrowserChatMessageRequestSchema, { maxBytes: 512 * 1024 });
     const userId = requestUserId(request);
-    return await runIdempotentJson(request, {
-      fingerprint: idempotencyFingerprint({ sessionId, ...body }),
-      scope: 'browser-chat.message',
+    const session = await sendBrowserChatMessage(
+      sessionId,
+      body.content,
+      body.safetyMode,
+      body.modelProvider,
+      body.model,
+      body.clientMessageId,
+      body.attachments,
+      body.skillIds,
       userId,
-    }, async () => {
-      const session = await sendBrowserChatMessage(
-        sessionId,
-        body.content,
-        body.safetyMode,
-        body.modelProvider,
-        body.model,
-        body.clientMessageId,
-        body.attachments,
-        body.skillIds,
-        userId,
-      );
-      return apiJson(request, { session });
-    });
+    );
+    return apiJson(request, { session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to send browser chat message';
     const normalizedError = /Browser chat session not found/i.test(message)

@@ -97,6 +97,37 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   assert.equal(result.activity ? 'observation' in result.activity : false, false);
 });
 
+test('domSnapshot skips an unresponsive iframe instead of reaching the kernel watchdog', async () => {
+  await page.setContent(`
+    <title>Snapshot fallback</title>
+    <button>Still visible</button>
+    <iframe title="stalled-frame" srcdoc="<!doctype html><body>Frame</body>"></iframe>
+  `);
+  try {
+    const stalledFrame = page.frames().find((frame) => frame !== page.mainFrame());
+    assert.ok(stalledFrame);
+    await stalledFrame.evaluate(() => {
+      const stalledObservation = Function('return new Promise(function () {})') as () => Promise<never>;
+      Object.defineProperty(window, '__aiDomRuntime', {
+        configurable: true,
+        value: { pageObservation: stalledObservation },
+      });
+    });
+
+    const startedAt = Date.now();
+    const result = await run(`
+      var boundedSnapshot = await page.domSnapshot();
+      nodeRepl.write(boundedSnapshot);
+    `);
+
+    assert.equal(result.ok, true, result.error);
+    assert.ok(Date.now() - startedAt < 10_000, 'snapshot fallback should finish before the kernel watchdog');
+    assert.match(String(result.value), /Still visible/);
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
 test('browserCode establishes caret and ranges for keyboard editing in textareas and rich-text frames', async () => {
   await page.setContent(`
     <title>Insertion editor</title>

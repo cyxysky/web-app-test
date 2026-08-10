@@ -210,12 +210,10 @@ type PendingExecution = {
   startedAt: number;
 };
 
-const defaultMaxOutputChars = 20_000;
-const maxOutputCharsLimit = 50_000;
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 23;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 24;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -302,6 +300,10 @@ function browserCodeKernelMain() {
   const browserCodeActionTimeoutMs = 5_000;
   const browserCodeNavigationTimeoutMs = 30_000;
   const browserCodePointerLookupTimeoutMs = 250;
+  const browserCodeFrameObservationTimeoutMs = 1_500;
+  const browserCodePageObservationTimeoutMs = 2_500;
+  const browserCodeAxSnapshotTimeoutMs = 6_000;
+  const browserCodeSnapshotFallbackTimeoutMs = 1_500;
   const maxBrowserCodeImages = 4;
   const maxBrowserCodeImageBytes = 8 * 1024 * 1024;
   const maxBrowserCodeImageBytesTotal = 20 * 1024 * 1024;
@@ -313,6 +315,26 @@ function browserCodeKernelMain() {
   const repl = childRequire('node:repl') as typeof import('node:repl');
   const { PassThrough } = childRequire('node:stream') as typeof import('node:stream');
   const { Buffer: ChildBuffer } = childRequire('node:buffer') as typeof import('node:buffer');
+
+  const settleKernelTask = <T>(promise: Promise<T>, timeoutMs: number, label: string) => (
+    new Promise<{ ok: true; value: T } | { ok: false; error: string }>((resolve) => {
+      let settled = false;
+      const finish = (result: { ok: true; value: T } | { ok: false; error: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+      const timer = setTimeout(() => {
+        finish({ ok: false, error: `${label} timed out after ${timeoutMs}ms` });
+      }, timeoutMs);
+      timer.unref?.();
+      promise.then(
+        (value) => finish({ ok: true, value }),
+        (error) => finish({ ok: false, error: `${label} failed: ${error instanceof Error ? error.message : String(error)}` }),
+      );
+    })
+  );
   const hostProcess = process;
   type CoordinateClickEvidence = {
     capturedAt: number;
@@ -367,7 +389,7 @@ function browserCodeKernelMain() {
     if (typeof hostProcess.send === 'function') hostProcess.send(payload);
   };
 
-  const jsonSafe = (value: unknown, maxOutputChars: number) => {
+  const jsonSafe = (value: unknown, maxOutputChars?: number) => {
     const seen = new WeakSet<object>();
     const serialized = JSON.stringify(value, (_key, item) => {
       if (typeof item === 'bigint') return String(item);
@@ -380,7 +402,7 @@ function browserCodeKernelMain() {
       return item;
     });
     if (serialized === undefined) return null;
-    if (serialized.length > maxOutputChars) {
+    if (maxOutputChars && serialized.length > maxOutputChars) {
       return {
         truncated: true,
         originalChars: serialized.length,
@@ -541,7 +563,7 @@ function browserCodeKernelMain() {
   ): Promise<KernelPageObservation> => {
     const mainFrame = page.mainFrame();
     const observations = await Promise.all(page.frames().slice(0, 25).map(async (frame) => {
-      const observation = await frame.evaluate(() => {
+      const observationResult = await settleKernelTask(frame.evaluate(() => {
         const browserWindow = window as Window & {
           __aiDomMutationState?: { epoch?: number };
           __aiDomRuntime?: { pageObservation?: () => KernelPageObservation };
@@ -633,7 +655,8 @@ function browserCodeKernelMain() {
           topSurfaceIds: surfaces.map((surface) => surface.id),
           surfaceTransition: 'initial' as const,
         };
-      }).catch(() => undefined);
+      }), browserCodeFrameObservationTimeoutMs, `frame observation ${compactObservationUrl(frame.url()) || 'about:blank'}`);
+      const observation = observationResult.ok ? observationResult.value : undefined;
       if (!observation) return undefined;
       return {
         ...observation,
@@ -663,10 +686,13 @@ function browserCodeKernelMain() {
         || right.surface.activationOrder - left.surface.activationOrder
         || right.surface.zIndex - left.surface.zIndex
       ))[0];
+    const titleResult = main
+      ? undefined
+      : await settleKernelTask(page.title(), browserCodeSnapshotFallbackTimeoutMs, 'page title');
     return {
       epoch: available.reduce((max, item) => Math.max(max, item.epoch), 0),
       url: main?.url || compactObservationUrl(page.url()),
-      title: main?.title || await page.title().catch(() => ''),
+      title: main?.title || (titleResult?.ok ? titleResult.value : ''),
       ...(main?.focusedElement ? { focusedElement: main.focusedElement } : {}),
       ...(selectedSurface ? { activeSurface: selectedSurface.surface } : {}),
       surfaces: available.flatMap((item) => item.surfaces),
@@ -1788,24 +1814,60 @@ function browserCodeKernelMain() {
         configurable: false,
         enumerable: false,
         value: async (options: { scope?: 'active' | 'all' } = {}) => {
-          const observation = await readUnifiedPageObservation(page);
+          const observationResult = await settleKernelTask(
+            readUnifiedPageObservation(page),
+            browserCodePageObservationTimeoutMs,
+            'page observation',
+          );
+          const observation: KernelPageObservation = observationResult.ok
+            ? observationResult.value
+            : {
+              epoch: 0,
+              url: compactObservationUrl(page.url()),
+              title: '',
+              surfaces: [],
+              surfaceStack: [],
+              topSurfaceIds: [],
+              surfaceTransition: 'initial',
+            };
           const scope = options.scope || 'active';
           const targetFrame = observation.activeSurface?.framePath
             ? page.frames().find((frame) => frame.url() === observation.activeSurface?.framePath) || page.mainFrame()
             : page.mainFrame();
-          let snapshot: string;
-          if (scope === 'active' && observation.activeSurface) {
-            const semanticSurfaceSelector = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
-            const selectedSurface = observation.activeSurface.selector
-              ? targetFrame.locator(observation.activeSurface.selector).filter({ visible: true })
-              : targetFrame.locator(semanticSurfaceSelector).filter({ visible: true }).last();
-            snapshot = await selectedSurface.count()
-              ? await selectedSurface.first().ariaSnapshot({ timeout: browserCodeActionTimeoutMs })
-              : await targetFrame.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
-          } else {
-            snapshot = await page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+          const axResult = await settleKernelTask((async () => {
+            if (scope === 'active' && observation.activeSurface) {
+              const semanticSurfaceSelector = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
+              const selectedSurface = observation.activeSurface.selector
+                ? targetFrame.locator(observation.activeSurface.selector).filter({ visible: true })
+                : targetFrame.locator(semanticSurfaceSelector).filter({ visible: true }).last();
+              return await selectedSurface.count()
+                ? selectedSurface.first().ariaSnapshot({ timeout: browserCodeActionTimeoutMs })
+                : targetFrame.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+            }
+            return page.locator('body').ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+          })(), browserCodeAxSnapshotTimeoutMs, 'AX snapshot');
+          const warnings = [
+            ...(!observationResult.ok ? [observationResult.error] : []),
+            ...(!axResult.ok ? [axResult.error] : []),
+          ];
+          let snapshot = axResult.ok ? axResult.value : '';
+          if (!snapshot) {
+            const fallbackResult = await settleKernelTask(
+              targetFrame.locator('body').innerText({ timeout: browserCodeSnapshotFallbackTimeoutMs }),
+              browserCodeSnapshotFallbackTimeoutMs,
+              'snapshot text fallback',
+            );
+            snapshot = fallbackResult.ok && fallbackResult.value.trim()
+              ? `[text-fallback]\n${fallbackResult.value.trim().slice(0, 12_000)}`
+              : '[snapshot unavailable]';
+            if (!fallbackResult.ok) warnings.push(fallbackResult.error);
           }
-          return `[page-state] ${JSON.stringify(observation)}\n[ax-tree scope=${scope}]\n${snapshot}`;
+          return [
+            `[page-state] ${JSON.stringify(observation)}`,
+            ...(warnings.length ? [`[snapshot-warning] ${warnings.join('; ')}`] : []),
+            `[ax-tree scope=${scope}]`,
+            snapshot,
+          ].join('\n');
         },
         writable: false,
       });
@@ -2065,7 +2127,7 @@ function browserCodeKernelMain() {
     code: string;
     credentials?: BrowserCodeCredentialBinding[];
     executionId: string;
-    maxOutputChars: number;
+    maxOutputChars?: number;
     requestId: string;
   }) => {
     if (!replServer) throw new Error('browserCode JavaScript kernel is not initialized.');
@@ -2185,7 +2247,7 @@ function browserCodeKernelMain() {
           code: string;
           credentials?: BrowserCodeCredentialBinding[];
           executionId: string;
-          maxOutputChars: number;
+          maxOutputChars?: number;
           requestId: string;
         });
       }
@@ -2317,7 +2379,9 @@ export class BrowserCodeKernel {
       return { ok: false, error: 'browserCode JavaScript kernel is not connected.', elapsedMs: Date.now() - startedAt, logs: [] };
     }
 
-    const maxOutputChars = boundedInteger(input.maxOutputChars, defaultMaxOutputChars, 1_000, maxOutputCharsLimit);
+    const maxOutputChars = typeof input.maxOutputChars === 'number'
+      ? Math.max(1_000, Math.floor(input.maxOutputChars))
+      : undefined;
     const requestId = randomUUID();
     return new Promise<BrowserCodeRunResult>((resolve) => {
       const onAbort = () => {

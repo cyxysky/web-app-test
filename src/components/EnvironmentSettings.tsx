@@ -18,7 +18,7 @@ import {
 import { useI18n } from '@/i18n/I18nProvider';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
-import { languageOptions } from '@/i18n/translations';
+import { languageOptions } from '@/i18n/language';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import type { ModelConfigRecord, ModelProvider, ModelProviderSettings, RuntimeEnvRecord } from '@/server/ai/schemas/runtime.schema';

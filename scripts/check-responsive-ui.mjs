@@ -5,8 +5,15 @@ import postcss from 'postcss';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const files = [
-  path.join(projectRoot, 'src/app/globals.css'),
-  path.join(projectRoot, 'src/app/styles/modern-system.css'),
+  path.join(projectRoot, 'src/app/styles/foundation.css'),
+  path.join(projectRoot, 'src/app/styles/shared-base.css'),
+  path.join(projectRoot, 'src/app/styles/domains/chat-base.css'),
+  path.join(projectRoot, 'src/app/styles/domains/settings-base.css'),
+  path.join(projectRoot, 'src/app/styles/workspace-shared.css'),
+  path.join(projectRoot, 'src/app/styles/domains/chat.css'),
+  path.join(projectRoot, 'src/app/styles/domains/settings.css'),
+  path.join(projectRoot, 'src/app/styles/domains/automation.css'),
+  path.join(projectRoot, 'src/app/styles/domains/embedded-browser.css'),
 ];
 const source = files.map((file) => fs.readFileSync(file, 'utf8')).join('\n');
 const root = postcss.parse(source);

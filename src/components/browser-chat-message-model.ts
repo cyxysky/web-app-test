@@ -23,6 +23,7 @@ export type BrowserChatAiOutputCycleLike = {
   output: {
     reasoning?: string[];
     texts: string[];
+    tools?: unknown[];
   };
 };
 
@@ -36,6 +37,27 @@ export type BrowserChatMessageRenderEntry<TMessage extends BrowserChatMessageLik
 
 function hasVisibleText(value: unknown) {
   return typeof value === 'string' && Boolean(value.trim());
+}
+
+function normalizedVisibleText(value: unknown) {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+}
+
+export function isBrowserChatManualVerificationStatusText(text: string) {
+  const normalized = normalizedVisibleText(text);
+  return /^AI requested a manual verification pause\. Ask the user to inspect the browser and continue after completing any required verification\.$/i.test(normalized)
+    || /^Manual verification is visible \(.+\)\. The run UI should pause and wait for the user to complete it\.$/i.test(normalized)
+    || /^已暂停自动操作(?:[：:,，；;]|\s)/.test(normalized)
+    || /^已暂停(?:自动操作)?[，,]?\s*等待您检查浏览器/.test(normalized);
+}
+
+export function browserChatAiCycleAnchorsText(
+  cycle: BrowserChatAiOutputCycleLike,
+  text: string,
+) {
+  const normalizedText = normalizedVisibleText(text);
+  if (!normalizedText || !cycle.output.tools?.length) return false;
+  return cycle.output.texts.some((candidate) => normalizedVisibleText(candidate) === normalizedText);
 }
 
 export function browserChatMessageElapsedMs(

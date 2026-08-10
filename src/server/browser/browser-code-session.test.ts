@@ -667,7 +667,7 @@ test('application shutdown closes every registered test browser', async () => {
   }
 });
 
-test('browserCode returns structured dependency failures from its request window', async (context) => {
+test('browserCode returns structured dependency failures from the current cell', async (context) => {
   const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-dependency-test' });
   context.after(async () => session.close());
   await session.start();
@@ -706,4 +706,118 @@ test('browserCode returns structured dependency failures from its request window
     status: 502,
     url: '/itr/service/problem/version?productIdEquals=12',
   }]);
+});
+
+test('browserCode reports a delayed 504 in the next result exactly once', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-delayed-dependency-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  let releaseResponse: () => void = () => {};
+  const responseGate = new Promise<void>((resolve) => { releaseResponse = resolve; });
+  await page.context().route('https://delayed-dependency.test/**', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.pathname === '/late') {
+      await responseGate;
+      await route.fulfill({ body: 'late failure', status: 504 });
+      return;
+    }
+    await route.fulfill({ body: '<!doctype html><title>Delayed dependency</title>', contentType: 'text/html', status: 200 });
+  });
+  await page.goto('https://delayed-dependency.test/form');
+
+  const first = await session.executeBrowserCode({
+    code: `
+      await page.evaluate(() => { void fetch('/late').catch(() => undefined); });
+      nodeRepl.write('request-started');
+    `,
+    runId: 'browser-code-delayed-dependency-test',
+    stepIndex: 1,
+  });
+  assert.equal(first.ok, true, first.actual);
+  assert.equal(first.dependencyFailures, undefined);
+
+  releaseResponse();
+  await waitForCondition(() => (
+    (Reflect.get(session, 'pendingBrowserCodeDependencyFailures') as Map<unknown, unknown>).size === 1
+  ));
+
+  const second = await session.executeBrowserCode({
+    code: `nodeRepl.write('next-cell');`,
+    runId: 'browser-code-delayed-dependency-test',
+    stepIndex: 2,
+  });
+  assert.deepEqual(second.dependencyFailures, [{
+    category: 'external_service',
+    key: 'GET:/late',
+    method: 'GET',
+    status: 504,
+    url: '/late',
+  }]);
+
+  const third = await session.executeBrowserCode({
+    code: `nodeRepl.write('third-cell');`,
+    runId: 'browser-code-delayed-dependency-test',
+    stepIndex: 3,
+  });
+  assert.equal(third.dependencyFailures, undefined);
+});
+
+test('browserCode reports 408 and 429 but ignores ordinary 404 responses', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-http-status-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.context().route('https://http-status.test/**', async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    const status = pathname === '/timeout' ? 408 : pathname === '/rate-limit' ? 429 : pathname === '/missing' ? 404 : 200;
+    await route.fulfill({ body: String(status), status });
+  });
+  await page.goto('https://http-status.test/form');
+
+  const result = await session.executeBrowserCode({
+    code: `
+      await page.evaluate(async () => {
+        await fetch('/timeout');
+        await fetch('/rate-limit');
+        await fetch('/missing');
+      });
+      nodeRepl.write('statuses-read');
+    `,
+    runId: 'browser-code-http-status-test',
+    stepIndex: 1,
+  });
+
+  assert.deepEqual(result.dependencyFailures?.map((failure) => failure.status), [408, 429]);
+});
+
+test('browserCode carries a transport timeout observed between cells into the next result', async (context) => {
+  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-network-timeout-test' });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.context().route('https://network-timeout.test/**', async (route) => {
+    const pathname = new URL(route.request().url()).pathname;
+    if (pathname === '/timeout') {
+      await route.abort('timedout');
+      return;
+    }
+    await route.fulfill({ body: '<!doctype html><title>Network timeout</title>', contentType: 'text/html', status: 200 });
+  });
+  await page.goto('https://network-timeout.test/form');
+  await page.evaluate(() => fetch('/timeout').catch(() => undefined));
+  await waitForCondition(() => (
+    (Reflect.get(session, 'pendingBrowserCodeDependencyFailures') as Map<unknown, unknown>).size === 1
+  ));
+
+  const result = await session.executeBrowserCode({
+    code: `nodeRepl.write('collect-timeout');`,
+    runId: 'browser-code-network-timeout-test',
+    stepIndex: 1,
+  });
+
+  assert.equal(result.dependencyFailures?.length, 1);
+  assert.equal(result.dependencyFailures?.[0]?.category, 'network_error');
+  assert.equal(result.dependencyFailures?.[0]?.key, 'GET:/timeout');
+  assert.match(result.dependencyFailures?.[0]?.errorText || '', /TIMED_OUT/i);
 });

@@ -134,7 +134,7 @@ export function readBrowserChatLogsPage<T>(
   const params: Array<string | number> = [sessionId];
   let messageWhere = '';
   if (options.messageId?.trim()) {
-    messageWhere = "AND json_extract(record_json, '$.messageId') = ?";
+    messageWhere = 'AND message_id = ?';
     params.push(options.messageId.trim());
   }
   let cursorWhere = '';

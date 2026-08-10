@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 15;
+const currentSchemaVersion = 16;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -499,6 +499,63 @@ function applyVersionFifteenMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionSixteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 16').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const columns = database.prepare('PRAGMA table_info(browser_chat_log)').all() as Array<{ name?: string }>;
+    if (!columns.some((column) => column.name === 'message_id')) {
+      database.exec('ALTER TABLE browser_chat_log ADD COLUMN message_id TEXT');
+    }
+    database.exec(`
+      UPDATE browser_chat_log
+      SET message_id = json_extract(record_json, '$.messageId')
+      WHERE message_id IS NULL AND json_extract(record_json, '$.messageId') IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS browser_chat_log_session_message_time_idx
+        ON browser_chat_log(session_id, message_id, time DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS skill_user_updated_id_idx
+        ON skill(user_id, updated_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS skill_shared_updated_id_idx
+        ON skill(shared, updated_at DESC, id DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (16, 'indexed-chat-logs-and-skill-pagination', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function applyVersionSeventeenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 17').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      DELETE FROM browser_chat_realtime_outbox
+      WHERE delivered_at IS NOT NULL;
+      DELETE FROM api_idempotency
+      WHERE scope = 'browser-chat.message';
+      UPDATE browser_chat_log
+      SET record_json = json_remove(record_json, '$.details')
+      WHERE json_extract(record_json, '$.phase') = 'ai:runtime:request'
+        AND json_extract(record_json, '$.details') IS NOT NULL;
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (17, 'compact-browser-chat-runtime-storage', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -582,6 +639,7 @@ function initializeSchema(database: DatabaseSync) {
       session_id TEXT NOT NULL,
       id TEXT NOT NULL,
       time TEXT NOT NULL,
+      message_id TEXT,
       record_json TEXT NOT NULL,
       PRIMARY KEY (session_id, id),
       FOREIGN KEY (session_id) REFERENCES browser_chat_session(id) ON DELETE CASCADE
@@ -690,6 +748,8 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionThirteenMigration(database);
   applyVersionFourteenMigration(database);
   applyVersionFifteenMigration(database);
+  applyVersionSixteenMigration(database);
+  applyVersionSeventeenMigration(database);
 }
 
 export function getSqliteDatabase() {

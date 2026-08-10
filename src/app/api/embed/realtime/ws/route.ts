@@ -1,4 +1,3 @@
-import { ensureRefreshWebSocketServer } from '@/server/realtime/ws-refresh';
 import { embedErrorJson, embedJson, embedOptionsResponse, readEmbedAuth } from '@/server/embed/browser-chat-embed';
 import { createWebSocketTicket, requestPublicOrigin } from '@/server/auth/websocket-ticket';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
@@ -13,7 +12,6 @@ export function OPTIONS() {
 export async function GET(request: Request) {
   try {
     const auth = readEmbedAuth(request);
-    const info = await ensureRefreshWebSocketServer();
     const ticket = createWebSocketTicket({
       origin: auth.origin || request.headers.get('origin') || requestPublicOrigin(request),
       scope: 'realtime-refresh',
@@ -23,7 +21,7 @@ export async function GET(request: Request) {
     publicOrigin.protocol = publicOrigin.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = new URL(withWebPilotBasePath('/refresh'), publicOrigin);
     url.searchParams.set('ticket', ticket.ticket);
-    return embedJson({ ...info, expiresAt: ticket.expiresAt, transport: 'websocket', url: url.toString() });
+    return embedJson({ expiresAt: ticket.expiresAt, transport: 'websocket', url: url.toString() });
   } catch (error) {
     return embedErrorJson(error, 'Realtime WebSocket is unavailable');
   }

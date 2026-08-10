@@ -65,7 +65,12 @@ export function writeConfigRecord(data: ConfigRecord) {
   `).run(JSON.stringify(data.runtimeEnv || []), data.modelConfig === undefined ? null : JSON.stringify(data.modelConfig), now());
 }
 
-export function readSkills(userId?: string, input: { limit?: number; query?: string } = {}) {
+export function readSkills(userId?: string, input: {
+  beforeId?: string;
+  beforeUpdatedAt?: string;
+  limit?: number;
+  query?: string;
+} = {}) {
   const clauses: string[] = [];
   const values: Array<number | string> = [];
   if (userId !== undefined) {
@@ -77,14 +82,18 @@ export function readSkills(userId?: string, input: { limit?: number; query?: str
     clauses.push('LOWER(record_json) LIKE ?');
     values.push(`%${query}%`);
   }
+  if (input.beforeId?.trim() && input.beforeUpdatedAt?.trim()) {
+    clauses.push('(updated_at < ? OR (updated_at = ? AND id < ?))');
+    values.push(input.beforeUpdatedAt.trim(), input.beforeUpdatedAt.trim(), input.beforeId.trim());
+  }
   const limit = Number.isFinite(input.limit)
     ? Math.max(1, Math.min(500, Math.floor(Number(input.limit))))
     : undefined;
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const sql = `
-    SELECT user_id, shared, record_json FROM skill
+    SELECT id, user_id, shared, record_json FROM skill
     ${where}
-    ORDER BY updated_at DESC
+    ORDER BY updated_at DESC, id DESC
     ${limit ? 'LIMIT ?' : ''}
   `;
   if (limit) values.push(limit);
@@ -451,7 +460,7 @@ export function writeBrowserChatSessionRecord<
   TSnapshot extends BrowserChatSessionFields,
   TMessage extends { id: string; createdAt: string; updatedAt?: string },
   TStep extends { index: number },
-  TLog extends { id: string; time: string },
+  TLog extends { id: string; messageId?: string; time: string },
 >(
   snapshot: TSnapshot,
   summary: unknown,
@@ -500,10 +509,13 @@ export function writeBrowserChatSessionRecord<
     pruneBrowserChatRows(database, 'browser_chat_step', 'step_index', snapshot.id, steps.map((step) => step.index));
 
     const insertLog = prepared(database, `
-      INSERT INTO browser_chat_log (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
-      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+      INSERT INTO browser_chat_log (session_id, id, time, message_id, record_json) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET
+        time = excluded.time,
+        message_id = excluded.message_id,
+        record_json = excluded.record_json
     `);
-    for (const log of logs) insertLog.run(snapshot.id, log.id, log.time, JSON.stringify(log));
+    for (const log of logs) insertLog.run(snapshot.id, log.id, log.time, log.messageId || null, JSON.stringify(log));
     pruneBrowserChatRows(database, 'browser_chat_log', 'id', snapshot.id, logs.map((log) => log.id));
   });
 }
@@ -512,7 +524,7 @@ export function writeBrowserChatSessionDelta<
   TSnapshot extends BrowserChatSessionFields,
   TMessage extends { id: string; createdAt: string; updatedAt?: string },
   TStep extends { index: number },
-  TLog extends { id: string; time: string },
+  TLog extends { id: string; messageId?: string; time: string },
 >(
   snapshot: TSnapshot,
   summary: unknown,
@@ -565,10 +577,15 @@ export function writeBrowserChatSessionDelta<
     for (const step of delta.steps || []) upsertStep.run(snapshot.id, step.index, JSON.stringify(step));
 
     const upsertLog = prepared(database, `
-      INSERT INTO browser_chat_log (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
-      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+      INSERT INTO browser_chat_log (session_id, id, time, message_id, record_json) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET
+        time = excluded.time,
+        message_id = excluded.message_id,
+        record_json = excluded.record_json
     `);
-    for (const log of delta.logs || []) upsertLog.run(snapshot.id, log.id, log.time, JSON.stringify(log));
+    for (const log of delta.logs || []) {
+      upsertLog.run(snapshot.id, log.id, log.time, log.messageId || null, JSON.stringify(log));
+    }
 
     const deleteMessage = prepared(database, 'DELETE FROM browser_chat_message WHERE session_id = ? AND id = ?');
     for (const messageId of delta.removedMessageIds || []) deleteMessage.run(snapshot.id, messageId);
@@ -601,7 +618,7 @@ export function writeBrowserChatSessionDeltaQueued<
   TSnapshot extends BrowserChatSessionFields,
   TMessage extends { id: string; createdAt: string; updatedAt?: string },
   TStep extends { index: number },
-  TLog extends { id: string; time: string },
+  TLog extends { id: string; messageId?: string; time: string },
 >(
   snapshot: TSnapshot,
   summary: unknown,
@@ -650,10 +667,13 @@ export function writeBrowserChatSessionDeltaQueued<
   });
   for (const log of delta.logs || []) statements.push({
     sql: `
-      INSERT INTO browser_chat_log (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
-      ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
+      INSERT INTO browser_chat_log (session_id, id, time, message_id, record_json) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, id) DO UPDATE SET
+        time = excluded.time,
+        message_id = excluded.message_id,
+        record_json = excluded.record_json
     `,
-    params: [snapshot.id, log.id, log.time, JSON.stringify(log)],
+    params: [snapshot.id, log.id, log.time, log.messageId || null, JSON.stringify(log)],
   });
   for (const id of delta.removedMessageIds || []) statements.push({
     sql: 'DELETE FROM browser_chat_message WHERE session_id = ? AND id = ?',
@@ -749,10 +769,9 @@ export function readPendingBrowserChatRealtimeOutbox(limit = 100): BrowserChatRe
 
 export function markBrowserChatRealtimeOutboxDelivered(id: number) {
   getSqliteDatabase().prepare(`
-    UPDATE browser_chat_realtime_outbox
-    SET delivered_at = ?, attempts = attempts + 1, last_error = NULL
-    WHERE id = ? AND delivered_at IS NULL
-  `).run(now(), id);
+    DELETE FROM browser_chat_realtime_outbox
+    WHERE id = ?
+  `).run(id);
 }
 
 export function markBrowserChatRealtimeOutboxFailed(id: number, error: string) {
@@ -763,15 +782,9 @@ export function markBrowserChatRealtimeOutboxFailed(id: number, error: string) {
   `).run(error.slice(0, 1000), id);
 }
 
-export function pruneDeliveredBrowserChatRealtimeOutbox(retain = 1_000) {
+export function pruneDeliveredBrowserChatRealtimeOutbox() {
   getSqliteDatabase().prepare(`
     DELETE FROM browser_chat_realtime_outbox
     WHERE delivered_at IS NOT NULL
-      AND id NOT IN (
-        SELECT id FROM browser_chat_realtime_outbox
-        WHERE delivered_at IS NOT NULL
-        ORDER BY id DESC
-        LIMIT ?
-      )
-  `).run(Math.max(100, Math.floor(retain)));
+  `).run();
 }

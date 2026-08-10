@@ -9,7 +9,7 @@ export type BrowserChatHistoryState = {
   steps: BrowserChatHistoryPageState;
 };
 
-type MessageLike = { createdAt?: string; id: string };
+type MessageLike = { clientMessageId?: string; createdAt?: string; id: string; role?: string };
 type StepLike = { index: number };
 type LogLike = { id: string; time?: string };
 type HistorySession<TMessage extends MessageLike, TStep extends StepLike, TLog extends LogLike> = {
@@ -39,6 +39,12 @@ export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | u
   );
 }
 
+function messageKey(message: MessageLike) {
+  return message.clientMessageId && message.role
+    ? `client:${message.clientMessageId}:${message.role}`
+    : `id:${message.id}`;
+}
+
 export function mergeBrowserChatSessionWindowData<
   TMessage extends MessageLike,
   TStep extends StepLike,
@@ -46,8 +52,8 @@ export function mergeBrowserChatSessionWindowData<
   TSession extends HistorySession<TMessage, TStep, TLog>,
 >(existing: TSession | null | undefined, incoming: TSession): TSession {
   if (!existing || existing.id !== incoming.id || !incoming.history) return incoming;
-  const messages = new Map(existing.messages.map((message) => [message.id, message]));
-  for (const message of incoming.messages) messages.set(message.id, message);
+  const messages = new Map(existing.messages.map((message) => [messageKey(message), message]));
+  for (const message of incoming.messages) messages.set(messageKey(message), message);
   const steps = new Map(existing.steps.map((step) => [step.index, step]));
   for (const step of incoming.steps) steps.set(step.index, step);
   const logs = new Map(existing.logs.map((log) => [log.id, log]));
@@ -79,8 +85,8 @@ export function mergeBrowserChatHistoryChunkData<
     subagents?: unknown[];
   },
 ): TSession {
-  const messages = new Map(current.messages.map((message) => [message.id, message]));
-  for (const message of chunk.messages || []) messages.set(message.id, message);
+  const messages = new Map(current.messages.map((message) => [messageKey(message), message]));
+  for (const message of chunk.messages || []) messages.set(messageKey(message), message);
   const steps = new Map(current.steps.map((step) => [step.index, step]));
   for (const step of chunk.steps || []) steps.set(step.index, step);
   const logs = new Map(current.logs.map((log) => [log.id, log]));

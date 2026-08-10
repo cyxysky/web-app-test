@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  browserChatAiCycleAnchorsText,
   browserChatMessageElapsedMs,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
@@ -8,7 +9,36 @@ import {
   browserChatAssistantMessageHasVisibleText,
   browserChatLogsForMessage,
   formatBrowserChatElapsedTime,
+  isBrowserChatManualVerificationStatusText,
 } from './browser-chat-message-model';
+
+test('recognizes localized manual-verification status text without duplicating the verification card', () => {
+  assert.equal(isBrowserChatManualVerificationStatusText(
+    '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后点击对话中的“校验完成，继续执行”。',
+  ), true);
+  assert.equal(isBrowserChatManualVerificationStatusText(
+    '已暂停自动操作：页面需要人工完成验证。',
+  ), true);
+  assert.equal(isBrowserChatManualVerificationStatusText('这里是需要正常展示的最终回答。'), false);
+});
+
+test('keeps text anchored to the tool cycle that emitted it', () => {
+  assert.equal(browserChatAiCycleAnchorsText({
+    id: 'c1',
+    output: {
+      texts: ['账号密码已填充。 现在提交登录。'],
+      tools: [{ name: 'browserCode' }],
+    },
+  }, '账号密码已填充。 现在提交登录。'), true);
+
+  assert.equal(browserChatAiCycleAnchorsText({
+    id: 'c2',
+    output: {
+      texts: ['最终回答'],
+      tools: [],
+    },
+  }, '最终回答'), false);
+});
 
 test('formats the completed assistant processing duration', () => {
   const elapsed = browserChatMessageElapsedMs({

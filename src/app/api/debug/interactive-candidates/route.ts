@@ -1,6 +1,8 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { BrowserSession } from '@/server/browser/browser-session';
 import { store } from '@/server/db/store';
+import { apiError, apiJson } from '@/server/http/api-request';
+import { requireDebugRouteAccess } from '@/server/http/debug-route-access';
 
 type DebugInteractiveCandidateState = {
   session?: BrowserSession;
@@ -17,16 +19,16 @@ function boolParam(value: string | null, fallback: boolean) {
 }
 
 export async function GET(request: NextRequest) {
-  const search = request.nextUrl.searchParams;
-  const url = search.get('url') || 'https://www.bing.com/';
-  const pause = boolParam(search.get('pause'), true);
-  const serverPause = boolParam(search.get('serverPause'), false);
-  const keepOpen = boolParam(search.get('keepOpen'), true);
-  const includeScreenshot = boolParam(search.get('screenshot'), true);
-  const reuse = boolParam(search.get('reuse'), false);
-  const runId = `debug_interactive_candidates_${Date.now()}`;
-
   try {
+    requireDebugRouteAccess(request);
+    const search = request.nextUrl.searchParams;
+    const url = search.get('url') || 'https://www.bing.com/';
+    const pause = boolParam(search.get('pause'), true);
+    const serverPause = boolParam(search.get('serverPause'), false);
+    const keepOpen = boolParam(search.get('keepOpen'), true);
+    const includeScreenshot = boolParam(search.get('screenshot'), true);
+    const reuse = boolParam(search.get('reuse'), false);
+    const runId = `debug_interactive_candidates_${Date.now()}`;
     if (serverPause) {
       debugger;
     }
@@ -75,7 +77,7 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    return NextResponse.json({
+    return apiJson(request, {
       ok: true,
       url,
       pause,
@@ -89,10 +91,6 @@ export async function GET(request: NextRequest) {
       scan,
     });
   } catch (error) {
-    return NextResponse.json({
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    }, { status: 500 });
+    return apiError(request, error, { fallback: 'Interactive candidate debugging failed', status: 500 });
   }
 }

@@ -1,0 +1,45 @@
+/* Embedded browser */
+.browser-chat-embedded-browser {
+  --embedded-tab-strip-bg: var(--sidebar);
+  --embedded-toolbar-bg: var(--panel);
+  border-color: var(--border);
+}
+
+.browser-chat-embedded-tab-list {
+  gap: 4px;
+  padding-inline: 4px;
+}
+
+.browser-chat-embedded-tab,
+.browser-chat-embedded-tab-group-tag {
+  border-radius: 9px 9px 0 0;
+}
+
+.browser-chat-embedded-tab.active {
+  box-shadow:
+    0 -1px 0 color-mix(in srgb, var(--border) 70%, transparent),
+    1px 0 0 color-mix(in srgb, var(--border) 70%, transparent),
+    -1px 0 0 color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.browser-chat-embedded-toolbar {
+  box-shadow: 0 1px 0 var(--border);
+}
+
+.browser-chat-embedded-address-bar {
+  background: var(--panel-soft);
+  border-color: transparent;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 64%, transparent);
+}
+
+.browser-chat-embedded-address-bar:focus-within {
+  background: var(--panel);
+  border-color: color-mix(in srgb, var(--focus-ring) 42%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring) 9%, transparent);
+}
+
+.browser-chat-embedded-resizer span {
+  border-radius: 999px;
+  width: 2px;
+}

@@ -1,9 +1,6 @@
-export type Language = 'zh' | 'en';
+import type { Language } from '@/i18n/language';
 
-export const languageOptions: Array<{ value: Language; label: string }> = [
-  { value: 'zh', label: '中文' },
-  { value: 'en', label: 'English' },
-];
+export type { Language } from '@/i18n/language';
 
 const en: Record<string, string> = {
   'theme.color': 'Theme color',
@@ -1497,10 +1494,6 @@ const reverseEn = Object.entries(en).reduce<Record<string, string>>((acc, [sourc
   acc[translated] = source;
   return acc;
 }, {});
-
-export function normalizeLanguage(value: unknown): Language {
-  return value === 'en' ? 'en' : 'zh';
-}
 
 export function hasChinese(value: string) {
   return /[\u4e00-\u9fff]/.test(value);

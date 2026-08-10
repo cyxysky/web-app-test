@@ -31,6 +31,17 @@ test('browser chat history uses stable cursors and returns oldest-to-newest chun
     assert.equal(third.hasMore, false);
     const messageLogs = history.readBrowserChatLogsPage<{ id: string }>(snapshot.id, { messageId: 'b', limit: 10 });
     assert.deepEqual(messageLogs.items.map((item) => item.id), ['l4', 'l5', 'l6']);
+    const database = databaseModule.getSqliteDatabase();
+    const columns = database.prepare('PRAGMA table_info(browser_chat_log)').all() as Array<{ name?: string }>;
+    assert.equal(columns.some((column) => column.name === 'message_id'), true);
+    const plan = database.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT id FROM browser_chat_log
+      WHERE session_id = ? AND message_id = ?
+      ORDER BY time DESC, id DESC
+      LIMIT ?
+    `).all(snapshot.id, 'b', 10) as Array<{ detail?: string }>;
+    assert.match(plan.map((item) => item.detail || '').join('\n'), /browser_chat_log_session_message_time_idx/);
   } finally {
     databaseModule.getSqliteDatabase().close();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

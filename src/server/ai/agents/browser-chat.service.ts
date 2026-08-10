@@ -45,7 +45,11 @@ import {
   runtimeSnapshotIsNewer,
   type RegisteredBrowserChatTurn,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
-import { transitionBrowserChatSession } from '@/server/ai/agents/browser-chat-session-state';
+import {
+  normalizeBrowserChatTurnState,
+  transitionBrowserChatSession,
+  type BrowserChatTurnState,
+} from '@/server/ai/agents/browser-chat-session-state';
 import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
@@ -71,7 +75,7 @@ import {
   flushBrowserChatRealtimeOutbox,
   scheduleBrowserChatRealtimeOutboxFlush,
 } from '@/server/realtime/browser-chat-outbox';
-import { publishBrowserChatRefreshEvent } from '@/server/realtime/ws-refresh';
+import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
 import {
   deleteBrowserChatSessionRecordQueued,
   readBrowserChatSessionRecord,
@@ -93,6 +97,13 @@ import {
   scheduleBrowserChatArtifactMaintenance,
 } from '@/server/storage/browser-chat-artifact-lifecycle';
 import { scheduleSqliteMaintenance } from '@/server/storage/sqlite-maintenance';
+import {
+  applyBrowserChatPersistenceDelta,
+  collectBrowserChatPersistenceDelta,
+  seedBrowserChatPersistenceCursor,
+  type BrowserChatDirtyRecords as PersistenceDirtyRecords,
+  type BrowserChatPersistenceCursor as PersistenceCursor,
+} from './browser-chat-persistence-delta';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
@@ -167,6 +178,7 @@ export type BrowserChatSessionSnapshot = {
   modelProvider: ModelProvider;
   model: string;
   status: 'idle' | 'running' | 'closed' | 'error';
+  turnState?: BrowserChatTurnState;
   busy: boolean;
   tabs: BrowserTabSnapshot[];
   createdAt: string;
@@ -188,27 +200,16 @@ export type BrowserChatSessionPage = BrowserChatSessionSnapshot & {
   history: BrowserChatHistoryState;
 };
 
-type BrowserChatSessionRecord = BrowserChatSessionSnapshot & {
+type BrowserChatSessionRecord = Omit<BrowserChatSessionSnapshot, 'turnState'> & {
+  turnState: BrowserChatTurnState;
   activeAssistantMessageId?: string;
   activeAbortController?: AbortController;
   browser?: BrowserSession;
   started: boolean;
 };
 
-type BrowserChatPersistenceCursor = {
-  logs: Map<string, BrowserChatLogRecord>;
-  messages: Map<string, BrowserChatMessage>;
-  steps: Map<number, StepExecutionResult>;
-};
-
-type BrowserChatDirtyRecords = {
-  logs: Map<string, BrowserChatLogRecord>;
-  messages: Map<string, BrowserChatMessage>;
-  removedLogIds: Set<string>;
-  removedMessageIds: Set<string>;
-  removedStepIndexes: Set<number>;
-  steps: Map<number, StepExecutionResult>;
-};
+type BrowserChatPersistenceCursor = PersistenceCursor<BrowserChatMessage, StepExecutionResult, BrowserChatLogRecord>;
+type BrowserChatDirtyRecords = PersistenceDirtyRecords<BrowserChatMessage, StepExecutionResult, BrowserChatLogRecord>;
 
 export type BrowserChatSessionRealtimePatch = {
   session: Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'pendingToolConfirmation' | 'steps'> & {
@@ -1423,6 +1424,7 @@ function sessionSnapshotHeader(
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
     status: session.status,
+    turnState: normalizeBrowserChatTurnState(session),
     busy: session.busy,
     tabs: browserChatTabs(session),
     createdAt: session.createdAt,
@@ -1674,6 +1676,9 @@ function recordFromSnapshot(
     conversationContext: normalizeConversationContext(session.conversationContext),
     pendingToolConfirmation: preserveRecentRunningState ? normalizeToolConfirmation(session.pendingToolConfirmation) : undefined,
     status,
+    turnState: preserveRecentRunningState
+      ? normalizeBrowserChatTurnState(session)
+      : normalizeBrowserChatTurnState({ ...session, busy: false, status }),
     busy: preserveRecentRunningState ? session.busy : false,
     logs: session.logs || [],
     started: false,
@@ -1752,29 +1757,11 @@ function readSessionSnapshot(sessionId: string) {
 }
 
 function persistenceDelta(item: BrowserChatSessionSnapshot) {
-  const dirty = dirtyRecords.get(item.id);
-  if (dirty) {
-    return {
-      messages: [...dirty.messages.values()],
-      steps: [...dirty.steps.values()],
-      logs: [...dirty.logs.values()],
-      removedMessageIds: [...dirty.removedMessageIds],
-      removedStepIndexes: [...dirty.removedStepIndexes],
-      removedLogIds: [...dirty.removedLogIds],
-    };
-  }
-  const previous = persistenceCursors.get(item.id);
-  const messageIds = new Set(item.messages.map((message) => message.id));
-  const stepIndexes = new Set(item.steps.map((step) => step.index));
-  const logIds = new Set(item.logs.map((log) => log.id));
-  return {
-    messages: item.messages.filter((message) => previous?.messages.get(message.id) !== message),
-    steps: item.steps.filter((step) => previous?.steps.get(step.index) !== step),
-    logs: item.logs.filter((log) => previous?.logs.get(log.id) !== log),
-    removedMessageIds: previous ? [...previous.messages.keys()].filter((id) => !messageIds.has(id)) : [],
-    removedStepIndexes: previous ? [...previous.steps.keys()].filter((index) => !stepIndexes.has(index)) : [],
-    removedLogIds: previous ? [...previous.logs.keys()].filter((id) => !logIds.has(id)) : [],
-  };
+  return collectBrowserChatPersistenceDelta(
+    item,
+    persistenceCursors.get(item.id),
+    dirtyRecords.get(item.id),
+  );
 }
 
 function advancePersistenceCursor(item: BrowserChatSessionSnapshot, delta: ReturnType<typeof persistenceDelta>) {
@@ -1783,30 +1770,14 @@ function advancePersistenceCursor(item: BrowserChatSessionSnapshot, delta: Retur
     messages: new Map<string, BrowserChatMessage>(),
     steps: new Map<number, StepExecutionResult>(),
   };
-  for (const message of delta.messages) cursor.messages.set(message.id, message);
-  for (const step of delta.steps) cursor.steps.set(step.index, step);
-  for (const log of delta.logs) cursor.logs.set(log.id, log);
-  for (const id of delta.removedMessageIds) cursor.messages.delete(id);
-  for (const index of delta.removedStepIndexes) cursor.steps.delete(index);
-  for (const id of delta.removedLogIds) cursor.logs.delete(id);
-  persistenceCursors.set(item.id, cursor);
+  persistenceCursors.set(item.id, applyBrowserChatPersistenceDelta(cursor, delta));
 }
 
 function seedPersistenceCursor(
   item: Pick<BrowserChatSessionSnapshot, 'id' | 'logs' | 'messages' | 'steps'>,
   persisted: Pick<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> = item,
 ) {
-  const messages = new Map(persisted.messages.map((message) => [message.id, message]));
-  for (const message of item.messages) messages.set(message.id, message);
-  const steps = new Map(persisted.steps.map((step) => [step.index, step]));
-  for (const step of item.steps) steps.set(step.index, step);
-  const logs = new Map(persisted.logs.map((log) => [log.id, log]));
-  for (const log of item.logs) logs.set(log.id, log);
-  persistenceCursors.set(item.id, {
-    messages,
-    steps,
-    logs,
-  });
+  persistenceCursors.set(item.id, seedBrowserChatPersistenceCursor(item, persisted));
 }
 
 function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
@@ -1829,7 +1800,8 @@ function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
 }
 
 function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSessionRealtimePatch {
-  const storedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
+  const retainedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
+  const storedLogs = compactBrowserChatLogsForClient(retainedLogs);
   const persistedItem = storedLogs === item.logs ? item : { ...item, logs: storedLogs };
   const delta = persistenceDelta(persistedItem);
   const sessionRecord: Partial<BrowserChatSessionSnapshot> = { ...persistedItem };
@@ -1852,18 +1824,21 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
     ...(delta.removedLogIds.length ? { removedLogIds: delta.removedLogIds } : {}),
   };
-  trackSessionSqliteWrite(item.id, writeBrowserChatSessionDeltaQueued(
+  const realtimeEvent = {
+    entityType: 'browserChatSession' as const,
+    id: item.id,
+    updatedAt: item.updatedAt,
+    userId: normalizeApplicationUserId(item.userId),
+    patch,
+  };
+  const sqliteWrite = writeBrowserChatSessionDeltaQueued(
     { ...session, messages: [], steps: [], logs: [] },
     summary,
     delta,
-    {
-      entityType: 'browserChatSession',
-      id: item.id,
-      updatedAt: item.updatedAt,
-      userId: normalizeApplicationUserId(item.userId),
-      patch,
-    },
-  ));
+    realtimeEvent,
+  );
+  trackSessionSqliteWrite(item.id, sqliteWrite);
+  void sqliteWrite.catch(() => publishRealtimeRefreshEvent(realtimeEvent).catch(() => undefined));
   if (dirtyRecords.has(item.id)) {
     advancePersistenceCursor(persistedItem, delta);
     dirtyRecords.delete(item.id);
@@ -1892,7 +1867,7 @@ function scheduleBrowserChatTextStreamPublish(sessionId: string, assistantMessag
         stepIndexes: message.stepIndexes ? [...message.stepIndexes] : undefined,
       }],
     };
-    void publishBrowserChatRefreshEvent({
+    void publishRealtimeRefreshEvent({
       entityType: 'browserChatSession',
       id: session.id,
       updatedAt: session.updatedAt,
@@ -2493,6 +2468,7 @@ export function createBrowserChatSession(input: {
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
     status: 'idle',
+    turnState: 'idle',
     busy: false,
     tabs: [],
     started: false,
@@ -3509,6 +3485,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const timestamp = now();
   const reason = new Error('Browser chat operation interrupted by user.');
+  transitionBrowserChatSession(session, { type: 'turnStopping', at: timestamp });
   const assistantMessageIds = new Set([
     registeredTurn?.assistantMessageId,
     session.activeAssistantMessageId,

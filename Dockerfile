@@ -29,7 +29,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/.env ./.env
 COPY --from=build /app/next.config.ts ./next.config.ts
-COPY --from=build /app/server/webpilot-server.js /app/server/webpilot-identity.js ./server/
+COPY --from=build /app/server/webpilot-server.js /app/server/webpilot-identity.js /app/server/realtime-refresh-hub.js ./server/
 
 RUN mkdir -p .data artifacts
 

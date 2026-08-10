@@ -1,0 +1,1618 @@
+/* Settings domain styles. */
+
+.custom-select.settings-control {
+  justify-self: end;
+  width: min(100%, 360px);
+}
+
+.settings-workspace {
+  background: var(--body-gradient), var(--background);
+  color: var(--foreground);
+  display: flex;
+  flex-direction: column;
+  gap: 34px;
+  min-height: 100vh;
+  padding: 28px 40px 64px;
+  width: 100%;
+}
+
+.settings-workspace.embedded {
+  background: transparent;
+  gap: 22px;
+  min-height: 100%;
+  padding: 0;
+}
+
+.settings-header {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 1180px;
+}
+
+.settings-header .ghost-link {
+  color: var(--muted-strong);
+  width: max-content;
+}
+
+.settings-header .ghost-link:hover {
+  color: var(--foreground);
+}
+
+.settings-header h1 {
+  color: var(--foreground);
+  font-size: 30px;
+  font-weight: 780;
+  letter-spacing: 0;
+  margin: 0 0 8px;
+}
+
+.settings-header span {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.settings-layout {
+  align-items: start;
+  display: grid;
+  gap: 34px;
+  grid-template-columns: 178px 1fr;
+}
+
+.settings-layout.no-tabs {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.settings-tabs {
+  display: grid;
+  gap: 6px;
+  position: sticky;
+  top: 24px;
+}
+
+.settings-tabs button {
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 760;
+  min-height: 42px;
+  padding: 0 14px;
+  text-align: left;
+}
+
+.settings-tabs button.active,
+.settings-tabs button:hover {
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.settings-content {
+  display: grid;
+  min-width: 0;
+}
+
+.settings-content section {
+  min-width: 0;
+}
+
+.settings-loading-panel:not(.compact)>div {
+  display: grid;
+  gap: 5px;
+  min-width: min(420px, 100%);
+}
+
+.settings-loading-panel > div > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 560;
+  line-height: 1.5;
+}
+
+.settings-content h2 {
+  color: var(--foreground);
+  font-size: 24px;
+  font-weight: 780;
+  letter-spacing: 0;
+  margin: 0;
+}
+
+.settings-section-head {
+  align-items: flex-end;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.settings-section-head span,
+.settings-row span,
+.env-name span {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 620;
+  line-height: 1.5;
+}
+
+.settings-row {
+  align-items: center;
+  display: grid;
+  gap: 24px;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  padding: 16px 0px;
+}
+
+.settings-row strong {
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 780;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-workspace .input {
+  background: #ffffff;
+  border-color: var(--border);
+  color: var(--foreground);
+}
+
+.settings-workspace .input:disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.74;
+}
+
+.settings-workspace .input::placeholder {
+  color: #8e8ea0;
+}
+
+.settings-env-row {
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 360px);
+}
+
+.settings-env-row.prompt-row {
+  align-items: start;
+  grid-template-columns: minmax(220px, 0.75fr) minmax(420px, 1.25fr);
+}
+
+.settings-env-row.prompt-row .settings-row-control {
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+.settings-prompt-control {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  width: 100%;
+}
+
+.settings-prompt-control .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.settings-directory-control {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  justify-self: end;
+  width: min(100%, 520px);
+}
+
+.settings-directory-control .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.settings-model-list-row {
+  align-items: start;
+}
+
+.settings-model-list-control {
+  display: grid;
+  gap: 8px;
+  justify-self: end;
+  width: min(100%, 520px);
+}
+
+.settings-model-input-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 38px;
+}
+
+.settings-model-input-row .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.settings-model-row-button {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--foreground);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 850;
+  gap: 7px;
+  justify-content: center;
+  min-height: 38px;
+  transition:
+    background 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease;
+  padding: 0;
+  width: 38px;
+}
+
+.settings-model-row-button:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--accent-strong);
+}
+
+.settings-model-row-button.danger {
+  color: var(--danger);
+}
+
+.settings-model-row-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.settings-textarea-control {
+  line-height: 1.5;
+  min-height: 150px;
+  resize: vertical;
+}
+
+.env-name {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.env-name strong {
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.settings-row-control {
+  align-items: center;
+  display: flex;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.settings-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.resource-sharing-field {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  min-height: 66px;
+  padding: 14px 2px 2px;
+}
+
+.resource-sharing-field > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.resource-sharing-field strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.resource-sharing-field small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.resource-shared-badge,
+.resource-readonly-label {
+  align-items: center;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 999px;
+  color: var(--accent-strong, var(--accent));
+  display: inline-flex;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 650;
+  line-height: 1;
+  min-height: 24px;
+  padding: 0 9px;
+  white-space: nowrap;
+}
+
+.resource-readonly-label {
+  background: var(--panel-soft);
+  border-color: var(--border);
+  color: var(--muted-strong);
+}
+
+.settings-workspace .empty-state {
+  color: var(--muted);
+}
+
+.personal-memory-settings {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.personal-memory-head-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.personal-memory-head-actions .ui-button {
+  white-space: nowrap;
+}
+
+.data-transfer-buttons {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.data-transfer-file-input {
+  display: none;
+}
+
+.ui-modal--data-transfer {
+  width: min(92vw, 560px);
+}
+
+.data-transfer-passphrase-form {
+  display: grid;
+  gap: 14px;
+}
+
+.data-transfer-passphrase-form label {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  font-weight: 800;
+  gap: 7px;
+}
+
+.data-transfer-security-note {
+  align-items: flex-start;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: 8px;
+  color: var(--muted-strong);
+  display: flex;
+  font-size: 12px;
+  gap: 9px;
+  line-height: 1.55;
+  padding: 12px;
+}
+
+.data-transfer-security-note svg {
+  color: var(--accent-strong);
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.domain-list-toolbar {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: minmax(220px, 1fr) auto;
+  min-width: 0;
+}
+
+.domain-list-search {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  color: var(--muted);
+  display: flex;
+  gap: 9px;
+  height: 42px;
+  min-width: 0;
+  padding: 0 7px 0 12px;
+  position: relative;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    color 150ms ease;
+}
+
+.domain-list-search:hover {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--border-strong) 70%, transparent);
+}
+
+.domain-list-search:focus-within {
+  background: transparent;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent);
+  color: var(--foreground);
+}
+
+.domain-list-search > svg {
+  color: currentColor;
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
+.domain-list-search-input {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 13px;
+  height: 100%;
+  min-width: 0;
+  outline: 0;
+  padding: 0;
+  width: 100%;
+}
+
+.domain-list-search-input:focus,
+.domain-list-search-input:focus-visible {
+  outline: 0;
+}
+
+.domain-list-search-input::placeholder {
+  color: color-mix(in srgb, var(--muted) 84%, transparent);
+  opacity: 1;
+}
+
+.domain-list-search-input::-webkit-search-cancel-button,
+.domain-list-search-input::-webkit-search-decoration {
+  appearance: none;
+  display: none;
+}
+
+.domain-list-search > button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  transition:
+    background-color 140ms ease,
+    color 140ms ease;
+  width: 28px;
+}
+
+.domain-list-search > button:hover {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.domain-list-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 680;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.domain-accordion-group {
+  background: var(--panel);
+  border: 0;
+  overflow: hidden;
+}
+
+.domain-accordion-toggle > svg:first-child {
+  color: var(--accent-strong);
+}
+
+.domain-accordion-toggle > svg:last-child {
+  color: var(--muted);
+  transition: transform 0.18s ease;
+}
+
+.domain-accordion-group.open > .domain-accordion-toggle > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.domain-accordion-content {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 150ms ease,
+    visibility 0s linear 240ms;
+  visibility: hidden;
+}
+
+.domain-accordion-group.open > .domain-accordion-content {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  pointer-events: auto;
+  transition:
+    grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 180ms ease,
+    visibility 0s linear;
+  visibility: visible;
+}
+
+.domain-accordion-items {
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  display: grid;
+  min-width: 0;
+  padding: 8px;
+  transform: translateY(-4px);
+  transition: transform 200ms ease;
+}
+
+.domain-accordion-group.open > .domain-accordion-content .domain-accordion-items {
+  transform: translateY(0);
+}
+
+.domain-accordion-item {
+  min-width: 0;
+}
+
+.domain-accordion-item + .domain-accordion-item {
+  border-top: 1px solid var(--border);
+}
+
+.domain-accordion-item > .personal-memory-item,
+.domain-accordion-item > .login-account-item,
+.domain-accordion-item > .skills-manager-item {
+  box-shadow: none;
+  transform: none;
+}
+
+.domain-accordion-item > .personal-memory-item:hover,
+.domain-accordion-item > .login-account-item:hover,
+.domain-accordion-item > .skills-manager-item:hover {
+  background: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+  box-shadow: none;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .domain-accordion-content,
+  .domain-accordion-items {
+    transition-duration: 0.01ms;
+  }
+}
+
+.login-account-domain-list .domain-accordion-items {
+  background: transparent;
+  gap: 0;
+}
+
+.login-account-domain-list .login-account-item {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 12px 2px;
+}
+
+@media (max-width: 900px) {
+  .domain-list-toolbar {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .domain-list-count {
+    text-align: left;
+  }
+}
+
+@media (max-width: 620px) {
+  .domain-list-toolbar {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ui-modal--personal-memory {
+  height: auto;
+  width: min(92vw, 920px);
+}
+
+.personal-memory-form {
+  align-content: start;
+  display: grid;
+  gap: 14px 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.personal-memory-field {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  font-weight: 850;
+  gap: 6px;
+  min-width: 0;
+}
+
+.personal-memory-field.wide {
+  grid-column: 1 / -1;
+}
+
+.personal-memory-field .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.personal-memory-field .custom-select {
+  z-index: 1;
+}
+
+.personal-memory-field textarea {
+  line-height: 1.5;
+  min-height: 92px;
+  resize: vertical;
+}
+
+.personal-memory-item {
+  align-items: start;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+  padding: 16px 18px 17px;
+}
+
+.personal-memory-item.disabled {
+  opacity: 0.72;
+}
+
+.personal-memory-item-main {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.personal-memory-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.personal-memory-meta span {
+  align-items: center;
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 999px;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 11.5px;
+  font-weight: 700;
+  justify-content: center;
+  line-height: 24px;
+  min-height: 24px;
+  padding: 0 9px;
+}
+
+.personal-memory-meta span:first-child {
+  color: var(--foreground);
+  font-weight: 780;
+}
+
+.personal-memory-status.active {
+  background: rgba(22, 101, 52, 0.08);
+  border-color: rgba(22, 101, 52, 0.2);
+  color: var(--success);
+}
+
+.personal-memory-status.disabled {
+  background: rgba(127, 29, 29, 0.08);
+  border-color: rgba(127, 29, 29, 0.2);
+  color: var(--danger);
+}
+
+.personal-memory-meta .resource-shared-badge {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
+  color: var(--accent-strong);
+}
+
+.personal-memory-copy {
+  display: grid;
+  gap: 5px;
+  max-width: 78ch;
+  min-width: 0;
+}
+
+.personal-memory-item h3 {
+  color: var(--foreground);
+  font-size: 14px;
+  font-weight: 780;
+  letter-spacing: -0.01em;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.personal-memory-item p {
+  color: var(--muted-strong);
+  font-size: 13.5px;
+  line-height: 1.65;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.personal-memory-aliases {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+}
+
+.personal-memory-aliases > span {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0.02em;
+}
+
+.personal-memory-aliases small {
+  color: var(--muted-strong);
+  font-size: 12.5px;
+  font-weight: 520;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.personal-memory-actions {
+  align-items: center;
+  display: flex;
+  gap: 2px;
+  opacity: 0.68;
+  padding-top: 1px;
+  transition: opacity 150ms ease;
+}
+
+.personal-memory-item:hover .personal-memory-actions,
+.personal-memory-actions:focus-within {
+  opacity: 1;
+}
+
+.personal-memory-delete-error {
+  background: rgba(127, 29, 29, 0.08);
+  border: 1px solid rgba(127, 29, 29, 0.2);
+  border-radius: 8px;
+  color: var(--danger);
+  padding: 10px 12px;
+}
+
+.login-account-modal {
+  width: min(92vw, 620px);
+}
+
+.login-account-modal-header {
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+}
+
+.login-account-modal-icon {
+  align-items: center;
+  align-self: start;
+  border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  border-radius: 10px;
+  color: var(--accent-strong);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.login-account-form > label {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 11px;
+  font-weight: 720;
+  gap: 6px;
+  min-width: 0;
+}
+
+.login-account-form > label.wide,
+.login-account-form > .wide {
+  grid-column: 1 / -1;
+}
+
+.login-account-form label > span {
+  align-items: baseline;
+  display: flex;
+  gap: 5px;
+}
+
+.login-account-form label small {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 560;
+}
+
+.login-account-form .input {
+  min-width: 0;
+  width: 100%;
+}
+
+.login-account-security-note {
+  align-items: flex-start;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  display: flex;
+  font-size: 10px;
+  gap: 7px;
+  line-height: 1.5;
+  padding-top: 12px;
+}
+
+.login-account-security-note svg {
+  color: var(--accent-strong);
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.login-account-modal-error {
+  border-left: 2px solid var(--danger);
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 4px 0 4px 9px;
+}
+
+.login-account-settings {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.login-account-item-icon {
+  align-items: center;
+  color: var(--accent-strong);
+  display: inline-flex;
+  height: 32px;
+  justify-content: center;
+  width: 32px;
+}
+
+.login-account-item-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.login-account-item-actions {
+  display: flex;
+  gap: 5px;
+}
+
+@media (max-width: 620px) {
+  .login-account-form { grid-template-columns: 1fr; }
+  .login-account-form > label.wide,
+  .login-account-form > .wide { grid-column: auto; }
+}
+
+.skills-manager {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+
+.skills-manager-head {
+  margin-bottom: 0;
+}
+
+.skills-manager-list {
+  align-content: start;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.skills-manager-list-body {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.settings-loading-panel.compact {
+  height: 100%;
+  justify-content: center;
+  min-height: 100%;
+  padding: 12px 0;
+  text-align: center;
+  width: 100%;
+}
+
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) {
+  height: 100vh;
+  height: 100dvh;
+}
+
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) .settings-layout {
+  align-items: stretch;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) .settings-content {
+  height: 100%;
+  min-height: 0;
+}
+
+.skills-manager.is-loading,
+.personal-memory-settings.is-loading,
+.login-account-settings.is-loading {
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 100%;
+}
+
+.skills-manager.is-loading .skills-manager-layout,
+.skills-manager.is-loading .skills-manager-list,
+.skills-manager.is-loading .skills-manager-list-body {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.skills-manager-item {
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  display: grid;
+  min-width: 0;
+}
+
+.skills-manager-item:hover {
+  background: var(--panel-soft);
+}
+
+.skills-manager-item-row {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 52px;
+  padding: 4px 8px 4px 12px;
+}
+
+.skills-manager-item-main {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  cursor: pointer;
+  display: grid;
+  font: inherit;
+  gap: 9px;
+  grid-template-columns: 16px minmax(0, 1fr);
+  min-height: 42px;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+}
+
+.skills-manager-item-main b {
+  font-size: 14px;
+  font-weight: 780;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-manager-chevron {
+  color: var(--muted);
+  transition: transform 0.16s ease;
+}
+
+.skills-manager-chevron.open {
+  transform: rotate(180deg);
+}
+
+.skills-manager-item-actions {
+  align-items: center;
+  display: flex;
+  gap: 2px;
+  opacity: 0.68;
+  transition: opacity 150ms ease;
+}
+
+.skills-manager-item:hover .skills-manager-item-actions,
+.skills-manager-item-actions:focus-within {
+  opacity: 1;
+}
+
+.skills-manager-item-actions .ui-icon-button {
+  height: 32px;
+  min-height: 32px;
+  width: 32px;
+}
+
+.skills-manager-item-detail {
+  background: transparent;
+  border-top: 0;
+  display: grid;
+  gap: 18px;
+  padding: 0 18px 18px 37px;
+}
+
+.skills-manager-item-intro {
+  display: grid;
+  gap: 9px;
+  max-width: 78ch;
+  min-width: 0;
+}
+
+.skills-manager-item-description {
+  color: var(--muted-strong);
+  font-size: 13.5px;
+  line-height: 1.65;
+  margin: 0;
+}
+
+.skills-manager-chip-row,
+.skills-manager-trigger-list {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.skills-manager-trigger-list span {
+  align-items: center;
+  background: transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  display: inline-flex;
+  font-size: 11.5px;
+  font-weight: 650;
+  justify-content: center;
+  line-height: 1.2;
+  min-height: 24px;
+  padding: 0 9px;
+}
+
+.skills-manager-section-grid {
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  display: grid;
+  gap: clamp(20px, 3vw, 36px);
+  grid-template-columns: minmax(180px, 0.42fr) minmax(0, 1fr);
+  padding-top: 16px;
+}
+
+.skills-manager-section {
+  align-content: start;
+  border-top: 0;
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 0;
+}
+
+.skills-manager-section>div:first-child {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.skills-manager-section h4 {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 760;
+  letter-spacing: 0.025em;
+  margin: 0;
+}
+
+.skills-manager-section>div:first-child span {
+  color: var(--muted);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.skills-manager-section p {
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.skills-manager-section p.skills-manager-muted {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.skills-manager-muted {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+  margin: 0;
+}
+
+.skills-manager-field {
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  font-weight: 850;
+  gap: 6px;
+  min-width: 0;
+}
+
+.skills-manager-field.wide {
+  grid-column: 1 / -1;
+}
+
+.skills-manager-field .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.skills-manager-field textarea {
+  line-height: 1.5;
+  min-height: 74px;
+  resize: vertical;
+}
+
+.skills-manager-field textarea.compact {
+  min-height: 58px;
+}
+
+.skills-manager-field textarea.skill-details {
+  min-height: 300px;
+}
+
+.skills-manager-details {
+  color: color-mix(in srgb, var(--foreground) 82%, var(--muted));
+  font-size: 13.5px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.skills-manager-footnote {
+  align-items: center;
+  border-top: 0;
+  color: var(--muted);
+  display: flex;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 620;
+  gap: 6px;
+  justify-content: flex-end;
+  padding-top: 0;
+}
+
+.skills-manager-form {
+  display: grid;
+  gap: 14px 16px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: start;
+  margin: 0 auto;
+  padding: 20px clamp(18px, 4vw, 48px);
+  width: min(100%, 1180px);
+}
+
+.skills-manager-delete-body {
+  display: grid;
+  gap: 10px;
+}
+
+.skills-manager-delete-body h3 {
+  color: var(--foreground);
+  letter-spacing: 0;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 850;
+}
+
+.skills-manager-delete-body p {
+  color: var(--muted-strong);
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 0;
+}
+
+.settings-add-model-button {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  width: 100%;
+}
+
+.settings-add-model-button:not(:disabled):hover {
+  background: var(--control-hover-bg) !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+@media (max-width: 900px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-tabs {
+    display: flex;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    position: static;
+  }
+
+  .settings-tabs button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+
+  .settings-section-head {
+    align-items: stretch;
+    display: grid;
+  }
+
+  .settings-row,
+  .settings-env-row {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .settings-env-row.prompt-row {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-control {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .settings-directory-control {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .personal-memory-form,
+.personal-memory-item {
+    grid-template-columns: 1fr;
+  }
+
+  .personal-memory-head-actions,
+.personal-memory-actions {
+    justify-content: flex-start;
+  }
+
+  .skills-manager-layout,
+  .skills-manager-form,
+  .skills-manager-section-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .skills-manager-item-detail {
+    padding: 12px;
+  }
+
+  .skills-manager-form {
+    padding: 16px;
+  }
+}
+
+.browser-chat-settings-tab-lock {
+  color: var(--muted);
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-settings-tab-lock {
+  display: none;
+}
+
+.admin-settings-password-form,
+.admin-settings-password-form label {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-settings-password-form label > span {
+  color: var(--muted-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.admin-settings-password-input {
+  align-items: center;
+  display: flex;
+  position: relative;
+}
+
+.admin-settings-password-input > svg {
+  color: var(--muted);
+  left: 13px;
+  pointer-events: none;
+  position: absolute;
+  z-index: 1;
+}
+
+.admin-settings-password-input .input {
+  padding-left: 40px;
+  width: 100%;
+}
+
+.admin-settings-password-form .error {
+  margin: 2px 0 0;
+}
+
+.browser-chat-settings-pane .settings-layout {
+  min-height: calc(100vh - 74px);
+}
+
+:root[data-theme="dark"] .settings-model-row-button.danger {
+  color: #fca5a5;
+}
+
+:root[data-theme="dark"] .settings-model-row-button:disabled {
+  background: color-mix(in srgb, var(--panel-soft) 72%, #000000);
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  color: color-mix(in srgb, var(--muted) 70%, transparent);
+  opacity: 0.62;
+}
+
+:root[data-theme="dark"] .settings-card {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+:root[data-theme="dark"] .skills-manager-list {
+  background: color-mix(in srgb, var(--panel) 90%, #000000);
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="dark"] .skills-manager-item:hover {
+  background: var(--panel-warm);
+}
+
+:root[data-theme="dark"] .skills-manager-trigger-list span {
+  background: transparent;
+  border-color: var(--border-strong);
+}
+
+:root[data-theme="dark"] .settings-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+}
+
+:root[data-theme="dark"] .settings-card .settings-row:last-child {
+  border-bottom: 0;
+}
+
+.browser-chat-settings-pane .settings-workspace.embedded {
+  gap: 0;
+  min-height: 0;
+}
+
+.browser-chat-settings-pane .settings-workspace.embedded:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) {
+  height: 100%;
+}
+
+.browser-chat-settings-pane:has(.settings-loading-panel) {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.browser-chat-settings-pane:has(.settings-loading-panel) .settings-workspace.embedded {
+  height: 100%;
+  min-height: 0;
+}
+
+.browser-chat-settings-pane .settings-layout.no-tabs {
+  display: block;
+  min-height: 0;
+}
+
+.browser-chat-settings-pane .settings-content>section,
+.browser-chat-settings-pane .personal-memory-settings,
+.browser-chat-settings-pane .skills-manager {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
+  padding: 0;
+}
+
+.browser-chat-settings-pane .settings-content>section::before,
+.browser-chat-settings-pane .personal-memory-settings::before,
+.browser-chat-settings-pane .skills-manager::before {
+  content: none;
+}
+
+.browser-chat-settings-pane .settings-section-head span {
+  font-size: 13px;
+  line-height: 1.65;
+  margin-top: 3px;
+  max-width: 680px;
+}
+
+.browser-chat-settings-pane .settings-section-head>.ui-button {
+  border-radius: 8px;
+  min-height: 36px;
+  padding-inline: 13px;
+}
+
+.browser-chat-settings-pane .settings-card .settings-row:last-child {
+  border-bottom: 0;
+}
+
+.browser-chat-settings-pane .settings-row>div:first-child {
+  align-content: center;
+  display: grid;
+  gap: 5px;
+}
+
+.browser-chat-settings-pane .settings-section-head>div:first-child,
+.browser-chat-settings-pane .env-name {
+  display: grid;
+  gap: 5px;
+}
+
+.browser-chat-settings-pane .settings-row-control {
+  justify-content: stretch;
+}
+
+.browser-chat-settings-pane .custom-select-button,
+.browser-chat-settings-pane .settings-workspace .input,
+.browser-chat-settings-pane .settings-workspace .textarea,
+.browser-chat-settings-pane .theme-color-picker {
+  background: var(--panel-soft);
+  border-color: var(--border);
+  border-radius: 8px;
+  min-height: 40px;
+}
+
+.browser-chat-settings-pane .custom-select-button:hover,
+.browser-chat-settings-pane .settings-workspace .input:focus,
+.browser-chat-settings-pane .settings-workspace .textarea:focus,
+.browser-chat-settings-pane .theme-color-picker:hover {
+  border-color: color-mix(in srgb, var(--accent) 56%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent);
+}
+
+.browser-chat-settings-pane .theme-color-picker {
+  justify-self: stretch;
+}
+
+.browser-chat-settings-pane .settings-model-list-row,
+.browser-chat-settings-pane .settings-env-row.prompt-row {
+  grid-template-columns: minmax(220px, 1fr) var(--settings-control-width);
+}
+
+.browser-chat-settings-pane .settings-loading-panel {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+.browser-chat-settings-pane .domain-accordion-list {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.browser-chat-settings-pane .personal-memory-item {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 16px 18px 17px;
+}
+
+.browser-chat-settings-pane .personal-memory-item:hover {
+  background: color-mix(in srgb, var(--foreground) 2.5%, transparent);
+}
+
+.browser-chat-settings-pane .skills-manager-list-body {
+  gap: 0;
+}
+
+.browser-chat-settings-pane .skills-manager-list:has(.empty-state),
+.browser-chat-settings-pane .skills-manager-list:has(.settings-loading-panel),
+.browser-chat-settings-pane .skills-manager-list:has(.empty-state) .skills-manager-list-body,
+.browser-chat-settings-pane .skills-manager-list:has(.settings-loading-panel) .skills-manager-list-body,
+.browser-chat-settings-pane .skills-manager-list .empty-state {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.browser-chat-settings-pane .skills-manager-list .empty-state {
+  padding: 28px 0;
+}
+
+.browser-chat-settings-pane .skills-manager-item {
+  border: 0;
+  border-radius: 0;
+}
+
+.browser-chat-settings-pane .skills-manager-item:hover {
+  background: color-mix(in srgb, var(--foreground) 2.5%, transparent);
+}
+
+:root[data-theme="dark"] .browser-chat-settings-pane .custom-select-button,
+:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .input,
+:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .textarea,
+:root[data-theme="dark"] .browser-chat-settings-pane .theme-color-picker {
+  background: color-mix(in srgb, var(--panel-soft) 88%, #000000);
+}
+
+:where(.personal-memory-item, .skills-manager-item) {
+  transition:
+    background var(--motion-normal) ease,
+    border-color var(--motion-normal) ease,
+    box-shadow var(--motion-normal) ease,
+    transform var(--motion-normal) var(--ease-standard);
+}
+
+@media (max-width: 760px) {
+  .browser-chat-settings-pane {
+    padding: 18px 14px 36px;
+  }
+
+  .browser-chat-settings-pane .settings-content>section,
+  .browser-chat-settings-pane .personal-memory-settings,
+  .browser-chat-settings-pane .skills-manager {
+    border-radius: 0;
+    padding: 0;
+  }
+
+  .browser-chat-settings-pane .settings-section-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .browser-chat-settings-pane .settings-row,
+  .browser-chat-settings-pane .settings-model-list-row,
+  .browser-chat-settings-pane .settings-env-row.prompt-row {
+    gap: 14px;
+    grid-template-columns: 1fr;
+    padding: 16px 0;
+  }
+}
+
+:where(.skills-manager-item-detail) {
+  animation: ui-disclosure-in var(--motion-normal) var(--ease-emphasized) both;
+  transform-origin: top center;
+}
