@@ -194,3 +194,5 @@ docker login
 docker push "${DockerHubUser}/webpilot-qa:${ImageVersion}"
 docker push "${DockerHubUser}/webpilot-qa:latest"
 ```
+1.你现在新建标签页，还是会把组挤到被遮挡的地方
+2.你现在删除按钮还是和文本重叠了，你能不能用flex布局，文本overflow：hidden？
