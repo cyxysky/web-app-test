@@ -1377,10 +1377,6 @@
   margin: 2px 0 0;
 }
 
-.browser-chat-settings-pane .settings-layout {
-  min-height: calc(100vh - 74px);
-}
-
 :root[data-theme="dark"] .settings-model-row-button.danger {
   color: #fca5a5;
 }

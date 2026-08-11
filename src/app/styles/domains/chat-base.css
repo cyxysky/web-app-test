@@ -3808,3 +3808,10 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
   color: var(--foreground);
 }
+
+.browser-chat-answer {
+  display: block;
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

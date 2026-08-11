@@ -13,7 +13,7 @@ import type {
   WindowWithAiDomRuntime,
 } from './browser-session';
 
-export const AI_DOM_RUNTIME_VERSION = 26;
+export const AI_DOM_RUNTIME_VERSION = 27;
 
 export function installAccessibilitySnapshotExportControl() {
   if (window.top !== window) return;
@@ -2422,6 +2422,19 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     }
     const fileInputAction = action === 'setinputfiles';
     const pointerAction = /^(click|dblclick|hover|tap|check|uncheck|setchecked|dragto|draganddrop)$/.test(action);
+    const viewportBlockingLayer = (candidate: Element | undefined) => {
+      if (!candidate || composedContains(candidate, element) || composedContains(element, candidate)) return undefined;
+      const style = visibleDomStyle(candidate);
+      if (!style || !['fixed', 'absolute', 'sticky'].includes(style.position)) return undefined;
+      const rect = candidate.getBoundingClientRect();
+      const horizontalCoverage = Math.max(0, Math.min(window.innerWidth, rect.right) - Math.max(0, rect.left));
+      const verticalCoverage = Math.max(0, Math.min(window.innerHeight, rect.bottom) - Math.max(0, rect.top));
+      if (
+        horizontalCoverage < window.innerWidth * 0.8
+        || verticalCoverage < window.innerHeight * 0.8
+      ) return undefined;
+      return candidate;
+    };
     if (action && !/^(screenshot|ariaSnapshot|innerText|textContent|getAttribute|inputValue|count)$/.test(action)) {
       rememberSurfaceSource(element);
     }
@@ -2476,6 +2489,20 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
           && renderedRect.bottom > 0
           && renderedRect.left < window.innerWidth
           && renderedRect.top < window.innerHeight;
+        const currentViewportBlocker = viewportBlockingLayer(topmostRenderableAt(
+          Math.max(0, Math.floor(window.innerWidth / 2)),
+          Math.max(0, Math.floor(window.innerHeight / 2)),
+          { requirePointerEvents: true },
+        ));
+        if (!intersectsViewport && currentViewportBlocker) {
+          return {
+            ok: false,
+            reason: `${targetDescriptor} is outside the viewport behind viewport-blocking layer ${descriptor(currentViewportBlocker)}`,
+            descriptor: targetDescriptor,
+            failureKind: 'occluded' as const,
+            coveredBy: descriptor(currentViewportBlocker),
+          };
+        }
         if (!intersectsViewport && targetStyle?.position === 'fixed') {
           return {
             ok: false,
@@ -2487,9 +2514,12 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
           const centerX = Math.min(window.innerWidth - 1, Math.max(0, renderedRect.left + renderedRect.width / 2));
           const centerY = Math.min(window.innerHeight - 1, Math.max(0, renderedRect.top + renderedRect.height / 2));
           const coveredBy = topmostRenderableAt(centerX, centerY, { requirePointerEvents: true });
+          const blockingLayer = viewportBlockingLayer(coveredBy);
           return {
             ok: false,
-            reason: `${targetDescriptor} has no unobstructed actionable point`,
+            reason: blockingLayer
+              ? `${targetDescriptor} is covered by viewport-blocking layer ${descriptor(blockingLayer)}`
+              : `${targetDescriptor} has no unobstructed actionable point`,
             descriptor: targetDescriptor,
             failureKind: 'occluded' as const,
             ...(coveredBy ? { coveredBy: descriptor(coveredBy) } : {}),

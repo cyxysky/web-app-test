@@ -34,9 +34,25 @@ test('bootstrap returns a bounded first page with a continuation cursor', async 
       };
       records.writeBrowserChatSessionRecord(session, session, [message], [], []);
     }
+    for (let index = 0; index < 3; index += 1) {
+      const timestamp = new Date(Date.UTC(2027, 0, 1, 0, 0, index)).toISOString();
+      const emptySession = {
+        id: `empty-session-${index}`,
+        userId,
+        title: `Empty session ${index}`,
+        status: 'idle',
+        busy: false,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        messages: [],
+        steps: [],
+        logs: [],
+      };
+      records.writeBrowserChatSessionRecord(emptySession, emptySession, [], [], []);
+    }
 
     const { GET } = await import('./route');
-    const response = await GET(new NextRequest('http://localhost/api/browser-chat/bootstrap?sessionLimit=10&skillLimit=5', {
+    const response = await GET(new NextRequest('http://localhost/api/browser-chat/bootstrap?skillLimit=5', {
       headers: {
         'x-webpilot-identity-proof': 'bootstrap-test-secret',
         'x-webpilot-identity-user-id': userId,
@@ -49,6 +65,7 @@ test('bootstrap returns a bounded first page with a continuation cursor', async 
     };
     assert.equal(response.status, 200);
     assert.equal(body.sessions?.length, 10);
+    assert.equal(body.sessions?.some((session) => session.id.startsWith('empty-session-')), false);
     assert.equal(body.sessionPage?.hasMore, true);
     assert.ok(body.sessionPage?.next?.beforeId);
     assert.ok(body.sessionPage?.next?.beforeUpdatedAt);

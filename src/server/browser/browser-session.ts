@@ -139,6 +139,12 @@ export type BrowserSessionOptions = {
   actionFrameLimit?: number;
 };
 
+export type BrowserSessionCookie = {
+  name: string;
+  url: string;
+  value: string;
+};
+
 export type AccessibilitySnapshotExportControlResult = {
   ok: boolean;
   fileName?: string;
@@ -1674,6 +1680,13 @@ export class BrowserSession {
 
   async exportStorageState() {
     return this.context?.storageState({ indexedDB: true });
+  }
+
+  async injectCookies(cookies: BrowserSessionCookie[]) {
+    if (!this.context) throw new Error('Browser session has not started');
+    if (!cookies.length) return 0;
+    await this.context.addCookies(cookies);
+    return cookies.length;
   }
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
@@ -6307,6 +6320,19 @@ export class BrowserSession {
       return { error: `UID ${uid} is not present in the latest snapshot ${generation.id}. Take a new snapshot and choose a current UID.` };
     }
     return { reference };
+  }
+
+  describeElementTarget(target: BrowserElementTarget | undefined) {
+    const ref = String(target?.ref || '').trim();
+    if (!ref) return undefined;
+    if (ref.startsWith('dom-')) {
+      const reference = this.lastDomNodeReferences.get(ref);
+      if (!reference || reference.observationId !== this.domVisibleObservationId) return undefined;
+      return `${reference.tag} "${reference.label}" ${reference.contextText || reference.descriptor}`.replace(/\s+/g, ' ').trim();
+    }
+    const resolved = this.currentSnapshotReference(ref);
+    const reference = resolved.reference;
+    return reference ? `${reference.role} "${reference.name}"` : undefined;
   }
 
   private async snapshotReferenceLocator(reference: SnapshotReference) {

@@ -40,6 +40,15 @@ async function compressScreenshotForAi(buffer: Buffer, maxBytes: number) {
 export async function readScreenshotForAi(filePath: string) {
   const buffer = await readFile(filePath);
   const maxBytes = aiScreenshotMaxBytes();
-  if (!maxBytes) return buffer;
-  return compressScreenshotForAi(buffer, maxBytes).catch(() => buffer);
+  const data = maxBytes
+    ? await compressScreenshotForAi(buffer, maxBytes).catch(() => buffer)
+    : buffer;
+  const mediaType = data[0] === 0xff && data[1] === 0xd8
+    ? 'image/jpeg'
+    : data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+      ? 'image/png'
+      : data.subarray(0, 4).toString('ascii') === 'RIFF' && data.subarray(8, 12).toString('ascii') === 'WEBP'
+        ? 'image/webp'
+        : 'application/octet-stream';
+  return { data, mediaType };
 }

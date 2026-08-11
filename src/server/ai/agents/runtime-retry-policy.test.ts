@@ -12,6 +12,19 @@ test('runtime retry only accepts transient provider and network failures', () =>
   assert.equal(classifyRuntimeRetry({ statusCode: 429, responseHeaders: { 'retry-after': '2' } }).retryable, true);
   assert.equal(classifyRuntimeRetry({ status: 503 }).retryable, true);
   assert.equal(classifyRuntimeRetry(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })).retryable, true);
+  assert.deepEqual(
+    classifyRuntimeRetry(Object.assign(
+      new Error('Cannot connect to API: Connect Timeout Error (attempted address: api.deepseek.com:443, timeout: 10000ms)'),
+      { cause: Object.assign(new Error('Connect Timeout Error'), { code: 'UND_ERR_CONNECT_TIMEOUT' }) },
+    )),
+    {
+      category: 'request-timeout',
+      reason: 'temporary request timeout',
+      retryAfterMs: undefined,
+      retryable: true,
+      statusCode: undefined,
+    },
+  );
   assert.equal(classifyRuntimeRetry({ status: 401, message: 'invalid api key' }).retryable, false);
   assert.equal(classifyRuntimeRetry({ status: 400, message: 'invalid tool schema' }).retryable, false);
   assert.equal(classifyRuntimeRetry(new Error('locator.click failed')).retryable, false);

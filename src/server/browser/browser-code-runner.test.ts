@@ -451,6 +451,37 @@ test('browserCode auto-filters hidden candidates and permits explicit positional
     assert.equal(trialFilteredAction.ok, true, trialFilteredAction.error);
     assert.equal(await page.locator('body').getAttribute('data-trial-filtered-action'), 'done');
 
+    await page.evaluate(() => {
+      const foregroundSurface = document.createElement('div');
+      foregroundSurface.className = 'foreground-surface';
+      foregroundSurface.setAttribute('role', 'dialog');
+      foregroundSurface.textContent = 'Foreground dialog';
+      Object.assign(foregroundSurface.style, {
+        background: 'white',
+        height: '120px',
+        left: '12px',
+        position: 'fixed',
+        top: '12px',
+        width: '240px',
+        zIndex: '100',
+      });
+      const backgroundTarget = document.createElement('button');
+      backgroundTarget.className = 'background-behind-surface';
+      backgroundTarget.textContent = 'Background target';
+      backgroundTarget.style.marginTop = '3000px';
+      document.body.append(foregroundSurface, backgroundTarget);
+    });
+    const scrollBeforeCoveredBackgroundAction = await page.evaluate(() => window.scrollY);
+    const coveredBackgroundAction = await run(`
+      await page.domSnapshot();
+      await page.locator('.background-behind-surface').click();
+    `);
+    assert.equal(coveredBackgroundAction.ok, false);
+    assert.match(coveredBackgroundAction.error || '', /(active foreground surface|viewport-blocking layer)/i);
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBeforeCoveredBackgroundAction);
+    await page.locator('.foreground-surface, .background-behind-surface')
+      .evaluateAll((elements) => elements.forEach((element) => element.remove()));
+
     const allInvalid = await run(`
       await page.domSnapshot();
       await page.locator('.all-invalid-action').click();
@@ -491,6 +522,7 @@ test('browserCode auto-filters hidden candidates and permits explicit positional
       '#hidden-parent, .auto-filter-locator, .auto-filter-page, .auto-filter-page-fill, '
       + '.auto-filter-actionability, .auto-filter-opacity, .all-invalid-action, .duplicate-action, '
       + '.pointer-events-parent, .own-pointer-events-action, .hit-test-container, .hit-test-action, .trial-filter-action, '
+      + '.foreground-surface, .background-behind-surface, '
       + '.qz-modal-title',
     ).evaluateAll((elements) => elements.forEach((element) => element.remove()));
     await page.locator('body').evaluate((body) => {
@@ -683,6 +715,30 @@ test('browserCode allows a unique rendered overlay target to use Playwright forc
     assert.equal(forced.value, 'true');
   } finally {
     await page.locator('#blocking-overlay').evaluate((element) => element.remove()).catch(() => undefined);
+  }
+});
+
+test('browserCode does not scroll the background when a viewport overlay blocks an offscreen target', async () => {
+  await page.setContent(`
+    <style>
+      body { margin: 0; min-height: 3200px; }
+      #blocked-offscreen-action { margin-top: 2600px; }
+      #viewport-blocking-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, 0.05); }
+    </style>
+    <button id="blocked-offscreen-action">Blocked offscreen action</button>
+    <div id="viewport-blocking-backdrop"></div>
+  `);
+  try {
+    await page.evaluate(() => window.scrollTo(0, 240));
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    const blocked = await run(`
+      await page.locator('#blocked-offscreen-action').click();
+    `);
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error || '', /viewport-blocking layer/i);
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
   }
 });
 

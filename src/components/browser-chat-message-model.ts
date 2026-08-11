@@ -4,6 +4,7 @@ export type BrowserChatLogRecordLike = {
 };
 
 export type BrowserChatMessageLike = {
+  activity?: { phase?: string };
   content?: string;
   createdAt?: string;
   id: string;
@@ -26,6 +27,12 @@ export type BrowserChatAiOutputCycleLike = {
     tools?: unknown[];
   };
 };
+
+export function browserChatMessageIsTextStreaming(message: BrowserChatMessageLike) {
+  return message.role === 'assistant'
+    && message.status === 'running'
+    && message.activity?.phase === 'ai:text:streaming';
+}
 
 export type BrowserChatAiCycleRenderEntry<TCycle extends BrowserChatAiOutputCycleLike> =
   | { cycle: TCycle; kind: 'cycle' }

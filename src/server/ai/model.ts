@@ -1,29 +1,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { createAlibaba } from '@ai-sdk/alibaba';
-import { createAmazonBedrock } from '@ai-sdk/amazon-bedrock';
-import { createAnthropic } from '@ai-sdk/anthropic';
-import { createAzure } from '@ai-sdk/azure';
-import { createCerebras } from '@ai-sdk/cerebras';
-import { createCohere } from '@ai-sdk/cohere';
-import { createDeepInfra } from '@ai-sdk/deepinfra';
-import { createDeepSeek } from '@ai-sdk/deepseek';
-import { createFireworks } from '@ai-sdk/fireworks';
-import { createGateway } from '@ai-sdk/gateway';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
-import { createGroq } from '@ai-sdk/groq';
-import { createHuggingFace } from '@ai-sdk/huggingface';
-import { createMistral } from '@ai-sdk/mistral';
-import { createOpenAI } from '@ai-sdk/openai';
-import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
-import { createPerplexity } from '@ai-sdk/perplexity';
-import { createTogetherAI } from '@ai-sdk/togetherai';
-import { createVercel } from '@ai-sdk/vercel';
-import { createXai } from '@ai-sdk/xai';
-import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
-import { createCodexAppServer, createCodexCli, type ReasoningEffort } from 'ai-sdk-provider-codex-cli';
+import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
+
+ensureAiSdkTelemetryRegistered();
 
 type GenerateTextModel = Parameters<typeof generateText>[0]['model'];
+type LoadedLanguageModel = LanguageModelV4;
+type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 type AiProvider =
   | 'ai-gateway'
   | 'alibaba'
@@ -58,106 +42,167 @@ export type ModelSettingsOverride = {
 
 const modelSettingsStorage = new AsyncLocalStorage<ModelSettingsOverride>();
 
+function optionalEnvironmentValue(name: string) {
+  const value = String(process.env[name] || '').trim();
+  if (value) return value;
+  // AI SDK 7 provider entrypoints validate their own base URL environment
+  // variable while the package is imported. An empty persisted setting means
+  // "use the provider default", so it must be absent rather than an empty
+  // string before the lazy import runs.
+  delete process.env[name];
+  return undefined;
+}
+
+function lazyLanguageModel(
+  provider: string,
+  modelId: string,
+  loader: () => Promise<LoadedLanguageModel>,
+): GenerateTextModel {
+  let resolvedModel: Promise<LoadedLanguageModel> | undefined;
+  const loadModel = () => (resolvedModel ??= loader());
+  return {
+    specificationVersion: 'v4',
+    provider,
+    modelId,
+    supportedUrls: {},
+    doGenerate: async (options) => (await loadModel()).doGenerate(options),
+    doStream: async (options) => (await loadModel()).doStream(options),
+  } satisfies GenerateTextModel;
+}
+
+function openAiCompatibleModel(
+  provider: 'llama-cpp' | 'lmstudio' | 'ollama',
+  modelId: string,
+  baseUrlEnvironmentName: string,
+  defaultBaseURL: string,
+  apiKeyEnvironmentName: string,
+) {
+  return lazyLanguageModel(provider, modelId, async () => {
+    const baseURL = optionalEnvironmentValue(baseUrlEnvironmentName) || defaultBaseURL;
+    const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
+    return createOpenAICompatible({
+      name: provider,
+      baseURL,
+      apiKey: optionalEnvironmentValue(apiKeyEnvironmentName),
+    })(modelId) as unknown as LoadedLanguageModel;
+  });
+}
+
 export function withModelSettings<T>(settings: ModelSettingsOverride, callback: () => T): T {
   return modelSettingsStorage.run(settings, callback);
 }
 
 export function getModel(): GenerateTextModel {
   const { provider, model } = getModelSettings();
-  if (provider === 'ai-gateway') return createGateway({
-    apiKey: process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_AI_GATEWAY_API_KEY || '',
-    baseURL: process.env.AI_GATEWAY_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'alibaba') return createAlibaba({
-    apiKey: process.env.ALIBABA_API_KEY || '',
-    baseURL: process.env.ALIBABA_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'anthropic') return createAnthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY || '',
-    baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'bedrock') return createAmazonBedrock({
-    apiKey: process.env.AWS_BEARER_TOKEN_BEDROCK || undefined,
-    region: process.env.AWS_REGION || 'us-east-1',
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'cerebras') return createCerebras({
-    apiKey: process.env.CEREBRAS_API_KEY || '',
-    baseURL: process.env.CEREBRAS_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'cohere') return createCohere({
-    apiKey: process.env.COHERE_API_KEY || '',
-    baseURL: process.env.COHERE_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
+  if (provider === 'ai-gateway') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('AI_GATEWAY_BASE_URL');
+    const { createGateway } = await import('@ai-sdk/gateway');
+    return createGateway({
+      apiKey: process.env.AI_GATEWAY_API_KEY || process.env.VERCEL_AI_GATEWAY_API_KEY || '',
+      baseURL,
+    })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'alibaba') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('ALIBABA_BASE_URL');
+    const { createAlibaba } = await import('@ai-sdk/alibaba');
+    return createAlibaba({ apiKey: process.env.ALIBABA_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'anthropic') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('ANTHROPIC_BASE_URL');
+    const { createAnthropic } = await import('@ai-sdk/anthropic');
+    return createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'bedrock') return lazyLanguageModel(provider, model, async () => {
+    const { createAmazonBedrock } = await import('@ai-sdk/amazon-bedrock');
+    return createAmazonBedrock({
+      apiKey: process.env.AWS_BEARER_TOKEN_BEDROCK || undefined,
+      region: process.env.AWS_REGION || 'us-east-1',
+    })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'cerebras') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('CEREBRAS_BASE_URL');
+    const { createCerebras } = await import('@ai-sdk/cerebras');
+    return createCerebras({ apiKey: process.env.CEREBRAS_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'cohere') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('COHERE_BASE_URL');
+    const { createCohere } = await import('@ai-sdk/cohere');
+    return createCohere({ apiKey: process.env.COHERE_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
   if (provider === 'codex') return getCodexModel(model);
-  if (provider === 'deepseek') return createDeepSeek({
-    apiKey: process.env.DEEPSEEK_API_KEY || '',
-    baseURL: process.env.DEEPSEEK_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'deepinfra') return createDeepInfra({
-    apiKey: process.env.DEEPINFRA_API_KEY || '',
-    baseURL: process.env.DEEPINFRA_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'fireworks') return createFireworks({
-    apiKey: process.env.FIREWORKS_API_KEY || '',
-    baseURL: process.env.FIREWORKS_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'google') return createGoogleGenerativeAI({
-    apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY || '',
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'groq') return createGroq({
-    apiKey: process.env.GROQ_API_KEY || '',
-    baseURL: process.env.GROQ_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'huggingface') return createHuggingFace({
-    apiKey: process.env.HUGGINGFACE_API_KEY || '',
-    baseURL: process.env.HUGGINGFACE_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'lmstudio') return createOpenAICompatible({
-    name: 'lmstudio',
-    baseURL: process.env.LMSTUDIO_BASE_URL || 'http://localhost:1234/v1',
-    apiKey: process.env.LMSTUDIO_API_KEY || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'llama-cpp') return createOpenAICompatible({
-    name: 'llama-cpp',
-    baseURL: process.env.LLAMA_CPP_BASE_URL || 'http://localhost:8080/v1',
-    apiKey: process.env.LLAMA_CPP_API_KEY || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'ollama') return createOpenAICompatible({
-    name: 'ollama',
-    baseURL: process.env.OLLAMA_BASE_URL || 'http://localhost:11434/v1',
-    apiKey: process.env.OLLAMA_API_KEY || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'openai') return createOpenAI({
-    apiKey: process.env.OPENAI_API_KEY || '',
-    baseURL: process.env.OPENAI_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'azure-openai') return createAzure({
-    baseURL: process.env.AZURE_OPENAI_BASE_URL || 'http://mirrors.shterm.com:4000',
-    apiKey: process.env.AZURE_OPENAI_API_KEY || '-',
-  }).chat(model) as unknown as GenerateTextModel;
-  if (provider === 'mistral') return createMistral({
-    apiKey: process.env.MISTRAL_API_KEY || '',
-    baseURL: process.env.MISTRAL_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'perplexity') return createPerplexity({
-    apiKey: process.env.PERPLEXITY_API_KEY || '',
-    baseURL: process.env.PERPLEXITY_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'togetherai') return createTogetherAI({
-    apiKey: process.env.TOGETHERAI_API_KEY || '',
-    baseURL: process.env.TOGETHERAI_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'vercel') return createVercel({
-    apiKey: process.env.VERCEL_API_KEY || '',
-    baseURL: process.env.VERCEL_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  if (provider === 'xai') return createXai({
-    apiKey: process.env.XAI_API_KEY || '',
-    baseURL: process.env.XAI_BASE_URL || undefined,
-  })(model) as unknown as GenerateTextModel;
-  return createOpenRouter({
-    apiKey: process.env.OPENROUTER_API_KEY || '',
-  }).chat(model) as unknown as GenerateTextModel;
+  if (provider === 'deepseek') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('DEEPSEEK_BASE_URL');
+    const { createDeepSeek } = await import('@ai-sdk/deepseek');
+    return createDeepSeek({ apiKey: process.env.DEEPSEEK_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'deepinfra') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('DEEPINFRA_BASE_URL');
+    const { createDeepInfra } = await import('@ai-sdk/deepinfra');
+    return createDeepInfra({ apiKey: process.env.DEEPINFRA_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'fireworks') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('FIREWORKS_BASE_URL');
+    const { createFireworks } = await import('@ai-sdk/fireworks');
+    return createFireworks({ apiKey: process.env.FIREWORKS_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'google') return lazyLanguageModel(provider, model, async () => {
+    const { createGoogleGenerativeAI } = await import('@ai-sdk/google');
+    return createGoogleGenerativeAI({
+      apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY || process.env.GOOGLE_API_KEY || '',
+    })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'groq') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('GROQ_BASE_URL');
+    const { createGroq } = await import('@ai-sdk/groq');
+    return createGroq({ apiKey: process.env.GROQ_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'huggingface') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('HUGGINGFACE_BASE_URL');
+    const { createHuggingFace } = await import('@ai-sdk/huggingface');
+    return createHuggingFace({ apiKey: process.env.HUGGINGFACE_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'lmstudio') return openAiCompatibleModel(provider, model, 'LMSTUDIO_BASE_URL', 'http://localhost:1234/v1', 'LMSTUDIO_API_KEY');
+  if (provider === 'llama-cpp') return openAiCompatibleModel(provider, model, 'LLAMA_CPP_BASE_URL', 'http://localhost:8080/v1', 'LLAMA_CPP_API_KEY');
+  if (provider === 'ollama') return openAiCompatibleModel(provider, model, 'OLLAMA_BASE_URL', 'http://localhost:11434/v1', 'OLLAMA_API_KEY');
+  if (provider === 'openai') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('OPENAI_BASE_URL');
+    const { createOpenAI } = await import('@ai-sdk/openai');
+    return createOpenAI({ apiKey: process.env.OPENAI_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'azure-openai') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('AZURE_OPENAI_BASE_URL') || 'http://mirrors.shterm.com:4000';
+    const { createAzure } = await import('@ai-sdk/azure');
+    return createAzure({ baseURL, apiKey: process.env.AZURE_OPENAI_API_KEY || '-' }).chat(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'mistral') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('MISTRAL_BASE_URL');
+    const { createMistral } = await import('@ai-sdk/mistral');
+    return createMistral({ apiKey: process.env.MISTRAL_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'perplexity') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('PERPLEXITY_BASE_URL');
+    const { createPerplexity } = await import('@ai-sdk/perplexity');
+    return createPerplexity({ apiKey: process.env.PERPLEXITY_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'togetherai') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('TOGETHERAI_BASE_URL');
+    const { createTogetherAI } = await import('@ai-sdk/togetherai');
+    return createTogetherAI({ apiKey: process.env.TOGETHERAI_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'vercel') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('VERCEL_BASE_URL');
+    const { createVercel } = await import('@ai-sdk/vercel');
+    return createVercel({ apiKey: process.env.VERCEL_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  if (provider === 'xai') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('XAI_BASE_URL');
+    const { createXai } = await import('@ai-sdk/xai');
+    return createXai({ apiKey: process.env.XAI_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
+  return lazyLanguageModel('openrouter', model, async () => {
+    const { createOpenRouter } = await import('@openrouter/ai-sdk-provider');
+    return createOpenRouter({ apiKey: process.env.OPENROUTER_API_KEY || '' }).chat(model) as unknown as LoadedLanguageModel;
+  });
 }
 
 export function getModelSettings() {
@@ -200,36 +245,36 @@ function getCodexModel(model: string): GenerateTextModel {
   const cwd = process.env.CODEX_CWD || process.cwd();
   const approvalMode = parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure';
   const sandboxMode = parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write';
-  const effort = parseReasoningEffort(process.env.CODEX_REASONING_EFFORT) || 'medium';
+  const effort = parseReasoningEffort(process.env.AI_REASONING_EFFORT) || 'medium';
   const verbose = process.env.CODEX_VERBOSE === 'true';
 
-  if (process.env.CODEX_TRANSPORT === 'exec' || process.env.CODEX_PROVIDER_MODE === 'exec') {
-    return createCodexCli({
-      defaultSettings: {
-        codexPath,
-        cwd,
-        approvalMode,
-        sandboxMode,
-        reasoningEffort: effort,
-        verbose,
-        skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
-        allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
-      },
-    })(model) as unknown as GenerateTextModel;
-  }
-
-  return createCodexAppServer({
-    defaultSettings: {
-      codexPath,
-      cwd,
-      approvalPolicy: approvalMode,
-      sandboxPolicy: sandboxMode,
-      effort,
-      verbose,
-      minCodexVersion: '0.130.0',
-      threadMode: 'stateless',
-    },
-  })(model) as unknown as GenerateTextModel;
+  return lazyLanguageModel('codex', model, () => import('ai-sdk-provider-codex-cli').then((provider) => (
+    process.env.CODEX_TRANSPORT === 'exec' || process.env.CODEX_PROVIDER_MODE === 'exec'
+      ? provider.createCodexCli({
+          defaultSettings: {
+            codexPath,
+            cwd,
+            approvalMode,
+            sandboxMode,
+            reasoningEffort: effort,
+            verbose,
+            skipGitRepoCheck: process.env.CODEX_SKIP_GIT_REPO_CHECK !== 'false',
+            allowNpx: process.env.CODEX_ALLOW_NPX === 'true',
+          },
+        })(model) as unknown as LoadedLanguageModel
+      : provider.createCodexAppServer({
+          defaultSettings: {
+            codexPath,
+            cwd,
+            approvalPolicy: approvalMode,
+            sandboxPolicy: sandboxMode,
+            effort,
+            verbose,
+            minCodexVersion: '0.130.0',
+            threadMode: 'stateless',
+          },
+        })(model) as unknown as LoadedLanguageModel
+  )));
 }
 
 function normalizeProvider(value: string | undefined): AiProvider {

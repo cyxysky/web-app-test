@@ -428,6 +428,7 @@ export function readBrowserChatSessionRecord<T extends { logs?: unknown[]; messa
 export function readBrowserChatSessionSummaries<T>(input: {
   beforeId?: string;
   beforeUpdatedAt?: string;
+  hasMessagesOnly?: boolean;
   limit?: number;
   userId?: string;
 } = {}) {
@@ -436,6 +437,12 @@ export function readBrowserChatSessionSummaries<T>(input: {
   if (input.userId) {
     clauses.push('user_id = ?');
     values.push(input.userId);
+  }
+  if (input.hasMessagesOnly) {
+    clauses.push(`EXISTS (
+      SELECT 1 FROM browser_chat_message
+      WHERE browser_chat_message.session_id = browser_chat_session.id
+    )`);
   }
   if (input.beforeUpdatedAt && input.beforeId) {
     clauses.push('(updated_at < ? OR (updated_at = ? AND id < ?))');

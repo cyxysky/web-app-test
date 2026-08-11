@@ -112,6 +112,7 @@ export function boundedQueryInteger(
   value: string | null,
   input: { fallback: number; max: number; min?: number },
 ) {
+  if (value === null || !value.trim()) return input.fallback;
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return input.fallback;
   return Math.max(input.min ?? 1, Math.min(input.max, Math.floor(numeric)));

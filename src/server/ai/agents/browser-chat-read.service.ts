@@ -36,8 +36,9 @@ export function listBrowserChatSessionSummaries(
 ) {
   return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
     ...input,
+    hasMessagesOnly: true,
     userId: normalizeApplicationUserId(userId),
-  }).filter((session) => session?.id && session.messages?.length && belongsToUser(session, userId));
+  }).filter((session) => session?.id && belongsToUser(session, userId));
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {

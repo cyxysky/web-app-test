@@ -1,19 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { generateText, hasToolCall, streamText, tool, type ModelMessage } from 'ai';
+import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
+import { aiReasoningEffort, aiRequestTimeoutMs, aiStreamTimeouts, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { structuredLog } from '@/server/observability/runtime-observability';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import {
   BrowserSession,
   type BrowserActionResult,
+  type BrowserElementTarget,
   type BrowserSessionMode,
 } from '@/server/browser/browser-session';
-import { analyzeBrowserCodeRisk, browserCodeHasCommittingAction, type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import { type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { browserElementTargetSchema, browserInteractTextEditingDescription, browserInteractToolDescription, browserInteractToolShape, browserTextSelectionSchema, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
-import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
-import { racePromiseWithAbort } from './browser-chat-interrupt-state';
+import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
@@ -42,6 +44,7 @@ import {
 } from './runtime-retry-policy';
 
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
+import { browserToolApprovalRequest } from './browser-tool-approval';
 import { compactOlderBrowserToolResults } from './browser-code-tool-history';
 import {
   estimateRuntimeTextTokens,
@@ -159,6 +162,13 @@ type BrowserChatOperationalContext = {
   credentialBindings?: BrowserCodeCredentialBinding[];
 };
 
+type BrowserAgentRuntimeContext = {
+  operationalContext: string;
+  credentialRefs: string[];
+  workingMemory: RuntimeWorkingMemory;
+  visualContext: ReturnType<VisualContextManager['snapshot']>;
+};
+
 const codexRuntimeObjectSchema = z.object({
   type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
   message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool.'),
@@ -184,8 +194,6 @@ const codexRuntimeObjectSchema = z.object({
     ids: z.array(z.string()).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
-    requiresConfirmation: z.boolean().nullable().optional(),
-    confirmationMessage: z.string().nullable().optional(),
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
     target: z.union([z.enum(['current', 'new']), browserElementTargetSchema]).nullable().optional(),
@@ -440,9 +448,7 @@ function splitToolInputAndReason(input: unknown) {
   if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
     return { input: safeInput, reason: undefined };
   }
-  const { reason, requiresConfirmation, confirmationMessage, ...rest } = safeInput as Record<string, unknown>;
-  void requiresConfirmation;
-  void confirmationMessage;
+  const { reason, ...rest } = safeInput as Record<string, unknown>;
   const compactInput = Object.keys(rest).length ? rest : undefined;
   return {
     input: compactInput,
@@ -450,37 +456,34 @@ function splitToolInputAndReason(input: unknown) {
   };
 }
 
-function toolConfirmationFromInput(toolName: string, input: unknown) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
-  const record = input as Record<string, unknown>;
-  if (toolName === 'interact' && record.action === 'type') return undefined;
-  if (record.requiresConfirmation !== true) return undefined;
-  const reason = typeof record.reason === 'string' ? trimDebugText(record.reason.trim(), 300) : undefined;
-  const explicit = typeof record.confirmationMessage === 'string' ? record.confirmationMessage.trim() : '';
-  const prompt = trimDebugText(
-    explicit || `请确认是否执行工具 ${toolName}${reason ? `：${reason}` : ''}`,
-    300,
-  );
-  return { prompt, reason };
-}
-
-function browserCodeInputWithRisk<T extends Record<string, unknown>>(input: T, strictSafety: boolean) {
-  if (!strictSafety || typeof input.code !== 'string') return input;
-  const risk = analyzeBrowserCodeRisk(input.code);
-  const explicitCommittingConfirmation = input.requiresConfirmation === true
-    && browserCodeHasCommittingAction(input.code);
-  if (!risk.requiresConfirmation && !explicitCommittingConfirmation) {
-    const safeInput = { ...input };
-    delete safeInput.requiresConfirmation;
-    delete safeInput.confirmationMessage;
-    return safeInput;
-  }
-  if (input.requiresConfirmation === true) return input;
-  return {
-    ...input,
-    requiresConfirmation: true,
-    confirmationMessage: `即将执行可能产生重要影响的浏览器代码：${risk.reasons.join('；')}`,
-  };
+async function requestBrowserToolApproval(input: {
+  session: BrowserSession;
+  toolName: string;
+  toolInput: unknown;
+  stepIndex?: number;
+  request?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
+}) {
+  if (!input.request) return 'not-applicable' as const;
+  const record = input.toolInput && typeof input.toolInput === 'object' && !Array.isArray(input.toolInput)
+    ? input.toolInput as Record<string, unknown>
+    : {};
+  const target = record.target && typeof record.target === 'object' && !Array.isArray(record.target)
+    ? record.target as BrowserElementTarget
+    : undefined;
+  const approval = browserToolApprovalRequest({
+    toolName: input.toolName,
+    toolInput: input.toolInput,
+    targetDescription: input.session.describeElementTarget(target),
+  });
+  if (!approval) return 'not-applicable' as const;
+  const decision = await input.request({
+    toolName: input.toolName,
+    input: input.toolInput,
+    reason: approval.reason,
+    prompt: approval.prompt,
+    stepIndex: input.stepIndex,
+  });
+  return decision === 'confirmed' ? 'approved' as const : 'denied' as const;
 }
 
 function parseJsonObjectText(text?: string) {
@@ -573,65 +576,6 @@ function throwIfAborted(signal?: AbortSignal) {
 function throwIfStopped(signal?: AbortSignal, shouldContinue?: () => boolean) {
   throwIfAborted(signal);
   if (shouldContinue && !shouldContinue()) throw browserChatAbortError(signal);
-}
-
-// 为每次 AI 请求加超时保护，避免模型长时间无响应导致整次执行卡死。
-function generateTextTimeoutMs(options: Parameters<typeof generateText>[0]) {
-  void options;
-  const raw = Number(process.env.AI_REQUEST_TIMEOUT_MS || 30000);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 30000;
-}
-
-async function generateTextWithTimeout(options: Parameters<typeof generateText>[0], timeoutOverrideMs?: number) {
-  throwIfAborted(options.abortSignal);
-  // A native Agent Loop includes tool execution time. In particular,
-  // spawnSubagents must remain awaited until every child finishes, so an
-  // elapsed wall-clock timeout must never start a second main-Agent attempt.
-  if (typeof (options as { prepareStep?: unknown }).prepareStep === 'function') {
-    const upstream = options.abortSignal;
-    return racePromiseWithAbort(generateText(options), upstream);
-  }
-  const timeoutMs = Number.isFinite(timeoutOverrideMs) && Number(timeoutOverrideMs) > 0
-    ? Math.floor(Number(timeoutOverrideMs))
-    : generateTextTimeoutMs(options);
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error(`AI request timed out after ${timeoutMs}ms`)), timeoutMs);
-  const upstream = options.abortSignal;
-  const abortSignal = upstream ? AbortSignal.any([upstream, timeoutController.signal]) : timeoutController.signal;
-  let stopAbortWatch = () => {};
-  const abortPromise = new Promise<never>((_resolve, reject) => {
-    const onAbort = () => {
-      if (upstream?.aborted) {
-        reject(browserChatAbortError(upstream));
-        return;
-      }
-      if (timeoutController.signal.aborted) {
-        reject(timeoutController.signal.reason || new Error(`AI request timed out after ${timeoutMs}ms`));
-        return;
-      }
-      reject(browserChatAbortError(upstream));
-    };
-    abortSignal.addEventListener('abort', onAbort, { once: true });
-    stopAbortWatch = () => abortSignal.removeEventListener('abort', onAbort);
-    if (abortSignal.aborted) onAbort();
-  });
-  try {
-    return await Promise.race([
-      generateText({ ...options, abortSignal }),
-      abortPromise,
-    ]);
-  } catch (error) {
-    if (isBrowserChatAbortError(error, upstream)) throw browserChatAbortError(upstream);
-    if (timeoutController.signal.aborted && !upstream?.aborted) {
-      const timeoutError = new Error(`AI request timed out after ${timeoutMs}ms`);
-      (timeoutError as { cause?: unknown }).cause = error;
-      throw timeoutError;
-    }
-    throw error;
-  } finally {
-    stopAbortWatch();
-    clearTimeout(timer);
-  }
 }
 
 // 从模型回复中提取 JSON，兼容模型把 JSON 包在 markdown 代码块里的情况。
@@ -1114,8 +1058,6 @@ function makeBrowserTools(
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
     reason: toolReasonInput,
-    requiresConfirmation: z.boolean().optional().describe('Browser chat strict safety mode only: set true when this important tool call must pause for user confirm/cancel before execution. Do not use this in full safety mode.'),
-    confirmationMessage: z.string().min(1).max(300).optional().describe('Browser chat strict safety mode only: concise Chinese text shown next to the tool confirm/cancel buttons.'),
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
   async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>) {
@@ -1129,37 +1071,8 @@ function makeBrowserTools(
       } satisfies BrowserActionResult;
     }
     toolExecutionGate.executed = true;
-    const pendingConfirmation = referenceOptions?.requestToolConfirmation ? toolConfirmationFromInput(name, input) : undefined;
-    let browserActionExecuted = false;
-    const actionWithConfirmation = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
-      if (pendingConfirmation && referenceOptions?.requestToolConfirmation) {
-        const decision = await referenceOptions.requestToolConfirmation({
-          toolName: name,
-          input,
-          reason: pendingConfirmation.reason,
-          prompt: pendingConfirmation.prompt,
-          stepIndex: referenceOptions.stepIndex,
-        });
-        throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
-        if (decision !== 'confirmed') {
-          return {
-            ok: true,
-            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
-          } satisfies BrowserActionResult;
-        }
-        if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
-        browserActionExecuted = true;
-        const result = await action(actionSignal, trace);
-        // This becomes the native tool-result message for the next model step
-        // and is also retained by working-memory/continuation compression.
-        // A confirmation log alone is UI state and is not model context.
-        return {
-          ...result,
-          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
-        } satisfies BrowserActionResult;
-      }
+    const actionAfterBrowserStart = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
       if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
-      browserActionExecuted = true;
       return action(actionSignal, trace);
     };
     const traceVisualContext = referenceOptions?.visualContext;
@@ -1175,14 +1088,13 @@ function makeBrowserTools(
       aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
       onToolTrace,
       onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
-      action: actionWithConfirmation,
-    }).then(async (result) => {
-      void browserActionExecuted;
-    const imagePaths = result.referenceImagePaths?.length
-      ? result.referenceImagePaths
-      : result.referenceImagePath ? [result.referenceImagePath] : [];
-    for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path });
-    return compactToolResultForModel(name, result);
+      action: actionAfterBrowserStart,
+    }).then((result) => {
+      const imagePaths = result.referenceImagePaths?.length
+        ? result.referenceImagePaths
+        : result.referenceImagePath ? [result.referenceImagePath] : [];
+      for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path });
+      return compactToolResultForModel(name, result);
     });
   }
 
@@ -1198,13 +1110,12 @@ function makeBrowserTools(
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
       }),
       execute: (input) => {
-        const normalizedInput = browserCodeInputWithRisk(input, Boolean(referenceOptions?.requestToolConfirmation));
-        return record('browserCode', normalizedInput, (abortSignal) => {
-          const violation = browserCodeServiceFileDeliveryViolation(normalizedInput.code);
+        return record('browserCode', input, (abortSignal) => {
+          const violation = browserCodeServiceFileDeliveryViolation(input.code);
           if (violation) return Promise.resolve({ ok: false, actual: violation });
           return session.executeBrowserCode({
-            code: normalizedInput.code,
-            maxOutputChars: normalizedInput.maxOutputChars,
+            code: input.code,
+            maxOutputChars: input.maxOutputChars,
             credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
             runId: referenceOptions?.runId || 'browser-code',
             stepIndex: referenceOptions?.stepIndex || 0,
@@ -1419,7 +1330,7 @@ function makeBrowserTools(
   return Object.fromEntries(Object.entries(tools).filter(([name]) => allowed.has(name))) as typeof tools;
 }
 
-type RuntimeToolDefinitions = ReturnType<typeof makeBrowserTools>;
+type RuntimeToolDefinitions = ToolSet;
 
 function toolInputJsonSchema(inputSchema: unknown) {
   if (!inputSchema) return undefined;
@@ -1893,7 +1804,8 @@ async function executeRuntimeStep(input: {
   readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
-  agentLoopTimeoutMs?: number;
+  memoryTools?: ToolSet;
+  useToolLoopAgent?: boolean;
 }) {
   const {
     session,
@@ -1989,7 +1901,9 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [...durableTraces];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
-    const availableRuntimeToolNames = runtimeToolNames(mode).filter((name) => (
+    const externalTools = codexMode ? {} : (input.memoryTools || {});
+    const externalToolNames = new Set(Object.keys(externalTools));
+    const availableRuntimeToolNames = [...runtimeToolNames(mode), ...externalToolNames].filter((name) => (
       (name !== 'takeScreenshot' || screenshotToolEnabled)
       && (name !== 'spawnSubagents' || Boolean(input.runSubagents))
       && (name !== 'readSubagent' || Boolean(input.readSubagent))
@@ -2041,7 +1955,7 @@ async function executeRuntimeStep(input: {
       })
       .filter((message): message is { role: 'user' | 'assistant'; content: string } => Boolean(message)) as RuntimeModelMessage[];
     const initialImagePaths = [...initialVisualPaths, ...initialUserReferenceImagePaths];
-    const initialImages: Buffer[] = [];
+    const initialImages: Awaited<ReturnType<typeof readScreenshotForAi>>[] = [];
     for (const imagePath of initialImagePaths) {
       const image = await readScreenshotForAi(imagePath).catch(() => undefined);
       if (image) initialImages.push(image);
@@ -2071,7 +1985,7 @@ async function executeRuntimeStep(input: {
           role: 'user' as const,
           content: [
             { type: 'text' as const, text },
-            ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ...initialImages.map((image) => ({ type: 'file' as const, data: image.data, mediaType: image.mediaType })),
           ],
         };
       } else {
@@ -2079,7 +1993,7 @@ async function executeRuntimeStep(input: {
           role: 'user' as const,
           content: [
             { type: 'text' as const, text: fallbackText },
-            ...initialImages.map((image) => ({ type: 'image' as const, image })),
+            ...initialImages.map((image) => ({ type: 'file' as const, data: image.data, mediaType: image.mediaType })),
           ],
         });
       }
@@ -2155,7 +2069,7 @@ async function executeRuntimeStep(input: {
         runtimeState: continuationRuntimeState(workingMemory),
       });
       try {
-        const result = await generateTextWithTimeout({
+        const result = await generateText({
           model: getModel(),
           messages: [{
             role: 'user' as const,
@@ -2172,8 +2086,11 @@ async function executeRuntimeStep(input: {
             }),
           }],
           temperature: 0.1,
+          reasoning: aiReasoningEffort(),
           maxRetries: 0,
           abortSignal,
+          timeout: aiRequestTimeoutMs(),
+          telemetry: aiTelemetry('browser-chat-continuation-summary'),
         });
         ensureActive();
         const text = sanitizeRuntimeContinuationSummary(result.text || '');
@@ -2212,11 +2129,11 @@ async function executeRuntimeStep(input: {
       while (pendingObservationMessages.length) {
         const observation = pendingObservationMessages.shift();
         if (!observation) break;
-        const content: Array<{ type: 'text'; text: string } | { type: 'image'; image: Buffer }> = [{ type: 'text', text: observation.text }];
+        const content: Array<{ type: 'text'; text: string } | { type: 'file'; data: Buffer; mediaType: string }> = [{ type: 'text', text: observation.text }];
         for (const imagePath of observation.imagePaths) {
           const image = await readScreenshotForAi(imagePath).catch(() => undefined);
           if (image) {
-            content.push({ type: 'image', image });
+            content.push({ type: 'file', data: image.data, mediaType: image.mediaType });
             appendedImagePaths.push(imagePath);
           }
         }
@@ -2323,7 +2240,17 @@ async function executeRuntimeStep(input: {
           codexObjectMode: true,
         }, modelMessagesForLog),
       });
-      const result = await generateTextWithTimeout({ model: getModel(), system, messages, temperature: 0.1, maxRetries: 0, abortSignal });
+      const result = await generateText({
+        model: getModel(),
+        instructions: system,
+        messages,
+        temperature: 0.1,
+        reasoning: aiReasoningEffort(),
+        maxRetries: 0,
+        abortSignal,
+        timeout: aiRequestTimeoutMs(),
+        telemetry: aiTelemetry('browser-chat-codex-runtime'),
+      });
       const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
       const object = alignCodexRuntimeObjectTool(
@@ -2403,8 +2330,7 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    const stopWhen = [hasToolCall('reportState'), hasToolCall('waitForHumanVerification')];
-    nativeToolsRef.current = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
+    const browserTools = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
       upsertToolTrace(durableTraces, trace);
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
@@ -2445,87 +2371,205 @@ async function executeRuntimeStep(input: {
         await onAttemptDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
       },
     });
+    const allowedToolNameSet = new Set(allowedToolTypes);
+    const allowedExternalTools = Object.fromEntries(
+      Object.entries(externalTools).filter(([name]) => allowedToolNameSet.has(name)),
+    );
+    nativeToolsRef.current = {
+      ...browserTools,
+      ...allowedExternalTools,
+    };
     const toolsForRequest = nativeToolsRef.current;
+    const stopWhen = [
+      hasToolCall<typeof toolsForRequest>('reportState'),
+      hasToolCall<typeof toolsForRequest>('waitForHumanVerification'),
+    ];
     try {
       let streamedStepNumber = 0;
       let streamedStepText = '';
-      const result = streamText({
-        model: getModel(),
-        messages: initialMessages,
-        tools: toolsForRequest,
-        stopWhen,
-        prepareStep: async ({ stepNumber, messages }) => {
-          ensureActive();
-          const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
-          ensureActive();
-          stepModelMessagesForLog.set(stepNumber, prepared.modelMessagesForLog);
-          toolExecutionGate.stepNumber = stepNumber;
-          toolExecutionGate.executed = false;
-          stepTraceStarts.set(stepNumber, traces.length);
-          stepStartedAt.set(stepNumber, Date.now());
-          streamedStepNumber = stepNumber;
-          streamedStepText = '';
-          await onAttemptDebug?.({
-            phase: 'ai:runtime:request',
-            stepIndex,
-            message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
-            details: aiRequestLogDetails(aiRequest, {
-              provider: getModelSettings().provider,
-              model: getModelSettings().model,
-              agentStepIndex: retryAgentStepOffset + stepNumber + 1,
+      const runtimeContext = {
+        operationalContext: activeOperationalContext,
+        credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
+        workingMemory,
+        visualContext: visualContext.snapshot(),
+      } satisfies BrowserAgentRuntimeContext;
+      const prepareAgentStep = async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
+        ensureActive();
+        const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
+        ensureActive();
+        stepModelMessagesForLog.set(stepNumber, prepared.modelMessagesForLog);
+        toolExecutionGate.stepNumber = stepNumber;
+        toolExecutionGate.executed = false;
+        stepTraceStarts.set(stepNumber, traces.length);
+        stepStartedAt.set(stepNumber, Date.now());
+        streamedStepNumber = stepNumber;
+        streamedStepText = '';
+        await onAttemptDebug?.({
+          phase: 'ai:runtime:request',
+          stepIndex,
+          message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
+          details: aiRequestLogDetails(aiRequest, {
+            provider: getModelSettings().provider,
+            model: getModelSettings().model,
+            agentStepIndex: retryAgentStepOffset + stepNumber + 1,
+            nativeToolLoop: true,
+            toolLoopAgent: input.useToolLoopAgent === true,
+          }, prepared.modelMessagesForLog),
+        });
+        return {
+          instructions: prepared.system,
+          messages: prepared.messages,
+          runtimeContext: {
+            operationalContext: activeOperationalContext,
+            credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
+            workingMemory,
+            visualContext: visualContext.snapshot(),
+          } satisfies BrowserAgentRuntimeContext,
+        };
+      };
+      const approveAgentTool = input.requestToolConfirmation ? async ({ toolCall }: { toolCall?: { toolName: string; input: unknown } }) => {
+        if (!toolCall) return 'not-applicable' as const;
+        const approval = await requestBrowserToolApproval({
+          session,
+          toolName: toolCall.toolName,
+          toolInput: toolCall.input,
+          stepIndex,
+          request: input.requestToolConfirmation!,
+        });
+        ensureActive();
+        if (approval === 'approved') return { type: 'approved' as const, reason: 'User confirmed the server-classified operation.' };
+        if (approval === 'denied') return { type: 'denied' as const, reason: 'User cancelled the server-classified operation.' };
+        return 'not-applicable' as const;
+      } : undefined;
+      const onAgentToolExecutionStart = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown } }) => {
+        if (!externalToolNames.has(event.toolCall.toolName)) return;
+        const trace: ToolTrace = {
+          id: event.toolCall.toolCallId,
+          name: event.toolCall.toolName,
+          input: event.toolCall.input,
+          startedAt: Date.now(),
+          contextBefore: toolContextFromAiRequest(aiRequest),
+        };
+        upsertToolTrace(traces, trace);
+        upsertToolTrace(durableTraces, trace);
+        await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+      };
+      const onAgentToolExecutionEnd = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown }; toolExecutionMs: number; toolOutput: unknown }) => {
+        if (!externalToolNames.has(event.toolCall.toolName)) return;
+        const output = event.toolOutput as { type?: string; output?: unknown; error?: unknown };
+        const resultValue = output.type === 'tool-result' ? output.output : output.error;
+        const actual = typeof resultValue === 'string'
+          ? resultValue
+          : JSON.stringify(jsonSafe(resultValue));
+        const trace: ToolTrace = {
+          id: event.toolCall.toolCallId,
+          name: event.toolCall.toolName,
+          input: event.toolCall.input,
+          result: {
+            ok: output.type === 'tool-result',
+            actual: actual || (output.type === 'tool-result' ? 'Memory tool completed.' : 'Memory tool failed.'),
+          },
+          startedAt: traces.find((item) => item.id === event.toolCall.toolCallId)?.startedAt,
+          completedAt: Date.now(),
+          elapsedMs: event.toolExecutionMs,
+          actionElapsedMs: event.toolExecutionMs,
+          contextBefore: toolContextFromAiRequest(aiRequest),
+          contextAfter: toolContextFromAiRequest(aiRequest),
+        };
+        upsertToolTrace(traces, trace);
+        upsertToolTrace(durableTraces, trace);
+        workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
+        await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+      };
+      const onAgentStepEnd = async (event: { text?: string; stepNumber?: number }) => {
+        ensureActive();
+        latestText = event.text || '';
+        const turnIndex = typeof event.stepNumber === 'number' ? event.stepNumber : toolExecutionGate.stepNumber;
+        const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
+        const newTraces = traces.slice(traceStart);
+        const startedAt = stepStartedAt.get(turnIndex) || Date.now();
+        await onAttemptDebug?.({
+          phase: 'ai:runtime:response',
+          stepIndex,
+          message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
+          details: aiResponseLogDetails({
+            aiRequest,
+            modelMessages: stepModelMessagesForLog.get(turnIndex),
+            response: event,
+            elapsedMs: elapsedSince(startedAt),
+            stepStartedAt: startedAt,
+            traces: newTraces,
+            visualContext: visualContext.snapshot(),
+            workingMemory,
+            extra: {
+              responseType: 'text',
+              text: latestText,
+              agentStepIndex: retryAgentStepOffset + turnIndex + 1,
               nativeToolLoop: true,
-            }, prepared.modelMessagesForLog),
-          });
-          return { system: prepared.system, messages: prepared.messages };
+              toolLoopAgent: input.useToolLoopAgent === true,
+            },
+          }),
+        });
+      };
+      const timeout = {
+        ...aiStreamTimeouts(),
+        tools: {
+          spawnSubagentsMs: boundedInteger(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS, 600_000, 1_000, 3_600_000),
         },
-        onChunk: async ({ chunk }) => {
-          if (chunk.type !== 'text-delta' || !chunk.text) return;
-          ensureActive();
-          streamedStepText += chunk.text;
-          latestText = streamedStepText;
-          await onTextStream?.({
-            delta: chunk.text,
-            stepNumber: streamedStepNumber,
-            text: streamedStepText,
-          });
-          ensureActive();
-        },
-        onStepFinish: async (event) => {
-          ensureActive();
-          latestText = event.text || '';
-          const eventStep = event as { stepNumber?: unknown };
-          const turnIndex = typeof eventStep.stepNumber === 'number' ? eventStep.stepNumber : toolExecutionGate.stepNumber;
-          const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
-          const newTraces = traces.slice(traceStart);
-          const startedAt = stepStartedAt.get(turnIndex) || Date.now();
-          await onAttemptDebug?.({
-            phase: 'ai:runtime:response',
-            stepIndex,
-            message: trimDebugText(latestText || 'AI returned no text; tool call completed.', 220) + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex) + '; AI+tool ' + elapsedSince(startedAt) + 'ms',
-            details: aiResponseLogDetails({
-              aiRequest,
-              modelMessages: stepModelMessagesForLog.get(turnIndex),
-              response: event,
-              elapsedMs: elapsedSince(startedAt),
-              stepStartedAt: startedAt,
-              traces: newTraces,
-              visualContext: visualContext.snapshot(),
-              workingMemory,
-              extra: {
-                responseType: 'text',
-                text: latestText,
-                agentStepIndex: retryAgentStepOffset + turnIndex + 1,
-                nativeToolLoop: true,
-              },
-            }),
-          });
-        },
+      };
+      const agentSettings = {
+        model: getModel(),
+        tools: toolsForRequest,
+        runtimeContext,
+        stopWhen,
+        prepareStep: prepareAgentStep,
+        toolApproval: approveAgentTool,
+        onToolExecutionStart: onAgentToolExecutionStart,
+        onToolExecutionEnd: onAgentToolExecutionEnd,
+        onStepEnd: onAgentStepEnd,
         temperature: 0.1,
+        reasoning: aiReasoningEffort(),
         maxRetries: 0,
-        abortSignal,
+        telemetry: aiTelemetry(input.useToolLoopAgent ? 'browser-chat-subagent-tool-loop-agent' : 'browser-chat-agent-loop'),
+      };
+      const result = input.useToolLoopAgent
+        ? await new ToolLoopAgent(agentSettings).stream({
+          messages: initialMessages,
+          abortSignal,
+          timeout,
+        })
+        : streamText({
+          ...agentSettings,
+          messages: initialMessages,
+          abortSignal,
+          timeout,
+          onChunk: async ({ chunk }) => {
+            if (chunk.type !== 'text-delta' || !chunk.text) return;
+            ensureActive();
+            streamedStepText += chunk.text;
+            latestText = streamedStepText;
+            await onTextStream?.({
+              delta: chunk.text,
+              stepNumber: streamedStepNumber,
+              text: streamedStepText,
+            });
+            ensureActive();
+          },
+        });
+      const [resultText, resultFinishReason, resultSteps] = await Promise.all([
+        result.text,
+        result.finishReason,
+        result.steps,
+      ]);
+      const finalSdkStep = resultSteps.at(-1);
+      const finishState = aiSdkFinishState(resultFinishReason, {
+        runtimeContinuationRequired: aiSdkToolResultRequiresContinuation({
+          finishReason: resultFinishReason,
+          responseText: resultText,
+          toolCallCount: finalSdkStep?.toolCalls.length,
+          toolResultCount: finalSdkStep?.toolResults.length,
+        }),
       });
-      const [resultText, resultFinishReason] = await Promise.all([result.text, result.finishReason]);
-      const finishState = aiSdkFinishState(resultFinishReason);
       ensureActive();
       latestText = finishState.terminatesTurn
         ? cleanFinalDisplayText(resultText || latestText) || ''
@@ -2593,7 +2637,7 @@ async function executeRuntimeStep(input: {
         await onDebug?.({
           phase: 'ai:runtime:retry',
           stepIndex,
-          message: `AI request failed transiently; retrying after ${retryDelayMs}ms (${consecutiveRequestFailures}/${consecutiveFailureLimit}) with the previously prepared model messages.`,
+          message: `第 ${attemptNumber - 1}/${consecutiveFailureLimit} 次 AI 请求失败；等待 ${retryDelayMs}ms 后开始第 ${attemptNumber}/${consecutiveFailureLimit} 次请求。`,
           details: {
             error: infrastructureError(lastError),
             consecutiveFailures: consecutiveRequestFailures,
@@ -2612,29 +2656,119 @@ async function executeRuntimeStep(input: {
         ensureActive();
       }
       ensureActive();
-      return await runAgent(includeImage, retryState, executionIdentity);
+      await onDebug?.({
+        phase: 'ai:runtime:attempt',
+        stepIndex,
+        message: `开始第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求${attemptNumber > 1 ? '（重试）' : ''}。最大 ${consecutiveFailureLimit} 次（首次请求 + ${Math.max(0, consecutiveFailureLimit - 1)} 次重试）。`,
+        details: {
+          attemptNumber,
+          attemptLimit: consecutiveFailureLimit,
+          execution: executionIdentity,
+          isRetry: attemptNumber > 1,
+        },
+      });
+      structuredLog({
+        event: 'ai.runtime.request.attempt_started',
+        operationId: executionIdentity.turnId,
+        attemptId: executionIdentity.attemptId,
+        attemptNumber,
+        attemptLimit: consecutiveFailureLimit,
+        isRetry: attemptNumber > 1,
+        provider: getModelSettings().provider,
+        model: getModelSettings().model,
+      });
+      const result = await runAgent(includeImage, retryState, executionIdentity);
+      const requestOutcomeMessage = result.responseFinished
+        ? result.responseStatus === 'passed'
+          ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求已返回并正常结束。`
+          : `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求已返回，但结束状态为 ${result.finishReason || result.responseStatus}。`
+        : `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求已返回，Agent 将继续处理。`;
+      await onDebug?.({
+        phase: 'ai:runtime:attempt-succeeded',
+        stepIndex,
+        message: requestOutcomeMessage,
+        details: {
+          attemptNumber,
+          attemptLimit: consecutiveFailureLimit,
+          execution: executionIdentity,
+          finishReason: result.finishReason,
+          responseFinished: result.responseFinished,
+          responseStatus: result.responseStatus,
+        },
+      });
+      structuredLog({
+        event: 'ai.runtime.request.attempt_succeeded',
+        operationId: executionIdentity.turnId,
+        attemptId: executionIdentity.attemptId,
+        attemptNumber,
+        attemptLimit: consecutiveFailureLimit,
+        provider: getModelSettings().provider,
+        model: getModelSettings().model,
+        finishReason: result.finishReason,
+        responseFinished: result.responseFinished,
+        responseStatus: result.responseStatus,
+      });
+      return result;
     } catch (error) {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       lastError = error;
       consecutiveRequestFailures += 1;
       lastRetryDecision = classifyRuntimeRetry(error, abortSignal);
-      if (!lastRetryDecision.retryable) {
-        await onDebug?.({
-          phase: 'ai:runtime:retry-skipped',
-          stepIndex,
-          message: `AI request failed with a non-retryable ${lastRetryDecision.category} error; no automatic retry will be started.`,
-          details: {
-            error: infrastructureError(error),
-            consecutiveFailures: consecutiveRequestFailures,
-            consecutiveFailureLimit,
-            execution: executionIdentity,
-            retryDecision: lastRetryDecision,
-          },
-        });
-        break;
-      }
-      if (consecutiveRequestFailures >= consecutiveFailureLimit) break;
-      retryDelayMs = runtimeRetryDelayMs(consecutiveRequestFailures, lastRetryDecision);
+      const retryExhausted = lastRetryDecision.retryable
+        && consecutiveRequestFailures >= consecutiveFailureLimit;
+      const willRetry = lastRetryDecision.retryable && !retryExhausted;
+      retryDelayMs = willRetry
+        ? runtimeRetryDelayMs(consecutiveRequestFailures, lastRetryDecision)
+        : 0;
+      const failurePhase = willRetry
+        ? 'ai:runtime:attempt-failed'
+        : retryExhausted
+          ? 'ai:runtime:retry-exhausted'
+          : 'ai:runtime:retry-skipped';
+      const failureMessage = willRetry
+        ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；${retryDelayMs}ms 后将进行第 ${attemptNumber + 1}/${consecutiveFailureLimit} 次请求。`
+        : retryExhausted
+          ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；已用完 ${consecutiveFailureLimit} 次请求机会，本轮最终失败。`
+          : `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；该错误不可重试，本轮最终失败。`;
+      await onDebug?.({
+        phase: failurePhase,
+        stepIndex,
+        message: failureMessage,
+        details: {
+          error: infrastructureError(error),
+          attemptNumber,
+          attemptLimit: consecutiveFailureLimit,
+          consecutiveFailures: consecutiveRequestFailures,
+          consecutiveFailureLimit,
+          delayMs: willRetry ? retryDelayMs : undefined,
+          nextAttemptNumber: willRetry ? attemptNumber + 1 : undefined,
+          willRetry,
+          finalFailure: !willRetry,
+          execution: executionIdentity,
+          retryDecision: lastRetryDecision,
+        },
+      });
+      structuredLog({
+        event: willRetry ? 'ai.runtime.request.attempt_failed' : 'ai.runtime.request.failed',
+        level: willRetry ? 'info' : 'warn',
+        operationId: executionIdentity.turnId,
+        attemptId: executionIdentity.attemptId,
+        attemptNumber,
+        attemptLimit: consecutiveFailureLimit,
+        category: lastRetryDecision.category,
+        reason: lastRetryDecision.reason,
+        statusCode: lastRetryDecision.statusCode,
+        retryDelayMs: willRetry ? retryDelayMs : undefined,
+        nextAttemptNumber: willRetry ? attemptNumber + 1 : undefined,
+        willRetry,
+        finalFailure: !willRetry,
+        provider: getModelSettings().provider,
+        model: getModelSettings().model,
+        ...(willRetry
+          ? { errorMessage: infrastructureError(error) }
+          : { error }),
+      });
+      if (!willRetry) break;
       retryingAfterFailure = true;
     }
   }
@@ -2681,17 +2815,14 @@ function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
     return [
       'Safety mode: full.',
       '- When the user request is clear, do not ask for extra confirmation only because an operation is important.',
-      '- Do not set requiresConfirmation or confirmationMessage for browser tools in full mode.',
       '- Still stop or ask for help when the page requires captcha/OTP/security verification, missing credentials, or information only the user can provide.',
     ].join('\n');
   }
   return [
     'Safety mode: strict.',
-    '- Before executing an operation you judge important, irreversible, externally visible, data-changing, privacy-sensitive, or costly, call the intended browser tool with requiresConfirmation=true and a concise Chinese confirmationMessage.',
-    '- Important operations can include submit/publish/send/delete/modify records, payment/order/authorization, login/security actions, file upload/download/export, or similar actions based on page context.',
-    '- Ask once for one bounded user-intended operation. Preparatory field entry, including filling a username or password for an explicitly requested login, must not request separate confirmation; confirm only the final submit/login action.',
-    '- The backend will pause this same browser-chat turn and show Confirm/Cancel buttons on that tool before executing it.',
-    '- Do not ask for this confirmation in plain text and do not end the turn just to ask the user to type confirm.',
+    '- The backend independently evaluates important, irreversible, externally visible, data-changing, privacy-sensitive, or costly tool calls and pauses them for user approval before execution.',
+    '- Do not ask for approval in plain text and do not add approval flags to tool input. Call the intended tool normally; the backend is the authority.',
+    '- Preparatory field entry, including filling a username or password for an explicitly requested login, does not pause separately; the final submit/login action does.',
   ].join('\n');
 }
 
@@ -2742,8 +2873,9 @@ export async function executeInteractiveBrowserTurn(input: {
   readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
-  agentLoopTimeoutMs?: number;
   allowedToolTypes?: string[];
+  memoryTools?: ToolSet;
+  useToolLoopAgent?: boolean;
 }): Promise<InteractiveBrowserTurnResult> {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
@@ -2796,7 +2928,8 @@ export async function executeInteractiveBrowserTurn(input: {
         readFile: input.readFile,
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
-        agentLoopTimeoutMs: input.agentLoopTimeoutMs,
+        memoryTools: input.memoryTools,
+        useToolLoopAgent: input.useToolLoopAgent,
         onTextStream: input.onTextStream,
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
@@ -3314,8 +3447,7 @@ async function executeCodexRuntimeObject(input: {
     };
   }
 
-  let normalizedParams = { ...params };
-  if (type === 'browserCode') normalizedParams = browserCodeInputWithRisk(normalizedParams, Boolean(requestToolConfirmation));
+  const normalizedParams = { ...params };
   if (type === 'readFile') normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
   const flow: BrowserOperationRecord = {
     index: stepIndex,
@@ -3323,7 +3455,6 @@ async function executeCodexRuntimeObject(input: {
     input: normalizedParams,
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
-  const pendingConfirmation = requestToolConfirmation ? toolConfirmationFromInput(type, normalizedParams) : undefined;
   const runTool = async (toolCallId?: string) => {
     if (type === 'spawnSubagents') {
       if (!runSubagents) return { ok: false, actual: 'spawnSubagents is unavailable in this runtime.' };
@@ -3376,30 +3507,29 @@ async function executeCodexRuntimeObject(input: {
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {
-      if (pendingConfirmation && requestToolConfirmation) {
-        const decision = await requestToolConfirmation({
-          toolName: type,
-          input: normalizedParams,
-          reason: pendingConfirmation.reason,
-          prompt: pendingConfirmation.prompt,
-          stepIndex,
-        });
-        throwIfStopped(abortSignal, shouldContinue);
-        if (decision !== 'confirmed') {
-          return {
-            ok: true,
-            actual: 'Skipped before execution because the user cancelled this confirmed tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
-          } satisfies BrowserActionResult;
-        }
-        if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
-        const result = await runTool(trace?.id);
+      const approval = await requestBrowserToolApproval({
+        session,
+        toolName: type,
+        toolInput: normalizedParams,
+        stepIndex,
+        request: requestToolConfirmation,
+      });
+      throwIfStopped(abortSignal, shouldContinue);
+      if (approval === 'denied') {
+        return {
+          ok: true,
+          actual: 'Skipped before execution because the user cancelled this server-approved tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
+        } satisfies BrowserActionResult;
+      }
+      if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
+      const result = await runTool(trace?.id);
+      if (approval === 'approved') {
         return {
           ...result,
           actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
         } satisfies BrowserActionResult;
       }
-      if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
-      return runTool(trace?.id);
+      return result;
     },
   });
   const imagePaths = result.referenceImagePaths?.length

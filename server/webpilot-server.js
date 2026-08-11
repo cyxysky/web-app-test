@@ -225,7 +225,12 @@ async function main() {
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
+  const { loadEnvConfig } = requireRuntimeDependency(appDir, '@next/env');
+  loadEnvConfig(appDir, dev);
   process.env.WEBPILOT_REALTIME_PUBLISH_TOKEN ||= randomBytes(32).toString('base64url');
+  process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
+  process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
+  process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
 
   // Load the complete build-time configuration before loading Next itself.
@@ -248,12 +253,8 @@ async function main() {
   await application.prepare();
   const handleNextUpgrade = dev ? application.getUpgradeHandler() : undefined;
 
-  // In development, Next has now loaded .env. In production the build
-  // manifest is the sole source of truth for basePath.
+  // In production the build manifest is the sole source of truth for basePath.
   const basePath = applicationBasePath(dev, compiledConfig);
-  process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
-  process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
-  process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
 
   const refreshHub = createRealtimeRefreshHub({ appDir });
   const server = http.createServer((request, response) => {

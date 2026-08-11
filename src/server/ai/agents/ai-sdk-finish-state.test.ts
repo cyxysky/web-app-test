@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aiSdkFinishMessage, aiSdkFinishState } from './ai-sdk-finish-state';
+import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
 
 test('treats stop as a normally completed AI response', () => {
   assert.deepEqual(aiSdkFinishState('stop'), {
@@ -65,6 +65,36 @@ test('keeps a Codex object response running when its generated object executed a
     terminatesTurn: false,
     status: 'passed',
   });
+});
+
+test('continues an incomplete stream after its final tool result completed', () => {
+  assert.equal(aiSdkToolResultRequiresContinuation({
+    finishReason: 'other',
+    responseText: '',
+    toolCallCount: 1,
+    toolResultCount: 1,
+  }), true);
+  assert.deepEqual(aiSdkFinishState('other', { runtimeContinuationRequired: true }), {
+    finishReason: 'other',
+    retryRequest: false,
+    terminatesTurn: false,
+    status: 'passed',
+  });
+});
+
+test('does not continue other when text or a completed tool result is missing', () => {
+  assert.equal(aiSdkToolResultRequiresContinuation({
+    finishReason: 'other',
+    responseText: 'final answer',
+    toolCallCount: 1,
+    toolResultCount: 1,
+  }), false);
+  assert.equal(aiSdkToolResultRequiresContinuation({
+    finishReason: 'other',
+    responseText: '',
+    toolCallCount: 1,
+    toolResultCount: 0,
+  }), false);
 });
 
 test('retries an SDK error finish reason instead of treating it as task completion', () => {

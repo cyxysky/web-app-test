@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 16;
+const currentSchemaVersion = 18;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -556,6 +556,34 @@ function applyVersionSeventeenMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionEighteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 18').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS browser_domain_cookie (
+        user_id TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        cookie_envelope TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, domain)
+      );
+      CREATE INDEX IF NOT EXISTS browser_domain_cookie_updated_idx
+        ON browser_domain_cookie(updated_at DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (18, 'browser-domain-cookie-vault', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -750,6 +778,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionFifteenMigration(database);
   applyVersionSixteenMigration(database);
   applyVersionSeventeenMigration(database);
+  applyVersionEighteenMigration(database);
 }
 
 export function getSqliteDatabase() {

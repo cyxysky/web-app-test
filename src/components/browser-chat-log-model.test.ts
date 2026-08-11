@@ -8,7 +8,11 @@ import {
 
 test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', () => {
   const logs = [
+    { phase: 'ai:runtime:attempt' },
     { phase: 'ai:runtime:request' },
+    { phase: 'ai:runtime:attempt-failed' },
+    { phase: 'ai:runtime:retry-exhausted' },
+    { phase: 'ai:runtime:attempt-succeeded' },
     { phase: 'ai:runtime:recoverable-error' },
     { phase: 'chat:runtime:request-aborted' },
     { phase: 'conversation:context:response' },
@@ -17,7 +21,11 @@ test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', (
   ];
 
   assert.deepEqual(visibleBrowserChatExecutionLogs(logs).map((log) => log.phase), [
+    'ai:runtime:attempt',
     'ai:runtime:request',
+    'ai:runtime:attempt-failed',
+    'ai:runtime:retry-exhausted',
+    'ai:runtime:attempt-succeeded',
     'ai:runtime:recoverable-error',
     'chat:runtime:request-aborted',
     'conversation:context:response',
@@ -39,6 +47,21 @@ test('summarizeBrowserChatLogs counts visible log categories', () => {
     screenshot: 1,
     total: 4,
   });
+});
+
+test('visibleBrowserChatExecutionLogs exposes the complete request attempt lifecycle', () => {
+  const phases = [
+    'ai:runtime:attempt',
+    'ai:runtime:attempt-failed',
+    'ai:runtime:retry',
+    'ai:runtime:attempt-succeeded',
+    'ai:runtime:retry-exhausted',
+    'ai:runtime:retry-skipped',
+  ];
+  assert.deepEqual(
+    visibleBrowserChatExecutionLogs(phases.map((phase) => ({ phase }))).map((log) => log.phase),
+    phases,
+  );
 });
 
 test('summarizeBrowserChatExecutionTotals sums top-level and subagent runtime timings', () => {

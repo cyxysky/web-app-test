@@ -11,7 +11,7 @@ function requestUserId(request: NextRequest) {
 }
 
 export async function GET(request: NextRequest) {
-  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 500, max: 500 });
+  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 10, max: 100 });
   const page = listBrowserChatSessionSummaries(requestUserId(request), {
     beforeId: request.nextUrl.searchParams.get('beforeId')?.trim() || undefined,
     beforeUpdatedAt: request.nextUrl.searchParams.get('beforeUpdatedAt')?.trim() || undefined,

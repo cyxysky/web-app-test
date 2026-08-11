@@ -1,5 +1,6 @@
-import { generateText } from 'ai';
+import { generateText, Output } from 'ai';
 import { z } from 'zod';
+import { aiReasoningEffort, aiRequestTimeoutMs, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel } from '@/server/ai/model';
 import { skillContentSchema, type SkillRecord, type StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { normalizeSkillDomain } from './skill-context';
@@ -13,22 +14,8 @@ const generatedSkillSchema = z.object({
   }),
 });
 
-function extractGeneratedSkillJson(text: string) {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-  const candidate = fenced || trimmed;
-  try {
-    return JSON.parse(candidate) as unknown;
-  } catch {
-    const start = candidate.indexOf('{');
-    const end = candidate.lastIndexOf('}');
-    if (start >= 0 && end > start) return JSON.parse(candidate.slice(start, end + 1)) as unknown;
-    throw new Error('Skill model response did not contain a JSON object.');
-  }
-}
-
-export function parseGeneratedSkillText(text: string) {
-  const parsed = generatedSkillSchema.safeParse(extractGeneratedSkillJson(text));
+export function parseGeneratedSkillOutput(value: unknown) {
+  const parsed = generatedSkillSchema.safeParse(value);
   if (!parsed.success) {
     const detail = parsed.error.issues
       .slice(0, 4)
@@ -135,6 +122,10 @@ export async function generateSkillFromBrowserHistory(input: {
   const result = await generateText({
     model: getModel(),
     temperature: 0.2,
+    reasoning: aiReasoningEffort(),
+    timeout: aiRequestTimeoutMs(),
+    telemetry: aiTelemetry('browser-skill-generator'),
+    output: Output.object({ schema: generatedSkillSchema }),
     prompt: [
       'You are converting a completed browser test execution record into a reusable application Skill.',
       'The Skill will be injected into future browser prompts. Minimize tokens and preserve only durable operating knowledge.',
@@ -150,8 +141,7 @@ export async function generateSkillFromBrowserHistory(input: {
       '- Do NOT include passwords, cookies, tokens, one-time codes, personal accounts, or secrets. Replace them with generic placeholders.',
       '- Avoid describing this as a report. It is a reusable operating skill for later AI browser runs.',
       '- Keep the details actionable but semantic: describe what to find/click/check, not old ids or exact pixels.',
-      '- Return exactly one JSON object. Do not use Markdown fences or add explanatory text.',
-      '- JSON shape: {"title":"...","description":"...","triggerPhrases":["..."],"content":{"details":"..."}}.',
+      '- Return exactly one object matching the configured output schema.',
       '',
       `Reusable source JSON:\n${safeJson({
         title: input.title,
@@ -165,7 +155,7 @@ export async function generateSkillFromBrowserHistory(input: {
       }, 10000)}`,
     ].join('\n'),
   });
-  const generated = parseGeneratedSkillText(result.text);
+  const generated = parseGeneratedSkillOutput(result.output);
   return {
     title: generated.title,
     description: generated.description,

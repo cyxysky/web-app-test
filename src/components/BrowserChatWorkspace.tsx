@@ -124,6 +124,7 @@ import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   browserChatAiCycleAnchorsText,
   browserChatMessageElapsedMs,
+  browserChatMessageIsTextStreaming,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
@@ -2457,6 +2458,35 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
   );
 });
 
+const BrowserChatPendingToolConfirmationCard = memo(function BrowserChatPendingToolConfirmationCard({
+  pending,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
+  onResolveToolConfirmation,
+}: {
+  pending: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
+}) {
+  const { t } = useI18n();
+  const label = browserChatToolLabel(pending.toolName, t);
+  return (
+    <section className="browser-chat-tool-call browser-chat-pending-tool-confirmation">
+      {pending.reason ? <p className="browser-chat-tool-reason">{pending.reason}</p> : null}
+      <div className="browser-chat-tool-card is-waiting">
+        <BrowserChatToolCardContent label={label} meta={t('等待用户确认')} name={pending.toolName} />
+      </div>
+      <BrowserChatToolConfirmationActions
+        pending={pending}
+        resolvingConfirmationAction={resolvingConfirmationAction}
+        resolvingConfirmationId={resolvingConfirmationId}
+        onResolveToolConfirmation={onResolveToolConfirmation}
+      />
+    </section>
+  );
+});
+
 const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolDisclosure({
   cardContent,
   className,
@@ -3328,9 +3358,13 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   const desiredExpandedRef = useRef(autoOpen);
   const openFrameRef = useRef(0);
   const previousAutoOpenRef = useRef(autoOpen);
+  const autoOpenedAtRef = useRef(autoOpen ? Date.now() : 0);
+  const autoCloseTimerRef = useRef(0);
   const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
   const elapsed = formatBrowserChatElapsedTime(browserChatMessageElapsedMs(message, running ? liveNowMs : undefined));
   const setDisclosureExpanded = useCallback((nextExpanded: boolean) => {
+    if (autoCloseTimerRef.current) window.clearTimeout(autoCloseTimerRef.current);
+    autoCloseTimerRef.current = 0;
     desiredExpandedRef.current = nextExpanded;
     if (openFrameRef.current) cancelAnimationFrame(openFrameRef.current);
     openFrameRef.current = 0;
@@ -3346,13 +3380,27 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   }, []);
 
   useEffect(() => {
-    if (autoOpen) setDisclosureExpanded(true);
-    else if (previousAutoOpenRef.current) setDisclosureExpanded(false);
+    if (autoOpen) {
+      if (!previousAutoOpenRef.current) autoOpenedAtRef.current = Date.now();
+      setDisclosureExpanded(true);
+    } else if (previousAutoOpenRef.current) {
+      const minimumOpenMs = 1_200;
+      const remainingOpenMs = Math.max(0, minimumOpenMs - (Date.now() - autoOpenedAtRef.current));
+      if (remainingOpenMs > 0) {
+        autoCloseTimerRef.current = window.setTimeout(() => {
+          autoCloseTimerRef.current = 0;
+          setDisclosureExpanded(false);
+        }, remainingOpenMs);
+      } else {
+        setDisclosureExpanded(false);
+      }
+    }
     previousAutoOpenRef.current = autoOpen;
   }, [autoOpen, setDisclosureExpanded]);
 
   useEffect(() => () => {
     if (openFrameRef.current) cancelAnimationFrame(openFrameRef.current);
+    if (autoCloseTimerRef.current) window.clearTimeout(autoCloseTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -3388,105 +3436,6 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   );
 });
 
-function advanceTextByCodePoints(text: string, start: number, count: number) {
-  let index = start;
-  for (let consumed = 0; consumed < count && index < text.length; consumed += 1) {
-    const codePoint = text.codePointAt(index);
-    index += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
-  }
-  return index;
-}
-
-function sharedTextPrefixLength(left: string, right: string) {
-  const limit = Math.min(left.length, right.length);
-  let index = 0;
-  while (index < limit && left[index] === right[index]) index += 1;
-  if (index > 0) {
-    const previous = left.charCodeAt(index - 1);
-    if (previous >= 0xd800 && previous <= 0xdbff) index -= 1;
-  }
-  return index;
-}
-
-function smoothStreamingCharactersPerSecond(remaining: number, running: boolean) {
-  if (!running) return Math.min(240, 90 + remaining * 1.5);
-  if (remaining <= 24) return 60;
-  if (remaining <= 96) return 90;
-  return Math.min(180, 105 + remaining * 0.3);
-}
-
-function useSmoothStreamingText(targetText: string, running: boolean) {
-  const initialText = running ? '' : targetText;
-  const [displayedText, setDisplayedText] = useState(initialText);
-  const displayedTextRef = useRef(initialText);
-  const targetTextRef = useRef(targetText);
-  const runningRef = useRef(running);
-  const frameRef = useRef(0);
-  const characterBudgetRef = useRef(0);
-  const holdUntilRef = useRef(0);
-
-  const startAnimation = useCallback(() => {
-    if (frameRef.current) return;
-    let previousFrameAt = performance.now();
-    const animate = (frameAt: number) => {
-      frameRef.current = 0;
-      const target = targetTextRef.current;
-      const isRunning = runningRef.current;
-      let current = displayedTextRef.current;
-
-      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-        current = target;
-        characterBudgetRef.current = 0;
-      } else if (!target.startsWith(current)) {
-        const prefixLength = isRunning ? sharedTextPrefixLength(current, target) : target.length;
-        current = target.slice(0, prefixLength);
-        characterBudgetRef.current = 0;
-        holdUntilRef.current = isRunning ? frameAt + 72 : 0;
-      } else if (current !== target && frameAt >= holdUntilRef.current) {
-        const elapsedMs = Math.min(Math.max(frameAt - previousFrameAt, 0), 64);
-        const remaining = target.length - current.length;
-        characterBudgetRef.current += elapsedMs
-          * smoothStreamingCharactersPerSecond(remaining, isRunning)
-          / 1_000;
-        const characterCount = Math.min(isRunning ? 3 : 4, Math.floor(characterBudgetRef.current));
-        if (characterCount > 0) {
-          characterBudgetRef.current -= characterCount;
-          const nextIndex = advanceTextByCodePoints(target, current.length, characterCount);
-          current = target.slice(0, nextIndex);
-        }
-      }
-
-      previousFrameAt = frameAt;
-      if (current !== displayedTextRef.current) {
-        displayedTextRef.current = current;
-        setDisplayedText(current);
-      }
-      if (current !== targetTextRef.current) frameRef.current = requestAnimationFrame(animate);
-    };
-    frameRef.current = requestAnimationFrame(animate);
-  }, []);
-
-  useLayoutEffect(() => {
-    const previousTarget = targetTextRef.current;
-    targetTextRef.current = targetText;
-    runningRef.current = running;
-    if (running && !previousTarget && targetText && !displayedTextRef.current) {
-      holdUntilRef.current = performance.now() + 72;
-    } else if (!running) {
-      holdUntilRef.current = 0;
-    }
-    startAnimation();
-  }, [running, startAnimation, targetText]);
-
-  useEffect(() => () => {
-    if (frameRef.current) cancelAnimationFrame(frameRef.current);
-  }, []);
-
-  if (targetText.startsWith(displayedText)) return displayedText;
-  if (!running) return targetText;
-  return targetText.slice(0, sharedTextPrefixLength(displayedText, targetText));
-}
-
 const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
   hidden,
   running,
@@ -3496,17 +3445,17 @@ const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
   running: boolean;
   text: string;
 }) {
-  const displayedText = useSmoothStreamingText(text, running);
-  if (hidden || !displayedText.trim()) return null;
+  if (hidden || !text.trim()) return null;
   return (
     <div className={`browser-chat-answer${running ? ' is-streaming' : ''}`}>
-      <BrowserChatMarkdown markdown={displayedText} />
+      <BrowserChatMarkdown markdown={text} />
     </div>
   );
 });
 
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   logs,
+  manualVerificationRequired,
   message,
   onLoadSubagentRecords,
   outputCycles,
@@ -3522,6 +3471,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   subagents,
 }: {
   logs: BrowserChatLogRecord[];
+  manualVerificationRequired?: boolean;
   message: BrowserChatMessage;
   onLoadSubagentRecords?: () => void;
   outputCycles: BrowserChatAiOutputCycle[];
@@ -3539,6 +3489,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
   const { t } = useI18n();
   const finalText = stringFromUnknown(message.content);
+  const textStreaming = browserChatMessageIsTextStreaming(message);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
   const aiOutputCycles = useMemo(() => outputCycles.filter((cycle) => !cycle.subagentId)
     .map((cycle) => (showReasoning ? cycle : {
@@ -3628,7 +3579,19 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       }));
     })
   ));
+  const timelineContainsPendingConfirmation = hasPendingConfirmation && timelineSteps.some((step) => (
+    (step.tools || []).some((tool) => Boolean(pendingConfirmationForTool({
+      pending: pendingToolConfirmation,
+      stepIndex: step.index,
+      toolName: tool.name,
+      toolInput: tool.input,
+      toolOk: tool.ok,
+    })))
+  ));
   const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
+  const showStandalonePendingConfirmation = hasPendingConfirmation
+    && !aiCyclesContainPendingConfirmation
+    && !timelineContainsPendingConfirmation;
   const splitTimelineEntries = unrepresentedTimelineEntries.map(({ step, visibleToolIndexes }) => {
     const currentToolIndexes: number[] = [];
     const historicalToolIndexes: number[] = [];
@@ -3710,14 +3673,14 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     (cycle) => cycle.output.tools.some((_tool, index) => aiCycleToolDetails.has(aiCycleToolKey(cycle.id, index))),
   ), [aiCycleToolDetails, renderAiOutputCycles]);
   const shouldShowStepTimeline = currentTimelineEntries.length > 0 || waitingForTool;
-  const manualVerificationPaused = message.status === 'blocked' && (
+  const manualVerificationPaused = Boolean(manualVerificationRequired) || (message.status === 'blocked' && (
     steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
     || pairedAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'))
-  );
+  ));
   const hasFinalText = Boolean(finalText.trim());
   const hideManualVerificationStatusText = manualVerificationPaused && isBrowserChatManualVerificationStatusText(finalText);
   const hasHistoricalAiOutput = aiOutputCycleEntries.length > 0;
-  const hasProcessContent = hasHistoricalAiOutput || shouldShowStepTimeline || running;
+  const hasProcessContent = hasHistoricalAiOutput || shouldShowStepTimeline || running || hasPendingConfirmation;
   const runningActivityLabel = message.activity?.label?.trim()
     ? t(message.activity.label)
     : t('正在分析页面状态并准备下一步操作');
@@ -3769,7 +3732,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           {running && !finalTextAnchoredToToolCycle ? (
             <BrowserChatStreamingAnswer
               hidden={hideManualVerificationStatusText}
-              running
+              running={textStreaming}
               text={finalText}
             />
           ) : null}
@@ -3798,7 +3761,15 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               ))}
             </div>
           ) : null}
-          {running ? (
+          {showStandalonePendingConfirmation && pendingToolConfirmation ? (
+            <BrowserChatPendingToolConfirmationCard
+              pending={pendingToolConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+            />
+          ) : null}
+          {running && !hasPendingConfirmation ? (
             <div
               aria-live="polite"
               className={`browser-chat-agent-empty browser-chat-agent-thinking${hasHistoricalAiOutput || shouldShowStepTimeline ? ' is-continuation' : ''}`}
@@ -3815,7 +3786,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       ) : null}
       {manualVerificationPaused ? (
         <BrowserChatManualVerificationCard
-          onResume={!running && message.status === 'blocked' ? onResumeHumanVerification : undefined}
+          onResume={!running ? onResumeHumanVerification : undefined}
           resuming={resumingHumanVerification}
         />
       ) : null}
@@ -3842,7 +3813,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   itemOutputCycles,
   itemSubagents,
   itemSteps,
-  lastAssistantMessageId,
+  manualVerificationRequired,
   onGenerateAutomationCase,
   onGenerateSkill,
   onLoadMessageLogs,
@@ -3855,7 +3826,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   resolvingConfirmationAction,
   resolvingConfirmationId,
   resumingHumanVerification,
-  sessionBusy,
 }: {
   generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
@@ -3864,7 +3834,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   itemOutputCycles: BrowserChatAiOutputCycle[];
   itemSubagents: BrowserChatSubagentRecord[];
   itemSteps: StepExecutionResult[];
-  lastAssistantMessageId?: string;
+  manualVerificationRequired?: boolean;
   onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
   onLoadMessageLogs: (messageId: string) => Promise<void> | void;
@@ -3877,11 +3847,10 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
-  sessionBusy: boolean;
   skillsById: Map<string, SkillRecord>;
 }) {
   const { t } = useI18n();
-  const operationRunning = item.role === 'assistant' && (item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId));
+  const operationRunning = item.role === 'assistant' && item.status === 'running';
   const canGenerateSkill = item.role === 'assistant' && item.status !== 'running' && itemSteps.length > 0;
   const canGenerateAutomationCase = canGenerateSkill;
   const actionDisabled = Boolean(generatingSkillMessageId || generatingAutomationMessageId);
@@ -3902,6 +3871,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
         {item.role === 'assistant' ? (
           <BrowserChatAssistantTimeline
             logs={itemLogs}
+            manualVerificationRequired={manualVerificationRequired}
             message={item}
             onLoadSubagentRecords={() => onLoadMessageLogs(item.id)}
             outputCycles={itemOutputCycles}
@@ -3978,6 +3948,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   items,
   lastAssistantMessageId,
   logIndex,
+  sessionAwaitingHuman,
   onLoadMessageLogs,
   outputCycles,
   onResolveToolConfirmation,
@@ -3987,13 +3958,13 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationAction,
   resolvingConfirmationId,
   resumingHumanVerification,
-  sessionBusy,
   subagents,
   stepsByIndex,
 }: {
   items: BrowserChatMessage[];
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
+  sessionAwaitingHuman?: boolean;
   onLoadMessageLogs: (messageId: string) => Promise<void> | void;
   outputCycles: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -4003,7 +3974,6 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
-  sessionBusy: boolean;
   subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
@@ -4016,7 +3986,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
       item,
       logs: browserChatLogsForMessage(item, logIndex),
       outputCycles: outputCycles.filter((cycle) => cycle.messageId === item.id),
-      running: item.status === 'running' || Boolean(sessionBusy && item.id === lastAssistantMessageId),
+      running: item.status === 'running',
       subagents: subagents.filter((subagent) => subagent.messageId === item.id),
       steps,
     };
@@ -4045,6 +4015,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
               <div className="browser-chat-executed-entry" key={item.id}>
                 <BrowserChatAssistantTimeline
                   logs={logs}
+                  manualVerificationRequired={Boolean(sessionAwaitingHuman && item.id === lastAssistantMessageId)}
                   message={item}
                   onLoadSubagentRecords={() => onLoadMessageLogs(item.id)}
                   outputCycles={itemOutputCycles}
@@ -4092,6 +4063,8 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   resolvingConfirmationAction,
   resolvingConfirmationId,
   resumingHumanVerification,
+  revealImmediately,
+  sessionAwaitingHuman,
   sessionId,
   sessionBusy,
   subagents,
@@ -4120,6 +4093,8 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
   resolvingConfirmationId?: string | null;
   resumingHumanVerification?: boolean;
+  revealImmediately?: boolean;
+  sessionAwaitingHuman?: boolean;
   sessionId?: string;
   sessionBusy: boolean;
   subagents: BrowserChatSubagentRecord[];
@@ -4146,16 +4121,20 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     () => buildBrowserChatMessageRenderEntries(
       messages,
       logIndex,
-      (message) => browserChatAssistantMessageHasVisibleText(
-        message,
-        outputCycles.filter((cycle) => cycle.messageId === message.id && !cycle.subagentId),
+      (message) => (
+        pendingToolConfirmation?.messageId === message.id
+        || Boolean(sessionAwaitingHuman && message.id === lastAssistantMessageId)
+        || browserChatAssistantMessageHasVisibleText(
+          message,
+          outputCycles.filter((cycle) => cycle.messageId === message.id && !cycle.subagentId),
+        )
       ),
       (message) => (message.stepIndexes || []).some((stepIndex) => {
         const step = stepsByIndex.get(stepIndex);
         return step?.messageId === message.id && Boolean(step.tools?.length);
       }),
     ),
-    [logIndex, messages, outputCycles, stepsByIndex],
+    [lastAssistantMessageId, logIndex, messages, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman, stepsByIndex],
   );
   const scrollKey = [
     sessionId || '',
@@ -4371,7 +4350,11 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   }, [getScrollContainer, historyHasMore, loadEarlier, onLoadEarlier]);
 
   return (
-    <div className="browser-chat-message-list" ref={scrollRef}>
+    <div
+      className="browser-chat-message-list"
+      data-scroll-ready={revealImmediately ? 'true' : undefined}
+      ref={scrollRef}
+    >
       {historyHasMore ? <div aria-hidden="true" className="browser-chat-history-sentinel" ref={historySentinelRef} /> : null}
       {historyHasMore && historyLoading ? (
         <div aria-live="polite" className="browser-chat-history-loader" role="status">
@@ -4397,7 +4380,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
               resolvingConfirmationAction={resolvingConfirmationAction}
               resolvingConfirmationId={resolvingConfirmationId}
               resumingHumanVerification={resumingHumanVerification}
-              sessionBusy={sessionBusy}
+              sessionAwaitingHuman={sessionAwaitingHuman}
               subagents={subagents}
               stepsByIndex={stepsByIndex}
             />
@@ -4423,7 +4406,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             itemSubagents={itemSubagents}
             itemSteps={itemSteps}
             key={item.id}
-            lastAssistantMessageId={lastAssistantMessageId}
+            manualVerificationRequired={Boolean(sessionAwaitingHuman && item.id === lastAssistantMessageId)}
             onGenerateAutomationCase={onGenerateAutomationCase}
             onGenerateSkill={onGenerateSkill}
             onLoadMessageLogs={onLoadMessageLogs}
@@ -4436,7 +4419,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             resolvingConfirmationAction={resolvingConfirmationAction}
             resolvingConfirmationId={resolvingConfirmationId}
             resumingHumanVerification={resumingHumanVerification}
-            sessionBusy={sessionBusy}
             skillsById={skillsById}
           />
         );
@@ -7867,7 +7849,7 @@ export function BrowserChatWorkspace({
     for (const item of sessions) merged.set(item.id, item);
     if (session) merged.set(session.id, session);
     return [...merged.values()]
-      .filter((item) => item.messages.length || item.id === session?.id)
+      .filter((item) => item.messages.length)
       .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
   }, [session, sessions]);
   const recentSessions = useMemo(() => sidebarSessions, [sidebarSessions]);
@@ -8134,7 +8116,7 @@ export function BrowserChatWorkspace({
     const loadingStartedAt = Date.now();
     setLoadingSessionHistory(true);
     try {
-      const response = await fetch(browserChatApiUrl('/api/browser-chat'), { cache: 'no-store' });
+      const response = await fetch(browserChatApiUrl('/api/browser-chat?limit=10'), { cache: 'no-store' });
       const data = await readApiJson<{ page?: BrowserChatSessionListPage; sessions?: BrowserChatSession[] }>(response, '加载对话历史失败');
       initializeSessionListPage(data.page || {});
       await applyLoadedSessions(Array.isArray(data.sessions) ? data.sessions as BrowserChatSession[] : []);
@@ -8145,9 +8127,25 @@ export function BrowserChatWorkspace({
     }
   }, [applyLoadedSessions, browserChatApiUrl, initializeSessionListPage]);
 
+  const refreshSessionList = useCallback(async () => {
+    const response = await fetch(browserChatApiUrl('/api/browser-chat?limit=10'), { cache: 'no-store' });
+    const data = await readApiJson<{ page?: BrowserChatSessionListPage; sessions?: BrowserChatSession[] }>(
+      response,
+      '刷新对话列表失败',
+    );
+    const nextSessions = (Array.isArray(data.sessions) ? data.sessions : []).map((item) => {
+      const normalized = normalizeSession(item);
+      const guarded = applyBrowserChatInterruptGuard(normalized, interruptGuardsRef.current.get(normalized.id));
+      if (guarded.release) interruptGuardsRef.current.delete(normalized.id);
+      return guarded.session;
+    });
+    initializeSessionListPage(data.page || {});
+    setSessions(nextSessions);
+  }, [browserChatApiUrl, initializeSessionListPage]);
+
   const loadInitialBrowserChatData = useCallback(async () => {
     const data = await readBrowserChatInitialRequest(
-      browserChatApiUrl('/api/browser-chat/bootstrap'),
+      browserChatApiUrl('/api/browser-chat/bootstrap?sessionLimit=10'),
       '加载对话初始化数据失败',
     ) as BrowserChatBootstrapData;
     initializeSkills(Array.isArray(data.skills) ? data.skills : [], data.skillPage || {});
@@ -8197,6 +8195,7 @@ export function BrowserChatWorkspace({
       }
       setSession((current) => (current?.id === event.id ? null : current));
       setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
+      void refreshSessionList().catch(() => undefined);
       return;
     }
     const patch = browserChatRealtimePatch(event.patch);
@@ -8232,7 +8231,7 @@ export function BrowserChatWorkspace({
       return [guarded.session, ...current.filter((item) => item.id !== event.id)]
         .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
     });
-  }, []);
+  }, [refreshSessionList]);
 
   const resyncRealtimeSessions = useCallback(async () => {
     const activeSessionId = activeSessionIdRef.current;
@@ -8247,7 +8246,6 @@ export function BrowserChatWorkspace({
 
   async function createSession() {
     sessionSelectionIntentRef.current += 1;
-    setMessageViewportReady(false);
     const response = await fetch(browserChatApiUrl('/api/browser-chat/create'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -8437,7 +8435,8 @@ export function BrowserChatWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, confirmationId }),
       });
-      await readApiJson<Record<string, unknown>>(response, '工具确认失败');
+      const data = await readApiJson<{ session: BrowserChatSession }>(response, '工具确认失败');
+      if (data.session) upsertSession(data.session, { activate: activeSessionIdRef.current === sessionId });
     } catch (resolveError) {
       setError(resolveError instanceof Error ? resolveError.message : '工具确认失败');
     } finally {
@@ -8453,7 +8452,8 @@ export function BrowserChatWorkspace({
     setError('');
     try {
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${active.id}/resume-verification`), { method: 'POST' });
-      await readApiJson<{ session: BrowserChatSession }>(response, '继续人工校验回合失败');
+      const data = await readApiJson<{ session: BrowserChatSession }>(response, '继续人工校验回合失败');
+      if (data.session) upsertSession(data.session, { activate: activeSessionIdRef.current === active.id });
     } catch (resumeError) {
       setError(resumeError instanceof Error ? resumeError.message : '继续人工校验回合失败');
     } finally {
@@ -8510,6 +8510,7 @@ export function BrowserChatWorkspace({
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (deletingActiveSession) clearDeletedActiveSession();
       if (deletedSession) await discardEmbeddedBrowserDataForSessions([deletedSession]);
+      await refreshSessionList().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
     } finally {
@@ -8566,6 +8567,7 @@ export function BrowserChatWorkspace({
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (deletingActiveSession) clearDeletedActiveSession();
       await discardEmbeddedBrowserDataForSessions(deletedSessions);
+      await refreshSessionList().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
     } finally {
@@ -8950,20 +8952,20 @@ export function BrowserChatWorkspace({
                 </li>
               ))}
             </ol>
-            {sessionListPage.hasMore ? (
-              <button
-                className="browser-chat-history-load-more"
-                disabled={loadingMoreSessions}
-                onClick={() => void loadMoreSessions()}
-                type="button"
-              >
-                {loadingMoreSessions ? <Loader2 className="spin" size={13} /> : null}
-                {t(loadingMoreSessions ? '正在加载' : '加载更多')}
-              </button>
-            ) : null}
             </>
           ) : recentSessions.length ? (
             <p className="browser-chat-history-filter-empty">{t('没有匹配的对话')}</p>
+          ) : null}
+          {!loadingSessionHistory && sessionListPage.hasMore ? (
+            <button
+              className="browser-chat-history-load-more"
+              disabled={loadingMoreSessions}
+              onClick={() => void loadMoreSessions()}
+              type="button"
+            >
+              {loadingMoreSessions ? <Loader2 className="spin" size={13} /> : null}
+              {t(loadingMoreSessions ? '正在加载' : '加载更多')}
+            </button>
           ) : null}
         </div>
         </div>
@@ -9070,6 +9072,8 @@ export function BrowserChatWorkspace({
           resolvingConfirmationAction={resolvingConfirmationAction}
           resolvingConfirmationId={resolvingConfirmationId}
           resumingHumanVerification={resumingHumanVerification}
+          revealImmediately={!loadingSessionHistory && !loadingSessionId && messageViewportReady}
+          sessionAwaitingHuman={session?.turnState === 'awaiting_human'}
           sessionId={session?.id}
           sessionBusy={selectedSessionRunning}
           subagents={session?.subagents || []}

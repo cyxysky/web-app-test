@@ -23,12 +23,24 @@ function text(value: unknown) {
 }
 
 export async function GET(request: NextRequest) {
+  const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 10, max: 100 });
+  const records = listAutomationCases({
+    userId: requestApplicationUserId(request),
+    sourceSessionId: request.nextUrl.searchParams.get('sourceSessionId')?.trim() || undefined,
+    beforeId: request.nextUrl.searchParams.get('beforeId')?.trim() || undefined,
+    beforeUpdatedAt: request.nextUrl.searchParams.get('beforeUpdatedAt')?.trim() || undefined,
+    limit: limit + 1,
+  });
+  const cases = records.slice(0, limit);
+  const last = cases.at(-1);
   return apiJson(request, {
-    cases: listAutomationCases({
-      userId: requestApplicationUserId(request),
-      sourceSessionId: request.nextUrl.searchParams.get('sourceSessionId')?.trim() || undefined,
-      limit: boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 100, max: 500 }),
-    }),
+    cases,
+    page: {
+      hasMore: records.length > limit,
+      next: records.length > limit && last
+        ? { beforeId: last.id, beforeUpdatedAt: last.updatedAt }
+        : undefined,
+    },
   });
 }
 
@@ -60,7 +72,7 @@ export async function POST(request: NextRequest) {
         ok: true,
         case: automationCase,
         automationCase,
-        cases: listAutomationCases({ userId }),
+        cases: listAutomationCases({ userId, limit: 10 }),
       }, { status: 201 });
     });
   } catch (error) {

@@ -213,7 +213,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 24;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 25;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -762,6 +762,7 @@ function browserCodeKernelMain() {
             descriptor: string;
             coveredBy?: string;
             failureKind?: 'occluded';
+            preserveScroll?: boolean;
           };
         };
       };
@@ -772,15 +773,101 @@ function browserCodeKernelMain() {
         descriptor: string;
         coveredBy?: string;
         failureKind?: 'occluded';
+        preserveScroll?: boolean;
       } => {
-        const shared = runtime?.actionability?.(element, { action: operation });
-        if (shared) return shared;
         const descriptor = `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
+        const pointerAction = /^(click|dblclick|hover|tap|check|uncheck|setchecked|dragto|draganddrop)$/.test(operation.toLowerCase());
+        let blockingLayer: Element | undefined;
+        if (pointerAction) {
+          const foregroundSurfaceSelector = [
+            'dialog[open]',
+            '[aria-modal="true"]',
+            '[role="dialog"]',
+            '[role="alertdialog"]',
+            '[role="menu"]',
+            '[role="listbox"]',
+            '[popover]',
+          ].join(',');
+          const foregroundSurfaces = Array.from(document.querySelectorAll(foregroundSurfaceSelector)).filter((surface) => {
+            if (surface.hasAttribute('popover')) {
+              try {
+                if (!surface.matches(':popover-open')) return false;
+              } catch {
+                return false;
+              }
+            }
+            const surfaceStyle = getComputedStyle(surface);
+            const surfaceRect = surface.getBoundingClientRect();
+            return surface.isConnected
+              && surfaceStyle.display !== 'none'
+              && surfaceStyle.visibility !== 'hidden'
+              && Number(surfaceStyle.opacity || '1') > 0.01
+              && surfaceStyle.pointerEvents !== 'none'
+              && surfaceRect.width > 0
+              && surfaceRect.height > 0
+              && surfaceRect.right > 0
+              && surfaceRect.bottom > 0
+              && surfaceRect.left < window.innerWidth
+              && surfaceRect.top < window.innerHeight;
+          });
+          const targetBelongsToForegroundSurface = foregroundSurfaces.some((surface) => (
+            surface === element || surface.contains(element)
+          ));
+          if (!targetBelongsToForegroundSurface) {
+            blockingLayer = foregroundSurfaces.filter((surface) => !element.contains(surface)).at(-1);
+          }
+          const rect = element.getBoundingClientRect();
+          const intersectsViewport = rect.right > 0
+            && rect.bottom > 0
+            && rect.left < window.innerWidth
+            && rect.top < window.innerHeight;
+          if (!intersectsViewport && !blockingLayer) {
+            const candidate = document.elementFromPoint(
+              Math.max(0, Math.floor(window.innerWidth / 2)),
+              Math.max(0, Math.floor(window.innerHeight / 2)),
+            );
+            if (candidate && !candidate.contains(element) && !element.contains(candidate)) {
+              const style = getComputedStyle(candidate);
+              const blockerRect = candidate.getBoundingClientRect();
+              const horizontalCoverage = Math.max(0, Math.min(window.innerWidth, blockerRect.right) - Math.max(0, blockerRect.left));
+              const verticalCoverage = Math.max(0, Math.min(window.innerHeight, blockerRect.bottom) - Math.max(0, blockerRect.top));
+              if (
+                ['fixed', 'absolute', 'sticky'].includes(style.position)
+                && horizontalCoverage >= window.innerWidth * 0.8
+                && verticalCoverage >= window.innerHeight * 0.8
+              ) blockingLayer = candidate;
+            }
+          }
+        }
+        const shared = runtime?.actionability?.(element, { action: operation });
+        if (shared) {
+          if (!blockingLayer) return shared;
+          if (!shared.ok && shared.failureKind !== 'occluded') return shared;
+          const blockerDescriptor = `${blockingLayer.tagName.toLowerCase()}${blockingLayer.id ? `#${blockingLayer.id}` : ''}`;
+          return {
+            ok: false,
+            reason: `${descriptor} is outside the active foreground surface ${blockerDescriptor}; close or dismiss that surface before targeting the background`,
+            descriptor,
+            failureKind: 'occluded',
+            coveredBy: blockerDescriptor,
+            preserveScroll: true,
+          };
+        }
         if (!element.isConnected) {
           return { ok: false, reason: 'target is detached from the current document', descriptor };
         }
         const fileInputAction = operation.toLowerCase() === 'setinputfiles';
-        const pointerAction = /^(click|dblclick|hover|tap|check|uncheck|setchecked|dragto|draganddrop)$/.test(operation.toLowerCase());
+        if (blockingLayer) {
+          const blockerDescriptor = `${blockingLayer.tagName.toLowerCase()}${blockingLayer.id ? `#${blockingLayer.id}` : ''}`;
+          return {
+            ok: false,
+            reason: `${descriptor} is outside the viewport behind viewport-blocking layer ${blockerDescriptor}`,
+            descriptor,
+            failureKind: 'occluded',
+            coveredBy: blockerDescriptor,
+            preserveScroll: true,
+          };
+        }
         const targetStyle = getComputedStyle(element);
         if (pointerAction && targetStyle.pointerEvents === 'none') {
           return { ok: false, reason: `${descriptor} has computed pointer-events:none`, descriptor };
@@ -845,6 +932,13 @@ function browserCodeKernelMain() {
       for (const [index, result] of results.entries()) {
         const supplementalOcclusion = result.failureKind === 'occluded'
           || /no unobstructed actionable point/i.test(result.reason);
+        if (!result.ok && result.preserveScroll) {
+          trialResults.push({
+            ...result,
+            reason: `${result.reason}; Playwright ${trialMethod} trial skipped to preserve the current background scroll position`,
+          });
+          continue;
+        }
         if (!result.ok && !supplementalOcclusion) {
           trialResults.push(result);
           continue;
@@ -857,8 +951,23 @@ function browserCodeKernelMain() {
           });
           continue;
         }
+        const trialCandidate = candidateSet.nth(index);
+        const scrollState = await trialCandidate.evaluate((element) => {
+          const ancestors: Array<{ left: number; top: number }> = [];
+          let current = element.parentElement;
+          while (current) {
+            ancestors.push({ left: current.scrollLeft, top: current.scrollTop });
+            current = current.parentElement;
+          }
+          const scrolling = document.scrollingElement;
+          return {
+            ancestors,
+            documentLeft: scrolling?.scrollLeft || window.scrollX,
+            documentTop: scrolling?.scrollTop || window.scrollY,
+          };
+        }).catch(() => undefined);
         try {
-          await Reflect.apply(nativeTrialAction, candidateSet.nth(index), [{
+          await Reflect.apply(nativeTrialAction, trialCandidate, [{
             timeout: supplementalOcclusion || results.length > 1
               ? browserCodePointerLookupTimeoutMs
               : browserCodeActionTimeoutMs,
@@ -873,6 +982,21 @@ function browserCodeKernelMain() {
             coveredBy: undefined,
           });
         } catch (error) {
+          if (scrollState) {
+            await trialCandidate.evaluate((element, state) => {
+              let current = element.parentElement;
+              let ancestorIndex = 0;
+              while (current && ancestorIndex < state.ancestors.length) {
+                const position = state.ancestors[ancestorIndex];
+                current.scrollTo(position.left, position.top);
+                current = current.parentElement;
+                ancestorIndex += 1;
+              }
+              const scrolling = document.scrollingElement;
+              if (scrolling) scrolling.scrollTo(state.documentLeft, state.documentTop);
+              else window.scrollTo(state.documentLeft, state.documentTop);
+            }, scrollState).catch(() => undefined);
+          }
           const detail = (error instanceof Error ? error.message : String(error))
             .replace(/\s+/g, ' ')
             .slice(0, 600);

@@ -175,6 +175,8 @@ function persistSchedule(database: DatabaseSync, record: AutomationScheduleRecor
 }
 
 export type AutomationCaseListOptions = {
+  beforeId?: string;
+  beforeUpdatedAt?: string;
   userId?: string;
   sourceSessionId?: string;
   limit?: number;
@@ -191,11 +193,15 @@ export function listAutomationCases(options: AutomationCaseListOptions = {}) {
     clauses.push('source_session_id = ?');
     values.push(options.sourceSessionId);
   }
+  if (options.beforeUpdatedAt && options.beforeId) {
+    clauses.push('(updated_at < ? OR (updated_at = ? AND id < ?))');
+    values.push(options.beforeUpdatedAt, options.beforeUpdatedAt, options.beforeId);
+  }
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const rows = getSqliteDatabase().prepare(`
     SELECT record_json FROM automation_case
     ${where}
-    ORDER BY updated_at DESC
+    ORDER BY updated_at DESC, id DESC
     LIMIT ?
   `).all(...values, normalizedLimit(options.limit)) as JsonRow[];
   return rows.map(parseCaseRow).filter((record): record is AutomationCaseRecord => Boolean(record));

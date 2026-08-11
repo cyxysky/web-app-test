@@ -59,7 +59,9 @@ export function isBrowserChatAiInputOutputLog(log: BrowserChatLogRecordLike) {
 }
 
 export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
-  return log.phase === 'ai:runtime:retry'
+  return log.phase === 'ai:runtime:attempt-failed'
+    || log.phase === 'ai:runtime:retry'
+    || log.phase === 'ai:runtime:retry-exhausted'
     || log.phase === 'ai:runtime:retry-skipped'
     || log.phase === 'ai:runtime:recoverable-error'
     || log.phase === 'chat:runtime:request-aborted'
@@ -68,13 +70,19 @@ export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
     || log.phase === 'target:plan:error';
 }
 
+export function isBrowserChatAiAttemptLog(log: BrowserChatLogRecordLike) {
+  return log.phase === 'ai:runtime:attempt'
+    || log.phase === 'ai:runtime:attempt-succeeded'
+    || isBrowserChatAiFailureLog(log);
+}
+
 export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
   return log.phase.startsWith('target:plan:');
 }
 
 export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
   return isBrowserChatAiInputOutputLog(log)
-    || isBrowserChatAiFailureLog(log)
+    || isBrowserChatAiAttemptLog(log)
     || isBrowserChatTargetPlanningLog(log);
 }
 

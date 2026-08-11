@@ -16,7 +16,7 @@ const browserChatRuntimeKeys = new Set([
 
 export async function GET(request: NextRequest) {
   const userId = requestApplicationUserId(request);
-  const sessionLimit = boundedQueryInteger(request.nextUrl.searchParams.get('sessionLimit'), { fallback: 40, max: 100 });
+  const sessionLimit = boundedQueryInteger(request.nextUrl.searchParams.get('sessionLimit'), { fallback: 10, max: 100 });
   const skillLimit = boundedQueryInteger(request.nextUrl.searchParams.get('skillLimit'), { fallback: 50, max: 100 });
   const sessionPage = listBrowserChatSessionSummaries(userId, { limit: sessionLimit + 1 });
   const sessions = sessionPage.slice(0, sessionLimit);

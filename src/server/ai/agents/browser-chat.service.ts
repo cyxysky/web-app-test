@@ -3,6 +3,7 @@ import { generateText } from 'ai';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
 import {
   executeInteractiveBrowserTurn,
@@ -60,7 +61,9 @@ import {
   personalMemoryEnabled,
   searchPersonalMemory,
 } from '@/server/ai/personal-memory';
+import { createPersonalMemoryTools } from '@/server/ai/personal-memory-tools';
 import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
+import { aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
 import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
 import type {
@@ -75,6 +78,7 @@ import {
   scheduleBrowserChatRealtimeOutboxFlush,
 } from '@/server/realtime/browser-chat-outbox';
 import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
+import { createLatestOnlyAsyncScheduler, type LatestOnlyAsyncScheduler } from '@/server/realtime/latest-only-async-scheduler';
 import {
   deleteBrowserChatSessionRecordQueued,
   readBrowserChatSessionRecord,
@@ -274,7 +278,7 @@ type BrowserChatRuntimeState = {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
-  pendingStreamPublishTimers: Map<string, ReturnType<typeof setTimeout>>;
+  streamPublisher?: LatestOnlyAsyncScheduler<string, string>;
   pendingSqliteWrites: Map<string, Promise<boolean>>;
   sessionEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
   persistenceCursors: Map<string, BrowserChatPersistenceCursor>;
@@ -289,7 +293,7 @@ type BrowserChatRuntimeState = {
   lastPersistWarningAt: number;
 };
 
-const browserChatRuntimeState = ((globalThis as typeof globalThis & {
+const browserChatRuntimeState: BrowserChatRuntimeState = ((globalThis as typeof globalThis & {
   __browserChatRuntimeState?: BrowserChatRuntimeState;
 }).__browserChatRuntimeState ??= {
   sessions: new Map<string, BrowserChatSessionRecord>(),
@@ -304,7 +308,6 @@ const browserChatRuntimeState = ((globalThis as typeof globalThis & {
     promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
-  pendingStreamPublishTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   pendingSqliteWrites: new Map<string, Promise<boolean>>(),
   sessionEvictionTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   persistenceCursors: new Map<string, BrowserChatPersistenceCursor>(),
@@ -326,7 +329,6 @@ browserChatRuntimeState.subagentResults ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
-browserChatRuntimeState.pendingStreamPublishTimers ??= new Map();
 browserChatRuntimeState.pendingSqliteWrites ??= new Map();
 browserChatRuntimeState.sessionEvictionTimers ??= new Map();
 browserChatRuntimeState.persistenceCursors ??= new Map();
@@ -347,7 +349,6 @@ const subagentResults = browserChatRuntimeState.subagentResults;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
-const pendingStreamPublishTimers = browserChatRuntimeState.pendingStreamPublishTimers;
 const pendingSqliteWrites = browserChatRuntimeState.pendingSqliteWrites;
 const sessionEvictionTimers = browserChatRuntimeState.sessionEvictionTimers;
 const persistenceCursors = browserChatRuntimeState.persistenceCursors;
@@ -418,9 +419,7 @@ function browserChatSessionHasRuntimeWork(session: BrowserChatSessionRecord) {
 function evictBrowserChatSessionRuntime(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session || browserChatSessionHasRuntimeWork(session) || pendingPersistTimers.has(sessionId) || pendingSqliteWrites.has(sessionId)) return false;
-  const streamTimer = pendingStreamPublishTimers.get(sessionId);
-  if (streamTimer) clearTimeout(streamTimer);
-  pendingStreamPublishTimers.delete(sessionId);
+  browserChatRuntimeState.streamPublisher?.cancel(sessionId);
   sessions.delete(sessionId);
   persistenceCursors.delete(sessionId);
   dirtyRecords.delete(sessionId);
@@ -1750,6 +1749,7 @@ function appendLog(
 
 function readSessionSummaries(userId?: string | number): BrowserChatSessionSnapshot[] {
   return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
+    hasMessagesOnly: true,
     userId: userId === undefined ? undefined : normalizeApplicationUserId(userId),
   })
     .filter(isBrowserChatSessionSnapshot);
@@ -1859,35 +1859,40 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
   return patch;
 }
 
+async function publishBrowserChatTextStreamSnapshot(sessionId: string, assistantMessageId: string) {
+  const session = sessions.get(sessionId);
+  const message = session?.messages.find((item) => item.id === assistantMessageId);
+  if (!session || !message || message.role !== 'assistant') return;
+  const header = sessionSnapshotHeader(session);
+  const patch: BrowserChatSessionRealtimePatch = {
+    session: {
+      ...header,
+      pendingToolConfirmation: header.pendingToolConfirmation ?? null,
+    },
+    messages: [{
+      ...message,
+      attachments: message.attachments ? [...message.attachments] : undefined,
+      stepIndexes: message.stepIndexes ? [...message.stepIndexes] : undefined,
+    }],
+  };
+  await publishRealtimeRefreshEvent({
+    entityType: 'browserChatSession',
+    id: session.id,
+    updatedAt: session.updatedAt,
+    userId: normalizeApplicationUserId(session.userId),
+    patch,
+  });
+}
+
+function browserChatTextStreamPublisher() {
+  return browserChatRuntimeState.streamPublisher ??= createLatestOnlyAsyncScheduler({
+    delayMs: browserChatStreamPublishDelayMs,
+    publish: publishBrowserChatTextStreamSnapshot,
+  });
+}
+
 function scheduleBrowserChatTextStreamPublish(sessionId: string, assistantMessageId: string) {
-  if (pendingStreamPublishTimers.has(sessionId)) return;
-  const timer = setTimeout(() => {
-    pendingStreamPublishTimers.delete(sessionId);
-    const session = sessions.get(sessionId);
-    const message = session?.messages.find((item) => item.id === assistantMessageId);
-    if (!session || !message || message.role !== 'assistant') return;
-    const header = sessionSnapshotHeader(session);
-    const patch: BrowserChatSessionRealtimePatch = {
-      session: {
-        ...header,
-        pendingToolConfirmation: header.pendingToolConfirmation ?? null,
-      },
-      messages: [{
-        ...message,
-        attachments: message.attachments ? [...message.attachments] : undefined,
-        stepIndexes: message.stepIndexes ? [...message.stepIndexes] : undefined,
-      }],
-    };
-    void publishRealtimeRefreshEvent({
-      entityType: 'browserChatSession',
-      id: session.id,
-      updatedAt: session.updatedAt,
-      userId: normalizeApplicationUserId(session.userId),
-      patch,
-    }).catch(() => undefined);
-  }, browserChatStreamPublishDelayMs());
-  timer.unref?.();
-  pendingStreamPublishTimers.set(sessionId, timer);
+  browserChatTextStreamPublisher().schedule(sessionId, assistantMessageId);
 }
 
 function deleteSessionSnapshot(sessionId: string, userId: string) {
@@ -2258,39 +2263,35 @@ async function ensureConversationContextWithinThreshold(
   const startedAt = Date.now();
   try {
     const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_CONTEXT_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 30000));
-    const timeoutController = new AbortController();
-    const timer = setTimeout(() => timeoutController.abort(new Error(`AI conversation context summary timed out after ${timeoutMs}ms`)), timeoutMs);
-    const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, timeoutController.signal]) : timeoutController.signal;
-    try {
-      const result = await generateText({
-        model: getModel(),
-        temperature: 0.1,
-        maxRetries: 0,
-        prompt,
-        abortSignal: combinedSignal,
-      });
-      const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages, userId: session.userId });
-      session.conversationContext = {
-        version: 1,
-        updatedAt: now(),
-        coveredMessageIds: historicalMessages.map((message) => message.id).slice(-300),
-        summary,
-      };
-      appendLog(session, 'conversation:context:response', '历史对话已压缩，后续轮次会以该摘要作为 messages 开头。', {
-        elapsedMs: elapsedMs(startedAt),
-        details: fullLogDetails({
-          provider,
-          model,
-          estimatedTokensBefore: estimatedTokens,
-          estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId)),
-          thresholdTokens,
-          context: session.conversationContext,
-        }),
-      });
-      persistAndNotify(session.id);
-    } finally {
-      clearTimeout(timer);
-    }
+    const result = await generateText({
+      model: getModel(),
+      temperature: 0.1,
+      reasoning: aiReasoningEffort(),
+      maxRetries: 0,
+      prompt,
+      abortSignal,
+      timeout: timeoutMs,
+      telemetry: aiTelemetry('browser-chat-context-summary'),
+    });
+    const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages, userId: session.userId });
+    session.conversationContext = {
+      version: 1,
+      updatedAt: now(),
+      coveredMessageIds: historicalMessages.map((message) => message.id).slice(-300),
+      summary,
+    };
+    appendLog(session, 'conversation:context:response', '历史对话已压缩，后续轮次会以该摘要作为 messages 开头。', {
+      elapsedMs: elapsedMs(startedAt),
+      details: fullLogDetails({
+        provider,
+        model,
+        estimatedTokensBefore: estimatedTokens,
+        estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId)),
+        thresholdTokens,
+        context: session.conversationContext,
+      }),
+    });
+    persistAndNotify(session.id);
   } catch (error) {
     if (abortSignal?.aborted) throw abortSignal.reason || error;
     appendLog(session, 'conversation:context:error', '历史对话压缩失败，本轮继续使用未压缩历史。', {
@@ -2404,6 +2405,17 @@ async function ensureStartedNow(
   try {
     await browser.start();
     assertTurnActive?.();
+    const savedCookies = readBrowserDomainCookies(session.userId);
+    if (savedCookies.length) {
+      const injectedCount = await browser.injectCookies(savedCookies);
+      assertTurnActive?.();
+      const domainCount = new Set(savedCookies.map((cookie) => new URL(cookie.url).hostname)).size;
+      appendLog(
+        session,
+        'browser:cookies:injected',
+        `已为当前用户注入 ${injectedCount} 个 Cookie，覆盖 ${domainCount} 个域名。`,
+      );
+    }
   } catch (error) {
     await browser.close({ keepOpen: true }).catch(() => undefined);
     if (session.browser === browser) {
@@ -3233,10 +3245,14 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'ai:runtime-input:start') return '正在准备运行上下文';
   if (phase === 'perf:runtime-input') return '正在准备页面上下文';
   if (phase === 'ai:prepare') return '正在请求 AI 决策';
+  if (phase === 'ai:runtime:attempt') return message;
   if (phase === 'ai:runtime:request') return '正在请求 AI 模型';
   if (phase === 'ai:runtime:response') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:object') return 'AI 已返回，正在解析动作';
-  if (phase === 'ai:runtime:retry') return 'AI 请求失败，正在重试';
+  if (phase === 'ai:runtime:attempt-failed' || phase === 'ai:runtime:retry') return message;
+  if (phase === 'ai:runtime:retry-exhausted') return 'AI 请求重试已耗尽';
+  if (phase === 'ai:runtime:retry-skipped') return 'AI 请求失败，该错误不可重试';
+  if (phase === 'ai:runtime:attempt-succeeded') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:partial') return '工具已执行，正在继续判断';
   if (phase === 'ai:context-compressed') return '正在整理上下文';
   if (phase === 'ai:visual-context') return '正在更新视觉上下文';
@@ -3291,7 +3307,7 @@ function toolConfirmationInputSignature(value: unknown) {
     if (!input || typeof input !== 'object') return input;
     const record = input as Record<string, unknown>;
     return Object.fromEntries(Object.keys(record)
-      .filter((key) => key !== 'reason' && key !== 'requiresConfirmation' && key !== 'confirmationMessage')
+      .filter((key) => key !== 'reason')
       .sort()
       .map((key) => [key, omitToolPresentationFields(record[key])]));
   };
@@ -3777,6 +3793,7 @@ async function executeBrowserChatSubagentBatch(input: {
         completedSteps: [],
         mode: session.mode,
         safetyMode: session.safetyMode,
+        useToolLoopAgent: true,
         credentialBindings: initialRuntimeContext.credentialBindings,
         getRuntimeOperationalContext,
         abortSignal: abortController.signal,
@@ -4001,6 +4018,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       completedSteps: binding.steps,
       mode: session.mode,
       safetyMode: session.safetyMode,
+      useToolLoopAgent: true,
       credentialBindings: initialRuntimeContext.credentialBindings,
       getRuntimeOperationalContext,
       abortSignal: abortController.signal,
@@ -4171,6 +4189,15 @@ async function runBrowserChatMessage(
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
+        memoryTools: createPersonalMemoryTools({
+          userId: session.userId,
+          currentUrl: browserChatMemoryUrl(browser, session),
+          sourceSessionId: session.id,
+          sourceMessageIds: [userMessageId, assistantMessageId],
+          userMessages: session.messages
+            .filter((message) => message.role === 'user')
+            .map((message) => message.content),
+        }),
         referenceImagePaths,
         credentialBindings: initialRuntimeContext.credentialBindings,
         getRuntimeOperationalContext,
@@ -4240,7 +4267,13 @@ async function runBrowserChatMessage(
           if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
           const persistImmediately = event.phase === 'ai:runtime:request'
             || event.phase === 'ai:runtime:response'
-            || event.phase === 'ai:tool';
+            || event.phase === 'ai:tool'
+            || event.phase === 'ai:runtime:attempt'
+            || event.phase === 'ai:runtime:attempt-failed'
+            || event.phase === 'ai:runtime:attempt-succeeded'
+            || event.phase === 'ai:runtime:retry'
+            || event.phase === 'ai:runtime:retry-exhausted'
+            || event.phase === 'ai:runtime:retry-skipped';
           appendLog(session, event.phase, event.message, {
             stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(event.details),

@@ -25,7 +25,7 @@ export function useBrowserChatSessionPagination<TSession>(
     if (!page.hasMore || !next || loadingMore) return;
     setLoadingMore(true);
     try {
-      const params = new URLSearchParams({ limit: '40' });
+      const params = new URLSearchParams({ limit: '10' });
       if (next.beforeId) params.set('beforeId', next.beforeId);
       if (next.beforeUpdatedAt) params.set('beforeUpdatedAt', next.beforeUpdatedAt);
       const response = await fetch(apiUrl(`/api/browser-chat?${params.toString()}`), { cache: 'no-store' });

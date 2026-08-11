@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { generateText } from 'ai';
+import { generateText, Output } from 'ai';
+import { z } from 'zod';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
+import { aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
@@ -90,6 +92,25 @@ type PersonalMemoryExtractionDraft = PersonalMemoryDraft & {
 const memoryTypes: PersonalMemoryType[] = ['alias', 'preference', 'workflow', 'domain_fact'];
 const memoryScopes: PersonalMemoryScope[] = ['global', 'domain'];
 const memoryStatuses: PersonalMemoryStatus[] = ['active', 'disabled'];
+const personalMemoryExtractionSchema = z.object({
+  items: z.array(z.object({
+    scope: z.enum(['global', 'domain']),
+    domain: z.string().max(253).optional(),
+    type: z.enum(['alias', 'preference', 'workflow', 'domain_fact']),
+    key: z.string().min(1).max(120),
+    aliases: z.array(z.string().min(1).max(120)).max(8).optional(),
+    value: z.string().min(1).max(500),
+    confidence: z.number().min(0).max(1).optional(),
+    evidence: z.array(z.string().min(1).max(500)).min(1).max(8),
+    durability: z.enum([
+      'explicit_preference',
+      'explicit_workflow',
+      'explicit_alias',
+      'explicit_remember',
+      'repeated_user_behavior',
+    ]),
+  })).max(8),
+});
 
 function now() {
   return new Date().toISOString();
@@ -576,22 +597,6 @@ function summarizeStep(step: StepExecutionResult) {
   };
 }
 
-function extractJsonObject(text: string) {
-  const trimmed = text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-  const candidate = fenced || trimmed;
-  try {
-    return JSON.parse(candidate) as unknown;
-  } catch {
-    const start = candidate.indexOf('{');
-    const end = candidate.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      return JSON.parse(candidate.slice(start, end + 1)) as unknown;
-    }
-    throw new Error('AI personal memory extraction did not return JSON.');
-  }
-}
-
 const personalMemoryDurabilitySignals = new Set<PersonalMemoryDurabilitySignal>([
   'explicit_preference',
   'explicit_workflow',
@@ -642,16 +647,6 @@ export function filterDurablePersonalMemoryDrafts(
   });
 }
 
-function parseExtractionItems(text: string, userMessages: string[]): PersonalMemoryDraft[] {
-  const parsed = extractJsonObject(text);
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
-  const items = (parsed as { items?: unknown }).items;
-  const drafts = Array.isArray(items)
-    ? items.filter((item): item is PersonalMemoryExtractionDraft => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
-    : [];
-  return filterDurablePersonalMemoryDrafts(drafts, userMessages);
-}
-
 function compactConversationForMemory(messages: PersonalMemoryConversationMessage[]) {
   return messages.map((message) => ({ role: message.role, content: compactText(message.content, 1400) }));
 }
@@ -694,7 +689,7 @@ function buildExtractionPrompt(input: {
   };
   return [
     'You extract durable personal short memory for a browser assistant.',
-    'Return ONLY strict JSON: {"items":[...]}',
+    'Return one object matching the configured output schema.',
     '',
     'Allowed item fields:',
     '- scope: "global" or "domain"',
@@ -809,31 +804,29 @@ export async function extractPersonalMemoryFromTurn(input: {
     existingItems,
   });
   const timeoutMs = personalMemoryExtractionTimeoutMs();
-  const timeoutController = new AbortController();
-  const timer = setTimeout(() => timeoutController.abort(new Error(`Personal memory extraction timed out after ${timeoutMs}ms`)), timeoutMs);
-  try {
-    const result = await generateText({
-      model: getModel(),
-      temperature: 0.1,
-      maxRetries: 0,
-      prompt,
-      abortSignal: timeoutController.signal,
-    });
-    const items = upsertExtractedPersonalMemoryItems({
-      userId,
-      domain: currentDomain,
-      sourceSessionId: input.sourceSessionId,
-      sourceMessageIds: input.sourceMessageIds,
-      sourceUrl: input.currentUrl || input.targetUrl || '',
-      items: parseExtractionItems(result.text || '', [
-        ...(input.conversation || []).filter((message) => message.role === 'user').map((message) => message.content),
-        input.userMessage,
-      ]),
-    });
-    return { items, rawText: result.text || '', skipped: false };
-  } finally {
-    clearTimeout(timer);
-  }
+  const result = await generateText({
+    model: getModel(),
+    temperature: 0.1,
+    reasoning: aiReasoningEffort(),
+    maxRetries: 0,
+    prompt,
+    output: Output.object({ schema: personalMemoryExtractionSchema }),
+    timeout: timeoutMs,
+    telemetry: aiTelemetry('personal-memory-extraction'),
+  });
+  const userMessages = [
+    ...(input.conversation || []).filter((message) => message.role === 'user').map((message) => message.content),
+    input.userMessage,
+  ];
+  const items = upsertExtractedPersonalMemoryItems({
+    userId,
+    domain: currentDomain,
+    sourceSessionId: input.sourceSessionId,
+    sourceMessageIds: input.sourceMessageIds,
+    sourceUrl: input.currentUrl || input.targetUrl || '',
+    items: filterDurablePersonalMemoryDrafts(result.output.items, userMessages),
+  });
+  return { items, rawText: safeJson(result.output), skipped: false };
 }
 
 export function personalMemoryDiagnostics() {

@@ -61,6 +61,11 @@ type AutomationCase = {
   updatedAt?: string;
 };
 
+type AutomationCaseListPage = {
+  hasMore?: boolean;
+  next?: { beforeId?: string; beforeUpdatedAt?: string };
+};
+
 type AutomationSchedule = {
   id: string;
   name: string;
@@ -297,6 +302,22 @@ async function fetchCollection<T>(
   const response = await fetch(apiUrl(path, userId), { cache: 'no-store' });
   const payload = await readApiJson<unknown>(response, fallback);
   return collectionItems(payload, keys).map(normalize).filter((item): item is T => Boolean(item));
+}
+
+async function fetchAutomationCasePage(
+  userId: string,
+  t: Translate,
+  params: Record<string, string> = { limit: '10' },
+) {
+  const response = await fetch(apiUrl('/api/automation/cases', userId, params), { cache: 'no-store' });
+  const payload = await readApiJson<unknown>(response, t('加载自动化用例失败'));
+  const record = asRecord(payload);
+  return {
+    cases: collectionItems(payload, ['cases'])
+      .map((value) => normalizeCase(value, t))
+      .filter((item): item is AutomationCase => Boolean(item)),
+    page: asRecord(record?.page) as AutomationCaseListPage | undefined,
+  };
 }
 
 function formatDateTime(value: string | undefined, language: Language) {
@@ -542,6 +563,8 @@ export function AutomationWorkspace({
   const { language, t } = useI18n();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [cases, setCases] = useState<AutomationCase[]>([]);
+  const [caseListPage, setCaseListPage] = useState<AutomationCaseListPage>({});
+  const [loadingMoreCases, setLoadingMoreCases] = useState(false);
   const [schedules, setSchedules] = useState<AutomationSchedule[]>([]);
   const [runs, setRuns] = useState<AutomationRun[]>([]);
   const [caseDraft, setCaseDraft] = useState<CaseDraft>(emptyCaseDraft);
@@ -576,12 +599,13 @@ export function AutomationWorkspace({
     const loadingStartedAt = Date.now();
     if (!silent) setLoading(true);
     try {
-      const [nextCases, nextSchedules, nextRuns] = await Promise.all([
-        fetchCollection('/api/automation/cases', userId, ['cases'], (value) => normalizeCase(value, t), t('加载自动化用例失败')),
+      const [casePage, nextSchedules, nextRuns] = await Promise.all([
+        fetchAutomationCasePage(userId, t),
         fetchCollection('/api/automation/schedules', userId, ['schedules'], (value) => normalizeSchedule(value, t), t('加载执行计划失败')),
         fetchCollection('/api/automation/runs', userId, ['runs'], (value) => normalizeRun(value, t), t('加载运行历史失败')),
       ]);
-      setCases(nextCases);
+      setCases(casePage.cases);
+      setCaseListPage(casePage.page || {});
       setSchedules(nextSchedules);
       setRuns(nextRuns);
       setError('');
@@ -594,6 +618,32 @@ export function AutomationWorkspace({
       }
     }
   }, [t, userId]);
+
+  const loadMoreCases = useCallback(async () => {
+    const next = caseListPage.next;
+    if (!caseListPage.hasMore || !next || loadingMoreCases) return;
+    setLoadingMoreCases(true);
+    try {
+      const page = await fetchAutomationCasePage(userId, t, {
+        limit: '10',
+        ...(next.beforeId ? { beforeId: next.beforeId } : {}),
+        ...(next.beforeUpdatedAt ? { beforeUpdatedAt: next.beforeUpdatedAt } : {}),
+      });
+      setCases((current) => {
+        const byId = new Map(current.map((item) => [item.id, item]));
+        for (const item of page.cases) byId.set(item.id, item);
+        return [...byId.values()].sort((left, right) => (
+          String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''))
+          || right.id.localeCompare(left.id)
+        ));
+      });
+      setCaseListPage(page.page || {});
+    } catch (loadError) {
+      setError(loadError instanceof Error ? t(loadError.message) : t('加载自动化用例失败'));
+    } finally {
+      setLoadingMoreCases(false);
+    }
+  }, [caseListPage, loadingMoreCases, t, userId]);
 
   useLayoutEffect(() => {
     const storedSidebarCollapsed = readSidebarCollapsedPreference(initialSidebarCollapsed);
@@ -610,11 +660,11 @@ export function AutomationWorkspace({
       if (event.entityType === 'automationCase') {
         if (event.deleted) {
           setCases((current) => current.filter((item) => item.id !== event.id));
-          return;
+        } else {
+          const record = normalizeCase(event.patch, t);
+          if (record) setCases((current) => [record, ...current.filter((item) => item.id !== record.id)]);
         }
-        const record = normalizeCase(event.patch, t);
-        if (!record) return;
-        setCases((current) => [record, ...current.filter((item) => item.id !== record.id)]);
+        void loadAll(true);
         return;
       }
       if (event.entityType === 'automationSchedule') {
@@ -1071,6 +1121,17 @@ export function AutomationWorkspace({
             ) : (
               <p className="browser-chat-history-filter-empty">{t('暂无用例')}</p>
             )}
+            {!loading && caseListPage.hasMore ? (
+              <button
+                className="browser-chat-history-load-more"
+                disabled={loadingMoreCases}
+                onClick={() => void loadMoreCases()}
+                type="button"
+              >
+                {loadingMoreCases ? <Loader2 className="spin" size={13} /> : null}
+                {t(loadingMoreCases ? '正在加载' : '加载更多')}
+              </button>
+            ) : null}
           </div>
         </section>
 

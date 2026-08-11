@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   browserChatAiCycleAnchorsText,
   browserChatMessageElapsedMs,
+  browserChatMessageIsTextStreaming,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
@@ -11,6 +12,23 @@ import {
   formatBrowserChatElapsedTime,
   isBrowserChatManualVerificationStatusText,
 } from './browser-chat-message-model';
+
+test('shows the streaming caret only while model text is actively streaming', () => {
+  assert.equal(browserChatMessageIsTextStreaming({
+    activity: { phase: 'ai:text:streaming' },
+    content: '华',
+    id: 'a1',
+    role: 'assistant',
+    status: 'running',
+  }), true);
+  assert.equal(browserChatMessageIsTextStreaming({
+    activity: { phase: 'browser:tool' },
+    content: '华',
+    id: 'a1',
+    role: 'assistant',
+    status: 'running',
+  }), false);
+});
 
 test('recognizes localized manual-verification status text without duplicating the verification card', () => {
   assert.equal(isBrowserChatManualVerificationStatusText(

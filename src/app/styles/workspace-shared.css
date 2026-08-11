@@ -480,10 +480,21 @@
     .automation-case-history-list
   ) {
     box-sizing: border-box;
-    justify-items: start;
-    margin-right: -10px;
-    padding: 10px 10px 0 0;
-    width: calc(100% + 10px);
+    justify-items: center;
+    margin-right: 0;
+    padding: 0;
+    scrollbar-gutter: auto;
+    scrollbar-width: none;
+    width: 100%;
+  }
+
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-list,
+    .automation-case-history-list
+  )::-webkit-scrollbar {
+    display: none;
+    height: 0;
+    width: 0;
   }
 
   .browser-chat-layout.sidebar-collapsed :is(
@@ -497,34 +508,44 @@
 
   .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete {
     align-items: center;
-    background: var(--panel);
-    border: 1px solid currentColor;
-    border-radius: 999px;
-    box-shadow: 0 2px 7px color-mix(in srgb, var(--foreground) 14%, transparent);
+    background: var(--surface-hover);
+    border: 0;
+    border-radius: 10px;
+    box-shadow: none;
     color: var(--danger);
     display: inline-flex;
-    height: 19px;
+    height: 36px;
     justify-content: center;
-    min-height: 19px;
+    inset: 0;
+    min-height: 36px;
     opacity: 0;
     padding: 0;
     pointer-events: none;
     position: absolute;
-    right: 0;
-    top: 0;
-    transform: translate(50%, -50%) scale(0.82);
-    transition: opacity var(--motion-fast) ease, transform var(--motion-fast) ease;
-    width: 19px;
+    transform: none;
+    transition: opacity var(--motion-fast) ease;
+    width: 36px;
     z-index: 3;
   }
 
   .browser-chat-layout.sidebar-collapsed :is(
     .browser-chat-recent-item,
     .automation-case-history-item
-  ):is(:hover, :focus-within) > .browser-chat-collapsed-delete {
+  ):is(:hover, :has(> .browser-chat-collapsed-delete:focus-visible)) > .browser-chat-collapsed-delete {
     opacity: 1;
     pointer-events: auto;
-    transform: translate(50%, -50%) scale(1);
+    transform: none;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item:is(
+    :hover,
+    :has(> .browser-chat-collapsed-delete:focus-visible)
+  ) > .browser-chat-recent-open,
+  .browser-chat-layout.sidebar-collapsed .automation-case-history-item:is(
+    :hover,
+    :has(> .browser-chat-collapsed-delete:focus-visible)
+  ) > .automation-case-history-open {
+    opacity: 0;
   }
 
   .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete:not(:disabled):hover {
