@@ -6937,12 +6937,13 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const frame = window.requestAnimationFrame(() => {
       const activeTab = tabList.querySelector<HTMLElement>('.browser-chat-embedded-tab[aria-selected="true"]');
       if (!activeTab) return;
-      const listRect = tabList.getBoundingClientRect();
+      const scrollViewport = activeTab.closest<HTMLElement>('.browser-chat-embedded-tab-stack') || tabList;
+      const listRect = scrollViewport.getBoundingClientRect();
       const tabRect = activeTab.getBoundingClientRect();
       const leftDelta = tabRect.left - listRect.left;
       const rightDelta = tabRect.right - listRect.right;
-      if (leftDelta < 0) tabList.scrollBy({ left: leftDelta - 8, behavior: 'auto' });
-      else if (rightDelta > 0) tabList.scrollBy({ left: rightDelta + 8, behavior: 'auto' });
+      if (leftDelta < 0) scrollViewport.scrollBy({ left: leftDelta - 8, behavior: 'auto' });
+      else if (rightDelta > 0) scrollViewport.scrollBy({ left: rightDelta + 8, behavior: 'auto' });
     });
     return () => window.cancelAnimationFrame(frame);
   }, [activeEmbeddedTab?.id, renderedVisibleGroups]);

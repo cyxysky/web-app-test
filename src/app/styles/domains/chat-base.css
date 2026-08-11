@@ -934,7 +934,7 @@
   z-index: 2;
 }
 
-.browser-chat-embedded-tab-list::-webkit-scrollbar {
+.browser-chat-embedded-tab-stack::-webkit-scrollbar {
   display: none;
 }
 
@@ -1044,20 +1044,6 @@
   padding: 0 8px;
 }
 
-.browser-chat-embedded-tab--compact:is(.active, :hover, :focus-within) {
-  padding-right: 32px;
-}
-
-.browser-chat-embedded-tab--full.active {
-  padding-right: 32px;
-}
-
-.browser-chat-embedded-tab--full:is(:hover, :focus-within),
-.browser-chat-embedded-tab--full:has(.browser-chat-embedded-tab-mute.is-muted),
-.browser-chat-embedded-tab--full.browser-chat-embedded-tab-drag-overlay {
-  padding-right: 52px;
-}
-
 .browser-chat-embedded-tab--compact .browser-chat-embedded-tab-mute {
   display: none;
 }
@@ -1082,7 +1068,9 @@
   left: 50%;
   opacity: 0;
   pointer-events: none;
+  position: absolute;
   right: auto;
+  top: 50%;
   transform: translate(-50%, -50%);
 }
 
@@ -1130,6 +1118,11 @@
 .browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-close,
 .browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-mute {
   opacity: 0.88;
+}
+
+.browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab--full.browser-chat-embedded-tab-drag-overlay .browser-chat-embedded-tab-mute {
+  display: inline-flex;
 }
 
 .browser-chat-embedded-tab-icon {
@@ -1195,17 +1188,15 @@
   border-radius: 999px;
   color: var(--muted);
   cursor: pointer;
-  display: inline-flex;
+  display: none;
+  flex: 0 0 20px;
   height: 20px;
   justify-content: center;
-  left: auto;
   opacity: 0;
   padding: 0;
   pointer-events: none;
-  position: absolute;
-  right: 8px;
-  top: 50%;
-  transform: translateY(-50%);
+  position: static;
+  transform: none;
   transition:
     background 0.16s ease,
     color 0.16s ease,
@@ -1221,24 +1212,24 @@
   border-radius: 999px;
   color: var(--muted);
   cursor: pointer;
-  display: inline-flex;
+  display: none;
+  flex: 0 0 20px;
   height: 20px;
   justify-content: center;
   opacity: 0;
   padding: 0;
   pointer-events: none;
-  position: absolute;
-  right: 28px;
-  top: 50%;
-  transform: translateY(-50%);
+  position: static;
+  transform: none;
   transition: background 0.16s ease, color 0.16s ease, opacity 0.16s ease;
   width: 20px;
   z-index: 2;
 }
 
-.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-mute,
-.browser-chat-embedded-tab:focus-within .browser-chat-embedded-tab-mute,
-.browser-chat-embedded-tab-mute.is-muted {
+.browser-chat-embedded-tab--full:hover .browser-chat-embedded-tab-mute,
+.browser-chat-embedded-tab--full:focus-within .browser-chat-embedded-tab-mute,
+.browser-chat-embedded-tab--full .browser-chat-embedded-tab-mute.is-muted {
+  display: inline-flex;
   opacity: 0.88;
   pointer-events: auto;
 }
@@ -1253,7 +1244,9 @@
 }
 
 .browser-chat-embedded-tab.active .browser-chat-embedded-tab-close,
-.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-close {
+.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab:focus-within .browser-chat-embedded-tab-close {
+  display: inline-flex;
   opacity: 0.88;
   pointer-events: auto;
 }
