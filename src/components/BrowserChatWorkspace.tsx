@@ -106,6 +106,7 @@ import {
   parseBrowserChatRealtimePatch,
 } from '@/components/browser-chat-realtime-model';
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
+import { resolveEmbeddedBrowserTabLayout, type EmbeddedBrowserTabDensity } from '@/components/embedded-browser-tab-layout';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import {
   useBrowserChatSkillCatalog,
@@ -474,8 +475,6 @@ type EmbeddedBrowserTabDndData = {
   tabId: string;
   type: 'embedded-browser-tab';
 };
-
-type EmbeddedBrowserTabDensity = 'close-only' | 'compact' | 'full' | 'icon-only';
 
 type EmbeddedBrowserGroupDndData = {
   groupId: string;
@@ -6908,21 +6907,16 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const groupGapWidth = Math.max(0, groupCount - 1) * 5;
     const tagToTabGapWidth = expandedGroups.filter((group) => group.tabs.length > 0).length * 4;
     const tabGapWidth = expandedGroups.reduce((total, group) => total + Math.max(0, group.tabs.length - 1) * 4, 0);
+    const endPaddingWidth = 6;
     const fixedWidth = groupCount * 36
       + groupGapWidth
       + tagToTabGapWidth
-      + tabGapWidth;
+      + tabGapWidth
+      + endPaddingWidth;
     const requestedWidth = tabListWidth > 0 && tabCount > 0
       ? Math.floor((tabListWidth - fixedWidth) / tabCount)
       : 210;
-    const tabWidth = Math.min(210, Math.max(64, requestedWidth));
-    const density: EmbeddedBrowserTabDensity = tabWidth >= 136
-      ? 'full'
-      : tabWidth >= 64
-        ? 'compact'
-        : tabWidth >= 48
-          ? 'icon-only'
-          : 'close-only';
+    const { density, width: tabWidth } = resolveEmbeddedBrowserTabLayout(requestedWidth);
     return {
       density,
       style: { '--embedded-tab-width': `${tabWidth}px` } as CSSProperties,
@@ -7064,7 +7058,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     tabDragCurrentGroupRef.current = dragData.groupId;
     tabDragSourceGroupRef.current = dragData.groupId;
     setDraggingTabId(dragData.tabId);
-    const sourceRect = event.active.rect.current.initial;
+    const sourceElement = event.activatorEvent.target instanceof Element
+      ? event.activatorEvent.target.closest<HTMLElement>('.browser-chat-embedded-tab')
+      : null;
+    const sourceRect = sourceElement?.getBoundingClientRect() || event.active.rect.current.initial;
     setDraggingTabSize(sourceRect ? { height: sourceRect.height, width: sourceRect.width } : null);
     setDragDropGroupId(dragData.groupId);
     setTabDragPreview(Object.fromEntries(visibleGroups.map((group) => [group.id, group.tabs.map((tab) => tab.id)])));
@@ -9143,7 +9140,14 @@ export function BrowserChatWorkspace({
 
       </WorkspaceSidebar>
 
-      <main aria-busy={messageViewportPositioning} className={messageViewportPositioning ? 'browser-chat-main is-positioning-chat' : 'browser-chat-main'}>
+      <main
+        aria-busy={messageViewportPositioning}
+        className={[
+          'browser-chat-main',
+          messageViewportPositioning ? 'is-positioning-chat' : '',
+          embeddedBrowserActive && embeddedChatCollapsed ? 'embedded-chat-collapsed' : '',
+        ].filter(Boolean).join(' ')}
+      >
         {embeddedBrowserActive ? (
           <div
             className={embeddedChatCollapsed ? 'browser-chat-embedded-workspace chat-collapsed' : 'browser-chat-embedded-workspace'}

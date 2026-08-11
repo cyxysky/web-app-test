@@ -6,8 +6,9 @@
   grid-template-columns: var(--browser-chat-sidebar-expanded-width) minmax(0, 1fr);
   min-width: 0;
   width: 100%;
-  --browser-chat-sidebar-expanded-width: 248px;
-  --browser-chat-sidebar-collapsed-width: 60px;
+  --browser-chat-sidebar-expanded-width: 258px;
+  --browser-chat-sidebar-collapsed-width: 64px;
+  --browser-chat-main-inset: 8px;
   background: var(--background);
   height: 100dvh;
   min-height: 100dvh;
@@ -727,8 +728,6 @@
 
 /* Sidebar and main workspace */
 .browser-chat-layout {
-  --browser-chat-sidebar-expanded-width: 258px;
-  --browser-chat-sidebar-collapsed-width: 64px;
   background: var(--sidebar);
 }
 
@@ -856,7 +855,11 @@
   border-radius: 14px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.025);
   height: calc(100% - 16px);
-  margin: 8px 8px 8px 0;
+  margin: 8px var(--browser-chat-main-inset) 8px 0;
+}
+
+.browser-chat-main.embedded-chat-collapsed {
+  margin-right: 0;
 }
 
 /* Loading states inherit their surrounding surface instead of painting a

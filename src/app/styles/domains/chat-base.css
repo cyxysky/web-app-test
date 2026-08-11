@@ -875,7 +875,7 @@
 }
 
 .browser-chat-embedded-workspace.chat-collapsed {
-  grid-template-columns: minmax(420px, 1fr) var(--browser-chat-sidebar-collapsed-width, 56px);
+  grid-template-columns: minmax(420px, 1fr) var(--browser-chat-sidebar-collapsed-width);
 }
 
 .browser-chat-embedded-browser>header {
@@ -947,9 +947,7 @@
   min-width: 0;
   padding-top: 0;
   position: relative;
-  transition:
-    flex-basis 0.16s ease,
-    filter 0.16s ease;
+  transition: none;
 }
 
 .browser-chat-embedded-tab-group-end-drop-zone {
@@ -984,15 +982,6 @@
   flex: 0 0 auto;
 }
 
-.browser-chat-embedded-tab-group-tag:hover {
-  background: rgba(255, 255, 255, 0.68);
-  border-color: rgba(92, 105, 124, 0.16);
-  color: var(--accent-strong);
-  flex-basis: 80px;
-  max-width: 80px;
-  min-width: 80px;
-}
-
 .browser-chat-embedded-tab-group-label:focus-visible {
   outline: 2px solid var(--accent-strong);
   outline-offset: 2px;
@@ -1003,13 +992,6 @@
   border-color: color-mix(in srgb, var(--accent-strong) 34%, transparent);
   color: var(--accent-strong);
   opacity: 1;
-}
-
-.browser-chat-embedded-tab-group-tag:hover .browser-chat-embedded-tab-group-action {
-  flex-basis: 20px;
-  opacity: 0.74;
-  pointer-events: auto;
-  width: 20px;
 }
 
 .browser-chat-embedded-tab-group-action:focus-visible {
@@ -1054,12 +1036,26 @@
 }
 
 .browser-chat-embedded-tab--full {
-  padding: 0 52px 0 11px;
+  padding: 0 10px;
 }
 
 .browser-chat-embedded-tab--compact {
   gap: 6px;
-  padding: 0 30px 0 8px;
+  padding: 0 8px;
+}
+
+.browser-chat-embedded-tab--compact:is(.active, :hover, :focus-within) {
+  padding-right: 32px;
+}
+
+.browser-chat-embedded-tab--full.active {
+  padding-right: 32px;
+}
+
+.browser-chat-embedded-tab--full:is(:hover, :focus-within),
+.browser-chat-embedded-tab--full:has(.browser-chat-embedded-tab-mute.is-muted),
+.browser-chat-embedded-tab--full.browser-chat-embedded-tab-drag-overlay {
+  padding-right: 52px;
 }
 
 .browser-chat-embedded-tab--compact .browser-chat-embedded-tab-mute {
@@ -1068,8 +1064,8 @@
 
 .browser-chat-embedded-tab--icon-only {
   gap: 0;
-  justify-content: flex-start;
-  padding: 0 22px 0 2px;
+  justify-content: center;
+  padding: 0;
 }
 
 .browser-chat-embedded-tab--icon-only :is(
@@ -1081,35 +1077,27 @@
   display: none;
 }
 
-.browser-chat-embedded-tab--icon-only .browser-chat-embedded-tab-close {
-  display: inline-flex;
-  opacity: 0.72;
-  pointer-events: auto;
-  right: 2px;
-}
-
-.browser-chat-embedded-tab--close-only {
-  gap: 0;
-  padding: 0;
-}
-
-.browser-chat-embedded-tab--close-only :is(
-  .browser-chat-embedded-tab-icon,
-  .browser-chat-embedded-tab-text,
-  .browser-chat-embedded-tab-pin,
-  .browser-chat-embedded-tab-loading,
-  .browser-chat-embedded-tab-mute
-) {
-  display: none;
-}
-
-.browser-chat-embedded-tab--close-only .browser-chat-embedded-tab-close {
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only .browser-chat-embedded-tab-close {
   display: inline-flex;
   left: 50%;
-  opacity: 0.72;
-  pointer-events: auto;
+  opacity: 0;
+  pointer-events: none;
   right: auto;
   transform: translate(-50%, -50%);
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only.active .browser-chat-embedded-tab-close {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only:is(:hover, :focus-within) .browser-chat-embedded-tab-icon {
+  opacity: 0;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only:is(:hover, :focus-within) .browser-chat-embedded-tab-close {
+  opacity: 0.88;
+  pointer-events: auto;
 }
 
 .browser-chat-embedded-tab:active {
@@ -1193,6 +1181,7 @@
   flex: 1 1 auto;
   line-height: 1;
   min-width: 0;
+  overflow: hidden;
 }
 
 .browser-chat-embedded-tab.loading .browser-chat-embedded-tab-icon {
@@ -1247,8 +1236,8 @@
   z-index: 2;
 }
 
-.browser-chat-embedded-tab.active .browser-chat-embedded-tab-mute,
 .browser-chat-embedded-tab:hover .browser-chat-embedded-tab-mute,
+.browser-chat-embedded-tab:focus-within .browser-chat-embedded-tab-mute,
 .browser-chat-embedded-tab-mute.is-muted {
   opacity: 0.88;
   pointer-events: auto;
@@ -1406,7 +1395,6 @@
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tab:hover,
-:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag:hover,
 :root[data-theme="dark"] .browser-chat-embedded-tool-button:not(:disabled):hover {
   background: rgba(255, 255, 255, 0.12);
   border-color: rgba(255, 255, 255, 0.12);
@@ -3443,12 +3431,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   border-color: rgba(255, 255, 255, 0.09);
   color: var(--accent-strong);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
-}
-
-:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag:hover {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.08);
-  color: var(--accent-strong);
 }
 
 :root[data-theme="dark"] .browser-chat-embedded-tool-button.active {
