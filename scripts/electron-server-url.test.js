@@ -4,7 +4,23 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
-const { compiledServerBasePath, serverRouteUrl, withServerBasePath } = require('../electron/server-url');
+const {
+  compiledServerBasePath,
+  loadDevelopmentEnvironment,
+  serverRouteUrl,
+  withServerBasePath,
+} = require('../electron/server-url');
+
+test('loads Next development environment before Electron derives server URLs', () => {
+  const calls = [];
+  const result = loadDevelopmentEnvironment('C:\\project', (projectDir, dev) => {
+    calls.push({ projectDir, dev });
+    return { loadedEnvFiles: [{ path: '.env' }] };
+  });
+
+  assert.deepEqual(calls, [{ projectDir: 'C:\\project', dev: true }]);
+  assert.deepEqual(result, { loadedEnvFiles: [{ path: '.env' }] });
+});
 
 test('uses the compiled base path for the Electron local server URL', () => {
   const serverDir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpilot-electron-server-'));

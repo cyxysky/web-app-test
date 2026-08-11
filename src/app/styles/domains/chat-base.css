@@ -1036,12 +1036,12 @@
 }
 
 .browser-chat-embedded-tab--full {
-  padding: 0 10px;
+  padding: 0 8px;
 }
 
 .browser-chat-embedded-tab--compact {
-  gap: 6px;
-  padding: 0 8px;
+  gap: 4px;
+  padding: 0 6px;
 }
 
 .browser-chat-embedded-tab--compact .browser-chat-embedded-tab-mute {
@@ -1049,9 +1049,9 @@
 }
 
 .browser-chat-embedded-tab--icon-only {
-  gap: 0;
+  gap: 4px;
   justify-content: center;
-  padding: 0;
+  padding: 0 6px;
 }
 
 .browser-chat-embedded-tab--icon-only :is(
@@ -1065,13 +1065,13 @@
 
 .browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only .browser-chat-embedded-tab-close {
   display: inline-flex;
-  left: 50%;
+  flex-basis: 0;
   opacity: 0;
+  overflow: hidden;
   pointer-events: none;
-  position: absolute;
-  right: auto;
-  top: 50%;
-  transform: translate(-50%, -50%);
+  position: static;
+  transform: none;
+  width: 0;
 }
 
 .browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only.active .browser-chat-embedded-tab-close {
@@ -1079,13 +1079,11 @@
   pointer-events: none;
 }
 
-.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only:is(:hover, :focus-within) .browser-chat-embedded-tab-icon {
-  opacity: 0;
-}
-
 .browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only:is(:hover, :focus-within) .browser-chat-embedded-tab-close {
+  flex-basis: 18px;
   opacity: 0.88;
   pointer-events: auto;
+  width: 18px;
 }
 
 .browser-chat-embedded-tab:active {
@@ -1189,8 +1187,8 @@
   color: var(--muted);
   cursor: pointer;
   display: none;
-  flex: 0 0 20px;
-  height: 20px;
+  flex: 0 0 18px;
+  height: 18px;
   justify-content: center;
   opacity: 0;
   padding: 0;
@@ -1201,7 +1199,7 @@
     background 0.16s ease,
     color 0.16s ease,
     opacity 0.16s ease;
-  width: 20px;
+  width: 18px;
   z-index: 2;
 }
 
@@ -1243,7 +1241,6 @@
   color: var(--accent-strong);
 }
 
-.browser-chat-embedded-tab.active .browser-chat-embedded-tab-close,
 .browser-chat-embedded-tab:hover .browser-chat-embedded-tab-close,
 .browser-chat-embedded-tab:focus-within .browser-chat-embedded-tab-close {
   display: inline-flex;

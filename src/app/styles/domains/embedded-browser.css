@@ -6,20 +6,293 @@
 }
 
 .browser-chat-embedded-tab-list {
-  gap: 4px;
-  padding-inline: 4px;
+  -ms-overflow-style: none;
+  gap: 5px;
+  isolation: isolate;
+  overflow-anchor: none;
+  overflow-x: hidden;
+  overflow-y: hidden;
+  padding: 0;
+  scrollbar-width: none;
 }
 
-.browser-chat-embedded-tab,
-.browser-chat-embedded-tab-group-tag {
-  border-radius: 9px 9px 0 0;
+.browser-chat-embedded-tab-list::-webkit-scrollbar {
+  display: none;
+}
+
+.browser-chat-embedded-tab-group-shell {
+  --embedded-group-collapsed-width: 28px;
+  --embedded-group-expanded-width: 68px;
+  --embedded-group-control-width: var(--embedded-group-collapsed-width);
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+}
+
+.browser-chat-embedded-tab-group-shell:has(> .browser-chat-embedded-tab-group-tag .browser-chat-embedded-tab-group-action:focus-visible) {
+  --embedded-group-control-width: var(--embedded-group-expanded-width);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .browser-chat-embedded-tab-group-shell:has(> .browser-chat-embedded-tab-group-tag:hover) {
+    --embedded-group-control-width: var(--embedded-group-expanded-width);
+  }
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed {
+  flex-basis: var(--embedded-group-control-width);
+}
+
+.browser-chat-embedded-tab-group-shell.collapsed:is(:hover, :focus-within) {
+  flex-basis: var(--embedded-group-control-width);
+}
+
+.browser-chat-embedded-tab-stack {
+  flex: 1 1 0;
+  gap: 0;
+  max-width: calc(100% - var(--embedded-group-control-width) - 4px);
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  padding: 0 10px;
+  scroll-padding-inline: 10px;
+  scrollbar-width: none;
+  transition: max-width 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.browser-chat-embedded-tab-stack::-webkit-scrollbar {
+  display: none;
+}
+
+.browser-chat-embedded-tab {
+  background: transparent;
+  border: 0;
+  border-radius: 10px 10px 0 0;
+  box-shadow: none;
+  color: var(--muted-strong);
+  flex: 1 1 var(--embedded-tab-width, 210px);
+  min-width: 64px;
+  overflow: visible;
+  width: var(--embedded-tab-width, 210px);
+  z-index: 0;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--full {
+  gap: 8px;
+  padding: 0 10px;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--compact {
+  gap: 6px;
+  padding: 0 8px;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only {
+  gap: 4px;
+  padding: 0 8px;
+}
+
+.browser-chat-embedded-tab:not(.active):hover,
+.browser-chat-embedded-tab:not(.active):focus-within {
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  border-radius: 10px;
+  color: var(--foreground);
 }
 
 .browser-chat-embedded-tab.active {
+  --embedded-active-tab-bg: color-mix(in srgb, var(--embedded-toolbar-bg) 86%, var(--foreground) 14%);
+  background: var(--embedded-active-tab-bg);
+  border: 0;
   box-shadow:
-    0 -1px 0 color-mix(in srgb, var(--border) 70%, transparent),
-    1px 0 0 color-mix(in srgb, var(--border) 70%, transparent),
-    -1px 0 0 color-mix(in srgb, var(--border) 70%, transparent);
+    inset 0 2px 0 color-mix(in srgb, var(--accent-strong) 86%, transparent),
+    inset 1px 0 0 color-mix(in srgb, var(--foreground) 7%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+  z-index: 2;
+}
+
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-text strong {
+  font-weight: 650;
+}
+
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon {
+  color: var(--accent-strong);
+}
+
+.browser-chat-embedded-tab.active::before,
+.browser-chat-embedded-tab.active::after {
+  bottom: 0;
+  content: "";
+  height: 10px;
+  pointer-events: none;
+  position: absolute;
+  width: 10px;
+}
+
+.browser-chat-embedded-tab.active::before {
+  border-radius: 0 0 10px 0;
+  box-shadow: 5px 5px 0 5px var(--embedded-active-tab-bg);
+  left: -10px;
+}
+
+.browser-chat-embedded-tab.active::after {
+  border-radius: 0 0 0 10px;
+  box-shadow: -5px 5px 0 5px var(--embedded-active-tab-bg);
+  right: -10px;
+}
+
+.browser-chat-embedded-tab:not(.active)::after {
+  background: color-mix(in srgb, var(--foreground) 18%, transparent);
+  content: "";
+  height: 18px;
+  opacity: 0.72;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  top: 8px;
+  transition: opacity 120ms ease;
+  width: 1px;
+}
+
+.browser-chat-embedded-tab:not(.active):is(:hover, :focus-within)::after,
+.browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay::before,
+.browser-chat-embedded-tab.browser-chat-embedded-tab-drag-overlay::after {
+  content: none;
+}
+
+.browser-chat-embedded-tab:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--focus-ring) 72%, transparent);
+  outline: 0;
+}
+
+.browser-chat-embedded-tab-icon {
+  height: 16px;
+  width: 16px;
+}
+
+.browser-chat-embedded-tab-close {
+  flex-basis: 16px;
+  height: 16px;
+  width: 16px;
+}
+
+.browser-chat-embedded-tab--full .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab:hover .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab:focus-within .browser-chat-embedded-tab-close {
+  display: inline-flex;
+  opacity: 0.76;
+  pointer-events: auto;
+}
+
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only.active .browser-chat-embedded-tab-close,
+.browser-chat-embedded-tab.browser-chat-embedded-tab--icon-only:is(:hover, :focus-within) .browser-chat-embedded-tab-close {
+  flex-basis: 16px;
+  opacity: 0.76;
+  pointer-events: auto;
+  width: 16px;
+}
+
+.browser-chat-embedded-tab-close:hover,
+.browser-chat-embedded-tab.active .browser-chat-embedded-tab-close:hover {
+  background: color-mix(in srgb, var(--foreground) 12%, transparent) !important;
+  color: var(--foreground) !important;
+  opacity: 1;
+}
+
+.browser-chat-embedded-tab.pinned {
+  flex: 0 0 40px;
+  max-width: 40px;
+  min-width: 40px;
+  padding: 0 12px;
+  width: 40px;
+}
+
+.browser-chat-embedded-tab.pinned :is(
+  .browser-chat-embedded-tab-text,
+  .browser-chat-embedded-tab-pin,
+  .browser-chat-embedded-tab-close,
+  .browser-chat-embedded-tab-mute
+) {
+  display: none;
+}
+
+.browser-chat-embedded-tab-group-tag {
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  box-shadow: none;
+  flex: 0 0 var(--embedded-group-control-width);
+  gap: 2px;
+  height: 28px;
+  justify-content: flex-start;
+  margin-bottom: 3px;
+  max-width: var(--embedded-group-control-width);
+  min-width: var(--embedded-group-control-width);
+  overflow: hidden;
+  position: relative;
+  transition:
+    flex-basis 160ms cubic-bezier(0.2, 0, 0, 1),
+    max-width 160ms cubic-bezier(0.2, 0, 0, 1),
+    min-width 160ms cubic-bezier(0.2, 0, 0, 1);
+  z-index: 4;
+}
+
+.browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag,
+.browser-chat-embedded-tab-group-tag:hover,
+.browser-chat-embedded-tab-group-tag:focus-within,
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-shell.active .browser-chat-embedded-tab-group-tag,
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag:hover,
+:root[data-theme="dark"] .browser-chat-embedded-tab-group-tag:focus-within {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+
+.browser-chat-embedded-tab-group-tag:hover,
+.browser-chat-embedded-tab-group-tag:focus-within {
+  flex-basis: var(--embedded-group-control-width);
+}
+
+.browser-chat-embedded-tab-group-label {
+  border-radius: 8px;
+  flex-basis: 28px;
+  height: 28px;
+  width: 28px;
+}
+
+.browser-chat-embedded-tab-group-label:hover {
+  background: color-mix(in srgb, var(--embedded-group-icon-color) 12%, transparent);
+}
+
+.browser-chat-embedded-tab-group-action,
+.browser-chat-embedded-tab-group-tag:focus-within .browser-chat-embedded-tab-group-action {
+  border: 0;
+  box-sizing: border-box;
+  flex: 0 0 18px;
+  height: 18px;
+  min-height: 18px;
+  min-width: 18px;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  transform: translateX(4px) scale(0.88);
+  width: 18px;
+}
+
+.browser-chat-embedded-tab-group-tag:hover .browser-chat-embedded-tab-group-action,
+.browser-chat-embedded-tab-group-tag:has(.browser-chat-embedded-tab-group-action:focus-visible) .browser-chat-embedded-tab-group-action {
+  flex-basis: 18px;
+  min-width: 18px;
+  opacity: 0.72;
+  pointer-events: auto;
+  transform: none;
+  width: 18px;
+}
+
+.browser-chat-embedded-tab-strip {
+  padding: 6px 8px 0;
 }
 
 .browser-chat-embedded-toolbar {
@@ -42,4 +315,61 @@
 .browser-chat-embedded-resizer span {
   border-radius: 999px;
   width: 2px;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .browser-chat-embedded-tab-group-shell {
+    --embedded-group-collapsed-width: 88px;
+    --embedded-group-expanded-width: 88px;
+  }
+
+  .browser-chat-embedded-tab-group-tag {
+    max-width: var(--embedded-group-control-width);
+  }
+
+  .browser-chat-embedded-tab-group-action {
+    flex-basis: 28px;
+    min-height: 28px;
+    min-width: 28px;
+    opacity: 0.82;
+    pointer-events: auto;
+    transform: none;
+    width: 28px;
+  }
+}
+
+/* Edge-style raised active surface, kept above the legacy dark-theme rules. */
+.browser-chat-embedded-browser .browser-chat-embedded-tab.active,
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active {
+  --embedded-active-tab-bg: color-mix(in srgb, var(--embedded-toolbar-bg) 90%, var(--foreground) 10%);
+  background: var(--embedded-active-tab-bg);
+  border: 0;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--foreground) 16%, transparent),
+    inset 1px 0 0 color-mix(in srgb, var(--foreground) 8%, transparent),
+    inset -1px 0 0 color-mix(in srgb, var(--foreground) 8%, transparent);
+  color: var(--foreground);
+}
+
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active {
+  --embedded-active-tab-bg: color-mix(in srgb, var(--embedded-toolbar-bg) 74%, var(--foreground) 26%);
+}
+
+.browser-chat-embedded-browser .browser-chat-embedded-tab.active::before,
+.browser-chat-embedded-browser .browser-chat-embedded-tab.active::after,
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active::before,
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active::after {
+  content: "";
+}
+
+.browser-chat-embedded-browser .browser-chat-embedded-tab.active .browser-chat-embedded-tab-text strong,
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active .browser-chat-embedded-tab-text strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.browser-chat-embedded-browser .browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon,
+:root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active .browser-chat-embedded-tab-icon {
+  color: var(--foreground);
+  opacity: 1;
 }

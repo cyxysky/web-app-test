@@ -509,24 +509,27 @@
 
   .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete {
     align-items: center;
-    background: var(--surface-hover);
-    border: 0;
-    border-radius: 10px;
-    box-shadow: none;
+    background: var(--panel);
+    border: 1px solid color-mix(in srgb, var(--danger) 24%, var(--border));
+    border-radius: 999px;
+    box-shadow: 0 1px 4px color-mix(in srgb, #111827 14%, transparent);
     color: var(--danger);
     display: inline-flex;
-    height: 36px;
+    height: 18px;
     justify-content: center;
-    inset: 0;
-    min-height: 36px;
+    min-height: 18px;
     opacity: 0;
     padding: 0;
     pointer-events: none;
     position: absolute;
-    transform: none;
-    transition: opacity var(--motion-fast) ease;
-    width: 36px;
-    z-index: 3;
+    right: -3px;
+    top: -3px;
+    transform: scale(0.86);
+    transition:
+      opacity var(--motion-fast) ease,
+      transform var(--motion-fast) ease;
+    width: 18px;
+    z-index: 4;
   }
 
   .browser-chat-layout.sidebar-collapsed :is(
@@ -538,19 +541,8 @@
     transform: none;
   }
 
-  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item:is(
-    :hover,
-    :has(> .browser-chat-collapsed-delete:focus-visible)
-  ) > .browser-chat-recent-open,
-  .browser-chat-layout.sidebar-collapsed .automation-case-history-item:is(
-    :hover,
-    :has(> .browser-chat-collapsed-delete:focus-visible)
-  ) > .automation-case-history-open {
-    opacity: 0;
-  }
-
   .browser-chat-layout.sidebar-collapsed .browser-chat-collapsed-delete:not(:disabled):hover {
-    background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+    background: color-mix(in srgb, var(--danger) 10%, var(--panel));
     color: var(--danger);
   }
 }
@@ -1231,13 +1223,16 @@
   }
 
   .browser-chat-embedded-tab-group-tag {
-    flex-basis: 84px;
+    flex-basis: 96px;
+    max-width: 96px;
+  }
+
+  .browser-chat-embedded-tab-group-shell.collapsed {
+    flex-basis: 96px;
   }
 
   .browser-chat-embedded-tab-group-label span {
-    display: inline;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    display: none;
   }
 
   .browser-chat-sidebar :is(
@@ -1267,8 +1262,16 @@
     .browser-chat-embedded-tab-close,
     .browser-chat-embedded-tab-mute
   ) {
-    min-height: 36px;
-    min-width: 36px;
+    min-height: 28px;
+    min-width: 28px;
+  }
+
+  .browser-chat-embedded-browser .browser-chat-embedded-tab-group-action {
+    flex-basis: 28px;
+    opacity: 0.82;
+    pointer-events: auto;
+    transform: none;
+    width: 28px;
   }
 
   .browser-chat-sidebar .browser-chat-recent-row-menu,

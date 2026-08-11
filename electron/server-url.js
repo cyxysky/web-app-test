@@ -2,6 +2,11 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+function loadDevelopmentEnvironment(projectDir, loadEnvConfigOverride) {
+  const loadEnvConfig = loadEnvConfigOverride || require('@next/env').loadEnvConfig;
+  return loadEnvConfig(projectDir, true);
+}
+
 function normalizeBasePath(value) {
   const normalized = String(value || '').trim().replace(/^\/+|\/+$/g, '');
   return normalized ? `/${normalized}` : '';
@@ -38,6 +43,7 @@ function serverRouteUrl(serverUrl, basePath, routePath) {
 
 module.exports = {
   compiledServerBasePath,
+  loadDevelopmentEnvironment,
   normalizeBasePath,
   serverRouteUrl,
   withServerBasePath,

@@ -106,7 +106,11 @@ import {
   parseBrowserChatRealtimePatch,
 } from '@/components/browser-chat-realtime-model';
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
-import { resolveEmbeddedBrowserTabLayout, type EmbeddedBrowserTabDensity } from '@/components/embedded-browser-tab-layout';
+import {
+  resolveEmbeddedBrowserTabLayout,
+  resolveEmbeddedBrowserWheelScrollLeft,
+  type EmbeddedBrowserTabDensity,
+} from '@/components/embedded-browser-tab-layout';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import {
   useBrowserChatSkillCatalog,
@@ -6906,13 +6910,11 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
     const groupCount = renderedVisibleGroups.length;
     const groupGapWidth = Math.max(0, groupCount - 1) * 5;
     const tagToTabGapWidth = expandedGroups.filter((group) => group.tabs.length > 0).length * 4;
-    const tabGapWidth = expandedGroups.reduce((total, group) => total + Math.max(0, group.tabs.length - 1) * 4, 0);
-    const endPaddingWidth = 6;
-    const fixedWidth = groupCount * 36
+    const stackPaddingWidth = expandedGroups.length * 20;
+    const fixedWidth = groupCount * 28
       + groupGapWidth
       + tagToTabGapWidth
-      + tabGapWidth
-      + endPaddingWidth;
+      + stackPaddingWidth;
     const requestedWidth = tabListWidth > 0 && tabCount > 0
       ? Math.floor((tabListWidth - fixedWidth) / tabCount)
       : 210;
@@ -6967,6 +6969,22 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           : (currentIndex + 1) % tabs.length;
     tabs[nextIndex]?.focus({ preventScroll: true });
     tabs[nextIndex]?.click();
+  }
+
+  function handleEmbeddedTabStackWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    const stack = event.currentTarget;
+    const previousScrollLeft = stack.scrollLeft;
+    const nextScrollLeft = resolveEmbeddedBrowserWheelScrollLeft({
+      clientWidth: stack.clientWidth,
+      deltaMode: event.deltaMode,
+      deltaX: event.deltaX,
+      deltaY: event.deltaY,
+      scrollLeft: previousScrollLeft,
+      scrollWidth: stack.scrollWidth,
+    });
+    if (nextScrollLeft === previousScrollLeft) return;
+    event.preventDefault();
+    stack.scrollLeft = nextScrollLeft;
   }
 
   const isEmbeddedBrowserLoading = Boolean(activeEmbeddedTab?.loading);
@@ -7267,7 +7285,10 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
                       items={group.tabs.map((tab) => embeddedBrowserTabDndId(tab.id))}
                       strategy={horizontalListSortingStrategy}
                     >
-                      <div className="browser-chat-embedded-tab-stack">
+                      <div
+                        className="browser-chat-embedded-tab-stack"
+                        onWheel={handleEmbeddedTabStackWheel}
+                      >
                         {group.tabs.map((tab) => {
                           const tabIndex = browserTabs.findIndex((item) => item.id === tab.id);
                           const isActiveTab = tab.id === activeEmbeddedTab?.id;
@@ -8924,7 +8945,7 @@ export function BrowserChatWorkspace({
                       title={item.busy ? t('执行中，无法删除') : t('删除对话')}
                       type="button"
                     >
-                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={11} /> : <X size={12} />}
+                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={10} /> : <X size={11} />}
                     </button>
                   ) : null}
                   <BrowserChatOverflowMenu

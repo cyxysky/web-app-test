@@ -7,7 +7,19 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
-const { compiledServerBasePath, serverRouteUrl, withServerBasePath } = require('./server-url');
+const {
+  compiledServerBasePath,
+  loadDevelopmentEnvironment,
+  serverRouteUrl,
+  withServerBasePath,
+} = require('./server-url');
+
+if (!app.isPackaged) {
+  // The spawned Next development server loads .env files automatically. Load
+  // them in Electron as well before deriving ports and public route URLs so
+  // both processes use the same WEBPILOT_BASE_PATH and runtime settings.
+  loadDevelopmentEnvironment(process.cwd());
+}
 
 const APP_NAME = 'WebPilot';
 const APP_TITLE = APP_NAME;
