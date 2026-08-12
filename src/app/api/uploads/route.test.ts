@@ -44,6 +44,26 @@ test('streams a raw upload into the authenticated user artifact directory', asyn
       'streamed upload',
     );
 
+    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>');
+    const svgResponse = await POST(new NextRequest('http://localhost/api/uploads', {
+      method: 'POST',
+      headers: {
+        ...identityHeaders,
+        'content-length': String(svg.length),
+        'content-type': 'image/svg+xml',
+        'x-webpilot-file-name': encodeURIComponent('diagram.svg'),
+        'x-webpilot-upload': 'raw',
+      },
+      body: svg,
+    }));
+    assert.equal(svgResponse.status, 200);
+    const svgPayload = await svgResponse.json() as { fileId: string };
+    assert.match(svgPayload.fileId, /\.svg$/);
+    assert.equal(
+      readFileSync(path.join(dataRoot, 'artifacts', 'uploads', 'upload-user', svgPayload.fileId), 'utf8'),
+      svg.toString('utf8'),
+    );
+
     const oversized = await POST(new NextRequest('http://localhost/api/uploads', {
       method: 'POST',
       headers: {

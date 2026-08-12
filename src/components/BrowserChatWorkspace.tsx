@@ -112,6 +112,7 @@ import {
   type EmbeddedBrowserTabDensity,
 } from '@/components/embedded-browser-tab-layout';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { BrowserChatOnboarding } from '@/components/BrowserChatOnboarding';
 import {
   useBrowserChatSkillCatalog,
   type BrowserChatSkillListPage,
@@ -9098,7 +9099,12 @@ export function BrowserChatWorkspace({
           subagents={session?.subagents || []}
           stepsByIndex={stepsByIndex}
         />
-      ) : null}
+      ) : (
+        <BrowserChatOnboarding
+          busy={currentBusy || Boolean(loadingSessionId)}
+          onSubmit={(content) => sendMessage(content)}
+        />
+      )}
       {messageViewportPositioning ? (
         <div className="browser-chat-session-loading-overlay">
           <BrowserChatSessionLoading label={t(loadingSessionHistory || loadingSessionId ? '正在加载对话' : '正在定位对话')} />
@@ -9146,6 +9152,7 @@ export function BrowserChatWorkspace({
     <BrowserChatReasoningVisibilityContext.Provider value={showReasoning}>
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
       <WorkspaceSidebar
+        collapsed={sidebarCollapsed}
         collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
         onToggleTheme={toggleMode}

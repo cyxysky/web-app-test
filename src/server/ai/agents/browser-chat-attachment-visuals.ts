@@ -1,16 +1,15 @@
-import { execFile } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
-import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import { PDFParse } from 'pdf-parse';
 import { chromium } from 'playwright';
 import sharp from 'sharp';
 import * as XLSX from 'xlsx';
+import { officePreviewExtensions, readableFileExtensions } from '@/server/files/file-format-registry';
+import { convertOfficeFile } from '@/server/files/libreoffice';
 import { artifactsRoot } from '@/server/storage/paths';
 
 export type BrowserChatAttachmentVisualResult = {
@@ -27,13 +26,9 @@ const defaultPreviewPages = [1, 2, 3, 4];
 const maxPreviewPagesPerRead = 6;
 const htmlPageWidth = 960;
 const htmlPageHeight = 1_358;
-const officeExtensions = new Set([
-  '.doc', '.docx', '.odt',
-  '.ppt', '.pptx', '.pps', '.ppsx', '.pot', '.potx', '.odp',
-  '.xls', '.xlsx', '.xlsb', '.xlsm', '.ods',
-]);
+const officeExtensions = officePreviewExtensions();
 const docxExtensions = new Set(['.docx']);
-const spreadsheetExtensions = new Set(['.xls', '.xlsx', '.xlsm', '.xlsb', '.ods']);
+const spreadsheetExtensions = readableFileExtensions('spreadsheet');
 
 function normalizedPages(value: unknown, pageCount?: number) {
   const source = Array.isArray(value) && value.length ? value : defaultPreviewPages;
@@ -186,71 +181,8 @@ async function renderHtmlPages(input: {
   }
 }
 
-async function resolveLibreOfficeExecutable() {
-  const configured = String(process.env.LIBREOFFICE_PATH || '').trim();
-  const candidates = [
-    configured,
-    process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'LibreOffice', 'program', 'soffice.exe') : '',
-    process.platform === 'win32' ? path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'LibreOffice', 'program', 'soffice.exe') : '',
-    ...String(process.env.PATH || '').split(path.delimiter).flatMap((directory) => {
-      const clean = directory.replace(/^"|"$/g, '').trim();
-      if (!clean) return [];
-      return process.platform === 'win32'
-        ? [path.join(clean, 'soffice.exe'), path.join(clean, 'libreoffice.exe')]
-        : [path.join(clean, 'soffice'), path.join(clean, 'libreoffice')];
-    }),
-  ].filter(Boolean);
-  for (const candidate of candidates) {
-    try {
-      await access(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // Keep searching configured and PATH candidates.
-    }
-  }
-  return undefined;
-}
-
-function runExecutable(executable: string, args: string[]) {
-  return new Promise<void>((resolve, reject) => {
-    execFile(executable, args, { maxBuffer: 10 * 1024 * 1024, windowsHide: true }, (error) => {
-      if (error) reject(error);
-      else resolve();
-    });
-  });
-}
-
 async function convertOfficeToPdf(absolutePath: string, extension: string) {
-  const executable = await resolveLibreOfficeExecutable();
-  if (!executable) return undefined;
-  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-render-'));
-  try {
-    const sourcePath = path.join(temporaryDirectory, `source${extension}`);
-    const outputDirectory = path.join(temporaryDirectory, 'output');
-    const profileDirectory = path.join(temporaryDirectory, 'profile');
-    await Promise.all([
-      copyFile(absolutePath, sourcePath),
-      mkdir(outputDirectory, { recursive: true }),
-      mkdir(profileDirectory, { recursive: true }),
-    ]);
-    await runExecutable(executable, [
-      '--headless',
-      '--nologo',
-      '--nodefault',
-      '--nolockcheck',
-      `-env:UserInstallation=${pathToFileURL(profileDirectory).href}`,
-      '--convert-to',
-      'pdf',
-      '--outdir',
-      outputDirectory,
-      sourcePath,
-    ]);
-    const outputName = (await readdir(outputDirectory)).find((name) => path.extname(name).toLowerCase() === '.pdf');
-    if (!outputName) throw new Error('LibreOffice did not produce a PDF preview.');
-    return await readFile(path.join(outputDirectory, outputName));
-  } finally {
-    await rm(temporaryDirectory, { force: true, recursive: true });
-  }
+  return convertOfficeFile({ absolutePath, sourceExtension: extension, targetExtension: '.pdf' });
 }
 
 async function renderDocxFallback(buffer: Buffer, directory: string, requestedPages: unknown, title: string) {

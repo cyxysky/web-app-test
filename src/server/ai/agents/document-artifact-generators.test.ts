@@ -7,6 +7,7 @@ import test from 'node:test';
 import JSZip from 'jszip';
 import mammoth from 'mammoth';
 import * as XLSX from 'xlsx';
+import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
 import { readBrowserChatAttachment } from './browser-chat-attachment-reader';
 import { generateFileBuffer } from './document-artifact-generators';
 
@@ -57,6 +58,19 @@ test('generates a real BIFF8 .xls workbook', async () => {
     ['Login', true],
     ['Duration', 12.5],
   ]);
+});
+
+test('generates CSV and TSV from structured sheet rows', async () => {
+  const csv = await generateFileBuffer({
+    fileName: 'table.csv',
+    sheets: [{ rows: [['name', 'value'], ['alpha', 1]] }],
+  });
+  const tsv = await generateFileBuffer({
+    fileName: 'table.tsv',
+    sheets: [{ rows: [['name', 'value'], ['alpha', 1]] }],
+  });
+  assert.match(csv.buffer.toString('utf8'), /name,value/);
+  assert.match(tsv.buffer.toString('utf8'), /name\tvalue/);
 });
 
 test('rejects .xls worksheets that exceed BIFF8 column limits', async () => {
@@ -147,6 +161,47 @@ test('conversation reader can read back every generated special format', async (
       assert.equal(read.ok, true, read.actual);
       assert.match(read.actual, new RegExp(expected[index]));
       assert.match(read.actual, /内容完整/);
+    }
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test('LibreOffice-backed legacy and OpenDocument outputs are real readable files', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed in this test environment.');
+    return;
+  }
+  const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-generated-libreoffice-'));
+  try {
+    const inputs = [
+      { fileName: 'report.doc', content: '# Legacy Word\n\nReadable body' },
+      { fileName: 'report.odt', content: '# OpenDocument Word\n\nReadable body' },
+      { fileName: 'report.ods', sheets: [{ rows: [['OpenDocument Sheet'], ['Readable body']] }] },
+      { fileName: 'report.ppt', slides: [{ title: 'Legacy Slides', bullets: ['Readable body'] }] },
+      { fileName: 'report.odp', slides: [{ title: 'OpenDocument Slides', bullets: ['Readable body'] }] },
+    ];
+    for (const [index, input] of inputs.entries()) {
+      const output = await generateFileBuffer(input);
+      assert.ok(output.buffer.byteLength > 128, `${input.fileName} should contain a real document`);
+      const filePath = path.join(directory, input.fileName);
+      await writeFile(filePath, output.buffer);
+      const read = await readBrowserChatAttachment({
+        absolutePath: filePath,
+        attachment: {
+          id: `libreoffice-${index}`,
+          kind: 'file',
+          name: input.fileName,
+          path: filePath,
+          size: output.buffer.byteLength,
+          type: 'application/octet-stream',
+          url: '',
+        },
+        includeVisuals: false,
+        limit: 40_000,
+      });
+      assert.equal(read.ok, true, read.actual);
+      assert.match(read.actual, /Readable body/);
     }
   } finally {
     await rm(directory, { force: true, recursive: true });

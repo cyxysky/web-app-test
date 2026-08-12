@@ -3,4 +3,5 @@
 @import "../workspace-shared.css";
 @import "./chat.css";
 @import "./embedded-browser.css";
+@import "./onboarding.css";
 @import "../browser-chat-debug.css";

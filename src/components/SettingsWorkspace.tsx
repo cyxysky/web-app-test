@@ -135,6 +135,7 @@ export function SettingsWorkspace({
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed settings-workspace-route' : 'browser-chat-layout settings-workspace-route'}>
       <WorkspaceSidebar
+        collapsed={sidebarCollapsed}
         collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
         onToggleTheme={toggleMode}

@@ -1000,6 +1000,7 @@ export function AutomationWorkspace({
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed automation-layout' : 'browser-chat-layout automation-layout'}>
       <WorkspaceSidebar
         className="automation-sidebar"
+        collapsed={sidebarCollapsed}
         collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
         onToggleTheme={toggleMode}

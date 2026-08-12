@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 19;
+const currentSchemaVersion = 20;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -610,6 +610,33 @@ function applyVersionNineteenMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionTwentyMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 20').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS user_onboarding_state (
+        user_id TEXT PRIMARY KEY,
+        tutorial_version INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        completed_steps_json TEXT NOT NULL DEFAULT '[]',
+        dismissed_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (20, 'user-onboarding-state', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -717,6 +744,16 @@ function initializeSchema(database: DatabaseSync) {
       ON personal_memory_item(user_id, scope, domain, type, memory_key);
     CREATE INDEX IF NOT EXISTS personal_memory_updated_at_idx ON personal_memory_item(updated_at DESC);
 
+    CREATE TABLE IF NOT EXISTS user_onboarding_state (
+      user_id TEXT PRIMARY KEY,
+      tutorial_version INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      completed_steps_json TEXT NOT NULL DEFAULT '[]',
+      dismissed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS login_account (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -786,6 +823,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionSeventeenMigration(database);
   applyVersionEighteenMigration(database);
   applyVersionNineteenMigration(database);
+  applyVersionTwentyMigration(database);
 }
 
 export function getSqliteDatabase() {

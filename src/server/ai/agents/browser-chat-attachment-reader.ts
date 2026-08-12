@@ -1,6 +1,6 @@
 import { readFile, stat } from 'node:fs/promises';
-import path from 'node:path';
 import { extractAttachmentTextInWorker } from '@/server/runtime/cpu-worker-pool';
+import { fileFormatForName, normalizedFileExtension } from '@/server/files/file-format-registry';
 import { normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import { inspectDocxTemplateBuffer } from './docx-template-filler';
@@ -24,17 +24,6 @@ export type BrowserChatAttachmentReadResult = {
 
 type AttachmentKind = 'archive' | 'image' | 'pdf' | 'presentation' | 'spreadsheet' | 'tab' | 'text' | 'unknown' | 'word';
 
-const textExtensions = new Set([
-  '.c', '.cc', '.cpp', '.cs', '.css', '.csv', '.env', '.go', '.graphql', '.h', '.html', '.htm',
-  '.ini', '.java', '.js', '.json', '.jsx', '.kt', '.log', '.lua', '.md', '.mdx', '.mjs', '.php',
-  '.py', '.rb', '.rs', '.rst', '.scss', '.sh', '.sql', '.svg', '.text', '.toml', '.ts', '.tsx',
-  '.txt', '.vue', '.xml', '.yaml', '.yml',
-]);
-const spreadsheetExtensions = new Set(['.xls', '.xlsx', '.xlsb', '.xlsm', '.ods']);
-const wordExtensions = new Set(['.doc', '.docx', '.odt']);
-const presentationExtensions = new Set(['.ppt', '.pptx', '.pps', '.ppsx', '.pot', '.potx', '.odp']);
-const archiveExtensions = new Set(['.zip', '.jar', '.epub']);
-const imageExtensions = new Set(['.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.tif', '.tiff', '.webp']);
 const maxSourceBytes = 64 * 1024 * 1024;
 
 function normalizedOffset(value: unknown) {
@@ -43,7 +32,7 @@ function normalizedOffset(value: unknown) {
 }
 
 function extensionOf(attachment: BrowserChatReadableAttachment) {
-  return path.extname(attachment.name).toLowerCase();
+  return normalizedFileExtension(attachment.name);
 }
 
 function formatSize(size?: number) {
@@ -53,15 +42,12 @@ function formatSize(size?: number) {
 }
 
 function attachmentKind(attachment: BrowserChatReadableAttachment): AttachmentKind {
-  const extension = extensionOf(attachment);
-  if (attachment.kind === 'image' || attachment.type.startsWith('image/') || imageExtensions.has(extension)) return 'image';
+  const format = fileFormatForName(attachment.name);
+  if (attachment.kind === 'image' || attachment.type.startsWith('image/') || format?.kind === 'image') return 'image';
   if (attachment.kind === 'tab') return 'tab';
-  if (attachment.type === 'application/pdf' || extension === '.pdf') return 'pdf';
-  if (wordExtensions.has(extension)) return 'word';
-  if (spreadsheetExtensions.has(extension)) return 'spreadsheet';
-  if (presentationExtensions.has(extension)) return 'presentation';
-  if (archiveExtensions.has(extension)) return 'archive';
-  if (attachment.type.startsWith('text/') || textExtensions.has(extension)) return 'text';
+  if (attachment.type === 'application/pdf' || format?.kind === 'pdf') return 'pdf';
+  if (format?.canRead && format.kind !== 'binary') return format.kind;
+  if (attachment.type.startsWith('text/')) return 'text';
   return 'unknown';
 }
 

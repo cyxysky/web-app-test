@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -48,6 +48,32 @@ test('CPU extraction does not detach the caller Buffer', async () => {
   assert.equal(await extractAttachmentTextInWorker({ buffer: source, extension: '.txt', kind: 'text' }), original.toString('utf8'));
   assert.equal(source.byteLength, original.byteLength);
   assert.deepEqual(source, original);
+});
+
+test('reads generated line-oriented data extensions without relying on a browser MIME type', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-line-data-'));
+  try {
+    for (const extension of ['.jsonl', '.ndjson', '.tsv']) {
+      const filePath = path.join(directory, `records${extension}`);
+      await writeFile(filePath, extension === '.tsv' ? 'name\tvalue\nalpha\t1\n' : '{"name":"alpha"}\n');
+      const result = await readBrowserChatAttachment({
+        absolutePath: filePath,
+        attachment: {
+          id: `line-data-${extension}`,
+          kind: 'file',
+          name: path.basename(filePath),
+          path: filePath,
+          size: (await stat(filePath)).size,
+          type: 'application/octet-stream',
+          url: '',
+        },
+      });
+      assert.equal(result.ok, true, result.actual);
+      assert.match(result.actual, /alpha/);
+    }
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
 });
 
 test('readFile can extract and inspect one DOCX from the same source bytes', async () => {

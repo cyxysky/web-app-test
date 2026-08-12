@@ -9,6 +9,7 @@ import type {
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
+import { artifactContentType } from '@/server/files/file-format-registry';
 import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
@@ -1028,7 +1029,7 @@ function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifac
     name,
     path: segments.join('/'),
     size: undefined,
-    type: 'application/octet-stream',
+    type: artifactContentType(name),
     url: artifactApiUrlFromRelative(segments.join('/')),
   };
 }

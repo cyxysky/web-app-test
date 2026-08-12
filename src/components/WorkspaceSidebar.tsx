@@ -4,10 +4,12 @@ import { Moon, PanelLeft, Sun } from 'lucide-react';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
+import { WebPilotHelpCenter } from '@/components/WebPilotHelpCenter';
 
 type WorkspaceSidebarProps = {
   children: ReactNode;
   className?: string;
+  collapsed: boolean;
   collapseLabel: string;
   onToggleCollapse: () => void;
   onToggleTheme: () => void;
@@ -46,6 +48,7 @@ export function WorkspaceNavItem({ active = false, href, icon, label, onClick }:
 export function WorkspaceSidebar({
   children,
   className,
+  collapsed,
   collapseLabel,
   onToggleCollapse,
   onToggleTheme,
@@ -70,7 +73,17 @@ export function WorkspaceSidebar({
 
       {children}
 
-      <div className="browser-chat-sidebar-footer">
+      <div
+        className="browser-chat-sidebar-footer"
+        style={{
+          alignItems: 'center',
+          display: 'flex',
+          flexDirection: collapsed ? 'column' : 'row',
+          gap: collapsed ? 2 : undefined,
+          justifyContent: collapsed ? 'center' : 'flex-end',
+        }}
+      >
+        <WebPilotHelpCenter collapsed={collapsed} />
         <button
           aria-label={themeToggleLabel}
           className="browser-chat-theme-toggle"

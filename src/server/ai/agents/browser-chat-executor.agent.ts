@@ -1320,12 +1320,12 @@ function makeBrowserTools(
       execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateFile: tool({
-      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension, PDF .pdf, Word .docx, Excel .xls or .xlsx, and PowerPoint .pptx. PDF and Word use Markdown-like content; Excel requires sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
+      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension; PDF .pdf; Word .doc, .docx, or .odt; Excel .xls, .xlsx, or .ods; and PowerPoint .ppt, .pptx, or .odp. Legacy and OpenDocument outputs require LibreOffice. PDF and Word use Markdown-like content; CSV/TSV accept content or one sheet; workbook formats require sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
       inputSchema: browserToolInput({
-        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, legacy-data.xls, data.xlsx, slides.pptx, notes.md, result.json, or export.csv.'),
+        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, legacy.doc, data.xls, data.xlsx, table.ods, slides.pptx, slides.odp, notes.md, result.jsonl, or export.tsv.'),
         title: z.string().max(300).optional().describe('Optional document or presentation title.'),
-        content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional fallback for PowerPoint.'),
-        sheets: generatedFileSheetsSchema.optional().describe('Excel worksheets. Required for .xls and .xlsx. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
+        content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional for CSV/TSV when sheets are provided and as a fallback for PowerPoint.'),
+        sheets: generatedFileSheetsSchema.optional().describe('Spreadsheet data. Required for .xls, .xlsx, and .ods; CSV/TSV use the first sheet when content is omitted. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
         slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. Each slide has a title plus content and/or bullet strings.'),
       }),
       execute: (input) => record('generateFile', input, () => generateFileArtifact({ ...input, runId: referenceOptions?.runId })),

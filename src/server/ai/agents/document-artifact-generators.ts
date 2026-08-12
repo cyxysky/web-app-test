@@ -10,6 +10,8 @@ import {
 import PDFDocument from 'pdfkit';
 import PptxGenJS from 'pptxgenjs';
 import * as XLSX from 'xlsx';
+import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '@/server/files/file-format-registry';
+import { convertOfficeBuffer } from '@/server/files/libreoffice';
 
 export type GeneratedFileCell = string | number | boolean | null;
 
@@ -37,14 +39,7 @@ export type GeneratedFileOutput = {
   extension: string;
 };
 
-export const generatedTextExtensions = new Set([
-  '.c', '.cc', '.cpp', '.cs', '.css', '.csv', '.go', '.graphql', '.h', '.html', '.htm',
-  '.ini', '.java', '.js', '.json', '.jsonl', '.jsx', '.kt', '.log', '.lua', '.md', '.mdx',
-  '.mjs', '.ndjson', '.php', '.py', '.rb', '.rs', '.rst', '.scss', '.sql', '.text',
-  '.toml', '.ts', '.tsx', '.tsv', '.txt', '.vue', '.xml', '.yaml', '.yml',
-]);
-
-const specialGeneratedExtensions = new Set(['.docx', '.pdf', '.pptx', '.xls', '.xlsx']);
+export const generatedTextExtensions = generatedFileExtensions('text');
 const maxGeneratedTextBytes = 4 * 1024 * 1024;
 const maxSpreadsheetCells = 200_000;
 const maxXlsRows = 65_536;
@@ -275,6 +270,27 @@ function generateSpreadsheet(input: GeneratedFileInput, extension: '.xls' | '.xl
   }));
 }
 
+function generateDelimitedText(input: GeneratedFileInput, extension: '.csv' | '.tsv') {
+  const content = normalizeContent(input.content);
+  if (content) return Buffer.from(`${content}\n`, 'utf8');
+  const sheet = input.sheets?.find((candidate) => Array.isArray(candidate.rows) && candidate.rows.length);
+  if (!sheet) throw new Error(`${extension.toUpperCase()} generation requires content or one non-empty sheet.`);
+  const worksheet = XLSX.utils.aoa_to_sheet(sheet.rows);
+  const value = XLSX.utils.sheet_to_csv(worksheet, {
+    FS: extension === '.tsv' ? '\t' : ',',
+    RS: '\n',
+  });
+  return Buffer.from(value.endsWith('\n') ? value : `${value}\n`, 'utf8');
+}
+
+async function convertGeneratedOffice(buffer: Buffer, sourceExtension: string, targetExtension: string) {
+  const converted = await convertOfficeBuffer({ buffer, sourceExtension, targetExtension });
+  if (!converted) {
+    throw new Error(`Generating ${targetExtension} requires LibreOffice, but no LibreOffice executable is available.`);
+  }
+  return converted;
+}
+
 function slidesFromContent(input: GeneratedFileInput): GeneratedFileSlide[] {
   const content = requiredContent(input, 'PowerPoint');
   const slides: GeneratedFileSlide[] = [];
@@ -351,23 +367,34 @@ async function generatePowerPoint(input: GeneratedFileInput) {
 }
 
 export function supportedGeneratedFileExtension(fileName: string) {
-  const extension = path.extname(fileName).toLowerCase();
-  return generatedTextExtensions.has(extension) || specialGeneratedExtensions.has(extension) ? extension : undefined;
+  const extension = normalizedFileExtension(fileName);
+  const format = fileFormatForExtension(extension);
+  return format?.canGenerate ? format.extension : undefined;
 }
 
 export async function generateFileBuffer(input: GeneratedFileInput): Promise<GeneratedFileOutput> {
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension) {
-    throw new Error('Unsupported output extension. Use a text format, .pdf, .docx, .xls, .xlsx, or .pptx.');
+    throw new Error('Unsupported output extension. Use a supported text/data format, PDF, Word, Excel, PowerPoint, or OpenDocument extension.');
   }
   if (generatedTextExtensions.has(extension)) {
+    if (extension === '.csv' || extension === '.tsv') {
+      return { buffer: generateDelimitedText(input, extension), extension };
+    }
     const content = `${requiredContent(input, 'Text file')}\n`;
     return { buffer: Buffer.from(content, 'utf8'), extension };
   }
   if (extension === '.docx') return { buffer: await generateWord(input), extension };
+  if (extension === '.doc' || extension === '.odt') {
+    return { buffer: await convertGeneratedOffice(await generateWord(input), '.docx', extension), extension };
+  }
   if (extension === '.pdf') return { buffer: await generatePdf(input), extension };
   if (extension === '.xls' || extension === '.xlsx') {
     return { buffer: generateSpreadsheet(input, extension), extension };
   }
-  return { buffer: await generatePowerPoint(input), extension };
+  if (extension === '.ods') {
+    return { buffer: await convertGeneratedOffice(generateSpreadsheet(input, '.xlsx'), '.xlsx', extension), extension };
+  }
+  if (extension === '.pptx') return { buffer: await generatePowerPoint(input), extension };
+  return { buffer: await convertGeneratedOffice(await generatePowerPoint(input), '.pptx', extension), extension };
 }

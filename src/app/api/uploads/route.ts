@@ -15,11 +15,7 @@ import {
   scheduleUploadArtifactMaintenance,
   userUploadUsage,
 } from '@/server/storage/upload-artifact-lifecycle';
-
-const allowedExtensions = new Set([
-  '.apng', '.bin', '.csv', '.docx', '.gif', '.jpeg', '.jpg', '.json', '.md', '.pdf',
-  '.png', '.pptx', '.tsv', '.txt', '.webp', '.xls', '.xlsx', '.xml', '.yaml', '.yml', '.zip',
-]);
+import { uploadStorageExtension } from '@/server/files/file-format-registry';
 
 function uploadMaxBytes() {
   const configured = Number(process.env.WEBPILOT_UPLOAD_MAX_BYTES || 50 * 1024 * 1024);
@@ -97,10 +93,7 @@ export async function POST(request: NextRequest) {
       source = Readable.fromWeb(file.stream() as Parameters<typeof Readable.fromWeb>[0]);
     }
 
-    const requestedExtension = path.extname(name).toLowerCase();
-    const ext = allowedExtensions.has(requestedExtension)
-      ? requestedExtension
-      : type.startsWith('image/') ? '.png' : '.bin';
+    const ext = uploadStorageExtension(name, type);
     const prefix = type.startsWith('image/') ? 'img' : 'file';
     const fileId = `${prefix}_${Date.now()}_${randomUUID().slice(0, 12)}${ext}`;
     const userId = requestApplicationUserId(request);
