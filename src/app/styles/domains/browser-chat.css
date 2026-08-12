@@ -1,6 +1,8 @@
 @import "../shared-base.css";
 @import "./chat-base.css";
+@import "./settings-base.css";
 @import "../workspace-shared.css";
+@import "./settings.css";
 @import "./chat.css";
 @import "./embedded-browser.css";
 @import "./onboarding.css";

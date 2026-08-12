@@ -6,8 +6,8 @@ import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'luci
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { CustomSelect } from '@/components/CustomSelect';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
-import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
+import { ManagementDataTable } from '@/components/ManagementDataTable';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { readApiJson } from '@/lib/api-client';
@@ -82,7 +82,15 @@ function statusLabel(status: SkillRecord['status']) {
   return '可用';
 }
 
-export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => void; userId?: string } = {}) {
+export function SkillsManager({
+  onChanged,
+  showTitle = true,
+  userId = '1',
+}: {
+  onChanged?: () => void;
+  showTitle?: boolean;
+  userId?: string;
+} = {}) {
   const { t } = useI18n();
   const normalizedUserId = userId.trim() || '1';
   const skillsApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
@@ -246,20 +254,24 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
     }
   }
 
+  const managerActions = (
+    <div className="personal-memory-head-actions">
+      <DataTransferButtons kind="skills" onImported={loadSkills} />
+      <button className="ui-button ui-button--primary" onClick={openCreateSkill} type="button">
+        <Plus size={15} />
+        {t('新建 Skill')}
+      </button>
+    </div>
+  );
+
   return (
     <section className={loading ? 'skills-manager is-loading' : 'skills-manager'}>
-      <div className="settings-section-head skills-manager-head">
+      {showTitle ? <div className="settings-section-head skills-manager-head">
         <div>
           <h2>{t('Skills 管理')}</h2>
         </div>
-        <div className="personal-memory-head-actions">
-          <DataTransferButtons kind="skills" onImported={loadSkills} />
-          <button className="ui-button ui-button--primary" onClick={openCreateSkill} type="button">
-            <Plus size={15} />
-            {t('新建 Skill')}
-          </button>
-        </div>
-      </div>
+        {managerActions}
+      </div> : null}
 
       <div className="skills-manager-layout">
         <div className="skills-manager-list">
@@ -272,11 +284,93 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
                 </div>
               </div>
             ) : (
-              <DomainGroupedAccordion
+              <ManagementDataTable
+                columns={[
+                  {
+                    key: 'skill',
+                    label: t('Skill'),
+                    className: 'management-table-primary-column',
+                    render: (skill) => {
+                      const expanded = expandedSkillIds.includes(skill.id);
+                      return (
+                        <button
+                          aria-expanded={expanded}
+                          className="management-table-primary-button"
+                          onClick={() => toggleSkillDetails(skill.id)}
+                          type="button"
+                        >
+                          <ChevronDown className={expanded ? 'skills-manager-chevron open' : 'skills-manager-chevron'} size={16} />
+                          <span>
+                            <strong>{skill.title}</strong>
+                            <small>{skill.description || skill.id}</small>
+                          </span>
+                        </button>
+                      );
+                    },
+                  },
+                  {
+                    key: 'scope',
+                    label: t('适用范围'),
+                    render: (skill) => (
+                      <div className="management-table-cell-stack">
+                        <span>{skill.domains?.length ? skill.domains.join(' · ') : t('所有域名')}</span>
+                        <small>{skill.shared ? t('所有 ID 共享') : t('仅创建 ID')}</small>
+                      </div>
+                    ),
+                  },
+                  {
+                    key: 'triggers',
+                    label: t('触发词'),
+                    render: (skill) => (
+                      <span className="management-table-muted">
+                        {skill.triggerPhrases.length ? skill.triggerPhrases.slice(0, 2).join(' · ') : t('暂无触发词')}
+                      </span>
+                    ),
+                  },
+                  {
+                    key: 'status',
+                    label: t('状态'),
+                    render: (skill) => <span className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</span>,
+                  },
+                  {
+                    key: 'updated',
+                    label: t('最近更新'),
+                    className: 'management-table-date-column',
+                    render: (skill) => <span className="management-table-muted">{new Date(skill.updatedAt).toLocaleString()}</span>,
+                  },
+                  {
+                    key: 'actions',
+                    label: t('操作'),
+                    className: 'management-table-actions-column',
+                    render: (skill) => (
+                      <div className="skills-manager-item-actions">
+                        {skill.userId === normalizedUserId ? <>
+                          <button
+                            aria-label={t('编辑 Skill')}
+                            className="ui-icon-button"
+                            onClick={() => openEditSkill(skill)}
+                            title={t('编辑')}
+                            type="button"
+                          >
+                            <Edit3 size={14} />
+                          </button>
+                          <button
+                            aria-label={t('删除 Skill')}
+                            className="ui-icon-button ui-icon-button--danger"
+                            disabled={deletingSkillId === skill.id}
+                            onClick={() => requestDeleteSkill(skill)}
+                            title={t('删除')}
+                            type="button"
+                          >
+                            {deletingSkillId === skill.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
+                          </button>
+                        </> : <span className="resource-readonly-label">{t('只读')}</span>}
+                      </div>
+                    ),
+                  },
+                ]}
                 emptyText={t('暂无 Skills')}
-                getDomains={(skill) => skill.domains || []}
                 getId={(skill) => skill.id}
-                getName={(skill) => skill.title}
                 getSearchText={(skill) => [
                   skill.title,
                   skill.description,
@@ -287,51 +381,8 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
                   skill.shared ? t('所有 ID 共享') : t('仅创建 ID'),
                   skill.userId,
                 ]}
-                getUpdatedAt={(skill) => skill.updatedAt}
                 items={skills}
-                renderItem={(skill) => {
-              const expanded = expandedSkillIds.includes(skill.id);
-              return (
-                <div
-                  className={expanded ? 'skills-manager-item expanded' : 'skills-manager-item'}
-                  key={skill.id}
-                >
-                  <div className="skills-manager-item-row">
-                    <button
-                      aria-expanded={expanded}
-                      className="skills-manager-item-main"
-                      onClick={() => toggleSkillDetails(skill.id)}
-                      type="button"
-                    >
-                      <ChevronDown className={expanded ? 'skills-manager-chevron open' : 'skills-manager-chevron'} size={16} />
-                      <b>{skill.title}</b>
-                    </button>
-                    <div className="skills-manager-item-actions">
-                      {skill.userId === normalizedUserId ? <>
-                      <button
-                        aria-label={t('编辑 Skill')}
-                        className="ui-icon-button"
-                        onClick={() => openEditSkill(skill)}
-                        title={t('编辑')}
-                        type="button"
-                      >
-                        <Edit3 size={14} />
-                      </button>
-                      <button
-                        aria-label={t('删除 Skill')}
-                        className="ui-icon-button ui-icon-button--danger"
-                        disabled={deletingSkillId === skill.id}
-                        onClick={() => requestDeleteSkill(skill)}
-                        title={t('删除')}
-                        type="button"
-                      >
-                        {deletingSkillId === skill.id ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />}
-                      </button>
-                      </> : <span className="resource-readonly-label">{t('只读')}</span>}
-                    </div>
-                  </div>
-
-                  {expanded ? (
+                renderExpandedRow={(skill) => expandedSkillIds.includes(skill.id) ? (
                     <div className="skills-manager-item-detail">
                       <div className="skills-manager-item-intro">
                         <p className="skills-manager-item-description">{skill.description || skill.id}</p>
@@ -370,11 +421,9 @@ export function SkillsManager({ onChanged, userId = '1' }: { onChanged?: () => v
                       </div>
                     </div>
                   ) : null}
-                </div>
-              );
-                }}
+                rowClassName={(skill) => expandedSkillIds.includes(skill.id) ? 'is-expanded' : ''}
                 searchPlaceholder={t('筛选 Skills')}
-                unscopedLabel={t('所有域名')}
+                toolbarActions={showTitle ? undefined : managerActions}
               />
             )}
           </div>

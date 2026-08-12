@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
-import { ArrowRight, Check, FileText, Globe2, Loader2, Settings, Workflow } from 'lucide-react';
+import { ArrowRight, Check, Loader2, Settings } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { WebPilotOnboardingReadiness, WebPilotOnboardingState, WebPilotOnboardingStep } from '@/lib/onboarding';
 import { readApiJson } from '@/lib/api-client';
@@ -12,12 +12,6 @@ type OnboardingPayload = {
   readiness: WebPilotOnboardingReadiness;
   state: WebPilotOnboardingState;
 };
-
-const starterTasks = [
-  { icon: Globe2, label: '查看当前浏览器页面并概括主要内容', prompt: '查看当前打开的浏览器页面，告诉我页面标题、主要内容和可以执行的操作。' },
-  { icon: FileText, label: '分析一个附件或填写文档模板', prompt: '我准备上传一个文件。请先查看附件元数据，等我说明目标后再按需读取。' },
-  { icon: Workflow, label: '把一次成功操作保存为自动化', prompt: '先帮我完成浏览器任务；成功后提醒我把这次过程保存成自动化用例。' },
-];
 
 export function BrowserChatOnboarding({
   busy,
@@ -85,14 +79,6 @@ export function BrowserChatOnboarding({
           <span>WebPilot</span>
           <h1>今天想让浏览器帮你做什么？</h1>
           <p>描述目标即可。涉及提交、删除或其他外部影响的操作仍会按安全模式确认。</p>
-        </div>
-        <div className="browser-chat-starter-grid">
-          {starterTasks.map(({ icon: Icon, label, prompt }) => (
-            <button disabled={busy} key={label} onClick={() => void onSubmit(prompt)} type="button">
-              <Icon aria-hidden="true" size={17} />
-              <span>{label}</span>
-            </button>
-          ))}
         </div>
         <button className="browser-chat-tutorial-link" onClick={() => setShowTutorial(true)} type="button">查看 3 分钟新手教程</button>
       </section>

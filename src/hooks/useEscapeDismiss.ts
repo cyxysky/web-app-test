@@ -35,6 +35,8 @@ export function useEscapeDismiss(active: boolean, onDismiss: () => void) {
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
+      const openDialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]'));
+      if (openDialogs[openDialogs.length - 1] !== dialog) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         dismissRef.current();

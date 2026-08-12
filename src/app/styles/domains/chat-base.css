@@ -766,39 +766,6 @@
   scrollbar-width: thin;
 }
 
-.browser-chat-history-stage {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
-  min-height: 0;
-  min-width: 0;
-  overflow: hidden;
-  position: relative;
-}
-
-.browser-chat-history-stage > .browser-chat-recent-list {
-  height: auto;
-}
-
-.browser-chat-history-stage > .automation-case-history-list {
-  height: 100%;
-}
-
-.browser-chat-history-loading {
-  align-content: start;
-  align-items: center;
-  background: var(--panel-soft);
-  color: var(--muted-strong);
-  display: grid;
-  font-size: 12px;
-  gap: 8px;
-  grid-template-columns: auto auto;
-  inset: 0;
-  justify-content: center;
-  padding: 14px 4px;
-  position: absolute;
-  z-index: 2;
-}
-
 .browser-chat-recent-list li {
   min-width: 0;
 }

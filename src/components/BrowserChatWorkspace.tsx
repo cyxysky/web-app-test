@@ -33,6 +33,7 @@ import {
   ArrowRight,
   ArrowUp,
   BadgeCheck,
+  Brain,
   Braces,
   Bug,
   Check,
@@ -50,6 +51,7 @@ import {
   Gauge,
   Globe,
   ImageUp,
+  KeyRound,
   Library,
   Loader2,
   Lock,
@@ -5272,6 +5274,87 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   );
 });
 
+type BrowserChatManagementTab = 'accounts' | 'memory' | 'skills';
+
+function BrowserChatManagementSettingsLoading() {
+  const { t } = useI18n();
+  return (
+    <div className="settings-loading-panel compact" role="status" aria-live="polite">
+      <LiquidGlassLoader className="ui-liquid-glass-loader--compact" />
+      <div><h2>{t('正在打开快捷管理')}</h2></div>
+    </div>
+  );
+}
+
+const BrowserChatManagementSettings = dynamic(
+  () => import('@/components/EnvironmentSettings').then((module) => module.EnvironmentSettings),
+  {
+    ssr: false,
+    loading: () => <BrowserChatManagementSettingsLoading />,
+  },
+);
+
+function BrowserChatManagementDialog({
+  defaultUserId,
+  onClose,
+  onSkillsChanged,
+  personalMemoryRefreshToken,
+  tab,
+}: {
+  defaultUserId: string;
+  onClose: () => void;
+  onSkillsChanged: () => void | Promise<void>;
+  personalMemoryRefreshToken?: string;
+  tab: BrowserChatManagementTab;
+}) {
+  const { t } = useI18n();
+  const titleId = useId();
+  const Icon = tab === 'skills' ? Braces : tab === 'memory' ? Brain : KeyRound;
+  const title = tab === 'skills' ? t('Skills 管理') : tab === 'memory' ? t('个性化记忆') : t('登录账号');
+
+  useEscapeDismiss(true, onClose);
+
+  return createPortal((
+    <div className="ui-modal-overlay browser-chat-management-overlay" onMouseDown={onClose}>
+      <section
+        aria-labelledby={titleId}
+        aria-modal="true"
+        className="ui-modal ui-modal--wide browser-chat-management-dialog"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+      >
+        <header className="ui-modal-header">
+          <div className="ui-modal-heading browser-chat-management-heading">
+            <span aria-hidden="true"><Icon size={18} /></span>
+            <div>
+              <h2 className="ui-modal-title" id={titleId}>{title}</h2>
+              <p className="ui-modal-subtitle">{t('无需离开当前对话')}</p>
+            </div>
+          </div>
+          <button aria-label={t('关闭')} autoFocus className="ui-icon-button ui-modal-close" onClick={onClose} type="button">
+            <X size={16} />
+          </button>
+        </header>
+        <div className="ui-modal-body browser-chat-management-body">
+          <div className="browser-chat-settings-pane">
+            <BrowserChatManagementSettings
+              activeTab={tab}
+              defaultUserId={defaultUserId}
+              embedded
+              key={tab}
+              onSkillsChanged={onSkillsChanged}
+              personalMemoryRefreshToken={personalMemoryRefreshToken}
+              showSectionTitles={false}
+              showTabs={false}
+              userId={defaultUserId}
+            />
+          </div>
+        </div>
+      </section>
+    </div>
+  ), document.body);
+}
+
 function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: number } = {}): EmbeddedBrowserBounds {
   const rect = element.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
@@ -7594,6 +7677,11 @@ export function BrowserChatWorkspace({
   const [generatingSkillMessageId, setGeneratingSkillMessageId] = useState<string | null>(null);
   const [messageGenerationDialog, setMessageGenerationDialog] = useState<BrowserChatMessageGenerationDialog | null>(null);
   const [messageGenerationError, setMessageGenerationError] = useState('');
+  const [managementTab, setManagementTab] = useState<BrowserChatManagementTab | null>(null);
+  const personalMemoryRefreshToken = session?.logs.reduce(
+    (token, log) => log.phase === 'memory:extract:done' ? log.id : token,
+    '',
+  ) || '';
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [sessionMinimumLoadingElapsed, setSessionMinimumLoadingElapsed] = useState(false);
   const [loadingSessionHistory, setLoadingSessionHistory] = useState(true);
@@ -9144,6 +9232,20 @@ export function BrowserChatWorkspace({
           skillsHasMore={Boolean(skillListPage.hasMore)}
           uploadingImage={uploadingImage}
         />
+        <div aria-label={t('快捷管理')} className="browser-chat-management-shortcuts" role="group">
+          <button aria-label={t('Skills 管理')} onClick={() => setManagementTab('skills')} title={t('Skills 管理')} type="button">
+            <Braces aria-hidden="true" size={14} />
+            <span>{t('技能')}</span>
+          </button>
+          <button aria-label={t('个性化记忆')} onClick={() => setManagementTab('memory')} title={t('个性化记忆')} type="button">
+            <Brain aria-hidden="true" size={14} />
+            <span>{t('记忆')}</span>
+          </button>
+          <button aria-label={t('登录账号')} onClick={() => setManagementTab('accounts')} title={t('登录账号')} type="button">
+            <KeyRound aria-hidden="true" size={14} />
+            <span>{t('账号')}</span>
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -9259,6 +9361,17 @@ export function BrowserChatWorkspace({
           messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
           onClose={() => setLogDialogMessageId(null)}
           summaryEntries={logDialogSummaryEntries}
+        />
+      ) : null}
+
+      {managementTab ? (
+        <BrowserChatManagementDialog
+          defaultUserId={requestUserId}
+          key={managementTab}
+          onClose={() => setManagementTab(null)}
+          onSkillsChanged={loadSkills}
+          personalMemoryRefreshToken={personalMemoryRefreshToken}
+          tab={managementTab}
         />
       ) : null}
 

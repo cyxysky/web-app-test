@@ -26,7 +26,7 @@ import { useTheme } from '@/theme/ThemeProvider';
 import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
-import { DomainGroupedAccordion } from '@/components/DomainGroupedAccordion';
+import { ManagementDataTable } from '@/components/ManagementDataTable';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import {
   environmentSettingsTabs,
@@ -234,6 +234,8 @@ export function EnvironmentSettings({
   onModelSaved,
   onRuntimeEnvSaved,
   onSkillsChanged,
+  personalMemoryRefreshToken = '',
+  showSectionTitles = true,
   showTabs = true,
   userId,
 }: {
@@ -247,9 +249,13 @@ export function EnvironmentSettings({
   onModelSaved?: () => void;
   onRuntimeEnvSaved?: () => void;
   onSkillsChanged?: () => void;
+  personalMemoryRefreshToken?: string;
+  showSectionTitles?: boolean;
   showTabs?: boolean;
   userId?: string;
 } = {}) {
+  const shouldLoadEnvironmentConfig = !controlledActiveTab
+    || !['skills', 'memory', 'accounts'].includes(controlledActiveTab);
   const { language, setLanguage, t } = useI18n();
   const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
@@ -267,7 +273,7 @@ export function EnvironmentSettings({
   const [deleteLoginAccountTarget, setDeleteLoginAccountTarget] = useState<LoginAccountMetadata | null>(null);
   const [deleteLoginAccountError, setDeleteLoginAccountError] = useState('');
   const [portalReady, setPortalReady] = useState(false);
-  const [loading, setLoading] = useState(!initialData && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
+  const [loading, setLoading] = useState(!initialData && shouldLoadEnvironmentConfig && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
   const [loadingPersonalMemory, setLoadingPersonalMemory] = useState(false);
@@ -298,7 +304,7 @@ export function EnvironmentSettings({
 
   useEffect(() => {
     setHasDirectoryPicker(typeof window !== 'undefined' && Boolean(window.webPilotSystem?.selectDirectory));
-    if (!initialData && (!adminSettingsPasswordRequired || adminSettingsAccessToken)) void load();
+    if (!initialData && shouldLoadEnvironmentConfig && (!adminSettingsPasswordRequired || adminSettingsAccessToken)) void load();
     else setLoading(false);
   // The server snapshot is immutable for this component instance; saves update local state directly.
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -530,7 +536,7 @@ export function EnvironmentSettings({
   useLayoutEffect(() => {
     if (activeTab !== 'memory') return;
     void loadPersonalMemoryItems().catch(() => undefined);
-  }, [activeTab, loadPersonalMemoryItems]);
+  }, [activeTab, loadPersonalMemoryItems, personalMemoryRefreshToken]);
 
   const loadLoginAccounts = useCallback(async () => {
     const loadingSequence = ++loginAccountsLoadSequenceRef.current;
@@ -907,25 +913,28 @@ export function EnvironmentSettings({
   }
 
   function renderPersonalMemoryPanel() {
+    const memoryActions = (
+      <div className="personal-memory-head-actions">
+        <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} />
+        <button className="ui-button ui-button--neutral" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
+          <RefreshCw size={15} />
+          {t('刷新')}
+        </button>
+        <button className="ui-button ui-button--primary" onClick={openCreatePersonalMemory} type="button">
+          <Plus size={15} />
+          {t('新增记忆')}
+        </button>
+      </div>
+    );
     return (
       <section className={loadingPersonalMemory ? 'personal-memory-settings is-loading' : 'personal-memory-settings'}>
-        <div className="settings-section-head">
+        {showSectionTitles ? <div className="settings-section-head">
           <div>
             <h2>{t('个性化记忆')}</h2>
             <span>{t('{count} 条记录，存储于本地数据库', { count: personalMemoryItems.length })}</span>
           </div>
-          <div className="personal-memory-head-actions">
-            <DataTransferButtons kind="memory" onImported={loadPersonalMemoryItems} />
-            <button className="ui-button ui-button--neutral" disabled={loadingPersonalMemory} onClick={() => void loadPersonalMemoryItems()} type="button">
-              <RefreshCw size={15} />
-              {t('刷新')}
-            </button>
-            <button className="ui-button ui-button--primary" onClick={openCreatePersonalMemory} type="button">
-              <Plus size={15} />
-              {t('新增记忆')}
-            </button>
-          </div>
-        </div>
+          {memoryActions}
+        </div> : null}
 
         {loadingPersonalMemory ? (
           <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在读取个性化记忆')}>
@@ -935,11 +944,95 @@ export function EnvironmentSettings({
             </div>
           </div>
         ) : (
-          <DomainGroupedAccordion
+          <ManagementDataTable
+            columns={[
+              {
+                key: 'memory',
+                label: t('记忆'),
+                className: 'management-table-primary-column',
+                render: (item) => (
+                  <div className="management-table-primary-copy">
+                    <strong>{item.key}</strong>
+                    <span>{item.value}</span>
+                    {item.aliases?.length ? <small>{t('等价说法')}：{item.aliases.join(' · ')}</small> : null}
+                  </div>
+                ),
+              },
+              {
+                key: 'type',
+                label: t('类型'),
+                render: (item) => <span>{t(personalMemoryTypeLabel(item.type))}</span>,
+              },
+              {
+                key: 'scope',
+                label: t('适用范围'),
+                render: (item) => (
+                  <div className="management-table-cell-stack">
+                    <span>{item.scope === 'domain' ? item.domain : t('全局')}</span>
+                    <small>{item.shared ? t('所有 ID 共享') : t('仅创建 ID')}</small>
+                  </div>
+                ),
+              },
+              {
+                key: 'status',
+                label: t('状态'),
+                render: (item) => (
+                  <div className="management-table-cell-stack">
+                    <span className={`personal-memory-status ${item.status}`}>{t(item.status === 'active' ? '启用' : '停用')}</span>
+                    {item.useCount ? <small>{t('使用 {count} 次', { count: item.useCount })}</small> : null}
+                  </div>
+                ),
+              },
+              {
+                key: 'updated',
+                label: t('最近更新'),
+                className: 'management-table-date-column',
+                render: (item) => <span className="management-table-muted">{new Date(item.updatedAt).toLocaleString()}</span>,
+              },
+              {
+                key: 'actions',
+                label: t('操作'),
+                className: 'management-table-actions-column',
+                render: (item) => (
+                  <div className="personal-memory-actions">
+                    {item.userId === normalizedUserId ? <>
+                      <button
+                        aria-label={t('编辑记忆')}
+                        className="settings-model-row-button"
+                        disabled={savingPersonalMemory || updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
+                        onClick={() => openEditPersonalMemory(item)}
+                        title={t('编辑记忆')}
+                        type="button"
+                      >
+                        <PencilLine size={15} />
+                      </button>
+                      <button
+                        aria-label={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
+                        className="settings-model-row-button"
+                        disabled={updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
+                        onClick={() => void togglePersonalMemory(item)}
+                        title={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
+                        type="button"
+                      >
+                        {updatingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Power size={15} />}
+                      </button>
+                      <button
+                        aria-label={t('删除记忆')}
+                        className="settings-model-row-button danger"
+                        disabled={deletingPersonalMemoryId === item.id}
+                        onClick={() => requestDeletePersonalMemory(item)}
+                        title={t('删除记忆')}
+                        type="button"
+                      >
+                        {deletingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                      </button>
+                    </> : <span className="resource-readonly-label">{t('只读')}</span>}
+                  </div>
+                ),
+              },
+            ]}
             emptyText={t('暂无个性化记忆')}
-            getDomains={(item) => item.scope === 'domain' && item.domain ? [item.domain] : []}
             getId={(item) => item.id}
-            getName={(item) => item.key}
             getSearchText={(item) => [
               item.key,
               item.value,
@@ -952,66 +1045,10 @@ export function EnvironmentSettings({
               item.userId,
               ...(item.aliases || []),
             ]}
-            getUpdatedAt={(item) => item.updatedAt}
             items={personalMemoryItems}
-            renderItem={(item) => (
-              <article className={`personal-memory-item ${item.status}`} data-i18n-skip key={item.id}>
-                <div className="personal-memory-item-main">
-                  <div className="personal-memory-meta">
-                    <span>{t(personalMemoryTypeLabel(item.type))}</span>
-                    <span className={`personal-memory-status ${item.status}`}>{item.status === 'active' ? t('启用') : t('停用')}</span>
-                    {item.shared ? <span className="resource-shared-badge">{item.userId === normalizedUserId ? t('所有 ID 共享') : t('ID {id} 共享', { id: item.userId })}</span> : null}
-                    {item.useCount ? <span>{t('使用 {count} 次', { count: item.useCount })}</span> : null}
-                  </div>
-                  <div className="personal-memory-copy">
-                    <h3>{item.key}</h3>
-                    <p>{item.value}</p>
-                  </div>
-                  {item.aliases?.length ? (
-                    <div className="personal-memory-aliases">
-                      <span>{t('等价说法')}</span>
-                      <small>{item.aliases.join(' · ')}</small>
-                    </div>
-                  ) : null}
-                </div>
-                <div className="personal-memory-actions">
-                  {item.userId === normalizedUserId ? <>
-                  <button
-                    aria-label={t('编辑记忆')}
-                    className="settings-model-row-button"
-                    disabled={savingPersonalMemory || updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
-                    onClick={() => openEditPersonalMemory(item)}
-                    title={t('编辑记忆')}
-                    type="button"
-                  >
-                    <PencilLine size={15} />
-                  </button>
-                  <button
-                    aria-label={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
-                    className="settings-model-row-button"
-                    disabled={updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
-                    onClick={() => void togglePersonalMemory(item)}
-                    title={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
-                    type="button"
-                  >
-                    {updatingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Power size={15} />}
-                  </button>
-                  <button
-                    aria-label={t('删除记忆')}
-                    className="settings-model-row-button danger"
-                    disabled={deletingPersonalMemoryId === item.id}
-                    onClick={() => requestDeletePersonalMemory(item)}
-                    title={t('删除记忆')}
-                    type="button"
-                  >
-                    {deletingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-                  </button>
-                  </> : <span className="resource-readonly-label">{t('只读')}</span>}
-                </div>
-              </article>
-            )}
+            rowClassName={(item) => item.status === 'disabled' ? 'is-disabled' : ''}
             searchPlaceholder={t('筛选记忆')}
-            unscopedLabel={t('全局')}
+            toolbarActions={showSectionTitles ? undefined : memoryActions}
           />
         )}
         {renderPersonalMemoryEditorModal()}
@@ -1021,25 +1058,28 @@ export function EnvironmentSettings({
   }
 
   function renderLoginAccountsPanel() {
+    const accountActions = (
+      <div className="personal-memory-head-actions">
+        <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} />
+        <button className="ui-button ui-button--neutral" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
+          <RefreshCw size={15} />
+          {t('刷新')}
+        </button>
+        <button className="ui-button ui-button--primary" onClick={() => setLoginAccountEditor('create')} type="button">
+          <Plus size={15} />
+          {t('新增账号')}
+        </button>
+      </div>
+    );
     return (
       <section className={loadingLoginAccounts ? 'login-account-settings is-loading' : 'login-account-settings'}>
-        <div className="settings-section-head">
+        {showSectionTitles ? <div className="settings-section-head">
           <div>
             <h2>{t('登录账号')}</h2>
             <span>{t('{count} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用', { count: loginAccounts.length })}</span>
           </div>
-          <div className="personal-memory-head-actions">
-            <DataTransferButtons kind="credentials" onImported={loadLoginAccounts} />
-            <button className="ui-button ui-button--neutral" disabled={loadingLoginAccounts} onClick={() => void loadLoginAccounts()} type="button">
-              <RefreshCw size={15} />
-              {t('刷新')}
-            </button>
-            <button className="ui-button ui-button--primary" onClick={() => setLoginAccountEditor('create')} type="button">
-              <Plus size={15} />
-              {t('新增账号')}
-            </button>
-          </div>
-        </div>
+          {accountActions}
+        </div> : null}
 
         {loadingLoginAccounts ? (
           <div className="settings-loading-panel compact" role="status" aria-live="polite" aria-label={t('正在读取登录账号')}>
@@ -1047,12 +1087,81 @@ export function EnvironmentSettings({
             <div><h2>{t('正在读取登录账号')}</h2></div>
           </div>
         ) : (
-          <DomainGroupedAccordion
-            className="login-account-domain-list"
+          <ManagementDataTable
+            columns={[
+              {
+                key: 'account',
+                label: t('账号'),
+                className: 'management-table-primary-column',
+                render: (account) => (
+                  <div className="management-table-account-copy">
+                    <span className="login-account-item-icon" aria-hidden="true"><KeyRound size={16} /></span>
+                    <span>
+                      <strong>{account.label || account.username}</strong>
+                      <small>{account.username}</small>
+                    </span>
+                  </div>
+                ),
+              },
+              {
+                key: 'domain',
+                label: t('域名'),
+                render: (account) => <span>{account.domain}</span>,
+              },
+              {
+                key: 'scope',
+                label: t('共享范围'),
+                render: (account) => (
+                  <span className="management-table-muted">
+                    {account.shared
+                      ? account.userId === normalizedUserId ? t('所有 ID 共享') : t('由 ID {id} 共享', { id: account.userId })
+                      : t('仅创建 ID')}
+                  </span>
+                ),
+              },
+              {
+                key: 'status',
+                label: t('状态'),
+                render: (account) => (
+                  <div className="management-table-cell-stack">
+                    <span>{t(account.status === 'active' ? '可用于目标测试' : '已停用')}</span>
+                    {account.useCount ? <small>{t('已使用 {count} 次', { count: account.useCount })}</small> : null}
+                  </div>
+                ),
+              },
+              {
+                key: 'updated',
+                label: t('最近更新'),
+                className: 'management-table-date-column',
+                render: (account) => <span className="management-table-muted">{new Date(account.updatedAt).toLocaleString()}</span>,
+              },
+              {
+                key: 'actions',
+                label: t('操作'),
+                className: 'management-table-actions-column',
+                render: (account) => (
+                  <div className="login-account-item-actions">
+                    {account.userId === normalizedUserId ? <>
+                      <button aria-label={t('编辑登录账号')} className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title={t('编辑登录账号')} type="button">
+                        <PencilLine size={15} />
+                      </button>
+                      <button
+                        aria-label={t('删除登录账号')}
+                        className="settings-model-row-button danger"
+                        disabled={deletingLoginAccountId === account.id}
+                        onClick={() => requestDeleteLoginAccount(account)}
+                        title={t('删除登录账号')}
+                        type="button"
+                      >
+                        {deletingLoginAccountId === account.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                      </button>
+                    </> : <span className="resource-readonly-label">{t('只读')}</span>}
+                  </div>
+                ),
+              },
+            ]}
             emptyText={t('尚未保存登录账号。目标测试需要新账号时，也可以直接在目标卡片中创建。')}
-            getDomains={(account) => [account.domain]}
             getId={(account) => account.id}
-            getName={(account) => account.label || account.username}
             getSearchText={(account) => [
               account.label,
               account.username,
@@ -1063,41 +1172,10 @@ export function EnvironmentSettings({
               account.shared ? t('所有 ID 共享') : t('仅创建 ID'),
               account.userId,
             ]}
-            getUpdatedAt={(account) => account.updatedAt}
             items={loginAccounts}
-            renderItem={(account) => (
-              <article className="login-account-item" key={account.id}>
-                <span className="login-account-item-icon" aria-hidden="true"><KeyRound size={17} /></span>
-                <div className="login-account-item-main">
-                  <strong>{account.label || account.username}</strong>
-                  <span>{account.username} · {account.domain}</span>
-                  <small>
-                    {t(account.status === 'active' ? '可用于目标测试' : '已停用')}
-                    {account.shared ? ` · ${account.userId === normalizedUserId ? t('所有 ID 共享') : t('由 ID {id} 共享', { id: account.userId })}` : ''}
-                    {account.useCount ? ` · ${t('已使用 {count} 次', { count: account.useCount })}` : ''}
-                  </small>
-                </div>
-                <div className="login-account-item-actions">
-                  {account.userId === normalizedUserId ? <>
-                  <button aria-label={t('编辑登录账号')} className="settings-model-row-button" onClick={() => setLoginAccountEditor(account)} title={t('编辑登录账号')} type="button">
-                    <PencilLine size={15} />
-                  </button>
-                  <button
-                    aria-label={t('删除登录账号')}
-                    className="settings-model-row-button danger"
-                    disabled={deletingLoginAccountId === account.id}
-                    onClick={() => requestDeleteLoginAccount(account)}
-                    title={t('删除登录账号')}
-                    type="button"
-                  >
-                    {deletingLoginAccountId === account.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-                  </button>
-                  </> : <span className="resource-readonly-label">{t('只读')}</span>}
-                </div>
-              </article>
-            )}
+            rowClassName={(account) => account.status === 'disabled' ? 'is-disabled' : ''}
             searchPlaceholder={t('筛选登录账号')}
-            unscopedLabel={t('未分组')}
+            toolbarActions={showSectionTitles ? undefined : accountActions}
           />
         )}
 
@@ -1339,7 +1417,7 @@ export function EnvironmentSettings({
             </section>
           ) : null}
 
-          {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} userId={normalizedUserId} /> : null}
+          {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} showTitle={showSectionTitles} userId={normalizedUserId} /> : null}
 
           {activeTab === 'memory' ? renderPersonalMemoryPanel() : null}
 

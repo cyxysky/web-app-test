@@ -47,37 +47,6 @@
   max-width: 620px;
 }
 
-.browser-chat-starter-grid {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  width: 100%;
-}
-
-.browser-chat-starter-grid button {
-  align-items: flex-start;
-  background: transparent;
-  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
-  border-radius: 12px;
-  color: var(--muted-strong);
-  cursor: pointer;
-  display: flex;
-  font: inherit;
-  font-size: 13px;
-  gap: 10px;
-  line-height: 1.45;
-  min-height: 76px;
-  padding: 15px;
-  text-align: left;
-}
-
-.browser-chat-starter-grid button:hover {
-  border-color: var(--border-strong);
-  color: var(--foreground);
-}
-
-.browser-chat-starter-grid svg { flex: 0 0 auto; margin-top: 1px; }
-
 .browser-chat-tutorial-link,
 .browser-chat-tutorial-skip {
   background: transparent;
@@ -183,8 +152,19 @@
 .webpilot-help-backdrop {
   background: color-mix(in srgb, #07100c 28%, transparent);
   inset: 0;
+  opacity: 0;
+  pointer-events: none;
   position: fixed;
+  transition: opacity 180ms ease, visibility 0s linear 220ms;
+  visibility: hidden;
   z-index: 300;
+}
+
+.webpilot-help-backdrop.is-open {
+  opacity: 1;
+  pointer-events: auto;
+  transition-delay: 0s;
+  visibility: visible;
 }
 
 .webpilot-help-drawer {
@@ -198,8 +178,12 @@
   position: absolute;
   right: 0;
   top: 0;
+  transform: translateX(100%);
+  transition: transform 220ms cubic-bezier(.22, 1, .36, 1);
   width: 460px;
 }
+
+.webpilot-help-backdrop.is-open .webpilot-help-drawer { transform: translateX(0); }
 
 .webpilot-help-drawer > header {
   align-items: center;
@@ -231,7 +215,12 @@
 .webpilot-help-drawer > footer .ui-button { align-items: center; display: inline-flex; font-size: 12px; gap: 7px; text-decoration: none; }
 
 @media (max-width: 700px) {
-  .browser-chat-starter-grid, .browser-chat-readiness-grid { grid-template-columns: 1fr; }
+  .browser-chat-readiness-grid { grid-template-columns: 1fr; }
   .browser-chat-empty-heading h1, .browser-chat-onboarding h1 { font-size: 28px; }
   .webpilot-help-drawer { max-width: 100%; width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .webpilot-help-backdrop,
+  .webpilot-help-drawer { transition: none; }
 }

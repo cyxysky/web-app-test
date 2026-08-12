@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  analyzeDurablePersonalMemoryDrafts,
   filterDurablePersonalMemoryDrafts,
   formatPersonalMemoryForPrompt,
   normalizePersonalMemoryValue,
@@ -48,7 +49,7 @@ test('formats multiline personal memory for prompts and applies only a prompt-ti
 });
 
 test('rejects one-off page references even when the extractor labels them as confident memory', () => {
-  const items = filterDurablePersonalMemoryDrafts([{
+  const candidates = [{
     scope: 'domain',
     domain: 'ng.ant.design',
     type: 'domain_fact',
@@ -58,9 +59,12 @@ test('rejects one-off page references even when the extractor labels them as con
     confidence: 0.95,
     evidence: ['打开带 icon 的滑块'],
     durability: 'explicit_alias',
-  }], ['打开带 icon 的滑块']);
+  }];
+  const analysis = analyzeDurablePersonalMemoryDrafts(candidates, ['打开带 icon 的滑块']);
 
-  assert.deepEqual(items, []);
+  assert.deepEqual(analysis.items, []);
+  assert.equal(analysis.rejected.length, 1);
+  assert.equal(analysis.rejected[0]?.reason, 'missing_explicit_durability_cue');
 });
 
 test('keeps an explicitly durable user preference with exact user evidence', () => {

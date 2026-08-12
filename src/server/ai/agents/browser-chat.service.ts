@@ -731,12 +731,37 @@ function queuePersonalMemoryExtraction(input: {
           sourceMessageIds: [input.userMessageId, input.assistantMessageId],
         });
         const current = sessions.get(input.session.id);
-        if (!current || current !== input.session || memoryResult.skipped || !memoryResult.items.length) return;
-        appendLog(current, 'memory:extract:done', `已提炼 ${memoryResult.items.length} 条个性化短记忆。`, {
+        if (!current || current !== input.session) return;
+        const details = {
+          currentDomain: normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl),
+          ...memoryResult.diagnostics,
+        };
+        if (memoryResult.skipped) {
+          appendLog(current, 'memory:extract:skipped', `个性化短记忆提炼已跳过：${memoryResult.reason || 'unknown reason'}。`, {
+            elapsedMs: elapsedMs(startedAt),
+            messageId: null,
+            details,
+          });
+          return;
+        }
+        if (!memoryResult.items.length) {
+          appendLog(
+            current,
+            'memory:extract:empty',
+            `模型返回 ${memoryResult.diagnostics.candidateCount} 条记忆候选，规则保留 ${memoryResult.diagnostics.acceptedCount} 条，本轮未写入记忆。`,
+            {
+              elapsedMs: elapsedMs(startedAt),
+              messageId: null,
+              details,
+            },
+          );
+          return;
+        }
+        appendLog(current, 'memory:extract:done', `模型返回 ${memoryResult.diagnostics.candidateCount} 条记忆候选，过滤 ${memoryResult.diagnostics.rejectedCount} 条，已保存 ${memoryResult.items.length} 条。`, {
           elapsedMs: elapsedMs(startedAt),
           messageId: null,
           details: {
-            currentDomain: normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl),
+            ...details,
             items: memoryResult.items.map((item) => ({
               id: item.id,
               scope: item.scope,
@@ -761,6 +786,11 @@ function queuePersonalMemoryExtraction(input: {
   });
   if (queueResult === 'full') {
     appendLog(input.session, 'memory:extract:queued-limit', '个性化短记忆提取队列已满，本轮跳过提取。', {
+      messageId: null,
+      deferPersist: true,
+    });
+  } else if (queueResult === 'duplicate') {
+    appendLog(input.session, 'memory:extract:duplicate', '本轮个性化短记忆提取任务已经存在，已跳过重复任务。', {
       messageId: null,
       deferPersist: true,
     });

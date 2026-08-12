@@ -525,6 +525,166 @@
   white-space: nowrap;
 }
 
+.domain-list-toolbar-meta {
+  align-items: center;
+  display: flex;
+  gap: 14px;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.management-data-table {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.management-data-table-scroll {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  min-width: 0;
+  overflow: auto;
+}
+
+.management-data-table table {
+  border-collapse: collapse;
+  min-width: 900px;
+  table-layout: fixed;
+  width: 100%;
+}
+
+.management-data-table th,
+.management-data-table td {
+  border-bottom: 1px solid var(--border);
+  padding: 13px 14px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.management-data-table th {
+  background: var(--panel-soft);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 720;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.management-data-table tbody tr:last-child > td,
+.management-data-table tbody tr:has(+ .management-data-table-expanded-row) > td {
+  border-bottom: 0;
+}
+
+.management-data-table tbody tr:not(.management-data-table-expanded-row):not(.management-data-table-empty-row):hover > td {
+  background: color-mix(in srgb, var(--foreground) 2.8%, transparent);
+}
+
+.management-data-table tbody tr.is-disabled {
+  opacity: 0.66;
+}
+
+.management-table-primary-column {
+  width: 27%;
+}
+
+.management-table-date-column {
+  width: 156px;
+}
+
+.management-table-actions-column {
+  text-align: right !important;
+  width: 112px;
+}
+
+.management-table-primary-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  cursor: pointer;
+  display: flex;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+  padding: 0;
+  text-align: left;
+}
+
+.management-table-primary-button > span,
+.management-table-primary-copy,
+.management-table-cell-stack,
+.management-table-account-copy > span:last-child {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.management-table-primary-button strong,
+.management-table-primary-copy strong,
+.management-table-account-copy strong {
+  color: var(--foreground);
+  font-size: 13.5px;
+  font-weight: 720;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.management-table-primary-button small,
+.management-table-primary-copy :where(span, small),
+.management-table-cell-stack small,
+.management-table-account-copy small,
+.management-table-muted {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.management-table-primary-copy > span {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.management-table-cell-stack > span:first-child {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.management-table-account-copy {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  min-width: 0;
+}
+
+.management-data-table :where(.skills-manager-item-actions, .personal-memory-actions, .login-account-item-actions) {
+  justify-content: flex-end;
+  opacity: 0.72;
+}
+
+.management-data-table tr:hover :where(.skills-manager-item-actions, .personal-memory-actions, .login-account-item-actions),
+.management-data-table :where(.skills-manager-item-actions, .personal-memory-actions, .login-account-item-actions):focus-within {
+  opacity: 1;
+}
+
+.management-data-table-expanded-row > td {
+  background: color-mix(in srgb, var(--panel-soft) 62%, transparent);
+  border-bottom: 1px solid var(--border) !important;
+  padding: 0;
+}
+
+.management-data-table-expanded-row .skills-manager-item-detail {
+  padding: 18px 22px 20px 38px;
+}
+
+.management-data-table-empty-row td {
+  color: var(--muted);
+  padding: 34px 18px;
+  text-align: center;
+}
+
 .domain-accordion-group {
   background: var(--panel);
   border: 0;
@@ -630,6 +790,11 @@
 
   .domain-list-count {
     text-align: left;
+  }
+
+  .domain-list-toolbar-meta {
+    justify-content: flex-start;
+    overflow-x: auto;
   }
 }
 

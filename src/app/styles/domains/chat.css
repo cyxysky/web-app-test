@@ -443,6 +443,107 @@
   width: min(100%, 860px);
 }
 
+.browser-chat-management-shortcuts {
+  align-items: center;
+  display: flex;
+  gap: 3px;
+  justify-content: center;
+  min-height: 28px;
+}
+
+.browser-chat-management-shortcuts button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 520;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.browser-chat-management-shortcuts button:hover {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-management-shortcuts svg { flex: 0 0 auto; }
+
+.browser-chat-management-dialog {
+  --ui-modal-inline-size: 1120px;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: min(88dvh, 860px);
+}
+
+.browser-chat-management-dialog > .ui-modal-header > .browser-chat-management-heading {
+  align-items: center;
+  display: flex;
+  gap: 11px;
+}
+
+.browser-chat-management-heading > div {
+  min-width: 0;
+}
+
+.browser-chat-management-heading > span {
+  align-items: center;
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--muted-strong);
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 34px;
+  justify-content: center;
+  width: 34px;
+}
+
+.browser-chat-management-body {
+  background: var(--panel);
+  padding: 0;
+}
+
+.browser-chat-management-body .browser-chat-settings-pane {
+  min-height: 100%;
+  overflow: visible;
+  padding: 26px 30px 42px;
+}
+
+.browser-chat-management-body .browser-chat-settings-pane .settings-workspace {
+  max-width: none;
+}
+
+.browser-chat-management-body .skills-manager-head {
+  justify-content: flex-end;
+}
+
+.browser-chat-management-dialog .browser-chat-settings-pane .settings-section-head > .personal-memory-head-actions,
+.browser-chat-management-dialog .domain-list-toolbar-meta > .personal-memory-head-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  justify-content: flex-end;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.browser-chat-management-dialog .domain-list-toolbar-meta {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.browser-chat-management-body .personal-memory-head-actions > *,
+.browser-chat-management-body .data-transfer-buttons {
+  flex: 0 0 auto;
+}
+
 .browser-chat-compose.browser-chat-compose--reference {
   display: grid;
   overflow: visible;

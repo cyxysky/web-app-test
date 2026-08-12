@@ -70,6 +70,35 @@ export type PersonalMemoryExtractionResult = {
   rawText: string;
   skipped: boolean;
   reason?: string;
+  diagnostics: PersonalMemoryExtractionDiagnostics;
+};
+
+export type PersonalMemoryFilterRejectionReason =
+  | 'missing_evidence'
+  | 'unsupported_durability'
+  | 'repeated_behavior_requires_two_quotes'
+  | 'repeated_behavior_requires_two_user_messages'
+  | 'evidence_not_found_in_user_messages'
+  | 'missing_explicit_durability_cue'
+  | 'domain_fact_requires_explicit_remember_or_alias';
+
+export type PersonalMemoryFilterRejection = {
+  index: number;
+  key: string;
+  type: string;
+  durability: string;
+  reason: PersonalMemoryFilterRejectionReason;
+  reasonDescription: string;
+};
+
+export type PersonalMemoryExtractionDiagnostics = {
+  candidateCount: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  savedCount: number;
+  normalizationRejectedCount: number;
+  rejectionReasons: Partial<Record<PersonalMemoryFilterRejectionReason, number>>;
+  rejectedCandidates: PersonalMemoryFilterRejection[];
 };
 
 type PersonalMemoryConversationMessage = {
@@ -600,6 +629,16 @@ const personalMemoryDurabilitySignals = new Set<PersonalMemoryDurabilitySignal>(
   'repeated_user_behavior',
 ]);
 
+const personalMemoryFilterRejectionDescriptions: Record<PersonalMemoryFilterRejectionReason, string> = {
+  missing_evidence: '缺少用户原文证据。',
+  unsupported_durability: '模型返回了不支持的长期性类型。',
+  repeated_behavior_requires_two_quotes: '重复行为至少需要两条用户原文证据。',
+  repeated_behavior_requires_two_user_messages: '重复行为证据必须来自两条不同的用户消息。',
+  evidence_not_found_in_user_messages: '模型给出的证据未在用户消息中找到。',
+  missing_explicit_durability_cue: '用户原文缺少“记住、以后、默认”等长期性表达。',
+  domain_fact_requires_explicit_remember_or_alias: '域名事实必须由用户明确要求记住或定义为可复用别名。',
+};
+
 function normalizedEvidenceText(value: unknown) {
   return textFromUnknown(value).toLowerCase().replace(/\s+/g, ' ').trim();
 }
@@ -620,26 +659,70 @@ export function filterDurablePersonalMemoryDrafts(
   items: PersonalMemoryExtractionDraft[],
   userMessages: string[],
 ): PersonalMemoryDraft[] {
+  return analyzeDurablePersonalMemoryDrafts(items, userMessages).items;
+}
+
+export function analyzeDurablePersonalMemoryDrafts(
+  items: PersonalMemoryExtractionDraft[],
+  userMessages: string[],
+) {
   const normalizedUserMessages = userMessages.map(normalizedEvidenceText).filter(Boolean);
-  return items.filter((item) => {
+  const accepted: PersonalMemoryDraft[] = [];
+  const rejected: PersonalMemoryFilterRejection[] = [];
+  items.forEach((item, index) => {
     const evidence = normalizedEvidenceTexts(item.evidence);
     const signal = textFromUnknown(item.durability).trim() as PersonalMemoryDurabilitySignal;
-    if (!evidence.length || !personalMemoryDurabilitySignals.has(signal)) return false;
+    const reject = (reason: PersonalMemoryFilterRejectionReason) => {
+      rejected.push({
+        index,
+        key: compactText(item.key, 120),
+        type: textFromUnknown(item.type),
+        durability: signal,
+        reason,
+        reasonDescription: personalMemoryFilterRejectionDescriptions[reason],
+      });
+    };
+    if (!evidence.length) {
+      reject('missing_evidence');
+      return;
+    }
+    if (!personalMemoryDurabilitySignals.has(signal)) {
+      reject('unsupported_durability');
+      return;
+    }
     const sourceMessageIndexes = new Set(evidence.map((quote) => (
       normalizedUserMessages.findIndex((message) => message.includes(quote))
     )).filter((index) => index >= 0));
     if (signal === 'repeated_user_behavior') {
-      if (evidence.length < 2 || sourceMessageIndexes.size < 2) return false;
+      if (evidence.length < 2) {
+        reject('repeated_behavior_requires_two_quotes');
+        return;
+      }
+      if (sourceMessageIndexes.size < 2) {
+        reject('repeated_behavior_requires_two_user_messages');
+        return;
+      }
     } else {
+      if (!sourceMessageIndexes.size) {
+        reject('evidence_not_found_in_user_messages');
+        return;
+      }
       const hasDurableUserEvidence = Array.from(sourceMessageIndexes).some((index) => (
         hasExplicitDurabilityCue(normalizedUserMessages[index], signal)
       ));
-      if (!hasDurableUserEvidence) return false;
+      if (!hasDurableUserEvidence) {
+        reject('missing_explicit_durability_cue');
+        return;
+      }
     }
     const type = normalizeType(item.type);
-    if (type === 'domain_fact' && signal !== 'explicit_remember' && signal !== 'explicit_alias') return false;
-    return true;
+    if (type === 'domain_fact' && signal !== 'explicit_remember' && signal !== 'explicit_alias') {
+      reject('domain_fact_requires_explicit_remember_or_alias');
+      return;
+    }
+    accepted.push(item);
   });
+  return { items: accepted, rejected };
 }
 
 function compactConversationForMemory(messages: PersonalMemoryConversationMessage[]) {
@@ -783,7 +866,21 @@ export async function extractPersonalMemoryFromTurn(input: {
   sourceSessionId: string;
   sourceMessageIds: string[];
 }): Promise<PersonalMemoryExtractionResult> {
-  if (!personalMemoryExtractionEnabled()) return { items: [], rawText: '', skipped: true, reason: 'disabled' };
+  if (!personalMemoryExtractionEnabled()) return {
+    items: [],
+    rawText: '',
+    skipped: true,
+    reason: 'disabled',
+    diagnostics: {
+      candidateCount: 0,
+      acceptedCount: 0,
+      rejectedCount: 0,
+      savedCount: 0,
+      normalizationRejectedCount: 0,
+      rejectionReasons: {},
+      rejectedCandidates: [],
+    },
+  };
   const userId = normalizePersonalMemoryUserId(input.userId);
   const currentDomain = normalizePersonalMemoryDomain(input.currentUrl || input.targetUrl || '');
   const existingItems = listPersonalMemoryItems({ userId, domain: currentDomain, includeDisabled: true });
@@ -802,7 +899,7 @@ export async function extractPersonalMemoryFromTurn(input: {
     model: getModel(),
     temperature: 0.1,
     reasoning: aiReasoningEffort(),
-    maxRetries: 0,
+    maxRetries: 3,
     prompt,
     output: Output.object({ schema: personalMemoryExtractionSchema }),
     telemetry: aiTelemetry('personal-memory-extraction'),
@@ -811,15 +908,33 @@ export async function extractPersonalMemoryFromTurn(input: {
     ...(input.conversation || []).filter((message) => message.role === 'user').map((message) => message.content),
     input.userMessage,
   ];
+  const filtered = analyzeDurablePersonalMemoryDrafts(result.output.items, userMessages);
   const items = upsertExtractedPersonalMemoryItems({
     userId,
     domain: currentDomain,
     sourceSessionId: input.sourceSessionId,
     sourceMessageIds: input.sourceMessageIds,
     sourceUrl: input.currentUrl || input.targetUrl || '',
-    items: filterDurablePersonalMemoryDrafts(result.output.items, userMessages),
+    items: filtered.items,
   });
-  return { items, rawText: safeJson(result.output), skipped: false };
+  const rejectionReasons = filtered.rejected.reduce<Partial<Record<PersonalMemoryFilterRejectionReason, number>>>((counts, rejection) => {
+    counts[rejection.reason] = (counts[rejection.reason] || 0) + 1;
+    return counts;
+  }, {});
+  return {
+    items,
+    rawText: safeJson(result.output),
+    skipped: false,
+    diagnostics: {
+      candidateCount: result.output.items.length,
+      acceptedCount: filtered.items.length,
+      rejectedCount: filtered.rejected.length,
+      savedCount: items.length,
+      normalizationRejectedCount: Math.max(0, filtered.items.length - items.length),
+      rejectionReasons,
+      rejectedCandidates: filtered.rejected,
+    },
+  };
 }
 
 export function personalMemoryDiagnostics() {

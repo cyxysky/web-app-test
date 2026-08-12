@@ -19,6 +19,7 @@ export function DomainGroupedAccordion<T>({
   items,
   renderItem,
   searchPlaceholder,
+  toolbarActions,
   unscopedLabel,
 }: {
   className?: string;
@@ -31,6 +32,7 @@ export function DomainGroupedAccordion<T>({
   items: T[];
   renderItem: (item: T, domain: string) => ReactNode;
   searchPlaceholder: string;
+  toolbarActions?: ReactNode;
   unscopedLabel: string;
 }) {
   const { t } = useI18n();
@@ -78,7 +80,10 @@ export function DomainGroupedAccordion<T>({
             <button aria-label={t('清空筛选')} onClick={() => setQuery('')} type="button"><X size={14} /></button>
           ) : null}
         </label>
-        <span className="domain-list-count">{t('显示 {visible} / {total} 条', { visible: result.filteredCount, total: items.length })}</span>
+        <div className="domain-list-toolbar-meta">
+          <span className="domain-list-count">{t('显示 {visible} / {total} 条', { visible: result.filteredCount, total: items.length })}</span>
+          {toolbarActions}
+        </div>
       </div>
 
       {result.groups.length ? (

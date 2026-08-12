@@ -14,6 +14,7 @@ type HelpPayload = { readiness: WebPilotOnboardingReadiness; state: WebPilotOnbo
 export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
+  const [portalReady, setPortalReady] = useState(false);
   const [payload, setPayload] = useState<HelpPayload>();
   const [resetting, setResetting] = useState(false);
   const endpoint = withWebPilotBasePath('/api/onboarding');
@@ -22,6 +23,8 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
     setPayload(await fetch(endpoint, { cache: 'no-store' })
       .then((response) => readApiJson<HelpPayload>(response, '加载帮助中心失败')));
   }, [endpoint]);
+
+  useEffect(() => setPortalReady(true), []);
 
   useEffect(() => {
     if (open) void load();
@@ -54,6 +57,8 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
   return (
     <>
       <button
+        aria-controls="webpilot-help-drawer"
+        aria-expanded={open}
         aria-label="帮助与教程"
         className="workspace-help-button"
         onClick={() => setOpen(true)}
@@ -64,9 +69,14 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
         <CircleHelp aria-hidden="true" size={17} />
         <span>帮助与教程</span>
       </button>
-      {open && typeof document !== 'undefined' ? createPortal(
-        <div className="webpilot-help-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}>
-          <aside aria-label="WebPilot 帮助中心" aria-modal="true" className="webpilot-help-drawer" role="dialog">
+      {portalReady ? createPortal(
+        <div
+          aria-hidden={!open}
+          className={`webpilot-help-backdrop${open ? ' is-open' : ''}`}
+          inert={!open}
+          onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}
+        >
+          <aside aria-label="WebPilot 帮助中心" aria-modal="true" className="webpilot-help-drawer" id="webpilot-help-drawer" role="dialog">
             <header>
               <div><span>WebPilot</span><h2>帮助与教程</h2></div>
               <button aria-label="关闭帮助中心" className="ui-icon-button" onClick={() => setOpen(false)} type="button"><X size={18} /></button>
