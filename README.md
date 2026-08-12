@@ -104,7 +104,6 @@ Runtime controls:
 - `AI_PERSONAL_MEMORY_EXTRACT_ENABLED=false` disables post-turn extraction while keeping manual memory recall available.
 - `AI_PERSONAL_MEMORY_PROMPT_LIMIT=6` controls how many memory items are injected into one turn.
 - `AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS=12000` limits only the memory text injected into one model prompt; stored manual memory remains complete and keeps line breaks.
-- `AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS=30000` controls the extraction request timeout.
 
 Minimal management API:
 
@@ -196,3 +195,19 @@ docker push "${DockerHubUser}/webpilot-qa:latest"
 ```
 1.你现在新建标签页，还是会把组挤到被遮挡的地方
 2.你现在删除按钮还是和文本重叠了，你能不能用flex布局，文本overflow：hidden？
+
+
+在wiki里面创建一个最新的DOMP更新日志
+流程是：
+1.进入这个界面https://wiki.shterm.com/pages/viewpage.action?pageId=327681890
+2.在新标签页打开这个https://wiki.shterm.com/pages/viewpage.action?pageId=478021312，里面是版本发布的模板，复制里面的模板
+3.当前是否是大版本更新
+ - 如果是大版本更新，就在https://wiki.shterm.com/pages/viewpage.action?pageId=327681890这个目录下新建一个，后续操作修改的名称是vx.x.x(最新的大版本) 版本发布自动配置方案
+ - 如果是小版本更新，就选中最新的大版本发布配置方案，在里面新建，后续操作修改的名称是vx.x.x(大版本) 0806(月份天) 版本发布自动配置方案
+4.在对应目录下点击新建后，进入界面编辑，修改标题为，修改发布时间为当天，存在2种更新时间点：如果中午更新就是12:00，如果晚上更新就是22:00。
+5.点击发布进行发布
+
+
+
+
+1.新建wiki的domp发版内容

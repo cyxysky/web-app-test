@@ -30,10 +30,17 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /default to 5000ms/);
   assert.match(rules, /navigation defaults to 30000ms/);
   assert.match(rules, /nodeRepl\.emitImage/);
-  assert.match(rules, /page\.setTextSelection/);
+  assert.match(rules, /targetPage\.setTextSelection/);
   assert.match(rules, /browser\.tabs\.list/);
+  assert.match(rules, /browser\.tabs\.use/);
+  assert.match(rules, /Page that owns the locator/);
+  assert.match(rules, /aria-hidden only changes accessibility exposure/);
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
+  assert.match(rules, /attachmentVault\.setInputFiles/);
+  assert.match(rules, /upload-only request, do not call readFile/i);
+  assert.match(rules, /FileChooser\.setFiles/);
+  assert.match(rules, /exactly one attachment at the requested destination/i);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /extra contains mounted non-actionable records/);
@@ -62,7 +69,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /<button role="treeitem"> is a treeitem, not a button/i);
   assert.match(rules, /never infer a control type, interaction sequence, or completion state/i);
   assert.match(rules, /unique Locator with force:true/i);
-  assert.match(rules, /Never force an ambiguous, hidden, detached, disabled, or unobserved target/i);
+  assert.match(rules, /Never force an ambiguous, visually hidden, detached, disabled, or unobserved target/i);
   assert.match(rules, /factory methods automatically exclude matches that do not currently exist as rendered elements/);
   assert.match(rules, /full actionability checks on every remaining candidate/);
   assert.match(rules, /exactly one candidate passes/);
@@ -147,6 +154,10 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /next cell/);
   assert.match(rules, /context\.pages/);
   assert.match(rules, /credentialVault\.fill/);
+  assert.match(rules, /attachmentVault\.setInputFiles/);
+  assert.match(rules, /upload-only request do not read or reconstruct the file/i);
+  assert.match(rules, /deterministic batch in one bounded cell/i);
+  assert.match(rules, /re-establish and verify the intended editable target and focus/i);
 });
 
 test('DOM mode requests screenshots explicitly instead of receiving automatic captures', () => {

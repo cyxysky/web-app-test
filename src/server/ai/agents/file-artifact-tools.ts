@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
@@ -8,6 +8,12 @@ import {
   generateFileBuffer,
   type GeneratedFileInput,
 } from './document-artifact-generators';
+import {
+  fillDocxTemplateBuffer,
+  type DocxTemplateFillOperation,
+} from './docx-template-filler';
+import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
+import type { BrowserCodeAttachmentBinding } from '@/server/browser/browser-code-runner';
 
 const FILE_DOWNLOAD_TIMEOUT_MS = 30000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
@@ -24,6 +30,15 @@ type DownloadArtifactInput = {
 type GenerateArtifactInput = Omit<GeneratedFileInput, 'fileName'> & {
   runId?: string;
   fileName?: string | null;
+};
+
+type FillDocumentTemplateArtifactInput = {
+  runId?: string;
+  templateAttachmentId?: string;
+  fileName?: string | null;
+  includeVisualVerification?: boolean;
+  operations?: DocxTemplateFillOperation[];
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
 };
 
 type ArtifactToolPayload = {
@@ -108,10 +123,14 @@ function artifactResultPayload(input: {
 }
 
 export function formatFileArtifactResult(toolName: string, actual?: string) {
-  if (toolName !== 'downloadFile' && toolName !== 'generateFile') return undefined;
+  if (toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
-    const label = toolName === 'downloadFile' ? 'File downloaded' : 'File generated';
+    const label = toolName === 'downloadFile'
+      ? 'File downloaded'
+      : toolName === 'fillDocumentTemplate'
+        ? 'Document template filled'
+        : 'File generated';
     const fileName = payload.fileName || 'artifact';
     const target = payload.downloadUrl || payload.url || payload.path || '';
     const targetLine = target
@@ -258,6 +277,73 @@ export async function generateFileArtifact(input: GenerateArtifactInput): Promis
   }
 }
 
+export async function fillDocumentTemplateArtifact(input: FillDocumentTemplateArtifactInput): Promise<BrowserActionResult> {
+  try {
+    const templateAttachmentId = String(input.templateAttachmentId || '').trim();
+    const binding = input.attachmentBindings?.find((item) => item.ref === templateAttachmentId);
+    if (!binding) {
+      return { ok: false, actual: 'fillDocumentTemplate failed: templateAttachmentId is not a registered attachment in this conversation.' };
+    }
+    if (path.extname(binding.name).toLowerCase() !== '.docx') {
+      return { ok: false, actual: 'fillDocumentTemplate failed: the registered template must be a .docx file.' };
+    }
+    const operations = Array.isArray(input.operations) ? input.operations : [];
+    if (!operations.length) {
+      return { ok: false, actual: 'fillDocumentTemplate failed: at least one fill operation is required.' };
+    }
+    const metadata = await stat(binding.path);
+    if (metadata.size > FILE_DOWNLOAD_MAX_BYTES) {
+      return { ok: false, actual: `fillDocumentTemplate failed: template exceeds ${FILE_DOWNLOAD_MAX_BYTES} bytes.` };
+    }
+    const requestedName = sanitizeFileName(
+      input.fileName || binding.name.replace(/\.docx$/i, '-filled.docx'),
+      `filled-document-${Date.now()}.docx`,
+    );
+    if (path.extname(requestedName).toLowerCase() !== '.docx') {
+      return { ok: false, actual: 'fillDocumentTemplate failed: fileName must end with .docx.' };
+    }
+    const filled = await fillDocxTemplateBuffer(await readFile(binding.path), operations);
+    const dir = artifactDir(input.runId, 'generated');
+    await mkdir(dir, { recursive: true });
+    const target = await uniqueArtifactPath(dir, requestedName);
+    await writeFile(target.filePath, filled.buffer);
+    const visualVerification = input.includeVisualVerification
+      ? await renderBrowserChatAttachmentVisuals({
+          absolutePath: target.filePath,
+          buffer: filled.buffer,
+          extension: '.docx',
+          name: target.fileName,
+        })
+      : undefined;
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        ...artifactResultPayload({
+          kind: 'generated',
+          fileName: target.fileName,
+          filePath: target.filePath,
+          bytes: filled.buffer.byteLength,
+        }),
+        templateValidation: {
+          changedParts: filled.changedParts,
+          filledOperations: filled.filledOperations,
+          preservedParts: filled.preservedParts,
+        },
+        visualVerification: visualVerification ? {
+          imageCount: visualVerification.imagePaths.length,
+          pageCount: visualVerification.pageCount,
+          renderedPages: visualVerification.renderedPages,
+          renderer: visualVerification.renderer,
+          warning: visualVerification.warning,
+        } : { skipped: 'current model does not accept image input' },
+      }),
+      referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
+    };
+  } catch (error) {
+    return { ok: false, actual: `fillDocumentTemplate failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 function verifiedArtifactDownloadUrl(value: unknown) {
   if (typeof value !== 'string' || !value.trim()) return undefined;
   try {
@@ -270,7 +356,7 @@ function verifiedArtifactDownloadUrl(value: unknown) {
 }
 
 export function fileArtifactDownloadFromToolResult(tool: FileArtifactToolResult): FileArtifactDownload | undefined {
-  if (tool.name !== 'downloadFile' && tool.name !== 'generateFile') return undefined;
+  if (tool.name !== 'downloadFile' && tool.name !== 'generateFile' && tool.name !== 'fillDocumentTemplate') return undefined;
   if (!tool.result || typeof tool.result !== 'object' || !('ok' in tool.result) || tool.result.ok !== true) return undefined;
   try {
     const actual = 'actual' in tool.result && typeof tool.result.actual === 'string'

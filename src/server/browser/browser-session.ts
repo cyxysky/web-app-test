@@ -48,6 +48,7 @@ import {
   BROWSER_CODE_KERNEL_RUNTIME_REVISION,
   browserCodePolicyViolation,
   BrowserCodeKernel,
+  type BrowserCodeAttachmentBinding,
   type BrowserCodeActivity,
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
@@ -2009,6 +2010,8 @@ export class BrowserSession {
       if (page.isClosed()) continue;
       const groupId = await this.readPageGroupId(page);
       if (groupId === this.pageGroupId && this.claimPage(page, { makeActive: false })) {
+        const nativeTabId = await this.readPageNativeTabId(page);
+        if (nativeTabId) this.nativeTabIdByPage.set(page, nativeTabId);
         reclaimedPages.push(page);
       }
     }
@@ -2019,11 +2022,11 @@ export class BrowserSession {
     const lookup = await this.findNativeTabGroupTabs(context);
     if (!lookup?.found) return { found: false, pages: [] };
 
-    const existingPages = await this.waitForNativeGroupPages(context, lookup.tabs, 4);
+    const existingPages = await this.waitForNativeGroupPages(context, 4);
     if (existingPages.length) return { found: true, pages: existingPages };
 
     await this.activateNativeTabGroupTab(context, lookup.tabs);
-    const activatedPages = await this.waitForNativeGroupPages(context, lookup.tabs, 8);
+    const activatedPages = await this.waitForNativeGroupPages(context, 8);
     return { found: true, pages: activatedPages };
   }
 
@@ -2081,41 +2084,14 @@ export class BrowserSession {
     }).catch(() => undefined);
   }
 
-  private async waitForNativeGroupPages(context: BrowserContext, tabs: NativeTabGroupPage[], attempts: number) {
+  private async waitForNativeGroupPages(context: BrowserContext, attempts: number) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       const markedPages = await this.reclaimSessionPagesByMarker(context);
       if (markedPages.length) return markedPages;
 
-      const urlClaimedPages = await this.claimPagesByNativeTabUrls(context, tabs);
-      if (urlClaimedPages.length) return urlClaimedPages;
-
       if (attempt < attempts - 1) await sleep(150);
     }
     return [] as Page[];
-  }
-
-  private async claimPagesByNativeTabUrls(context: BrowserContext, tabs: NativeTabGroupPage[]) {
-    this.ensureLivePreviewState();
-    const remainingByUrl = new Map<string, NativeTabGroupPage[]>();
-    for (const tab of tabs) {
-      if (!tab.url || isBlankBrowserUrlLike(tab.url)) continue;
-      const matches = remainingByUrl.get(tab.url) || [];
-      matches.push(tab);
-      remainingByUrl.set(tab.url, matches);
-    }
-    if (!remainingByUrl.size) return [];
-
-    const claimedPages: Page[] = [];
-    for (const page of context.pages()) {
-      if (page.isClosed()) continue;
-      const url = page.url();
-      const matches = remainingByUrl.get(url);
-      const nativeTab = matches?.shift();
-      if (!nativeTab) continue;
-      this.nativeTabIdByPage.set(page, nativeTab.tabId);
-      if (this.claimPage(page, { makeActive: false })) claimedPages.push(page);
-    }
-    return claimedPages;
   }
 
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
@@ -2450,6 +2426,14 @@ export class BrowserSession {
     }).catch(() => undefined);
   }
 
+  private async readPageNativeTabId(page: Page) {
+    if (page.isClosed()) return undefined;
+    return page.evaluate(() => {
+      const value = Number(document.documentElement?.getAttribute('data-ai-web-test-native-tab-id'));
+      return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+    }).catch(() => undefined);
+  }
+
   private ensureLivePreviewState() {
     this.configuredViewportKeyByPage ||= new WeakMap<Page, string>();
     this.livePreviewTabIds ||= new WeakMap<Page, string>();
@@ -2584,7 +2568,6 @@ export class BrowserSession {
       this.livePreviewNativeTabRefreshAt = now;
       const nativeGroup = await this.findNativeTabGroupTabs(context);
       if (nativeGroup?.found) {
-        await this.claimPagesByNativeTabUrls(context, nativeGroup.tabs);
         await this.reclaimSessionPagesByMarker(context);
       }
     }
@@ -4172,6 +4155,7 @@ export class BrowserSession {
     runId: string;
     stepIndex: number;
     maxOutputChars?: number;
+    attachments?: BrowserCodeAttachmentBinding[];
     credentials?: BrowserCodeCredentialBinding[];
     abortSignal?: AbortSignal;
   }): Promise<BrowserActionResult> {
@@ -4224,6 +4208,7 @@ export class BrowserSession {
     try {
       execution = await kernel.execute({
         code,
+        attachments: input.attachments,
         credentials: input.credentials,
         executionId,
         maxOutputChars: input.maxOutputChars,

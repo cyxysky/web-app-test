@@ -36,12 +36,17 @@ type FloatingLayerProps = {
 
 const floatingInset = 8;
 const floatingGap = 6;
+const modalFloatingLayerZIndex = 2147483003;
 const hiddenLayoutStyle: CSSProperties = {
   left: 0,
   position: 'fixed',
   top: 0,
   visibility: 'hidden',
 };
+
+export function floatingLayerZIndex(anchor: Pick<HTMLElement, 'closest'>) {
+  return anchor.closest('[aria-modal="true"]') ? modalFloatingLayerZIndex : undefined;
+}
 
 function viewportBounds() {
   const viewport = window.visualViewport;
@@ -136,8 +141,9 @@ export function FloatingLayer({
         top: Math.round(top),
         visibility: 'visible',
         width: matchAnchorWidth || preferredWidth ? Math.round(width) : undefined,
-        zIndex: 2147482000,
       };
+      const zIndex = floatingLayerZIndex(anchor);
+      if (zIndex) next.zIndex = zIndex;
       return JSON.stringify(current) === JSON.stringify(next) ? current : next;
     });
   }, [align, anchorRef, matchAnchorWidth, maxHeight, placement, preferredWidth]);

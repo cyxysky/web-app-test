@@ -1100,6 +1100,14 @@ select {
   display: none;
 }
 
+.browser-chat-layout.sidebar-collapsed .browser-chat-history-loading {
+  align-items: flex-start;
+  display: flex;
+  gap: 0;
+  justify-content: center;
+  padding-inline: 0;
+}
+
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-header {
   display: none;
 }

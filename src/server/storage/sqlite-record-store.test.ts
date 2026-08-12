@@ -11,6 +11,7 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
 
   const databaseModule = await import('./sqlite-database');
   const recordStore = await import('./sqlite-record-store');
+  const writeQueue = await import('./sqlite-write-queue');
   const time = new Date().toISOString();
   const snapshot = {
     id: 'session-smoke',
@@ -68,7 +69,6 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
         steps: [{ index: 3, value: 'delta' }],
         logs: [{ id: 'l3', time, value: 'delta' }],
       },
-      { entityType: 'browserChatSession', id: snapshot.id, updatedAt: time, userId: '0' },
     );
     const deltaAdded = recordStore.readBrowserChatSessionRecord<{
       messages: Array<{ content: string }>;
@@ -83,7 +83,6 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
       { ...snapshot, updatedAt: new Date().toISOString() },
       { id: snapshot.id, userId: snapshot.userId },
       { removedMessageIds: ['m2'], removedStepIndexes: [2], removedLogIds: ['l2'] },
-      { entityType: 'browserChatSession', id: snapshot.id, updatedAt: time, userId: '0' },
     );
     const deltaRemoved = recordStore.readBrowserChatSessionRecord<{
       messages: Array<{ content: string }>;
@@ -94,15 +93,10 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
     assert.deepEqual(deltaRemoved?.steps.map((item) => item.value), ['delta']);
     assert.deepEqual(deltaRemoved?.logs.map((item) => item.value), ['delta']);
 
-    const outbox = recordStore.readPendingBrowserChatRealtimeOutbox();
-    assert.equal(outbox.length, 2);
-    assert.deepEqual(outbox.map((item) => item.payload.id), [snapshot.id, snapshot.id]);
-    assert.ok(outbox[0].id < outbox[1].id);
-    recordStore.markBrowserChatRealtimeOutboxDelivered(outbox[0].id);
-    assert.deepEqual(
-      recordStore.readPendingBrowserChatRealtimeOutbox().map((item) => item.id),
-      [outbox[1].id],
-    );
+    const outboxTable = databaseModule.getSqliteDatabase().prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'browser_chat_realtime_outbox'
+    `).get();
+    assert.equal(outboxTable, undefined);
 
     const memoryBase = {
       shared: false,
@@ -171,7 +165,6 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
         steps: [{ index: 1, value: 'worker-step' }],
         logs: [{ id: 'worker-log', time, value: 'worker-log' }],
       },
-      { entityType: 'browserChatSession', id: 'session-worker', updatedAt: time, userId: snapshot.userId },
     );
     const workerWritten = recordStore.readBrowserChatSessionRecord<{
       messages: Array<{ content: string }>;
@@ -188,9 +181,10 @@ test('browser conversation rows hydrate incrementally and removed rows are prune
     `).all();
     assert.deepEqual(retiredTables, []);
   } finally {
-    databaseModule.getSqliteDatabase().close();
+    await writeQueue.closeSqliteWriteQueue();
+    databaseModule.closeSqliteDatabase();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;
     else process.env.APP_DATA_DIR = previousDataRoot;
-    rmSync(dataRoot, { force: true, recursive: true });
+    rmSync(dataRoot, { force: true, maxRetries: 5, recursive: true, retryDelay: 50 });
   }
 });

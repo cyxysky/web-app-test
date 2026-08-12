@@ -85,6 +85,33 @@ test('Playwright trial overrides a legacy supplemental occlusion diagnosis', asy
   assert.equal(await page.getAttribute('body', 'data-clicked'), 'true');
 });
 
+test('a rendered aria-hidden menu remains observable and actionable', async (context) => {
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'rendered-aria-hidden-menu-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent(`<!doctype html>
+    <main>Background</main>
+    <div id="more-menu" aria-hidden="true" role="menu"
+      style="background:white;display:block;height:120px;left:20px;position:fixed;top:20px;visibility:visible;width:240px;z-index:1000">
+      <button data-action="action-copy-page-link" type="button"
+        onclick="document.body.dataset.copied='true'">Copy page</button>
+    </div>`);
+
+  const observed = await session.readDomObservationSnapshot({ mode: 'full' });
+  assert.equal(observed.observation.surfaces.some((surface) => surface.descriptor === 'div#more-menu'), true);
+  const copyRef = observed.content.match(/<button uid=(dom-\S+)[^>]*data-action="action-copy-page-link"[^>]*>Copy page<\/button>/)?.[1];
+  assert.ok(copyRef, observed.content);
+
+  const clicked = await session.mouse({ action: 'click', uid: copyRef });
+  assert.equal(clicked.ok, true, clicked.actual);
+  assert.equal(await page.getAttribute('body', 'data-copied'), 'true');
+});
+
 test('actionability resolves eleven duplicate traps without surface-based target selection', async (context) => {
   const session = new BrowserSession('dom', {
     headless: true,

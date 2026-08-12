@@ -116,11 +116,6 @@
   box-shadow: none !important;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active::before {
-  content: none !important;
-  display: none !important;
-}
-
 .browser-chat-recent-list .browser-chat-recent-open > span {
   display: block;
   flex: 1 1 auto;
@@ -487,6 +482,18 @@
     scrollbar-gutter: auto;
     scrollbar-width: none;
     width: 100%;
+  }
+
+  /* Keep the active marker inside the scrolling viewport while leaving the
+   * 36px history button optically centered in the 64px collapsed sidebar. */
+  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-panel {
+    justify-self: center;
+    margin-inline: -6px;
+    width: 56px;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-list > li:has(> .browser-chat-recent-item.active) {
+    content-visibility: visible;
   }
 
   .browser-chat-layout.sidebar-collapsed :is(

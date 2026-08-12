@@ -12,7 +12,10 @@ import {
   type BrowserElementTarget,
   type BrowserSessionMode,
 } from '@/server/browser/browser-session';
-import { type BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import {
+  type BrowserCodeAttachmentBinding,
+  type BrowserCodeCredentialBinding,
+} from '@/server/browser/browser-code-runner';
 import { browserElementTargetSchema, browserInteractTextEditingDescription, browserInteractToolDescription, browserInteractToolShape, browserTextSelectionSchema, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
@@ -26,6 +29,7 @@ import {
 import {
   appendMissingFileArtifactDownloadLinks,
   downloadFileArtifact,
+  fillDocumentTemplateArtifact,
   formatFileArtifactResult,
   generateFileArtifact,
 } from './file-artifact-tools';
@@ -76,6 +80,15 @@ const generatedFileSlidesSchema = z.array(z.object({
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
 type RuntimeRetryState = RuntimeRetryStateBase<RuntimeModelMessage>;
+
+export type BrowserChatReadFileInput = {
+  attachmentId?: string;
+  artifactId?: string;
+  includeVisuals?: boolean;
+  limit?: number;
+  offset?: number;
+  pages?: number[];
+};
 
 export type BrowserChatTextStreamUpdate = {
   delta: string;
@@ -397,7 +410,7 @@ function userFacingInfrastructureError(value?: string, context?: { error?: unkno
       '本轮操作已停止，当前页面状态已保留。',
     ].join('\n');
   }
-  if (/AI SDK returned retryable finish reason "error"/i.test(text)) {
+  if (/AI SDK returned retryable finish reason "(?:error|other)"/i.test(text)) {
     const attempts = retryInfo
       ? `连续 ${retryInfo.consecutiveFailures} 次，达到上限 ${retryInfo.consecutiveFailureLimit} 次`
       : '达到请求级重试上限';
@@ -414,7 +427,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, _max =
   void _max;
   if (!result) return undefined;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
-  if (name === 'downloadFile' || name === 'generateFile') return formatFileArtifactResult(name, result.actual);
+  if (name === 'downloadFile' || name === 'generateFile' || name === 'fillDocumentTemplate') return formatFileArtifactResult(name, result.actual);
   return result.actual;
 }
 
@@ -1041,9 +1054,10 @@ function makeBrowserTools(
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
-    readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
-    onReferenceImage?: (input: { path: string }) => void;
+    readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+    onReferenceImage?: (input: { path: string; source: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
+    attachmentBindings?: BrowserCodeAttachmentBinding[];
     credentialBindings?: BrowserCodeCredentialBinding[];
     getCredentialBindings?: () => BrowserCodeCredentialBinding[] | undefined;
   },
@@ -1093,7 +1107,7 @@ function makeBrowserTools(
       const imagePaths = result.referenceImagePaths?.length
         ? result.referenceImagePaths
         : result.referenceImagePath ? [result.referenceImagePath] : [];
-      for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path });
+      for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path, source: name });
       return compactToolResultForModel(name, result);
     });
   }
@@ -1104,7 +1118,7 @@ function makeBrowserTools(
   const sharedTools = {
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove matches hidden by themselves or an ancestor and matches without a non-empty rendered rectangle before count() or positional selection. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, hidden, detached, disabled, or unobserved target. Hidden file inputs used by setInputFiles are the sole rendered-existence exception at the normal action boundary; an ancestor pointer-events:none alone does not reject a target. For precise editing in an input, textarea, or contenteditable, including frame locators, call page.setTextSelection(locator, spec), then use page.keyboard.insertText() or page.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
+      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call readFile merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
@@ -1116,6 +1130,7 @@ function makeBrowserTools(
           return session.executeBrowserCode({
             code: input.code,
             maxOutputChars: input.maxOutputChars,
+            attachments: referenceOptions?.attachmentBindings,
             credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
             runId: referenceOptions?.runId || 'browser-code',
             stepIndex: referenceOptions?.stepIndex || 0,
@@ -1273,15 +1288,23 @@ function makeBrowserTools(
     } : {}),
     ...(referenceOptions?.readFile ? {
       readFile: tool({
-        description: 'Read one registered file on demand. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. On the first read, omit offset and limit to read the first 20000 characters. Every text read returns at least 20000 characters. Continue only from the exact next offset returned by the previous read. Supports text, PDF, Word, Excel, PowerPoint, OpenDocument, ZIP listings, images, and extensible format detection. For an image, the tool attaches it to the next model request for visual understanding instead of returning image bytes as text.',
+        description: 'Inspect one registered file on demand while preserving the original attachment. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. On the first read, omit offset and limit to read the first 20000 characters. Every text read returns at least 20000 characters. Continue only from the exact next offset returned by the previous read. Rich documents return semantic package structure before extracted text. On the first read, visual-capable models also receive up to four rendered pages; pass pages to inspect other exact 1-based pages, or includeVisuals=false when only text is needed. PDF pages are rendered exactly. Office files use LibreOffice PDF rendering when configured, with DOCX/spreadsheet HTML preview and embedded-media fallback otherwise. Images are attached directly instead of encoded as text.',
         inputSchema: browserToolInput({
           attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in the conversation metadata.'),
           artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateFile.'),
+          includeVisuals: z.boolean().optional().describe('Whether to attach rendered pages/media to the next model request. Defaults to true for the first segment when the current model supports images.'),
           offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
           limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('Returned character count, from 20000 to 40000. Omit to read 20000 characters.'),
+          pages: z.array(z.number().int().min(1)).min(1).max(6).optional().describe('Up to six 1-based document pages to render and attach. Omit for pages 1-4 on the first read.'),
         }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
         execute: (input) => {
-          const normalizedInput = { ...input, limit: normalizeBrowserChatFileReadLimit(input.limit) };
+          const includeVisuals = modelSupportsScreenshotInput()
+            && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
+          const normalizedInput = {
+            ...input,
+            includeVisuals,
+            limit: normalizeBrowserChatFileReadLimit(input.limit),
+          };
           return record('readFile', normalizedInput, () => referenceOptions.readFile!(normalizedInput));
         },
       }),
@@ -1297,15 +1320,35 @@ function makeBrowserTools(
       execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateFile: tool({
-      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension, PDF .pdf, Word .docx, Excel .xlsx, and PowerPoint .pptx. PDF and Word use Markdown-like content; Excel requires sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
+      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension, PDF .pdf, Word .docx, Excel .xls or .xlsx, and PowerPoint .pptx. PDF and Word use Markdown-like content; Excel requires sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
       inputSchema: browserToolInput({
-        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, data.xlsx, slides.pptx, notes.md, result.json, or export.csv.'),
+        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, legacy-data.xls, data.xlsx, slides.pptx, notes.md, result.json, or export.csv.'),
         title: z.string().max(300).optional().describe('Optional document or presentation title.'),
         content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional fallback for PowerPoint.'),
-        sheets: generatedFileSheetsSchema.optional().describe('Excel worksheets. Required for .xlsx. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
+        sheets: generatedFileSheetsSchema.optional().describe('Excel worksheets. Required for .xls and .xlsx. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
         slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. Each slide has a title plus content and/or bullet strings.'),
       }),
       execute: (input) => record('generateFile', input, () => generateFileArtifact({ ...input, runId: referenceOptions?.runId })),
+    }),
+    fillDocumentTemplate: tool({
+      description: 'Fill an uploaded .docx template without recreating the document. The backend copies the original OOXML package, changes only word/document.xml at exact visible-text anchors, verifies that all unrelated package parts are byte-for-byte preserved, then renders the filled document and attaches its first visual pages to the next model request for layout review. First call readFile on the template and use its DOCX structure section. Use nextCell for a table label whose value belongs in the following cell, followingParagraph for a section heading followed by a blank paragraph, or replaceText for an exact placeholder/date. Ambiguous anchors require a 1-based occurrence. Do not use generateFile when the user requires the supplied template to be preserved.',
+      inputSchema: browserToolInput({
+        templateAttachmentId: z.string().min(1).max(160).describe('Exact attachmentId of the uploaded .docx template in this conversation.'),
+        fileName: z.string().min(1).max(180).refine((value) => value.toLowerCase().endsWith('.docx'), { message: 'fileName must end with .docx.' }).describe('Required output .docx file name.'),
+        operations: z.array(z.object({
+          anchor: z.string().min(1).max(1_000).describe('Exact visible text copied from readFile template evidence.'),
+          content: z.string().max(2 * 1024 * 1024).describe('Text to insert. Newlines become Word line breaks.'),
+          target: z.enum(['nextCell', 'followingParagraph', 'replaceText']),
+          occurrence: z.number().int().min(1).optional().describe('1-based occurrence when the exact anchor appears more than once.'),
+          allowOverwrite: z.boolean().optional().describe('Only for nextCell when current evidence proves the target cell intentionally contains replaceable text.'),
+        })).min(1).max(100),
+      }),
+      execute: (input) => record('fillDocumentTemplate', input, () => fillDocumentTemplateArtifact({
+        ...input,
+        runId: referenceOptions?.runId,
+        includeVisualVerification: modelSupportsScreenshotInput(),
+        attachmentBindings: referenceOptions?.attachmentBindings,
+      })),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1376,14 +1419,15 @@ function runtimePrompt(input: {
       : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
-    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile, fillDocumentTemplate, or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- When the user supplies a .docx template and asks to fill or edit it, first read the template, then use fillDocumentTemplate with exact anchors from the returned DOCX structure. Never substitute generateFile: it creates a new document and cannot preserve the source package, styles, headers, footers, relationships, or layout.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     '- Only for multi-document requirement analysis, inspect/search the root links, spawn one parallel subagent batch for independent URLs, keep dependent end-to-end work in the main Agent, and read one completed child result per later model step.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
-      ? '- For existing remote files, call downloadFile with the known URL. To create a new text, PDF, Word, Excel, or PowerPoint file, call generateFile with the complete content or structured sheets/slides.'
-      : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, and readFile for registered files.',
+      ? '- To upload a user attachment to a web file input, do not call readFile merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files, call downloadFile with the known URL. To create a new file, call generateFile; to fill an uploaded .docx template, call fillDocumentTemplate.'
+      : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, fillDocumentTemplate for uploaded .docx templates, and readFile for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     input.operationalContext
       ? `Relevant memory and secure capabilities supplied by the runtime:\n${input.operationalContext}`
@@ -1406,6 +1450,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'readFile',
     'downloadFile',
     'generateFile',
+    'fillDocumentTemplate',
     'reportState',
   ];
 }
@@ -1602,11 +1647,24 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
         ...(aiRequest?.options || {}),
         ...extra,
       },
-      system: aiRequest?.systemPrompt,
-      messages,
+      systemCharacters: aiRequest?.systemPrompt?.length || 0,
+      messageCount: Array.isArray(messages) ? messages.length : 0,
     },
     aiInputTokens: modelMessagesTextAndImageStats(messages),
   });
+}
+
+function compactAiResponseForLog(response: unknown) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return response;
+  const record = response as Record<string, unknown>;
+  return {
+    content: record.content,
+    finishReason: record.finishReason,
+    reasoningText: record.reasoningText,
+    text: record.text,
+    toolCalls: record.toolCalls,
+    usage: record.usage,
+  };
 }
 
 function aiResponseLogDetails(input: {
@@ -1631,7 +1689,7 @@ function aiResponseLogDetails(input: {
         totalElapsedMs: input.elapsedMs,
         traces: input.traces,
       }),
-      response: input.response,
+      response: compactAiResponseForLog(input.response),
     }, [], { imageIndex: 0 }),
   });
 }
@@ -1801,7 +1859,8 @@ async function executeRuntimeStep(input: {
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
   memoryTools?: ToolSet;
@@ -2275,6 +2334,7 @@ async function executeRuntimeStep(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
+        attachmentBindings: input.attachmentBindings,
         credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
         onVisualContextChange: async (snapshot) => { ensureActive(); await onAttemptDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot }); },
@@ -2286,10 +2346,12 @@ async function executeRuntimeStep(input: {
           ensureActive();
           await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
         },
-        onReferenceImage: (path) => {
+        onReferenceImage: ({ path, source }) => {
           if (!modelSupportsScreenshotInput()) return;
           pendingObservationMessages.push({
-            text: '[browserCode visual output]\nThe JavaScript cell emitted this image. Use it as fresh visual evidence for the next decision.',
+            text: source === 'readFile'
+              ? '[附件视觉内容]\nreadFile 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片、图表和模板内容。'
+              : '[browserCode visual output]\nThe JavaScript cell emitted this image. Use it as fresh visual evidence for the next decision.',
             imagePaths: [path],
           });
         },
@@ -2355,12 +2417,15 @@ async function executeRuntimeStep(input: {
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
       readFile: input.readFile,
+      attachmentBindings: input.attachmentBindings,
       credentialBindings: input.credentialBindings,
       getCredentialBindings: () => activeCredentialBindings,
-      onReferenceImage: ({ path }) => {
+      onReferenceImage: ({ path, source }) => {
         if (!modelSupportsScreenshotInput()) return;
         pendingObservationMessages.push({
-          text: '[显式视觉内容]\n工具返回了一张图片；该图片已附加到下一轮模型请求。请直接基于图片内容进行分析。',
+          text: source === 'readFile'
+            ? '[附件视觉内容]\nreadFile 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片、图表和模板内容。'
+            : '[显式视觉内容]\n工具返回了一张图片；该图片已附加到下一轮模型请求。请直接基于图片内容进行分析。',
           imagePaths: [path],
         });
       },
@@ -2517,6 +2582,7 @@ async function executeRuntimeStep(input: {
           spawnSubagentsMs: boundedInteger(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS, 600_000, 1_000, 3_600_000),
         },
       };
+      let streamedRequestError: unknown;
       const agentSettings = {
         model: getModel(),
         tools: toolsForRequest,
@@ -2530,6 +2596,9 @@ async function executeRuntimeStep(input: {
         temperature: 0.1,
         reasoning: aiReasoningEffort(),
         maxRetries: 0,
+        onError: ({ error }: { error: unknown }) => {
+          streamedRequestError ??= error;
+        },
         telemetry: aiTelemetry(input.useToolLoopAgent ? 'browser-chat-subagent-tool-loop-agent' : 'browser-chat-agent-loop'),
       };
       const result = input.useToolLoopAgent
@@ -2561,6 +2630,7 @@ async function executeRuntimeStep(input: {
         result.finishReason,
         result.steps,
       ]);
+      if (streamedRequestError) throw streamedRequestError;
       const finalSdkStep = resultSteps.at(-1);
       const finishState = aiSdkFinishState(resultFinishReason, {
         runtimeContinuationRequired: aiSdkToolResultRequiresContinuation({
@@ -2810,6 +2880,23 @@ export type InteractiveBrowserTurnResult = {
   networkErrors: string[];
 };
 
+export function appendBrowserChatFailedToolDisclosures(
+  reply: string,
+  steps: StepExecutionResult[],
+) {
+  const failedCalls = steps.flatMap((step) => (step.tools || []).filter((tool) => tool.ok === false));
+  if (!failedCalls.length) return reply;
+  const disclosure = [
+    '## 本轮未成功的工具尝试',
+    '',
+    ...failedCalls.map((tool, index) => {
+      const semanticReason = sanitizeHistoricalToolText(tool.reason, 180);
+      return `${index + 1}. ${semanticReason || '浏览器工具调用'}（未成功，后续操作已基于实际页面状态继续）`;
+    }),
+  ].join('\n');
+  return [reply.trim(), disclosure].filter(Boolean).join('\n\n');
+}
+
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
   if (mode === 'full') {
     return [
@@ -2870,7 +2957,8 @@ export async function executeInteractiveBrowserTurn(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
   allowedToolTypes?: string[];
@@ -2926,6 +3014,7 @@ export async function executeInteractiveBrowserTurn(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
+        attachmentBindings: input.attachmentBindings,
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
         memoryTools: input.memoryTools,
@@ -3075,6 +3164,7 @@ export async function executeInteractiveBrowserTurn(input: {
       result: toolCall.rawResult,
     }))),
   );
+  reply = appendBrowserChatFailedToolDisclosures(reply, newSteps);
 
   ensureActive();
   return {
@@ -3230,6 +3320,7 @@ export type RecordedBrowserOperationExecutionOptions = {
   runId?: string;
   targetUrl?: string;
   abortSignal?: AbortSignal;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
 };
 
@@ -3247,6 +3338,7 @@ export async function executeRecordedBrowserOperation(
   const reason = flow.reason ? ` Recorded reason: ${flow.reason}` : '';
   const runId = options.runId;
   const abortSignal = options.abortSignal;
+  const attachmentBindings = options.attachmentBindings;
   const credentialBindings = options.credentialBindings;
 
   switch (flow.name) {
@@ -3257,6 +3349,7 @@ export async function executeRecordedBrowserOperation(
       return session.executeBrowserCode({
         code,
         maxOutputChars: typeof input.maxOutputChars === 'number' ? input.maxOutputChars : undefined,
+        attachments: attachmentBindings,
         credentials: credentialBindings,
         runId: runId || 'browser-code',
         stepIndex: flow.index,
@@ -3394,6 +3487,29 @@ export async function executeRecordedBrowserOperation(
         sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
         slides: generatedFileSlidesSchema.safeParse(input.slides).data,
       });
+    case 'fillDocumentTemplate':
+      return fillDocumentTemplateArtifact({
+        runId,
+        templateAttachmentId: typeof input.templateAttachmentId === 'string' ? input.templateAttachmentId : undefined,
+        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        includeVisualVerification: modelSupportsScreenshotInput(),
+        operations: Array.isArray(input.operations) ? input.operations.flatMap((value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+          const operation = value as Record<string, unknown>;
+          const target = operation.target === 'nextCell' || operation.target === 'followingParagraph' || operation.target === 'replaceText'
+            ? operation.target
+            : undefined;
+          if (typeof operation.anchor !== 'string' || typeof operation.content !== 'string' || !target) return [];
+          return [{
+            anchor: operation.anchor,
+            content: operation.content,
+            target,
+            occurrence: typeof operation.occurrence === 'number' ? operation.occurrence : undefined,
+            allowOverwrite: operation.allowOverwrite === true,
+          }];
+        }) : undefined,
+        attachmentBindings,
+      });
     case 'reportState':
       return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };
     default:
@@ -3418,14 +3534,15 @@ async function executeCodexRuntimeObject(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readFile?: (input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number }) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  onReferenceImage?: (path: string) => void;
+  onReferenceImage?: (input: { path: string; source: string }) => void;
 }) {
-  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
+  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3448,7 +3565,18 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
-  if (type === 'readFile') normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
+  if (type === 'readFile') {
+    normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
+    normalizedParams.pages = Array.isArray(normalizedParams.pages)
+      ? Array.from(new Set(normalizedParams.pages
+          .map((page) => Number(page))
+          .filter((page) => Number.isSafeInteger(page) && page > 0))).slice(0, 6)
+      : undefined;
+    normalizedParams.includeVisuals = modelSupportsScreenshotInput()
+      && (typeof normalizedParams.includeVisuals === 'boolean'
+        ? normalizedParams.includeVisuals
+        : normalizedParams.offset === undefined || Number(normalizedParams.offset) === 0 || Boolean((normalizedParams.pages as number[] | undefined)?.length));
+  }
   const flow: BrowserOperationRecord = {
     index: stepIndex,
     name: type,
@@ -3483,13 +3611,16 @@ async function executeCodexRuntimeObject(input: {
       return readFile({
         attachmentId,
         artifactId,
+        includeVisuals: normalizedParams.includeVisuals === true,
         limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
+        pages: Array.isArray(normalizedParams.pages) ? normalizedParams.pages as number[] : undefined,
       });
     }
     return executeRecordedBrowserOperation(session, flow, {
       runId,
       abortSignal,
+      attachmentBindings,
       credentialBindings,
     });
   };
@@ -3535,7 +3666,7 @@ async function executeCodexRuntimeObject(input: {
   const imagePaths = result.referenceImagePaths?.length
     ? result.referenceImagePaths
     : result.referenceImagePath ? [result.referenceImagePath] : [];
-  for (const imagePath of new Set(imagePaths)) onReferenceImage?.(imagePath);
+  for (const imagePath of new Set(imagePaths)) onReferenceImage?.({ path: imagePath, source: type });
   const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
   return { text: fileResult || toolConsistentAssistantText(message, type), executed: true };
 }

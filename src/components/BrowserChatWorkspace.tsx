@@ -8910,7 +8910,7 @@ export function BrowserChatWorkspace({
               {filteredRecentSessions.map((item) => (
                 <li key={item.id}>
                   <div
-                    className={`${session?.id === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
+                    className={`${(loadingSessionId || session?.id || requestedSessionId) === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
                   >
                   {recentSelectionMode ? (
                     <input

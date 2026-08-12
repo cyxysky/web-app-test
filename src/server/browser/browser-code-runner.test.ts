@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import test, { after, before } from 'node:test';
 import { chromium, type Browser, type BrowserContext, type BrowserServer, type Page } from 'playwright';
 import {
   analyzeBrowserCodeRisk,
   browserCodePolicyViolation,
   BrowserCodeKernel,
+  type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
 } from './browser-code-runner';
 
@@ -49,6 +53,7 @@ after(async () => {
 async function run(code: string, options: {
   abortSignal?: AbortSignal;
   maxOutputChars?: number;
+  attachments?: BrowserCodeAttachmentBinding[];
   credentials?: BrowserCodeCredentialBinding[];
 } = {}) {
   const executionId = randomUUID();
@@ -174,6 +179,35 @@ test('browserCode establishes caret and ranges for keyboard editing in textareas
     );
   } finally {
     await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
+test('browserCode exposes exact text selection on every session Page', async () => {
+  const secondaryPage = await browserContext.newPage();
+  await secondaryPage.setContent(`
+    <title>Secondary editor</title>
+    <iframe title="Secondary frame" srcdoc="<!doctype html><body contenteditable='true'>date: 2026-08-12</body>"></iframe>
+  `);
+  try {
+    const result = await run(`
+      var secondaryEditorPage = context.pages().find(asyncPage => asyncPage !== page && !asyncPage.isClosed());
+      if (!secondaryEditorPage) throw new Error('Secondary page was not found.');
+      var secondaryEditor = secondaryEditorPage.frameLocator('iframe[title="Secondary frame"]').locator('body[contenteditable="true"]');
+      var secondarySelection = await secondaryEditorPage.setTextSelection(secondaryEditor, { exactText: '2026-08-12' });
+      await secondaryEditorPage.keyboard.insertText('2026-08-13');
+      nodeRepl.write({
+        hasSelectionHelper: typeof secondaryEditorPage.setTextSelection === 'function',
+        selectedText: secondarySelection.selectedText,
+      });
+    `);
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(result.value, { hasSelectionHelper: true, selectedText: '2026-08-12' });
+    assert.equal(
+      await secondaryPage.frameLocator('iframe[title="Secondary frame"]').locator('body').textContent(),
+      'date: 2026-08-13',
+    );
+  } finally {
+    await secondaryPage.close().catch(() => undefined);
   }
 });
 
@@ -496,7 +530,8 @@ test('browserCode auto-filters hidden candidates and permits explicit positional
       await page.domSnapshot();
       await page.locator('.hidden-file-input').setInputFiles([]);
     `);
-    assert.equal(hiddenFileInput.ok, true, hiddenFileInput.error);
+    assert.equal(hiddenFileInput.ok, false);
+    assert.match(hiddenFileInput.error || '', /attachmentVault\.setInputFiles/);
 
     const ambiguous = await run(`
       await page.domSnapshot();
@@ -718,6 +753,58 @@ test('browserCode allows a unique rendered overlay target to use Playwright forc
   }
 });
 
+test('browserCode treats aria-hidden as accessibility metadata instead of visual hiding', async () => {
+  await page.evaluate(() => {
+    const menu = document.createElement('div');
+    menu.id = 'rendered-aria-hidden-menu';
+    menu.setAttribute('aria-hidden', 'true');
+    menu.setAttribute('role', 'menu');
+    Object.assign(menu.style, {
+      background: 'white',
+      display: 'block',
+      height: '80px',
+      left: '20px',
+      position: 'fixed',
+      top: '20px',
+      visibility: 'visible',
+      width: '220px',
+      zIndex: '9999',
+    });
+    const copy = document.createElement('button');
+    copy.dataset.action = 'action-copy-page-link';
+    copy.textContent = 'Copy';
+    copy.onclick = () => { document.body.dataset.renderedAriaHiddenClicked = 'true'; };
+    menu.append(copy);
+    document.body.append(menu);
+    delete document.body.dataset.renderedAriaHiddenClicked;
+  });
+  try {
+    const clicked = await run(`
+      var renderedMenuTarget = page.locator('[data-action="action-copy-page-link"]');
+      var renderedMenuGeometry = await renderedMenuTarget.evaluate(element => {
+        var rect = element.getBoundingClientRect();
+        var style = getComputedStyle(element);
+        return { display: style.display, height: rect.height, visibility: style.visibility, width: rect.width };
+      });
+      await renderedMenuTarget.click();
+      nodeRepl.write({
+        clicked: await page.locator('body').getAttribute('data-rendered-aria-hidden-clicked'),
+        rendered: renderedMenuGeometry.display !== 'none'
+          && renderedMenuGeometry.visibility === 'visible'
+          && renderedMenuGeometry.width > 0
+          && renderedMenuGeometry.height > 0,
+      });
+    `);
+    assert.equal(clicked.ok, true, clicked.error);
+    assert.deepEqual(clicked.value, {
+      clicked: 'true',
+      rendered: true,
+    });
+  } finally {
+    await page.locator('#rendered-aria-hidden-menu').evaluate((element) => element.remove()).catch(() => undefined);
+  }
+});
+
 test('browserCode does not scroll the background when a viewport overlay blocks an offscreen target', async () => {
   await page.setContent(`
     <style>
@@ -787,7 +874,7 @@ test('browserCode exposes browser and tab lifecycle as JavaScript APIs', async (
 
   const result = await run(`
     var runtimeOpenTabs = await runtimeBrowser.user.openTabs();
-    runtimeTab.use();
+    await runtimeBrowser.tabs.use(runtimeTab);
     await runtimeBrowser.tabs.finalize({ keep: [{ tab: runtimeTab, status: 'deliverable' }] });
     nodeRepl.write({
       browserCount: (await agent.browsers.list()).length,
@@ -959,6 +1046,56 @@ test('browserCode restarts with a clean kernel after an aborted cell', async () 
   assert.deepEqual(result.value, { title: 'Editor', oldBinding: 'undefined' });
 });
 
+test('browserCode uploads registered attachments through attachmentVault only', async () => {
+  await page.setContent('<title>Attachment upload</title><input id="attachment-input" type="file" hidden>');
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'browser-code-attachment-'));
+  const fileName = 'drag.txt';
+  const attachmentPath = path.join(tempDir, fileName);
+  writeFileSync(attachmentPath, 'controlled attachment content', 'utf8');
+  const attachments = [{
+    name: fileName,
+    path: attachmentPath,
+    ref: 'attachment-test-ref',
+  }];
+  try {
+    const direct = await run(`
+      await page.locator('#attachment-input').setInputFiles('C:/untrusted/local/path.txt');
+    `);
+    assert.equal(direct.ok, false);
+    assert.match(direct.error || '', /attachmentVault\.setInputFiles/);
+
+    const missing = await run(`
+      await attachmentVault.setInputFiles(page.locator('#attachment-input'), 'missing-attachment');
+    `, { attachments });
+    assert.equal(missing.ok, false);
+    assert.match(missing.error || '', /unavailable for this browserCode execution/);
+
+    const uploaded = await run(`
+      await page.domSnapshot();
+      var controlledUpload = await attachmentVault.setInputFiles(
+        page.locator('#attachment-input'),
+        'attachment-test-ref'
+      );
+      nodeRepl.write(controlledUpload);
+    `, { attachments });
+    assert.equal(uploaded.ok, true, uploaded.error);
+    assert.deepEqual(uploaded.activity?.actions, ['attachment.setInputFiles']);
+    assert.deepEqual(
+      await page.locator('#attachment-input').evaluate((element) => Array.from(
+        (element as HTMLInputElement).files || [],
+        (file) => file.name,
+      )),
+      [fileName],
+    );
+    assert.equal((uploaded.value as { attachmentId?: string }).attachmentId, 'attachment-test-ref');
+    assert.equal((uploaded.value as { fileName?: string }).fileName, fileName);
+    assert.doesNotMatch(JSON.stringify(uploaded), new RegExp(attachmentPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+    rmSync(tempDir, { force: true, recursive: true });
+  }
+});
+
 test('browserCode fills credential references only on an allowed origin without returning the raw value', async () => {
   await browserContext.route('http://credential.test/**', (route) => route.fulfill({
     body: `
@@ -1109,6 +1246,21 @@ test('browserCode risk analysis confirms committed effects instead of preparator
 test('browserCode policy allows Playwright force while retaining script-click protections', () => {
   assert.equal(browserCodePolicyViolation(`await locator.click({ force: true })`), undefined);
   assert.equal(browserCodePolicyViolation(`await locator.click()`), undefined);
+  assert.equal(
+    browserCodePolicyViolation(`await attachmentVault.setInputFiles(page.locator('input[type=file]'), 'attachment-1')`),
+    undefined,
+  );
+});
+
+test('browserCode policy rejects direct or reconstructed file uploads', () => {
+  assert.match(
+    browserCodePolicyViolation(`await page.locator('input[type=file]').setInputFiles('C:/secret.txt')`) || '',
+    /attachmentVault\.setInputFiles/,
+  );
+  assert.match(
+    browserCodePolicyViolation(`await fileChooser.setFiles({ name: 'drag.txt', buffer: encoded })`) || '',
+    /FileChooser\.setFiles/,
+  );
 });
 
 test('browserCode policy rejects scripted clicks that bypass actionability', () => {

@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { BrowserTextSelectionSpec } from './editable-text-selection';
@@ -179,6 +179,13 @@ export function browserCodePolicyViolation(code: string) {
   if (evaluateCallContainsDomClick(code)) {
     return 'browserCode forbids DOM element.click() inside evaluate callbacks because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
+  const uploadSource = browserCodeWithoutComments(code).replace(
+    /\battachmentVault\s*\.\s*setInputFiles\s*\(/gi,
+    '(',
+  );
+  if (/\.\s*(?:setInputFiles|setFiles)\s*\(/i.test(uploadSource)) {
+    return 'Use attachmentVault.setInputFiles(locator, attachmentId) for a registered user attachment. Direct paths, reconstructed file payloads, Locator/Page.setInputFiles(), and FileChooser.setFiles() are unavailable to browserCode.';
+  }
   return undefined;
 }
 
@@ -188,10 +195,17 @@ export type BrowserCodeCredentialBinding = {
   allowedOrigins: string[];
 };
 
+export type BrowserCodeAttachmentBinding = {
+  name: string;
+  path: string;
+  ref: string;
+};
+
 export type BrowserCodeExecutionInput = {
   code: string;
   executionId: string;
   maxOutputChars?: number;
+  attachments?: BrowserCodeAttachmentBinding[];
   credentials?: BrowserCodeCredentialBinding[];
   abortSignal?: AbortSignal;
 };
@@ -213,7 +227,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 25;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 27;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -368,6 +382,7 @@ function browserCodeKernelMain() {
     imageBytes: number;
     outputs: unknown[];
     startedAt: number;
+    attachments: Map<string, BrowserCodeAttachmentBinding>;
     credentials: Map<string, BrowserCodeCredentialBinding>;
     pendingCoordinateClickEvidence: Map<import('playwright').Page, CoordinateClickEvidence>;
     observationsBeforeAction: WeakMap<import('playwright').Page, KernelPageObservation>;
@@ -574,7 +589,6 @@ function browserCodeKernelMain() {
           if (
             !element.isConnected
             || element.hasAttribute('hidden')
-            || element.getAttribute('aria-hidden') === 'true'
             || (element as HTMLElement).inert
             || element.hasAttribute('inert')
           ) return false;
@@ -875,8 +889,7 @@ function browserCodeKernelMain() {
         let current: Element | null = element;
         while (current) {
           const currentDescriptor = `${current.tagName.toLowerCase()}${current.id ? `#${current.id}` : ''}`;
-          if (current.hasAttribute('hidden')) return { ok: false, reason: `${currentDescriptor} has the hidden attribute`, descriptor };
-          if (current.getAttribute('aria-hidden') === 'true') return { ok: false, reason: `${currentDescriptor} or an ancestor has aria-hidden=true`, descriptor };
+          if (!fileInputAction && current.hasAttribute('hidden')) return { ok: false, reason: `${currentDescriptor} has the hidden attribute`, descriptor };
           if ((current as HTMLElement).inert || current.hasAttribute('inert')) return { ok: false, reason: `${currentDescriptor} or an ancestor is inert`, descriptor };
           const style = getComputedStyle(current);
           if (!fileInputAction && style.display === 'none') return { ok: false, reason: `${currentDescriptor} or an ancestor has display:none`, descriptor };
@@ -1203,6 +1216,61 @@ function browserCodeKernelMain() {
     },
   });
 
+  const attachmentVault = Object.freeze({
+    async setInputFiles(locator: unknown, attachmentRef: unknown) {
+      if (!activeExecution) {
+        throw new Error('attachmentVault.setInputFiles() is only available while browserCode is executing.');
+      }
+      const ref = typeof attachmentRef === 'string' ? attachmentRef.trim() : '';
+      const attachment = ref ? activeExecution.attachments.get(ref) : undefined;
+      if (!attachment) {
+        throw new Error('The requested user attachment is unavailable for this browserCode execution.');
+      }
+      if (!locator || typeof locator !== 'object') {
+        throw new Error('attachmentVault.setInputFiles() requires a real Playwright Locator.');
+      }
+      const sourceLocator = rawLocatorByExistingLocator.get(locator) || locator;
+      const locatorPrototype = Object.getPrototypeOf(sourceLocator) as object | null;
+      const targetFrame = Reflect.get(sourceLocator, '_frame') as import('playwright').Frame | undefined;
+      const selector = Reflect.get(sourceLocator, '_selector');
+      const targetPage = targetFrame
+        ? currentPages().find((candidatePage) => candidatePage.frames().includes(targetFrame))
+        : undefined;
+      if (
+        !locatorPrototype
+        || !credentialLocatorPrototypes.has(locatorPrototype)
+        || typeof selector !== 'string'
+        || !targetFrame
+        || !targetPage
+        || targetPage.isClosed()
+      ) {
+        throw new Error('attachmentVault.setInputFiles() requires a Locator from the active browser session.');
+      }
+      const nativeSetInputFiles = nativeLocatorActions.get('setInputFiles');
+      if (!nativeFrameLocator || !nativeSetInputFiles) {
+        throw new Error('attachmentVault.setInputFiles() could not access the trusted Playwright file-input implementation.');
+      }
+      const trustedLocator = Reflect.apply(nativeFrameLocator, targetFrame, [selector]);
+      const fileInput = await resolveActionableLocator(trustedLocator, 'setInputFiles');
+      prepareStateChangingAction(targetPage, 'attachment.setInputFiles');
+      await Reflect.apply(nativeSetInputFiles, fileInput, [attachment.path]);
+      await completeStateChangingAction(targetPage, 'attachment.setInputFiles');
+      const selectedFiles = await fileInput.evaluate((element) => Array.from(
+        (element as HTMLInputElement).files || [],
+        (file) => ({ name: file.name, size: file.size, type: file.type }),
+      ));
+      if (!selectedFiles.some((file) => file.name === attachment.name)) {
+        throw new Error(`The browser file input did not retain the selected attachment ${attachment.name}.`);
+      }
+      return {
+        attachmentId: attachment.ref,
+        fileName: attachment.name,
+        selectedFiles,
+        uploaded: true,
+      };
+    },
+  });
+
   const decorateLocatorPrototype = (page: import('playwright').Page) => {
     const prototype = Object.getPrototypeOf(page.locator('html')) as Record<string, unknown> | null;
     if (!prototype || pointerDecoratedLocatorPrototypes.has(prototype)) return;
@@ -1318,6 +1386,9 @@ function browserCodeKernelMain() {
         Object.defineProperty(prototype, name, {
           configurable: true,
           value: async function observedLocatorAction(this: object, ...args: unknown[]) {
+            if (name === 'setInputFiles' && activeExecution) {
+              throw new Error('Use attachmentVault.setInputFiles(locator, attachmentId); direct file paths and reconstructed payloads are unavailable to browserCode.');
+            }
             const targetPage = locatorPage(this);
             let actionableLocator = this as import('playwright').Locator;
             if (targetPage && activeExecution) {
@@ -1577,6 +1648,17 @@ function browserCodeKernelMain() {
     patchInputDevice(keyboard, 'press', 'keyboard.press');
     patchInputDevice(keyboard, 'type', 'keyboard.type');
     patchInputDevice(keyboard, 'insertText', 'keyboard.insertText');
+    const extendedPage = page as import('playwright').Page & {
+      setTextSelection?: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => Promise<unknown>;
+    };
+    if (typeof extendedPage.setTextSelection !== 'function') {
+      Object.defineProperty(extendedPage, 'setTextSelection', {
+        configurable: false,
+        enumerable: false,
+        value: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => setTextSelection(page, locator, input),
+        writable: false,
+      });
+    }
   };
 
   const tabId = (page: import('playwright').Page) => {
@@ -1788,7 +1870,7 @@ function browserCodeKernelMain() {
       || typeof Reflect.get(locatorInput, 'evaluate') !== 'function'
       || locatorPage(locatorInput) !== page
     ) {
-      throw new Error('page.setTextSelection() requires a real Playwright Locator from the active page, including a locator inside one of its frames.');
+      throw new Error('page.setTextSelection() requires a real Playwright Locator from the same Page, including a locator inside one of its frames. Call the method on the locator owner Page.');
     }
     const actionableLocator = await resolveActionableLocator(locatorInput, 'focus');
     await actionableLocator.focus();
@@ -2012,14 +2094,6 @@ function browserCodeKernelMain() {
         writable: false,
       });
     }
-    if (typeof extendedPage.setTextSelection !== 'function') {
-      Object.defineProperty(extendedPage, 'setTextSelection', {
-        configurable: false,
-        enumerable: false,
-        value: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => setTextSelection(page, locator, input),
-        writable: false,
-      });
-    }
     if (typeof extendedPage.verifyState !== 'function') {
       Object.defineProperty(extendedPage, 'verifyState', {
         configurable: false,
@@ -2111,11 +2185,11 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), and nodeRepl.emitImage().',
+      'Use browser.tabs.list()/new()/use()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), attachmentVault.setInputFiles(), and nodeRepl.emitImage().',
       'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
-      'Page and Locator factory methods expose only currently rendered matches: hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
+      'Page and Locator factory methods expose only currently rendered matches: CSS-hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
-      'page.setTextSelection(locator, spec) establishes a caret or text range in an input, textarea, or contenteditable (including frame locators) without changing content. Then use page.keyboard.insertText()/press() in the same cell to insert, replace, or delete through the real keyboard.',
+      'Every session Page exposes setTextSelection(locator, spec). Call it on the Page that owns the locator, including for frame locators, then use that same Page keyboard.insertText()/press() in the same cell. Use browser.tabs.use(tab) or tab.use() when the global page binding should switch tabs.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
     ].join('\n'),
     id: 'current',
@@ -2143,6 +2217,18 @@ function browserCodeKernelMain() {
         selectPage(newPage);
         if (options.url) await newPage.goto(options.url);
         return tabForPage(newPage);
+      },
+      use: async (value: unknown) => {
+        const selectedPage = pageFromTab(value);
+        if (!selectedPage) throw new Error('The requested browser tab is no longer available.');
+        if (sessionGroupId) {
+          const selectedTabInfo = await tabInfo(selectedPage);
+          if (selectedTabInfo.groupId !== sessionGroupId) {
+            throw new Error('The requested browser tab does not belong to the current conversation tab group.');
+          }
+        }
+        selectPage(selectedPage);
+        return tabForPage(selectedPage);
       },
     }),
     type: 'playwright',
@@ -2222,6 +2308,7 @@ function browserCodeKernelMain() {
     });
     Object.defineProperties(replServer.context, {
       Buffer: { configurable: false, enumerable: false, value: undefined, writable: false },
+      attachmentVault: { configurable: false, enumerable: true, value: attachmentVault, writable: false },
       console: { configurable: false, enumerable: true, value: safeConsole, writable: false },
       global: { configurable: false, enumerable: false, value: undefined, writable: false },
       module: { configurable: false, enumerable: false, value: undefined, writable: false },
@@ -2249,6 +2336,7 @@ function browserCodeKernelMain() {
 
   const execute = async (input: {
     code: string;
+    attachments?: BrowserCodeAttachmentBinding[];
     credentials?: BrowserCodeCredentialBinding[];
     executionId: string;
     maxOutputChars?: number;
@@ -2278,6 +2366,7 @@ function browserCodeKernelMain() {
       logs: [],
       outputs: [],
       startedAt: Date.now(),
+      attachments: new Map((input.attachments || []).map((attachment) => [attachment.ref, attachment])),
       credentials: new Map((input.credentials || []).map((credential) => [credential.ref, credential])),
       pendingCoordinateClickEvidence: new Map(),
       observationsBeforeAction: new WeakMap(),
@@ -2369,6 +2458,7 @@ function browserCodeKernelMain() {
       if (input.type === 'execute') {
         await execute(input as {
           code: string;
+          attachments?: BrowserCodeAttachmentBinding[];
           credentials?: BrowserCodeCredentialBinding[];
           executionId: string;
           maxOutputChars?: number;
@@ -2506,6 +2596,27 @@ export class BrowserCodeKernel {
     const maxOutputChars = typeof input.maxOutputChars === 'number'
       ? Math.max(1_000, Math.floor(input.maxOutputChars))
       : undefined;
+    let attachmentBindings: BrowserCodeAttachmentBinding[] = [];
+    if (/\battachmentVault\s*\.\s*setInputFiles\s*\(/i.test(browserCodeWithoutComments(input.code))) {
+      try {
+        if (!this.tempDir) throw new Error('browserCode attachment staging directory is unavailable.');
+        attachmentBindings = (input.attachments || []).map((attachment, index) => {
+          const fileName = path.basename(String(attachment.name || '').trim()) || 'attachment';
+          const stagingDir = path.join(this.tempDir!, 'attachments', `${index}-${randomUUID()}`);
+          mkdirSync(stagingDir, { recursive: true });
+          const stagedPath = path.join(stagingDir, fileName);
+          copyFileSync(attachment.path, stagedPath);
+          return { name: fileName, path: stagedPath, ref: String(attachment.ref || '') };
+        });
+      } catch (error) {
+        return {
+          ok: false,
+          error: `Unable to stage the registered user attachment: ${error instanceof Error ? error.message : String(error)}`,
+          elapsedMs: Date.now() - startedAt,
+          logs: [],
+        };
+      }
+    }
     const requestId = randomUUID();
     return new Promise<BrowserCodeRunResult>((resolve) => {
       const onAbort = () => {
@@ -2537,6 +2648,11 @@ export class BrowserCodeKernel {
       }, executionTimeoutMs);
       this.child?.send({
         type: 'execute',
+        attachments: attachmentBindings.map((attachment) => ({
+          name: String(attachment.name || ''),
+          path: String(attachment.path || ''),
+          ref: String(attachment.ref || ''),
+        })),
         code: input.code,
         credentials: (input.credentials || []).map((credential) => ({
           ref: String(credential.ref || ''),

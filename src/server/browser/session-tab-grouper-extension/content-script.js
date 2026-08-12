@@ -1,6 +1,7 @@
 const SESSION_ID_ATTRIBUTE = 'data-ai-web-test-session-group-id';
 const SESSION_TITLE_ATTRIBUTE = 'data-ai-web-test-session-group-title';
 const GROUPED_ID_ATTRIBUTE = 'data-ai-web-test-session-grouped-id';
+const NATIVE_TAB_ID_ATTRIBUTE = 'data-ai-web-test-native-tab-id';
 
 let groupedKey = '';
 let pendingGroupKey = '';
@@ -23,6 +24,15 @@ function markGrouped(sessionId) {
   }
 }
 
+function markNativeTabId(tabId) {
+  const normalized = Number(tabId);
+  if (!Number.isSafeInteger(normalized) || normalized <= 0) return;
+  const value = String(normalized);
+  if (document.documentElement?.getAttribute(NATIVE_TAB_ID_ATTRIBUTE) !== value) {
+    document.documentElement?.setAttribute(NATIVE_TAB_ID_ATTRIBUTE, value);
+  }
+}
+
 function groupCurrentTab(sessionId) {
   const cleanSessionId = cleanMarkerText(sessionId);
   if (!cleanSessionId) return Promise.resolve(false);
@@ -41,6 +51,7 @@ function groupCurrentTab(sessionId) {
     groupTitle: cleanGroupTitle,
   })).then((result) => {
     if (!result?.ok) return false;
+    markNativeTabId(result.tabId);
     groupedKey = key;
     markGrouped(cleanSessionId);
     return true;
@@ -53,9 +64,10 @@ function groupCurrentTab(sessionId) {
   return pendingGroupPromise;
 }
 
-function injectSessionMarker(sessionId) {
+function injectSessionMarker(sessionId, nativeTabId) {
   const cleanSessionId = cleanMarkerText(sessionId);
   if (!cleanSessionId) return;
+  markNativeTabId(nativeTabId);
   const cleanGroupTitle = aiWebTestSessionGroupTitle(cleanSessionId);
   if (document.documentElement?.getAttribute(SESSION_ID_ATTRIBUTE) !== cleanSessionId) {
     document.documentElement?.setAttribute(SESSION_ID_ATTRIBUTE, cleanSessionId);
@@ -80,7 +92,7 @@ function injectSessionMarker(sessionId) {
   `;
   const parent = document.documentElement || document.head || document.body;
   if (!parent) {
-    window.addEventListener('DOMContentLoaded', () => injectSessionMarker(cleanSessionId), { once: true });
+    window.addEventListener('DOMContentLoaded', () => injectSessionMarker(cleanSessionId, nativeTabId), { once: true });
   } else {
     parent.appendChild(script);
     script.remove();
@@ -99,7 +111,7 @@ function requestStoredSessionMarker() {
     if (response && typeof response.then === 'function') {
       response.then((result) => {
         const record = result?.record;
-        injectSessionMarker(record?.sessionId);
+        injectSessionMarker(record?.sessionId, result?.tabId);
       }).catch(() => undefined);
     }
   } catch {
@@ -126,7 +138,7 @@ requestStoredSessionMarker();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== 'apply-tab-session-marker') return false;
-  injectSessionMarker(message.sessionId);
+  injectSessionMarker(message.sessionId, message.tabId);
   sendResponse({ ok: true });
   return false;
 });

@@ -121,6 +121,7 @@ async function applySessionMarkerToTab(tab, sessionId, groupTitle) {
     type: 'apply-tab-session-marker',
     sessionId,
     groupTitle,
+    tabId: tab.id,
   }).catch(() => undefined);
 }
 
@@ -171,14 +172,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const tab = sender.tab;
   if (message?.type === 'get-tab-session') {
     storedTabSession(tab)
-      .then((record) => sendResponse({ ok: true, record }))
+      .then((record) => sendResponse({ ok: true, record, tabId: tab?.id }))
       .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
     return true;
   }
   if (message?.type !== 'group-tab') return false;
   const sessionId = cleanText(message.sessionId, '');
   groupTab(tab, sessionId)
-    .then((grouped) => sendResponse({ ok: grouped }))
+    .then((grouped) => sendResponse({ ok: grouped, tabId: tab?.id }))
     .catch((error) => sendResponse({ ok: false, error: String(error?.message || error) }));
   return true;
 });

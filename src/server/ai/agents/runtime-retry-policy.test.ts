@@ -12,6 +12,13 @@ test('runtime retry only accepts transient provider and network failures', () =>
   assert.equal(classifyRuntimeRetry({ statusCode: 429, responseHeaders: { 'retry-after': '2' } }).retryable, true);
   assert.equal(classifyRuntimeRetry({ status: 503 }).retryable, true);
   assert.equal(classifyRuntimeRetry(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })).retryable, true);
+  assert.deepEqual(classifyRuntimeRetry(new Error('Cannot connect to API: other side closed')), {
+    category: 'network',
+    reason: 'temporary network failure',
+    retryAfterMs: undefined,
+    retryable: true,
+    statusCode: undefined,
+  });
   assert.deepEqual(
     classifyRuntimeRetry(Object.assign(
       new Error('Cannot connect to API: Connect Timeout Error (attempted address: api.deepseek.com:443, timeout: 10000ms)'),
@@ -28,6 +35,11 @@ test('runtime retry only accepts transient provider and network failures', () =>
   assert.equal(classifyRuntimeRetry({ status: 401, message: 'invalid api key' }).retryable, false);
   assert.equal(classifyRuntimeRetry({ status: 400, message: 'invalid tool schema' }).retryable, false);
   assert.equal(classifyRuntimeRetry(new Error('locator.click failed')).retryable, false);
+});
+
+test('runtime retry accepts SDK error and other finish states', () => {
+  assert.equal(classifyRuntimeRetry(new Error('AI SDK returned retryable finish reason "error".')).retryable, true);
+  assert.equal(classifyRuntimeRetry(new Error('AI SDK returned retryable finish reason "other".')).retryable, true);
 });
 
 test('runtime retry honors Retry-After before exponential jitter', () => {

@@ -158,11 +158,6 @@ function personalMemoryExtractionInputLimit() {
   return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 3000), 60000) : 18000;
 }
 
-function personalMemoryExtractionTimeoutMs() {
-  const raw = Number(process.env.AI_PERSONAL_MEMORY_EXTRACTION_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 30000);
-  return Number.isFinite(raw) ? Math.min(Math.max(Math.floor(raw), 1000), 120000) : 30000;
-}
-
 export function normalizePersonalMemoryDomain(value: unknown) {
   const raw = textFromUnknown(value).trim();
   if (!raw) return '';
@@ -803,7 +798,6 @@ export async function extractPersonalMemoryFromTurn(input: {
     steps: input.steps,
     existingItems,
   });
-  const timeoutMs = personalMemoryExtractionTimeoutMs();
   const result = await generateText({
     model: getModel(),
     temperature: 0.1,
@@ -811,7 +805,6 @@ export async function extractPersonalMemoryFromTurn(input: {
     maxRetries: 0,
     prompt,
     output: Output.object({ schema: personalMemoryExtractionSchema }),
-    timeout: timeoutMs,
     telemetry: aiTelemetry('personal-memory-extraction'),
   });
   const userMessages = [

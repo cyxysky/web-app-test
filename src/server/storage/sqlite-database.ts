@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 18;
+const currentSchemaVersion = 19;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -536,8 +536,6 @@ function applyVersionSeventeenMigration(database: DatabaseSync) {
   database.exec('BEGIN IMMEDIATE');
   try {
     database.exec(`
-      DELETE FROM browser_chat_realtime_outbox
-      WHERE delivered_at IS NOT NULL;
       DELETE FROM api_idempotency
       WHERE scope = 'browser-chat.message';
       UPDATE browser_chat_log
@@ -576,6 +574,34 @@ function applyVersionEighteenMigration(database: DatabaseSync) {
     database.prepare(`
       INSERT INTO schema_migration (version, name, applied_at)
       VALUES (18, 'browser-domain-cookie-vault', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function applyVersionNineteenMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 19').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      DROP TABLE IF EXISTS browser_chat_realtime_outbox;
+      UPDATE browser_chat_log
+      SET record_json = json_remove(record_json, '$.details')
+      WHERE json_valid(record_json)
+        AND json_extract(record_json, '$.phase') IN (
+        'ai:runtime:request',
+        'ai:runtime:response',
+        'ai:runtime:object'
+      )
+        AND json_extract(record_json, '$.details') IS NOT NULL;
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (19, 'remove-browser-chat-realtime-outbox-and-unbounded-ai-logs', ?)
     `).run(new Date().toISOString());
     database.exec('COMMIT');
   } catch (error) {
@@ -674,22 +700,6 @@ function initializeSchema(database: DatabaseSync) {
     );
     CREATE INDEX IF NOT EXISTS browser_chat_log_session_time_idx ON browser_chat_log(session_id, time);
 
-    CREATE TABLE IF NOT EXISTS browser_chat_realtime_outbox (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      session_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      event_type TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      delivered_at TEXT,
-      attempts INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT
-    );
-    CREATE INDEX IF NOT EXISTS browser_chat_realtime_outbox_pending_idx
-      ON browser_chat_realtime_outbox(delivered_at, id);
-    CREATE INDEX IF NOT EXISTS browser_chat_realtime_outbox_session_idx
-      ON browser_chat_realtime_outbox(session_id, id);
-
     CREATE TABLE IF NOT EXISTS personal_memory_item (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -764,10 +774,6 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionSevenMigration(database);
   applyVersionEightMigration(database);
   applyVersionNineMigration(database);
-  database.prepare(`
-    INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
-    VALUES (10, 'browser-chat-realtime-outbox', ?)
-  `).run(new Date().toISOString());
   database.prepare('DELETE FROM schema_migration WHERE version = 11').run();
   database.prepare(`
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
@@ -779,6 +785,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionSixteenMigration(database);
   applyVersionSeventeenMigration(database);
   applyVersionEighteenMigration(database);
+  applyVersionNineteenMigration(database);
 }
 
 export function getSqliteDatabase() {

@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { generateText } from 'ai';
+import { existsSync } from 'node:fs';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
-import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import type {
+  BrowserCodeAttachmentBinding,
+  BrowserCodeCredentialBinding,
+} from '@/server/browser/browser-code-runner';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
@@ -9,6 +13,7 @@ import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
   type BrowserToolConfirmationRequest,
+  type BrowserChatReadFileInput,
   type BrowserChatSubagentReader,
   type BrowserChatSubagentTask,
   type InteractiveBrowserTurnMessage,
@@ -74,9 +79,6 @@ import type {
   StepExecutionResult,
 } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
-import {
-  scheduleBrowserChatRealtimeOutboxFlush,
-} from '@/server/realtime/browser-chat-outbox';
 import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
 import { createLatestOnlyAsyncScheduler, type LatestOnlyAsyncScheduler } from '@/server/realtime/latest-only-async-scheduler';
 import {
@@ -807,10 +809,6 @@ function id(prefix: string) {
   return `${prefix}_${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
-function schedulePersistedSessionEvents() {
-  scheduleBrowserChatRealtimeOutboxFlush();
-}
-
 function elapsedMs(startedAt: number) {
   return Date.now() - startedAt;
 }
@@ -869,15 +867,14 @@ function stringifyCompactLogDetails(value: unknown) {
 }
 
 function logDetailsFromUnknown(input: unknown) {
-  const { value, full } = unwrapLogDetails(input);
+  const { value } = unwrapLogDetails(input);
   if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'string') return full ? value.trim() : trimLogText(value);
+  if (typeof value === 'string') return trimLogText(value, 20_000);
   try {
-    const serialized = (full ? stringifyJsonSafe(value, 2) : stringifyCompactLogDetails(value)) || String(value);
-    return full ? serialized.trim() : trimLogText(serialized);
+    const serialized = stringifyCompactLogDetails(value) || String(value);
+    return trimLogText(serialized, 20_000);
   } catch {
-    const fallback = String(value);
-    return full ? fallback.trim() : trimLogText(fallback);
+    return trimLogText(String(value), 20_000);
   }
 }
 
@@ -1038,7 +1035,7 @@ function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifac
 
 async function readFileForSession(
   session: BrowserChatSessionRecord,
-  input: { attachmentId?: string; artifactId?: string; limit?: number; offset?: number },
+  input: BrowserChatReadFileInput,
 ) {
   const attachment = input.attachmentId
     ? [...session.messages]
@@ -1057,8 +1054,10 @@ async function readFileForSession(
   const result = await readBrowserChatAttachment({
     attachment,
     absolutePath: uploadedBrowserChatAttachmentPath(attachment, session.userId),
+    includeVisuals: input.includeVisuals,
     limit: input.limit,
     offset: input.offset,
+    pages: input.pages,
   });
   return isBrowserChatImageAttachment(attachment) && result.ok
     ? { ...result, referenceImagePath: uploadedBrowserChatAttachmentPath(attachment, session.userId) }
@@ -1369,6 +1368,26 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   delete clientStep.visualContext;
   delete clientStep.workingMemory;
   return clientStep;
+}
+
+function browserCodeAttachmentBindingsForSession(
+  session: BrowserChatSessionRecord,
+): BrowserCodeAttachmentBinding[] {
+  const bindings = new Map<string, BrowserCodeAttachmentBinding>();
+  for (const message of session.messages) {
+    if (message.role !== 'user') continue;
+    for (const attachment of message.attachments || []) {
+      if (attachment.kind === 'tab' || bindings.has(attachment.id)) continue;
+      const absolutePath = uploadedBrowserChatAttachmentPath(attachment, session.userId);
+      if (!absolutePath || !existsSync(absolutePath)) continue;
+      bindings.set(attachment.id, {
+        name: attachment.name,
+        path: absolutePath,
+        ref: attachment.id,
+      });
+    }
+  }
+  return [...bindings.values()];
 }
 
 function compactStepForRealtime(step: StepExecutionResult): StepExecutionResult {
@@ -1714,7 +1733,7 @@ function appendLog(
     : {};
   const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
   const stepIndex = phase.startsWith('subagent:') ? undefined : input.stepIndex;
-  const logRecord: BrowserChatLogRecord = {
+  const logRecord = compactBrowserChatLogsForClient<BrowserChatLogRecord>([{
     id: id('log'),
     time: timestamp,
     phase,
@@ -1726,7 +1745,7 @@ function appendLog(
     turnId: typeof execution.turnId === 'string' ? execution.turnId : undefined,
     attemptId: typeof execution.attemptId === 'string' ? execution.attemptId : undefined,
     toolCallId: typeof execution.toolCallId === 'string' ? execution.toolCallId : undefined,
-  };
+  }])[0];
   replaceSessionLogs(session, [
     ...(session.logs || []),
     logRecord,
@@ -1795,7 +1814,6 @@ function seedPersistenceCursor(
 function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
   const tracked: Promise<boolean> = operation
     .then(() => {
-      schedulePersistedSessionEvents();
       return true;
     })
     .catch((error) => {
@@ -1815,7 +1833,11 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
   const retainedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
   const storedLogs = compactBrowserChatLogsForClient(retainedLogs);
   const persistedItem = storedLogs === item.logs ? item : { ...item, logs: storedLogs };
-  const delta = persistenceDelta(persistedItem);
+  const rawDelta = persistenceDelta(persistedItem);
+  const delta = {
+    ...rawDelta,
+    logs: compactBrowserChatLogsForClient(rawDelta.logs),
+  };
   const sessionRecord: Partial<BrowserChatSessionSnapshot> = { ...persistedItem };
   delete sessionRecord.messages;
   delete sessionRecord.steps;
@@ -1896,13 +1918,16 @@ function scheduleBrowserChatTextStreamPublish(sessionId: string, assistantMessag
 }
 
 function deleteSessionSnapshot(sessionId: string, userId: string) {
-  trackSessionSqliteWrite(sessionId, deleteBrowserChatSessionRecordQueued(sessionId, {
+  const event = {
     entityType: 'browserChatSession',
     id: sessionId,
     updatedAt: now(),
     userId: normalizeApplicationUserId(userId),
     deleted: true,
-  }));
+  } as const;
+  void trackSessionSqliteWrite(sessionId, deleteBrowserChatSessionRecordQueued(sessionId))
+    .then((stored) => stored ? publishRealtimeRefreshEvent(event) : undefined)
+    .catch(() => undefined);
   persistenceCursors.delete(sessionId);
   dirtyRecords.delete(sessionId);
 }
@@ -2170,7 +2195,6 @@ function persistAndNotify(sessionId: string, options: { defer?: boolean; deleted
     mergePersisted: options.mergePersisted,
   });
   if (!persisted) return false;
-  schedulePersistedSessionEvents();
   scheduleBrowserChatSessionEviction(sessionId);
   return true;
 }
@@ -2190,7 +2214,6 @@ function persistDeletedSessions(items: Array<{ id: string; userId: string }>) {
     for (const item of items) {
       deleteSessionSnapshot(item.id, item.userId);
     }
-    scheduleBrowserChatRealtimeOutboxFlush();
     return true;
   } catch (error) {
     warnPersistFailure(error);
@@ -4213,6 +4236,7 @@ async function runBrowserChatMessage(
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
         readFile: (input) => readFileForSession(session, input),
+        attachmentBindings: browserCodeAttachmentBindingsForSession(session),
         onTextStream: ({ text: streamedText }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const timestamp = now();

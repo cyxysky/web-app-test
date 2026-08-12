@@ -33,6 +33,37 @@ function copyPlaywrightChromium(context) {
   }
 }
 
+function findLibreOfficeRoot() {
+  const candidates = [
+    process.env.LIBREOFFICE_BUNDLE_DIR,
+    process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'LibreOffice'),
+    process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'LibreOffice'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const root = path.resolve(candidate);
+    if (fs.existsSync(path.join(root, 'program', 'soffice.exe'))) return root;
+  }
+
+  throw new Error(
+    'LibreOffice was not found. Install LibreOffice or set LIBREOFFICE_BUNDLE_DIR to its installation directory before packaging.',
+  );
+}
+
+function copyLibreOffice(context) {
+  const sourceRoot = findLibreOfficeRoot();
+  const targetRoot = path.join(context.appOutDir, 'resources', 'libreoffice');
+
+  fs.rmSync(targetRoot, { recursive: true, force: true });
+  fs.mkdirSync(path.dirname(targetRoot), { recursive: true });
+  fs.cpSync(sourceRoot, targetRoot, { recursive: true });
+
+  const packagedExecutable = path.join(targetRoot, 'program', 'soffice.exe');
+  if (!fs.existsSync(packagedExecutable)) {
+    throw new Error(`Packaged LibreOffice executable is missing: ${packagedExecutable}`);
+  }
+}
+
 function assertPackagedServerRuntime(serverRoot) {
   const runtimeRequire = createRequire(path.join(serverRoot, 'webpilot-server.js'));
   const packageRoot = path.join(serverRoot, 'node_modules') + path.sep;
@@ -64,4 +95,5 @@ exports.default = async function afterPack(context) {
   assertPackagedServerRuntime(path.join(context.appOutDir, 'resources', 'server'));
 
   copyPlaywrightChromium(context);
+  copyLibreOffice(context);
 };

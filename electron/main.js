@@ -233,6 +233,12 @@ function packagedChromiumExecutable() {
   }
 }
 
+function packagedLibreOfficeExecutable() {
+  if (!app.isPackaged) return String(process.env.LIBREOFFICE_PATH || '').trim();
+  const executablePath = path.join(process.resourcesPath, 'libreoffice', 'program', 'soffice.exe');
+  return fs.existsSync(executablePath) ? executablePath : '';
+}
+
 function embeddedBrowserPlaceholderUrl() {
   const html = [
     '<!doctype html>',
@@ -2576,6 +2582,7 @@ async function startServer(appDataDir) {
     BROWSER_USER_DATA_DIR: process.env.BROWSER_USER_DATA_DIR || browserProfileDir,
     ELECTRON_EMBEDDED_BROWSER_CDP_PORT: String(EMBEDDED_BROWSER_CDP_PORT),
     HOSTNAME: '127.0.0.1',
+    LIBREOFFICE_PATH: packagedLibreOfficeExecutable(),
     NODE_PATH: app.isPackaged ? path.join(serverDir, 'node_modules') : process.env.NODE_PATH,
     NODE_ENV: 'production',
     PORT: String(port),
@@ -2598,6 +2605,7 @@ async function startServer(appDataDir) {
   appendLog(`AI_WEB_TEST_BROWSER_PROFILE_DIR=${env.AI_WEB_TEST_BROWSER_PROFILE_DIR}`);
   appendLog(`PLAYWRIGHT_BROWSERS_PATH=${env.PLAYWRIGHT_BROWSERS_PATH || ''}`);
   appendLog(`AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH=${env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH || ''}`);
+  appendLog(`LIBREOFFICE_PATH=${env.LIBREOFFICE_PATH || ''}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${env.WEBPILOT_ELECTRON_CDP_PORT || ''}`);
   appendLog(`NODE_PATH=${env.NODE_PATH || ''}`);
 

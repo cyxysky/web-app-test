@@ -28,6 +28,7 @@ const contentTypes: Record<string, string> = {
   '.tsv': 'text/tab-separated-values; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
   '.webp': 'image/webp',
+  '.xls': 'application/vnd.ms-excel',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   '.xml': 'application/xml; charset=utf-8',
   '.yaml': 'application/yaml; charset=utf-8',

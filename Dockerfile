@@ -16,11 +16,16 @@ FROM mcr.microsoft.com/playwright:v1.60.0-noble AS runner
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libreoffice-nogui fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 ENV HEADLESS_BROWSER=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV LIBREOFFICE_PATH=/usr/bin/libreoffice
 ENV APP_DATA_DIR=/app
 ENV ARTIFACTS_DIR=/app/artifacts
 

@@ -162,10 +162,10 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   if (statusCode === 503 || /\b(overloaded|over capacity|temporarily unavailable|service unavailable)\b/.test(normalizedMessage)) {
     return { category: 'provider-overloaded', reason: 'provider is temporarily overloaded', retryAfterMs, retryable: true, statusCode };
   }
-  if (retryableNetworkCodes.has(code) || /\b(socket hang up|connection reset|connection closed|network error|fetch failed|terminated)\b/.test(normalizedMessage)) {
+  if (retryableNetworkCodes.has(code) || /\b(socket hang up|connection reset|connection closed|other side closed|cannot connect to api|network error|fetch failed|terminated)\b/.test(normalizedMessage)) {
     return { category: 'network', reason: `temporary network failure${code ? ` (${code})` : ''}`, retryAfterMs, retryable: true, statusCode };
   }
-  if (/ai sdk returned retryable finish reason\s+"error"/i.test(message)) {
+  if (/ai sdk returned retryable finish reason\s+"(?:error|other)"/i.test(message)) {
     return { category: 'server-error', reason: 'provider returned an error finish state', retryAfterMs, retryable: true, statusCode };
   }
   return { category: 'unknown', reason: 'error is not known to be transient', retryable: false, statusCode };

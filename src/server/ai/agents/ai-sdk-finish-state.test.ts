@@ -97,9 +97,15 @@ test('does not continue other when text or a completed tool result is missing', 
   }), false);
 });
 
-test('retries an SDK error finish reason instead of treating it as task completion', () => {
+test('retries SDK error states instead of treating them as task completion', () => {
   assert.deepEqual(aiSdkFinishState('error'), {
     finishReason: 'error',
+    retryRequest: true,
+    terminatesTurn: false,
+    status: 'failed',
+  });
+  assert.deepEqual(aiSdkFinishState('other'), {
+    finishReason: 'other',
     retryRequest: true,
     terminatesTurn: false,
     status: 'failed',
@@ -118,12 +124,6 @@ test('terminates without retrying for deterministic SDK terminal reasons', () =>
     retryRequest: false,
     terminatesTurn: true,
     status: 'blocked',
-  });
-  assert.deepEqual(aiSdkFinishState('other'), {
-    finishReason: 'other',
-    retryRequest: false,
-    terminatesTurn: true,
-    status: 'failed',
   });
 });
 

@@ -18,7 +18,7 @@ import {
 
 const allowedExtensions = new Set([
   '.apng', '.bin', '.csv', '.docx', '.gif', '.jpeg', '.jpg', '.json', '.md', '.pdf',
-  '.png', '.pptx', '.tsv', '.txt', '.webp', '.xlsx', '.xml', '.yaml', '.yml', '.zip',
+  '.png', '.pptx', '.tsv', '.txt', '.webp', '.xls', '.xlsx', '.xml', '.yaml', '.yml', '.zip',
 ]);
 
 function uploadMaxBytes() {

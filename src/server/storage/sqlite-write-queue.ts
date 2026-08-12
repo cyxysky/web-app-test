@@ -149,6 +149,13 @@ export async function flushSqliteWriteQueue() {
   }
 }
 
+export async function closeSqliteWriteQueue() {
+  await flushSqliteWriteQueue();
+  const activeWorker = state.worker;
+  state.worker = undefined;
+  if (activeWorker) await activeWorker.terminate();
+}
+
 export function sqliteWriteQueueSnapshot() {
   return { pending: state.pending.size, workerActive: Boolean(state.worker) };
 }

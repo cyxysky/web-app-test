@@ -44,9 +44,11 @@ export const generatedTextExtensions = new Set([
   '.toml', '.ts', '.tsx', '.tsv', '.txt', '.vue', '.xml', '.yaml', '.yml',
 ]);
 
-const specialGeneratedExtensions = new Set(['.docx', '.pdf', '.pptx', '.xlsx']);
+const specialGeneratedExtensions = new Set(['.docx', '.pdf', '.pptx', '.xls', '.xlsx']);
 const maxGeneratedTextBytes = 4 * 1024 * 1024;
 const maxSpreadsheetCells = 200_000;
+const maxXlsRows = 65_536;
+const maxXlsColumns = 256;
 
 type DocumentBlock = {
   kind: 'code' | 'heading' | 'list' | 'paragraph';
@@ -236,11 +238,22 @@ function normalizedSheetName(value: string | undefined, index: number, used: Set
   return name;
 }
 
-function generateSpreadsheet(input: GeneratedFileInput) {
+function generateSpreadsheet(input: GeneratedFileInput, extension: '.xls' | '.xlsx') {
   const sheets = input.sheets?.filter((sheet) => Array.isArray(sheet.rows) && sheet.rows.length) || [];
   if (!sheets.length) throw new Error('Excel generation requires at least one non-empty sheet.');
   const cellCount = sheets.reduce((total, sheet) => total + sheet.rows.reduce((sum, row) => sum + row.length, 0), 0);
   if (cellCount > maxSpreadsheetCells) throw new Error(`Excel generation exceeds ${maxSpreadsheetCells} cells.`);
+  if (extension === '.xls') {
+    for (const [index, sheet] of sheets.entries()) {
+      if (sheet.rows.length > maxXlsRows) {
+        throw new Error(`Excel .xls sheet ${index + 1} exceeds the ${maxXlsRows} row BIFF8 limit.`);
+      }
+      const columnCount = sheet.rows.reduce((max, row) => Math.max(max, row.length), 0);
+      if (columnCount > maxXlsColumns) {
+        throw new Error(`Excel .xls sheet ${index + 1} exceeds the ${maxXlsColumns} column BIFF8 limit.`);
+      }
+    }
+  }
 
   const workbook = XLSX.utils.book_new();
   const used = new Set<string>();
@@ -255,7 +268,11 @@ function generateSpreadsheet(input: GeneratedFileInput) {
     worksheet['!cols'] = widths.map((wch) => ({ wch }));
     XLSX.utils.book_append_sheet(workbook, worksheet, normalizedSheetName(sheet.name, index, used));
   }
-  return Buffer.from(XLSX.write(workbook, { bookType: 'xlsx', compression: true, type: 'buffer' }));
+  return Buffer.from(XLSX.write(workbook, {
+    bookType: extension === '.xls' ? 'biff8' : 'xlsx',
+    compression: extension === '.xlsx',
+    type: 'buffer',
+  }));
 }
 
 function slidesFromContent(input: GeneratedFileInput): GeneratedFileSlide[] {
@@ -341,7 +358,7 @@ export function supportedGeneratedFileExtension(fileName: string) {
 export async function generateFileBuffer(input: GeneratedFileInput): Promise<GeneratedFileOutput> {
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension) {
-    throw new Error('Unsupported output extension. Use a text format, .pdf, .docx, .xlsx, or .pptx.');
+    throw new Error('Unsupported output extension. Use a text format, .pdf, .docx, .xls, .xlsx, or .pptx.');
   }
   if (generatedTextExtensions.has(extension)) {
     const content = `${requiredContent(input, 'Text file')}\n`;
@@ -349,6 +366,8 @@ export async function generateFileBuffer(input: GeneratedFileInput): Promise<Gen
   }
   if (extension === '.docx') return { buffer: await generateWord(input), extension };
   if (extension === '.pdf') return { buffer: await generatePdf(input), extension };
-  if (extension === '.xlsx') return { buffer: generateSpreadsheet(input), extension };
+  if (extension === '.xls' || extension === '.xlsx') {
+    return { buffer: generateSpreadsheet(input, extension), extension };
+  }
   return { buffer: await generatePowerPoint(input), extension };
 }

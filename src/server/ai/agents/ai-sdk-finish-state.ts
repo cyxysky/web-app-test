@@ -39,7 +39,7 @@ export function aiSdkFinishState(value: unknown, options: { runtimeContinuationR
   if (finishReason === 'stop') {
     return { finishReason, retryRequest: false, terminatesTurn: true, status: 'passed' };
   }
-  if (finishReason === 'error') {
+  if (finishReason === 'error' || finishReason === 'other') {
     return { finishReason, retryRequest: true, terminatesTurn: false, status: 'failed' };
   }
   if (finishReason === 'content-filter') {

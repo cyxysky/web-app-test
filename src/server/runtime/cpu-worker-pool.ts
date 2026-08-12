@@ -207,12 +207,10 @@ export function extractAttachmentTextInWorker(input: {
     incrementMetric('cpu_worker_task_rejected_total', { task: 'attachment_extract' });
     return Promise.reject(new Error('文件解析队列繁忙，请稍后重试。'));
   }
-  const backing = input.buffer.buffer;
-  const source = backing instanceof ArrayBuffer
-    && input.buffer.byteOffset === 0
-    && input.buffer.byteLength === backing.byteLength
-    ? backing
-    : backing.slice(input.buffer.byteOffset, input.buffer.byteOffset + input.buffer.byteLength) as ArrayBuffer;
+  // Worker transfer lists detach the transferred ArrayBuffer in the caller. Always copy the
+  // requested Buffer range so callers can continue using the original bytes for package
+  // inspection, rendering, hashing, or template-preserving edits after text extraction.
+  const source = Uint8Array.from(input.buffer).buffer;
   const result = new Promise<string>((resolve, reject) => {
     state.queue.push({
       extension: input.extension,

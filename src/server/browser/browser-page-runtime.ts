@@ -13,7 +13,7 @@ import type {
   WindowWithAiDomRuntime,
 } from './browser-session';
 
-export const AI_DOM_RUNTIME_VERSION = 27;
+export const AI_DOM_RUNTIME_VERSION = 28;
 
 export function installAccessibilitySnapshotExportControl() {
   if (window.top !== window) return;
@@ -299,7 +299,6 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     const tag = element.tagName.toLowerCase();
     if (skippedTags.has(tag)) return false;
     if (element.hasAttribute('hidden')) return false;
-    if (element.getAttribute('aria-hidden') === 'true') return false;
     const style = window.getComputedStyle(element);
     if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
     if (options.requirePointerEvents && style.pointerEvents === 'none') return false;
@@ -591,8 +590,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
 
   function isVisibleDomHidden(element: Element) {
     const tag = visibleDomElementName(element);
-    return element.getAttribute('aria-hidden') === 'true'
-      || element.hasAttribute('hidden')
+    return element.hasAttribute('hidden')
       || (element as HTMLElement).inert
       || element.hasAttribute('inert')
       || (tag === 'input' && element.getAttribute('type') === 'hidden');
@@ -2450,9 +2448,6 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       if (current.hasAttribute('hidden')) {
         return { ok: false, reason: `${descriptor(current)} has the hidden attribute`, descriptor: targetDescriptor };
       }
-      if (current.getAttribute('aria-hidden') === 'true') {
-        return { ok: false, reason: `${descriptor(current)} or an ancestor has aria-hidden=true`, descriptor: targetDescriptor };
-      }
       if ((current as HTMLElement).inert || current.hasAttribute('inert')) {
         return { ok: false, reason: `${descriptor(current)} or an ancestor is inert`, descriptor: targetDescriptor };
       }
@@ -2696,7 +2691,6 @@ export function collectAiDomObservation(input: { includeInteractiveCandidates?: 
 
   function isHiddenForStructuredText(element: Element) {
     if (element.closest(overlaySelector)) return true;
-    if (element.getAttribute('aria-hidden') === 'true') return true;
     const style = window.getComputedStyle(element);
     return style.display === 'none'
       || style.visibility === 'hidden'

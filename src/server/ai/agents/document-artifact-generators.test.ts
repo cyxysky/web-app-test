@@ -44,6 +44,31 @@ test('generates a readable Excel workbook with multiple value types', async () =
   ]);
 });
 
+test('generates a real BIFF8 .xls workbook', async () => {
+  const result = await generateFileBuffer({
+    fileName: 'legacy-results.xls',
+    sheets: [{ name: 'Legacy', rows: [['Case', 'Passed'], ['Login', true], ['Duration', 12.5]] }],
+  });
+  assert.equal(result.extension, '.xls');
+  assert.equal(result.buffer.subarray(0, 8).toString('hex'), 'd0cf11e0a1b11ae1');
+  const workbook = XLSX.read(result.buffer, { type: 'buffer' });
+  assert.deepEqual(XLSX.utils.sheet_to_json(workbook.Sheets.Legacy, { header: 1 }), [
+    ['Case', 'Passed'],
+    ['Login', true],
+    ['Duration', 12.5],
+  ]);
+});
+
+test('rejects .xls worksheets that exceed BIFF8 column limits', async () => {
+  await assert.rejects(
+    generateFileBuffer({
+      fileName: 'too-wide.xls',
+      sheets: [{ rows: [Array.from({ length: 257 }, (_, index) => index)] }],
+    }),
+    /256 column BIFF8 limit/,
+  );
+});
+
 test('generates a real PowerPoint package with slide content', async () => {
   const result = await generateFileBuffer({
     fileName: 'plan.pptx',
