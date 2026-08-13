@@ -610,6 +610,10 @@
   text-align: left;
 }
 
+.management-table-primary-button > svg {
+  flex: 0 0 auto;
+}
+
 .management-table-primary-button > span,
 .management-table-primary-copy,
 .management-table-cell-stack,
@@ -891,18 +895,6 @@
 .personal-memory-meta span:first-child {
   color: var(--foreground);
   font-weight: 780;
-}
-
-.personal-memory-status.active {
-  background: rgba(22, 101, 52, 0.08);
-  border-color: rgba(22, 101, 52, 0.2);
-  color: var(--success);
-}
-
-.personal-memory-status.disabled {
-  background: rgba(127, 29, 29, 0.08);
-  border-color: rgba(127, 29, 29, 0.2);
-  color: var(--danger);
 }
 
 .personal-memory-meta .resource-shared-badge {
@@ -1205,7 +1197,9 @@
 
 .skills-manager-chevron {
   color: var(--muted);
+  height: 16px;
   transition: transform 0.16s ease;
+  width: 16px;
 }
 
 .skills-manager-chevron.open {

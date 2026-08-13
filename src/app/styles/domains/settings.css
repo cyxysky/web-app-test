@@ -129,11 +129,14 @@
 }
 
 .settings-toggle span {
+  align-items: center;
   background: #ffffff;
   border-radius: 999px;
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  display: inline-flex;
   flex: 0 0 22px;
   height: 22px;
+  justify-content: center;
   transform: translateX(0);
   transition:
     background-color var(--motion-normal) ease,
@@ -149,6 +152,30 @@
 
 .settings-toggle.on span {
   transform: translateX(22px);
+}
+
+.settings-toggle--status {
+  height: 24px;
+  padding: 2px;
+  width: 42px;
+}
+
+.settings-toggle--status span {
+  flex-basis: 18px;
+  height: 18px;
+  width: 18px;
+}
+
+.settings-toggle--status.on span {
+  transform: translateX(18px);
+}
+
+.settings-toggle--status.is-loading:disabled {
+  opacity: 1;
+}
+
+.settings-toggle--status span svg {
+  color: #222222;
 }
 
 .settings-toggle:focus-visible {
@@ -267,6 +294,241 @@
   color: var(--muted-strong);
   font-size: 12px;
   font-weight: 600;
+}
+
+:is(.login-account-form, .personal-memory-form, .skills-manager-form) :is(.input, .textarea, .custom-select-button) {
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.personal-memory-status-field {
+  align-content: start;
+}
+
+.personal-memory-status-control {
+  align-items: center;
+  display: flex;
+  gap: 9px;
+  min-height: var(--control-height);
+}
+
+.personal-memory-status-label {
+  align-items: center;
+  color: var(--foreground);
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 500;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.personal-memory-status-cell {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.personal-memory-status-cell > small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.personal-memory-status-column {
+  width: 142px;
+}
+
+.skills-manager .management-data-table table {
+  min-width: 1060px;
+}
+
+.skills-manager-scope-column {
+  width: 180px;
+}
+
+.skills-manager-trigger-column {
+  width: 220px;
+}
+
+.skills-manager-status-column {
+  width: 92px;
+}
+
+.skills-manager-table-triggers {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.skills-manager-table-triggers > span,
+.skills-manager-table-triggers > small {
+  background: var(--panel-soft);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-strong);
+  display: inline-block;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 22px;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skills-manager-table-triggers > small {
+  color: var(--muted);
+  flex: 0 0 auto;
+}
+
+.management-data-table-heading {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.management-data-table-heading > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.management-table-actions-column .management-data-table-heading {
+  justify-content: flex-end;
+}
+
+.management-data-table-filter-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 24px;
+  justify-content: center;
+  padding: 0;
+  transition: background-color 140ms ease, color 140ms ease;
+  width: 24px;
+}
+
+.management-data-table-filter-button:hover {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.management-data-table-filter-button.active {
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  color: var(--accent-strong);
+}
+
+.management-data-table-filter-clear {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+  width: 22px;
+}
+
+.management-data-table-filter-clear:hover {
+  background: color-mix(in srgb, var(--foreground) 7%, transparent);
+  color: var(--foreground);
+}
+
+.management-data-table-filter-popover {
+  background: var(--panel-elevated);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-lg);
+  color: var(--foreground);
+  overflow: visible;
+  padding: 0;
+}
+
+.management-data-table-filter-popover form {
+  display: grid;
+  gap: 14px;
+  padding: 14px;
+}
+
+.management-data-table-filter-popover header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.management-data-table-filter-popover header strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.management-data-table-filter-popover header span {
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.management-data-table-filter-popover label {
+  display: grid;
+  gap: 6px;
+}
+
+.management-data-table-filter-popover label > span {
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.management-data-table-filter-popover input,
+.management-data-table-filter-select .custom-select-button {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  height: 36px;
+  min-height: 36px;
+  min-width: 0;
+  outline: 0;
+  padding: 0 10px;
+  width: 100%;
+}
+
+.management-data-table-filter-popover input:focus,
+.management-data-table-filter-select .custom-select-button:focus-visible {
+  border-color: var(--focus-ring);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring) 13%, transparent);
+}
+
+.management-data-table-filter-popover footer {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin: 2px -14px -14px;
+  padding: 10px 14px;
+}
+
+.management-data-table-filter-popover footer .ui-button {
+  min-height: 32px;
+  padding-inline: 12px;
 }
 
 .login-account-form label small,

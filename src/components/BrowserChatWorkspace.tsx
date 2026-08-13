@@ -5328,7 +5328,6 @@ function BrowserChatManagementDialog({
             <span aria-hidden="true"><Icon size={18} /></span>
             <div>
               <h2 className="ui-modal-title" id={titleId}>{title}</h2>
-              <p className="ui-modal-subtitle">{t('无需离开当前对话')}</p>
             </div>
           </div>
           <button aria-label={t('关闭')} autoFocus className="ui-icon-button ui-modal-close" onClick={onClose} type="button">

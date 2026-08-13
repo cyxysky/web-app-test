@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { createPortal } from 'react-dom';
-import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, Power, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
@@ -119,11 +119,6 @@ const personalMemoryTypeOptions: Array<{ label: string; value: PersonalMemoryTyp
   { label: '使用偏好', value: 'preference' },
   { label: '工作流程', value: 'workflow' },
   { label: '域名事实', value: 'domain_fact' },
-];
-
-const personalMemoryStatusOptions: Array<{ label: string; value: PersonalMemoryStatus }> = [
-  { label: '启用', value: 'active' },
-  { label: '停用', value: 'disabled' },
 ];
 
 function createPersonalMemoryDraft(): PersonalMemoryDraft {
@@ -288,7 +283,8 @@ export function EnvironmentSettings({
   const normalizedUserId = userId?.trim() || normalizedDefaultUserId;
   const visibleSettingsTabs = environmentSettingsTabsForUser(normalizedUserId, normalizedDefaultUserId);
   const requestedActiveTab = controlledActiveTab || internalActiveTab;
-  const activeTab = visibleSettingsTabs.some((tab) => tab.id === requestedActiveTab) ? requestedActiveTab : 'general';
+  const standaloneManagementTab = !showTabs && ['skills', 'memory', 'accounts'].includes(requestedActiveTab);
+  const activeTab = standaloneManagementTab || visibleSettingsTabs.some((tab) => tab.id === requestedActiveTab) ? requestedActiveTab : 'general';
   const adminSettingsAuthorizationHeaders: Record<string, string> = adminSettingsAccessToken
     ? { Authorization: `Bearer ${adminSettingsAccessToken}` }
     : {};
@@ -519,6 +515,10 @@ export function EnvironmentSettings({
     setPersonalMemoryItems((current) => sortPersonalMemoryItems([item, ...current.filter((entry) => entry.id !== item.id)]));
   }
 
+  function replacePersonalMemoryItemInPlace(item: PersonalMemoryItem) {
+    setPersonalMemoryItems((current) => current.map((entry) => entry.id === item.id ? item : entry));
+  }
+
   const loadPersonalMemoryItems = useCallback(async () => {
     const loadingSequence = ++personalMemoryLoadSequenceRef.current;
     const loadingStartedAt = Date.now();
@@ -645,7 +645,7 @@ export function EnvironmentSettings({
         body: JSON.stringify({ status: item.status === 'active' ? 'disabled' : 'active' }),
       });
       const data = await readApiJson<{ item?: PersonalMemoryItem }>(response, t('更新个性化记忆失败'));
-      if (data.item) replacePersonalMemoryItem(data.item);
+      if (data.item) replacePersonalMemoryItemInPlace(data.item);
     } finally {
       setUpdatingPersonalMemoryId('');
     }
@@ -810,15 +810,22 @@ export function EnvironmentSettings({
                 options={personalMemoryTypeOptions.map((option) => ({ label: t(option.label), value: option.value }))}
               />
             </label>
-            <label className="personal-memory-field">
+            <div className="personal-memory-field personal-memory-status-field">
               <span>{t('状态')}</span>
-              <CustomSelect
-                className="settings-control"
-                value={personalMemoryDraft.status}
-                onChange={(value) => updatePersonalMemoryDraft({ status: value as PersonalMemoryStatus })}
-                options={personalMemoryStatusOptions.map((option) => ({ label: t(option.label), value: option.value }))}
-              />
-            </label>
+              <div className="personal-memory-status-control">
+                <button
+                  aria-label={personalMemoryDraft.status === 'active' ? t('禁用记忆') : t('启用记忆')}
+                  aria-pressed={personalMemoryDraft.status === 'active'}
+                  className={`settings-toggle${personalMemoryDraft.status === 'active' ? ' on' : ''}`}
+                  disabled={savingPersonalMemory}
+                  onClick={() => updatePersonalMemoryDraft({ status: personalMemoryDraft.status === 'active' ? 'disabled' : 'active' })}
+                  type="button"
+                >
+                  <span />
+                </button>
+                <span className="personal-memory-status-label">{t(personalMemoryDraft.status === 'active' ? '启用' : '禁用')}</span>
+              </div>
+            </div>
             <label className="personal-memory-field">
               <span>{t('常用短语')}</span>
               <input
@@ -950,6 +957,10 @@ export function EnvironmentSettings({
                 key: 'memory',
                 label: t('记忆'),
                 className: 'management-table-primary-column',
+                filter: {
+                  getValue: (item) => [item.key, item.value, ...(item.aliases || [])],
+                  type: 'text',
+                },
                 render: (item) => (
                   <div className="management-table-primary-copy">
                     <strong>{item.key}</strong>
@@ -961,11 +972,21 @@ export function EnvironmentSettings({
               {
                 key: 'type',
                 label: t('类型'),
+                filter: {
+                  getValue: (item) => item.type,
+                  options: personalMemoryTypeOptions.map((option) => ({ label: t(option.label), value: option.value })),
+                  type: 'select',
+                },
                 render: (item) => <span>{t(personalMemoryTypeLabel(item.type))}</span>,
               },
               {
                 key: 'scope',
                 label: t('适用范围'),
+                filter: {
+                  getValue: (item) => item.scope,
+                  options: personalMemoryScopeOptions.map((option) => ({ label: t(option.label), value: option.value })),
+                  type: 'select',
+                },
                 render: (item) => (
                   <div className="management-table-cell-stack">
                     <span>{item.scope === 'domain' ? item.domain : t('全局')}</span>
@@ -976,9 +997,31 @@ export function EnvironmentSettings({
               {
                 key: 'status',
                 label: t('状态'),
+                className: 'personal-memory-status-column',
+                filter: {
+                  getValue: (item) => item.status,
+                  options: [
+                    { label: t('启用'), value: 'active' },
+                    { label: t('禁用'), value: 'disabled' },
+                  ],
+                  type: 'select',
+                },
                 render: (item) => (
-                  <div className="management-table-cell-stack">
-                    <span className={`personal-memory-status ${item.status}`}>{t(item.status === 'active' ? '启用' : '停用')}</span>
+                  <div className="personal-memory-status-cell">
+                    <div className="personal-memory-status-control">
+                      <button
+                        aria-label={item.status === 'active' ? t('禁用记忆') : t('启用记忆')}
+                        aria-pressed={item.status === 'active'}
+                        className={`settings-toggle settings-toggle--status${item.status === 'active' ? ' on' : ''}${updatingPersonalMemoryId === item.id ? ' is-loading' : ''}`}
+                        disabled={item.userId !== normalizedUserId || updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
+                        onClick={() => void togglePersonalMemory(item)}
+                        title={item.status === 'active' ? t('禁用记忆') : t('启用记忆')}
+                        type="button"
+                      >
+                        <span>{updatingPersonalMemoryId === item.id ? <Loader2 className="spin" size={12} /> : null}</span>
+                      </button>
+                      <span className="personal-memory-status-label">{t(item.status === 'active' ? '启用' : '禁用')}</span>
+                    </div>
                     {item.useCount ? <small>{t('使用 {count} 次', { count: item.useCount })}</small> : null}
                   </div>
                 ),
@@ -987,6 +1030,7 @@ export function EnvironmentSettings({
                 key: 'updated',
                 label: t('最近更新'),
                 className: 'management-table-date-column',
+                filter: { getValue: (item) => item.updatedAt, type: 'datetime' },
                 render: (item) => <span className="management-table-muted">{new Date(item.updatedAt).toLocaleString()}</span>,
               },
               {
@@ -1005,16 +1049,6 @@ export function EnvironmentSettings({
                         type="button"
                       >
                         <PencilLine size={15} />
-                      </button>
-                      <button
-                        aria-label={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
-                        className="settings-model-row-button"
-                        disabled={updatingPersonalMemoryId === item.id || deletingPersonalMemoryId === item.id}
-                        onClick={() => void togglePersonalMemory(item)}
-                        title={item.status === 'active' ? t('停用记忆') : t('启用记忆')}
-                        type="button"
-                      >
-                        {updatingPersonalMemoryId === item.id ? <Loader2 className="spin" size={15} /> : <Power size={15} />}
                       </button>
                       <button
                         aria-label={t('删除记忆')}
@@ -1040,7 +1074,7 @@ export function EnvironmentSettings({
               item.type,
               item.status,
               personalMemoryTypeLabel(item.type),
-              t(item.status === 'active' ? '启用' : '停用'),
+              t(item.status === 'active' ? '启用' : '禁用'),
               item.shared ? t('所有 ID 共享') : t('仅创建 ID'),
               item.userId,
               ...(item.aliases || []),
@@ -1093,6 +1127,7 @@ export function EnvironmentSettings({
                 key: 'account',
                 label: t('账号'),
                 className: 'management-table-primary-column',
+                filter: { getValue: (account) => [account.label, account.username], type: 'text' },
                 render: (account) => (
                   <div className="management-table-account-copy">
                     <span className="login-account-item-icon" aria-hidden="true"><KeyRound size={16} /></span>
@@ -1106,11 +1141,20 @@ export function EnvironmentSettings({
               {
                 key: 'domain',
                 label: t('域名'),
+                filter: { getValue: (account) => [account.domain, account.loginUrl || ''], type: 'text' },
                 render: (account) => <span>{account.domain}</span>,
               },
               {
                 key: 'scope',
                 label: t('共享范围'),
+                filter: {
+                  getValue: (account) => account.shared ? 'shared' : 'private',
+                  options: [
+                    { label: t('所有 ID 共享'), value: 'shared' },
+                    { label: t('仅创建 ID'), value: 'private' },
+                  ],
+                  type: 'select',
+                },
                 render: (account) => (
                   <span className="management-table-muted">
                     {account.shared
@@ -1122,6 +1166,14 @@ export function EnvironmentSettings({
               {
                 key: 'status',
                 label: t('状态'),
+                filter: {
+                  getValue: (account) => account.status,
+                  options: [
+                    { label: t('可用于目标测试'), value: 'active' },
+                    { label: t('已停用'), value: 'disabled' },
+                  ],
+                  type: 'select',
+                },
                 render: (account) => (
                   <div className="management-table-cell-stack">
                     <span>{t(account.status === 'active' ? '可用于目标测试' : '已停用')}</span>
@@ -1133,6 +1185,7 @@ export function EnvironmentSettings({
                 key: 'updated',
                 label: t('最近更新'),
                 className: 'management-table-date-column',
+                filter: { getValue: (account) => account.updatedAt, type: 'datetime' },
                 render: (account) => <span className="management-table-muted">{new Date(account.updatedAt).toLocaleString()}</span>,
               },
               {

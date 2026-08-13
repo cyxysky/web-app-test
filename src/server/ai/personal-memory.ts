@@ -482,12 +482,14 @@ export function updatePersonalMemoryItem(id: string, patch: PersonalMemoryDraft,
     sourceUrl: previous.sourceUrl,
   });
   if (!draft) throw new Error('Personal memory item requires key and value.');
+  const patchKeys = Object.keys(patch);
+  const statusOnlyUpdate = patchKeys.length === 1 && patchKeys[0] === 'status';
   const item: PersonalMemoryItem = {
     ...previous,
     ...draft,
     id: previous.id,
     createdAt: previous.createdAt,
-    updatedAt: now(),
+    updatedAt: statusOnlyUpdate ? previous.updatedAt : now(),
     lastUsedAt: previous.lastUsedAt,
     useCount: previous.useCount,
     status: normalizeStatus(patch.status ?? previous.status),

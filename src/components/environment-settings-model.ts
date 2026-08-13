@@ -1,13 +1,10 @@
 import type { SettingsTab } from '@/config/settings';
 
 export const environmentSettingsTabs: Array<{ id: SettingsTab; label: string }> = [
-  { id: 'skills', label: 'Skills 管理' },
   { id: 'general', label: '通用设置' },
   { id: 'model', label: '模型配置' },
   { id: 'browser', label: '浏览器与截图' },
   { id: 'runtime', label: '运行控制' },
-  { id: 'memory', label: '个性化记忆' },
-  { id: 'accounts', label: '登录账号' },
   { id: 'debug', label: '调试与高级' },
 ];
 

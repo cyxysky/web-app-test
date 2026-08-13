@@ -18,6 +18,7 @@ type FloatingLayerAlign = 'end' | 'start';
 type FloatingLayerProps = {
   active?: boolean;
   align?: FloatingLayerAlign;
+  allowNestedFloatingLayers?: boolean;
   anchorRef: RefObject<HTMLElement | null>;
   ariaLabel?: string;
   children: ReactNode;
@@ -45,6 +46,11 @@ const hiddenLayoutStyle: CSSProperties = {
 };
 
 export function floatingLayerZIndex(anchor: Pick<HTMLElement, 'closest'>) {
+  const parentFloatingLayer = anchor.closest('.ui-floating-layer');
+  if (parentFloatingLayer) {
+    const parentZIndex = Number.parseInt(window.getComputedStyle(parentFloatingLayer).zIndex, 10);
+    if (Number.isFinite(parentZIndex)) return parentZIndex + 1;
+  }
   return anchor.closest('[aria-modal="true"]') ? modalFloatingLayerZIndex : undefined;
 }
 
@@ -60,6 +66,7 @@ function viewportBounds() {
 export function FloatingLayer({
   active = true,
   align = 'end',
+  allowNestedFloatingLayers = false,
   anchorRef,
   ariaLabel,
   children,
@@ -178,6 +185,7 @@ export function FloatingLayer({
       const target = event.target;
       if (!(target instanceof Node)) return;
       if (anchorRef.current?.contains(target) || internalLayerRef.current?.contains(target)) return;
+      if (allowNestedFloatingLayers && target instanceof Element && target.closest('.ui-floating-layer')) return;
       dismissRef.current();
     };
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -192,7 +200,7 @@ export function FloatingLayer({
       document.removeEventListener('pointerdown', closeOnPointerDown, true);
       document.removeEventListener('keydown', closeOnEscape, true);
     };
-  }, [active, anchorRef, present]);
+  }, [active, allowNestedFloatingLayers, anchorRef, present]);
 
   if (!portalReady || !present) return null;
   return createPortal((

@@ -290,6 +290,7 @@ export function SkillsManager({
                     key: 'skill',
                     label: t('Skill'),
                     className: 'management-table-primary-column',
+                    filter: { getValue: (skill) => [skill.title, skill.description, skill.id], type: 'text' },
                     render: (skill) => {
                       const expanded = expandedSkillIds.includes(skill.id);
                       return (
@@ -311,6 +312,14 @@ export function SkillsManager({
                   {
                     key: 'scope',
                     label: t('适用范围'),
+                    className: 'skills-manager-scope-column',
+                    filter: {
+                      getValue: (skill) => [
+                        ...(skill.domains || []),
+                        skill.shared ? t('所有 ID 共享') : t('仅创建 ID'),
+                      ],
+                      type: 'text',
+                    },
                     render: (skill) => (
                       <div className="management-table-cell-stack">
                         <span>{skill.domains?.length ? skill.domains.join(' · ') : t('所有域名')}</span>
@@ -321,21 +330,37 @@ export function SkillsManager({
                   {
                     key: 'triggers',
                     label: t('触发词'),
+                    className: 'skills-manager-trigger-column',
+                    filter: { getValue: (skill) => skill.triggerPhrases, type: 'text' },
                     render: (skill) => (
-                      <span className="management-table-muted">
-                        {skill.triggerPhrases.length ? skill.triggerPhrases.slice(0, 2).join(' · ') : t('暂无触发词')}
-                      </span>
+                      skill.triggerPhrases.length ? (
+                        <div className="skills-manager-table-triggers">
+                          {skill.triggerPhrases.slice(0, 2).map((phrase) => <span key={phrase} title={phrase}>{phrase}</span>)}
+                          {skill.triggerPhrases.length > 2 ? <small>+{skill.triggerPhrases.length - 2}</small> : null}
+                        </div>
+                      ) : <span className="management-table-muted">{t('暂无触发词')}</span>
                     ),
                   },
                   {
                     key: 'status',
                     label: t('状态'),
+                    className: 'skills-manager-status-column',
+                    filter: {
+                      getValue: (skill) => skill.status,
+                      options: [
+                        { label: t('可用'), value: 'ready' },
+                        { label: t('草稿'), value: 'draft' },
+                        { label: t('停用'), value: 'disabled' },
+                      ],
+                      type: 'select',
+                    },
                     render: (skill) => <span className={`skill-status status-${skill.status}`}>{t(statusLabel(skill.status))}</span>,
                   },
                   {
                     key: 'updated',
                     label: t('最近更新'),
                     className: 'management-table-date-column',
+                    filter: { getValue: (skill) => skill.updatedAt, type: 'datetime' },
                     render: (skill) => <span className="management-table-muted">{new Date(skill.updatedAt).toLocaleString()}</span>,
                   },
                   {
