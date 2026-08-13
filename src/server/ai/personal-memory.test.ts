@@ -38,8 +38,10 @@ test('formats multiline personal memory for prompts and applies only a prompt-ti
   try {
     process.env.AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS = '1000';
     const prompt = formatPersonalMemoryForPrompt([item]);
-    assert.match(prompt, /第一行\n   第二行/);
+    assert.match(prompt, /<memory id="memory_multiline" scope="global" type="workflow">/);
+    assert.match(prompt, /第一行\n第二行/);
     assert.match(prompt, /stored memory remains complete/);
+    assert.match(prompt, /<\/memory>/);
     assert.ok(prompt.length <= 1000);
     assert.equal(normalizePersonalMemoryValue(item.value), item.value);
   } finally {

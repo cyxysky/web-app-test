@@ -57,7 +57,7 @@ import {
   transitionBrowserChatSession,
   type BrowserChatTurnState,
 } from '@/server/ai/agents/browser-chat-session-state';
-import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
+import { formatSkillReferencesForUser, formatSkillSummariesForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
   extractPersonalMemoryFromTurn,
@@ -1102,6 +1102,7 @@ type BrowserChatResourceSeed = {
 };
 
 type BrowserChatCredentialDescriptor = {
+  accountId: string;
   origins: string[];
   username: string;
   usernameRef: string;
@@ -1180,7 +1181,7 @@ function browserChatCredentialContext(
     const usernameRef = `credential_${token}_username`;
     const passwordRef = `credential_${token}_password`;
     const allowedOrigins = Array.from(origins);
-    credentials.push({ origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
+    credentials.push({ accountId: account.id, origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
     bindings.push(
       { ref: usernameRef, value: account.username, allowedOrigins },
       { ref: passwordRef, value: credential.password, allowedOrigins },
@@ -1194,9 +1195,12 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
   return [
     '[后台已匹配的安全账号引用]',
     ...credentials.map((item) => [
-      `- ${item.origins.join('、')} / ${item.username}`,
+      `<account id="${item.accountId}">`,
+      `  Origins: ${item.origins.join('、')}`,
+      `  Username: ${item.username}`,
       `  用户名：await credentialVault.fill(page.getByLabel('用户名'), "${item.usernameRef}")`,
       `  密码：await credentialVault.fill(page.getByLabel('密码'), "${item.passwordRef}")`,
+      '</account>',
     ].join('\n')),
     'credentialVault.fill 只会把对应值写入真实 Playwright Locator，并且只允许上述 origin；它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
@@ -1209,16 +1213,18 @@ function createBrowserChatRuntimeOperationalContext(input: {
   modelText: string;
   explicitlySelectedSkills?: SkillRecord[];
 }) {
-  let cachedKey = '';
-  let cachedContext: { operationalContext: string; credentialBindings: BrowserCodeCredentialBinding[] } | undefined;
-  return () => {
+  const loadedSkillIds = new Set<string>();
+  const explicitlySelectedSkillIds = new Set((input.explicitlySelectedSkills || []).map((skill) => skill.id));
+  const getContext = () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
-    const key = httpOrigin(currentUrl) || normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl) || 'global';
-    if (cachedContext && cachedKey === key) return cachedContext;
+    const allSkills = store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready');
+    const explicitlySelectedSkills = allSkills.filter((skill) => explicitlySelectedSkillIds.has(skill.id));
     const skills = runtimeSkillsForUrl(
-      store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready'),
-      input.explicitlySelectedSkills || [],
+      allSkills,
+      explicitlySelectedSkills,
       currentUrl || input.session.targetUrl,
+      loadedSkillIds,
+      [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
     );
     const memory = browserChatPersonalMemoryContext({
       session: input.session,
@@ -1238,17 +1244,35 @@ function createBrowserChatRuntimeOperationalContext(input: {
       }] : [],
       input.modelText,
     );
-    cachedKey = key;
-    cachedContext = {
+    return {
       operationalContext: [
-        formatSkillsForPrompt(skills),
+        formatSkillSummariesForPrompt(skills),
         memory.context,
         browserChatCredentialPrompt(credentials.credentials),
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
     };
-    return cachedContext;
   };
+  return Object.assign(getContext, {
+    readSkill: async (skillId: string): Promise<BrowserActionResult> => {
+      const skill = store.getSkill(skillId.trim(), input.session.userId);
+      if (!skill || skill.status !== 'ready') {
+        return { ok: false, actual: 'Skill not found or unavailable for the current user.' };
+      }
+      loadedSkillIds.add(skill.id);
+      return {
+        ok: true,
+        actual: [
+          `<skill id="${skill.id}" version="${skill.version}">`,
+          `Title: ${skill.title}`,
+          `Summary: ${skill.description}`,
+          'Content:',
+          skill.content.details.trim(),
+          '</skill>',
+        ].filter(Boolean).join('\n'),
+      };
+    },
+  });
 }
 
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
@@ -3850,6 +3874,7 @@ async function executeBrowserChatSubagentBatch(input: {
         useToolLoopAgent: true,
         credentialBindings: initialRuntimeContext.credentialBindings,
         getRuntimeOperationalContext,
+        readSkill: getRuntimeOperationalContext.readSkill,
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
@@ -4075,6 +4100,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       useToolLoopAgent: true,
       credentialBindings: initialRuntimeContext.credentialBindings,
       getRuntimeOperationalContext,
+      readSkill: getRuntimeOperationalContext.readSkill,
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
@@ -4255,6 +4281,7 @@ async function runBrowserChatMessage(
         referenceImagePaths,
         credentialBindings: initialRuntimeContext.credentialBindings,
         getRuntimeOperationalContext,
+        readSkill: getRuntimeOperationalContext.readSkill,
         abortSignal: abortController.signal,
         shouldContinue: () => isActiveBrowserChatTurn(session, assistantMessageId, abortController),
         requestToolConfirmation: requestTurnToolConfirmation,

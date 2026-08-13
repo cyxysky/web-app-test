@@ -5,10 +5,12 @@ function compactText(value: string, max = 900) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function detailsBlock(value: string) {
-  const details = value.trim();
-  if (!details) return '';
-  return `Details:\n${details.slice(0, 12_000)}`;
+function xmlAttribute(value: unknown) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
 export function activeSkills(skills: SkillRecord[]) {
@@ -53,12 +55,46 @@ export function skillMatchesUrl(skill: SkillRecord, currentUrl: string) {
   });
 }
 
-export function runtimeSkillsForUrl(allSkills: SkillRecord[], explicitlySelected: SkillRecord[], currentUrl: string) {
+function normalizedRelevanceText(value: string) {
+  return value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+}
+
+function skillRelevanceScore(skill: SkillRecord, query: string) {
+  const normalizedQuery = normalizedRelevanceText(query);
+  if (!normalizedQuery) return 0;
+  const scoreFor = (value: string, weight: number) => {
+    const term = normalizedRelevanceText(value);
+    return term.length >= 2 && (normalizedQuery.includes(term) || term.includes(normalizedQuery)) ? weight : 0;
+  };
+  return Math.max(
+    scoreFor(skill.title, 8),
+    scoreFor(skill.description, 5),
+    ...skill.triggerPhrases.map((phrase) => scoreFor(phrase, 10)),
+  );
+}
+
+export function runtimeSkillsForUrl(
+  allSkills: SkillRecord[],
+  explicitlySelected: SkillRecord[],
+  currentUrl: string,
+  loadedSkillIds: ReadonlySet<string> = new Set(),
+  query = '',
+) {
   const selectedIds = new Set(explicitlySelected.map((skill) => skill.id));
+  const autoSkills = allSkills
+    .filter((skill) => !selectedIds.has(skill.id) && skillMatchesUrl(skill, currentUrl))
+    .map((skill) => ({
+      skill,
+      relevance: skillRelevanceScore(skill, query),
+      domainScoped: normalizeSkillDomains(skill.domains).length > 0,
+    }))
+    .filter((item) => !query.trim() || item.domainScoped || item.relevance > 0)
+    .sort((left, right) => right.relevance - left.relevance)
+    .map((item) => item.skill);
   return activeSkills([
     ...explicitlySelected,
-    ...allSkills.filter((skill) => !selectedIds.has(skill.id) && skillMatchesUrl(skill, currentUrl)),
-  ]);
+    ...autoSkills,
+  ].filter((skill) => !loadedSkillIds.has(skill.id)));
 }
 
 export function formatSkillReferencesForUser(skills: SkillRecord[]) {
@@ -71,18 +107,20 @@ export function formatSkillReferencesForUser(skills: SkillRecord[]) {
   ].filter(Boolean).join('\n')).join('\n\n');
 }
 
-export function formatSkillsForPrompt(skills: SkillRecord[]) {
+export function formatSkillSummariesForPrompt(skills: SkillRecord[]) {
   const selected = activeSkills(skills);
   if (!selected.length) return '';
   return [
-    'Loaded reusable Skills for the current browser domain:',
-    'A Skill may be loaded automatically by domain or explicitly referenced by the user.',
-    'Use these Skills as semantic operating guidance only. Do not copy old ids, coordinates, screenshots, run ids, or raw tool inputs. Prefer current page evidence when it contradicts a Skill.',
+    'Available Skill summaries for the current task and browser domain:',
+    'When a Skill is relevant, call readSkill with its id before performing the related browser actions. The tool returns the complete current Skill.',
+    'Do not call readSkill repeatedly for the same Skill in one user turn. Prefer current page evidence when it contradicts a Skill.',
     ...selected.map((skill, index) => [
       '',
-      `Skill ${index + 1} (referenced by <skills id="${index + 1}">): ${skill.title}`,
-      `Description: ${compactText(skill.description, 360)}`,
-      detailsBlock(skill.content.details),
+      `<skill id="${xmlAttribute(skill.id)}" version="${xmlAttribute(skill.version)}" index="${index + 1}">`,
+      `Title: ${compactText(skill.title, 120)}`,
+      `Summary: ${compactText(skill.description, 360)}`,
+      skill.triggerPhrases.length ? `Triggers: ${skill.triggerPhrases.map((phrase) => compactText(phrase, 80)).join(', ')}` : '',
+      '</skill>',
     ].filter(Boolean).join('\n')),
   ].join('\n');
 }

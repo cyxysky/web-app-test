@@ -579,23 +579,38 @@ export function markPersonalMemoryItemsUsed(ids: string[]) {
 export function formatPersonalMemoryForPrompt(results: PersonalMemorySearchResult[] | PersonalMemoryItem[]) {
   const items = results.map((entry) => 'item' in entry ? entry.item : entry).filter((item) => item.status === 'active');
   if (!items.length) return '';
-  const prompt = [
+  const header = [
     'Personal short memory:',
     'Use these concise user/domain facts when relevant. If the latest user message contradicts a memory, follow the latest user message.',
-    ...items.map((item, index) => {
-      const scope = item.scope === 'domain' && item.domain ? `[${item.domain}]` : '[global]';
-      const aliases = item.aliases.length ? ` aliases=${item.aliases.join(', ')}` : '';
-      const value = normalizePersonalMemoryValue(item.value)
-        .split('\n')
-        .map((line) => `   ${line}`)
-        .join('\n');
-      return `${index + 1}. ${scope} ${item.type} ${item.key}${aliases}:\n${value}`;
-    }),
   ].join('\n');
   const maxChars = personalMemoryPromptMaxChars();
-  if (prompt.length <= maxChars) return prompt;
-  const suffix = '\n[Personal memory truncated only for this prompt; the stored memory remains complete.]';
-  return `${prompt.slice(0, Math.max(0, maxChars - suffix.length)).trimEnd()}${suffix}`;
+  const blocks: string[] = [];
+  let usedChars = header.length;
+  for (const item of items) {
+    const attributes = [
+      `id="${item.id}"`,
+      `scope="${item.scope}"`,
+      `type="${item.type}"`,
+      item.scope === 'domain' && item.domain ? `domain="${item.domain}"` : '',
+    ].filter(Boolean).join(' ');
+    const aliases = item.aliases.length ? `\nAliases: ${item.aliases.join(', ')}` : '';
+    const opening = `<memory ${attributes}>\nKey: ${item.key}${aliases}\nValue:\n`;
+    const closing = '\n</memory>';
+    const separatorChars = 2;
+    const available = maxChars - usedChars - separatorChars - opening.length - closing.length;
+    if (available <= 0) break;
+    const rawValue = normalizePersonalMemoryValue(item.value);
+    const truncated = rawValue.length > available;
+    const fullSuffix = '\n[Personal memory truncated only for this prompt; the stored memory remains complete.]';
+    const suffix = truncated ? fullSuffix.slice(0, available) : '';
+    const valueLimit = Math.max(0, available - suffix.length);
+    const value = rawValue.slice(0, valueLimit).trimEnd();
+    const block = `${opening}${value}${suffix}${closing}`;
+    blocks.push(block);
+    usedChars += separatorChars + block.length;
+    if (truncated) break;
+  }
+  return [header, ...blocks].join('\n\n');
 }
 
 function safeJson(value: unknown) {

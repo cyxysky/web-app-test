@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
-import { formatSkillReferencesForUser, formatSkillsForPrompt, runtimeSkillsForUrl, skillMatchesUrl } from './skill-context';
+import { formatSkillReferencesForUser, formatSkillSummariesForPrompt, runtimeSkillsForUrl, skillMatchesUrl } from './skill-context';
 
 const skill: SkillRecord = {
   id: 'skill-search-room',
@@ -31,13 +31,16 @@ test('compact user Skill references contain only the id mapping and title', () =
   assert.doesNotMatch(reference, /打开指定主播直播间|Workflow/);
 });
 
-test('detailed Skill prompt injects operating content once and omits matching metadata', () => {
-  const prompt = formatSkillsForPrompt([skill]);
+test('Skill prompt exposes tagged summaries without injecting full content', () => {
+  const prompt = formatSkillSummariesForPrompt([skill]);
+  assert.match(prompt, /<skill id="skill-search-room" version="1" index="1">/);
   assert.equal((prompt.match(/通过主播名进入指定直播间/g) || []).length, 1);
-  assert.equal((prompt.match(/打开直播平台并定位主播搜索入口/g) || []).length, 1);
-  assert.equal((prompt.match(/搜索建议未出现时改用房间号/g) || []).length, 1);
-  assert.equal((prompt.match(/地址和页面标题均对应目标主播/g) || []).length, 1);
-  assert.doesNotMatch(prompt, /打开指定主播直播间|Trigger phrases/);
+  assert.match(prompt, /Triggers: 打开指定主播直播间/);
+  assert.match(prompt, /call readSkill/);
+  assert.doesNotMatch(prompt, /打开直播平台并定位主播搜索入口/);
+  assert.doesNotMatch(prompt, /搜索建议未出现时改用房间号/);
+  assert.doesNotMatch(prompt, /地址和页面标题均对应目标主播/);
+  assert.match(prompt, /<\/skill>/);
 });
 
 test('Skill content keeps the detailed Markdown block intact', () => {
@@ -63,5 +66,35 @@ test('runtime skills keep explicit selections and add matching global and domain
   assert.deepEqual(
     runtimeSkillsForUrl([global, matching, unrelated], [explicit], 'https://app.example.com/path').map((item) => item.id),
     ['explicit', 'global', 'matching'],
+  );
+});
+
+test('runtime Skill summaries exclude Skills already read in the current user turn', () => {
+  const matching = { ...skill, id: 'matching', domains: ['example.com'] };
+  assert.deepEqual(
+    runtimeSkillsForUrl([matching], [], 'https://example.com/path', new Set(['matching'])),
+    [],
+  );
+});
+
+test('runtime Skill summaries use the current conversation to filter global Skills', () => {
+  const relevant = { ...skill, id: 'relevant', domains: [] };
+  const unrelated = {
+    ...skill,
+    id: 'unrelated',
+    title: '导出财务报表',
+    description: '导出财务数据。',
+    triggerPhrases: ['导出报表'],
+    domains: [],
+  };
+  assert.deepEqual(
+    runtimeSkillsForUrl(
+      [unrelated, relevant],
+      [],
+      'https://example.com/path',
+      new Set(),
+      '请帮我打开指定主播直播间',
+    ).map((item) => item.id),
+    ['relevant'],
   );
 });

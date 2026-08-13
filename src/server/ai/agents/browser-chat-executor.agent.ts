@@ -90,6 +90,8 @@ export type BrowserChatReadFileInput = {
   pages?: number[];
 };
 
+export type BrowserChatReadSkill = (skillId: string) => Promise<BrowserActionResult>;
+
 export type BrowserChatTextStreamUpdate = {
   delta: string;
   stepNumber: number;
@@ -233,6 +235,7 @@ const codexRuntimeObjectSchema = z.object({
     followByEnter: z.boolean().nullable().optional(),
     value: z.string().nullable().optional(),
     label: z.string().nullable().optional(),
+    skillId: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
@@ -1055,6 +1058,7 @@ function makeBrowserTools(
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
     readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+    readSkill?: BrowserChatReadSkill;
     onReferenceImage?: (input: { path: string; source: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
     attachmentBindings?: BrowserCodeAttachmentBinding[];
@@ -1309,6 +1313,15 @@ function makeBrowserTools(
         },
       }),
     } : {}),
+    ...(referenceOptions?.readSkill ? {
+      readSkill: tool({
+        description: 'Read the complete current content of one Skill listed in the system prompt. Call this before performing browser actions governed by that Skill. Do not call it again for the same Skill in this user turn.',
+        inputSchema: browserToolInput({
+          skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
+        }),
+        execute: (input) => record('readSkill', input, () => referenceOptions.readSkill!(input.skillId)),
+      }),
+    } : {}),
     downloadFile: tool({
       description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
       inputSchema: browserToolInput({
@@ -1430,7 +1443,7 @@ function runtimePrompt(input: {
       : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, fillDocumentTemplate for uploaded .docx templates, and readFile for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     input.operationalContext
-      ? `Relevant memory and secure capabilities supplied by the runtime:\n${input.operationalContext}`
+      ? `Relevant Skill summaries, memory, and secure capabilities supplied by the runtime:\n${input.operationalContext}`
       : '',
     customPrompt,
     '',
@@ -1448,6 +1461,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'spawnSubagents',
     'readSubagent',
     'readFile',
+    'readSkill',
     'downloadFile',
     'generateFile',
     'fillDocumentTemplate',
@@ -1860,6 +1874,7 @@ async function executeRuntimeStep(input: {
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
@@ -1967,6 +1982,7 @@ async function executeRuntimeStep(input: {
       && (name !== 'spawnSubagents' || Boolean(input.runSubagents))
       && (name !== 'readSubagent' || Boolean(input.readSubagent))
       && (name !== 'readFile' || Boolean(input.readFile))
+      && (name !== 'readSkill' || Boolean(input.readSkill))
     ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode: true,
@@ -2334,6 +2350,7 @@ async function executeRuntimeStep(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
+        readSkill: input.readSkill,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
@@ -2417,6 +2434,7 @@ async function executeRuntimeStep(input: {
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
       readFile: input.readFile,
+      readSkill: input.readSkill,
       attachmentBindings: input.attachmentBindings,
       credentialBindings: input.credentialBindings,
       getCredentialBindings: () => activeCredentialBindings,
@@ -2958,6 +2976,7 @@ export async function executeInteractiveBrowserTurn(input: {
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
@@ -2977,6 +2996,8 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
+  const carriedSkillIds = new Set<string>();
+  const carriedSkillMessages: InteractiveBrowserTurnMessage[] = [];
 
   while (true) {
     ensureActive();
@@ -3004,7 +3025,7 @@ export async function executeInteractiveBrowserTurn(input: {
         stepIndex,
         instruction: input.modelInstruction || input.instruction,
         operationalContext: input.operationalContext,
-        conversation: input.conversation || [],
+        conversation: [...(input.conversation || []), ...carriedSkillMessages],
         referenceImagePaths: input.referenceImagePaths,
         getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         abortSignal: input.abortSignal,
@@ -3014,6 +3035,7 @@ export async function executeInteractiveBrowserTurn(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
+        readSkill: input.readSkill,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
@@ -3072,6 +3094,18 @@ export async function executeInteractiveBrowserTurn(input: {
 
     ensureActive();
     const browserChatReply = textFromUnknown(actionResult.text).trim();
+    for (const trace of actionResult.traces) {
+      if (trace.name !== 'readSkill' || !trace.result?.ok) continue;
+      const traceInput = flowInput(trace.input);
+      const skillId = typeof traceInput.skillId === 'string' ? traceInput.skillId.trim() : '';
+      const content = trace.result.actual.trim();
+      if (!skillId || !content || carriedSkillIds.has(skillId)) continue;
+      carriedSkillIds.add(skillId);
+      carriedSkillMessages.push({
+        role: 'user',
+        content: `[Runtime readSkill result from earlier in this user turn]\n${content}`,
+      });
+    }
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -3535,6 +3569,7 @@ async function executeCodexRuntimeObject(input: {
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
@@ -3542,7 +3577,7 @@ async function executeCodexRuntimeObject(input: {
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onReferenceImage?: (input: { path: string; source: string }) => void;
 }) {
-  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
+  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3616,6 +3651,12 @@ async function executeCodexRuntimeObject(input: {
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
         pages: Array.isArray(normalizedParams.pages) ? normalizedParams.pages as number[] : undefined,
       });
+    }
+    if (type === 'readSkill') {
+      if (!readSkill) return { ok: false, actual: 'readSkill is unavailable in this runtime.' };
+      const skillId = typeof normalizedParams.skillId === 'string' ? normalizedParams.skillId.trim() : '';
+      if (!skillId) return { ok: false, actual: 'readSkill requires one Skill id.' };
+      return readSkill(skillId);
     }
     return executeRecordedBrowserOperation(session, flow, {
       runId,
