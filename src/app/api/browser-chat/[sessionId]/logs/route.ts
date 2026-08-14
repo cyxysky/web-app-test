@@ -21,6 +21,7 @@ export async function GET(request: Request, context: RouteContext) {
       cursor: url.searchParams.get('cursor') || undefined,
       limit: boundedQueryInteger(url.searchParams.get('limit'), { fallback: 500, max: 2_000 }),
       messageId: url.searchParams.get('messageId') || undefined,
+      subagentsOnly: url.searchParams.get('subagentsOnly') === 'true',
     });
     if (!result) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, result);

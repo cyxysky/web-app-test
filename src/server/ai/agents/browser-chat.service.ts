@@ -38,10 +38,15 @@ import {
   attachBrowserChatStepOwners,
 } from '@/server/ai/agents/browser-chat-step-ownership';
 import {
+  browserChatSubagentConfirmationMessage,
+  browserChatSubagentInputMessage,
+  browserChatSubagentMessagesFromModelMessages,
   browserChatSubagentSuggestedSummaryChars,
+  limitBrowserChatSubagentMessages,
   preserveBrowserChatSubagentSummary,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
+  type BrowserChatSubagentConfirmationInteraction,
 } from '@/server/ai/agents/browser-chat-subagents';
 import {
   clearRegisteredBrowserChatTurn,
@@ -80,6 +85,7 @@ import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat
 import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
 import type {
   BrowserChatAiOutputCycle,
+  BrowserChatSubagentMessage,
   BrowserChatSubagentRecord,
   ModelProvider,
   SkillRecord,
@@ -271,8 +277,9 @@ type BrowserChatStoredSubagent = {
   summaryChars: number;
   summaryOriginalChars: number;
   summaryTruncated: boolean;
-  steps: StepExecutionResult[];
-  events: unknown[];
+  toolCount: number;
+  currentAction?: string;
+  messages: BrowserChatSubagentMessage[];
   error?: string;
   createdAt: string;
   updatedAt: string;
@@ -381,7 +388,6 @@ scheduleBrowserChatArtifactMaintenance(() => (
 ));
 scheduleSqliteMaintenance();
 const runningHydrationGraceMs = 2 * 60 * 1000;
-const fullLogDetailsFlag = '__browserChatFullLogDetails';
 
 function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
@@ -512,10 +518,6 @@ function scheduleBrowserChatUserIdleClose(userId?: string | number) {
   }, browserChatUserBrowserIdleTimeoutMs());
   timer.unref?.();
   browserIdleTimers.set(userKey, timer);
-}
-
-function fullLogDetails(value: unknown) {
-  return { [fullLogDetailsFlag]: true, value };
 }
 
 function browserChatLogLimit() {
@@ -889,14 +891,7 @@ function trimLogText(value: string, max = 3000) {
 }
 
 function unwrapLogDetails(value: unknown) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return { value, full: false };
-  }
-  const record = value as Record<string, unknown>;
-  if (record[fullLogDetailsFlag] !== true) {
-    return { value, full: false };
-  }
-  return { value: record.value, full: true };
+  return { value, full: false };
 }
 
 function stringifyCompactLogDetails(value: unknown) {
@@ -2080,9 +2075,13 @@ function mergePersistedSubagents(existing: BrowserChatSubagentRecord[] = [], inc
   for (const subagent of existing) byId.set(subagent.id, subagent);
   for (const subagent of incoming) {
     const previous = byId.get(subagent.id);
-    byId.set(subagent.id, previous
-      ? { ...previous, ...subagent, steps: mergePersistedSteps(previous.steps, subagent.steps) }
-      : subagent);
+    if (!previous) {
+      byId.set(subagent.id, subagent);
+      continue;
+    }
+    const messages = new Map((previous.messages || []).map((message) => [message.id, message]));
+    for (const message of subagent.messages || []) messages.set(message.id, message);
+    byId.set(subagent.id, { ...previous, ...subagent, messages: [...messages.values()] });
   }
   return [...byId.values()].sort((left, right) => left.index - right.index);
 }
@@ -3502,7 +3501,7 @@ function createBrowserChatTurnToolConfirmation(
   session: BrowserChatSessionRecord,
   assistantMessageId: string,
   abortSignal: AbortSignal,
-  options: { serialize?: boolean } = {},
+  options: { recordLogs?: boolean; serialize?: boolean } = {},
 ) {
   const confirmedScopes = new Set<string>();
   const confirmedInputs = new Set<string>();
@@ -3510,16 +3509,19 @@ function createBrowserChatTurnToolConfirmation(
   const requestWithReuse = async (
     request: BrowserToolConfirmationRequest,
     browser?: BrowserSession,
+    onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void,
   ): Promise<BrowserToolConfirmationDecision> => {
     const inputSignature = toolConfirmationInputSignature(request.input);
     const inputKey = `${request.toolName}:${inputSignature}`;
     const scope = browserChatToolConfirmationScope(session, request, browser);
     if (confirmedInputs.has(inputKey) || (scope && confirmedScopes.has(scope))) {
-      appendLog(session, 'tool:confirmation:reused', `已复用本轮用户对 ${request.reason || request.prompt} 的确认。`, {
-        stepIndex: request.stepIndex,
-        messageId: assistantMessageId,
-        details: { inputKey, scope, toolName: request.toolName },
-      });
+      if (options.recordLogs !== false) {
+        appendLog(session, 'tool:confirmation:reused', `已复用本轮用户对 ${request.reason || request.prompt} 的确认。`, {
+          stepIndex: request.stepIndex,
+          messageId: assistantMessageId,
+          details: { inputKey, scope, toolName: request.toolName },
+        });
+      }
       return 'confirmed';
     }
     const decision = await requestBrowserChatToolConfirmation(
@@ -3528,6 +3530,7 @@ function createBrowserChatTurnToolConfirmation(
       request,
       abortSignal,
       browser,
+      { onDecision, recordLogs: options.recordLogs !== false },
     );
     if (decision === 'confirmed') {
       confirmedInputs.add(inputKey);
@@ -3538,14 +3541,15 @@ function createBrowserChatTurnToolConfirmation(
   return async (
     request: BrowserToolConfirmationRequest,
     browser?: BrowserSession,
+    onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void,
   ): Promise<BrowserToolConfirmationDecision> => {
-    if (!options.serialize) return requestWithReuse(request, browser);
+    if (!options.serialize) return requestWithReuse(request, browser, onDecision);
     const previous = confirmationQueue;
     let release!: () => void;
     confirmationQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await requestWithReuse(request, browser);
+      return await requestWithReuse(request, browser, onDecision);
     } finally {
       release();
     }
@@ -3575,6 +3579,7 @@ async function captureBrowserChatToolConfirmationScreenshot(
   session: BrowserChatSessionRecord,
   request: BrowserToolConfirmationRequest,
   browser: BrowserSession | undefined = session.browser,
+  recordErrors = true,
 ) {
   if (!browser) return undefined;
   try {
@@ -3588,10 +3593,12 @@ async function captureBrowserChatToolConfirmationScreenshot(
     if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return undefined;
     return artifactApiUrlFromRelative(relativePath.split(path.sep).join('/'));
   } catch (error) {
-    appendLog(session, 'tool:confirmation:screenshot:error', '确认前页面截图获取失败，确认操作仍可继续。', {
-      stepIndex: request.stepIndex,
-      details: { error: error instanceof Error ? error.message : String(error), toolName: request.toolName },
-    });
+    if (recordErrors) {
+      appendLog(session, 'tool:confirmation:screenshot:error', '确认前页面截图获取失败，确认操作仍可继续。', {
+        stepIndex: request.stepIndex,
+        details: { error: error instanceof Error ? error.message : String(error), toolName: request.toolName },
+      });
+    }
     return undefined;
   }
 }
@@ -3602,6 +3609,10 @@ async function requestBrowserChatToolConfirmation(
   request: BrowserToolConfirmationRequest,
   abortSignal?: AbortSignal,
   browser?: BrowserSession,
+  options: {
+    onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void;
+    recordLogs?: boolean;
+  } = {},
 ): Promise<BrowserToolConfirmationDecision> {
   if (abortSignal?.aborted) return 'cancelled';
   const existing = session.pendingToolConfirmation;
@@ -3623,7 +3634,12 @@ async function requestBrowserChatToolConfirmation(
   cancelOrphanToolConfirmationsForSession(session.id);
   const confirmationId = id('confirm');
   const requestedAt = now();
-  const screenshotUrl = await captureBrowserChatToolConfirmationScreenshot(session, request, browser);
+  const screenshotUrl = await captureBrowserChatToolConfirmationScreenshot(
+    session,
+    request,
+    browser,
+    options.recordLogs !== false,
+  );
   if (abortSignal?.aborted) return 'cancelled';
   const pending: BrowserChatToolConfirmation = {
     id: confirmationId,
@@ -3648,19 +3664,31 @@ async function requestBrowserChatToolConfirmation(
       abortSignal?.removeEventListener('abort', onAbort);
       if (session.pendingToolConfirmation?.id === confirmationId) {
         transitionBrowserChatSession(session, { type: 'confirmationCleared' });
-        const log = toolConfirmationLog(decision);
-        appendLog(session, log.phase, log.message, {
-          stepIndex: pending.stepIndex,
-          messageId: assistantMessageId,
-          details: {
-            confirmationId,
-            decision,
-            toolName: pending.toolName,
-            inputSignature: pending.inputSignature,
-            screenshotUrl: pending.screenshotUrl,
-          },
-        });
+        if (options.recordLogs !== false) {
+          const log = toolConfirmationLog(decision);
+          appendLog(session, log.phase, log.message, {
+            stepIndex: pending.stepIndex,
+            messageId: assistantMessageId,
+            details: {
+              confirmationId,
+              decision,
+              toolName: pending.toolName,
+              inputSignature: pending.inputSignature,
+              screenshotUrl: pending.screenshotUrl,
+            },
+          });
+        }
       }
+      options.onDecision?.({
+        id: pending.id,
+        toolName: pending.toolName,
+        input: request.input,
+        prompt: pending.prompt,
+        reason: pending.reason,
+        screenshotUrl: pending.screenshotUrl,
+        requestedAt: pending.requestedAt,
+        decision,
+      });
       resolve(decision);
     };
     onAbort = () => finish('cancelled');
@@ -3669,11 +3697,15 @@ async function requestBrowserChatToolConfirmation(
       confirmation: pending,
       at: requestedAt,
     });
-    appendLog(session, 'tool:confirmation:pending', `工具 ${request.toolName} 等待用户确认。`, {
-      stepIndex: request.stepIndex,
-      messageId: assistantMessageId,
-      details: { confirmation: pending, input: request.input },
-    });
+    if (options.recordLogs !== false) {
+      appendLog(session, 'tool:confirmation:pending', `工具 ${request.toolName} 等待用户确认。`, {
+        stepIndex: request.stepIndex,
+        messageId: assistantMessageId,
+        details: { confirmation: pending, input: request.input },
+      });
+    } else {
+      persistAndNotify(session.id);
+    }
   });
   toolConfirmations.set(confirmationId, { sessionId: session.id, resolve: finish, promise: decisionPromise });
   abortSignal?.addEventListener('abort', onAbort, { once: true });
@@ -3811,7 +3843,7 @@ function browserChatSubagentSessionRegistry(sessionId: string) {
 function updateBrowserChatStoredSubagent(
   sessionId: string,
   uuid: string,
-  update: Partial<Pick<BrowserChatStoredSubagent, 'status' | 'summary' | 'summaryChars' | 'summaryOriginalChars' | 'summaryTruncated' | 'steps' | 'events' | 'error'>>,
+  update: Partial<Pick<BrowserChatStoredSubagent, 'status' | 'summary' | 'summaryChars' | 'summaryOriginalChars' | 'summaryTruncated' | 'toolCount' | 'currentAction' | 'messages' | 'error'>>,
 ) {
   const record = browserChatSubagentSessionRegistry(sessionId).get(uuid);
   if (!record) return;
@@ -3827,11 +3859,28 @@ function updateBrowserChatStoredSubagent(
       status: record.status,
       summary: record.summary || undefined,
       resumable: blockedSubagents.has(record.uuid),
-      toolCount: record.steps.reduce((count: number, step: StepExecutionResult) => count + (step.tools || []).length, 0),
-      steps: [...record.steps],
+      toolCount: record.toolCount,
+      currentAction: record.currentAction,
+      messages: [...record.messages],
       error: record.error,
     });
   }
+}
+
+function recordBrowserChatSubagentConfirmation(
+  sessionId: string,
+  subagentId: string,
+  interaction: BrowserChatSubagentConfirmationInteraction,
+) {
+  const record = browserChatSubagentSessionRegistry(sessionId).get(subagentId);
+  if (!record) return;
+  const message = browserChatSubagentConfirmationMessage(subagentId, interaction);
+  const messages = limitBrowserChatSubagentMessages(
+    subagentId,
+    [...record.messages.filter((item) => item.id !== message.id), message],
+  );
+  updateBrowserChatStoredSubagent(sessionId, subagentId, { messages });
+  persistAndNotify(sessionId, { defer: true });
 }
 
 function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
@@ -3904,8 +3953,9 @@ async function executeBrowserChatSubagentBatch(input: {
       summaryChars: 0,
       summaryOriginalChars: 0,
       summaryTruncated: false,
-      steps: [],
-      events: [],
+      toolCount: 0,
+      currentAction: '正在启动',
+      messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
       createdAt,
       updatedAt: createdAt,
     });
@@ -3918,19 +3968,16 @@ async function executeBrowserChatSubagentBatch(input: {
       status: 'running',
       resumable: false,
       toolCount: 0,
-      steps: [],
+      currentAction: '正在启动',
+      messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
     });
-  });
-  appendLog(session, 'subagents:start', `正在并行执行 ${tasks.length} 个子 Agent；单个分支失败不会中止其他分支`, {
-    details: fullLogDetails({ batchId, requestedTasks, tasks }),
-    messageId: assistantMessageId,
   });
   persistAndNotify(session.id);
   const requestBatchToolConfirmation = createBrowserChatTurnToolConfirmation(
     session,
     assistantMessageId,
     abortController.signal,
-    { serialize: true },
+    { recordLogs: false, serialize: true },
   );
 
   const inheritedStorageState = session.browser?.isUsable()
@@ -3938,13 +3985,8 @@ async function executeBrowserChatSubagentBatch(input: {
     : undefined;
   const summaryGuidanceChars = browserChatSubagentSuggestedSummaryChars();
 
-  const settled = await settleBrowserChatSubagents(tasks, async (task, index) => {
+  const settled = await settleBrowserChatSubagents(tasks, async (task) => {
     if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
-    appendLog(session, `subagent:${task.id}:start`, `子 Agent ${index + 1} 已启动：${task.title}`, {
-      details: { batchId, id: task.id, index, title: task.title, instruction: task.instruction, url: task.url, status: 'running' },
-      messageId: assistantMessageId,
-    });
-    persistAndNotify(session.id);
     const browserProfileKey = browserChatBrowserProfileKey(session);
     const child = new BrowserSession(session.mode, {
       browserSurface: 'external',
@@ -3958,7 +4000,6 @@ async function executeBrowserChatSubagentBatch(input: {
       runId: `${session.id}_${task.id}`,
     });
     const childSteps = new Map<number, StepExecutionResult>();
-    let latestChildText = '';
     try {
       await child.start();
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
@@ -4006,56 +4047,22 @@ async function executeBrowserChatSubagentBatch(input: {
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
-          ? (request) => requestBatchToolConfirmation(request, child)
+          ? (request) => requestBatchToolConfirmation(
+            request,
+            child,
+            (interaction) => recordBrowserChatSubagentConfirmation(session.id, task.id, interaction),
+          )
           : undefined,
         onProgress: (step) => {
           if (!ownsTurn()) return;
           childSteps.set(step.index, step);
+          const steps = [...childSteps.values()];
           updateBrowserChatStoredSubagent(session.id, task.id, {
-            status: step.status === 'queued' ? 'running' : step.status,
-            steps: [...childSteps.values()].sort((left, right) => left.index - right.index),
+            status: step.status === 'blocked' ? 'blocked' : 'running',
+            currentAction: step.action || step.actual || '正在执行',
+            toolCount: steps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
           });
-          appendLog(session, `subagent:${task.id}:progress`, `${task.title}：${step.action || '正在执行'}`, {
-            details: fullLogDetails({ batchId, id: task.id, index, title: task.title, status: step.status, step }),
-            messageId: assistantMessageId,
-          });
-        },
-        onDebug: (event) => {
-          if (!ownsTurn()) return;
-          const eventDetails = unwrapLogDetails(event.details).value;
-          const outputCycle = browserChatAiOutputCycleFromDebugEvent({
-            details: event.details,
-            id: id('cycle'),
-            messageId: assistantMessageId,
-            phase: event.phase,
-            stepIndex: event.stepIndex,
-            subagentId: task.id,
-            batchId,
-          });
-          if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
-          if (event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object') {
-            const eventRecord = eventDetails && typeof eventDetails === 'object' && !Array.isArray(eventDetails)
-              ? eventDetails as Record<string, unknown>
-              : undefined;
-            const aiOutput = eventRecord?.aiOutput && typeof eventRecord.aiOutput === 'object' && !Array.isArray(eventRecord.aiOutput)
-              ? eventRecord.aiOutput as Record<string, unknown>
-              : undefined;
-            const responseText = textFromUnknown(aiOutput?.response ?? aiOutput?.text);
-            if (responseText.trim()) latestChildText = responseText;
-          }
-          const stored = registry.get(task.id);
-          if (stored) {
-            stored.events.push({ phase: event.phase, message: event.message, stepIndex: event.stepIndex, details: eventDetails });
-            stored.updatedAt = now();
-          }
-          appendLog(session, `subagent:${task.id}:${event.phase}`, event.message, {
-            elapsedMs: elapsedFromDetails(eventDetails),
-            details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
-              ? fullLogDetails({ batchId, id: task.id, index, title: task.title, childStepIndex: event.stepIndex, event: eventDetails })
-              : { batchId, id: task.id, index, title: task.title, childStepIndex: event.stepIndex, event: eventDetails },
-            messageId: assistantMessageId,
-            deferPersist: true,
-          });
+          persistAndNotify(session.id, { defer: true });
         },
       });
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
@@ -4063,87 +4070,39 @@ async function executeBrowserChatSubagentBatch(input: {
         textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 已完成，但没有返回额外文本。'),
       );
       const summary = summaryResult.summary;
-      const evidence = result.newSteps.map((step) => ({
-        index: step.index,
-        status: step.status,
-        action: step.action,
-        expected: step.expected,
-        actual: step.actual,
-        note: step.note,
-        tools: (step.tools || []).map((tool) => ({
-          name: tool.name,
-          input: tool.input,
-          reason: tool.reason,
-          ok: tool.ok,
-          recovered: tool.recovered,
-          transient: tool.transient,
-          result: tool.result,
-        })),
-      }));
-      appendLog(session, `subagent:${task.id}:done`, `子 Agent ${index + 1} 已完成：${task.title}`, {
-        details: fullLogDetails({
-          batchId,
-          id: task.id,
-          index,
-          title: task.title,
-          status: result.status,
-          ...summaryResult,
-          resumable: false,
-          steps: result.newSteps,
-          stepCount: result.newSteps.length,
-        }),
-        messageId: assistantMessageId,
-      });
+      const resultMessages = browserChatSubagentMessagesFromModelMessages(task.id, result.turnMessages);
+      const modelMessages = resultMessages.some((message) => message.role === 'user')
+        ? resultMessages
+        : [browserChatSubagentInputMessage(task.id, task.instruction), ...resultMessages];
+      const confirmationMessages = (registry.get(task.id)?.messages || [])
+        .filter((message) => message.id.includes(':message:confirmation:'));
+      const messages = limitBrowserChatSubagentMessages(task.id, [...modelMessages, ...confirmationMessages]);
       updateBrowserChatStoredSubagent(session.id, task.id, {
         status: result.status,
         ...summaryResult,
-        steps: result.newSteps,
+        currentAction: undefined,
+        toolCount: result.newSteps.reduce((count, step) => count + (step.tools || []).length, 0),
+        messages,
       });
       persistAndNotify(session.id);
-      return { id: task.id, title: task.title, task, status: result.status, summary, content: summary, evidence };
+      return { id: task.id, title: task.title, task, status: result.status, summary, content: summary };
     } catch (error) {
       if (!ownsTurn()) throw error;
       const message = userFacingErrorMessage(error);
       const steps = [...childSteps.values()].sort((left, right) => left.index - right.index);
       const partialSummaryResult = preserveBrowserChatSubagentSummary(
-        latestChildText || steps.map((step) => step.actual).filter(Boolean).join('\n\n'),
+        steps.map((step) => step.actual).filter(Boolean).join('\n\n'),
       );
       const partialContent = partialSummaryResult.summary;
-      const evidence = steps.map((step) => ({
-        index: step.index,
-        status: step.status,
-        action: step.action,
-        expected: step.expected,
-        actual: step.actual,
-        note: step.note,
-        tools: (step.tools || []).map((tool) => ({
-          name: tool.name,
-          input: tool.input,
-          reason: tool.reason,
-          ok: tool.ok,
-          recovered: tool.recovered,
-          transient: tool.transient,
-          result: tool.result,
-        })),
-      }));
-      appendLog(session, `subagent:${task.id}:failed`, `子 Agent ${index + 1} 失败，其他分支继续：${task.title}`, {
-        details: fullLogDetails({
-          batchId,
-          id: task.id,
-          index,
-          title: task.title,
-          status: 'failed',
-          error: message,
-          ...partialSummaryResult,
-          partial: Boolean(partialContent || evidence.length),
-          steps,
-        }),
-        messageId: assistantMessageId,
-      });
+      const storedMessages = registry.get(task.id)?.messages || [];
       updateBrowserChatStoredSubagent(session.id, task.id, {
         status: 'failed',
         ...partialSummaryResult,
-        steps,
+        currentAction: undefined,
+        toolCount: steps.reduce((count, step) => count + (step.tools || []).length, 0),
+        messages: partialContent
+          ? [...storedMessages, { id: `${task.id}:message:error`, role: 'assistant' as const, content: partialContent }]
+          : storedMessages,
         error: message,
       });
       persistAndNotify(session.id);
@@ -4153,10 +4112,9 @@ async function executeBrowserChatSubagentBatch(input: {
         task,
         status: 'failed' as const,
         error: message,
-        partial: Boolean(partialContent || evidence.length),
+        partial: Boolean(partialContent || steps.length),
         summary: partialContent,
         content: partialContent,
-        evidence,
       };
     } finally {
       await child.close().catch(() => undefined);
@@ -4169,7 +4127,7 @@ async function executeBrowserChatSubagentBatch(input: {
     if (settledResult.result) return settledResult.result;
     const error = userFacingErrorMessage(settledResult.error);
     void index;
-    updateBrowserChatStoredSubagent(session.id, task.id, { status: 'failed', error });
+    updateBrowserChatStoredSubagent(session.id, task.id, { status: 'failed', currentAction: undefined, error });
     return { id: task.id, title: task.title, task, status: 'failed' as const, error };
   });
   persistAndNotify(session.id);
@@ -4213,6 +4171,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     session,
     assistantMessageId,
     abortController.signal,
+    { recordLogs: false },
   );
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
@@ -4238,62 +4197,46 @@ async function resumeBlockedBrowserChatSubagent(input: {
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
-        ? (request) => requestSubagentToolConfirmation(request, binding.browser)
+        ? (request) => requestSubagentToolConfirmation(
+          request,
+          binding.browser,
+          (interaction) => recordBrowserChatSubagentConfirmation(session.id, binding.id, interaction),
+        )
         : undefined,
       onProgress: (step) => {
         if (!ownsTurn()) return;
         const nextSteps = [...binding.steps.filter((item) => item.index !== step.index), step].sort((left, right) => left.index - right.index);
         binding.steps = nextSteps;
         updateBrowserChatStoredSubagent(session.id, binding.id, {
-          status: step.status === 'queued' ? 'running' : step.status,
-          steps: nextSteps,
+          status: step.status === 'blocked' ? 'blocked' : 'running',
+          currentAction: step.action || step.actual || '正在继续',
+          toolCount: nextSteps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
         });
-        appendLog(session, `subagent:${binding.id}:progress`, `${binding.title}：${step.action || '正在继续'}`, {
-          details: { id: binding.id, title: binding.title, status: step.status, step },
-          messageId: assistantMessageId,
-          deferPersist: true,
-        });
-      },
-      onDebug: (event) => {
-        if (!ownsTurn()) return;
-        const outputCycle = browserChatAiOutputCycleFromDebugEvent({
-          details: event.details,
-          id: id('cycle'),
-          messageId: assistantMessageId,
-          phase: event.phase,
-          stepIndex: event.stepIndex,
-          subagentId: binding.id,
-        });
-        if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
-        const eventDetails = unwrapLogDetails(event.details).value;
-        appendLog(session, `subagent:${binding.id}:${event.phase}`, event.message, {
-          elapsedMs: elapsedFromDetails(eventDetails),
-          details: event.phase === 'ai:runtime:response' || event.phase === 'ai:runtime:object'
-            ? fullLogDetails({ id: binding.id, title: binding.title, childStepIndex: event.stepIndex, event: eventDetails })
-            : { id: binding.id, title: binding.title, childStepIndex: event.stepIndex, event: eventDetails },
-          messageId: assistantMessageId,
-          deferPersist: true,
-        });
+        persistAndNotify(session.id, { defer: true });
       },
     }));
     if (!ownsTurn()) return;
-    const summary = textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 续跑完成。');
-    appendLog(session, `subagent:${binding.id}:done`, `子 Agent 续跑完成：${binding.title}`, {
-      details: fullLogDetails({
-        id: binding.id,
-        title: binding.title,
-        status: result.status,
-        summary,
-        steps: result.newSteps,
-        stepCount: result.newSteps.length,
-      }),
-      messageId: assistantMessageId,
-    });
+    const summaryResult = preserveBrowserChatSubagentSummary(
+      textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 续跑完成。'),
+    );
+    const summary = summaryResult.summary;
     binding.steps = result.steps;
+    const stored = browserChatSubagentSessionRegistry(session.id).get(binding.id);
+    const resumedMessages = browserChatSubagentMessagesFromModelMessages(
+      binding.id,
+      result.turnMessages,
+      stored?.messages.length || 0,
+    );
     updateBrowserChatStoredSubagent(session.id, binding.id, {
       status: result.status,
-      summary,
-      steps: result.steps,
+      ...summaryResult,
+      currentAction: undefined,
+      toolCount: result.steps.reduce((count, step) => count + (step.tools || []).length, 0),
+      messages: limitBrowserChatSubagentMessages(
+        binding.id,
+        [...(stored?.messages || []), ...resumedMessages],
+        stored?.messages.length || 0,
+      ),
       error: undefined,
     });
     if (result.status === 'blocked') {
@@ -4334,9 +4277,10 @@ async function resumeBlockedBrowserChatSubagent(input: {
     await binding.browser.close().catch(() => undefined);
     const timestamp = now();
     const message = userFacingErrorMessage(error);
-    appendLog(session, `subagent:${binding.id}:failed`, `子 Agent 续跑失败：${binding.title}`, {
-      details: { id: binding.id, title: binding.title, status: 'failed', error: message },
-      messageId: assistantMessageId,
+    updateBrowserChatStoredSubagent(session.id, binding.id, {
+      status: 'failed',
+      currentAction: undefined,
+      error: message,
     });
     updateAssistantMessage(session, assistantMessageId, (assistant) => ({
       ...assistant,

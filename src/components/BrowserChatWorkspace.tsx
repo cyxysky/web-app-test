@@ -176,6 +176,7 @@ import type {
   BrowserChatAiOutputPart,
   BrowserChatAiOutputTool,
   BrowserChatAiOutputView,
+  BrowserChatSubagentMessage,
   BrowserChatSubagentRecord,
   ModelProvider,
   SkillRecord,
@@ -794,10 +795,6 @@ async function discardEmbeddedBrowserDataForSessions(
   for (const groupId of groupIds) {
     await bridge.discardGroup({ clearStorage: true, id: groupId }).catch(() => undefined);
   }
-}
-
-function aiOutputTextSetFromCycles(cycles: BrowserChatAiOutputCycle[]) {
-  return new Set(cycles.flatMap((cycle) => cycle.output.texts).map((text) => text.replace(/\s+/g, ' ').trim()));
 }
 
 function aiCycleToolKey(cycleId: string, toolIndex: number) {
@@ -2590,31 +2587,23 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   cardContent,
   className,
   isActive,
-  logs,
   onLoadSubagentRecords,
-  outputCycles,
   onResume,
-  onSelectTool,
   resuming,
   running,
   structuredSubagents,
   title,
-  toolInput,
   toolResult,
 }: {
   cardContent: ReactNode;
   className: string;
   isActive: boolean;
-  logs: BrowserChatLogRecord[];
   onLoadSubagentRecords?: () => void;
-  outputCycles?: BrowserChatAiOutputCycle[];
   onResume?: () => void | Promise<void>;
-  onSelectTool: (detail: BrowserChatToolDetail) => void;
   resuming?: boolean;
   running: boolean;
   structuredSubagents?: BrowserChatSubagentRecord[];
   title: string;
-  toolInput: unknown;
   toolResult?: unknown;
 }) {
   const [loadingRecords, setLoadingRecords] = useState(false);
@@ -2634,12 +2623,9 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   }, [loadingRecords, onLoadSubagentRecords, structuredSubagentsComplete]);
   const subagents = useMemo(
     () => bodyMounted
-      ? mergeBrowserChatSubagentViews(
-        browserChatSubagentsFromLogs(logs, toolInput, toolResult),
-        browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult),
-      )
+      ? browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult)
       : [],
-    [bodyMounted, logs, structuredSubagents, toolInput, toolResult],
+    [bodyMounted, structuredSubagents, toolResult],
   );
   const hasProblem = subagents.some((subagent) => subagent.status === 'failed' || subagent.status === 'blocked');
   useEffect(() => {
@@ -2668,11 +2654,9 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
         <BrowserChatSubagentList
           loadingRecords={loadingRecords}
           onResume={onResume}
-          onSelectTool={onSelectTool}
           resuming={resuming}
           running={running}
           subagents={subagents}
-          outputCycles={outputCycles}
         />
       ) : null}
     </details>
@@ -2682,7 +2666,6 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
 const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   logs,
   onLoadSubagentRecords,
-  outputCycles,
   onSelectTool,
   onResumeHumanVerification,
   onResolveToolConfirmation,
@@ -2698,7 +2681,6 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 }: {
   logs: BrowserChatLogRecord[];
   onLoadSubagentRecords?: () => void;
-  outputCycles?: BrowserChatAiOutputCycle[];
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResumeHumanVerification?: () => void | Promise<void>;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -2777,16 +2759,12 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 )}
                 className={stateClass}
                 isActive={isActiveTool}
-                logs={logs}
                 onLoadSubagentRecords={onLoadSubagentRecords}
-                outputCycles={outputCycles}
                 onResume={onResumeHumanVerification}
-                onSelectTool={onSelectTool}
                 resuming={resumingHumanVerification}
                 running={running}
                 structuredSubagents={structuredSubagents}
                 title={`${displayText} · ${translatedStatus}`}
-                toolInput={tool.input}
                 toolResult={tool.rawResult ?? tool.result}
               />
             ) : (
@@ -2816,7 +2794,6 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
 type BrowserChatAiCycleCommonProps = {
   logs: BrowserChatLogRecord[];
   onLoadSubagentRecords?: () => void;
-  outputCycles?: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
@@ -2833,7 +2810,6 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   cycle,
   logs,
   onLoadSubagentRecords,
-  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -2936,16 +2912,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                     cardContent={card}
                     className={stateClass}
                     isActive={isActive}
-                    logs={logs}
                     onLoadSubagentRecords={onLoadSubagentRecords}
-                    outputCycles={outputCycles}
                     onResume={onResumeHumanVerification}
-                    onSelectTool={onSelectTool}
                     resuming={resumingHumanVerification}
                     running={running}
                     structuredSubagents={structuredSubagents}
                     title={`${label}${meta ? ` - ${meta}` : ''}`}
-                    toolInput={toolDetail.tool.input}
                     toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
                   />
                 ) : (
@@ -2978,7 +2950,6 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   cycles,
   logs,
   onLoadSubagentRecords,
-  outputCycles,
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
@@ -3031,7 +3002,6 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
               cycle={cycle}
               logs={logs}
               onLoadSubagentRecords={onLoadSubagentRecords}
-              outputCycles={outputCycles}
               onResolveToolConfirmation={onResolveToolConfirmation}
               onResumeHumanVerification={onResumeHumanVerification}
               onSelectTool={onSelectTool}
@@ -3085,9 +3055,8 @@ type BrowserChatSubagentView = {
   summary?: string;
   resumable: boolean;
   toolCount: number;
-  logs: BrowserChatLogRecord[];
-  steps: StepExecutionResult[];
-  taskKey: string;
+  currentAction?: string;
+  messages: BrowserChatSubagentMessage[];
 };
 
 type BrowserChatSubagentPanelContextValue = {
@@ -3103,20 +3072,6 @@ function browserChatSubagentStatusPresentation(status: BrowserChatSubagentView['
   if (status === 'failed') return { className: 'status-failed', label: '执行失败' };
   if (status === 'blocked') return { className: 'status-blocked', label: '等待处理' };
   return { className: 'status-running', label: '正在执行' };
-}
-
-function browserChatSubagentTaskKey(value: unknown) {
-  const task = asRecord(value);
-  if (!task) return '';
-  const url = stringFromUnknown(task.url).trim().toLowerCase();
-  if (url) return `url:${url}`;
-  const title = stringFromUnknown(task.title);
-  const instruction = stringFromUnknown(task.instruction);
-  return `task:${title}\n${instruction}`.replace(/\s+/g, ' ').trim().toLowerCase();
-}
-
-function browserChatSubagentTaskListSignature(values: unknown[]) {
-  return values.map(browserChatSubagentTaskKey).filter(Boolean).sort().join('\u0000');
 }
 
 function browserChatSubagentToolResultRecord(value: unknown) {
@@ -3140,279 +3095,219 @@ function browserChatSubagentViewsFromRecords(records: BrowserChatSubagentRecord[
       summary: record.summary,
       resumable: record.resumable,
       toolCount: record.toolCount,
-      logs: [],
-      steps: record.steps,
-      taskKey: '',
+      currentAction: record.currentAction,
+      messages: record.messages || [],
     }));
 }
 
-function mergeBrowserChatSubagentViews(
-  fromLogs: BrowserChatSubagentView[],
-  fromRecords: BrowserChatSubagentView[],
-) {
-  const merged = new Map<string, BrowserChatSubagentView>(fromLogs.map((item) => [item.id, item]));
-  for (const record of fromRecords) {
-    const existing = merged.get(record.id);
-    if (!existing) {
-      merged.set(record.id, record);
-      continue;
-    }
-    const steps = existing.steps.length ? existing.steps : record.steps;
-    merged.set(record.id, {
-      ...record,
-      title: record.title || existing.title,
-      summary: record.summary || existing.summary,
-      resumable: record.resumable || existing.resumable,
-      toolCount: steps.reduce((sum, step) => sum + (step.tools || []).length, 0),
-      logs: existing.logs,
-      steps,
-      taskKey: existing.taskKey,
-    });
+type BrowserChatSubagentDisplayPart = {
+  id: string;
+  kind: 'text' | 'reasoning' | 'tool-call' | 'tool-result' | 'confirmation' | 'data';
+  name?: string;
+  text?: string;
+  value?: unknown;
+};
+
+function browserChatSubagentDisplayParts(message: BrowserChatSubagentMessage): BrowserChatSubagentDisplayPart[] {
+  if (typeof message.content === 'string') {
+    return [{ id: `${message.id}:text`, kind: 'text', text: message.content }];
   }
-  return [...merged.values()];
+  const values = Array.isArray(message.content) ? message.content : [message.content];
+  return values.flatMap<BrowserChatSubagentDisplayPart>((value, index) => {
+    const part = asRecord(value);
+    if (!part) return [{ id: `${message.id}:${index}`, kind: 'data' as const, value }];
+    const type = stringFromUnknown(part.type);
+    if (type === 'text' || type === 'reasoning') {
+      return [{
+        id: `${message.id}:${index}`,
+        kind: type,
+        text: stringFromUnknown(part.text),
+      } satisfies BrowserChatSubagentDisplayPart];
+    }
+    if (type === 'tool-call') {
+      return [{
+        id: `${message.id}:${index}`,
+        kind: 'tool-call',
+        name: stringFromUnknown(part.toolName) || 'tool',
+        value: part.input,
+      } satisfies BrowserChatSubagentDisplayPart];
+    }
+    if (type === 'tool-result') {
+      return [{
+        id: `${message.id}:${index}`,
+        kind: 'tool-result',
+        name: stringFromUnknown(part.toolName) || 'tool',
+        value: part.output ?? part.result,
+      } satisfies BrowserChatSubagentDisplayPart];
+    }
+    if (type === 'tool-confirmation') {
+      return [{
+        id: `${message.id}:${index}`,
+        kind: 'confirmation',
+        name: stringFromUnknown(part.toolName) || 'tool',
+        value: part,
+      } satisfies BrowserChatSubagentDisplayPart];
+    }
+    return [{ id: `${message.id}:${index}`, kind: 'data' as const, name: type || undefined, value }];
+  });
 }
 
-function browserChatNestedLogDetails(value: unknown) {
+function browserChatSubagentValueText(value: unknown) {
   if (typeof value === 'string') return value;
   try {
-    return JSON.stringify(value);
+    return JSON.stringify(value, null, 2);
   } catch {
-    return undefined;
+    return stringFromUnknown(value);
   }
 }
 
-function browserChatSubagentsFromLogs(logs: BrowserChatLogRecord[], toolInput: unknown, toolResult?: unknown) {
-  type MutableSubagentView = BrowserChatSubagentView & { stepMap: Map<number, StepExecutionResult>; taskIndex?: number };
-  const toolRecord = asRecord(toolInput);
-  const toolTasks = Array.isArray(toolRecord?.tasks) ? toolRecord.tasks : [];
-  const requestedSignature = browserChatSubagentTaskListSignature(toolTasks);
-  let batchId = browserChatSubagentBatchIdFromToolResult(toolResult);
-  let loggedTasks: unknown[] = [];
-  let matchedBatchStart = false;
-  for (let index = logs.length - 1; index >= 0; index -= 1) {
-    if (logs[index]?.phase !== 'subagents:start') continue;
-    const details = parseJsonObjectText(logs[index].details);
-    const candidateBatchId = stringFromUnknown(details?.batchId).trim();
-    if (batchId && candidateBatchId !== batchId) continue;
-    const requestedTasks = Array.isArray(details?.requestedTasks) ? details.requestedTasks : [];
-    if (!batchId && requestedSignature && requestedTasks.length
-      && browserChatSubagentTaskListSignature(requestedTasks) !== requestedSignature) continue;
-    if (!batchId && candidateBatchId) batchId = candidateBatchId;
-    if (Array.isArray(details?.tasks)) loggedTasks = details.tasks;
-    matchedBatchStart = true;
-    break;
-  }
-  const tasks = matchedBatchStart && loggedTasks.length ? loggedTasks : toolTasks;
-  const taskKeys = tasks.map(browserChatSubagentTaskKey).filter(Boolean);
-  const taskKeySet = new Set(taskKeys);
-  const useTaskKeyFilter = taskKeySet.size > 0;
-  const runs = new Map<string, MutableSubagentView>();
-  const replaceSteps = (current: MutableSubagentView, values: unknown[]) => {
-    current.stepMap.clear();
-    for (const value of values) {
-      const step = asRecord(value);
-      const stepIndex = Number(step?.index);
-      if (Number.isFinite(stepIndex)) current.stepMap.set(stepIndex, step as unknown as StepExecutionResult);
-    }
-  };
-  for (const log of logs) {
-    const match = /^subagent:([^:]+):(.+)$/.exec(log.phase);
-    if (!match) continue;
-    const [, id, phase] = match;
-    const details = parseJsonObjectText(log.details);
-    if (batchId && stringFromUnknown(details?.batchId).trim() !== batchId) continue;
-    const explicitTitle = stringFromUnknown(details?.title);
-    const eventTaskKey = browserChatSubagentTaskKey(details);
-    const detailIndex = Number(details?.index);
-    const taskIndex = Number.isInteger(detailIndex) && detailIndex >= 0 && (!taskKeys.length || detailIndex < taskKeys.length)
-      ? detailIndex
-      : undefined;
-    const indexedTaskKey = taskIndex === undefined ? '' : taskKeys[taskIndex];
-    const indexedTaskTitle = taskIndex === undefined ? '' : stringFromUnknown(asRecord(tasks[taskIndex])?.title);
-    const canUseIndexedTask = Boolean(indexedTaskKey) && (
-      !eventTaskKey
-      || eventTaskKey === 'task:'
-      || Boolean(explicitTitle && indexedTaskTitle && explicitTitle === indexedTaskTitle)
+const BrowserChatSubagentDataPart = memo(function BrowserChatSubagentDataPart({
+  kind,
+  name,
+  value,
+}: Pick<BrowserChatSubagentDisplayPart, 'kind' | 'name' | 'value'>) {
+  const { t } = useI18n();
+  const [bodyMounted, setBodyMounted] = useState(false);
+  const [screenshotOpen, setScreenshotOpen] = useState(false);
+  const screenshotTitleId = useId();
+  useEscapeDismiss(screenshotOpen, () => setScreenshotOpen(false));
+  const confirmation = kind === 'confirmation' ? asRecord(value) : undefined;
+  if (confirmation) {
+    const screenshotUrl = stringFromUnknown(confirmation.screenshotUrl).trim();
+    const prompt = stringFromUnknown(confirmation.reason || confirmation.prompt).trim();
+    const decision = stringFromUnknown(confirmation.decision);
+    const confirmed = decision === 'confirmed';
+    return (
+      <section className="browser-chat-subagent-confirmation">
+        <div className="browser-chat-subagent-confirmation-heading">
+          <span aria-hidden="true"><BrowserChatToolIcon name={name || 'tool'} /></span>
+          <strong>{browserChatToolLabel(name || 'tool', t)}</strong>
+          <span className={confirmed ? 'is-confirmed' : 'is-cancelled'}>
+            {t(confirmed ? '用户已确认' : '用户已取消')}
+          </span>
+        </div>
+        {prompt ? <p>{prompt}</p> : null}
+        <div className="browser-chat-subagent-confirmation-actions">
+          {screenshotUrl ? (
+            <button className="browser-chat-tool-screenshot" onClick={() => setScreenshotOpen(true)} type="button">
+              <ScanSearch size={14} />
+              {t('查看确认时页面')}
+            </button>
+          ) : null}
+          {confirmation.input !== undefined ? (
+            <details onToggle={(event) => {
+              if ((event.currentTarget as HTMLDetailsElement).open) setBodyMounted(true);
+            }}>
+              <summary>{t('查看请求内容')}<ChevronDown aria-hidden="true" size={13} /></summary>
+              {bodyMounted ? <pre>{browserChatSubagentValueText(confirmation.input)}</pre> : null}
+            </details>
+          ) : null}
+        </div>
+        {screenshotOpen && screenshotUrl ? createPortal((
+          <div className="ui-modal-overlay browser-chat-confirmation-screenshot-overlay" onMouseDown={() => setScreenshotOpen(false)}>
+            <section
+              aria-labelledby={screenshotTitleId}
+              aria-modal="true"
+              className="ui-modal browser-chat-confirmation-screenshot-dialog"
+              onMouseDown={(event) => event.stopPropagation()}
+              role="dialog"
+            >
+              <header className="ui-modal-header">
+                <div className="ui-modal-heading ui-modal-heading--with-icon">
+                  <span aria-hidden="true" className="ui-modal-heading-icon"><ScanSearch size={18} /></span>
+                  <div className="ui-modal-heading-copy">
+                    <h2 className="ui-modal-title" id={screenshotTitleId}>{t('用户确认时的页面')}</h2>
+                    <p className="ui-modal-subtitle">{t('执行该子 Agent 工具前自动截取的浏览器可视区域')}</p>
+                  </div>
+                </div>
+                <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" onClick={() => setScreenshotOpen(false)} type="button">
+                  <X size={16} />
+                </button>
+              </header>
+              <div className="ui-modal-body browser-chat-confirmation-screenshot-body">
+                <img alt={t('用户确认时的页面截图')} src={screenshotUrl} />
+              </div>
+            </section>
+          </div>
+        ), document.body) : null}
+      </section>
     );
-    const resolvedTaskKey = taskKeySet.has(eventTaskKey)
-      ? eventTaskKey
-      : canUseIndexedTask ? indexedTaskKey : eventTaskKey;
-    const current = runs.get(id) || {
-      id,
-      title: explicitTitle || `子 Agent ${runs.size + 1}`,
-      status: 'running' as const,
-      toolCount: 0,
-      resumable: false,
-      logs: [],
-      steps: [],
-      stepMap: new Map<number, StepExecutionResult>(),
-      taskKey: resolvedTaskKey,
-      taskIndex,
-    };
-    if (explicitTitle) current.title = explicitTitle;
-    if (current.taskIndex === undefined && taskIndex !== undefined) current.taskIndex = taskIndex;
-    if (!current.taskKey && indexedTaskKey) current.taskKey = indexedTaskKey;
-    if (phase === 'start') {
-      if (resolvedTaskKey && resolvedTaskKey !== 'task:') current.taskKey = resolvedTaskKey;
-    }
-    if (phase === 'done') {
-      const status = stringFromUnknown(details?.status);
-      current.status = status === 'blocked' || status === 'failed' ? status : 'passed';
-      current.summary = stringFromUnknown(details?.summary);
-      current.resumable = details?.resumable === true;
-      if (Array.isArray(details?.steps)) replaceSteps(current, details.steps);
-    } else if (phase === 'failed') {
-      current.status = 'failed';
-      current.summary = stringFromUnknown(details?.summary || details?.error);
-      if (Array.isArray(details?.steps)) replaceSteps(current, details.steps);
-    } else if (phase === 'progress') {
-      const step = asRecord(details?.step);
-      const stepIndex = Number(step?.index);
-      if (Number.isFinite(stepIndex)) current.stepMap.set(stepIndex, step as unknown as StepExecutionResult);
-    }
-    if (details && Object.prototype.hasOwnProperty.call(details, 'event')) {
-      const childStepIndex = Number(details.childStepIndex);
-      current.logs.push({
-        ...log,
-        phase,
-        stepIndex: Number.isFinite(childStepIndex) ? childStepIndex : undefined,
-        details: browserChatNestedLogDetails(details.event),
-      });
-    }
-    current.steps = [...current.stepMap.values()].sort((left, right) => left.index - right.index);
-    current.toolCount = current.steps.reduce((sum, step) => sum + (step.tools || []).length, 0);
-    runs.set(id, current);
   }
-  const loggedViews = [...runs.values()]
-    .filter((item) => !useTaskKeyFilter || taskKeySet.has(item.taskKey) || item.taskIndex !== undefined)
-    .sort((left, right) => (
-      (taskKeys.indexOf(left.taskKey) >= 0 ? taskKeys.indexOf(left.taskKey) : left.taskIndex ?? Number.MAX_SAFE_INTEGER)
-      - (taskKeys.indexOf(right.taskKey) >= 0 ? taskKeys.indexOf(right.taskKey) : right.taskIndex ?? Number.MAX_SAFE_INTEGER)
-    ));
-  const toolResultRecord = browserChatSubagentToolResultRecord(toolResult);
-  const resultItems = Array.isArray(toolResultRecord?.results) ? toolResultRecord.results : toolResultRecord?.subagents;
-  if (!Array.isArray(resultItems)) return loggedViews;
-  const merged = new Map<string, BrowserChatSubagentView>(loggedViews.map((item) => [item.id, item]));
-  resultItems.forEach((value, index) => {
-    const result = asRecord(value);
-    if (!result) return;
-    const id = stringFromUnknown(result.uuid || result.id).trim() || `result-${batchId || 'subagent'}-${index}`;
-    const statusValue = stringFromUnknown(result.status);
-    const status: BrowserChatSubagentView['status'] = statusValue === 'failed' || statusValue === 'blocked'
-      ? statusValue
-      : 'passed';
-    const evidence = Array.isArray(result.evidence)
-      ? result.evidence.flatMap((item) => {
-        const step = asRecord(item);
-        return Number.isFinite(Number(step?.index)) ? [step as unknown as StepExecutionResult] : [];
-      })
-      : [];
-    const existing = merged.get(id);
-    const resultTaskKey = browserChatSubagentTaskKey(result.task);
-    const taskKey = resultTaskKey || taskKeys[index] || existing?.taskKey || '';
-    const steps = evidence.length ? evidence : existing?.steps || [];
-    merged.set(id, {
-      id,
-      title: stringFromUnknown(result.title).trim() || existing?.title || `子 Agent ${index + 1}`,
-      status,
-      summary: stringFromUnknown(result.content || result.summary || result.error) || existing?.summary,
-      resumable: existing?.resumable || false,
-      toolCount: steps.reduce((sum, step) => sum + (step.tools || []).length, 0),
-      logs: existing?.logs || [],
-      steps,
-      taskKey,
-    });
-  });
-  return [...merged.values()].sort((left, right) => (
-    (taskKeys.indexOf(left.taskKey) >= 0 ? taskKeys.indexOf(left.taskKey) : Number.MAX_SAFE_INTEGER)
-    - (taskKeys.indexOf(right.taskKey) >= 0 ? taskKeys.indexOf(right.taskKey) : Number.MAX_SAFE_INTEGER)
-  ));
-}
+  const isResult = kind === 'tool-result';
+  const label = kind === 'tool-call'
+    ? t('调用 {name}', { name: browserChatToolLabel(name || 'tool', t) })
+    : isResult ? t('{name} 返回结果', { name: browserChatToolLabel(name || 'tool', t) }) : t('消息数据');
+  return (
+    <details
+      className={`browser-chat-subagent-message-data${isResult ? ' is-result' : ''}`}
+      onToggle={(event) => {
+        if ((event.currentTarget as HTMLDetailsElement).open) setBodyMounted(true);
+      }}
+    >
+      <summary>
+        <Braces aria-hidden="true" size={14} />
+        <span>{label}</span>
+        <ChevronDown aria-hidden="true" size={13} />
+      </summary>
+      {bodyMounted ? <pre>{browserChatSubagentValueText(value)}</pre> : null}
+    </details>
+  );
+});
+
+const BrowserChatSubagentMessageItem = memo(function BrowserChatSubagentMessageItem({
+  message,
+}: {
+  message: BrowserChatSubagentMessage;
+}) {
+  const { t } = useI18n();
+  const parts = useMemo(() => browserChatSubagentDisplayParts(message), [message]);
+  const roleLabel = message.role === 'user' ? t('任务') : message.role === 'assistant' ? t('子 Agent') : t('工具');
+  return (
+    <article className={`browser-chat-subagent-message is-${message.role}`}>
+      <header>{roleLabel}</header>
+      <div className="browser-chat-subagent-message-content">
+        {parts.map((part) => part.kind === 'text' || part.kind === 'reasoning' ? (
+          part.text ? (
+            <div className={part.kind === 'reasoning' ? 'is-reasoning' : undefined} key={part.id}>
+              <BrowserChatMarkdown markdown={part.text} />
+            </div>
+          ) : null
+        ) : (
+          <BrowserChatSubagentDataPart key={part.id} kind={part.kind} name={part.name} value={part.value} />
+        ))}
+      </div>
+    </article>
+  );
+});
 
 const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
   onResume,
-  onSelectTool,
-  outputCycles,
   resuming,
   running,
   subagent,
 }: {
   onResume?: () => void | Promise<void>;
-  onSelectTool: (detail: BrowserChatToolDetail) => void;
-  outputCycles?: BrowserChatAiOutputCycle[];
   resuming?: boolean;
   running: boolean;
   subagent: BrowserChatSubagentView;
 }) {
   const { t } = useI18n();
-  const cycles = useMemo(
-    () => (outputCycles || []).filter((cycle) => cycle.subagentId === subagent.id),
-    [outputCycles, subagent.id],
-  );
-  const toolDetails = useMemo(() => buildAiCycleToolDetailMap(cycles, subagent.steps), [cycles, subagent.steps]);
-  const remainingSteps = useMemo(() => {
-    const representedTools = new Set([...toolDetails.values()].map((detail) => `${detail.stepIndex}:${detail.toolIndex}`));
-    return subagent.steps.flatMap((step) => {
-      const visibleToolIndexes = (step.tools || []).flatMap((_tool, toolIndex) => (
-        representedTools.has(`${step.index}:${toolIndex}`) ? [] : [toolIndex]
-      ));
-      return visibleToolIndexes.length ? [{ step, visibleToolIndexes }] : [];
-    });
-  }, [subagent.steps, toolDetails]);
-  const renderedText = useMemo(() => aiOutputTextSetFromCycles(cycles), [cycles]);
-  const normalizedSummary = subagent.summary?.replace(/\s+/g, ' ').trim();
-  const hasDetails = cycles.length > 0 || remainingSteps.length > 0 || Boolean(subagent.summary);
+  const hasAssistantText = useMemo(() => subagent.messages.some((message) => (
+    message.role === 'assistant'
+    && browserChatSubagentDisplayParts(message).some((part) => part.kind === 'text' && Boolean(part.text?.trim()))
+  )), [subagent.messages]);
+  const hasDetails = subagent.messages.length > 0 || Boolean(subagent.summary);
 
   return (
     <div className="browser-chat-subagent-detail">
-      {cycles.map((cycle) => (
-        <div className="browser-chat-executed-entry" key={cycle.id}>
-          <BrowserChatAiCycleLine
-            cycle={cycle}
-            logs={subagent.logs}
-            onSelectTool={onSelectTool}
-            resumingHumanVerification={resuming}
-            running={subagent.status === 'running'}
-            toolDetails={toolDetails}
-          />
+      {subagent.messages.map((message) => <BrowserChatSubagentMessageItem key={message.id} message={message} />)}
+      {subagent.status === 'running' && subagent.currentAction ? (
+        <div className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+          <Loader2 className="spin" size={14} />
+          <span>{subagent.currentAction}</span>
         </div>
-      ))}
-      {remainingSteps.flatMap(({ step, visibleToolIndexes }) => visibleToolIndexes.flatMap((toolIndex) => {
-        const tool = step.tools?.[toolIndex];
-        if (!tool) return [];
-        const cycleId = `subagent-step-${subagent.id}-${step.index}-${toolIndex}`;
-        const reason = tool.reason?.trim() || '';
-        const cycle: BrowserChatAiOutputCycle = {
-          id: cycleId,
-          stepIndex: step.index,
-          subagentId: subagent.id,
-          output: {
-            parts: reason
-              ? [{ index: 0, kind: 'text' }, { index: 0, kind: 'tool' }]
-              : [{ index: 0, kind: 'tool' }],
-            reasoning: [],
-            texts: reason ? [reason] : [],
-            tools: [{ id: tool.id || cycleId, input: tool.input, name: tool.name }],
-          },
-        };
-        const syntheticToolDetails = new Map<string, BrowserChatToolDetail>([[
-          aiCycleToolKey(cycleId, 0),
-          { step, stepIndex: step.index, tool, toolIndex },
-        ]]);
-        return (
-          <div className="browser-chat-executed-entry" key={cycleId}>
-            <BrowserChatAiCycleLine
-              cycle={cycle}
-              logs={subagent.logs}
-              onSelectTool={onSelectTool}
-              resumingHumanVerification={resuming}
-              running={subagent.status === 'running' && step.status === 'running'}
-              toolDetails={syntheticToolDetails}
-            />
-          </div>
-        );
-      }))}
-      {subagent.summary && (!normalizedSummary || !renderedText.has(normalizedSummary)) ? (
+      ) : null}
+      {subagent.summary && !hasAssistantText ? (
         <div className="browser-chat-subagent-summary">
           <BrowserChatMarkdown markdown={subagent.summary} />
         </div>
@@ -3439,8 +3334,6 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
   loadingRecords,
   onClose,
   onResume,
-  onSelectTool,
-  outputCycles,
   resuming,
   running,
   subagent,
@@ -3448,8 +3341,6 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
   loadingRecords?: boolean;
   onClose: () => void;
   onResume?: () => void | Promise<void>;
-  onSelectTool: (detail: BrowserChatToolDetail) => void;
-  outputCycles?: BrowserChatAiOutputCycle[];
   resuming?: boolean;
   running: boolean;
   subagent: BrowserChatSubagentView;
@@ -3477,7 +3368,7 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
             <div>
               <h2 id={titleId}>{subagent.title}</h2>
               <p>
-                {loadingRecords ? t('正在加载工具记录') : t(status.label)}
+                {loadingRecords ? t('正在加载消息') : t(status.label)}
                 {' · '}
                 {t('{count} 个工具', { count: subagent.toolCount })}
               </p>
@@ -3490,8 +3381,6 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
         <div className="browser-chat-subagent-panel-body">
           <BrowserChatSubagentDetail
             onResume={onResume}
-            onSelectTool={onSelectTool}
-            outputCycles={outputCycles}
             resuming={resuming}
             running={running}
             subagent={subagent}
@@ -3504,17 +3393,13 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
 
 const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   loadingRecords,
-  outputCycles,
   onResume,
-  onSelectTool,
   resuming,
   running,
   subagents = [],
 }: {
   loadingRecords?: boolean;
-  outputCycles?: BrowserChatAiOutputCycle[];
   onResume?: () => void | Promise<void>;
-  onSelectTool: (detail: BrowserChatToolDetail) => void;
   resuming?: boolean;
   running: boolean;
   subagents?: BrowserChatSubagentView[];
@@ -3530,7 +3415,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
       {loadingRecords && !subagents.length ? (
         <div className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
           <Loader2 className="spin" size={14} />
-          <span>{t('正在加载子 Agent 工具记录')}</span>
+          <span>{t('正在加载子 Agent 消息')}</span>
         </div>
       ) : null}
       {subagents.map((subagent) => {
@@ -3553,7 +3438,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
             <span className="browser-chat-subagent-row-copy">
               <span className="browser-chat-subagent-row-title">{subagent.title}</span>
               <span className="browser-chat-subagent-row-meta">
-                {loadingRecords ? t('正在加载工具记录') : t(status.label)}
+                {loadingRecords ? t('正在加载消息') : t(status.label)}
                 {' · '}
                 {t('{count} 个工具', { count: subagent.toolCount })}
               </span>
@@ -3567,8 +3452,6 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
           loadingRecords={loadingRecords}
           onClose={panel.closeSubagent}
           onResume={onResume}
-          onSelectTool={onSelectTool}
-          outputCycles={outputCycles}
           resuming={resuming}
           running={running}
           subagent={selectedSubagent}
@@ -3939,7 +3822,6 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     onResolveToolConfirmation,
     onResumeHumanVerification,
     onSelectTool,
-    outputCycles,
     pendingToolConfirmation,
     resolvingConfirmationAction,
     resolvingConfirmationId,
@@ -3982,7 +3864,6 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
                   <BrowserChatStepToolCards
                     logs={logs}
                     onLoadSubagentRecords={onLoadSubagentRecords}
-                    outputCycles={outputCycles}
                     onResolveToolConfirmation={onResolveToolConfirmation}
                     onResumeHumanVerification={onResumeHumanVerification}
                     onSelectTool={onSelectTool}
@@ -8149,8 +8030,24 @@ export function BrowserChatWorkspace({
     const sessionId = activeSessionIdRef.current;
     const key = `${sessionId || ''}\u0000${messageId}`;
     if (!sessionId) return;
+    const isSubagentRecordRequest = Object.prototype.hasOwnProperty.call(options, 'historicalSubagents');
     if (options.historicalSubagents) {
       if (!beginHistoricalSubagentQuery(loadedHistoricalSubagentKeysRef.current, key)) return;
+    }
+    if (isSubagentRecordRequest) {
+      return (async () => {
+        try {
+          const params = new URLSearchParams({ messageId, subagentsOnly: 'true' });
+          const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/logs?${params}`), { cache: 'no-store' });
+          const data = await readApiJson<{ subagents?: BrowserChatSubagentRecord[] }>(response, '加载子 Agent 消息失败');
+          if (!Array.isArray(data.subagents)) return;
+          setSession((current) => current?.id === sessionId
+            ? mergeBrowserChatHistoryChunk(current, { subagents: data.subagents })
+            : current);
+        } catch {
+          // The conversation remains usable if structured child-Agent messages are temporarily unavailable.
+        }
+      })();
     }
     if (loadedLogMessageKeysRef.current.has(key)) return;
     loadedLogMessageKeysRef.current.add(key);

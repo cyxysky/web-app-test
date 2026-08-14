@@ -209,6 +209,12 @@ export type BrowserChatAiOutputCycle = {
   batchId?: string;
 };
 
+export type BrowserChatSubagentMessage = {
+  id: string;
+  role: 'user' | 'assistant' | 'tool';
+  content: unknown;
+};
+
 export type BrowserChatSubagentRecord = {
   id: string;
   messageId: string;
@@ -219,7 +225,8 @@ export type BrowserChatSubagentRecord = {
   summary?: string;
   resumable: boolean;
   toolCount: number;
-  steps: StepExecutionResult[];
+  currentAction?: string;
+  messages: BrowserChatSubagentMessage[];
   error?: string;
 };
 

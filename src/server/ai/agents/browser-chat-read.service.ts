@@ -105,10 +105,19 @@ export function readBrowserChatSessionHistoryPage(
 export function readBrowserChatSessionLogs(
   sessionId: string,
   userId?: string | number,
-  input: { cursor?: string; limit?: number; messageId?: string } = {},
+  input: { cursor?: string; limit?: number; messageId?: string; subagentsOnly?: boolean } = {},
 ) {
   const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
+  if (input.subagentsOnly) {
+    return {
+      logs: [],
+      subagents: input.messageId
+        ? (session.subagents || []).filter((subagent) => subagent.messageId === input.messageId)
+        : [],
+      history: { hasMore: false },
+    };
+  }
   const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, input);
   return {
     logs: page.items,
