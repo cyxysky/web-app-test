@@ -9,6 +9,7 @@ export type BrowserChatLogSummary = {
   ai: number;
   context: number;
   screenshot: number;
+  tool: number;
   total: number;
 };
 
@@ -34,6 +35,10 @@ function runtimeLogTimings(log: BrowserChatLogRecordLike) {
   return asRecord(asRecord(payload?.aiOutput)?.timings);
 }
 
+function phaseMatches(log: BrowserChatLogRecordLike, phase: string) {
+  return log.phase === phase || log.phase.endsWith(`:${phase}`);
+}
+
 export function summarizeBrowserChatExecutionTotals(logs: BrowserChatLogRecordLike[]): BrowserChatExecutionTotals {
   return logs.reduce<BrowserChatExecutionTotals>((summary, log) => {
     const timings = runtimeLogTimings(log);
@@ -51,33 +56,33 @@ export function summarizeBrowserChatExecutionTotals(logs: BrowserChatLogRecordLi
 }
 
 export function isBrowserChatAiInputOutputLog(log: BrowserChatLogRecordLike) {
-  return log.phase === 'ai:runtime:request'
-    || log.phase === 'ai:runtime:response'
-    || log.phase === 'ai:runtime:object'
-    || log.phase === 'conversation:context:request'
-    || log.phase === 'conversation:context:response';
+  return phaseMatches(log, 'ai:runtime:request')
+    || phaseMatches(log, 'ai:runtime:response')
+    || phaseMatches(log, 'ai:runtime:object')
+    || phaseMatches(log, 'conversation:context:request')
+    || phaseMatches(log, 'conversation:context:response');
 }
 
 export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
-  return log.phase === 'ai:runtime:attempt-failed'
-    || log.phase === 'ai:runtime:retry'
-    || log.phase === 'ai:runtime:retry-exhausted'
-    || log.phase === 'ai:runtime:retry-skipped'
-    || log.phase === 'ai:runtime:recoverable-error'
-    || log.phase === 'chat:runtime:request-aborted'
-    || log.phase === 'target:plan:validation:retry'
-    || log.phase === 'target:plan:validation:error'
-    || log.phase === 'target:plan:error';
+  return phaseMatches(log, 'ai:runtime:attempt-failed')
+    || phaseMatches(log, 'ai:runtime:retry')
+    || phaseMatches(log, 'ai:runtime:retry-exhausted')
+    || phaseMatches(log, 'ai:runtime:retry-skipped')
+    || phaseMatches(log, 'ai:runtime:recoverable-error')
+    || phaseMatches(log, 'chat:runtime:request-aborted')
+    || phaseMatches(log, 'target:plan:validation:retry')
+    || phaseMatches(log, 'target:plan:validation:error')
+    || phaseMatches(log, 'target:plan:error');
 }
 
 export function isBrowserChatAiAttemptLog(log: BrowserChatLogRecordLike) {
-  return log.phase === 'ai:runtime:attempt'
-    || log.phase === 'ai:runtime:attempt-succeeded'
+  return phaseMatches(log, 'ai:runtime:attempt')
+    || phaseMatches(log, 'ai:runtime:attempt-succeeded')
     || isBrowserChatAiFailureLog(log);
 }
 
 export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
-  return log.phase.startsWith('target:plan:');
+  return log.phase.startsWith('target:plan:') || log.phase.includes(':target:plan:');
 }
 
 export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
@@ -87,20 +92,26 @@ export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
 }
 
 export function isBrowserChatContextCompressionLog(log: BrowserChatLogRecordLike) {
-  return log.phase === 'ai:context-segmented'
-    || log.phase === 'conversation:context:request'
-    || log.phase === 'conversation:context:response'
-    || log.phase === 'conversation:context:error';
+  return phaseMatches(log, 'ai:context-segmented')
+    || phaseMatches(log, 'conversation:context:request')
+    || phaseMatches(log, 'conversation:context:response')
+    || phaseMatches(log, 'conversation:context:error');
+}
+
+export function isBrowserChatToolLifecycleLog(log: BrowserChatLogRecordLike) {
+  return log.phase === 'ai:tool' || log.phase.endsWith(':ai:tool');
 }
 
 export function isBrowserChatScreenshotPerformanceLog(log: BrowserChatLogRecordLike) {
   const phase = log.phase.toLowerCase();
   return phase.startsWith('browser:screenshot:')
-    || (phase.startsWith('perf:') && phase.includes('screenshot'));
+    || phase.includes(':browser:screenshot:')
+    || ((phase.startsWith('perf:') || phase.includes(':perf:')) && phase.includes('screenshot'));
 }
 
 export function isBrowserChatVisibleExecutionLog(log: BrowserChatLogRecordLike) {
   return isBrowserChatAiLog(log)
+    || isBrowserChatToolLifecycleLog(log)
     || isBrowserChatContextCompressionLog(log)
     || isBrowserChatScreenshotPerformanceLog(log);
 }
@@ -114,6 +125,7 @@ export function summarizeBrowserChatLogs(logs: BrowserChatLogRecordLike[]): Brow
     ai: summary.ai + (isBrowserChatAiLog(log) ? 1 : 0),
     context: summary.context + (isBrowserChatContextCompressionLog(log) ? 1 : 0),
     screenshot: summary.screenshot + (isBrowserChatScreenshotPerformanceLog(log) ? 1 : 0),
+    tool: summary.tool + (isBrowserChatToolLifecycleLog(log) ? 1 : 0),
     total: summary.total + 1,
-  }), { ai: 0, context: 0, screenshot: 0, total: 0 });
+  }), { ai: 0, context: 0, screenshot: 0, tool: 0, total: 0 });
 }

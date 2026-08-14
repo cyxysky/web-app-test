@@ -3,28 +3,36 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { Document, ImageRun, Packer, Paragraph, TextRun } from 'docx';
-import PDFDocument from 'pdfkit';
-import sharp from 'sharp';
+import {
+  resolveLibreOfficeExecutable,
+  resolveLibreOfficeOfficeWorker,
+  resolveLibreOfficePythonExecutable,
+} from '@/server/files/libreoffice';
+import { generateFileBuffer } from './document-artifact-generators';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 
-function pdfBuffer() {
-  return new Promise<Buffer>((resolve, reject) => {
-    const document = new PDFDocument({ autoFirstPage: false });
-    const chunks: Buffer[] = [];
-    document.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-    document.on('end', () => resolve(Buffer.concat(chunks)));
-    document.on('error', reject);
-    document.addPage().fontSize(24).text('Attachment visual page one');
-    document.addPage().fontSize(24).text('Attachment visual page two');
-    document.end();
-  });
+async function officeGenerationAvailable() {
+  const executable = await resolveLibreOfficeExecutable();
+  return Boolean(
+    executable
+    && await resolveLibreOfficePythonExecutable(executable)
+    && await resolveLibreOfficeOfficeWorker()
+  );
 }
 
-test('renders selected PDF pages into model-ready PNG files', async () => {
+test('renders selected PDF pages into model-ready PNG files', async (context) => {
+  if (!await officeGenerationAvailable()) {
+    context.skip('LibreOffice UNO generation is not available in this environment.');
+    return;
+  }
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-attachment-visual-'));
   const sourcePath = path.join(root, 'source.pdf');
-  const buffer = await pdfBuffer();
+  const generated = await generateFileBuffer({
+    fileName: 'source.pdf',
+    title: 'Attachment visual pages',
+    content: Array.from({ length: 140 }, (_, index) => `Paragraph ${index + 1}: enough content to verify exact PDF page selection.`).join('\n\n'),
+  });
+  const buffer = generated.buffer;
   await writeFile(sourcePath, buffer);
 
   try {
@@ -38,7 +46,7 @@ test('renders selected PDF pages into model-ready PNG files', async () => {
     });
 
     assert.equal(result.renderer, 'pdf');
-    assert.equal(result.pageCount, 2);
+    assert.ok((result.pageCount ?? 0) >= 2);
     assert.deepEqual(result.renderedPages, [2]);
     assert.equal(result.imagePaths.length, 1);
     const image = await readFile(result.imagePaths[0]);
@@ -48,20 +56,19 @@ test('renders selected PDF pages into model-ready PNG files', async () => {
   }
 });
 
-test('renders DOCX text and embedded images into visual pages without detaching the source', async () => {
+test('renders a LibreOffice-generated DOCX into visual pages without detaching the source', async (context) => {
+  if (!await officeGenerationAvailable()) {
+    context.skip('LibreOffice UNO generation is not available in this environment.');
+    return;
+  }
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-docx-visual-'));
   const sourcePath = path.join(root, 'template.docx');
-  const logo = await sharp({
-    create: { width: 80, height: 40, channels: 4, background: { r: 28, g: 125, b: 86, alpha: 1 } },
-  }).png().toBuffer();
-  const buffer = await Packer.toBuffer(new Document({
-    sections: [{
-      children: [
-        new Paragraph({ children: [new TextRun({ text: '研发部员工年中工作总结报告', bold: true })] }),
-        new Paragraph({ children: [new ImageRun({ data: logo, transformation: { width: 80, height: 40 }, type: 'png' })] }),
-      ],
-    }],
-  }));
+  const generated = await generateFileBuffer({
+    fileName: 'template.docx',
+    title: '研发部员工年中工作总结报告',
+    content: '# 工作概览\n\n本年度研发工作按计划推进。',
+  });
+  const buffer = generated.buffer;
   await writeFile(sourcePath, buffer);
 
   try {

@@ -12,7 +12,11 @@ import {
 import { modelProviderDefinition } from '@/config/settings';
 import { getSqliteDatabase } from '@/server/storage/sqlite-database';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
-import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
+import {
+  resolveLibreOfficeExecutable,
+  resolveLibreOfficeOfficeWorker,
+  resolveLibreOfficePythonExecutable,
+} from '@/server/files/libreoffice';
 import { store } from '@/server/db/store';
 
 type OnboardingRow = {
@@ -163,6 +167,11 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const visionReady = screenshotSetting === 'true'
     || (screenshotSetting !== 'false' && provider !== 'deepseek' && !selectedModel.startsWith('deepseek'));
   const libreOfficeExecutable = await resolveLibreOfficeExecutable();
+  const libreOfficePython = libreOfficeExecutable
+    ? await resolveLibreOfficePythonExecutable(libreOfficeExecutable)
+    : undefined;
+  const libreOfficeWorker = await resolveLibreOfficeOfficeWorker();
+  const libreOfficeReady = Boolean(libreOfficeExecutable && libreOfficePython && libreOfficeWorker);
   let browserReady = false;
   try {
     browserReady = existsSync(chromium.executablePath());
@@ -175,8 +184,12 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
       ready: browserReady,
     },
     libreOffice: {
-      detail: libreOfficeExecutable ? 'LibreOffice 可用于 Office 预览与格式转换' : '未找到 LibreOffice，Office 预览和旧格式导出会受限',
-      ready: Boolean(libreOfficeExecutable),
+      detail: libreOfficeReady
+        ? 'LibreOffice UNO 可用于 Office 创建、排版、预览与格式转换'
+        : libreOfficeExecutable
+          ? 'LibreOffice 已安装，但 Python/PyUNO Worker 不可用，Office 文件生成会受限'
+          : '未找到 LibreOffice，Office 创建、预览与格式转换不可用',
+      ready: libreOfficeReady,
     },
     model: {
       detail: modelReady ? `${provider} / ${providerSettings?.model}` : '尚未完成可用模型配置',

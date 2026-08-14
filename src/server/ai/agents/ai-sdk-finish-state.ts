@@ -23,7 +23,6 @@ export function aiSdkToolResultRequiresContinuation(input: {
   const toolCallCount = Math.max(0, input.toolCallCount || 0);
   const toolResultCount = Math.max(0, input.toolResultCount || 0);
   return normalizedFinishReason(input.finishReason) === 'other'
-    && !String(input.responseText || '').trim()
     && toolCallCount > 0
     && toolResultCount >= toolCallCount;
 }

@@ -978,13 +978,8 @@
   width: min(92vw, 620px);
 }
 
-.login-account-modal-header {
-  grid-template-columns: 34px minmax(0, 1fr) auto;
-}
-
 .login-account-modal-icon {
   align-items: center;
-  align-self: start;
   border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
   border-radius: 10px;
   color: var(--accent-strong);

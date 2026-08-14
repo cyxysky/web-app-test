@@ -64,6 +64,52 @@ test('appends only missing current-turn Artifact download links', () => {
   assert.match(result, new RegExp(`\\[second\\.docx\\]\\(${secondUrl.replace(/[?]/g, '\\?')}\\)`));
 });
 
+test('repairs a model-authored Artifact link from the verified tool result instead of appending a duplicate', () => {
+  const fileName = '研发部员工年中工作总结报告-陈劲帆-丰富版.docx';
+  const correctUrl = `/webpilot/api/artifacts/chat_test/generated/${encodeURIComponent(fileName)}?download=1`;
+  const wrongUrl = `/webpilot/api/artifacts/chat_test/generated/${encodeURIComponent('研发部员工工作总结报告-陈劲帆-丰富版.docx')}?download=1`;
+  const result = appendMissingFileArtifactDownloadLinks(
+    `下载：[${fileName}](${wrongUrl})`,
+    [{
+      name: 'fillDocumentTemplate',
+      result: {
+        ok: true,
+        actual: JSON.stringify({
+          artifactId: `chat_test/generated/${fileName}`,
+          downloadUrl: correctUrl,
+          fileName,
+        }),
+      },
+    }],
+  );
+
+  assert.equal(result, `下载：[${fileName}](${correctUrl})`);
+  assert.doesNotMatch(result, /## 文件下载/);
+  assert.doesNotMatch(result, new RegExp(wrongUrl));
+});
+
+test('repairs multiple model-authored Artifact links by their verified file labels', () => {
+  const firstUrl = '/webpilot/api/artifacts/chat_test/generated/first.md?download=1';
+  const secondUrl = '/webpilot/api/artifacts/chat_test/generated/second.docx?download=1';
+  const result = appendMissingFileArtifactDownloadLinks(
+    '[first.md](/webpilot/api/artifacts/chat_test/generated/wrong-first.md?download=1)\n[second.docx](/webpilot/api/artifacts/chat_test/generated/wrong-second.docx?download=1)',
+    [
+      {
+        name: 'generateFile',
+        result: { ok: true, actual: JSON.stringify({ artifactId: 'chat_test/generated/first.md', downloadUrl: firstUrl, fileName: 'first.md' }) },
+      },
+      {
+        name: 'generateFile',
+        result: { ok: true, actual: JSON.stringify({ artifactId: 'chat_test/generated/second.docx', downloadUrl: secondUrl, fileName: 'second.docx' }) },
+      },
+    ],
+  );
+
+  assert.match(result, new RegExp(firstUrl.replace(/[?]/g, '\\?')));
+  assert.match(result, new RegExp(secondUrl.replace(/[?]/g, '\\?')));
+  assert.doesNotMatch(result, /wrong-first|wrong-second|## 文件下载/);
+});
+
 test('does not expose failed or non-Artifact file tool URLs', () => {
   const reply = '生成失败。';
   const result = appendMissingFileArtifactDownloadLinks(reply, [

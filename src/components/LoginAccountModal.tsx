@@ -130,10 +130,12 @@ export function LoginAccountModal({
         role="dialog"
       >
         <header className="ui-modal-header login-account-modal-header">
-          <span className="login-account-modal-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
-          <div className="ui-modal-heading">
-            <h2 className="ui-modal-title" id="login-account-modal-title">{t(editing ? '编辑登录账号' : '新增登录账号')}</h2>
-            <p className="ui-modal-subtitle">{t('按域名保存，目标测试会自动匹配并通过安全引用登录')}</p>
+          <div className="ui-modal-heading ui-modal-heading--with-icon">
+            <span className="ui-modal-heading-icon login-account-modal-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
+            <div className="ui-modal-heading-copy">
+              <h2 className="ui-modal-title" id="login-account-modal-title">{t(editing ? '编辑登录账号' : '新增登录账号')}</h2>
+              <p className="ui-modal-subtitle">{t('按域名保存，目标测试会自动匹配并通过安全引用登录')}</p>
+            </div>
           </div>
           <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={saving} onClick={onClose} type="button">
             <X size={16} />

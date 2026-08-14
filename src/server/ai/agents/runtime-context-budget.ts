@@ -5,9 +5,15 @@ export function runtimeContextWindowTokens() {
 }
 
 export function runtimeContextCompressionThresholdRatio() {
-  const raw = Number(process.env.AI_CONTEXT_COMPRESSION_THRESHOLD || process.env.AI_CONTEXT_COMPRESSION_RATIO || 0.7);
-  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
-  return raw > 1 ? Math.min(0.98, raw / 100) : Math.min(0.98, raw);
+  return 0.85;
+}
+
+export function runtimeContextCompressionTargetFloorRatio() {
+  return 0.1;
+}
+
+export function runtimeContextCompressionTargetCeilingRatio() {
+  return 0.2;
 }
 
 export function estimateRuntimeTextTokens(text: string) {

@@ -37,16 +37,49 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
     }) as { item: { id: string } };
     assert.match(saved.item.id, /^mem_/);
 
+    let currentUrl = 'https://example.com/dashboard';
+    const usedMemoryIds = new Set<string>();
     const searchTools = createPersonalMemoryTools({
       userId: 'memory-tool-user',
-      currentUrl: 'https://example.com/dashboard',
+      getCurrentUrl: () => currentUrl,
       readOnly: true,
+      usedMemoryIds,
     });
     const searched = await execute(searchTools, 'searchMemory', {
       query: 'DOM first browser inspection method',
     }) as { items: Array<{ id: string; value: string }> };
     assert.equal(searched.items[0]?.id, saved.item.id);
     assert.equal(searched.items[0]?.value, 'Use DOM inspection before screenshots.');
+    await execute(searchTools, 'searchMemory', {
+      query: 'DOM first browser inspection method',
+    });
+    const memoryModule = await import('./personal-memory');
+    assert.equal(memoryModule.getPersonalMemoryItem(saved.item.id, 'memory-tool-user')?.useCount, 1);
+
+    const dompMemory = memoryModule.savePersonalMemoryItem({
+      userId: 'memory-tool-user',
+      scope: 'domain',
+      domain: 'domp.example.com',
+      type: 'workflow',
+      key: 'active project system',
+      value: 'Use DOMP project workflow.',
+    });
+    const wikiMemory = memoryModule.savePersonalMemoryItem({
+      userId: 'memory-tool-user',
+      scope: 'domain',
+      domain: 'wiki.example.com',
+      type: 'workflow',
+      key: 'active project system',
+      value: 'Use Wiki documentation workflow.',
+    });
+    currentUrl = 'https://domp.example.com/project';
+    const dompSearch = await execute(searchTools, 'searchMemory', { query: 'active project system' }) as { items: Array<{ id: string }> };
+    assert.equal(dompSearch.items.some((item) => item.id === dompMemory.id), true);
+    assert.equal(dompSearch.items.some((item) => item.id === wikiMemory.id), false);
+    currentUrl = 'https://wiki.example.com/page';
+    const wikiSearch = await execute(searchTools, 'searchMemory', { query: 'active project system' }) as { items: Array<{ id: string }> };
+    assert.equal(wikiSearch.items.some((item) => item.id === wikiMemory.id), true);
+    assert.equal(wikiSearch.items.some((item) => item.id === dompMemory.id), false);
 
     const invalidWrite = createPersonalMemoryTools({
       userId: 'memory-tool-user',

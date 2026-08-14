@@ -291,7 +291,9 @@ function browserCodeWithoutComments(code: string) {
 export function browserCodeHasCommittingAction(code: string) {
   const source = browserCodeWithoutComments(code);
   return /\.(?:click|dblclick|check|uncheck|press|setInputFiles|selectOption|submit)\s*\(/i.test(source)
-    || /\b(?:fetch|XMLHttpRequest|sendBeacon)\s*\(/i.test(source)
+    || /\bfetch\s*\([\s\S]*?\bmethod\s*:\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]/i.test(source)
+    || /\.open\s*\(\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]/i.test(source)
+    || /\bsendBeacon\s*\(/i.test(source)
     || /\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/i.test(source);
 }
 
@@ -302,7 +304,7 @@ export function analyzeBrowserCodeRisk(code: string): BrowserCodeRisk {
   const checks: Array<[RegExp, string]> = [
     [/\b(?:submit|publish|send|delete|remove|destroy|approve|authorize|pay|purchase|checkout|order|transfer|upload|download|login|logout)\b/i, '代码包含可能对外产生影响或修改数据的操作'],
     [/(?:提交|发布|发送|删除|移除|确认|批准|授权|支付|购买|下单|转账|上传|下载|登录|退出)/, '代码包含可能对外产生影响或修改数据的操作'],
-    [/\b(?:fetch|XMLHttpRequest|sendBeacon)\s*\(|\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/i, '页面代码可能发起请求或修改页面状态'],
+    [/\bfetch\s*\([\s\S]*?\bmethod\s*:\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]|\.open\s*\(\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]|\bsendBeacon\s*\(|\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(/i, '页面代码可能发起写请求或修改页面状态'],
   ];
   for (const [pattern, reason] of checks) {
     if (pattern.test(source)) reasons.push(reason);

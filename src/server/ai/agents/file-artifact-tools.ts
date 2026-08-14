@@ -30,6 +30,7 @@ type DownloadArtifactInput = {
 type GenerateArtifactInput = Omit<GeneratedFileInput, 'fileName'> & {
   runId?: string;
   fileName?: string | null;
+  includeVisualVerification?: boolean;
 };
 
 type FillDocumentTemplateArtifactInput = {
@@ -77,7 +78,7 @@ function sanitizeFileName(value: string | undefined | null, fallback: string) {
   return cleaned || fallback;
 }
 
-function artifactDir(runId: string | undefined, kind: 'downloads' | 'generated') {
+function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'downloads' | 'generated') {
   return artifactPath(sanitizeFileName(runId, 'adhoc'), kind);
 }
 
@@ -253,9 +254,12 @@ export async function generateFileArtifact(input: GenerateArtifactInput): Promis
     );
     const generated = await generateFileBuffer({
       content: input.content,
+      documentType: input.documentType,
       fileName: requestedName,
       sheets: input.sheets,
       slides: input.slides,
+      subtitle: input.subtitle,
+      theme: input.theme,
       title: input.title,
     });
     const dir = artifactDir(input.runId, 'generated');
@@ -263,14 +267,36 @@ export async function generateFileArtifact(input: GenerateArtifactInput): Promis
     const target = await uniqueArtifactPath(dir, requestedName);
     await writeFile(target.filePath, generated.buffer);
 
+    const visualVerification = input.includeVisualVerification && [
+      '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
+    ].includes(generated.extension)
+      ? await renderBrowserChatAttachmentVisuals({
+          absolutePath: target.filePath,
+          buffer: generated.buffer,
+          extension: generated.extension,
+          name: target.fileName,
+          previewRoot: artifactDir(input.runId, 'attachment-previews'),
+        })
+      : undefined;
+
     return {
       ok: true,
-      actual: JSON.stringify(artifactResultPayload({
-        kind: 'generated',
-        fileName: target.fileName,
-        filePath: target.filePath,
-        bytes: generated.buffer.byteLength,
-      })),
+      actual: JSON.stringify({
+        ...artifactResultPayload({
+          kind: 'generated',
+          fileName: target.fileName,
+          filePath: target.filePath,
+          bytes: generated.buffer.byteLength,
+        }),
+        visualVerification: visualVerification ? {
+          imageCount: visualVerification.imagePaths.length,
+          pageCount: visualVerification.pageCount,
+          renderedPages: visualVerification.renderedPages,
+          renderer: visualVerification.renderer,
+          warning: visualVerification.warning,
+        } : { skipped: 'current model does not accept image input or the generated format has no page renderer' },
+      }),
+      referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
   } catch (error) {
     return { ok: false, actual: `generateFile failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -313,6 +339,7 @@ export async function fillDocumentTemplateArtifact(input: FillDocumentTemplateAr
           buffer: filled.buffer,
           extension: '.docx',
           name: target.fileName,
+          previewRoot: artifactDir(input.runId, 'attachment-previews'),
         })
       : undefined;
     return {
@@ -378,13 +405,47 @@ export function fileArtifactDownloadFromToolResult(tool: FileArtifactToolResult)
   }
 }
 
+function artifactMarkdownUrl(value: string) {
+  try {
+    const url = new URL(value, 'http://webpilot.local');
+    return url.pathname.includes('/api/artifacts/');
+  } catch {
+    return false;
+  }
+}
+
+function normalizedMarkdownLinkLabel(value: string) {
+  return value
+    .replace(/\\([\[\]\\])/g, '$1')
+    .replace(/[*_`]/g, '')
+    .trim();
+}
+
+function repairArtifactDownloadLinks(reply: string, downloads: FileArtifactDownload[]) {
+  if (!downloads.length) return reply;
+  return reply.replace(/(!?)\[([^\]\r\n]*)\]\(([^)\s]+)([^)\r\n]*)\)/g, (full, imagePrefix, label, href) => {
+    if (imagePrefix || !artifactMarkdownUrl(href)) return full;
+    const normalizedLabel = normalizedMarkdownLinkLabel(label);
+    const exactUrl = downloads.find((item) => item.downloadUrl === href);
+    const labelMatches = downloads.filter((item) => (
+      normalizedLabel === item.fileName || normalizedLabel.endsWith(item.fileName)
+    ));
+    const verified = exactUrl
+      || (labelMatches.length === 1 ? labelMatches[0] : undefined)
+      || (downloads.length === 1 ? downloads[0] : undefined);
+    if (!verified) return full;
+    return `[${label}](${verified.downloadUrl})`;
+  });
+}
+
 export function appendMissingFileArtifactDownloadLinks(reply: string, tools: FileArtifactToolResult[]) {
   const downloads = tools
     .map(fileArtifactDownloadFromToolResult)
     .filter((item): item is FileArtifactDownload => Boolean(item));
   const unique = [...new Map(downloads.map((item) => [item.artifactId, item])).values()];
-  const missing = unique.filter((item) => !reply.includes(item.downloadUrl));
-  if (!missing.length) return reply;
+  const repairedReply = repairArtifactDownloadLinks(reply, unique);
+  const missing = unique.filter((item) => !repairedReply.includes(item.downloadUrl));
+  if (!missing.length) return repairedReply;
   const links = missing.map((item) => `- [${escapeMarkdownLinkLabel(item.fileName)}](${item.downloadUrl})`).join('\n');
-  return [reply.trim(), `## 文件下载\n\n${links}`].filter(Boolean).join('\n\n');
+  return [repairedReply.trim(), `## 文件下载\n\n${links}`].filter(Boolean).join('\n\n');
 }

@@ -49,16 +49,21 @@ import {
 
 import { runtimeAllowedToolTypes } from './runtime-tool-selection';
 import { browserToolApprovalRequest } from './browser-tool-approval';
-import { compactOlderBrowserToolResults } from './browser-code-tool-history';
 import {
   estimateRuntimeTextTokens,
+  runtimeContextCompressionTargetCeilingRatio,
+  runtimeContextCompressionTargetFloorRatio,
   runtimeContextCompressionThresholdRatio,
   runtimeContextWindowTokens,
 } from './runtime-context-budget';
+import type { BrowserChatModelContextCompression } from './browser-chat-model-context';
 import {
+  atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
   fallbackRuntimeContinuationSummary,
+  mergeRuntimeModelMessageChain,
   sanitizeRuntimeContinuationSummary,
+  selectRecentRuntimeMessageBlocks,
 } from './runtime-context-compression';
 import {
   isEffectiveToolTraceFailure,
@@ -67,12 +72,53 @@ import {
 } from './runtime-tool-trace';
 
 const generatedFileCellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
+const generatedFileThemeSchema = z.object({
+  preset: z.enum(['professional', 'minimal', 'executive', 'warm']).optional(),
+  primaryColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  accentColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  bodyColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  backgroundColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  fontFamily: z.string().min(1).max(120).optional(),
+});
+const generatedFileSheetColumnSchema = z.object({
+  index: z.number().int().min(0).max(255),
+  width: z.number().min(8).max(60).optional(),
+  format: z.string().min(1).max(160).optional(),
+});
+const generatedFileSheetFormulaSchema = z.object({
+  cell: z.string().min(1).max(40),
+  formula: z.string().min(1).max(2_000),
+});
+const generatedFileSheetStyleSchema = z.object({
+  range: z.string().min(1).max(80),
+  bold: z.boolean().optional(),
+  color: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  backgroundColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
+  horizontal: z.enum(['left', 'center', 'right']).optional(),
+  numberFormat: z.string().min(1).max(160).optional(),
+});
+const generatedFileSheetChartSchema = z.object({
+  type: z.enum(['area', 'bar', 'column', 'line', 'pie']),
+  range: z.string().min(1).max(80),
+  title: z.string().max(300).optional(),
+});
 const generatedFileSheetsSchema = z.array(z.object({
   name: z.string().max(31).optional(),
   rows: z.array(z.array(generatedFileCellSchema).max(100)).min(1).max(5_000),
+  headerRows: z.number().int().min(0).max(10).optional(),
+  freezeRows: z.number().int().min(0).max(100).optional(),
+  freezeColumns: z.number().int().min(0).max(100).optional(),
+  autoFilter: z.boolean().optional(),
+  landscape: z.boolean().optional(),
+  columns: z.array(generatedFileSheetColumnSchema).max(100).optional(),
+  formulas: z.array(generatedFileSheetFormulaSchema).max(5_000).optional(),
+  merges: z.array(z.string().min(1).max(80)).max(500).optional(),
+  styles: z.array(generatedFileSheetStyleSchema).max(1_000).optional(),
+  charts: z.array(generatedFileSheetChartSchema).max(20).optional(),
 })).min(1).max(20);
 const generatedFileSlidesSchema = z.array(z.object({
   title: z.string().max(300).optional(),
+  subtitle: z.string().max(500).optional(),
   content: z.string().max(20_000).optional(),
   bullets: z.array(z.string().max(2_000)).max(100).optional(),
 })).min(1).max(100);
@@ -673,6 +719,67 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
   });
 }
 
+function subagentUuidsFromToolResult(result?: BrowserActionResult) {
+  if (!result?.ok) return [];
+  const parsed = parseJsonObjectText(result.actual);
+  const subagents = Array.isArray(parsed?.subagents) ? parsed.subagents : [];
+  return subagents.flatMap((item) => {
+    const record = recordFromUnknown(item);
+    const uuid = typeof record.uuid === 'string' ? record.uuid.trim() : '';
+    return uuid ? [uuid] : [];
+  });
+}
+
+function pendingSubagentUuidsFromTraces(traces: ToolTrace[]) {
+  const spawned: string[] = [];
+  const read = new Set<string>();
+  for (const trace of traces) {
+    if (trace.name === 'spawnSubagents') {
+      for (const uuid of subagentUuidsFromToolResult(trace.result)) {
+        if (!spawned.includes(uuid)) spawned.push(uuid);
+      }
+      continue;
+    }
+    if (trace.name !== 'readSubagent' || !trace.result?.ok) continue;
+    const input = recordFromUnknown(trace.input);
+    const uuid = typeof input.uuid === 'string' ? input.uuid.trim() : '';
+    if (uuid) read.add(uuid);
+  }
+  return spawned.filter((uuid) => !read.has(uuid));
+}
+
+function pendingSubagentUuidsFromSteps(steps: StepExecutionResult[]) {
+  const spawned: string[] = [];
+  const read = new Set<string>();
+  for (const step of steps) {
+    for (const toolCall of step.tools || []) {
+      const rawResult = toolCall.rawResult && typeof toolCall.rawResult === 'object' && !Array.isArray(toolCall.rawResult)
+        ? toolCall.rawResult as BrowserActionResult
+        : undefined;
+      if (toolCall.name === 'spawnSubagents') {
+        for (const uuid of subagentUuidsFromToolResult(rawResult)) {
+          if (!spawned.includes(uuid)) spawned.push(uuid);
+        }
+        continue;
+      }
+      if (toolCall.name !== 'readSubagent' || rawResult?.ok !== true) continue;
+      const input = recordFromUnknown(toolCall.input);
+      const uuid = typeof input.uuid === 'string' ? input.uuid.trim() : '';
+      if (uuid) read.add(uuid);
+    }
+  }
+  return spawned.filter((uuid) => !read.has(uuid));
+}
+
+function requiredSubagentReadDirective(uuid: string, remaining: number) {
+  return [
+    '[Required child Agent result read]',
+    `There are ${remaining} completed child Agent result(s) that have not been read.`,
+    `In this model step, call readSubagent with exactly this UUID: ${uuid}`,
+    'Do not answer, synthesize, or call another tool until every returned child UUID has been read.',
+  ].join('\n');
+}
+
 function upsertToolTrace(traces: ToolTrace[], trace: ToolTrace) {
   const index = trace.id ? traces.findIndex((item) => item.id === trace.id) : -1;
   if (index >= 0) traces[index] = trace;
@@ -1270,13 +1377,13 @@ function makeBrowserTools(
     }),
     ...(referenceOptions?.runSubagents ? {
       spawnSubagents: tool({
-        description: 'Run several independent research or testing tasks concurrently with full browser-agent tools. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Read child results one at a time in later model steps with readSubagent. One child failure does not cancel its siblings.',
+        description: 'Run independent research, reading, comparison, or testing branches concurrently with full browser-agent tools. Use this by default when two or more URLs, documents, pages, or other items can be handled without depending on one another; for example, eight independent links should become eight child tasks in one batch instead of eight serial main-Agent reads. Do not delegate dependent steps or multiple actions on the same interactive page. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Read child results one at a time in later model steps with readSubagent. One child failure does not cancel its siblings.',
         inputSchema: browserToolInput({
           tasks: z.array(z.object({
             title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
             instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
             url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
-          })).min(1).max(6),
+          })).min(1).max(12),
         }),
         execute: (input) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id)),
       }),
@@ -1315,7 +1422,7 @@ function makeBrowserTools(
     } : {}),
     ...(referenceOptions?.readSkill ? {
       readSkill: tool({
-        description: 'Read the complete current content of one Skill listed in the system prompt. Call this before performing browser actions governed by that Skill. Do not call it again for the same Skill in this user turn.',
+        description: 'Load the complete current content of one Skill listed in the system prompt into the next model context. Call this before performing browser actions governed by that Skill. Do not call it again while that Skill remains loaded.',
         inputSchema: browserToolInput({
           skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
         }),
@@ -1333,15 +1440,22 @@ function makeBrowserTools(
       execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
     }),
     generateFile: tool({
-      description: 'Generate a real downloadable file from AI-authored content. Supported outputs: text/code/data formats selected by fileName extension; PDF .pdf; Word .doc, .docx, or .odt; Excel .xls, .xlsx, or .ods; and PowerPoint .ppt, .pptx, or .odp. Legacy and OpenDocument outputs require LibreOffice. PDF and Word use Markdown-like content; CSV/TSV accept content or one sheet; workbook formats require sheets with rows; PowerPoint prefers slides and can fall back to Markdown-like content. Always include the returned download link in the final answer. Do not use this to download an existing remote file.',
+      description: 'Generate a styled, real downloadable file. LibreOffice UNO creates and formats every PDF/Word/Excel/PowerPoint document, then renders visual pages back for layout review. Supported outputs: text/data formats; PDF .pdf; Word .doc/.docx/.odt; Excel .xls/.xlsx/.ods; and PowerPoint .ppt/.pptx/.odp. Choose a theme or explicit colors. Word and report PDFs use Markdown-like content; spreadsheets use structured sheets with formatting, formulas, merges, filters, freezing, and charts; presentations use structured slides. For PDF, documentType selects Writer, Calc, or Impress layout. Always inspect returned visual pages, fix visible overflow or weak layout with at most one intentional regeneration, and include the final returned download link. Do not use this to download an existing remote file.',
       inputSchema: browserToolInput({
         fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, legacy.doc, data.xls, data.xlsx, table.ods, slides.pptx, slides.odp, notes.md, result.jsonl, or export.tsv.'),
+        documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('Layout engine for PDF output. Omit for native Office files because the extension determines it.'),
         title: z.string().max(300).optional().describe('Optional document or presentation title.'),
+        subtitle: z.string().max(500).optional().describe('Optional document or presentation subtitle.'),
+        theme: generatedFileThemeSchema.optional().describe('Visual design system. Prefer a preset and override colors/font only when the user requests a brand style.'),
         content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional for CSV/TSV when sheets are provided and as a fallback for PowerPoint.'),
-        sheets: generatedFileSheetsSchema.optional().describe('Spreadsheet data. Required for .xls, .xlsx, and .ods; CSV/TSV use the first sheet when content is omitted. Each sheet contains a two-dimensional rows array of string, number, boolean, or null cells.'),
-        slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. Each slide has a title plus content and/or bullet strings.'),
+        sheets: generatedFileSheetsSchema.optional().describe('Spreadsheet data and layout. Required for .xls/.xlsx/.ods or a spreadsheet PDF. Use headerRows, freezeRows, autoFilter, columns, formulas, merges, styles, and charts where they improve usability.'),
+        slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. LibreOffice applies a 16:9 theme and splits slides with excessive bullets.'),
       }),
-      execute: (input) => record('generateFile', input, () => generateFileArtifact({ ...input, runId: referenceOptions?.runId })),
+      execute: (input) => record('generateFile', input, () => generateFileArtifact({
+        ...input,
+        runId: referenceOptions?.runId,
+        includeVisualVerification: modelSupportsScreenshotInput(),
+      })),
     }),
     fillDocumentTemplate: tool({
       description: 'Fill an uploaded .docx template without recreating the document. The backend copies the original OOXML package, changes only word/document.xml at exact visible-text anchors, verifies that all unrelated package parts are byte-for-byte preserved, then renders the filled document and attaches its first visual pages to the next model request for layout review. First call readFile on the template and use its DOCX structure section. Use nextCell for a table label whose value belongs in the following cell, followingParagraph for a section heading followed by a blank paragraph, or replaceText for an exact placeholder/date. Ambiguous anchors require a 1-based occurrence. Do not use generateFile when the user requires the supplied template to be preserved.',
@@ -1433,10 +1547,11 @@ function runtimePrompt(input: {
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile, fillDocumentTemplate, or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- generateFile uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, use the structured Word/Calc/Impress controls required by the content, inspect its returned rendered pages, and regenerate at most once when the visual evidence shows overflow, clipping, weak hierarchy, or unusable sizing. Return only the final verified artifact link.',
     '- When the user supplies a .docx template and asks to fill or edit it, first read the template, then use fillDocumentTemplate with exact anchors from the returned DOCX structure. Never substitute generateFile: it creates a new document and cannot preserve the source package, styles, headers, footers, relationships, or layout.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- Only for multi-document requirement analysis, inspect/search the root links, spawn one parallel subagent batch for independent URLs, keep dependent end-to-end work in the main Agent, and read one completed child result per later model step.',
+    '- Parallelism is mandatory when the request contains two or more independent URLs, documents, pages, research questions, comparisons, or test branches whose results do not depend on one another. After discovering any needed root links, call spawnSubagents before reading those items serially in the main Agent, with one self-contained child task per independent item (for example, eight links become eight tasks in one batch). Keep dependent steps, multiple actions on the same interactive page, final synthesis, and externally consequential operations in the main Agent. After the batch barrier, call readSubagent once per returned UUID in later model steps and synthesize all results. Do not skip subagents merely because the main Agent could perform the work sequentially.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
       ? '- To upload a user attachment to a web file input, do not call readFile merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files, call downloadFile with the known URL. To create a new file, call generateFile; to fill an uploaded .docx template, call fillDocumentTemplate.'
@@ -1661,8 +1776,8 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
         ...(aiRequest?.options || {}),
         ...extra,
       },
-      systemCharacters: aiRequest?.systemPrompt?.length || 0,
-      messageCount: Array.isArray(messages) ? messages.length : 0,
+      system: aiRequest?.systemPrompt,
+      messages,
     },
     aiInputTokens: modelMessagesTextAndImageStats(messages),
   });
@@ -1860,6 +1975,7 @@ async function executeRuntimeStep(input: {
   turnId?: string;
   stepIndex: number;
   instruction?: string;
+  appendInstruction?: boolean;
   operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
   referenceImagePaths?: string[];
@@ -2019,16 +2135,7 @@ async function executeRuntimeStep(input: {
       imagePaths: string[];
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
-    const historyMessages = (input.conversation || [])
-      .map((message) => {
-        const content = textFromUnknown(message?.content);
-        if (!content.trim()) return undefined;
-        return {
-          role: message?.role === 'assistant' ? 'assistant' as const : 'user' as const,
-          content,
-        };
-      })
-      .filter((message): message is { role: 'user' | 'assistant'; content: string } => Boolean(message)) as RuntimeModelMessage[];
+    const historyMessages = [...(input.conversation || [])] as RuntimeModelMessage[];
     const initialImagePaths = [...initialVisualPaths, ...initialUserReferenceImagePaths];
     const initialImages: Awaited<ReturnType<typeof readScreenshotForAi>>[] = [];
     for (const imagePath of initialImagePaths) {
@@ -2045,7 +2152,7 @@ async function executeRuntimeStep(input: {
       const content = textFromUnknown(message.content);
       return content.trim() === latestInstruction || content.includes(latestInstruction);
     }));
-    if (latestInstruction && !hasLatestUserMessage) {
+    if (latestInstruction && (input.appendInstruction || !hasLatestUserMessage)) {
       initialMessages.push({ role: 'user' as const, content: latestInstruction });
     }
     if (initialImages.length) {
@@ -2073,6 +2180,7 @@ async function executeRuntimeStep(input: {
         });
       }
     }
+    const turnInputMessages = initialMessages.slice(historyMessages.length);
     if (retryState?.messages.length) {
       initialMessages = [...retryState.messages];
     }
@@ -2099,6 +2207,8 @@ async function executeRuntimeStep(input: {
     const stepStartedAt = new Map<number, number>();
     const stepModelMessagesForLog = new Map<number, unknown>();
     let contextSegmentationTurns = 0;
+    let lastPreparedMessages = [...initialMessages];
+    let latestContextCompression: BrowserChatModelContextCompression | undefined;
     const continuationSummaryMarker = '[WebPilot continuation summary]';
     let compactedModelContext: RuntimeModelMessage[] | undefined;
     let compactedSourceMessageCount = 0;
@@ -2130,6 +2240,7 @@ async function executeRuntimeStep(input: {
       turnIndex: number,
       estimatedTokens: number,
       thresholdTokens: number,
+      maxOutputTokens: number,
     ) => {
       ensureActive();
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
@@ -2162,6 +2273,7 @@ async function executeRuntimeStep(input: {
           }],
           temperature: 0.1,
           reasoning: aiReasoningEffort(),
+          maxOutputTokens,
           maxRetries: 0,
           abortSignal,
           timeout: aiRequestTimeoutMs(),
@@ -2193,7 +2305,12 @@ async function executeRuntimeStep(input: {
           });
         }
       }
-      const refreshedPrompt = `${runtimePrompt({ runtimeRecord, mode, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`;
+      const pendingSubagentUuids = pendingSubagentUuidsFromTraces(traces);
+      const requiredSubagentUuid = pendingSubagentUuids[0];
+      const refreshedPrompt = [
+        `${runtimePrompt({ runtimeRecord, mode, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`,
+        requiredSubagentUuid ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length) : '',
+      ].filter(Boolean).join('\n\n');
       requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = runtimeContextWindowTokens();
@@ -2219,11 +2336,9 @@ async function executeRuntimeStep(input: {
       let unsummarizedMessages = compactedModelContext?.length
         ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
-      unsummarizedMessages = compactOlderBrowserToolResults(unsummarizedMessages, mode);
       let messagesToSend = compactedModelContext?.length
         ? [...compactedModelContext, ...unsummarizedMessages]
         : unsummarizedMessages;
-      messagesToSend = compactOlderBrowserToolResults(messagesToSend, mode);
       if (appendedMessages.length) {
         messagesToSend = [...messagesToSend, ...appendedMessages];
         unsummarizedMessages = [...unsummarizedMessages, ...appendedMessages];
@@ -2236,13 +2351,40 @@ async function executeRuntimeStep(input: {
       const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
       const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
       if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
-        const deltaInputForSummary = sanitizeModelInputForStats('', unsummarizedMessages, appendedImagePaths);
+        const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
+        const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
+        const baseStats = modelMessagesTextAndImageStats(
+          sanitizeModelInputForStats(requestSystemPrompt, [], []),
+          codexMode ? undefined : nativeToolsRef.current,
+        );
+        const summarySourceMessages = messagesToSend.filter((message) => (
+          !textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+        ));
+        const blocks = atomicRuntimeModelMessageBlocks(summarySourceMessages);
+        const rawTailBudget = Math.max(0, targetFloorTokens - baseStats.estimatedTotalTokens);
+        const selectedBlocks = selectRecentRuntimeMessageBlocks(
+          blocks,
+          (candidate) => modelMessagesTextAndImageStats(
+            sanitizeModelInputForStats('', candidate, []),
+            undefined,
+          ).estimatedTotalTokens,
+          rawTailBudget,
+        );
+        const olderBlocks = selectedBlocks.olderBlocks;
+        const retainedTokens = selectedBlocks.retainedTokens;
+        const retainedMessages = selectedBlocks.retainedBlocks.flat();
+        const deltaInputForSummary = sanitizeModelInputForStats('', summarySourceMessages, appendedImagePaths);
         const deltaStats = modelMessagesTextAndImageStats(deltaInputForSummary, undefined);
+        const summaryOutputBudget = Math.max(256, Math.min(
+          8_192,
+          targetCeilingTokens - baseStats.estimatedTotalTokens - retainedTokens - 256,
+        ));
         const summaryResult = await summarizeContinuation(
           deltaInputForSummary,
           turnIndex,
           deltaStats.estimatedTotalTokens,
           thresholdTokens,
+          summaryOutputBudget,
         );
         const summary = summaryResult.summary;
         const previousSummaryChars = continuationSummaryText.length;
@@ -2250,14 +2392,46 @@ async function executeRuntimeStep(input: {
         contextSegmentationTurns += 1;
         messagesToSend = [
           { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
-          ...(appendedMessages.length
-            ? appendedMessages
-            : [{ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts: do not repeat a completed or known-empty search unless the user changed the query or fresh evidence contradicts it. If fresh page state is needed, inspect it with browserCode.' }]),
+          ...retainedMessages,
         ];
-        attachedImagePaths = appendedImagePaths;
+        if (messagesToSend.length === 1) {
+          messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
+        }
+        attachedImagePaths = [];
         messageImagePaths = [...attachedImagePaths];
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
-        const afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
+        let afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
+        while (afterStats.estimatedTotalTokens < targetFloorTokens && olderBlocks.length) {
+          const candidate = olderBlocks.pop()!;
+          const candidateMessages = candidate.concat(messagesToSend.slice(1));
+          const candidateContext = [messagesToSend[0], ...candidateMessages];
+          const candidateStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, candidateContext, []), codexMode ? undefined : nativeToolsRef.current);
+          if (candidateStats.estimatedTotalTokens > targetCeilingTokens) break;
+          messagesToSend = candidateContext;
+          afterStats = candidateStats;
+        }
+        while (afterStats.estimatedTotalTokens > targetCeilingTokens && messagesToSend.length > 1) {
+          const removableBlocks = atomicRuntimeModelMessageBlocks(messagesToSend.slice(1));
+          removableBlocks.shift();
+          messagesToSend = [messagesToSend[0], ...removableBlocks.flat()];
+          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, []), codexMode ? undefined : nativeToolsRef.current);
+        }
+        if (messagesToSend.length === 1) {
+          messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
+          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, []), codexMode ? undefined : nativeToolsRef.current);
+        }
+        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+        latestContextCompression = {
+          compressedAt: new Date().toISOString(),
+          estimatedTokensBefore: messageStats.estimatedTotalTokens,
+          estimatedTokensAfter: afterStats.estimatedTotalTokens,
+          retainedMessageCount: messagesToSend.length - 1,
+          summarizedMessageCount: summarySourceMessages.length,
+          targetCeilingTokens,
+          targetFloorTokens,
+          thresholdTokens,
+          windowTokens,
+        };
         modelContextSegmentation = {
           segment: contextSegmentationTurns,
           reason: 'modelMessages exceeded context threshold',
@@ -2269,6 +2443,9 @@ async function executeRuntimeStep(input: {
           previousSummaryChars,
           summaryChars: summary.length,
           unsummarizedMessageCount: unsummarizedMessages.length,
+          targetFloorTokens,
+          targetCeilingTokens,
+          retainedMessageCount: messagesToSend.length - 1,
           thresholdTokens,
         };
         await onAttemptDebug?.({
@@ -2287,6 +2464,7 @@ async function executeRuntimeStep(input: {
         compactedModelContext = [...messagesToSend];
         compactedSourceMessageCount = sourceMessages.length;
       }
+      lastPreparedMessages = [...messagesToSend];
       rememberRetryState({
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],
@@ -2298,6 +2476,10 @@ async function executeRuntimeStep(input: {
         system: requestSystemPrompt || undefined,
         messages: messagesToSend,
         modelMessagesForLog,
+        ...(requiredSubagentUuid ? {
+          activeTools: ['readSubagent'] as Array<keyof typeof toolsForRequest>,
+          toolChoice: { type: 'tool' as const, toolName: 'readSubagent' as keyof typeof toolsForRequest },
+        } : {}),
       };
     }
 
@@ -2401,6 +2583,9 @@ async function executeRuntimeStep(input: {
         text: execution.text,
         traces,
         aiRequest,
+        modelMessages: mergeRuntimeModelMessageChain(lastPreparedMessages, result.responseMessages),
+        turnMessages: [...turnInputMessages, ...result.responseMessages],
+        contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
         workingMemory,
         finishReason: finishState.finishReason,
@@ -2502,6 +2687,8 @@ async function executeRuntimeStep(input: {
         return {
           instructions: prepared.system,
           messages: prepared.messages,
+          activeTools: prepared.activeTools,
+          toolChoice: prepared.toolChoice,
           runtimeContext: {
             operationalContext: activeOperationalContext,
             credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
@@ -2643,19 +2830,37 @@ async function executeRuntimeStep(input: {
             ensureActive();
           },
         });
-      const [resultText, resultFinishReason, resultSteps] = await Promise.all([
+      const [resultText, resultFinishReason, resultSteps, responseMessages] = await Promise.all([
         result.text,
         result.finishReason,
         result.steps,
+        result.responseMessages,
       ]);
       if (streamedRequestError) throw streamedRequestError;
-      const finalSdkStep = resultSteps.at(-1);
+      const responseToolCallCount = responseMessages.reduce((count, message) => (
+        count + (Array.isArray(message.content)
+          ? message.content.filter((part) => part.type === 'tool-call').length
+          : 0)
+      ), 0);
+      const responseToolResultCount = responseMessages.reduce((count, message) => (
+        count + (Array.isArray(message.content)
+          ? message.content.filter((part) => part.type === 'tool-result').length
+          : 0)
+      ), 0);
+      const toolCallCount = Math.max(
+        responseToolCallCount,
+        resultSteps.reduce((count, step) => count + step.toolCalls.length, 0),
+      );
+      const toolResultCount = Math.max(
+        responseToolResultCount,
+        resultSteps.reduce((count, step) => count + step.toolResults.length, 0),
+      );
       const finishState = aiSdkFinishState(resultFinishReason, {
         runtimeContinuationRequired: aiSdkToolResultRequiresContinuation({
           finishReason: resultFinishReason,
           responseText: resultText,
-          toolCallCount: finalSdkStep?.toolCalls.length,
-          toolResultCount: finalSdkStep?.toolResults.length,
+          toolCallCount,
+          toolResultCount,
         }),
       });
       ensureActive();
@@ -2670,6 +2875,9 @@ async function executeRuntimeStep(input: {
         text: latestText,
         traces,
         aiRequest,
+        modelMessages: mergeRuntimeModelMessageChain(lastPreparedMessages, responseMessages),
+        turnMessages: [...turnInputMessages, ...responseMessages],
+        contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
         workingMemory,
         finishReason: finishState.finishReason,
@@ -2884,10 +3092,7 @@ async function executeRuntimeStep(input: {
   throw wrapped;
 }
 
-export type InteractiveBrowserTurnMessage = {
-  role: 'user' | 'assistant';
-  content: string;
-};
+export type InteractiveBrowserTurnMessage = ModelMessage;
 
 export type InteractiveBrowserTurnResult = {
   status: 'passed' | 'failed' | 'blocked';
@@ -2896,6 +3101,9 @@ export type InteractiveBrowserTurnResult = {
   newSteps: StepExecutionResult[];
   consoleErrors: string[];
   networkErrors: string[];
+  modelMessages: ModelMessage[];
+  turnMessages: ModelMessage[];
+  contextCompression?: BrowserChatModelContextCompression;
 };
 
 export function appendBrowserChatFailedToolDisclosures(
@@ -2987,6 +3195,9 @@ export async function executeInteractiveBrowserTurn(input: {
   const ensureActive = () => throwIfStopped(input.abortSignal, input.shouldContinue);
   const steps = [...(input.completedSteps || [])];
   const newSteps: StepExecutionResult[] = [];
+  let activeModelMessages = [...(input.conversation || [])];
+  const turnModelMessages: ModelMessage[] = [];
+  let contextCompression: BrowserChatModelContextCompression | undefined;
   const runtimeRecord = createInteractiveBrowserRuntimeRecord({
     safetyMode: input.safetyMode,
     targetUrl: input.targetUrl,
@@ -2996,9 +3207,6 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
-  const carriedSkillIds = new Set<string>();
-  const carriedSkillMessages: InteractiveBrowserTurnMessage[] = [];
-
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
@@ -3016,6 +3224,8 @@ export async function executeInteractiveBrowserTurn(input: {
     let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
 
     try {
+      const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
+      const requiredSubagentUuid = pendingSubagentUuids[0];
       actionResult = await executeRuntimeStep({
         session: input.session,
         mode: runtimeMode,
@@ -3023,15 +3233,19 @@ export async function executeInteractiveBrowserTurn(input: {
         runId: input.runId,
         turnId: input.turnId || input.runId,
         stepIndex,
-        instruction: input.modelInstruction || input.instruction,
+        instruction: [
+          input.modelInstruction || input.instruction,
+          requiredSubagentUuid ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length) : '',
+        ].filter(Boolean).join('\n\n'),
+        appendInstruction: turnModelMessages.length === 0 || Boolean(requiredSubagentUuid),
         operationalContext: input.operationalContext,
-        conversation: [...(input.conversation || []), ...carriedSkillMessages],
+        conversation: activeModelMessages,
         referenceImagePaths: input.referenceImagePaths,
         getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
-        allowedToolTypes: input.allowedToolTypes,
+        allowedToolTypes: requiredSubagentUuid ? ['readSubagent'] : input.allowedToolTypes,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
@@ -3057,6 +3271,9 @@ export async function executeInteractiveBrowserTurn(input: {
         },
       });
       ensureActive();
+      activeModelMessages = actionResult.modelMessages;
+      turnModelMessages.push(...actionResult.turnMessages);
+      contextCompression = actionResult.contextCompression || contextCompression;
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
       const retryInfo = runtimeRetryFromError(error);
@@ -3094,18 +3311,6 @@ export async function executeInteractiveBrowserTurn(input: {
 
     ensureActive();
     const browserChatReply = textFromUnknown(actionResult.text).trim();
-    for (const trace of actionResult.traces) {
-      if (trace.name !== 'readSkill' || !trace.result?.ok) continue;
-      const traceInput = flowInput(trace.input);
-      const skillId = typeof traceInput.skillId === 'string' ? traceInput.skillId.trim() : '';
-      const content = trace.result.actual.trim();
-      if (!skillId || !content || carriedSkillIds.has(skillId)) continue;
-      carriedSkillIds.add(skillId);
-      carriedSkillMessages.push({
-        role: 'user',
-        content: `[Runtime readSkill result from earlier in this user turn]\n${content}`,
-      });
-    }
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -3155,6 +3360,16 @@ export async function executeInteractiveBrowserTurn(input: {
     await input.onProgress?.(completedStep);
     ensureActive();
     const lastToolName = actionResult.traces.at(-1)?.name;
+    const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
+    if (pendingSubagentUuids.length) {
+      await input.onDebug?.({
+        phase: 'chat:subagent-read-required',
+        stepIndex,
+        message: `${pendingSubagentUuids.length} completed child Agent result(s) remain unread; forcing readSubagent before final synthesis.`,
+        details: { pendingSubagentUuids },
+      });
+      continue;
+    }
     if (actionResult.responseFinished) {
       await input.onDebug?.({
         phase: 'chat:ai-response-finished',
@@ -3208,6 +3423,9 @@ export async function executeInteractiveBrowserTurn(input: {
     newSteps,
     consoleErrors: [],
     networkErrors: input.session.getNetworkErrors(),
+    modelMessages: activeModelMessages,
+    turnMessages: turnModelMessages,
+    contextCompression,
   };
 }
 
@@ -3516,10 +3734,16 @@ export async function executeRecordedBrowserOperation(
       return generateFileArtifact({
         runId,
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        documentType: input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation'
+          ? input.documentType
+          : undefined,
         title: typeof input.title === 'string' ? input.title : undefined,
+        subtitle: typeof input.subtitle === 'string' ? input.subtitle : undefined,
         content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
+        theme: generatedFileThemeSchema.safeParse(input.theme).data,
         sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
         slides: generatedFileSlidesSchema.safeParse(input.slides).data,
+        includeVisualVerification: modelSupportsScreenshotInput(),
       });
     case 'fillDocumentTemplate':
       return fillDocumentTemplateArtifact({
@@ -3628,7 +3852,7 @@ async function executeCodexRuntimeObject(input: {
         const instruction = typeof item.instruction === 'string' ? item.instruction.trim() : '';
         if (!title || !instruction) return [];
         return [{ title, instruction, url: typeof item.url === 'string' ? item.url : undefined }];
-      }).slice(0, 6) : [];
+      }).slice(0, 12) : [];
       if (!tasks.length) return { ok: false, actual: 'spawnSubagents requires at least one valid task.' };
       return runSubagents(tasks, abortSignal, toolCallId);
     }

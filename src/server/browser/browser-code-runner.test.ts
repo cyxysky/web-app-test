@@ -1239,6 +1239,8 @@ test('browserCode risk analysis confirms committed effects instead of preparator
   assert.equal(analyzeBrowserCodeRisk(`await page.getByRole('button', { name: '删除' }).click()`).requiresConfirmation, true);
   assert.equal(analyzeBrowserCodeRisk(`await page.getByLabel('Password').fill('secret')`).requiresConfirmation, false);
   assert.equal(analyzeBrowserCodeRisk(`await page.getByRole('button', { name: 'Login' }).click()`).requiresConfirmation, true);
+  assert.equal(analyzeBrowserCodeRisk(`await fetch('data/document.js', { credentials: 'include' })`).requiresConfirmation, false);
+  assert.equal(analyzeBrowserCodeRisk(`await fetch('/api/report', { method: 'GET' })`).requiresConfirmation, false);
   assert.equal(analyzeBrowserCodeRisk(`await fetch('/api/update', { method: 'POST' })`).requiresConfirmation, true);
   assert.equal(analyzeBrowserCodeRisk(`return await page.getByRole('heading').innerText()`).requiresConfirmation, false);
 });

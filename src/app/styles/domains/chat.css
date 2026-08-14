@@ -481,16 +481,6 @@
   height: min(88dvh, 860px);
 }
 
-.browser-chat-management-dialog > .ui-modal-header > .browser-chat-management-heading {
-  align-items: center;
-  display: flex;
-  gap: 11px;
-}
-
-.browser-chat-management-heading > div {
-  min-width: 0;
-}
-
 .browser-chat-management-heading > span {
   align-items: center;
   background: var(--panel-soft);
@@ -597,10 +587,18 @@
   flex: 0 0 auto;
   flex-wrap: nowrap;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 42px;
   justify-self: stretch;
   min-width: 0;
   gap: 7px;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-tools,
+.browser-chat-compose--reference .browser-chat-compose-submit {
+  grid-template-columns: minmax(0, 1fr) 42px;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
+  grid-template-columns: minmax(0, 1fr) 42px 42px;
 }
 
 .browser-chat-compose--reference .browser-chat-attach {

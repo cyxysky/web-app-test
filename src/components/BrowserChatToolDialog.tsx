@@ -11,6 +11,7 @@ import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 
 export type BrowserChatToolDialogDetail = {
+  confirmationScreenshotUrl?: string;
   stepIndex: number;
   step: StepExecutionResult;
   toolIndex: number;
@@ -101,6 +102,24 @@ export function BrowserChatToolDialog({
           <section className="browser-chat-tool-detail-section">
             <h3>{t('调用理由')}</h3>
             <p>{detail.tool.reason}</p>
+          </section>
+        ) : null}
+
+        {detail.confirmationScreenshotUrl ? (
+          <section className="browser-chat-tool-detail-section">
+            <h3>{t('用户确认时的页面截图')}</h3>
+            <a
+              className="browser-chat-tool-shot-card"
+              href={detail.confirmationScreenshotUrl}
+              rel="noopener noreferrer"
+              target="_blank"
+            >
+              <img alt={t('用户确认时的页面截图')} src={detail.confirmationScreenshotUrl} />
+              <span>
+                <strong>{t('操作前确认截图')}</strong>
+                <code>{detail.confirmationScreenshotUrl}</code>
+              </span>
+            </a>
           </section>
         ) : null}
 

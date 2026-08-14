@@ -29,7 +29,7 @@ export function browserToolApprovalRequest(input: {
     if (!risk.requiresConfirmation) return undefined;
     return {
       reason,
-      prompt: `即将执行可能产生重要影响的浏览器代码：${risk.reasons.join('；')}`,
+      prompt: reason || `请确认是否执行浏览器代码：${compact(code, 180)}`,
     };
   }
 

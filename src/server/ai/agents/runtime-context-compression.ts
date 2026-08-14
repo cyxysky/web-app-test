@@ -1,3 +1,5 @@
+import type { ModelMessage } from 'ai';
+
 type RuntimeContinuationState = {
   blockers?: unknown;
   completed?: unknown;
@@ -11,6 +13,70 @@ type RuntimeContinuationState = {
 };
 
 const TRANSIENT_BROWSER_EVIDENCE_KEYS = new Set(['axTree', 'domChanges', 'domSnapshot']);
+
+function modelMessageContainsToolCall(message: ModelMessage) {
+  return message.role === 'assistant'
+    && Array.isArray(message.content)
+    && message.content.some((part) => part.type === 'tool-call');
+}
+
+export function atomicRuntimeModelMessageBlocks(messages: ModelMessage[]) {
+  const blocks: ModelMessage[][] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    if (modelMessageContainsToolCall(message)) {
+      const block = [message];
+      while (messages[index + 1]?.role === 'tool') block.push(messages[++index]);
+      blocks.push(block);
+      continue;
+    }
+    blocks.push([message]);
+  }
+  return blocks;
+}
+
+function runtimeModelMessageFingerprint(message: ModelMessage) {
+  try {
+    return JSON.stringify(message);
+  } catch {
+    return undefined;
+  }
+}
+
+export function mergeRuntimeModelMessageChain(base: ModelMessage[], response: ModelMessage[]) {
+  if (!response.length) return [...base];
+  const baseFingerprints = base.map(runtimeModelMessageFingerprint);
+  const responseFingerprints = response.map(runtimeModelMessageFingerprint);
+  for (let overlap = Math.min(base.length, response.length); overlap > 0; overlap -= 1) {
+    const baseStart = base.length - overlap;
+    const matches = responseFingerprints.slice(0, overlap).every((fingerprint, index) => (
+      fingerprint !== undefined
+      && fingerprint === baseFingerprints[baseStart + index]
+    ));
+    if (matches) return [...base, ...response.slice(overlap)];
+  }
+  return [...base, ...response];
+}
+
+export function selectRecentRuntimeMessageBlocks(
+  blocks: ModelMessage[][],
+  tokenEstimate: (block: ModelMessage[]) => number,
+  budgetTokens: number,
+) {
+  const olderBlocks = [...blocks];
+  const retainedBlocks: ModelMessage[][] = [];
+  let retainedTokens = 0;
+  while (olderBlocks.length) {
+    const candidate = olderBlocks.at(-1)!;
+    const candidateTokens = tokenEstimate(candidate);
+    if (retainedTokens + candidateTokens > budgetTokens) break;
+    olderBlocks.pop();
+    retainedBlocks.unshift(candidate);
+    retainedTokens += candidateTokens;
+    if (retainedTokens >= budgetTokens) break;
+  }
+  return { olderBlocks, retainedBlocks, retainedTokens };
+}
 
 function sanitizeContinuationValue(value: unknown): unknown {
   if (typeof value === 'string') {

@@ -26,6 +26,17 @@ test('requires approval for committing browser code', () => {
     toolInput: { code: "await page.getByRole('button', { name: '提交' }).click()", reason: '提交表单' },
   });
   assert.ok(request);
+  assert.equal(request?.prompt, '提交表单');
+});
+
+test('does not require approval for read-only page fetches', () => {
+  assert.equal(browserToolApprovalRequest({
+    toolName: 'browserCode',
+    toolInput: {
+      code: "const response = await fetch('data/document.js', { credentials: 'include' }); return response.text()",
+      reason: '读取 Axure 原型数据',
+    },
+  }), undefined);
 });
 
 test('requires approval before delivering a downloaded file', () => {

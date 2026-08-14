@@ -1,11 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   type BrowserChatHistoryState,
 } from './browser-chat-history-controller';
+
+test('historical subagent data is queried only on the first parallel-group expansion', () => {
+  const queried = new Set<string>();
+  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), true);
+  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), false);
+  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-2'), true);
+});
 
 test('continues loading while logs or steps still have earlier pages', () => {
   assert.equal(browserChatHasEarlierMessages({
@@ -33,6 +41,37 @@ test('window refresh keeps already loaded older records while accepting current 
   assert.equal(merged.history?.messages.cursor, 'older');
 });
 
+test('window refresh keeps historical subagent details when the new page omits them', () => {
+  type OutputCycle = { id: string; refreshed?: boolean };
+  const history = {
+    messages: { hasMore: false },
+    steps: { hasMore: false },
+    logs: { hasMore: false },
+  };
+  const existing = {
+    id: 'chat',
+    history,
+    messages: [],
+    steps: [],
+    logs: [],
+    outputCycles: [{ id: 'main-cycle' }, { id: 'subagent-cycle' }] as OutputCycle[],
+    subagents: [{ id: 'subagent-1' }],
+  };
+  const incoming = {
+    id: 'chat',
+    history,
+    messages: [],
+    steps: [],
+    logs: [],
+    outputCycles: [{ id: 'main-cycle', refreshed: true }] as OutputCycle[],
+    subagents: [],
+  };
+  const merged = mergeBrowserChatSessionWindowData(existing, incoming);
+  assert.deepEqual(merged.outputCycles?.map((cycle) => cycle.id), ['main-cycle', 'subagent-cycle']);
+  assert.deepEqual(merged.subagents?.map((subagent) => subagent.id), ['subagent-1']);
+  assert.equal(merged.outputCycles?.[0]?.refreshed, true);
+});
+
 test('older history chunks merge without duplicating messages', () => {
   const current: {
     history?: BrowserChatHistoryState;
@@ -47,4 +86,21 @@ test('older history chunks merge without duplicating messages', () => {
   });
   assert.deepEqual(merged.messages.map((message) => message.id), ['old', 'new']);
   assert.equal(merged.history?.messages.hasMore, false);
+});
+
+test('first historical subagent query adds details without replacing main output cycles', () => {
+  const current = {
+    id: 'chat',
+    messages: [],
+    steps: [],
+    logs: [],
+    outputCycles: [{ id: 'main-cycle' }],
+    subagents: [] as Array<{ id: string }>,
+  };
+  const merged = mergeBrowserChatHistoryChunkData(current, {
+    outputCycles: [{ id: 'subagent-cycle' }],
+    subagents: [{ id: 'subagent-1' }],
+  });
+  assert.deepEqual(merged.outputCycles?.map((cycle) => cycle.id), ['main-cycle', 'subagent-cycle']);
+  assert.deepEqual(merged.subagents?.map((subagent) => subagent.id), ['subagent-1']);
 });

@@ -87,6 +87,11 @@
   text-align: left;
 }
 
+.browser-chat-readiness-grid > div > div {
+  flex: 1;
+  min-width: 0;
+}
+
 .browser-chat-readiness-grid > div > span,
 .webpilot-help-readiness > div > span {
   align-items: center;

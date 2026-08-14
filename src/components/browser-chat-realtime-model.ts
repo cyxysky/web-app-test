@@ -18,6 +18,18 @@ export function parseBrowserChatRealtimePatch<T extends { session?: { id?: unkno
   return patch;
 }
 
+export function mergeBrowserChatRealtimeRecords<T extends { id: string }>(
+  current: T[] | undefined,
+  incoming: Array<Partial<T> & Pick<T, 'id'>> | undefined,
+) {
+  const byId = new Map((current || []).map((record) => [record.id, record]));
+  for (const record of incoming || []) {
+    const previous = byId.get(record.id);
+    byId.set(record.id, previous ? { ...previous, ...record } : record as T);
+  }
+  return [...byId.values()];
+}
+
 export function mergeBrowserChatRealtimeCollections<
   TMessage extends { clientMessageId?: string; id: string; role?: string; createdAt?: string; updatedAt?: string },
   TStep extends { index: number },

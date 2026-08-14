@@ -96,6 +96,10 @@ copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
 copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverRoot, 'webpilot-server.js'));
 copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverRoot, 'webpilot-identity.js'));
 copyInto(path.join(root, 'server', 'realtime-refresh-hub.js'), path.join(serverRoot, 'realtime-refresh-hub.js'));
+copyInto(
+  path.join(root, 'src', 'server', 'files', 'libreoffice-office-worker.py'),
+  path.join(serverRoot, 'src', 'server', 'files', 'libreoffice-office-worker.py'),
+);
 copyBrowserSessionExtension();
 copyPlaywrightChromium();
 

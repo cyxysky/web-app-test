@@ -8,6 +8,7 @@ import {
   isBrowserChatAiFailureLog,
   isBrowserChatContextCompressionLog,
   isBrowserChatScreenshotPerformanceLog,
+  isBrowserChatToolLifecycleLog,
   summarizeBrowserChatExecutionTotals,
   summarizeBrowserChatLogs,
 } from '@/components/browser-chat-log-model';
@@ -145,10 +146,10 @@ function aiLogTimingPayload(details: Record<string, unknown> | undefined, t: Tra
 
 function contextCompressionLabel(log: BrowserChatLogDialogRecord) {
   if (!isBrowserChatContextCompressionLog(log)) return '';
-  if (log.phase === 'ai:context-segmented') return 'Agent Loop 上下文压缩';
-  if (log.phase === 'conversation:context:request') return '历史对话上下文开始压缩';
-  if (log.phase === 'conversation:context:response') return '历史对话上下文压缩完成';
-  if (log.phase === 'conversation:context:error') return '历史对话上下文压缩失败';
+  if (log.phase.endsWith('ai:context-segmented')) return 'Agent Loop 上下文压缩';
+  if (log.phase.endsWith('conversation:context:request')) return '历史对话上下文开始压缩';
+  if (log.phase.endsWith('conversation:context:response')) return '历史对话上下文压缩完成';
+  if (log.phase.endsWith('conversation:context:error')) return '历史对话上下文压缩失败';
   return '';
 }
 
@@ -206,6 +207,7 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
   const isAiRequestLog = log.phase.endsWith('ai:runtime:request');
   const isAiResponseLog = log.phase.endsWith('ai:runtime:response') || log.phase.endsWith('ai:runtime:object');
   const isAiFailureLog = isBrowserChatAiFailureLog(log);
+  const isToolLifecycleLog = isBrowserChatToolLifecycleLog(log);
   const isConversationSummaryRequest = log.phase === 'conversation:context:request';
   const isConversationSummaryResponse = log.phase === 'conversation:context:response';
   if (!parsed) return null;
@@ -235,9 +237,13 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
       : '';
   const timingPayload = isAiResponseLog ? aiLogTimingPayload(payloadDetails, t) : '';
   const errorPayload = isAiFailureLog ? formatToolPayload(parsed) : '';
+  const toolPayload = isToolLifecycleLog ? formatToolPayload({
+    execution: payloadDetails.execution,
+    trace: payloadDetails.trace,
+  }) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
   const requestTokens = isAiRequestLog ? finiteNumber(asRecord(payloadDetails.aiInputTokens)?.estimatedTextTokens) : undefined;
-  if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload) return null;
+  if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
   return (
     <div className="browser-chat-log-details">
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title={t('耗时明细')} />
@@ -254,6 +260,7 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
         })}</p>
       ) : null}
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title={t('错误详情')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-tool" payload={toolPayload} title={t('工具日志 JSON')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title={t('截图性能')} />
     </div>
   );
@@ -310,6 +317,7 @@ function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogR
   const rowVirtualizer = useVirtualizer({
     count: entries.length,
     estimateSize: () => logVirtualRowEstimate,
+    getItemKey: (index) => entries[index]?.id || index,
     getScrollElement: () => scrollRef.current,
     overscan: 8,
   });
@@ -337,11 +345,13 @@ function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogR
           if (!log) return null;
           return (
             <BrowserChatLogEntry
-              key={log.id}
+              key={virtualRow.key}
               log={log}
               measureRef={rowVirtualizer.measureElement}
               style={{
+                left: 0,
                 position: 'absolute',
+                top: 0,
                 transform: `translateY(${virtualRow.start}px)`,
                 width: '100%',
               }}
@@ -400,6 +410,7 @@ export function BrowserChatLogDialog({
         {entries.length ? (
           <div className="browser-chat-log-summary" aria-label={t('日志摘要')}>
             <span>AI {summary.ai}</span>
+            <span>{t('工具')} {summary.tool}</span>
             <span>{t('上下文')} {summary.context}</span>
             <span>{t('截图')} {summary.screenshot}</span>
             <span>{t('总计')} {summary.total}</span>

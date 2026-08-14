@@ -2,8 +2,24 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   mergeBrowserChatRealtimeCollections,
+  mergeBrowserChatRealtimeRecords,
   parseBrowserChatRealtimePatch,
 } from './browser-chat-realtime-model';
+
+test('realtime record patches retain rendered subagents while updating their status', () => {
+  const current = [
+    { id: 'subagent-1', status: 'running', steps: [{ index: 1 }] },
+    { id: 'subagent-2', status: 'passed', steps: [{ index: 2 }] },
+  ];
+  const merged = mergeBrowserChatRealtimeRecords(current, [
+    { id: 'subagent-1', status: 'passed' },
+  ]);
+  assert.deepEqual(merged, [
+    { id: 'subagent-1', status: 'passed', steps: [{ index: 1 }] },
+    { id: 'subagent-2', status: 'passed', steps: [{ index: 2 }] },
+  ]);
+  assert.deepEqual(mergeBrowserChatRealtimeRecords(current, []), current);
+});
 
 test('browser-chat realtime collections replace newer records and prune removals', () => {
   const merged = mergeBrowserChatRealtimeCollections({

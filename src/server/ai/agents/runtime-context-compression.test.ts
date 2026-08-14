@@ -1,11 +1,98 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { buildRuntimeContinuationSummaryPrompt, sanitizeRuntimeContinuationSummary } from './runtime-context-compression';
-import { runtimeContextCompressionThresholdRatio, runtimeContextWindowTokens } from './runtime-context-budget';
+import type { ModelMessage } from 'ai';
+import {
+  atomicRuntimeModelMessageBlocks,
+  buildRuntimeContinuationSummaryPrompt,
+  mergeRuntimeModelMessageChain,
+  sanitizeRuntimeContinuationSummary,
+  selectRecentRuntimeMessageBlocks,
+} from './runtime-context-compression';
+import {
+  runtimeContextCompressionTargetCeilingRatio,
+  runtimeContextCompressionTargetFloorRatio,
+  runtimeContextCompressionThresholdRatio,
+  runtimeContextWindowTokens,
+} from './runtime-context-budget';
 
-test('runtime context defaults to a 256k window and seventy percent threshold', () => {
+test('runtime context uses an eighty-five percent trigger and a ten-to-twenty percent compression target', () => {
   assert.equal(runtimeContextWindowTokens(), 256000);
-  assert.equal(runtimeContextCompressionThresholdRatio(), 0.7);
+  assert.equal(runtimeContextCompressionThresholdRatio(), 0.85);
+  assert.equal(runtimeContextCompressionTargetFloorRatio(), 0.1);
+  assert.equal(runtimeContextCompressionTargetCeilingRatio(), 0.2);
+});
+
+test('compression never separates an assistant tool call from its tool result', () => {
+  const messages: ModelMessage[] = [
+    { role: 'user', content: '检查页面' },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'tool-1', toolName: 'inspect', input: { action: 'capture' } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'tool-1', toolName: 'inspect', output: { type: 'text', value: 'done' } }],
+    },
+    { role: 'assistant', content: '页面检查完成' },
+  ];
+  const blocks = atomicRuntimeModelMessageBlocks(messages);
+  assert.deepEqual(blocks.map((block) => block.map((message) => message.role)), [
+    ['user'],
+    ['assistant', 'tool'],
+    ['assistant'],
+  ]);
+});
+
+test('merges an SDK response chain without duplicating messages already prepared for the final step', () => {
+  const user: ModelMessage = { role: 'user', content: '分析全部链接' };
+  const firstCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'inspect-1', toolName: 'browserCode', input: {} }],
+  };
+  const firstResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'inspect-1', toolName: 'browserCode', output: { type: 'text', value: '9 links' } }],
+  };
+  const spawnCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'spawn-1', toolName: 'spawnSubagents', input: {} }],
+  };
+  const spawnResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'spawn-1', toolName: 'spawnSubagents', output: { type: 'text', value: 'completed' } }],
+  };
+  const merged = mergeRuntimeModelMessageChain(
+    [user, firstCall, firstResult],
+    [firstCall, firstResult, spawnCall, spawnResult],
+  );
+  assert.deepEqual(merged, [user, firstCall, firstResult, spawnCall, spawnResult]);
+});
+
+test('compression keeps only complete recent blocks that fit the ten-percent raw-tail budget', () => {
+  const blocks: ModelMessage[][] = [
+    [{ role: 'user', content: 'old' }],
+    [{ role: 'assistant', content: 'middle' }],
+    [{ role: 'assistant', content: 'recent' }],
+  ];
+  const weights = new Map([['old', 12], ['middle', 7], ['recent', 5]]);
+  const selected = selectRecentRuntimeMessageBlocks(
+    blocks,
+    (block) => weights.get(String(block[0]?.content)) || 0,
+    10,
+  );
+  assert.deepEqual(selected.retainedBlocks.flat().map((message) => message.content), ['recent']);
+  assert.equal(selected.retainedTokens, 5);
+  assert.equal(selected.olderBlocks.length, 2);
+});
+
+test('an oversized atomic tool block is summarized instead of breaking the twenty-percent ceiling', () => {
+  const toolBlock: ModelMessage[] = [
+    { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'huge', toolName: 'inspect', input: {} }] },
+    { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'huge', toolName: 'inspect', output: { type: 'text', value: 'x'.repeat(10_000) } }] },
+  ];
+  const selected = selectRecentRuntimeMessageBlocks([toolBlock], () => 2_500, 1_000);
+  assert.deepEqual(selected.retainedBlocks, []);
+  assert.deepEqual(selected.olderBlocks, [toolBlock]);
 });
 
 test('continuation compression explicitly merges a previous summary with only a delta', () => {

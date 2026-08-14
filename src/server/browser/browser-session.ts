@@ -394,6 +394,7 @@ export type ScreenshotCaptureMode = 'viewport' | 'fullPage';
 
 type ScreenshotCaptureOptions = {
   capture?: ScreenshotCaptureMode;
+  outputPixelRatio?: number;
 };
 
 type InteractiveCandidate = {
@@ -2619,9 +2620,16 @@ export class BrowserSession {
     const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
     const viewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() === 'fixed' ? 'fixed' : 'auto';
     const fixedViewport = fixedBrowserViewportFromEnv();
-    const viewport = fixedViewport || (headless
-      ? { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 }
-      : undefined);
+    const connectedExternalBrowser = this.browserSurface === 'external'
+      && (this.transportKind === 'cdp' || this.transportKind === 'persistent-cdp' || this.transportKind === 'shared');
+    // A connected browser owns its native window and CSS viewport. Applying a
+    // Playwright viewport override here makes the real test browser appear
+    // shrunken after an otherwise read-only screenshot/inspection operation.
+    const viewport = connectedExternalBrowser
+      ? undefined
+      : fixedViewport || (headless
+        ? { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 }
+        : undefined);
     const settingKey = [
       viewportMode,
       process.env.BROWSER_VIEWPORT_WIDTH || '',
@@ -2629,6 +2637,7 @@ export class BrowserSession {
       headless ? 'headless' : 'headful',
       fullscreen ? 'fullscreen' : 'windowed',
       this.browserSurface,
+      this.transportKind || 'not-started',
     ].join(':');
     if (this.configuredViewportKeyByPage.get(page) === settingKey) return;
 
@@ -3605,9 +3614,10 @@ export class BrowserSession {
   private async capturePngScreenshot(input: {
     capture: ScreenshotCaptureMode;
     filePath: string;
+    outputPixelRatio?: number;
     timeoutMs: number;
   }) {
-    const outputPixelRatio = browserOutputPixelRatioFromEnv();
+    const outputPixelRatio = input.outputPixelRatio ?? browserOutputPixelRatioFromEnv();
     if (outputPixelRatio === 1) {
       await this.activePage.screenshot({
         animations: 'disabled',
@@ -3739,6 +3749,7 @@ export class BrowserSession {
       await timed('capturePrimaryScreenshot', () => this.capturePngScreenshot({
         capture,
         filePath,
+        outputPixelRatio: options.outputPixelRatio,
         timeoutMs: screenshotTimeoutMs,
       }), () => ({ path: filePath }));
     } catch (error) {
@@ -3760,6 +3771,7 @@ export class BrowserSession {
         await timed('captureMarkerScreenshot', () => this.capturePngScreenshot({
           capture,
           filePath: markerFilePath,
+          outputPixelRatio: options.outputPixelRatio,
           timeoutMs: screenshotTimeoutMs,
         }), () => ({ path: markerFilePath }));
         this.lastCandidateMarkerScreenshotPath = markerFilePath;
@@ -3789,7 +3801,7 @@ export class BrowserSession {
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
-      outputPixelRatio: browserOutputPixelRatioFromEnv(),
+      outputPixelRatio: options.outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
       capture,
       generation: ++this.screenshotGenerationSequence,
       page: this.activePage,
@@ -3830,6 +3842,7 @@ export class BrowserSession {
     await this.capturePngScreenshot({
       capture,
       filePath,
+      outputPixelRatio: options.outputPixelRatio,
       timeoutMs: screenshotTimeoutMs,
     });
     const [image, viewportMetrics, scrollPosition] = await Promise.all([
@@ -3843,7 +3856,7 @@ export class BrowserSession {
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
-      outputPixelRatio: browserOutputPixelRatioFromEnv(),
+      outputPixelRatio: options.outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
       capture,
       generation: ++this.screenshotGenerationSequence,
       page: this.activePage,

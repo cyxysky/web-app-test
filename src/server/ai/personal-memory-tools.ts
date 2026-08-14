@@ -25,10 +25,12 @@ export type PersonalMemoryToolName = (typeof personalMemoryToolNames)[number];
 export type PersonalMemoryToolContext = {
   userId?: unknown;
   currentUrl?: string;
+  getCurrentUrl?: () => string;
   sourceSessionId?: string;
   sourceMessageIds?: string[];
   userMessages?: string[];
   readOnly?: boolean;
+  usedMemoryIds?: Set<string>;
 };
 
 const memoryScopeSchema = z.enum(['global', 'domain']);
@@ -100,7 +102,15 @@ function explicitMemoryManagementRequest(context: PersonalMemoryToolContext, evi
 
 export function createPersonalMemoryTools(context: PersonalMemoryToolContext): ToolSet {
   const userId = normalizePersonalMemoryUserId(context.userId);
-  const currentDomain = normalizePersonalMemoryDomain(context.currentUrl || '');
+  const usedMemoryIds = context.usedMemoryIds || new Set<string>();
+  const currentUrl = () => context.getCurrentUrl?.() || context.currentUrl || '';
+  const currentDomain = () => normalizePersonalMemoryDomain(currentUrl());
+  const markUsedOnce = (ids: string[]) => {
+    const unusedIds = Array.from(new Set(ids.filter((id) => id && !usedMemoryIds.has(id))));
+    if (!unusedIds.length) return;
+    markPersonalMemoryItemsUsed(unusedIds);
+    unusedIds.forEach((id) => usedMemoryIds.add(id));
+  };
 
   return {
     searchMemory: tool({
@@ -113,10 +123,10 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
         const results = searchPersonalMemory({
           userId,
           query,
-          domain: currentDomain,
+          domain: currentDomain(),
           limit,
         });
-        markPersonalMemoryItemsUsed(results.map((result) => result.item.id));
+        markUsedOnce(results.map((result) => result.item.id));
         return {
           items: results.map((result) => ({
             ...toolMemoryItem(result.item),
@@ -136,7 +146,7 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
       execute: async (input) => {
         assertWritable(context);
         const draft = durableDraft(input, context);
-        const domain = draft.scope === 'domain' ? draft.domain || currentDomain : '';
+        const domain = draft.scope === 'domain' ? draft.domain || currentDomain() : '';
         if (draft.scope === 'domain' && !domain) {
           throw new Error('Domain-scoped memory requires a current URL or an explicit domain.');
         }
@@ -146,7 +156,7 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
           domain,
           sourceSessionId: context.sourceSessionId,
           sourceMessageIds: context.sourceMessageIds,
-          sourceUrl: context.currentUrl,
+          sourceUrl: currentUrl(),
         });
         return { item: toolMemoryItem(item) };
       },

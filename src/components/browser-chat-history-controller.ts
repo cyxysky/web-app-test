@@ -39,10 +39,42 @@ export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | u
   );
 }
 
+export function beginHistoricalSubagentQuery(queriedKeys: Set<string>, key: string) {
+  if (queriedKeys.has(key)) return false;
+  queriedKeys.add(key);
+  return true;
+}
+
 function messageKey(message: MessageLike) {
   return message.clientMessageId && message.role
     ? `client:${message.clientMessageId}:${message.role}`
     : `id:${message.id}`;
+}
+
+function historyRecordId(value: unknown) {
+  if (!value || typeof value !== 'object' || !('id' in value)) return undefined;
+  const id = value.id;
+  return typeof id === 'string' || typeof id === 'number' ? String(id) : undefined;
+}
+
+function mergeHistoryRecords<T>(existing: T[] | undefined, incoming: T[] | undefined) {
+  const merged = [...(existing || [])];
+  const indexes = new Map<string, number>();
+  merged.forEach((value, index) => {
+    const id = historyRecordId(value);
+    if (id !== undefined) indexes.set(id, index);
+  });
+  for (const value of incoming || []) {
+    const id = historyRecordId(value);
+    const index = id === undefined ? undefined : indexes.get(id);
+    if (index === undefined) {
+      if (id !== undefined) indexes.set(id, merged.length);
+      merged.push(value);
+    } else {
+      merged[index] = value;
+    }
+  }
+  return merged;
 }
 
 export function mergeBrowserChatSessionWindowData<
@@ -63,8 +95,8 @@ export function mergeBrowserChatSessionWindowData<
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
-    outputCycles: incoming.outputCycles || existing.outputCycles || [],
-    subagents: incoming.subagents || existing.subagents || [],
+    outputCycles: mergeHistoryRecords(existing.outputCycles, incoming.outputCycles),
+    subagents: mergeHistoryRecords(existing.subagents, incoming.subagents),
     history: existing.history || incoming.history,
   };
 }
@@ -101,8 +133,8 @@ export function mergeBrowserChatHistoryChunkData<
     messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
     steps: [...steps.values()].sort((a, b) => a.index - b.index),
     logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
-    outputCycles: chunk.outputCycles || current.outputCycles || [],
-    subagents: chunk.subagents || current.subagents || [],
+    outputCycles: mergeHistoryRecords(current.outputCycles, chunk.outputCycles),
+    subagents: mergeHistoryRecords(current.subagents, chunk.subagents),
     history: {
       messages: chunk.history?.messages || previousHistory.messages,
       steps: chunk.history?.steps || previousHistory.steps,

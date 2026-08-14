@@ -80,15 +80,15 @@ test('continues an incomplete stream after its final tool result completed', () 
     terminatesTurn: false,
     status: 'passed',
   });
-});
-
-test('does not continue other when text or a completed tool result is missing', () => {
   assert.equal(aiSdkToolResultRequiresContinuation({
     finishReason: 'other',
-    responseText: 'final answer',
+    responseText: '正在并行分析链接。',
     toolCallCount: 1,
     toolResultCount: 1,
-  }), false);
+  }), true);
+});
+
+test('does not continue other when a completed tool result is missing', () => {
   assert.equal(aiSdkToolResultRequiresContinuation({
     finishReason: 'other',
     responseText: '',

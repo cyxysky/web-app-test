@@ -23,9 +23,6 @@ export default function nextConfig(phase: string): NextConfig {
     },
     serverExternalPackages: [
       'playwright',
-      'docx',
-      'pdfkit',
-      'pptxgenjs',
       'pdf-parse',
       'ai-sdk-provider-gemini-cli',
       '@google/gemini-cli-core',

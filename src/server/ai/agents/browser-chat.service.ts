@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { generateText } from 'ai';
 import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type {
   BrowserCodeAttachmentBinding,
@@ -17,7 +17,6 @@ import {
   type BrowserChatReadFileInput,
   type BrowserChatSubagentReader,
   type BrowserChatSubagentTask,
-  type InteractiveBrowserTurnMessage,
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-generator.agent';
@@ -29,10 +28,11 @@ import {
 } from '@/server/ai/agents/browser-chat-attachments';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import {
-  estimateRuntimeTextTokens,
-  runtimeContextCompressionThresholdRatio,
-  runtimeContextWindowTokens,
-} from '@/server/ai/agents/runtime-context-budget';
+  normalizeBrowserChatModelContext,
+  serializableBrowserChatModelMessages,
+  type BrowserChatModelContext,
+} from '@/server/ai/agents/browser-chat-model-context';
+import { browserChatConversationAttentionContext } from '@/server/ai/agents/browser-chat-conversation-attention';
 import {
   alignBrowserChatMessageStepIndexes,
   attachBrowserChatStepOwners,
@@ -57,7 +57,14 @@ import {
   transitionBrowserChatSession,
   type BrowserChatTurnState,
 } from '@/server/ai/agents/browser-chat-session-state';
-import { formatSkillReferencesForUser, formatSkillSummariesForPrompt, runtimeSkillsForUrl } from '@/server/ai/agents/skill-context';
+import {
+  formatLoadedSkillsForPrompt,
+  formatSkillReferencesForUser,
+  formatSkillSummariesForPrompt,
+  normalizeSkillDomains,
+  runtimeSkillsForUrl,
+  skillMatchesUrl,
+} from '@/server/ai/agents/skill-context';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
   extractPersonalMemoryFromTurn,
@@ -68,8 +75,7 @@ import {
   searchPersonalMemory,
 } from '@/server/ai/personal-memory';
 import { createPersonalMemoryTools } from '@/server/ai/personal-memory-tools';
-import { getModel, getModelSettings, withModelSettings } from '@/server/ai/model';
-import { aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { withModelSettings } from '@/server/ai/model';
 import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
 import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
 import type {
@@ -111,6 +117,7 @@ import {
   type BrowserChatPersistenceCursor as PersistenceCursor,
 } from './browser-chat-persistence-delta';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
+import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
   listLoginAccounts,
@@ -135,7 +142,7 @@ export type BrowserChatMessage = {
     label: string;
     updatedAt: string;
   };
-  status?: 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
+  status?: 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
 
 export type BrowserChatLogRecord = {
@@ -152,14 +159,16 @@ export type BrowserChatLogRecord = {
   toolCallId?: string;
 };
 
-export type BrowserChatConversationContext = {
-  version: 1;
-  updatedAt: string;
-  coveredMessageIds: string[];
-  summary: string;
-};
-
 export type BrowserChatSafetyMode = 'strict' | 'full';
+
+export type BrowserChatQueuedTurn = {
+  id: string;
+  userMessageId: string;
+  safetyMode: BrowserChatSafetyMode;
+  modelProvider: ModelProvider;
+  model: string;
+  queuedAt: string;
+};
 
 export type BrowserChatToolConfirmation = {
   id: string;
@@ -169,6 +178,7 @@ export type BrowserChatToolConfirmation = {
   inputSignature: string;
   reason?: string;
   prompt: string;
+  screenshotUrl?: string;
   requestedAt: string;
 };
 
@@ -198,7 +208,7 @@ export type BrowserChatSessionSnapshot = {
   consoleErrors: string[];
   networkErrors: string[];
   logs: BrowserChatLogRecord[];
-  conversationContext?: BrowserChatConversationContext;
+  queuedTurns: BrowserChatQueuedTurn[];
   pendingToolConfirmation?: BrowserChatToolConfirmation;
 };
 
@@ -206,12 +216,18 @@ export type BrowserChatSessionPage = BrowserChatSessionSnapshot & {
   history: BrowserChatHistoryState;
 };
 
-type BrowserChatSessionRecord = Omit<BrowserChatSessionSnapshot, 'turnState'> & {
+type BrowserChatPersistedSessionSnapshot = BrowserChatSessionSnapshot & {
+  modelContext?: BrowserChatModelContext;
+};
+
+type BrowserChatSessionRecord = Omit<BrowserChatPersistedSessionSnapshot, 'turnState'> & {
   turnState: BrowserChatTurnState;
+  modelContext: BrowserChatModelContext;
   activeAssistantMessageId?: string;
   activeAbortController?: AbortController;
   browser?: BrowserSession;
   started: boolean;
+  usedMemoryIdsByTurn?: Map<string, Set<string>>;
 };
 
 type BrowserChatPersistenceCursor = PersistenceCursor<BrowserChatMessage, StepExecutionResult, BrowserChatLogRecord>;
@@ -413,7 +429,7 @@ function cancelBrowserChatSessionEviction(sessionId: string) {
 }
 
 function browserChatSessionHasRuntimeWork(session: BrowserChatSessionRecord) {
-  if (session.busy || session.status === 'running' || session.browser || session.pendingToolConfirmation) return true;
+  if (session.busy || session.status === 'running' || session.browser || session.pendingToolConfirmation || session.queuedTurns.length) return true;
   if (activeTurns.has(session.id) || browserStartPromises.has(session.id)) return true;
   if ((browserPreviewCounts.get(browserChatUserRuntimeKey(session.userId)) || 0) > 0) return true;
   return [...blockedSubagents.values()].some((binding) => binding.sessionId === session.id);
@@ -447,7 +463,7 @@ function browserChatUserHasActiveWork(userKey: string) {
   if ((browserPreviewCounts.get(userKey) || 0) > 0) return true;
   return [...sessions.values()].some((session) => (
     browserChatUserRuntimeKey(session.userId) === userKey
-    && (session.busy || session.status === 'running' || session.turnState === 'awaiting_human')
+    && (session.busy || session.status === 'running' || session.turnState === 'awaiting_human' || session.queuedTurns.length > 0)
   ));
 }
 
@@ -637,7 +653,6 @@ function browserChatPersonalMemoryContext(input: {
     && !input.excludedIds?.has(result.item.id)
   ));
   if (!results.length) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  markPersonalMemoryItemsUsed(results.map((result) => result.item.id));
   appendLog(input.session, input.logPhase || 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
     details: {
       currentDomain,
@@ -828,12 +843,30 @@ function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation 
     inputSignature,
     reason: typeof record.reason === 'string' && record.reason.trim() ? compactText(record.reason, 300) : undefined,
     prompt: compactText(prompt, 500),
+    screenshotUrl: typeof record.screenshotUrl === 'string' && record.screenshotUrl.trim()
+      ? record.screenshotUrl.trim()
+      : undefined,
     requestedAt: typeof record.requestedAt === 'string' ? record.requestedAt : now(),
   };
 }
 
 function now() {
   return new Date().toISOString();
+}
+
+function browserChatTurnUsedMemoryIds(session: BrowserChatSessionRecord, assistantMessageId: string) {
+  const byTurn = session.usedMemoryIdsByTurn || new Map<string, Set<string>>();
+  session.usedMemoryIdsByTurn = byTurn;
+  const existing = byTurn.get(assistantMessageId);
+  if (existing) return existing;
+  while (byTurn.size >= 8) {
+    const oldestTurnId = byTurn.keys().next().value;
+    if (!oldestTurnId) break;
+    byTurn.delete(oldestTurnId);
+  }
+  const usedMemoryIds = new Set<string>();
+  byTurn.set(assistantMessageId, usedMemoryIds);
+  return usedMemoryIds;
 }
 
 function id(prefix: string) {
@@ -898,14 +931,15 @@ function stringifyCompactLogDetails(value: unknown) {
 }
 
 function logDetailsFromUnknown(input: unknown) {
-  const { value } = unwrapLogDetails(input);
+  const { value, full } = unwrapLogDetails(input);
   if (value === undefined || value === null || value === '') return undefined;
-  if (typeof value === 'string') return trimLogText(value, 20_000);
+  if (typeof value === 'string') return full ? value.trim() : trimLogText(value, 20_000);
   try {
-    const serialized = stringifyCompactLogDetails(value) || String(value);
-    return trimLogText(serialized, 20_000);
+    const serialized = (full ? stringifyJsonSafe(value, 2) : stringifyCompactLogDetails(value)) || String(value);
+    return full ? serialized.trim() : trimLogText(serialized, 20_000);
   } catch {
-    return trimLogText(String(value), 20_000);
+    const fallback = String(value);
+    return full ? fallback.trim() : trimLogText(fallback, 20_000);
   }
 }
 
@@ -1018,24 +1052,6 @@ function sessionBelongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'
   return normalizeUserId(session.userId) === normalizeUserId(userId);
 }
 
-function normalizeConversationContext(value: unknown): BrowserChatConversationContext | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const record = value as Partial<BrowserChatConversationContext>;
-  const arrayOfStrings = (items: unknown, limit: number, max = 420) => (
-    Array.isArray(items)
-      ? items.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map((item) => compactText(item, max)).slice(-limit)
-      : []
-  );
-  const summary = typeof record.summary === 'string' ? record.summary.trim() : '';
-  if (!summary) return undefined;
-  return {
-    version: 1,
-    updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : now(),
-    coveredMessageIds: arrayOfStrings(record.coveredMessageIds, 300, 120),
-    summary: compactText(summary, 12000),
-  };
-}
-
 function normalizeAttachments(value: unknown, userId?: unknown): BrowserChatAttachment[] {
   return normalizeBrowserChatAttachments(value, userId);
 }
@@ -1089,6 +1105,7 @@ async function readFileForSession(
     limit: input.limit,
     offset: input.offset,
     pages: input.pages,
+    previewRoot: artifactPath(session.id, 'attachment-previews'),
   });
   return isBrowserChatImageAttachment(attachment) && result.ok
     ? { ...result, referenceImagePath: uploadedBrowserChatAttachmentPath(attachment, session.userId) }
@@ -1103,6 +1120,7 @@ type BrowserChatResourceSeed = {
 
 type BrowserChatCredentialDescriptor = {
   accountId: string;
+  label: string;
   origins: string[];
   username: string;
   usernameRef: string;
@@ -1126,11 +1144,25 @@ function httpOrigin(value?: string) {
   }
 }
 
-function instructionMentionsLoginAccount(instruction: string, account: LoginAccountMetadata) {
+function loginAccountMentionScore(instruction: string, account: LoginAccountMetadata) {
   const normalized = instruction.toLowerCase();
-  return normalized.includes(account.username.toLowerCase())
-    || normalized.includes(account.domain.toLowerCase())
-    || Boolean(account.loginUrl && normalized.includes(account.loginUrl.toLowerCase()));
+  let score = 0;
+  if (account.label && normalized.includes(account.label.toLowerCase())) score += 16;
+  if (account.username && normalized.includes(account.username.toLowerCase())) score += 12;
+  if (account.loginUrl && normalized.includes(account.loginUrl.toLowerCase())) score += 8;
+  if (account.domain && normalized.includes(account.domain.toLowerCase())) score += 4;
+  return score;
+}
+
+function mentionedLoginAccounts(instruction: string, accounts: LoginAccountMetadata[]) {
+  const scored = accounts
+    .map((account) => ({ account, score: loginAccountMentionScore(instruction, account) }))
+    .filter((item) => item.score > 0);
+  if (!scored.length) return [];
+  const highestScore = Math.max(...scored.map((item) => item.score));
+  const strongest = scored.filter((item) => item.score === highestScore);
+  if (highestScore <= 4 && strongest.length > 1) return [];
+  return strongest.map((item) => item.account);
 }
 
 function browserChatCredentialContext(
@@ -1161,14 +1193,17 @@ function browserChatCredentialContext(
     if (!['http:', 'https:'].includes(url.protocol)) continue;
     const accounts = listLoginAccounts({ userId: session.userId, domain: url.hostname })
       .filter((account) => account.status === 'active' && account.hasPassword);
-    const mentioned = accounts.filter((account) => instructionMentionsLoginAccount(instruction, account));
-    const account = mentioned.length === 1 ? mentioned[0] : accounts.length === 1 ? accounts[0] : undefined;
-    if (!account) continue;
-    addAccount(account, [url.origin, httpOrigin(account.loginUrl)]);
+    const mentioned = mentionedLoginAccounts(instruction, accounts);
+    const selected = mentioned.length ? mentioned : accounts.length === 1 ? accounts : [];
+    selected.forEach((account) => addAccount(account, [url.origin, httpOrigin(account.loginUrl)]));
   }
 
-  for (const account of listLoginAccounts({ userId: session.userId })) {
-    if (account.status !== 'active' || !account.hasPassword || !instructionMentionsLoginAccount(instruction, account)) continue;
+  const globallyMentionedAccounts = mentionedLoginAccounts(
+    instruction,
+    listLoginAccounts({ userId: session.userId })
+      .filter((account) => account.status === 'active' && account.hasPassword),
+  );
+  for (const account of globallyMentionedAccounts) {
     addAccount(account, [httpOrigin(account.loginUrl)]);
   }
 
@@ -1181,7 +1216,7 @@ function browserChatCredentialContext(
     const usernameRef = `credential_${token}_username`;
     const passwordRef = `credential_${token}_password`;
     const allowedOrigins = Array.from(origins);
-    credentials.push({ accountId: account.id, origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
+    credentials.push({ accountId: account.id, label: account.label, origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
     bindings.push(
       { ref: usernameRef, value: account.username, allowedOrigins },
       { ref: passwordRef, value: credential.password, allowedOrigins },
@@ -1196,6 +1231,7 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
     '[后台已匹配的安全账号引用]',
     ...credentials.map((item) => [
       `<account id="${item.accountId}">`,
+      `  Name: ${item.label}`,
       `  Origins: ${item.origins.join('、')}`,
       `  Username: ${item.username}`,
       `  用户名：await credentialVault.fill(page.getByLabel('用户名'), "${item.usernameRef}")`,
@@ -1212,20 +1248,33 @@ function createBrowserChatRuntimeOperationalContext(input: {
   text: string;
   modelText: string;
   explicitlySelectedSkills?: SkillRecord[];
+  usedMemoryIds?: Set<string>;
 }) {
-  const loadedSkillIds = new Set<string>();
+  const loadedSkills = new Map<string, SkillRecord>();
+  const usedMemoryIds = input.usedMemoryIds || new Set<string>();
   const explicitlySelectedSkillIds = new Set((input.explicitlySelectedSkills || []).map((skill) => skill.id));
+  const query = [input.text, input.modelText, input.session.title].filter(Boolean).join('\n');
+  let availableSkillIds = new Set<string>();
   const getContext = () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
+    const effectiveUrl = currentUrl || input.session.targetUrl;
     const allSkills = store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready');
+    for (const [skillId, loadedSkill] of loadedSkills) {
+      if (normalizeSkillDomains(loadedSkill.domains).length && !skillMatchesUrl(loadedSkill, effectiveUrl)) {
+        loadedSkills.delete(skillId);
+      }
+    }
+    const activeLoadedSkills = [...loadedSkills.values()];
+    const activeLoadedSkillIds = new Set(activeLoadedSkills.map((skill) => skill.id));
     const explicitlySelectedSkills = allSkills.filter((skill) => explicitlySelectedSkillIds.has(skill.id));
     const skills = runtimeSkillsForUrl(
       allSkills,
       explicitlySelectedSkills,
-      currentUrl || input.session.targetUrl,
-      loadedSkillIds,
-      [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
+      effectiveUrl,
+      activeLoadedSkillIds,
+      query,
     );
+    availableSkillIds = new Set(skills.map((skill) => skill.id));
     const memory = browserChatPersonalMemoryContext({
       session: input.session,
       browser: input.browser,
@@ -1234,6 +1283,11 @@ function createBrowserChatRuntimeOperationalContext(input: {
       currentUrl,
       logPhase: 'memory:prompt:runtime-refresh',
     });
+    const unusedMemoryIds = memory.itemIds.filter((memoryId) => !usedMemoryIds.has(memoryId));
+    if (unusedMemoryIds.length) {
+      markPersonalMemoryItemsUsed(unusedMemoryIds);
+      unusedMemoryIds.forEach((memoryId) => usedMemoryIds.add(memoryId));
+    }
     const credentialUrl = httpOrigin(currentUrl) ? currentUrl : input.session.targetUrl;
     const credentials = browserChatCredentialContext(
       input.session,
@@ -1244,32 +1298,37 @@ function createBrowserChatRuntimeOperationalContext(input: {
       }] : [],
       input.modelText,
     );
+    const conversationAttention = browserChatConversationAttentionContext(input.session.messages);
     return {
       operationalContext: [
+        formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
         browserChatCredentialPrompt(credentials.credentials),
+        conversationAttention,
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
     };
   };
   return Object.assign(getContext, {
     readSkill: async (skillId: string): Promise<BrowserActionResult> => {
-      const skill = store.getSkill(skillId.trim(), input.session.userId);
-      if (!skill || skill.status !== 'ready') {
-        return { ok: false, actual: 'Skill not found or unavailable for the current user.' };
+      const normalizedSkillId = skillId.trim();
+      const currentUrl = browserChatMemoryUrl(input.browser, input.session) || input.session.targetUrl;
+      const skill = store.getSkill(normalizedSkillId, input.session.userId);
+      if (!availableSkillIds.has(normalizedSkillId) || !skill || skill.status !== 'ready') {
+        return { ok: false, actual: 'Skill is not available in the current runtime candidate list.' };
       }
-      loadedSkillIds.add(skill.id);
+      if (normalizeSkillDomains(skill.domains).length && !skillMatchesUrl(skill, currentUrl)) {
+        return { ok: false, actual: 'Skill is not available for the current browser domain.' };
+      }
+      if (loadedSkills.has(skill.id)) {
+        return { ok: false, actual: 'Skill is already loaded in the current browser context.' };
+      }
+      loadedSkills.set(skill.id, skill);
+      availableSkillIds.delete(skill.id);
       return {
         ok: true,
-        actual: [
-          `<skill id="${skill.id}" version="${skill.version}">`,
-          `Title: ${skill.title}`,
-          `Summary: ${skill.description}`,
-          'Content:',
-          skill.content.details.trim(),
-          '</skill>',
-        ].filter(Boolean).join('\n'),
+        actual: `Skill loaded into the current runtime context: ${skill.id} (${normalizeSkillDomains(skill.domains).length ? 'domain-scoped' : 'global'}).`,
       };
     },
   });
@@ -1328,77 +1387,6 @@ function contentWithInlineReferencesForPrompt(content: string, attachments: Brow
     }
     return '';
   }).replace(/[ \t]{2,}/g, ' ').trim();
-}
-
-function messageContentForPrompt(message: BrowserChatMessage, userId?: string) {
-  const selectedSkills = message.skillIds?.length
-    ? store.getSkills(message.skillIds, userId).filter((skill) => skill.status === 'ready')
-    : [];
-  const text = textFromUnknown(message.content);
-  const referencedAttachmentIds = inlineReferencedIds(text, 'ref');
-  const skillReferences = selectedSkills.length
-    ? formatSkillReferencesForUser(selectedSkills)
-    : '';
-  return [
-    contentWithInlineReferencesForPrompt(text, message.attachments || []),
-    skillReferences,
-    attachmentSummary(message.attachments, { excludeIds: referencedAttachmentIds }),
-  ].filter(Boolean).join('\n\n');
-}
-
-function stableConversationMessages(messages: BrowserChatMessage[]) {
-  return messages.filter((message) => (
-    (message.role === 'user' || message.role === 'assistant')
-    && message.status !== 'running'
-    && !isTransientBrowserChatProgress(textFromUnknown(message.content))
-  ));
-}
-
-function browserChatConversationTokenEstimate(messages: InteractiveBrowserTurnMessage[]) {
-  return estimateRuntimeTextTokens(messages.map((message) => `${message.role}: ${message.content}`).join('\n\n'));
-}
-
-function buildConversationSummaryPrompt(input: {
-  previousContext?: BrowserChatConversationContext;
-  messages: BrowserChatMessage[];
-  estimatedTokens: number;
-  thresholdTokens: number;
-  userId?: string;
-}) {
-  const source = {
-    previousSummary: input.previousContext?.summary || '',
-    messages: input.messages.map((message) => ({
-      id: message.id,
-      role: message.role,
-      createdAt: message.createdAt,
-      updatedAt: message.updatedAt,
-      content: messageContentForPrompt(message, input.userId),
-      stepIndexes: message.stepIndexes || [],
-      status: message.status,
-    })),
-  };
-  return [
-    'You are compressing the historical messages of a WebPilot browser chat session.',
-    'Return a concise Chinese summary that will become the first message of future model contexts.',
-    '',
-    'Rules:',
-    '- Preserve user goals, constraints, decisions, completed work, pending work, blockers, useful findings, URLs/pages, and any facts needed to continue.',
-    '- Preserve the order of important events, but do not copy long raw logs or repeated text.',
-    '- Do not summarize the latest user request if it is not included in the input.',
-    '- Do not invent facts.',
-    '- Plain text only. No markdown table.',
-    '',
-    `Estimated historical context tokens before compression: ${input.estimatedTokens}/${input.thresholdTokens}`,
-    '',
-    `Input JSON:\n${stringifyJsonSafe(source, 2) || ''}`,
-  ].join('\n');
-}
-
-function fallbackConversationSummary(input: { previousContext?: BrowserChatConversationContext; messages: BrowserChatMessage[]; userId?: string }) {
-  return [
-    input.previousContext?.summary ? `此前摘要：${input.previousContext.summary}` : '',
-    ...input.messages.map((message) => `${message.role === 'user' ? '用户' : 'AI'}：${messageContentForPrompt(message, input.userId)}`),
-  ].filter(Boolean).join('\n');
 }
 
 function safeJson(value: unknown) {
@@ -1520,7 +1508,7 @@ function sessionSnapshotHeader(
     networkErrors: [...session.networkErrors],
     outputCycles: [...session.outputCycles],
     subagents: [...session.subagents],
-    conversationContext: normalizeConversationContext(session.conversationContext),
+    queuedTurns: [...session.queuedTurns],
     pendingToolConfirmation: normalizeToolConfirmation(session.pendingToolConfirmation),
   };
 }
@@ -1532,7 +1520,7 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     steps: options.fullSteps ? [...session.steps] : session.steps.map(compactStepForClient),
     outputCycles: [...session.outputCycles],
     subagents: [...session.subagents],
-    logs: [...(session.logs || [])],
+    logs: compactBrowserChatLogsForClient(session.logs || []),
   };
 }
 
@@ -1698,7 +1686,7 @@ function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk:
 }
 
 function recordFromSnapshot(
-  session: BrowserChatSessionSnapshot,
+  session: BrowserChatPersistedSessionSnapshot,
   options: { preserveRunningState?: boolean } = {},
 ): BrowserChatSessionRecord {
   const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
@@ -1758,7 +1746,8 @@ function recordFromSnapshot(
     steps,
     outputCycles: session.outputCycles || [],
     subagents: session.subagents || [],
-    conversationContext: normalizeConversationContext(session.conversationContext),
+    queuedTurns: session.queuedTurns || [],
+    modelContext: normalizeBrowserChatModelContext(session.modelContext),
     pendingToolConfirmation: preserveRecentRunningState ? normalizeToolConfirmation(session.pendingToolConfirmation) : undefined,
     status,
     turnState: preserveRecentRunningState
@@ -1788,7 +1777,7 @@ function appendLog(
     : {};
   const logMessageId = input.messageId === null ? undefined : input.messageId ?? session.activeAssistantMessageId;
   const stepIndex = phase.startsWith('subagent:') ? undefined : input.stepIndex;
-  const logRecord = compactBrowserChatLogsForClient<BrowserChatLogRecord>([{
+  const logRecord: BrowserChatLogRecord = {
     id: id('log'),
     time: timestamp,
     phase,
@@ -1800,7 +1789,7 @@ function appendLog(
     turnId: typeof execution.turnId === 'string' ? execution.turnId : undefined,
     attemptId: typeof execution.attemptId === 'string' ? execution.attemptId : undefined,
     toolCallId: typeof execution.toolCallId === 'string' ? execution.toolCallId : undefined,
-  }])[0];
+  };
   replaceSessionLogs(session, [
     ...(session.logs || []),
     logRecord,
@@ -1837,7 +1826,7 @@ function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessi
 }
 
 function readSessionSnapshot(sessionId: string) {
-  const item = readBrowserChatSessionRecord<BrowserChatSessionSnapshot>(sessionId);
+  const item = readBrowserChatSessionRecord<BrowserChatPersistedSessionSnapshot>(sessionId);
   if (!isBrowserChatSessionSnapshot(item)) return undefined;
   return { ...item, logs: trimBrowserChatLogs(item.logs || []) };
 }
@@ -1884,20 +1873,20 @@ function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
   return tracked;
 }
 
-function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSessionRealtimePatch {
-  const retainedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
-  const storedLogs = compactBrowserChatLogsForClient(retainedLogs);
-  const persistedItem = storedLogs === item.logs ? item : { ...item, logs: storedLogs };
-  const rawDelta = persistenceDelta(persistedItem);
-  const delta = {
-    ...rawDelta,
-    logs: compactBrowserChatLogsForClient(rawDelta.logs),
+function writeSessionSnapshot(item: BrowserChatPersistedSessionSnapshot): BrowserChatSessionRealtimePatch {
+  const persistedLogs = item.logs.length > browserChatLogStorageLimit() ? trimBrowserChatLogs(item.logs) : item.logs;
+  const persistedItem = persistedLogs === item.logs ? item : { ...item, logs: persistedLogs };
+  const persistenceChanges = persistenceDelta(persistedItem);
+  const realtimeChanges = {
+    ...persistenceChanges,
+    logs: compactBrowserChatLogsForClient(persistenceChanges.logs),
   };
-  const sessionRecord: Partial<BrowserChatSessionSnapshot> = { ...persistedItem };
+  const sessionRecord: Partial<BrowserChatPersistedSessionSnapshot> = { ...persistedItem };
   delete sessionRecord.messages;
   delete sessionRecord.steps;
   delete sessionRecord.logs;
-  const session = sessionRecord as Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  const persistedSession = sessionRecord as Omit<BrowserChatPersistedSessionSnapshot, 'logs' | 'messages' | 'steps'>;
+  const { modelContext: _modelContext, ...session } = persistedSession;
   const realtimeSession: BrowserChatSessionRealtimePatch['session'] = {
     ...session,
     pendingToolConfirmation: session.pendingToolConfirmation ?? null,
@@ -1906,12 +1895,12 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
   const patch: BrowserChatSessionRealtimePatch = {
     session: realtimeSession,
     summary,
-    ...(delta.messages.length ? { messages: delta.messages } : {}),
-    ...(delta.steps.length ? { steps: delta.steps.map(compactStepForRealtime) } : {}),
-    ...(delta.logs.length ? { logs: delta.logs } : {}),
-    ...(delta.removedMessageIds.length ? { removedMessageIds: delta.removedMessageIds } : {}),
-    ...(delta.removedStepIndexes.length ? { removedStepIndexes: delta.removedStepIndexes } : {}),
-    ...(delta.removedLogIds.length ? { removedLogIds: delta.removedLogIds } : {}),
+    ...(realtimeChanges.messages.length ? { messages: realtimeChanges.messages } : {}),
+    ...(realtimeChanges.steps.length ? { steps: realtimeChanges.steps.map(compactStepForRealtime) } : {}),
+    ...(realtimeChanges.logs.length ? { logs: realtimeChanges.logs } : {}),
+    ...(realtimeChanges.removedMessageIds.length ? { removedMessageIds: realtimeChanges.removedMessageIds } : {}),
+    ...(realtimeChanges.removedStepIndexes.length ? { removedStepIndexes: realtimeChanges.removedStepIndexes } : {}),
+    ...(realtimeChanges.removedLogIds.length ? { removedLogIds: realtimeChanges.removedLogIds } : {}),
   };
   const realtimeEvent = {
     entityType: 'browserChatSession' as const,
@@ -1921,14 +1910,14 @@ function writeSessionSnapshot(item: BrowserChatSessionSnapshot): BrowserChatSess
     patch,
   };
   const sqliteWrite = writeBrowserChatSessionDeltaQueued(
-    { ...session, messages: [], steps: [], logs: [] },
+    { ...persistedSession, messages: [], steps: [], logs: [] },
     summary,
-    delta,
+    persistenceChanges,
   );
   trackSessionSqliteWrite(item.id, sqliteWrite);
   void publishRealtimeRefreshEvent(realtimeEvent).catch(() => undefined);
   if (dirtyRecords.has(item.id)) {
-    advancePersistenceCursor(persistedItem, delta);
+    advancePersistenceCursor(persistedItem, persistenceChanges);
     dirtyRecords.delete(item.id);
   } else {
     seedPersistenceCursor(persistedItem);
@@ -2098,21 +2087,10 @@ function mergePersistedSubagents(existing: BrowserChatSubagentRecord[] = [], inc
   return [...byId.values()].sort((left, right) => left.index - right.index);
 }
 
-function mergePersistedConversationContext(
-  existing?: BrowserChatConversationContext,
-  incoming?: BrowserChatConversationContext,
-) {
-  if (!existing) return normalizeConversationContext(incoming);
-  if (!incoming) return normalizeConversationContext(existing);
-  return timestampValue(incoming.updatedAt) >= timestampValue(existing.updatedAt)
-    ? normalizeConversationContext(incoming)
-    : normalizeConversationContext(existing);
-}
-
 function mergePersistedSessionSnapshot(
-  existing: BrowserChatSessionSnapshot | undefined,
-  incoming: BrowserChatSessionSnapshot,
-): BrowserChatSessionSnapshot {
+  existing: BrowserChatPersistedSessionSnapshot | undefined,
+  incoming: BrowserChatPersistedSessionSnapshot,
+): BrowserChatPersistedSessionSnapshot {
   if (!existing) {
     const steps = attachBrowserChatStepOwners(incoming.steps, incoming.logs);
     return { ...incoming, messages: alignBrowserChatMessageStepIndexes(incoming.messages, steps), steps };
@@ -2130,7 +2108,9 @@ function mergePersistedSessionSnapshot(
     consoleErrors: mergeStringLists(existing.consoleErrors, incoming.consoleErrors),
     networkErrors: mergeStringLists(existing.networkErrors, incoming.networkErrors),
     logs,
-    conversationContext: mergePersistedConversationContext(existing.conversationContext, incoming.conversationContext),
+    modelContext: incomingNewer
+      ? normalizeBrowserChatModelContext(incoming.modelContext)
+      : normalizeBrowserChatModelContext(existing.modelContext),
   };
 }
 
@@ -2151,12 +2131,12 @@ function mergeRuntimeSessionState(fromDisk: BrowserChatSessionRecord, existing: 
     consoleErrors: mergeStringLists(fromDisk.consoleErrors, existing.consoleErrors),
     networkErrors: mergeStringLists(fromDisk.networkErrors, existing.networkErrors),
     logs: mergePersistedLogs(fromDisk.logs, existing.logs),
-    conversationContext: mergePersistedConversationContext(fromDisk.conversationContext, existing.conversationContext),
+    modelContext: normalizeBrowserChatModelContext(existing.modelContext),
     pendingToolConfirmation: existing.pendingToolConfirmation || fromDisk.pendingToolConfirmation,
   };
 }
 
-function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatSessionSnapshot) {
+function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatPersistedSessionSnapshot) {
   const existing = sessions.get(persistedSnapshot.id);
   if (!existing) {
     sessions.set(persistedSnapshot.id, recordFromSnapshot(persistedSnapshot));
@@ -2187,14 +2167,20 @@ function hydrateSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (session && persisted && applied) seedPersistenceCursor(session, persisted);
   else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
-  if (session) scheduleBrowserChatSessionEviction(sessionId);
+  if (session) {
+    scheduleBrowserChatSessionEviction(sessionId);
+    startNextQueuedBrowserChatTurn(session);
+  }
   return session;
 }
 
 function persistSession(sessionId: string, options: { deletedUserId?: string; mergePersisted?: boolean } = {}): BrowserChatSessionRealtimePatch | true | false {
   try {
     const currentSession = sessions.get(sessionId);
-    const incoming = currentSession ? snapshot(currentSession, { fullSteps: true }) : undefined;
+    const incoming: BrowserChatPersistedSessionSnapshot | undefined = currentSession ? {
+      ...snapshot(currentSession, { fullSteps: true }),
+      modelContext: normalizeBrowserChatModelContext(currentSession.modelContext),
+    } : undefined;
     if (!incoming) {
       if (!options.deletedUserId) return false;
       deleteSessionSnapshot(sessionId, options.deletedUserId);
@@ -2273,108 +2259,6 @@ function persistDeletedSessions(items: Array<{ id: string; userId: string }>) {
   } catch (error) {
     warnPersistFailure(error);
     return false;
-  }
-}
-
-function orderedMessagesAfterCoveredContext(messages: BrowserChatMessage[], context?: BrowserChatConversationContext) {
-  if (!context?.coveredMessageIds.length) return messages;
-  const coveredIds = new Set(context.coveredMessageIds);
-  const lastCoveredIndex = messages.reduce((latest, message, index) => (
-    coveredIds.has(message.id) ? index : latest
-  ), -1);
-  return messages.slice(lastCoveredIndex + 1);
-}
-
-function conversationForPrompt(
-  messages: BrowserChatMessage[],
-  context?: BrowserChatConversationContext,
-  currentUserMessageId?: string,
-  userId?: string,
-): InteractiveBrowserTurnMessage[] {
-  const stableMessages = stableConversationMessages(messages)
-    .filter((message) => message.id !== currentUserMessageId);
-  const uncovered = orderedMessagesAfterCoveredContext(stableMessages, context);
-  return [
-    ...(context?.summary ? [{
-      role: 'user' as const,
-      content: `[历史会话总结]\n${context.summary}`,
-    }] : []),
-    ...uncovered.map((message) => ({ role: message.role, content: messageContentForPrompt(message, userId) })),
-  ];
-}
-
-async function ensureConversationContextWithinThreshold(
-  session: BrowserChatSessionRecord,
-  currentUserMessageId?: string,
-  abortSignal?: AbortSignal,
-) {
-  const stableMessages = stableConversationMessages(session.messages);
-  const currentUserIndex = currentUserMessageId ? stableMessages.findIndex((message) => message.id === currentUserMessageId) : -1;
-  const historicalMessages = (currentUserIndex >= 0 ? stableMessages.slice(0, currentUserIndex) : stableMessages)
-    .filter((message) => message.id !== session.activeAssistantMessageId);
-  const currentConversation = conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId);
-  const thresholdTokens = Math.floor(runtimeContextWindowTokens() * runtimeContextCompressionThresholdRatio());
-  const estimatedTokens = browserChatConversationTokenEstimate(currentConversation);
-  if (estimatedTokens <= thresholdTokens) return;
-
-  const previousContext = normalizeConversationContext(session.conversationContext);
-  const sourceMessages = orderedMessagesAfterCoveredContext(historicalMessages, previousContext);
-  if (!previousContext?.summary && !sourceMessages.length) return;
-
-  const prompt = buildConversationSummaryPrompt({
-    previousContext,
-    messages: sourceMessages,
-    estimatedTokens,
-    thresholdTokens,
-    userId: session.userId,
-  });
-  const { provider, model } = getModelSettings();
-  appendLog(session, 'conversation:context:request', '历史对话超过上下文阈值，正在压缩为后续模型上下文开头。', {
-    details: fullLogDetails({
-      provider,
-      model,
-      estimatedTokens,
-      thresholdTokens,
-      prompt,
-    }),
-  });
-  const startedAt = Date.now();
-  try {
-    const timeoutMs = Math.max(1000, Number(process.env.AI_BROWSER_CHAT_CONTEXT_TIMEOUT_MS || process.env.AI_REQUEST_TIMEOUT_MS || 30000));
-    const result = await generateText({
-      model: getModel(),
-      temperature: 0.1,
-      reasoning: aiReasoningEffort(),
-      maxRetries: 0,
-      prompt,
-      abortSignal,
-      timeout: timeoutMs,
-      telemetry: aiTelemetry('browser-chat-context-summary'),
-    });
-    const summary = compactText(result.text || '', 12000) || fallbackConversationSummary({ previousContext, messages: sourceMessages, userId: session.userId });
-    session.conversationContext = {
-      version: 1,
-      updatedAt: now(),
-      coveredMessageIds: historicalMessages.map((message) => message.id).slice(-300),
-      summary,
-    };
-    appendLog(session, 'conversation:context:response', '历史对话已压缩，后续轮次会以该摘要作为 messages 开头。', {
-      elapsedMs: elapsedMs(startedAt),
-      details: fullLogDetails({
-        provider,
-        model,
-        estimatedTokensBefore: estimatedTokens,
-        estimatedTokensAfter: browserChatConversationTokenEstimate(conversationForPrompt(historicalMessages, session.conversationContext, undefined, session.userId)),
-        thresholdTokens,
-        context: session.conversationContext,
-      }),
-    });
-    persistAndNotify(session.id);
-  } catch (error) {
-    if (abortSignal?.aborted) throw abortSignal.reason || error;
-    appendLog(session, 'conversation:context:error', '历史对话压缩失败，本轮继续使用未压缩历史。', {
-      details: errorLogDetails(error),
-    });
   }
 }
 
@@ -2578,9 +2462,11 @@ export function createBrowserChatSession(input: {
     steps: [],
     outputCycles: [],
     subagents: [],
+    queuedTurns: [],
     consoleErrors: [],
     networkErrors: [],
     logs: [],
+    modelContext: normalizeBrowserChatModelContext(undefined),
   };
   session.browserGroupId = `session:${session.id}`;
   sessions.set(session.id, session);
@@ -2596,23 +2482,32 @@ export function getBrowserChatSession(sessionId: string, userId?: string | numbe
 
 export function getBrowserChatSessionPage(sessionId: string, userId?: string | number) {
   const persisted = readBrowserChatSessionWindow<
-    BrowserChatSessionSnapshot,
+    BrowserChatPersistedSessionSnapshot,
     BrowserChatMessage,
     StepExecutionResult,
     BrowserChatLogRecord
   >(sessionId);
   const live = sessions.get(sessionId);
   if (!persisted && !live) return undefined;
-  const base = live ? {
+  const baseWithModelContext = live ? {
     ...sessionSnapshotHeader(live),
     messages: [],
     steps: [],
     logs: [],
   } : persisted as BrowserChatSessionPage;
-  if (!sessionBelongsToUser(base, userId)) return undefined;
+  if (!sessionBelongsToUser(baseWithModelContext, userId)) return undefined;
+  const { modelContext: _modelContext, ...base } = baseWithModelContext as BrowserChatPersistedSessionSnapshot & Partial<BrowserChatSessionPage>;
+  const includeLiveSubagentDetails = Boolean(base.busy || base.status === 'running');
+  const publicBase = {
+    ...base,
+    subagents: includeLiveSubagentDetails ? base.subagents : [],
+    outputCycles: includeLiveSubagentDetails
+      ? base.outputCycles
+      : (base.outputCycles || []).filter((cycle) => !cycle.subagentId),
+  };
   if (!persisted) {
     return {
-      ...base,
+      ...publicBase,
       messages: live?.messages.slice(-80) || [],
       steps: live?.steps.slice(-120).map(compactStepForClient) || [],
       logs: compactBrowserChatLogsForClient(live?.logs.slice(-200) || []),
@@ -2624,7 +2519,7 @@ export function getBrowserChatSessionPage(sessionId: string, userId?: string | n
     } satisfies BrowserChatSessionPage;
   }
   return {
-    ...base,
+    ...publicBase,
     messages: persisted.messages,
     steps: persisted.steps.map(compactStepForClient),
     logs: compactBrowserChatLogsForClient(persisted.logs),
@@ -2644,7 +2539,7 @@ export function getBrowserChatSessionHistory(
     stepLimit?: number;
   },
 ) {
-  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   if (!session) return undefined;
   const messages = input.messageCursor
@@ -2665,9 +2560,12 @@ export function getBrowserChatSessionHistory(
         limit: browserChatHistoryLimit(input.logLimit, 200),
       })
     : undefined;
+  const includeLiveSubagentState = Boolean(session.busy || session.status === 'running');
   return {
-    outputCycles: session.outputCycles || [],
-    subagents: session.subagents || [],
+    outputCycles: includeLiveSubagentState
+      ? session.outputCycles || []
+      : (session.outputCycles || []).filter((cycle) => !cycle.subagentId),
+    subagents: includeLiveSubagentState ? session.subagents || [] : [],
     ...(messages ? { messages: messages.items } : {}),
     ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
     ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),
@@ -2695,12 +2593,18 @@ export function getBrowserChatSessionLogs(
   userId?: string | number,
   input: { cursor?: string; limit?: number; messageId?: string } = {},
 ) {
-  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   if (!session) return undefined;
   const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, input);
   return {
     logs: page.items,
+    subagents: input.messageId
+      ? (session.subagents || []).filter((subagent) => subagent.messageId === input.messageId)
+      : [],
+    outputCycles: input.messageId
+      ? (session.outputCycles || []).filter((cycle) => cycle.messageId === input.messageId && Boolean(cycle.subagentId))
+      : [],
     history: { cursor: page.cursor, hasMore: page.hasMore },
   };
 }
@@ -2736,6 +2640,16 @@ async function stopBrowserChatRuntime(
     session.activeAbortController.abort(reason);
   }
   cancelPendingToolConfirmation(session);
+  if (session.queuedTurns.length) {
+    const queuedMessageIds = new Set(session.queuedTurns.map((item) => item.userMessageId));
+    session.queuedTurns = [];
+    session.messages = session.messages.map((message) => {
+      if (!queuedMessageIds.has(message.id) || message.status !== 'queued') return message;
+      const interruptedMessage = { ...message, status: 'interrupted' as const, updatedAt: now() };
+      markMessageDirty(session, interruptedMessage);
+      return interruptedMessage;
+    });
+  }
 
   // Block new preview/message work before waiting for a browser launch that is
   // already in flight. The completed launch is then closed below as well.
@@ -3029,6 +2943,119 @@ export async function generateBrowserChatMessagesSkill(
   return { skill, sourceMessageIds: uniqueMessageIds };
 }
 
+const browserChatQueuedTurnLimit = 50;
+
+function nextBrowserChatMessageTimestamp(session: BrowserChatSessionRecord) {
+  const latestCreatedAt = session.messages.reduce((latest, message) => {
+    const timestamp = Date.parse(message.createdAt);
+    return Number.isFinite(timestamp) ? Math.max(latest, timestamp) : latest;
+  }, 0);
+  return new Date(Math.max(Date.now(), latestCreatedAt + 1)).toISOString();
+}
+
+function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
+  if (
+    session.status === 'closed'
+    || session.busy
+    || activeTurns.has(session.id)
+    || session.turnState === 'awaiting_human'
+  ) return false;
+
+  let queued: BrowserChatQueuedTurn | undefined;
+  let userMessageIndex = -1;
+  while (session.queuedTurns.length) {
+    const candidate = session.queuedTurns.shift();
+    if (!candidate) break;
+    const candidateIndex = session.messages.findIndex((message) => (
+      message.id === candidate.userMessageId
+      && message.role === 'user'
+      && message.status === 'queued'
+    ));
+    if (candidateIndex < 0) continue;
+    queued = candidate;
+    userMessageIndex = candidateIndex;
+    break;
+  }
+  if (!queued || userMessageIndex < 0) return false;
+
+  store.applyRuntimeEnv();
+  session.mode = configuredBrowserChatMode();
+  cancelPendingToolConfirmation(session);
+  cancelOrphanToolConfirmationsForSession(session.id);
+  transitionBrowserChatSession(session, { type: 'confirmationCleared' });
+  session.safetyMode = normalizeSafetyMode(queued.safetyMode);
+  const modelSettings = browserChatModelSettings(queued.modelProvider, queued.model);
+  session.modelProvider = modelSettings.provider;
+  session.model = modelSettings.model;
+
+  const queuedUserMessage = session.messages[userMessageIndex];
+  const selectedSkills = store.getSkills(queuedUserMessage.skillIds || [], session.userId)
+    .filter((skill) => skill.status === 'ready');
+  const attachments = queuedUserMessage.attachments || [];
+  const messageText = queuedUserMessage.content;
+  const referencedAttachmentIds = inlineReferencedIds(messageText, 'ref');
+  const modelMessageText = [
+    contentWithInlineReferencesForPrompt(messageText, attachments),
+    formatSkillReferencesForUser(selectedSkills),
+    attachmentSummary(attachments, { excludeIds: referencedAttachmentIds }),
+  ].filter(Boolean).join('\n\n');
+  const timestamp = now();
+  const userMessage: BrowserChatMessage = {
+    ...queuedUserMessage,
+    status: undefined,
+    skillIds: selectedSkills.map((skill) => skill.id),
+    updatedAt: timestamp,
+  };
+  session.messages[userMessageIndex] = userMessage;
+  markMessageDirty(session, userMessage);
+
+  const assistantMessage: BrowserChatMessage = {
+    id: id('msg'),
+    role: 'assistant',
+    content: '',
+    createdAt: userMessage.createdAt,
+    updatedAt: timestamp,
+    clientMessageId: userMessage.clientMessageId,
+    status: 'running',
+    stepIndexes: [],
+    activity: {
+      phase: 'chat:queued',
+      label: '已从等待队列取出消息，准备执行对话与浏览器操作',
+      updatedAt: timestamp,
+    },
+  };
+  session.messages.splice(userMessageIndex + 1, 0, assistantMessage);
+  markMessageDirty(session, assistantMessage);
+
+  const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;
+  const abortController = new AbortController();
+  registerBrowserChatTurn(activeTurns, session.id, {
+    session,
+    assistantMessageId: assistantMessage.id,
+    abortController,
+  });
+  transitionBrowserChatSession(session, {
+    type: 'turnStarted',
+    assistantMessageId: assistantMessage.id,
+    abortController,
+    at: timestamp,
+  });
+  persistAndNotify(session.id);
+  appendLog(session, 'chat:dequeued', '等待队列中的下一条消息已开始处理', { messageId: assistantMessage.id });
+  void runBrowserChatMessage(
+    session,
+    messageText,
+    modelMessageText,
+    userMessage.id,
+    assistantMessage.id,
+    fromStepIndex,
+    abortController,
+    attachments,
+    selectedSkills,
+  );
+  return true;
+}
+
 export async function sendBrowserChatMessage(
   sessionId: string,
   content: string,
@@ -3059,7 +3086,48 @@ export async function sendBrowserChatMessage(
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
     return snapshot(session);
   }
-  if (session.busy || activeTurns.has(session.id)) throw new Error('Browser chat session is already running');
+  const requestedSafetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
+  const requestedModelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
+  if (
+    session.busy
+    || activeTurns.has(session.id)
+    || session.queuedTurns.length > 0
+    || session.turnState === 'awaiting_human'
+  ) {
+    if (session.queuedTurns.length >= browserChatQueuedTurnLimit) {
+      throw new Error(`Browser chat message queue is full (${browserChatQueuedTurnLimit})`);
+    }
+    const queuedAt = nextBrowserChatMessageTimestamp(session);
+    const firstUserMessage = !session.messages.some((message) => message.role === 'user');
+    if (firstUserMessage) session.title = browserChatFirstMessageTitle(messageText, attachments);
+    const userMessage: BrowserChatMessage = {
+      id: id('msg'),
+      role: 'user',
+      content: messageText,
+      createdAt: queuedAt,
+      updatedAt: queuedAt,
+      clientMessageId: normalizedClientMessageId,
+      attachments,
+      skillIds: selectedSkills.map((skill) => skill.id),
+      status: 'queued',
+    };
+    session.messages.push(userMessage);
+    session.queuedTurns.push({
+      id: id('queued_turn'),
+      userMessageId: userMessage.id,
+      safetyMode: requestedSafetyMode,
+      modelProvider: requestedModelSettings.provider,
+      model: requestedModelSettings.model,
+      queuedAt,
+    });
+    markMessageDirty(session, userMessage);
+    session.updatedAt = queuedAt;
+    appendLog(session, 'chat:queue:added', `消息已进入等待队列，前面还有 ${Math.max(0, session.queuedTurns.length - 1)} 条`, {
+      messageId: null,
+      details: { queuedTurnId: session.queuedTurns.at(-1)?.id, queueLength: session.queuedTurns.length },
+    });
+    return snapshot(session);
+  }
   // Operation mode is shared application configuration. A conversation or
   // mounted user must never preserve or override an older mode value.
   store.applyRuntimeEnv();
@@ -3067,14 +3135,14 @@ export async function sendBrowserChatMessage(
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   transitionBrowserChatSession(session, { type: 'confirmationCleared' });
-  session.safetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
-  const modelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
+  session.safetyMode = requestedSafetyMode;
+  const modelSettings = requestedModelSettings;
   session.modelProvider = modelSettings.provider;
   session.model = modelSettings.model;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
   if (firstUserMessage) session.title = browserChatFirstMessageTitle(messageText, attachments);
 
-  const timestamp = now();
+  const timestamp = nextBrowserChatMessageTimestamp(session);
   const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;
   const userMessage: BrowserChatMessage = {
     id: id('msg'),
@@ -3399,6 +3467,7 @@ function toolConfirmationInputSignature(value: unknown) {
 function browserChatToolConfirmationScope(
   session: BrowserChatSessionRecord,
   request: BrowserToolConfirmationRequest,
+  browser?: BrowserSession,
 ) {
   let inputText = '';
   try {
@@ -3414,10 +3483,12 @@ function browserChatToolConfirmationScope(
     ['logout', /\blogout\b|退出登录|登出/],
     ['login', /\blogin\b|登录/],
     ['submit', /\bsubmit\b|提交|确认/],
+    ['network-write', /\b(?:post|put|patch|delete)\b|写入请求/],
+    ['update', /\b(?:update|edit|modify|save|write)\b|更新|编辑|修改|保存|写入|设置/],
   ];
   const operation = operations.find(([, pattern]) => pattern.test(text))?.[0];
   if (!operation) return undefined;
-  const currentUrl = session.browser?.currentUrl() || session.targetUrl;
+  const currentUrl = browser?.currentUrl() || session.browser?.currentUrl() || session.targetUrl;
   let origin = currentUrl;
   try {
     origin = new URL(currentUrl).origin;
@@ -3431,15 +3502,23 @@ function createBrowserChatTurnToolConfirmation(
   session: BrowserChatSessionRecord,
   assistantMessageId: string,
   abortSignal: AbortSignal,
+  options: { serialize?: boolean } = {},
 ) {
   const confirmedScopes = new Set<string>();
-  return async (request: BrowserToolConfirmationRequest): Promise<BrowserToolConfirmationDecision> => {
-    const scope = browserChatToolConfirmationScope(session, request);
-    if (scope && confirmedScopes.has(scope)) {
-      appendLog(session, 'tool:confirmation:reused', `已复用本轮用户对 ${request.prompt} 的确认。`, {
+  const confirmedInputs = new Set<string>();
+  let confirmationQueue = Promise.resolve();
+  const requestWithReuse = async (
+    request: BrowserToolConfirmationRequest,
+    browser?: BrowserSession,
+  ): Promise<BrowserToolConfirmationDecision> => {
+    const inputSignature = toolConfirmationInputSignature(request.input);
+    const inputKey = `${request.toolName}:${inputSignature}`;
+    const scope = browserChatToolConfirmationScope(session, request, browser);
+    if (confirmedInputs.has(inputKey) || (scope && confirmedScopes.has(scope))) {
+      appendLog(session, 'tool:confirmation:reused', `已复用本轮用户对 ${request.reason || request.prompt} 的确认。`, {
         stepIndex: request.stepIndex,
         messageId: assistantMessageId,
-        details: { scope, toolName: request.toolName },
+        details: { inputKey, scope, toolName: request.toolName },
       });
       return 'confirmed';
     }
@@ -3448,9 +3527,28 @@ function createBrowserChatTurnToolConfirmation(
       assistantMessageId,
       request,
       abortSignal,
+      browser,
     );
-    if (decision === 'confirmed' && scope) confirmedScopes.add(scope);
+    if (decision === 'confirmed') {
+      confirmedInputs.add(inputKey);
+      if (scope) confirmedScopes.add(scope);
+    }
     return decision;
+  };
+  return async (
+    request: BrowserToolConfirmationRequest,
+    browser?: BrowserSession,
+  ): Promise<BrowserToolConfirmationDecision> => {
+    if (!options.serialize) return requestWithReuse(request, browser);
+    const previous = confirmationQueue;
+    let release!: () => void;
+    confirmationQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await requestWithReuse(request, browser);
+    } finally {
+      release();
+    }
   };
 }
 
@@ -3473,13 +3571,39 @@ function cancelOrphanToolConfirmationsForSession(sessionId: string, activeConfir
   }
 }
 
-function requestBrowserChatToolConfirmation(
+async function captureBrowserChatToolConfirmationScreenshot(
+  session: BrowserChatSessionRecord,
+  request: BrowserToolConfirmationRequest,
+  browser: BrowserSession | undefined = session.browser,
+) {
+  if (!browser) return undefined;
+  try {
+    const stepIndex = request.stepIndex || Math.max(1, ...session.steps.map((step) => step.index));
+    const phase = `tool-${Date.now()}` as `tool-${number}`;
+    const screenshotPath = await browser.takeScreenshot(session.id, stepIndex, phase, {
+      capture: 'viewport',
+      outputPixelRatio: 1,
+    });
+    const relativePath = path.relative(artifactsRoot(), screenshotPath);
+    if (!relativePath || relativePath.startsWith('..') || path.isAbsolute(relativePath)) return undefined;
+    return artifactApiUrlFromRelative(relativePath.split(path.sep).join('/'));
+  } catch (error) {
+    appendLog(session, 'tool:confirmation:screenshot:error', '确认前页面截图获取失败，确认操作仍可继续。', {
+      stepIndex: request.stepIndex,
+      details: { error: error instanceof Error ? error.message : String(error), toolName: request.toolName },
+    });
+    return undefined;
+  }
+}
+
+async function requestBrowserChatToolConfirmation(
   session: BrowserChatSessionRecord,
   assistantMessageId: string,
   request: BrowserToolConfirmationRequest,
   abortSignal?: AbortSignal,
+  browser?: BrowserSession,
 ): Promise<BrowserToolConfirmationDecision> {
-  if (abortSignal?.aborted) return Promise.resolve('cancelled');
+  if (abortSignal?.aborted) return 'cancelled';
   const existing = session.pendingToolConfirmation;
   const existingResolver = existing ? toolConfirmations.get(existing.id) : undefined;
   const inputSignature = toolConfirmationInputSignature(request.input);
@@ -3499,6 +3623,8 @@ function requestBrowserChatToolConfirmation(
   cancelOrphanToolConfirmationsForSession(session.id);
   const confirmationId = id('confirm');
   const requestedAt = now();
+  const screenshotUrl = await captureBrowserChatToolConfirmationScreenshot(session, request, browser);
+  if (abortSignal?.aborted) return 'cancelled';
   const pending: BrowserChatToolConfirmation = {
     id: confirmationId,
     messageId: assistantMessageId,
@@ -3507,6 +3633,7 @@ function requestBrowserChatToolConfirmation(
     inputSignature,
     reason: request.reason ? compactText(request.reason, 300) : undefined,
     prompt: compactText(request.prompt || `请确认是否执行工具 ${request.toolName}`, 500),
+    screenshotUrl,
     requestedAt,
   };
 
@@ -3525,7 +3652,13 @@ function requestBrowserChatToolConfirmation(
         appendLog(session, log.phase, log.message, {
           stepIndex: pending.stepIndex,
           messageId: assistantMessageId,
-          details: { confirmationId, decision, toolName: pending.toolName, inputSignature: pending.inputSignature },
+          details: {
+            confirmationId,
+            decision,
+            toolName: pending.toolName,
+            inputSignature: pending.inputSignature,
+            screenshotUrl: pending.screenshotUrl,
+          },
         });
       }
       resolve(decision);
@@ -3653,7 +3786,7 @@ async function runBrowserChatSubagents(input: {
   tasks: BrowserChatSubagentTask[];
   toolCallId?: string;
 }): Promise<BrowserActionResult> {
-  const requestedTasks = input.tasks.slice(0, 6);
+  const requestedTasks = input.tasks.slice(0, 12);
   const normalizedTasks = requestedTasks.map((task) => ({
     title: task.title.replace(/\s+/g, ' ').trim(),
     instruction: task.instruction.replace(/\s+/g, ' ').trim(),
@@ -3752,7 +3885,7 @@ async function executeBrowserChatSubagentBatch(input: {
 }): Promise<BrowserActionResult> {
   const { session, assistantMessageId, abortController } = input;
   const batchId = input.toolCallId || id('subagent_batch');
-  const requestedTasks = input.tasks.slice(0, 6);
+  const requestedTasks = input.tasks.slice(0, 12);
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   const tasks = requestedTasks.map((task) => ({ ...task, id: randomUUID() }));
   const registry = browserChatSubagentSessionRegistry(session.id);
@@ -3793,18 +3926,12 @@ async function executeBrowserChatSubagentBatch(input: {
     messageId: assistantMessageId,
   });
   persistAndNotify(session.id);
-  let confirmationQueue = Promise.resolve();
-  const requestSerialConfirmation = async (request: BrowserToolConfirmationRequest) => {
-    const previous = confirmationQueue;
-    let release!: () => void;
-    confirmationQueue = new Promise<void>((resolve) => { release = resolve; });
-    await previous;
-    try {
-      return await requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal);
-    } finally {
-      release();
-    }
-  };
+  const requestBatchToolConfirmation = createBrowserChatTurnToolConfirmation(
+    session,
+    assistantMessageId,
+    abortController.signal,
+    { serialize: true },
+  );
 
   const inheritedStorageState = session.browser?.isUsable()
     ? await session.browser.exportStorageState().catch(() => undefined)
@@ -3842,6 +3969,7 @@ async function executeBrowserChatSubagentBatch(input: {
         browser: child,
         text: task.instruction,
         modelText: task.instruction,
+        usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
       });
       const initialRuntimeContext = getRuntimeOperationalContext();
       const result = await executeInteractiveBrowserTurn({
@@ -3878,7 +4006,7 @@ async function executeBrowserChatSubagentBatch(input: {
         abortSignal: abortController.signal,
         shouldContinue: ownsTurn,
         requestToolConfirmation: session.safetyMode === 'strict'
-          ? requestSerialConfirmation
+          ? (request) => requestBatchToolConfirmation(request, child)
           : undefined,
         onProgress: (step) => {
           if (!ownsTurn()) return;
@@ -4078,8 +4206,14 @@ async function resumeBlockedBrowserChatSubagent(input: {
     browser: binding.browser,
     text: binding.task.instruction,
     modelText: binding.task.instruction,
+    usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
   });
   const initialRuntimeContext = getRuntimeOperationalContext();
+  const requestSubagentToolConfirmation = createBrowserChatTurnToolConfirmation(
+    session,
+    assistantMessageId,
+    abortController.signal,
+  );
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -4104,7 +4238,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       abortSignal: abortController.signal,
       shouldContinue: ownsTurn,
       requestToolConfirmation: session.safetyMode === 'strict'
-        ? (request) => requestBrowserChatToolConfirmation(session, assistantMessageId, request, abortController.signal)
+        ? (request) => requestSubagentToolConfirmation(request, binding.browser)
         : undefined,
       onProgress: (step) => {
         if (!ownsTurn()) return;
@@ -4214,6 +4348,13 @@ async function resumeBlockedBrowserChatSubagent(input: {
     clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
     transitionBrowserChatSession(session, { type: 'turnFinished', at: timestamp, error: message });
     persistAndNotify(session.id);
+  } finally {
+    transitionBrowserChatSession(session, {
+      type: 'turnRuntimeReleased',
+      assistantMessageId,
+      abortController,
+    });
+    startNextQueuedBrowserChatTurn(session);
   }
 }
 
@@ -4239,14 +4380,14 @@ async function runBrowserChatMessage(
       appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
       const browser = await browserForTurnDecision(session, assertTurnActive);
       assertTurnActive();
-      await ensureConversationContextWithinThreshold(session, userMessageId, abortController.signal);
-      if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
       const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
         session,
         browser,
         text,
         modelText,
         explicitlySelectedSkills: skills,
+        usedMemoryIds,
       });
       const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
@@ -4265,15 +4406,16 @@ async function runBrowserChatMessage(
         instruction: text,
         modelInstruction: modelText,
         operationalContext: initialRuntimeContext.operationalContext,
-        conversation: conversationForPrompt(session.messages, session.conversationContext, userMessageId, session.userId),
+        conversation: session.modelContext.activeMessages,
         completedSteps: session.steps,
         mode: session.mode,
         safetyMode: session.safetyMode,
         memoryTools: createPersonalMemoryTools({
           userId: session.userId,
-          currentUrl: browserChatMemoryUrl(browser, session),
+          getCurrentUrl: () => browserChatMemoryUrl(browser, session),
           sourceSessionId: session.id,
           sourceMessageIds: [userMessageId, assistantMessageId],
+          usedMemoryIds,
           userMessages: session.messages
             .filter((message) => message.role === 'user')
             .map((message) => message.content),
@@ -4365,6 +4507,18 @@ async function runBrowserChatMessage(
         },
       });
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+      const turnMessages = serializableBrowserChatModelMessages(result.turnMessages);
+      session.modelContext = {
+        version: 1,
+        transcript: [
+          ...session.modelContext.transcript,
+          ...turnMessages,
+        ],
+        activeMessages: serializableBrowserChatModelMessages(result.modelMessages),
+        ...(result.contextCompression ? { lastCompression: result.contextCompression } : (
+          session.modelContext.lastCompression ? { lastCompression: session.modelContext.lastCompression } : {}
+        )),
+      };
       appendLog(session, 'chat:run:saving', '正在写入本轮对话最终结果', { deferPersist: true });
       replaceSessionSteps(session, result.steps.map((step) => (
         step.index >= fromStepIndex ? { ...step, messageId: assistantMessageId } : step
@@ -4425,7 +4579,6 @@ async function runBrowserChatMessage(
       await persistAndNotifyTerminal(session.id);
       if (result.status !== 'blocked') scheduleBrowserChatUserIdleClose(session.userId);
       void enforceBrowserChatArtifactQuota(session.id).catch((error) => warnPersistFailure(error));
-      void ensureConversationContextWithinThreshold(session).catch(() => undefined);
     } catch (error) {
       const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
       const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
@@ -4470,6 +4623,7 @@ async function runBrowserChatMessage(
         assistantMessageId,
         abortController,
       });
+      startNextQueuedBrowserChatTurn(session);
     }
   });
 }

@@ -6,15 +6,19 @@ import {
   visibleBrowserChatExecutionLogs,
 } from './browser-chat-log-model';
 
-test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', () => {
+test('visibleBrowserChatExecutionLogs keeps ai, tool, context, and screenshot logs', () => {
   const logs = [
     { phase: 'ai:runtime:attempt' },
     { phase: 'ai:runtime:request' },
+    { phase: 'subagent:child-1:ai:runtime:response' },
+    { phase: 'subagent:child-1:ai:runtime:attempt-succeeded' },
     { phase: 'ai:runtime:attempt-failed' },
     { phase: 'ai:runtime:retry-exhausted' },
     { phase: 'ai:runtime:attempt-succeeded' },
     { phase: 'ai:runtime:recoverable-error' },
     { phase: 'chat:runtime:request-aborted' },
+    { phase: 'ai:tool' },
+    { phase: 'subagent:child-1:ai:tool' },
     { phase: 'conversation:context:response' },
     { phase: 'browser:screenshot:capture' },
     { phase: 'chat:message' },
@@ -23,11 +27,15 @@ test('visibleBrowserChatExecutionLogs keeps ai, context, and screenshot logs', (
   assert.deepEqual(visibleBrowserChatExecutionLogs(logs).map((log) => log.phase), [
     'ai:runtime:attempt',
     'ai:runtime:request',
+    'subagent:child-1:ai:runtime:response',
+    'subagent:child-1:ai:runtime:attempt-succeeded',
     'ai:runtime:attempt-failed',
     'ai:runtime:retry-exhausted',
     'ai:runtime:attempt-succeeded',
     'ai:runtime:recoverable-error',
     'chat:runtime:request-aborted',
+    'ai:tool',
+    'subagent:child-1:ai:tool',
     'conversation:context:response',
     'browser:screenshot:capture',
   ]);
@@ -37,6 +45,7 @@ test('summarizeBrowserChatLogs counts visible log categories', () => {
   const summary = summarizeBrowserChatLogs([
     { phase: 'ai:runtime:response' },
     { phase: 'ai:runtime:retry' },
+    { phase: 'ai:tool' },
     { phase: 'conversation:context:error' },
     { phase: 'perf:screenshot:compress' },
   ]);
@@ -45,7 +54,8 @@ test('summarizeBrowserChatLogs counts visible log categories', () => {
     ai: 2,
     context: 1,
     screenshot: 1,
-    total: 4,
+    tool: 1,
+    total: 5,
   });
 });
 

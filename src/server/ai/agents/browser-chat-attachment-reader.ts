@@ -99,6 +99,7 @@ export async function readBrowserChatAttachment(input: {
   limit?: unknown;
   offset?: unknown;
   pages?: unknown;
+  previewRoot?: string;
 }): Promise<BrowserChatAttachmentReadResult> {
   const { attachment } = input;
   if (!input.absolutePath && attachment.kind !== 'tab') {
@@ -120,6 +121,7 @@ export async function readBrowserChatAttachment(input: {
             extension: extensionOf(resolvedAttachment),
             name: resolvedAttachment.name,
             pages: input.pages,
+            previewRoot: input.previewRoot,
           })
         : undefined,
     ]);
