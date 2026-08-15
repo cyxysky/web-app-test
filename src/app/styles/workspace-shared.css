@@ -140,6 +140,21 @@
   padding-top: 8px;
 }
 
+.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-sidebar-footer .workspace-help-button {
+  flex: 0 1 auto;
+  width: auto;
+}
+
+.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-sidebar-footer .browser-chat-theme-toggle {
+  flex: 0 0 36px;
+  gap: 0;
+  height: 36px;
+  justify-content: center;
+  min-height: 36px;
+  padding: 0;
+  width: 36px;
+}
+
 .browser-chat-theme-toggle {
   align-items: center;
   background: transparent;
@@ -386,6 +401,10 @@
   display: none !important;
 }
 
+.automation-case-history-active-marker {
+  display: none;
+}
+
 .automation-case-history-copy {
   display: grid;
   gap: 3px;
@@ -459,6 +478,34 @@
   justify-items: center;
 }
 
+.browser-chat-layout.sidebar-collapsed .automation-case-history-list > .automation-case-history-row {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  min-width: 56px;
+  overflow: visible;
+  position: relative;
+  width: 56px;
+}
+
+.browser-chat-layout.sidebar-collapsed .automation-case-history-list > .automation-case-history-row.active {
+  content-visibility: visible;
+}
+
+.browser-chat-layout.sidebar-collapsed .automation-case-history-active-marker {
+  background: var(--accent);
+  border-radius: 0 999px 999px 0;
+  display: block;
+  height: 18px;
+  left: 0;
+  pointer-events: none;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  z-index: 5;
+}
+
 .browser-chat-layout.sidebar-collapsed .automation-case-history-copy,
 .browser-chat-layout.sidebar-collapsed .automation-case-history-count,
 .browser-chat-layout.sidebar-collapsed .automation-case-history-delete {
@@ -470,7 +517,9 @@
   height: 36px;
   justify-content: center;
   min-height: 36px;
+  overflow: visible;
   padding: 0;
+  position: relative;
   width: 36px;
 }
 
@@ -535,6 +584,10 @@
     width: 56px;
   }
 
+  .browser-chat-layout.sidebar-collapsed .automation-case-history > .browser-chat-history-stage {
+    transform: translateX(-6px);
+  }
+
   .browser-chat-layout.sidebar-collapsed .browser-chat-history-load-more {
     flex: 0 0 36px;
     height: 36px;
@@ -596,7 +649,10 @@
     z-index: 4;
   }
 
-  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item > .browser-chat-collapsed-delete {
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-item,
+    .automation-case-history-item
+  ) > .browser-chat-collapsed-delete {
     background: var(--danger) !important;
     border: 0 !important;
     border-radius: 0 7px 0 0;
@@ -612,7 +668,10 @@
     width: 18px;
   }
 
-  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item > .browser-chat-collapsed-delete > svg {
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-item,
+    .automation-case-history-item
+  ) > .browser-chat-collapsed-delete > svg {
     height: 8px;
     position: absolute;
     right: 1.5px;
@@ -635,7 +694,10 @@
     color: var(--danger);
   }
 
-  .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item > .browser-chat-collapsed-delete:not(:disabled):hover {
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-recent-item,
+    .automation-case-history-item
+  ) > .browser-chat-collapsed-delete:not(:disabled):hover {
     background: var(--danger) !important;
     color: #ffffff !important;
   }
@@ -928,6 +990,12 @@
 .automation-case-history-item.active,
 .automation-case-history-item.active:hover {
   background: var(--sidebar-active);
+}
+
+.browser-chat-layout.sidebar-collapsed .automation-case-history-item.active,
+.browser-chat-layout.sidebar-collapsed .automation-case-history-item.active:hover {
+  background: transparent;
+  box-shadow: none;
 }
 
 .browser-chat-recent-list .browser-chat-recent-open > span,

@@ -80,7 +80,7 @@ export function WorkspaceSidebar({
           display: 'flex',
           flexDirection: collapsed ? 'column' : 'row',
           gap: collapsed ? 2 : undefined,
-          justifyContent: collapsed ? 'center' : 'flex-end',
+          justifyContent: collapsed ? 'center' : 'space-between',
         }}
       >
         <WebPilotHelpCenter collapsed={collapsed} />

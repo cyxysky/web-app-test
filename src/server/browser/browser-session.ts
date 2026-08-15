@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, ElementHandle, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import {
   resolveBrowserOutputPixelRatio,
   resolveBrowserPreviewImageFormat,
@@ -211,6 +211,10 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Browser-owned control mirrored into the remote live-preview surface. */
+  liveControl?: BrowserLiveNativeControl;
+  /** Native select menu mirrored into the remote live-preview surface. */
+  liveSelect?: BrowserLiveSelectMenu;
   /** Undelivered page dependency failures observed since the previous browserCode result. */
   dependencyFailures?: BrowserDependencyFailure[];
   /** Snapshot/observation that owns any DOM refs returned with this result. */
@@ -978,7 +982,101 @@ export type BrowserLiveInput =
   | {
       kind: 'text';
       text: string;
+    }
+  | {
+      kind: 'select';
+      xRatio: number;
+      yRatio: number;
+      value: string;
+    }
+  | {
+      controlKind: 'datalist' | 'picker';
+      kind: 'controlValue';
+      value: string;
+      xRatio: number;
+      yRatio: number;
+    }
+  | {
+      controlId: string;
+      files: Array<{
+        mimeType: string;
+        name: string;
+        path: string;
+      }>;
+      kind: 'files';
+    }
+  | {
+      accept: boolean;
+      dialogId: string;
+      kind: 'dialog';
+      promptText?: string;
     };
+
+type BrowserLiveNativeControlPosition = {
+  label: string;
+  openUpwards: boolean;
+  targetXRatio: number;
+  targetYRatio: number;
+  topRatio: number;
+  widthRatio: number;
+  xRatio: number;
+  yRatio: number;
+};
+
+export type BrowserLiveSelectMenu = BrowserLiveNativeControlPosition & {
+  kind: 'select';
+  options: Array<{
+    disabled: boolean;
+    group?: string;
+    label: string;
+    selected: boolean;
+    value: string;
+  }>;
+  selectedValue: string;
+};
+
+export type BrowserLiveNativeControl = BrowserLiveSelectMenu
+  | (BrowserLiveNativeControlPosition & {
+      kind: 'datalist';
+      options: Array<{ label: string; value: string }>;
+      value: string;
+    })
+  | (BrowserLiveNativeControlPosition & {
+      inputType: 'color' | 'date' | 'datetime-local' | 'month' | 'time' | 'week';
+      kind: 'picker';
+      max?: string;
+      min?: string;
+      step?: string;
+      value: string;
+    })
+  | (BrowserLiveNativeControlPosition & {
+      accept: string;
+      capture?: string;
+      controlId: string;
+      kind: 'file';
+      multiple: boolean;
+    });
+
+export type BrowserLiveDialog = {
+  defaultValue: string;
+  dialogType: 'alert' | 'beforeunload' | 'confirm' | 'prompt';
+  id: string;
+  message: string;
+};
+
+export type BrowserLiveDownload = {
+  bytes?: number;
+  error?: string;
+  fileName: string;
+  id: string;
+  url?: string;
+};
+
+export type BrowserLiveNativeEvent =
+  | { dialog: BrowserLiveDialog; kind: 'dialogOpened' }
+  | { dialogId: string; kind: 'dialogClosed' }
+  | { control: BrowserLiveNativeControl; kind: 'controlOpened' }
+  | { download: BrowserLiveDownload; kind: 'downloadStarted' | 'downloadReady' | 'downloadFailed' };
 
 export type BrowserSelectOptionAction = {
   abortSignal?: AbortSignal;
@@ -1616,6 +1714,10 @@ export class BrowserSession {
   private releaseSharedBrowser?: (force?: boolean) => Promise<void>;
   private managedProfileDir?: string;
   private livePreviewStateListeners = new Set<BrowserLivePreviewStateListener>();
+  private livePreviewNativeListeners = new Set<(event: BrowserLiveNativeEvent) => void>();
+  private liveDialogOpenedWaiters = new Set<(page: Page) => void>();
+  private pendingLiveDialogs = new Map<string, { descriptor: BrowserLiveDialog; dialog: Dialog; page: Page }>();
+  private pendingLiveFileInputs = new Map<string, { element: ElementHandle<HTMLInputElement>; page: Page }>();
   private livePreviewTabsNotifyScheduled = false;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
@@ -1624,6 +1726,10 @@ export class BrowserSession {
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, string>();
   private livePreviewExplicitPageSelectionAt = 0;
   private livePreviewExplicitPageSelectionSequence = 0;
+  private livePreviewBackgroundPageUntil = new WeakMap<Page, number>();
+  private livePreviewBackgroundPopupOpeners = new WeakSet<Page>();
+  private livePreviewDownloadGestureUntil = new WeakMap<Page, number>();
+  private livePreviewDownloadListenerPages = new WeakSet<Page>();
   private configuredViewportKeyByPage = new WeakMap<Page, string>();
   private livePreviewNativeTabRefreshAt = 0;
   private livePreviewTabIdSequence = 0;
@@ -2108,7 +2214,7 @@ export class BrowserSession {
       });
     }
     if (options.claimPages === false) return;
-    context.on('page', (page) => this.claimPage(page));
+    context.on('page', (page) => this.claimPage(page, { makeActive: false }));
     for (const page of context.pages()) this.claimPage(page, { makeActive: false });
   }
 
@@ -2143,15 +2249,22 @@ export class BrowserSession {
     const selectionSequence = this.livePreviewExplicitPageSelectionSequence;
     const opener = await page.opener().catch(() => null);
     if (!opener || !this.ownedPages.has(opener)) return;
+    const openerDownloadGestureUntil = this.livePreviewDownloadGestureUntil.get(opener) || 0;
+    if (openerDownloadGestureUntil > Date.now()) {
+      this.livePreviewDownloadGestureUntil.set(page, openerDownloadGestureUntil);
+    }
+    const keepInBackground = this.livePreviewBackgroundPopupOpeners.has(opener);
+    if (keepInBackground) this.livePreviewBackgroundPageUntil.set(page, Date.now() + 2_000);
     if (this.claimPage(page, { makeActive: false })) {
       if (selectionSequence !== this.livePreviewExplicitPageSelectionSequence) return;
-      await page.bringToFront().catch(() => undefined);
+      await (keepInBackground ? opener : page).bringToFront().catch(() => undefined);
       if (
         selectionSequence === this.livePreviewExplicitPageSelectionSequence
         && !page.isClosed()
         && this.ownedPages.has(page)
       ) {
-        this.page = page;
+        this.page = keepInBackground ? opener : page;
+        if (keepInBackground) this.livePreviewExplicitPageSelectionAt = Date.now();
         this.notifyLivePreviewTabsChanged();
       }
     }
@@ -2228,6 +2341,7 @@ export class BrowserSession {
 
   private handleLivePreviewVisibility(page: Page, visible: boolean) {
     if (!visible || page.isClosed() || !this.ownedPages.has(page)) return;
+    if ((this.livePreviewBackgroundPageUntil.get(page) || 0) > Date.now()) return;
     if (Date.now() - this.livePreviewExplicitPageSelectionAt < 1_000) return;
     if (this.page !== page) {
       this.page = page;
@@ -2437,6 +2551,10 @@ export class BrowserSession {
 
   private ensureLivePreviewState() {
     this.configuredViewportKeyByPage ||= new WeakMap<Page, string>();
+    this.livePreviewBackgroundPageUntil ||= new WeakMap<Page, number>();
+    this.livePreviewBackgroundPopupOpeners ||= new WeakSet<Page>();
+    this.livePreviewDownloadGestureUntil ||= new WeakMap<Page, number>();
+    this.livePreviewDownloadListenerPages ||= new WeakSet<Page>();
     this.livePreviewTabIds ||= new WeakMap<Page, string>();
     this.nativeTabIdByPage ||= new WeakMap<Page, number>();
     if (!Number.isFinite(this.livePreviewExplicitPageSelectionAt)) this.livePreviewExplicitPageSelectionAt = 0;
@@ -2579,7 +2697,9 @@ export class BrowserSession {
       visible: await page.evaluate(() => document.visibilityState === 'visible').catch(() => false),
     })));
     const currentPageVisible = visibility.some((item) => item.page === this.page && item.visible);
-    const visiblePage = visibility.find((item) => item.visible)?.page;
+    const visiblePage = visibility.find((item) => (
+      item.visible && (this.livePreviewBackgroundPageUntil.get(item.page) || 0) <= now
+    ))?.page;
     // The explicitly selected page is authoritative. Some CDP targets report
     // multiple pages as visible, so always taking the first visible page can
     // undo a live-preview tab switch and reattach the old screencast forever.
@@ -2598,6 +2718,7 @@ export class BrowserSession {
 
   private async activateSessionPage(page: Page) {
     this.ensureLivePreviewState();
+    this.livePreviewBackgroundPageUntil.delete(page);
     const context = this.context;
     if (context && this.nativeTabGrouperEnabled) {
       const nativeGroup = await this.findNativeTabGroupTabs(context);
@@ -2672,6 +2793,7 @@ export class BrowserSession {
     onActivePageChanged?: () => void;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
+    onNativeEvent?: (event: BrowserLiveNativeEvent) => void;
     onTabsChanged?: (tabs: BrowserTabSnapshot[]) => void;
     video?: boolean;
   }): Promise<BrowserScreencastHandle> {
@@ -2688,6 +2810,7 @@ export class BrowserSession {
     let stopPromise: Promise<void> | undefined;
     let page: Page | undefined;
     let client: import('playwright').CDPSession | undefined;
+    let fileChooserListener: ((chooser: FileChooser) => void) | undefined;
     let nativeFrameListener: ((event: {
       data: string;
       metadata?: { deviceHeight?: number; deviceWidth?: number };
@@ -2718,6 +2841,13 @@ export class BrowserSession {
     if (tabsListener) {
       this.livePreviewStateListeners.add(tabsListener);
       tabsListener(this.getTabsSnapshot());
+    }
+    const nativeListener = options.onNativeEvent;
+    if (nativeListener) {
+      this.livePreviewNativeListeners.add(nativeListener);
+      for (const pending of this.pendingLiveDialogs.values()) {
+        nativeListener({ dialog: pending.descriptor, kind: 'dialogOpened' });
+      }
     }
 
     const pushOutputFrame = (
@@ -2784,8 +2914,11 @@ export class BrowserSession {
     const detachCurrentPage = async () => {
       const currentClient = client;
       const currentListener = nativeFrameListener;
+      const currentPage = page;
       client = undefined;
       nativeFrameListener = undefined;
+      if (currentPage && fileChooserListener) currentPage.off('filechooser', fileChooserListener);
+      fileChooserListener = undefined;
       if (!currentClient) return;
       if (currentListener) currentClient.off('Page.screencastFrame', currentListener);
       await currentClient.send('Page.stopScreencast').catch(() => undefined);
@@ -2807,6 +2940,18 @@ export class BrowserSession {
         const nextClient = await nextActivePage.context().newCDPSession(nextActivePage);
         page = nextActivePage;
         client = nextClient;
+        if (nativeListener) {
+          fileChooserListener = (chooser) => {
+            void this.liveFileControlForElement(nextActivePage, chooser.element() as ElementHandle<HTMLInputElement>)
+              .then((control) => {
+                if (!stopped && control) nativeListener({ control, kind: 'controlOpened' });
+              })
+              .catch((error) => {
+                if (!stopped) options.onError?.(error);
+              });
+          };
+          nextActivePage.on('filechooser', fileChooserListener);
+        }
         await Promise.all([
           nextClient.send('Page.setWebLifecycleState', { state: 'active' }).catch(() => undefined),
           nextClient.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => undefined),
@@ -2882,6 +3027,10 @@ export class BrowserSession {
       outputTimer = undefined;
       stopPromise = (async () => {
         if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
+        if (nativeListener) this.livePreviewNativeListeners.delete(nativeListener);
+        if (this.livePreviewNativeListeners.size === 0) {
+          await Promise.all([this.dismissPendingLiveDialogs(), this.clearPendingLiveFileInputs()]);
+        }
         await pageRefreshPromise?.catch(() => undefined);
         await framePump.stop();
         await detachCurrentPage();
@@ -2918,6 +3067,7 @@ export class BrowserSession {
       scheduleOutput();
     } catch (error) {
       if (tabsListener) this.livePreviewStateListeners.delete(tabsListener);
+      if (nativeListener) this.livePreviewNativeListeners.delete(nativeListener);
       await stopScreencast(false);
       throw error;
     }
@@ -2941,8 +3091,329 @@ export class BrowserSession {
     };
   }
 
+  private async liveFileControlForElement(
+    page: Page,
+    element: ElementHandle<HTMLInputElement>,
+  ): Promise<Extract<BrowserLiveNativeControl, { kind: 'file' }> | undefined> {
+    const descriptor = await element.evaluate((input) => {
+      if (input.type !== 'file' || input.disabled) return undefined;
+      const ownRect = input.getBoundingClientRect();
+      const labelRect = Array.from(input.labels || [])
+        .map((label) => label.getBoundingClientRect())
+        .find((rect) => rect.width > 0 && rect.height > 0);
+      const rect = ownRect.width > 0 && ownRect.height > 0 ? ownRect : labelRect;
+      const left = rect?.left ?? Math.max(16, window.innerWidth * 0.32);
+      const top = rect?.top ?? Math.max(16, window.innerHeight * 0.32);
+      const width = rect?.width ?? Math.min(360, window.innerWidth * 0.36);
+      const height = rect?.height ?? 40;
+      const labelClone = input.labels?.[0]?.cloneNode(true);
+      if (labelClone instanceof HTMLElement) {
+        labelClone.querySelectorAll('select, input, textarea, button').forEach((control) => control.remove());
+      }
+      return {
+        accept: input.accept,
+        capture: input.getAttribute('capture') || undefined,
+        label: input.getAttribute('aria-label') || labelClone?.textContent?.trim() || input.name || 'File upload',
+        multiple: input.multiple,
+        openUpwards: false,
+        targetXRatio: (left + width / 2) / Math.max(1, window.innerWidth),
+        targetYRatio: (top + height / 2) / Math.max(1, window.innerHeight),
+        topRatio: top / Math.max(1, window.innerHeight),
+        widthRatio: width / Math.max(1, window.innerWidth),
+        xRatio: left / Math.max(1, window.innerWidth),
+        yRatio: (top + height) / Math.max(1, window.innerHeight),
+      };
+    }).catch(() => undefined);
+    if (!descriptor) return undefined;
+    while (this.pendingLiveFileInputs.size >= 20) {
+      const oldest = this.pendingLiveFileInputs.entries().next().value as [string, { element: ElementHandle<HTMLInputElement> }] | undefined;
+      if (!oldest) break;
+      this.pendingLiveFileInputs.delete(oldest[0]);
+      void oldest[1].element.dispose().catch(() => undefined);
+    }
+    const controlId = randomUUID();
+    this.pendingLiveFileInputs.set(controlId, { element, page });
+    return { ...descriptor, controlId, kind: 'file' };
+  }
+
+  private async liveFileControlAt(page: Page, x: number, y: number) {
+    const handle = await page.evaluateHandle(({ x: pageX, y: pageY }) => {
+      const target = document.elementFromPoint(pageX, pageY);
+      if (!(target instanceof Element)) return undefined;
+      const direct = target instanceof HTMLInputElement && target.type === 'file'
+        ? target
+        : target.closest('input[type="file"]');
+      if (direct instanceof HTMLInputElement) return direct;
+      const label = target.closest('label');
+      if (!(label instanceof HTMLLabelElement)) return undefined;
+      const labelled = label.control || label.querySelector('input[type="file"]');
+      return labelled instanceof HTMLInputElement && labelled.type === 'file' ? labelled : undefined;
+    }, { x, y });
+    const element = handle.asElement() as ElementHandle<HTMLInputElement> | null;
+    if (!element) {
+      await handle.dispose().catch(() => undefined);
+      return undefined;
+    }
+    const control = await this.liveFileControlForElement(page, element);
+    if (!control) await element.dispose().catch(() => undefined);
+    return control;
+  }
+
+  private async liveNativeControlAt(page: Page, x: number, y: number): Promise<BrowserLiveNativeControl | undefined> {
+    const fileControl = await this.liveFileControlAt(page, x, y);
+    if (fileControl) return fileControl;
+    return page.evaluate(({ x: pageX, y: pageY }) => {
+      const target = document.elementFromPoint(pageX, pageY);
+      if (!(target instanceof Element)) return undefined;
+      const control = target.matches('select, input') ? target : target.closest('select, input');
+      if (!(control instanceof HTMLSelectElement || control instanceof HTMLInputElement)) return undefined;
+      const rect = control.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0 || control.disabled) return undefined;
+      const labelClone = control.labels?.[0]?.cloneNode(true);
+      if (labelClone instanceof HTMLElement) {
+        labelClone.querySelectorAll('select, input, textarea, button').forEach((child) => child.remove());
+      }
+      const label = control.getAttribute('aria-label') || labelClone?.textContent?.trim() || control.getAttribute('name') || 'Control';
+      const position = (estimatedMenuHeight: number) => ({
+        label,
+        openUpwards: rect.bottom + estimatedMenuHeight > window.innerHeight && rect.top > estimatedMenuHeight,
+        targetXRatio: (rect.left + rect.width / 2) / Math.max(1, window.innerWidth),
+        targetYRatio: (rect.top + rect.height / 2) / Math.max(1, window.innerHeight),
+        topRatio: rect.top / Math.max(1, window.innerHeight),
+        widthRatio: rect.width / Math.max(1, window.innerWidth),
+        xRatio: rect.left / Math.max(1, window.innerWidth),
+        yRatio: rect.bottom / Math.max(1, window.innerHeight),
+      });
+      if (control instanceof HTMLSelectElement) {
+        if (control.multiple || control.size > 1) return undefined;
+        const options = Array.from(control.options).slice(0, 500).map((option) => {
+          const group = option.parentElement instanceof HTMLOptGroupElement ? option.parentElement : undefined;
+          return {
+            disabled: option.disabled || Boolean(group?.disabled),
+            ...(group?.label ? { group: group.label } : {}),
+            label: option.label || option.textContent || option.value,
+            selected: option.selected,
+            value: option.value,
+          };
+        });
+        if (!options.length) return undefined;
+        control.focus({ preventScroll: true });
+        return {
+          ...position(Math.min(320, Math.max(48, options.length * 36 + 8))),
+          kind: 'select' as const,
+          options,
+          selectedValue: control.value,
+        };
+      }
+      if (control.readOnly || control.type === 'file') return undefined;
+      const inputType = control.type;
+      if (inputType === 'color' || inputType === 'date' || inputType === 'datetime-local' || inputType === 'month' || inputType === 'time' || inputType === 'week') {
+        control.focus({ preventScroll: true });
+        return {
+          ...position(190),
+          inputType,
+          kind: 'picker' as const,
+          max: control.max || undefined,
+          min: control.min || undefined,
+          step: control.step || undefined,
+          value: control.value,
+        };
+      }
+      const list = control.list;
+      if (list instanceof HTMLDataListElement) {
+        const options = Array.from(list.options).slice(0, 500).map((option) => ({
+          label: option.label || option.value,
+          value: option.value,
+        })).filter((option) => option.value);
+        if (!options.length) return undefined;
+        control.focus({ preventScroll: true });
+        return {
+          ...position(Math.min(320, Math.max(48, options.length * 36 + 8))),
+          kind: 'datalist' as const,
+          options,
+          value: control.value,
+        };
+      }
+      return undefined;
+    }, { x, y });
+  }
+
+  private async liveDownloadLinkAt(page: Page, x: number, y: number) {
+    return page.evaluate(({ x: clientX, y: clientY }) => {
+      const target = document.elementFromPoint(clientX, clientY);
+      const anchor = target instanceof Element ? target.closest('a[href]') : null;
+      if (!(anchor instanceof HTMLAnchorElement)) return undefined;
+      const url = anchor.href.trim();
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return undefined;
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
+      const label = [anchor.innerText, anchor.getAttribute('aria-label'), anchor.title]
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const downloadAttribute = anchor.getAttribute('download')?.trim() || '';
+      const looksLikeDownload = anchor.hasAttribute('download')
+        || /(下载|download|导出|export)/i.test(label)
+        || /(?:^|[/?&=._-])(download|export)(?:[/?&=._-]|$)/i.test(`${parsed.pathname}${parsed.search}`)
+        || /\.(?:7z|csv|docx?|gz|json|od[st]|pdf|pptx?|rar|tar|txt|xlsx?|xml|zip)(?:$|[?#])/i.test(url);
+      if (!looksLikeDownload) return undefined;
+      let pathName = '';
+      try {
+        pathName = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+      } catch {
+        pathName = parsed.pathname.split('/').filter(Boolean).pop() || '';
+      }
+      return {
+        fileName: downloadAttribute || label.replace(/^(下载|download)\s*/i, '').trim() || pathName || 'download',
+        url,
+      };
+    }, { x, y }).catch(() => undefined);
+  }
+
+  private relayLivePreviewDownload(download: { fileName: string; url: string }) {
+    const id = randomUUID();
+    const fileName = path.basename(download.fileName.replace(/[\\/]+/g, '_'))
+      .replace(/[\u0000-\u001f<>:"|?*]+/g, '_')
+      .replace(/^\.+/, '')
+      .trim()
+      .slice(0, 180) || 'download';
+    const descriptor: BrowserLiveDownload = { fileName, id, url: download.url };
+    this.notifyLivePreviewNative({ download: descriptor, kind: 'downloadStarted' });
+    this.notifyLivePreviewNative({ download: descriptor, kind: 'downloadReady' });
+  }
+
+  private async applyLiveSelectValue(page: Page, x: number, y: number, value: string) {
+    return page.evaluate(({ x: pageX, y: pageY, value: nextValue }) => {
+      const target = document.elementFromPoint(pageX, pageY);
+      const select = target instanceof HTMLSelectElement
+        ? target
+        : target?.closest('select');
+      if (!(select instanceof HTMLSelectElement) || select.disabled || select.multiple || select.size > 1) {
+        return { ok: false, actual: 'The native select is no longer available.' };
+      }
+      const option = Array.from(select.options).find((candidate) => candidate.value === nextValue);
+      const group = option?.parentElement instanceof HTMLOptGroupElement
+        ? option.parentElement
+        : undefined;
+      if (!option || option.disabled || group?.disabled) {
+        return { ok: false, actual: 'The selected native option is unavailable.' };
+      }
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
+      if (valueSetter) valueSetter.call(select, option.value);
+      else select.value = option.value;
+      select.focus({ preventScroll: true });
+      select.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return {
+        ok: true,
+        actual: `Selected ${option.label || option.textContent || option.value}.`,
+      };
+    }, { x, y, value });
+  }
+
+  private async applyLiveControlValue(
+    page: Page,
+    x: number,
+    y: number,
+    controlKind: 'datalist' | 'picker',
+    value: string,
+  ) {
+    return page.evaluate(({ controlKind: expectedKind, value: nextValue, x: pageX, y: pageY }) => {
+      const target = document.elementFromPoint(pageX, pageY);
+      const input = target instanceof HTMLInputElement ? target : target?.closest('input');
+      if (!(input instanceof HTMLInputElement) || input.disabled || input.readOnly) {
+        return { ok: false, actual: 'The native input is no longer available.' };
+      }
+      const pickerTypes = new Set(['color', 'date', 'datetime-local', 'month', 'time', 'week']);
+      if (expectedKind === 'picker' ? !pickerTypes.has(input.type) : !(input.list instanceof HTMLDataListElement)) {
+        return { ok: false, actual: 'The native input type has changed.' };
+      }
+      const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (valueSetter) valueSetter.call(input, nextValue);
+      else input.value = nextValue;
+      input.focus({ preventScroll: true });
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return { ok: true, actual: `Updated native ${expectedKind} value.` };
+    }, { controlKind, value, x, y });
+  }
+
+  private async applyLiveFiles(input: Extract<BrowserLiveInput, { kind: 'files' }>) {
+    const pending = this.pendingLiveFileInputs.get(input.controlId);
+    if (!pending) return { ok: false, actual: 'The file input is no longer available.' };
+    this.pendingLiveFileInputs.delete(input.controlId);
+    try {
+      if (pending.page.isClosed()) return { ok: false, actual: 'The file input page is closed.' };
+      const files = await Promise.all(input.files.map(async (file) => ({
+        buffer: await readFile(file.path),
+        mimeType: file.mimeType || 'application/octet-stream',
+        name: path.basename(file.name || file.path),
+      })));
+      await pending.element.setInputFiles(files);
+      return { ok: true, actual: `Uploaded ${files.length} file${files.length === 1 ? '' : 's'} to the native file input.` };
+    } catch (error) {
+      return { ok: false, actual: `Could not set native files: ${unknownErrorMessage(error)}` };
+    } finally {
+      await pending.element.dispose().catch(() => undefined);
+    }
+  }
+
+  private notifyLivePreviewNative(event: BrowserLiveNativeEvent) {
+    for (const listener of this.livePreviewNativeListeners) {
+      try {
+        listener(event);
+      } catch {
+        // A disconnected preview must not interfere with the controlled page.
+      }
+    }
+  }
+
+  private async dismissPendingLiveDialogs() {
+    const pending = [...this.pendingLiveDialogs.entries()];
+    this.pendingLiveDialogs.clear();
+    await Promise.all(pending.map(async ([dialogId, item]) => {
+      await item.dialog.dismiss().catch((error) => {
+        if (!isAlreadyHandledJavaScriptDialogError(error)) {
+          this.recordDomChangeError(item.page, 'dialog', `Could not dismiss JavaScript dialog: ${unknownErrorMessage(error)}`);
+        }
+      });
+      this.notifyLivePreviewNative({ dialogId, kind: 'dialogClosed' });
+    }));
+  }
+
+  private async clearPendingLiveFileInputs() {
+    const pending = [...this.pendingLiveFileInputs.values()];
+    this.pendingLiveFileInputs.clear();
+    await Promise.all(pending.map((item) => item.element.dispose().catch(() => undefined)));
+  }
+
+  private async resolveLiveDialog(input: Extract<BrowserLiveInput, { kind: 'dialog' }>) {
+    const pending = this.pendingLiveDialogs.get(input.dialogId);
+    if (!pending) return { ok: false, actual: 'The browser dialog is no longer available.' };
+    this.pendingLiveDialogs.delete(input.dialogId);
+    try {
+      if (input.accept) await pending.dialog.accept(input.promptText);
+      else await pending.dialog.dismiss();
+      return { ok: true, actual: `${input.accept ? 'Accepted' : 'Dismissed'} browser dialog.` };
+    } catch (error) {
+      if (isAlreadyHandledJavaScriptDialogError(error)) {
+        return { ok: false, actual: 'The browser dialog was already handled.' };
+      }
+      return { ok: false, actual: `Could not handle browser dialog: ${unknownErrorMessage(error)}` };
+    } finally {
+      this.notifyLivePreviewNative({ dialogId: input.dialogId, kind: 'dialogClosed' });
+    }
+  }
+
   async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
     if (input.kind === 'tab') return this.switchLivePreviewTab(input.tabId);
+    if (input.kind === 'files') return this.applyLiveFiles(input);
+    if (input.kind === 'dialog') return this.resolveLiveDialog(input);
     const page = this.activePage;
     await this.ensureBrowserPageRuntime(page);
     const clampRatio = (value: number) => Math.min(1, Math.max(0, Number(value)));
@@ -2973,16 +3444,73 @@ export class BrowserSession {
       if (input.kind === 'click') {
         const button = input.button === 'right' || input.button === 'middle' ? input.button : 'left';
         const clickCount = Math.min(2, Math.max(1, Math.floor(Number(input.clickCount) || 1)));
+        const liveControl = button === 'left' && clickCount === 1
+          ? await this.liveNativeControlAt(page, x, y)
+          : undefined;
+        if (liveControl) {
+          invalidateObservation();
+          return {
+            ok: true,
+            actual: `Opened native ${liveControl.kind} control at (${x}, ${y}).`,
+            liveControl,
+            ...(liveControl.kind === 'select' ? { liveSelect: liveControl } : {}),
+          };
+        }
+        const downloadLink = button === 'left' && clickCount === 1
+          ? await this.liveDownloadLinkAt(page, x, y)
+          : undefined;
+        if (downloadLink) {
+          this.relayLivePreviewDownload(downloadLink);
+          invalidateObservation();
+          return { ok: true, actual: `Relayed download link to the user browser: ${downloadLink.url}` };
+        }
+        if (button === 'left') this.livePreviewDownloadGestureUntil.set(page, Date.now() + 5_000);
         const popupPromise = button === 'left'
           ? page.waitForEvent('popup', { timeout: 1500 }).catch(() => undefined)
           : Promise.resolve(undefined);
+        if (button === 'left') this.livePreviewBackgroundPopupOpeners.add(page);
         const popupSelectionSequence = this.livePreviewExplicitPageSelectionSequence;
-        await page.mouse.click(x, y, { button, clickCount });
+        let resolveDialogOpened: (() => void) | undefined;
+        const dialogOpened = new Promise<void>((resolve) => { resolveDialogOpened = resolve; });
+        const dialogWaiter = (dialogPage: Page) => {
+          if (dialogPage === page) resolveDialogOpened?.();
+        };
+        if (button === 'left') this.liveDialogOpenedWaiters.add(dialogWaiter);
+        const clickPromise = page.mouse.click(x, y, { button, clickCount });
+        try {
+          const outcome = button === 'left'
+            ? await Promise.race([
+                clickPromise.then(() => 'clicked' as const),
+                dialogOpened.then(() => 'dialog' as const),
+              ])
+            : await clickPromise.then(() => 'clicked' as const);
+          if (outcome === 'dialog') void clickPromise.catch(() => undefined);
+        } finally {
+          this.liveDialogOpenedWaiters.delete(dialogWaiter);
+        }
         void popupPromise.then(async (popup) => {
           if (!popup) return;
-          await this.claimPopupPage(popup, undefined, popupSelectionSequence);
+          this.livePreviewBackgroundPageUntil.set(popup, Date.now() + 2_000);
+          const downloadGestureUntil = this.livePreviewDownloadGestureUntil.get(page) || 0;
+          if (downloadGestureUntil > Date.now()) {
+            this.livePreviewDownloadGestureUntil.set(popup, downloadGestureUntil);
+          }
+          this.claimPage(popup, { makeActive: false });
+          await this.ensurePageGroup(popup);
+          if (
+            popupSelectionSequence === this.livePreviewExplicitPageSelectionSequence
+            && !page.isClosed()
+            && this.ownedPages.has(page)
+          ) {
+            await page.bringToFront().catch(() => undefined);
+            this.page = page;
+            this.livePreviewExplicitPageSelectionAt = Date.now();
+            this.notifyLivePreviewTabsChanged();
+          }
           await this.refreshSessionGroupPages({ forceNativeRefresh: true });
-        }).catch(() => undefined);
+        }).catch(() => undefined).finally(() => {
+          this.livePreviewBackgroundPopupOpeners.delete(page);
+        });
         invalidateObservation();
         return { ok: true, actual: `Live browser clicked (${x}, ${y}).` };
       }
@@ -3015,9 +3543,38 @@ export class BrowserSession {
       return { ok: true, actual: `Live browser scrolled by (${deltaX}, ${deltaY}).` };
     }
 
+    if (input.kind === 'select') {
+      if (!Number.isFinite(input.xRatio) || !Number.isFinite(input.yRatio)) {
+        return { ok: false, actual: 'Live browser select requires finite relative coordinates.' };
+      }
+      const value = String(input.value || '');
+      if (value.length > 10_000) return { ok: false, actual: 'Live browser select value is too long.' };
+      const viewport = await this.getViewportMetrics();
+      const x = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.xRatio) * viewport.width)));
+      const y = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.yRatio) * viewport.height)));
+      const result = await this.applyLiveSelectValue(page, x, y, value);
+      if (result.ok) invalidateObservation();
+      return result;
+    }
+
+    if (input.kind === 'controlValue') {
+      if (!Number.isFinite(input.xRatio) || !Number.isFinite(input.yRatio)) {
+        return { ok: false, actual: 'Live browser control requires finite relative coordinates.' };
+      }
+      const value = String(input.value || '');
+      if (value.length > 10_000) return { ok: false, actual: 'Live browser control value is too long.' };
+      const viewport = await this.getViewportMetrics();
+      const x = Math.min(viewport.width - 1, Math.max(0, Math.round(clampRatio(input.xRatio) * viewport.width)));
+      const y = Math.min(viewport.height - 1, Math.max(0, Math.round(clampRatio(input.yRatio) * viewport.height)));
+      const result = await this.applyLiveControlValue(page, x, y, input.controlKind, value);
+      if (result.ok) invalidateObservation();
+      return result;
+    }
+
     if (input.kind === 'key') {
       const key = String(input.key || '').trim();
       if (!key || key.length > 80) return { ok: false, actual: 'Live browser key is invalid.' };
+      if (/^(Enter|Space)$/i.test(key)) this.livePreviewDownloadGestureUntil.set(page, Date.now() + 5_000);
       await page.keyboard.press(key);
       invalidateObservation();
       return { ok: true, actual: `Live browser pressed ${key}.` };
@@ -3093,7 +3650,19 @@ export class BrowserSession {
     void legacyArguments;
   }
 
+  private attachLivePreviewDownloadListener(page: Page) {
+    this.livePreviewDownloadListenerPages ||= new WeakSet<Page>();
+    if (this.livePreviewDownloadListenerPages.has(page)) return;
+    this.livePreviewDownloadListenerPages.add(page);
+    page.on('download', (download) => {
+      void this.captureLivePreviewDownload(page, download);
+    });
+  }
+
   private attachPageListeners(page: Page) {
+    // This listener is versioned separately from the long-lived page listener set
+    // so an existing controlled page also gains download relay after a dev reload.
+    this.attachLivePreviewDownloadListener(page);
     if (this.attachedPages.has(page)) return;
     this.attachedPages.add(page);
     this.navigationSequenceByPage.set(page, this.navigationSequenceByPage.get(page) || 0);
@@ -3122,6 +3691,25 @@ export class BrowserSession {
       this.recordDomChangeError(page, 'page', text);
     });
     page.on('dialog', (dialog: Dialog) => {
+      if (this.livePreviewNativeListeners.size > 0) {
+        const dialogId = randomUUID();
+        const rawDialogType = dialog.type();
+        const dialogType: BrowserLiveDialog['dialogType'] = rawDialogType === 'beforeunload'
+          || rawDialogType === 'confirm'
+          || rawDialogType === 'prompt'
+          ? rawDialogType
+          : 'alert';
+        const descriptor: BrowserLiveDialog = {
+          defaultValue: dialog.defaultValue(),
+          dialogType,
+          id: dialogId,
+          message: dialog.message(),
+        };
+        this.pendingLiveDialogs.set(dialogId, { descriptor, dialog, page });
+        this.notifyLivePreviewNative({ dialog: descriptor, kind: 'dialogOpened' });
+        for (const waiter of this.liveDialogOpenedWaiters) waiter(page);
+        return;
+      }
       // Playwright's automatic close path leaves a rejected promise behind when
       // another CDP client has already handled this browser dialog. Handling it
       // explicitly keeps that normal CDP race out of Next's unhandledRejection.
@@ -3155,6 +3743,55 @@ export class BrowserSession {
       this.networkErrors.push(message);
       this.recordDomChangeError(page, 'network', message);
       this.queueBrowserCodeDependencyFailure(request, record);
+    });
+  }
+
+  private async captureLivePreviewDownload(page: Page, download: PlaywrightDownload) {
+    if (!this.livePreviewNativeListeners.size) return;
+    let gesturePage = page;
+    let gestureUntil = this.livePreviewDownloadGestureUntil.get(page) || 0;
+    if (gestureUntil <= Date.now()) {
+      const opener = await page.opener().catch(() => null);
+      if (opener) {
+        gesturePage = opener;
+        gestureUntil = this.livePreviewDownloadGestureUntil.get(opener) || 0;
+      }
+    }
+    if (gestureUntil <= Date.now()) return;
+    this.livePreviewDownloadGestureUntil.delete(gesturePage);
+
+    const id = randomUUID();
+    const rawFileName = download.suggestedFilename() || `download-${Date.now()}.bin`;
+    const fileName = path.basename(rawFileName.replace(/[\\/]+/g, '_'))
+      .replace(/[\u0000-\u001f<>:"|?*]+/g, '_')
+      .replace(/^\.+/, '')
+      .trim()
+      .slice(0, 180) || `download-${Date.now()}.bin`;
+    const descriptor: BrowserLiveDownload = { fileName, id };
+    this.notifyLivePreviewNative({ download: descriptor, kind: 'downloadStarted' });
+    const url = download.url().trim();
+    const protocol = (() => {
+      try {
+        return new URL(url).protocol;
+      } catch {
+        return '';
+      }
+    })();
+
+    // The controlled browser runs on the WebPilot host. Letting it complete a
+    // download strands the file there and can also block the live page. Cancel
+    // that transfer immediately and let the user's browser request the same URL.
+    void download.cancel().catch(() => undefined);
+    if (protocol !== 'http:' && protocol !== 'https:') {
+      this.notifyLivePreviewNative({
+        download: { ...descriptor, error: 'This temporary download URL cannot be transferred to your browser.' },
+        kind: 'downloadFailed',
+      });
+      return;
+    }
+    this.notifyLivePreviewNative({
+      download: { ...descriptor, url },
+      kind: 'downloadReady',
     });
   }
 

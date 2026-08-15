@@ -10,6 +10,7 @@ import {
   Clock3,
   Download,
   ExternalLink,
+  Gauge,
   Globe2,
   History,
   ListChecks,
@@ -1012,6 +1013,9 @@ export function AutomationWorkspace({
         <nav className="browser-chat-nav" aria-label={t('工作模式')}>
           <WorkspaceNavItem href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
           <WorkspaceNavItem active href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
+          {userId === '1' ? (
+            <WorkspaceNavItem href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
+          ) : null}
           <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
         </nav>
 
@@ -1058,7 +1062,11 @@ export function AutomationWorkspace({
                 const itemActiveRuns = itemRuns.filter((run) => activeRunStatuses.has(run.status));
                 const active = item.id === selectedCase?.id;
                 return (
-                  <li key={item.id}>
+                  <li
+                    className={active ? 'automation-case-history-row active' : 'automation-case-history-row'}
+                    key={item.id}
+                  >
+                    {active ? <span aria-hidden="true" className="automation-case-history-active-marker" /> : null}
                     <div
                       className={active ? 'automation-case-history-item active' : 'automation-case-history-item'}
                       id={`automation-case-${item.id}`}

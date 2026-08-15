@@ -1,4 +1,5 @@
 export const WEBPILOT_ONBOARDING_VERSION = 1;
+export const WEBPILOT_ONBOARDING_RESTART_EVENT = 'webpilot:onboarding-restart';
 
 export const webPilotOnboardingSteps = [
   'welcome',

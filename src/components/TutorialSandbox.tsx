@@ -2,14 +2,16 @@
 
 import Link from 'next/link';
 import { CheckCircle2, Download, RotateCcw, ShieldCheck } from 'lucide-react';
-import { FormEvent, useState } from 'react';
+import { FormEvent, useRef, useState } from 'react';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import styles from './TutorialSandbox.module.css';
 
 export function TutorialSandbox() {
   const [name, setName] = useState('');
   const [department, setDepartment] = useState('');
+  const [attachment, setAttachment] = useState<File | null>(null);
   const [submitted, setSubmitted] = useState(false);
+  const attachmentInputRef = useRef<HTMLInputElement>(null);
 
   function submit(event: FormEvent) {
     event.preventDefault();
@@ -19,7 +21,9 @@ export function TutorialSandbox() {
   function reset() {
     setName('');
     setDepartment('');
+    setAttachment(null);
     setSubmitted(false);
+    if (attachmentInputRef.current) attachmentInputRef.current.value = '';
   }
 
   return (
@@ -37,6 +41,7 @@ export function TutorialSandbox() {
           <ol>
             <li>把姓名填写为“测试用户”</li>
             <li>把部门选择为“研发部”</li>
+            <li>在实时界面中选择一个测试文件</li>
             <li>不要点击提交</li>
             <li>读取下方状态并确认结果</li>
           </ol>
@@ -59,6 +64,18 @@ export function TutorialSandbox() {
               <option value="市场部">市场部</option>
             </select>
 
+            <label htmlFor="tutorial-file">测试附件</label>
+            <input
+              aria-describedby="tutorial-file-hint"
+              aria-label="测试附件"
+              data-testid="tutorial-file"
+              id="tutorial-file"
+              onChange={(event) => setAttachment(event.currentTarget.files?.[0] ?? null)}
+              ref={attachmentInputRef}
+              type="file"
+            />
+            <small className={styles.fileHint} id="tutorial-file-hint">文件只保留在当前页面内存中，不会发送到服务器。</small>
+
             <div className={styles.actions}>
               <button className={styles.reset} onClick={reset} type="button"><RotateCcw size={15} />重置</button>
               <button className={styles.submit} type="submit"><CheckCircle2 size={15} />提交演练</button>
@@ -68,6 +85,7 @@ export function TutorialSandbox() {
           <dl className={styles.status} aria-label="表单当前状态" data-testid="tutorial-status">
             <div><dt>姓名</dt><dd>{name || '未填写'}</dd></div>
             <div><dt>部门</dt><dd>{department || '未选择'}</dd></div>
+            <div><dt>测试附件</dt><dd title={attachment?.name}>{attachment?.name || '未选择'}</dd></div>
             <div><dt>提交状态</dt><dd>{submitted ? '已提交' : '未提交'}</dd></div>
           </dl>
         </section>

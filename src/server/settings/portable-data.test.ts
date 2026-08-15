@@ -53,6 +53,7 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
       provider: 'openai',
       providers: {
         openai: {
+          enabled: true,
           apiKey: 'model-api-secret',
           baseURL: 'https://models.example/v1',
           defaultModel: 'gpt-portable',
@@ -138,6 +139,7 @@ test('credentials, Skills, memory, and model configuration round-trip securely',
     assert.equal(personalMemory.listPersonalMemoryItems({ userId: targetUserId })[0]?.value, '优先使用管理员账号');
     assert.equal(store.getModelConfig()?.provider, 'openai');
     assert.equal(store.getModelConfig()?.providers.openai?.apiKey, 'model-api-secret');
+    assert.equal(store.getModelConfig()?.providers.openai?.enabled, true);
     assert.equal(store.getModelConfig()?.providers.openai?.models?.includes('gpt-portable'), true);
     assert.equal(store.getModelConfig()?.providers.openai?.models?.includes('gpt-backup'), true);
 

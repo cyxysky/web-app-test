@@ -95,6 +95,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
   const models = modelListForProvider(definition);
   const model = defaultModelForProvider(definition);
   return {
+    enabled: false,
     defaultModel: model,
     model,
     models,
@@ -116,6 +117,7 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
     providers[definition.value] = {
       ...defaultProviderSettings(definition.value),
       ...current,
+      enabled: current?.enabled === true,
       defaultModel: model,
       model,
       models,
@@ -126,7 +128,12 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
 
 function applyModelConfig(config?: ModelConfigRecord) {
   const normalized = normalizeStoredModelConfig(config);
-  if (!normalized) return;
+  if (!normalized) {
+    process.env.AI_MODEL_PROVIDER_ENABLED = 'false';
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_MODEL;
+    return;
+  }
   for (const definition of modelProviderDefinitions) {
     const settings = normalized.providers[definition.value] || defaultProviderSettings(definition.value);
     const keyEnv = modelApiKeyEnv[definition.value];
@@ -134,9 +141,19 @@ function applyModelConfig(config?: ModelConfigRecord) {
     const baseUrlEnv = modelBaseUrlEnv[definition.value];
     if (baseUrlEnv) process.env[baseUrlEnv] = settings.baseURL || definition.defaultBaseURL || '';
   }
-  const active = normalized.providers[normalized.provider] || defaultProviderSettings(normalized.provider);
-  process.env.AI_PROVIDER = normalized.provider;
-  process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[normalized.provider];
+  const activeProvider = normalized.providers[normalized.provider]?.enabled
+    ? normalized.provider
+    : modelProviderDefinitions.find((definition) => normalized.providers[definition.value]?.enabled)?.value;
+  if (!activeProvider) {
+    process.env.AI_MODEL_PROVIDER_ENABLED = 'false';
+    delete process.env.AI_PROVIDER;
+    delete process.env.AI_MODEL;
+    return;
+  }
+  const active = normalized.providers[activeProvider] || defaultProviderSettings(activeProvider);
+  process.env.AI_MODEL_PROVIDER_ENABLED = 'true';
+  process.env.AI_PROVIDER = activeProvider;
+  process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[activeProvider];
 }
 
 function normalizeSkillItems(items: string[] | undefined, limit: number) {
@@ -311,6 +328,7 @@ export const store = {
       providers[provider] = {
         ...defaultProviderSettings(provider),
         ...merged,
+        enabled: current?.enabled ?? previous?.enabled ?? false,
         defaultModel: model,
         model,
         models,

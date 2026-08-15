@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type {
   BrowserCodeAttachmentBinding,
   BrowserCodeCredentialBinding,
@@ -23,6 +23,7 @@ import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-genera
 import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
 import {
   normalizeBrowserChatAttachments,
+  normalizeBrowserChatUploadPath,
   uploadedBrowserChatAttachmentPath,
   type BrowserChatAttachment,
 } from '@/server/ai/agents/browser-chat-attachments';
@@ -124,7 +125,7 @@ import {
 } from './browser-chat-persistence-delta';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
-import { normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
+import { enabledModelProviders, normalizeModelProvider, resolveRuntimeModelSelection } from '@/lib/model-selection';
 import {
   listLoginAccounts,
   resolveLoginAccountCredentialById,
@@ -821,6 +822,9 @@ function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
 function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
   store.applyRuntimeEnv();
   const config = store.getModelConfig();
+  if (!enabledModelProviders(config).length) {
+    throw new Error('尚未启用模型服务商，请先在模型配置中开启至少一个服务商。');
+  }
   return resolveRuntimeModelSelection(config, {
     fallbackProvider: config?.provider,
     model: modelInput,
@@ -2746,6 +2750,7 @@ export async function startBrowserChatScreencast(
     onActivePageChanged?: () => void;
     onError?: (error: unknown) => void;
     onFrame: (frame: BrowserScreencastFrame) => void | Promise<void>;
+    onNativeEvent?: (event: BrowserLiveNativeEvent) => void;
     onTabsChanged?: (tabs: BrowserTabSnapshot[]) => void;
     video?: boolean;
   },
@@ -2769,6 +2774,7 @@ export async function startBrowserChatScreencast(
         session.targetUrl = exportableTargetUrl(frame.url) || session.targetUrl;
         return handlers.onFrame(frame);
       },
+      onNativeEvent: handlers.onNativeEvent,
       onTabsChanged: (tabs) => {
         session.tabs = tabs;
         handlers.onTabsChanged?.(tabs);
@@ -2811,7 +2817,34 @@ export async function dispatchBrowserChatPreviewInput(
     throw new Error('当前会话还没有运行中的浏览器，无法操作实时界面。');
   }
 
-  const result = await browser.dispatchLiveInput(input);
+  let resolvedInput = input;
+  if (input.kind === 'files') {
+    const configuredMaxTotalBytes = Number(process.env.WEBPILOT_LIVE_FILE_MAX_BYTES || 100 * 1024 * 1024);
+    const maxTotalBytes = Number.isFinite(configuredMaxTotalBytes)
+      ? Math.min(512 * 1024 * 1024, Math.max(1024, configuredMaxTotalBytes))
+      : 100 * 1024 * 1024;
+    let totalBytes = 0;
+    const files = input.files.slice(0, 8).map((file) => {
+      const relativePath = normalizeBrowserChatUploadPath(file.path, session.userId);
+      if (!relativePath || relativePath.split('/').length < 3) return undefined;
+      const absolutePath = artifactPath(...relativePath.split('/'));
+      if (!existsSync(absolutePath)) return undefined;
+      const metadata = statSync(absolutePath);
+      totalBytes += metadata.size;
+      if (!metadata.isFile() || totalBytes > maxTotalBytes) return undefined;
+      return {
+        mimeType: String(file.mimeType || 'application/octet-stream').slice(0, 160),
+        name: path.basename(String(file.name || path.basename(relativePath))).slice(0, 180),
+        path: absolutePath,
+      };
+    }).filter((file): file is NonNullable<typeof file> => Boolean(file));
+    if (!files.length || files.length !== input.files.length) {
+      return { ok: false, actual: 'One or more uploaded files are invalid or unavailable.' };
+    }
+    resolvedInput = { ...input, files };
+  }
+
+  const result = await browser.dispatchLiveInput(resolvedInput);
   session.tabs = browser.getTabsSnapshot();
   session.targetUrl = exportableTargetUrl(browser.currentUrl()) || session.targetUrl;
   if (input.kind === 'tab' && result.ok) {

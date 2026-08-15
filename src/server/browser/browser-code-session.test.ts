@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import type { Page } from 'playwright';
 import { BrowserSession, closeAllBrowserSessions } from './browser-session';
@@ -298,7 +300,7 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
   assert.deepEqual(new Set(markerStates.map((marker) => marker.groupTitle)), new Set(['ai-p-test']));
 });
 
-test('live preview screencast follows a clicked popup and tab switching without reconnecting', async (context) => {
+test('live preview keeps a clicked popup in the background until the user switches tabs', async (context) => {
   const session = new BrowserSession('dom', {
     headless: true,
     isolated: true,
@@ -352,8 +354,15 @@ test('live preview screencast follows a clicked popup and tab switching without 
   let popupTabs = await session.refreshTabsSnapshot();
   await waitForCondition(async () => {
     popupTabs = await session.refreshTabsSnapshot();
-    return popupTabs.length === 2 && popupTabs.some((tab) => tab.active && tab.url.endsWith('#detail'));
+    return popupTabs.length === 2 && popupTabs.some((tab) => tab.url.endsWith('#detail'));
   });
+  assert.equal(popupTabs.find((tab) => tab.id === originalTabId)?.active, true);
+  assert.equal(initialFrames.some((frame) => frame.url.endsWith('#detail')), false);
+
+  const popupTabId = popupTabs.find((tab) => tab.url.endsWith('#detail'))?.id;
+  assert.ok(popupTabId);
+  const openPopupResult = await session.switchLivePreviewTab(popupTabId);
+  assert.equal(openPopupResult.ok, true, openPopupResult.actual);
   await waitForCondition(() => initialFrames.some((frame) => frame.url.endsWith('#detail')));
 
   const switchResult = await session.switchLivePreviewTab(originalTabId);
@@ -455,6 +464,186 @@ test('live preview supports drag and does not drive the AI cursor', async (conte
   assert.equal(drag.ok, true, drag.actual);
   assert.equal(await page.locator('body').getAttribute('data-dropped'), 'source');
   assert.equal(await page.locator('#__ai_mouse_cursor__').count(), 0, 'user live-preview drag must not create the AI cursor');
+});
+
+test('live preview mirrors native select options and applies the selected value', async (context) => {
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-live-preview-native-select-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html,${encodeURIComponent(`
+    <!doctype html>
+    <html><body style="margin:0;padding:40px">
+      <label>Department
+        <select id="department" style="width:320px;height:44px">
+          <option value="">Choose a department</option>
+          <option value="engineering">Engineering</option>
+          <option value="finance" disabled>Finance</option>
+        </select>
+      </label>
+      <script>
+        department.addEventListener('change', () => { document.body.dataset.department = department.value; });
+      </script>
+    </body></html>
+  `)}`);
+
+  const box = await page.locator('#department').boundingBox();
+  const viewport = page.viewportSize();
+  assert.ok(box && viewport);
+  const opened = await session.dispatchLiveInput({
+    kind: 'click',
+    xRatio: (box.x + box.width / 2) / viewport.width,
+    yRatio: (box.y + box.height / 2) / viewport.height,
+    button: 'left',
+    clickCount: 1,
+  });
+
+  assert.equal(opened.ok, true, opened.actual);
+  assert.equal(opened.liveSelect?.label, 'Department');
+  assert.deepEqual(opened.liveSelect?.options.map((option) => ({ disabled: option.disabled, value: option.value })), [
+    { disabled: false, value: '' },
+    { disabled: false, value: 'engineering' },
+    { disabled: true, value: 'finance' },
+  ]);
+  assert.equal(await page.locator('#department').inputValue(), '');
+
+  assert.ok(opened.liveSelect);
+  const selected = await session.dispatchLiveInput({
+    kind: 'select',
+    value: 'engineering',
+    xRatio: opened.liveSelect.targetXRatio,
+    yRatio: opened.liveSelect.targetYRatio,
+  });
+  assert.equal(selected.ok, true, selected.actual);
+  assert.equal(await page.locator('#department').inputValue(), 'engineering');
+  assert.equal(await page.locator('body').getAttribute('data-department'), 'engineering');
+});
+
+test('live preview bridges native pickers, datalist, file chooser, and JavaScript dialogs', async (context) => {
+  const temporaryDirectory = await mkdtemp(path.join(tmpdir(), 'webpilot-live-native-'));
+  context.after(async () => rm(temporaryDirectory, { force: true, recursive: true }));
+  const uploadPath = path.join(temporaryDirectory, 'employee-note.txt');
+  await writeFile(uploadPath, 'live preview upload');
+
+  const session = new BrowserSession('dom', {
+    headless: true,
+    isolated: true,
+    runId: 'browser-live-preview-native-controls-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.goto(`data:text/html,${encodeURIComponent(`
+    <!doctype html>
+    <html><body style="margin:0;padding:40px">
+      <label>Start date <input id="start-date" type="date"></label>
+      <label>Office <input id="office" list="offices"></label>
+      <datalist id="offices"><option value="Hong Kong"><option value="Shenzhen"></datalist>
+      <button id="upload-trigger" onclick="upload.click()">Upload employee note</button>
+      <input id="upload" type="file" accept="text/plain" hidden>
+      <button id="alert-trigger" onclick="alert('Saved successfully'); document.body.dataset.alert='done'">Alert</button>
+      <button id="confirm-trigger" onclick="document.body.dataset.confirm=String(confirm('Approve this record?'))">Confirm</button>
+      <button id="prompt-trigger" onclick="document.body.dataset.prompt=prompt('Employee ID', 'E-001') || ''">Prompt</button>
+      <script>
+        document.getElementById('start-date').addEventListener('change', (event) => { document.body.dataset.startDate = event.target.value; });
+        document.getElementById('office').addEventListener('change', (event) => { document.body.dataset.office = event.target.value; });
+        upload.addEventListener('change', () => { document.body.dataset.file = upload.files?.[0]?.name || ''; });
+      </script>
+    </body></html>
+  `)}`);
+
+  const clickInput = async (selector: string) => {
+    const box = await page.locator(selector).boundingBox();
+    const viewport = page.viewportSize();
+    assert.ok(box && viewport);
+    return session.dispatchLiveInput({
+      button: 'left',
+      clickCount: 1,
+      kind: 'click',
+      xRatio: (box.x + box.width / 2) / viewport.width,
+      yRatio: (box.y + box.height / 2) / viewport.height,
+    });
+  };
+
+  const dateOpened = await clickInput('#start-date');
+  assert.equal(dateOpened.liveControl?.kind, 'picker');
+  assert.equal(dateOpened.liveControl?.label, 'Start date');
+  assert.ok(dateOpened.liveControl?.kind === 'picker');
+  await session.dispatchLiveInput({
+    controlKind: 'picker',
+    kind: 'controlValue',
+    value: '2026-08-15',
+    xRatio: dateOpened.liveControl.targetXRatio,
+    yRatio: dateOpened.liveControl.targetYRatio,
+  });
+  assert.equal(await page.locator('#start-date').inputValue(), '2026-08-15');
+  assert.equal(await page.locator('body').getAttribute('data-start-date'), '2026-08-15');
+
+  const datalistOpened = await clickInput('#office');
+  assert.equal(datalistOpened.liveControl?.kind, 'datalist');
+  assert.ok(datalistOpened.liveControl?.kind === 'datalist');
+  assert.deepEqual(datalistOpened.liveControl.options.map((option) => option.value), ['Hong Kong', 'Shenzhen']);
+  await session.dispatchLiveInput({
+    controlKind: 'datalist',
+    kind: 'controlValue',
+    value: 'Shenzhen',
+    xRatio: datalistOpened.liveControl.targetXRatio,
+    yRatio: datalistOpened.liveControl.targetYRatio,
+  });
+  assert.equal(await page.locator('#office').inputValue(), 'Shenzhen');
+
+  const nativeEvents: Array<Parameters<NonNullable<Parameters<BrowserSession['startScreencast']>[0]['onNativeEvent']>>[0]> = [];
+  const screencast = await session.startScreencast({
+    onFrame: () => undefined,
+    onNativeEvent: (event) => nativeEvents.push(event),
+  });
+  context.after(async () => screencast.stop());
+
+  await clickInput('#upload-trigger');
+  await waitForCondition(() => nativeEvents.some((event) => event.kind === 'controlOpened' && event.control.kind === 'file'));
+  const fileEvent = nativeEvents.find((event) => event.kind === 'controlOpened' && event.control.kind === 'file');
+  assert.ok(fileEvent?.kind === 'controlOpened' && fileEvent.control.kind === 'file');
+  assert.equal(fileEvent.control.accept, 'text/plain');
+  const uploaded = await session.dispatchLiveInput({
+    controlId: fileEvent.control.controlId,
+    files: [{ mimeType: 'text/plain', name: 'employee-note.txt', path: uploadPath }],
+    kind: 'files',
+  });
+  assert.equal(uploaded.ok, true, uploaded.actual);
+  assert.equal(await page.locator('body').getAttribute('data-file'), 'employee-note.txt');
+  assert.equal(await page.locator('#upload').evaluate(async (input: HTMLInputElement) => input.files?.[0]?.text()), 'live preview upload');
+
+  const verifyDialog = async (
+    selector: string,
+    expectedType: 'alert' | 'confirm' | 'prompt',
+    accept: boolean,
+    promptText?: string,
+  ) => {
+    const previousEvents = nativeEvents.length;
+    await clickInput(selector);
+    await waitForCondition(() => nativeEvents.slice(previousEvents).some((event) => event.kind === 'dialogOpened'));
+    const opened = nativeEvents.slice(previousEvents).find((event) => event.kind === 'dialogOpened');
+    assert.ok(opened?.kind === 'dialogOpened');
+    assert.equal(opened.dialog.dialogType, expectedType);
+    const result = await session.dispatchLiveInput({
+      accept,
+      dialogId: opened.dialog.id,
+      kind: 'dialog',
+      ...(promptText !== undefined ? { promptText } : {}),
+    });
+    assert.equal(result.ok, true, result.actual);
+  };
+
+  await verifyDialog('#alert-trigger', 'alert', true);
+  await verifyDialog('#confirm-trigger', 'confirm', false);
+  await verifyDialog('#prompt-trigger', 'prompt', true, 'E-007');
+  assert.equal(await page.locator('body').getAttribute('data-alert'), 'done');
+  assert.equal(await page.locator('body').getAttribute('data-confirm'), 'false');
+  assert.equal(await page.locator('body').getAttribute('data-prompt'), 'E-007');
 });
 
 test('browser viewport size and output pixel ratio are independent', async () => {

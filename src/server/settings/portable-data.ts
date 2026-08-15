@@ -62,6 +62,7 @@ const memoryItemSchema = z.object({
 }).strict();
 
 const modelProviderSettingsSchema = z.object({
+  enabled: z.boolean().optional(),
   defaultModel: z.string().trim().max(1_000).optional(),
   model: z.string().trim().min(1).max(1_000),
   models: z.array(z.string().trim().min(1).max(1_000)).max(500).optional(),
@@ -234,6 +235,7 @@ export async function exportPortableData(input: {
       const current = saved.providers[definition.value];
       if (!current) return [definition.value, undefined];
       return [definition.value, {
+        enabled: current.enabled === true,
         defaultModel: current.defaultModel,
         model: current.model,
         models: current.models,

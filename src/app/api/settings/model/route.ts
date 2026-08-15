@@ -56,6 +56,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
       model: typeof item.model === 'string' ? item.model : undefined,
     });
     result[definition.value] = {
+      enabled: item.enabled === true,
       defaultModel: model,
       model,
       models,
@@ -93,6 +94,7 @@ export async function POST(request: NextRequest) {
         const models = modelListForProvider(definition, { model: bodyModel });
         const model = defaultModelForProvider(definition, { models, model: bodyModel });
         providersInput[provider] = {
+          enabled: false,
           defaultModel: model,
           model,
           models,

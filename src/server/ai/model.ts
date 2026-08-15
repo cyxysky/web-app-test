@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
 import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
@@ -33,7 +35,7 @@ type AiProvider =
   | 'togetherai'
   | 'vercel'
   | 'xai';
-type ApprovalMode = 'never' | 'on-failure' | 'on-request' | 'untrusted';
+type ApprovalMode = 'never' | 'on-request' | 'untrusted';
 type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
 export type ModelSettingsOverride = {
   provider?: string;
@@ -41,6 +43,34 @@ export type ModelSettingsOverride = {
 };
 
 const modelSettingsStorage = new AsyncLocalStorage<ModelSettingsOverride>();
+
+function resolveCodexCliPath(configuredPath: string | undefined, projectRoot: string) {
+  const value = String(configuredPath || '').trim();
+  if (value) {
+    const expandedPath = value.replace(/^\[project\](?=$|[\\/])/i, projectRoot);
+    if (expandedPath !== value || path.isAbsolute(expandedPath)) {
+      return path.normalize(expandedPath);
+    }
+    if (expandedPath.startsWith('.') || /[\\/]/.test(expandedPath)) {
+      return path.resolve(projectRoot, expandedPath);
+    }
+    return expandedPath;
+  }
+
+  // Next.js can rewrite createRequire(import.meta.url).resolve() inside the
+  // provider to a literal "[project]" path. Supplying the optional local CLI
+  // entry explicitly bypasses that bundled resolver while retaining the PATH
+  // fallback when the optional dependency is not installed.
+  const localCliPath = path.join(
+    projectRoot,
+    'node_modules',
+    '@openai',
+    'codex',
+    'bin',
+    'codex.js',
+  );
+  return existsSync(localCliPath) ? localCliPath : undefined;
+}
 
 function optionalEnvironmentValue(name: string) {
   const value = String(process.env[name] || '').trim();
@@ -241,9 +271,10 @@ export function getModelSettings() {
 }
 
 function getCodexModel(model: string): GenerateTextModel {
-  const codexPath = process.env.CODEX_PATH || undefined;
-  const cwd = process.env.CODEX_CWD || process.cwd();
-  const approvalMode = parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-failure';
+  const projectRoot = process.cwd();
+  const codexPath = resolveCodexCliPath(process.env.CODEX_PATH, projectRoot);
+  const cwd = process.env.CODEX_CWD || projectRoot;
+  const approvalMode = parseApprovalMode(process.env.CODEX_APPROVAL_MODE) || 'on-request';
   const sandboxMode = parseSandboxMode(process.env.CODEX_SANDBOX_MODE) || 'workspace-write';
   const effort = parseReasoningEffort(process.env.AI_REASONING_EFFORT) || 'medium';
   const verbose = process.env.CODEX_VERBOSE === 'true';
@@ -270,7 +301,7 @@ function getCodexModel(model: string): GenerateTextModel {
             sandboxPolicy: sandboxMode,
             effort,
             verbose,
-            minCodexVersion: '0.130.0',
+            minCodexVersion: '0.144.0',
             threadMode: 'stateless',
           },
         })(model) as unknown as LoadedLanguageModel
@@ -306,7 +337,7 @@ function normalizeProvider(value: string | undefined): AiProvider {
 }
 
 function parseApprovalMode(value: string | undefined): ApprovalMode | undefined {
-  if (value === 'never' || value === 'on-request' || value === 'on-failure' || value === 'untrusted') return value;
+  if (value === 'never' || value === 'on-request' || value === 'untrusted') return value;
   return undefined;
 }
 

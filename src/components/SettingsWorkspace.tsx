@@ -7,6 +7,7 @@ import {
   Brain,
   Braces,
   Bug,
+  Gauge,
   KeyRound,
   Loader2,
   Lock,
@@ -146,6 +147,9 @@ export function SettingsWorkspace({
         <nav className="browser-chat-nav" aria-label={t('工作模式')}>
           <WorkspaceNavItem href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
           <WorkspaceNavItem href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
+          {defaultUserId === '1' ? (
+            <WorkspaceNavItem href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
+          ) : null}
           <WorkspaceNavItem active icon={<Settings size={17} />} label={t('设置')} onClick={() => undefined} />
         </nav>
         <section className="browser-chat-sidebar-section browser-chat-settings-section">

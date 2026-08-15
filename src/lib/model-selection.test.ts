@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { modelProviderDefinition } from '../config/settings';
 import {
+  modelSelectionOptionsForConfig,
   modelSelectionDiagnosticLabel,
   modelSelectionValueForConfig,
   resolveRuntimeModelSelection,
@@ -12,6 +13,7 @@ const config: RuntimeModelConfig = {
   provider: 'deepseek',
   providers: {
     deepseek: {
+      enabled: true,
       apiKey: '',
       baseURL: '',
       defaultModel: 'deepseek-v4-pro',
@@ -42,6 +44,34 @@ test('modelSelectionValueForConfig normalizes provider and model together', () =
   const value = modelSelectionValueForConfig(config, { model: 'deepseek-v3', provider: 'deepseek' });
 
   assert.equal(value, 'deepseek::model::deepseek-v3');
+});
+
+test('model selection only exposes models from enabled providers', () => {
+  const options = modelSelectionOptionsForConfig({
+    ...config,
+    providers: {
+      ...config.providers,
+      openai: {
+        enabled: false,
+        model: 'gpt-5.5',
+        models: ['gpt-5.5'],
+      },
+    },
+  });
+
+  assert.equal(options.length >= 2, true);
+  assert.equal(options.every((option) => option.group === 'DeepSeek'), true);
+});
+
+test('model selection is empty when every provider is disabled', () => {
+  const options = modelSelectionOptionsForConfig({
+    ...config,
+    providers: {
+      deepseek: { ...config.providers.deepseek!, enabled: false },
+    },
+  });
+
+  assert.deepEqual(options, []);
 });
 
 test('modelSelectionDiagnosticLabel includes current and default model source', () => {

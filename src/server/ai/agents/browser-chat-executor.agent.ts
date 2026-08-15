@@ -2569,7 +2569,7 @@ async function executeRuntimeStep(input: {
           traces,
           visualContext: visualContext.snapshot(),
           workingMemory,
-          extra: { responseType: 'object', objectType: object.type },
+          extra: { responseType: 'object', objectType: object.type, usage: result.usage },
         }),
       });
       const finishState = aiSdkFinishState(result.finishReason, {

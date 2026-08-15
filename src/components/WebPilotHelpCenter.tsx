@@ -6,7 +6,11 @@ import { useRouter } from 'next/navigation';
 import { Check, CircleHelp, FileText, Globe2, Loader2, RotateCcw, Settings, Workflow, X } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { useI18n } from '@/i18n/I18nProvider';
-import type { WebPilotOnboardingReadiness, WebPilotOnboardingState } from '@/lib/onboarding';
+import {
+  WEBPILOT_ONBOARDING_RESTART_EVENT,
+  type WebPilotOnboardingReadiness,
+  type WebPilotOnboardingState,
+} from '@/lib/onboarding';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
@@ -50,7 +54,8 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
         method: 'PATCH',
       }).then((response) => readApiJson(response, t('重置教程失败')));
       setOpen(false);
-      router.push('/browser-chat?onboarding=1');
+      window.dispatchEvent(new Event(WEBPILOT_ONBOARDING_RESTART_EVENT));
+      router.replace('/browser-chat?onboarding=1');
     } finally {
       setResetting(false);
     }

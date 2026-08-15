@@ -52,6 +52,17 @@ function modelProviderSettings(config: RuntimeModelConfig | null | undefined, pr
   return config?.providers?.[provider];
 }
 
+export function isModelProviderEnabled(config: RuntimeModelConfig | null | undefined, provider: ModelProvider) {
+  return config?.providers?.[provider]?.enabled === true;
+}
+
+export function enabledModelProviders(config: RuntimeModelConfig | null | undefined) {
+  if (!config) return [];
+  return modelProviderDefinitions
+    .map((definition) => definition.value)
+    .filter((provider) => isModelProviderEnabled(config, provider));
+}
+
 export function modelsForProvider(config: RuntimeModelConfig | null | undefined, provider: ModelProvider) {
   return modelListForProvider(modelProviderDefinition(provider), modelProviderSettings(config, provider));
 }
@@ -84,7 +95,10 @@ export function resolveRuntimeModelSelection(
   const fallbackProvider = config?.provider
     ? normalizeModelProvider(config.provider, input.fallbackProvider || 'openrouter')
     : input.fallbackProvider || 'openrouter';
-  const provider = normalizeModelProvider(input.provider, fallbackProvider);
+  const requestedProvider = normalizeModelProvider(input.provider, fallbackProvider);
+  const provider = config && !isModelProviderEnabled(config, requestedProvider)
+    ? (isModelProviderEnabled(config, fallbackProvider) ? fallbackProvider : enabledModelProviders(config)[0] || fallbackProvider)
+    : requestedProvider;
   return {
     provider,
     model: normalizeModelId(input.model, provider, config),
@@ -103,6 +117,7 @@ export function modelSelectionDiagnosticLabel(
   config: RuntimeModelConfig | null | undefined,
   input: { model?: unknown; provider?: unknown },
 ) {
+  if (config && !enabledModelProviders(config).length) return '尚未启用模型服务商';
   const selection = resolveRuntimeModelSelection(config, input);
   const provider = modelProviderDefinition(selection.provider);
   const defaultModel = defaultModelForConfig(config, selection.provider);
@@ -111,7 +126,9 @@ export function modelSelectionDiagnosticLabel(
 }
 
 export function modelSelectionOptionsForConfig(config: RuntimeModelConfig | null | undefined): RuntimeModelOption[] {
+  if (!config) return [];
   return modelProviderDefinitions.flatMap((provider) => {
+    if (!isModelProviderEnabled(config, provider.value)) return [];
     const models = modelsForProvider(config, provider.value);
     return models.map((model) => ({
       group: provider.label,

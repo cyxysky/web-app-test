@@ -13,6 +13,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
   const models = modelListForProvider(definition);
   const model = defaultModelForProvider(definition);
   return {
+    enabled: false,
     defaultModel: model,
     model,
     models,
@@ -30,6 +31,7 @@ function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSe
     result[definition.value] = {
       ...defaultProviderSettings(definition.value),
       ...current,
+      enabled: current?.enabled === true,
       defaultModel: model,
       model,
       models,

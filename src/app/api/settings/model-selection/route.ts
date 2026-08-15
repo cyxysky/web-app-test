@@ -4,7 +4,7 @@ import { defaultModelForProvider, modelListForProvider, modelProviderDefinition,
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { store } from '@/server/db/store';
-import { apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
+import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 
@@ -32,6 +32,9 @@ export async function POST(request: NextRequest) {
       const saved = store.getModelConfig();
       const definition = modelProviderDefinition(selection.provider);
       const currentProvider = saved?.providers?.[selection.provider];
+      if (currentProvider?.enabled !== true) {
+        throw new ApiRequestError('该模型服务商尚未启用。', { code: 'model_provider_disabled', status: 400 });
+      }
       const models = modelListForProvider(definition, {
         ...currentProvider,
         models: [...(currentProvider?.models || []), selection.model],
@@ -43,6 +46,7 @@ export async function POST(request: NextRequest) {
           ...(saved?.providers || {}),
           [selection.provider]: {
             ...currentProvider,
+            enabled: true,
             baseURL: currentProvider?.baseURL ?? definition.defaultBaseURL ?? '',
             defaultModel: model,
             model,

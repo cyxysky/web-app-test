@@ -77,7 +77,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 22;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 26;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
@@ -435,6 +435,49 @@ function readLiveInput(value: unknown): BrowserLiveInput | undefined {
   }
   if (input.kind === 'key' && typeof input.key === 'string') return { kind: 'key', key: input.key };
   if (input.kind === 'text' && typeof input.text === 'string') return { kind: 'text', text: input.text };
+  if (input.kind === 'select' && typeof input.value === 'string') {
+    return {
+      kind: 'select',
+      xRatio: Number(input.xRatio),
+      yRatio: Number(input.yRatio),
+      value: input.value,
+    };
+  }
+  if (
+    input.kind === 'controlValue'
+    && (input.controlKind === 'datalist' || input.controlKind === 'picker')
+    && typeof input.value === 'string'
+  ) {
+    return {
+      controlKind: input.controlKind,
+      kind: 'controlValue',
+      value: input.value,
+      xRatio: Number(input.xRatio),
+      yRatio: Number(input.yRatio),
+    };
+  }
+  if (input.kind === 'files' && typeof input.controlId === 'string' && Array.isArray(input.files)) {
+    const files = input.files.slice(0, 8).map((file) => {
+      if (!file || typeof file !== 'object') return undefined;
+      const record = file as Record<string, unknown>;
+      if (typeof record.path !== 'string' || typeof record.name !== 'string') return undefined;
+      return {
+        mimeType: typeof record.mimeType === 'string' ? record.mimeType.slice(0, 160) : 'application/octet-stream',
+        name: record.name.slice(0, 180),
+        path: record.path.slice(0, 2_048),
+      };
+    }).filter((file): file is NonNullable<typeof file> => Boolean(file));
+    if (!files.length || files.length !== input.files.length) return undefined;
+    return { controlId: input.controlId.slice(0, 160), files, kind: 'files' };
+  }
+  if (input.kind === 'dialog' && typeof input.dialogId === 'string' && typeof input.accept === 'boolean') {
+    return {
+      accept: input.accept,
+      dialogId: input.dialogId.slice(0, 160),
+      kind: 'dialog',
+      ...(typeof input.promptText === 'string' ? { promptText: input.promptText.slice(0, 10_000) } : {}),
+    };
+  }
   return undefined;
 }
 
@@ -496,6 +539,10 @@ function handleClientMessage(client: BrowserPreviewClient, text: string) {
           broadcastText(stream, { type: 'activeTabChanged', sessionId: client.sessionId });
           await restartStream(stream);
         }
+      } else if (result.liveControl || result.liveSelect) {
+        sendToClient(client, { type: 'nativeControlOpened', requestId, control: result.liveControl || result.liveSelect });
+      } else if (input.kind === 'select' || input.kind === 'controlValue' || input.kind === 'files') {
+        sendToClient(client, { type: 'nativeControlClosed', requestId });
       }
     } catch (error) {
       sendToClient(client, {
@@ -543,6 +590,21 @@ async function attachStream(stream: BrowserPreviewStream) {
           error: error instanceof Error ? error.message : 'Browser screencast failed',
         }),
         onFrame: (frame) => handlePreviewFrame(stream, frame),
+        onNativeEvent: (event) => {
+          if (event.kind === 'dialogOpened') {
+            broadcastText(stream, { type: 'nativeDialogOpened', dialog: event.dialog });
+          } else if (event.kind === 'dialogClosed') {
+            broadcastText(stream, { type: 'nativeDialogClosed', dialogId: event.dialogId });
+          } else if (event.kind === 'downloadStarted') {
+            broadcastText(stream, { type: 'browserDownloadStarted', download: event.download });
+          } else if (event.kind === 'downloadReady') {
+            broadcastText(stream, { type: 'browserDownloadReady', download: event.download });
+          } else if (event.kind === 'downloadFailed') {
+            broadcastText(stream, { type: 'browserDownloadFailed', download: event.download });
+          } else {
+            broadcastText(stream, { type: 'nativeControlOpened', control: event.control });
+          }
+        },
         onTabsChanged: (tabs) => broadcastTabsChanged(stream, tabs),
         video: stream.transport === 'video',
       });

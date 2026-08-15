@@ -20,6 +20,7 @@ test('settings snapshots expose secret presence without returning the model key'
       provider: 'openai',
       providers: {
         openai: {
+          enabled: true,
           apiKey: secret,
           baseURL: 'https://api.openai.com/v1',
           defaultModel: 'gpt-4.1',
@@ -31,7 +32,9 @@ test('settings snapshots expose secret presence without returning the model key'
 
     const state = readModelSettingsState();
     assert.equal(state.config.providers.openai?.apiKey, '');
+    assert.equal(state.config.providers.openai?.enabled, true);
     assert.equal(state.config.providers.openai?.hasApiKey, true);
+    assert.equal(state.config.providers.deepseek?.enabled, false);
     assert.equal(JSON.stringify(state).includes(secret), false);
     assert.equal(JSON.stringify(readEnvironmentSettingsSnapshot()).includes(secret), false);
   } finally {

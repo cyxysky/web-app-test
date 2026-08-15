@@ -10,6 +10,7 @@ import {
   type WebPilotOnboardingStep,
 } from '@/lib/onboarding';
 import { modelProviderDefinition } from '@/config/settings';
+import { enabledModelProviders } from '@/lib/model-selection';
 import { getSqliteDatabase } from '@/server/storage/sqlite-database';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 import {
@@ -157,11 +158,14 @@ export function updateOnboardingState(userId: string, input: {
 export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadiness> {
   store.applyRuntimeEnv();
   const modelState = readModelSettingsState();
-  const provider = modelState.config.provider;
+  const configuredProvider = modelState.config.provider;
+  const provider = modelState.config.providers?.[configuredProvider]?.enabled
+    ? configuredProvider
+    : enabledModelProviders(modelState.config)[0] || configuredProvider;
   const providerDefinition = modelProviderDefinition(provider);
   const providerSettings = modelState.config.providers?.[provider];
   const localProvider = ['codex', 'llama-cpp', 'lmstudio', 'ollama'].includes(provider);
-  const modelReady = Boolean(providerSettings?.model && (providerDefinition.localAuth || localProvider || providerSettings.hasApiKey));
+  const modelReady = Boolean(providerSettings?.enabled && providerSettings.model && (providerDefinition.localAuth || localProvider || providerSettings.hasApiKey));
   const screenshotSetting = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase();
   const selectedModel = String(providerSettings?.model || '').toLowerCase();
   const visionReady = screenshotSetting === 'true'

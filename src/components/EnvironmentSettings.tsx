@@ -180,6 +180,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, { ...current, models });
     providers[definition.value] = {
+      enabled: current?.enabled === true,
       defaultModel: model,
       model,
       models,
@@ -199,6 +200,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
 function providerSettings(config: ModelConfig, provider: ModelProvider) {
   const definition = modelProviderDefinition(provider);
   return config.providers[provider] || {
+    enabled: false,
     defaultModel: definition.defaultModel,
     model: definition.defaultModel,
     models: modelListForProvider(definition),
@@ -1249,6 +1251,7 @@ export function EnvironmentSettings({
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
   const activeProviderModels = draftModelRows(activeProviderOption, activeProviderSettings);
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
+  const activeProviderEnabled = activeProviderSettings.enabled === true;
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
     .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
@@ -1392,11 +1395,28 @@ export function EnvironmentSettings({
                 </div>
                 <div className="settings-row">
                   <div>
+                    <strong>{t('启用服务商')}</strong>
+                    <span>{t('开启后，该服务商下配置的模型才会出现在模型选择列表中。')}</span>
+                  </div>
+                  <button
+                    aria-label={t(activeProviderEnabled ? '关闭当前服务商' : '开启当前服务商')}
+                    aria-pressed={activeProviderEnabled}
+                    className={`settings-toggle${activeProviderEnabled ? ' on' : ''}`}
+                    onClick={() => updateActiveProviderSettings({ enabled: !activeProviderEnabled })}
+                    title={t(activeProviderEnabled ? '已开启' : '已关闭')}
+                    type="button"
+                  >
+                    <span />
+                  </button>
+                </div>
+                <div className="settings-row">
+                  <div>
                     <strong>{t('默认模型')}</strong>
                     <span>{t('从当前服务商配置的模型列表中选择默认模型。')}</span>
                   </div>
                   <CustomSelect
                     className="settings-control"
+                    disabled={!activeProviderEnabled}
                     value={activeProviderDefaultModel}
                     onChange={(nextModel) => updateActiveProviderSettings({ defaultModel: nextModel, model: nextModel })}
                     options={modelListForProvider(activeProviderOption, activeProviderSettings).map((model) => ({
@@ -1417,6 +1437,7 @@ export function EnvironmentSettings({
                       <div className="settings-model-input-row" key={`${activeProvider}-${index}`}>
                         <input
                           className="input settings-control"
+                          disabled={!activeProviderEnabled}
                           value={model}
                           onChange={(event) => updateActiveProviderModel(index, event.target.value)}
                           placeholder={activeProviderOption.defaultModel}
@@ -1424,7 +1445,7 @@ export function EnvironmentSettings({
                         <button
                           aria-label={t('删除模型')}
                           className="settings-model-row-button danger"
-                          disabled={activeProviderModels.length <= 1}
+                          disabled={!activeProviderEnabled || activeProviderModels.length <= 1}
                           onClick={() => removeActiveProviderModel(index)}
                           title={activeProviderModels.length <= 1 ? t('至少保留一个模型') : t('删除模型')}
                           type="button"
@@ -1433,7 +1454,7 @@ export function EnvironmentSettings({
                         </button>
                       </div>
                     ))}
-                    <button className="ui-button settings-add-model-button" onClick={addActiveProviderModel} type="button">
+                    <button className="ui-button settings-add-model-button" disabled={!activeProviderEnabled} onClick={addActiveProviderModel} type="button">
                       <Plus size={15} />
                       {t('添加模型')}
                     </button>
