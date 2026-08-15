@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 20;
+const currentSchemaVersion = 21;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -637,6 +637,36 @@ function applyVersionTwentyMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionTwentyOneMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 21').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS ai_operations_chat_archive (
+        session_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        first_event_at TEXT NOT NULL,
+        last_event_at TEXT NOT NULL,
+        archived_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS ai_operations_chat_archive_user_last_event_idx
+        ON ai_operations_chat_archive(user_id, last_event_at DESC);
+      CREATE INDEX IF NOT EXISTS ai_operations_chat_archive_last_event_idx
+        ON ai_operations_chat_archive(last_event_at DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (21, 'durable-ai-operations-chat-archive', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -726,6 +756,19 @@ function initializeSchema(database: DatabaseSync) {
       FOREIGN KEY (session_id) REFERENCES browser_chat_session(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS browser_chat_log_session_time_idx ON browser_chat_log(session_id, time);
+
+    CREATE TABLE IF NOT EXISTS ai_operations_chat_archive (
+      session_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      record_json TEXT NOT NULL,
+      first_event_at TEXT NOT NULL,
+      last_event_at TEXT NOT NULL,
+      archived_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ai_operations_chat_archive_user_last_event_idx
+      ON ai_operations_chat_archive(user_id, last_event_at DESC);
+    CREATE INDEX IF NOT EXISTS ai_operations_chat_archive_last_event_idx
+      ON ai_operations_chat_archive(last_event_at DESC);
 
     CREATE TABLE IF NOT EXISTS personal_memory_item (
       id TEXT PRIMARY KEY,
@@ -824,6 +867,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionEighteenMigration(database);
   applyVersionNineteenMigration(database);
   applyVersionTwentyMigration(database);
+  applyVersionTwentyOneMigration(database);
 }
 
 export function getSqliteDatabase() {

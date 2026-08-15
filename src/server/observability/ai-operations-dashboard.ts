@@ -2,6 +2,7 @@ import { getSqliteDatabase } from '@/server/storage/sqlite-database';
 import { runtimeMetricsSnapshot } from '@/server/observability/runtime-observability';
 import { sqliteWriteQueueSnapshot } from '@/server/storage/sqlite-write-queue';
 import { cpuWorkerPoolSnapshot } from '@/server/runtime/cpu-worker-pool';
+import { readArchivedAiOperationsChatSessions } from '@/server/observability/ai-operations-chat-archive';
 
 export type AiOperationsStatus = 'passed' | 'failed' | 'blocked' | 'running' | 'interrupted' | 'unknown';
 
@@ -388,6 +389,10 @@ export function readAiOperationsDashboard(
     FROM browser_chat_session
     WHERE updated_at >= ?
   `).all(sinceIso) as SessionRow[];
+  const liveSessionIds = new Set((database.prepare(`
+    SELECT id FROM browser_chat_session
+  `).all() as Array<{ id: string }>).map((row) => row.id));
+  const archivedChatSessions = readArchivedAiOperationsChatSessions();
   const messages = database.prepare(`
     SELECT message.session_id, message.time, message.record_json, session.user_id
     FROM browser_chat_message AS message
@@ -521,6 +526,70 @@ export function readAiOperationsDashboard(
       const record = parseRecord(tool);
       if (record.recovered === true) repairs += 1;
     }
+  }
+
+  const sinceTimestamp = timestampMs(sinceIso);
+  for (const archive of archivedChatSessions) {
+    if (liveSessionIds.has(archive.sessionId)) continue;
+    const identity = {
+      model: text(archive.model) || 'unknown-model',
+      provider: text(archive.provider) || 'unknown-provider',
+    };
+    const target = targetFromUrl(archive.targetUrl);
+    const userId = text(archive.userId) || 'unknown';
+    const includeInTrend = !trendUserId || trendUserId === userId;
+    for (const message of archive.messages) {
+      const eventTime = text(message.time);
+      if (!eventTime || timestampMs(eventTime) < sinceTimestamp) continue;
+      const point = trend.get(dateKey(eventTime));
+      const user = mutableUser(users, userId);
+      const model = mutableModel(models, identity.provider, identity.model);
+      const system = mutableSystem(systems, target);
+      if (message.role === 'user') {
+        chatTasks += 1;
+        if (point && includeInTrend) point.chatTasks += 1;
+        if (includeInTrend) trendUsers.get(dateKey(eventTime))?.add(userId);
+        user.chatTasks += 1;
+        user.lastActiveAt = user.lastActiveAt > eventTime ? user.lastActiveAt : eventTime;
+        model.taskCount += 1;
+        model.sessions.add(archive.sessionId);
+        system.totalTasks += 1;
+        continue;
+      }
+      let status = normalizedStatus(message.status);
+      if (status === 'running') status = 'interrupted';
+      if (includeInTrend) addTrendStatus(point, status);
+      if (message.durationMs > 0) durations.push(message.durationMs);
+      if (status === 'passed') chatPassed += 1;
+      else if (status === 'failed') chatFailed += 1;
+      else if (status === 'blocked') chatBlocked += 1;
+      else if (status === 'interrupted') chatInterrupted += 1;
+      markStatus(user, status);
+      markStatus(model, status);
+      markStatus(system, status);
+      if (['failed', 'blocked', 'interrupted'].includes(status)) {
+        incidents.push({
+          id: `archived-chat:${archive.sessionId}:${message.id}`,
+          reason: '对话内容已删除，仅保留匿名化运营结果',
+          source: 'chat',
+          status: status as AiOperationsIncident['status'],
+          target,
+          time: eventTime,
+          title: '已删除的对话任务',
+          userId,
+        });
+      }
+    }
+    for (const usage of archive.usages) {
+      const eventTime = text(usage.time);
+      if (!eventTime || timestampMs(eventTime) < sinceTimestamp) continue;
+      const user = mutableUser(users, userId);
+      user.inputTokens += numberValue(usage.inputTokens);
+      user.outputTokens += numberValue(usage.outputTokens);
+      user.totalTokens += numberValue(usage.totalTokens);
+      user.lastActiveAt = user.lastActiveAt > eventTime ? user.lastActiveAt : eventTime;
+    }
+    if (timestampMs(archive.updatedAt) >= sinceTimestamp) repairs += numberValue(archive.repairs);
   }
 
   let automationPassed = 0;

@@ -9,6 +9,7 @@ import type {
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
+import { archiveAiOperationsChatSession } from '@/server/observability/ai-operations-chat-archive';
 import { artifactContentType } from '@/server/files/file-format-registry';
 import {
   executeInteractiveBrowserTurn,
@@ -2708,6 +2709,15 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
+  try {
+    archiveAiOperationsChatSession({
+      ...snapshot(removed.session, { fullSteps: true }),
+      logs: [...(removed.session.logs || [])],
+    });
+  } catch (error) {
+    sessions.set(sessionId, removed.session);
+    throw error;
+  }
   const persisted = persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) });
   const pendingWrite = pendingSqliteWrites.get(sessionId);
   if (!persisted || (pendingWrite && !(await pendingWrite))) {
@@ -2886,6 +2896,17 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
     }
   }
   if (removed.length) {
+    try {
+      for (const item of removed) {
+        archiveAiOperationsChatSession({
+          ...snapshot(item.session, { fullSteps: true }),
+          logs: [...(item.session.logs || [])],
+        });
+      }
+    } catch (error) {
+      for (const item of removed) sessions.set(item.deleted.id, item.session);
+      throw error;
+    }
     const persisted = persistDeletedSessions(removed.map((item) => ({
       id: item.deleted.id,
       userId: normalizeApplicationUserId(item.session.userId),

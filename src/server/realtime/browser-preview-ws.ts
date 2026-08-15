@@ -601,7 +601,7 @@ async function attachStream(stream: BrowserPreviewStream) {
             broadcastText(stream, { type: 'browserDownloadReady', download: event.download });
           } else if (event.kind === 'downloadFailed') {
             broadcastText(stream, { type: 'browserDownloadFailed', download: event.download });
-          } else {
+          } else if (event.kind === 'controlOpened') {
             broadcastText(stream, { type: 'nativeControlOpened', control: event.control });
           }
         },
