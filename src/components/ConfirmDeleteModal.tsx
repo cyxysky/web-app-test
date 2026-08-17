@@ -2,7 +2,6 @@
 
 import { Loader2, Trash2, X } from 'lucide-react';
 import { createPortal } from 'react-dom';
-import type { ReactNode } from 'react';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 
@@ -10,7 +9,6 @@ type ConfirmDeleteModalProps = {
   description: string;
   deleting: boolean;
   error?: string;
-  icon?: ReactNode;
   id: string;
   itemTitle: string;
   onClose: () => void;
@@ -22,7 +20,6 @@ export function ConfirmDeleteModal({
   description,
   deleting,
   error,
-  icon,
   id,
   itemTitle,
   onClose,
@@ -50,7 +47,6 @@ export function ConfirmDeleteModal({
           </button>
         </header>
         <div className="ui-modal-body skills-manager-delete-body">
-          {icon}
           <h3>{itemTitle}</h3>
           <p>{description}</p>
           {error ? <p className="personal-memory-delete-error">{error}</p> : null}

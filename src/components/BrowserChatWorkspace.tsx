@@ -8170,6 +8170,9 @@ export function BrowserChatWorkspace({
   const loadingSessionRef = useRef<string | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const embeddedWorkspaceRef = useRef<HTMLDivElement | null>(null);
+  const recentSessionListRef = useRef<HTMLOListElement | null>(null);
+  const recentSessionListEndRef = useRef<HTMLLIElement | null>(null);
+  const recentSessionListFailedCursorRef = useRef('');
   const activeSessionIdRef = useRef<string | null>(null);
   const sessionActivationSequenceRef = useRef(0);
   const sessionSelectionIntentRef = useRef(0);
@@ -8553,6 +8556,22 @@ export function BrowserChatWorkspace({
     if (!query) return recentSessions;
     return sidebarSessions.filter((item) => sessionDisplayTitle(item).toLocaleLowerCase().includes(query));
   }, [historyFilter, recentSessions, sidebarSessions]);
+  useEffect(() => {
+    if (loadingSessionHistory || loadingMoreSessions || !sessionListPage.hasMore || !sessionListPage.next) return undefined;
+    const list = recentSessionListRef.current;
+    const listEnd = recentSessionListEndRef.current;
+    if (!list || !listEnd) return undefined;
+    const cursorKey = `${sessionListPage.next.beforeUpdatedAt || ''}\u0000${sessionListPage.next.beforeId || ''}`;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting) || recentSessionListFailedCursorRef.current === cursorKey) return;
+      void loadMoreSessions().catch((loadError) => {
+        recentSessionListFailedCursorRef.current = cursorKey;
+        setError(loadError instanceof Error ? loadError.message : '加载更多对话失败');
+      });
+    }, { root: list, rootMargin: '80px' });
+    observer.observe(listEnd);
+    return () => observer.disconnect();
+  }, [historyFilter, loadingMoreSessions, loadingSessionHistory, loadMoreSessions, mobileHistoryOpen, sessionListPage.hasMore, sessionListPage.next]);
   const selectedSessionIdSet = useMemo(() => new Set(selectedSessionIds), [selectedSessionIds]);
   const selectableRecentSessionIds = useMemo(
     () => filteredRecentSessions.filter((item) => !item.busy).map((item) => item.id),
@@ -8822,22 +8841,6 @@ export function BrowserChatWorkspace({
     }
   }, [applyLoadedSessions, browserChatApiUrl, initializeSessionListPage]);
 
-  const refreshSessionList = useCallback(async () => {
-    const response = await fetch(browserChatApiUrl('/api/browser-chat?limit=10'), { cache: 'no-store' });
-    const data = await readApiJson<{ page?: BrowserChatSessionListPage; sessions?: BrowserChatSession[] }>(
-      response,
-      '刷新对话列表失败',
-    );
-    const nextSessions = (Array.isArray(data.sessions) ? data.sessions : []).map((item) => {
-      const normalized = normalizeSession(item);
-      const guarded = applyBrowserChatInterruptGuard(normalized, interruptGuardsRef.current.get(normalized.id));
-      if (guarded.release) interruptGuardsRef.current.delete(normalized.id);
-      return guarded.session;
-    });
-    initializeSessionListPage(data.page || {});
-    setSessions(nextSessions);
-  }, [browserChatApiUrl, initializeSessionListPage]);
-
   const loadInitialBrowserChatData = useCallback(async () => {
     const data = await readBrowserChatInitialRequest(
       browserChatApiUrl('/api/browser-chat/bootstrap?sessionLimit=10'),
@@ -8890,7 +8893,6 @@ export function BrowserChatWorkspace({
       }
       setSession((current) => (current?.id === event.id ? null : current));
       setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
-      void refreshSessionList().catch(() => undefined);
       return;
     }
     const patch = browserChatRealtimePatch(event.patch);
@@ -8926,7 +8928,7 @@ export function BrowserChatWorkspace({
       return [guarded.session, ...current.filter((item) => item.id !== event.id)]
         .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
     });
-  }, [refreshSessionList]);
+  }, []);
 
   const resyncRealtimeSessions = useCallback(async () => {
     const activeSessionId = activeSessionIdRef.current;
@@ -9223,7 +9225,6 @@ export function BrowserChatWorkspace({
       setSelectedSessionIds((current) => current.filter((id) => id !== sessionId));
       if (deletingActiveSession) clearDeletedActiveSession();
       if (deletedSession) await discardEmbeddedBrowserDataForSessions([deletedSession]);
-      await refreshSessionList().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '删除历史对话失败');
     } finally {
@@ -9280,7 +9281,6 @@ export function BrowserChatWorkspace({
       setSelectedSessionIds((current) => current.filter((id) => !deletingIdSet.has(id)));
       if (deletingActiveSession) clearDeletedActiveSession();
       await discardEmbeddedBrowserDataForSessions(deletedSessions);
-      await refreshSessionList().catch(() => undefined);
     } catch (deleteError) {
       setError(deleteError instanceof Error ? deleteError.message : '批量删除历史对话失败');
     } finally {
@@ -9611,9 +9611,20 @@ export function BrowserChatWorkspace({
               <Loader2 className="spin" size={16} />
               <span>{t('正在加载对话')}</span>
             </div>
-          ) : filteredRecentSessions.length ? (
-            <>
-            <ol className="browser-chat-recent-list">
+          ) : filteredRecentSessions.length || (!historyFilter.trim() && sessionListPage.hasMore) ? (
+            <ol
+              aria-busy={loadingMoreSessions}
+              className="browser-chat-recent-list"
+              onScroll={(event) => {
+                const list = event.currentTarget;
+                const verticalRemaining = list.scrollHeight - list.scrollTop - list.clientHeight;
+                const horizontalRemaining = list.scrollWidth - list.scrollLeft - list.clientWidth;
+                if (verticalRemaining > 160 || horizontalRemaining > 160) {
+                  recentSessionListFailedCursorRef.current = '';
+                }
+              }}
+              ref={recentSessionListRef}
+            >
               {filteredRecentSessions.map((item) => (
                 <li key={item.id}>
                   <div
@@ -9677,23 +9688,22 @@ export function BrowserChatWorkspace({
                   </div>
                 </li>
               ))}
+              {sessionListPage.hasMore && sessionListPage.next ? (
+                <li
+                  className={`browser-chat-history-scroll-sentinel${loadingMoreSessions ? ' is-loading' : ''}`}
+                  ref={recentSessionListEndRef}
+                >
+                  {loadingMoreSessions ? (
+                    <span aria-live="polite" role="status">
+                      <Loader2 className="spin" size={13} />
+                      {t('正在加载更多对话')}
+                    </span>
+                  ) : null}
+                </li>
+              ) : null}
             </ol>
-            </>
           ) : recentSessions.length ? (
             <p className="browser-chat-history-filter-empty">{t('没有匹配的对话')}</p>
-          ) : null}
-          {!loadingSessionHistory && sessionListPage.hasMore ? (
-            <button
-              aria-label={t(loadingMoreSessions ? '正在加载' : '加载更多')}
-              className="browser-chat-history-load-more"
-              disabled={loadingMoreSessions}
-              onClick={() => void loadMoreSessions()}
-              title={t(loadingMoreSessions ? '正在加载' : '加载更多')}
-              type="button"
-            >
-              {loadingMoreSessions ? <Loader2 className="spin" size={13} /> : <ChevronDown aria-hidden="true" size={15} />}
-              <span>{t(loadingMoreSessions ? '正在加载' : '加载更多')}</span>
-            </button>
           ) : null}
         </div>
         </div>

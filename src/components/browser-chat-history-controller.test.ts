@@ -15,12 +15,12 @@ test('historical subagent data is queried only on the first parallel-group expan
   assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-2'), true);
 });
 
-test('continues loading while logs or steps still have earlier pages', () => {
+test('offers earlier-message loading only while the message page has a cursor', () => {
   assert.equal(browserChatHasEarlierMessages({
     messages: { hasMore: false },
     steps: { cursor: 'older-steps', hasMore: true },
     logs: { cursor: 'older-logs', hasMore: true },
-  }), true);
+  }), false);
   assert.equal(browserChatHasEarlierMessages({
     messages: { cursor: 'older-messages', hasMore: true },
     steps: { hasMore: false },

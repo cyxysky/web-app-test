@@ -538,7 +538,6 @@ export function SkillsManager({
         <ConfirmDeleteModal
           deleting={Boolean(deletingSkillId)}
           description={t('确定删除这个 Skill 吗？')}
-          icon={<div className="skills-manager-delete-icon"><Trash2 size={20} /></div>}
           id="skills-manager-delete-title"
           itemTitle={deleteTarget.title}
           onClose={closeDeleteModal}

@@ -540,22 +540,9 @@
   line-height: 1.55;
 }
 
-.login-account-modal-icon,
-.skills-manager-delete-icon {
+.login-account-modal-icon {
   background: var(--accent-soft);
   color: var(--accent-strong);
-}
-
-.skills-manager-delete-icon {
-  align-items: center;
-  border: 1px solid rgba(127, 29, 29, 0.2);
-  border-radius: 8px;
-  display: inline-flex;
-  height: 40px;
-  justify-content: center;
-  width: 40px;
-  background: color-mix(in srgb, var(--danger) 10%, var(--panel));
-  color: var(--danger);
 }
 
 .login-account-item {

@@ -32,11 +32,7 @@ export function normalizeBrowserChatHistory(value: BrowserChatHistoryState | und
 }
 
 export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | undefined) {
-  return Boolean(
-    (value?.messages.hasMore && value.messages.cursor)
-    || (value?.steps.hasMore && value.steps.cursor)
-    || (value?.logs.hasMore && value.logs.cursor),
-  );
+  return Boolean(value?.messages.hasMore && value.messages.cursor);
 }
 
 export function beginHistoricalSubagentQuery(queriedKeys: Set<string>, key: string) {

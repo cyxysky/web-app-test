@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { readApiJson } from '@/lib/api-client';
 
 export type BrowserChatSessionListPage = {
@@ -15,6 +15,7 @@ export function useBrowserChatSessionPagination<TSession>(
 ) {
   const [page, setPage] = useState<BrowserChatSessionListPage>({});
   const [loadingMore, setLoadingMore] = useState(false);
+  const loadingMoreRef = useRef(false);
 
   const initialize = useCallback((nextPage: BrowserChatSessionListPage = {}) => {
     setPage(nextPage);
@@ -22,7 +23,8 @@ export function useBrowserChatSessionPagination<TSession>(
 
   const loadMore = useCallback(async () => {
     const next = page.next;
-    if (!page.hasMore || !next || loadingMore) return;
+    if (!page.hasMore || !next || loadingMoreRef.current) return;
+    loadingMoreRef.current = true;
     setLoadingMore(true);
     try {
       const params = new URLSearchParams({ limit: '10' });
@@ -33,9 +35,10 @@ export function useBrowserChatSessionPagination<TSession>(
       applyPage(Array.isArray(data.sessions) ? data.sessions : []);
       setPage(data.page || {});
     } finally {
+      loadingMoreRef.current = false;
       setLoadingMore(false);
     }
-  }, [apiUrl, applyPage, loadingMore, page, translate]);
+  }, [apiUrl, applyPage, page, translate]);
 
   return { initialize, loadMore, loadingMore, page };
 }

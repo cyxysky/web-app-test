@@ -2148,3 +2148,25 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   cursor: wait;
   opacity: 0.68;
 }
+
+.browser-chat-history-scroll-sentinel {
+  align-items: center;
+  contain-intrinsic-size: auto 1px !important;
+  content-visibility: visible !important;
+  display: flex;
+  justify-content: center;
+  min-height: 1px;
+  width: 100%;
+}
+
+.browser-chat-history-scroll-sentinel.is-loading {
+  min-height: 34px;
+}
+
+.browser-chat-history-scroll-sentinel > span {
+  align-items: center;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 12px;
+  gap: 6px;
+}
