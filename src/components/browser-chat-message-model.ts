@@ -67,6 +67,19 @@ export function browserChatAiCycleAnchorsText(
   return cycle.output.texts.some((candidate) => normalizedVisibleText(candidate) === normalizedText);
 }
 
+export function browserChatTerminalAnswerCycleIndex(cycles: BrowserChatAiOutputCycleLike[]) {
+  for (let index = cycles.length - 1; index >= 0; index -= 1) {
+    const cycle = cycles[index];
+    if (cycle.output.tools?.length) continue;
+    if (cycle.output.texts.some(hasVisibleText)) return index;
+  }
+  return -1;
+}
+
+export function browserChatAssistantMessageHasExecutionMetadata(message: BrowserChatMessageLike) {
+  return message.role === 'assistant' && Boolean(message.stepIndexes?.length);
+}
+
 export function browserChatMessageElapsedMs(
   message: Pick<BrowserChatMessageLike, 'createdAt' | 'updatedAt'>,
   liveNowMs?: number,

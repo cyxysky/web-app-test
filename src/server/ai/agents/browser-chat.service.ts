@@ -882,9 +882,19 @@ function elapsedMs(startedAt: number) {
 }
 
 function elapsedFromDetails(details: unknown) {
-  if (!details || typeof details !== 'object') return undefined;
-  const value = (details as { elapsedMs?: unknown }).elapsedMs;
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  const unwrapped = unwrapLogDetails(details).value;
+  if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) return undefined;
+  const record = unwrapped as Record<string, unknown>;
+  const direct = record.elapsedMs;
+  if (typeof direct === 'number' && Number.isFinite(direct)) return direct;
+  const aiOutput = record.aiOutput && typeof record.aiOutput === 'object' && !Array.isArray(record.aiOutput)
+    ? record.aiOutput as Record<string, unknown>
+    : undefined;
+  const timings = aiOutput?.timings && typeof aiOutput.timings === 'object' && !Array.isArray(aiOutput.timings)
+    ? aiOutput.timings as Record<string, unknown>
+    : undefined;
+  const total = timings?.totalElapsedMs ?? aiOutput?.elapsedMs;
+  return typeof total === 'number' && Number.isFinite(total) ? total : undefined;
 }
 
 function trimLogText(value: string, max = 3000) {
@@ -893,7 +903,20 @@ function trimLogText(value: string, max = 3000) {
 }
 
 function unwrapLogDetails(value: unknown) {
-  return { value, full: false };
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { value, full: false };
+  const record = value as Record<string, unknown>;
+  if (record.__browserChatFullLogDetails !== true) return { value, full: false };
+  const payload = record.value;
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    return {
+      value: {
+        ...payload as Record<string, unknown>,
+        ...(record.execution ? { execution: record.execution } : {}),
+      },
+      full: true,
+    };
+  }
+  return { value: payload, full: true };
 }
 
 function stringifyCompactLogDetails(value: unknown) {
@@ -3294,7 +3317,17 @@ function updateAssistantMessage(
 }
 
 function appendBrowserChatOutputCycle(session: BrowserChatSessionRecord, cycle: BrowserChatAiOutputCycle) {
-  session.outputCycles = [...(session.outputCycles || []), cycle];
+  const outputCycles = session.outputCycles || [];
+  const lastSequence = outputCycles.reduce((highest, item) => (
+    typeof item.sequence === 'number' && Number.isFinite(item.sequence)
+      ? Math.max(highest, item.sequence)
+      : highest
+  ), 0);
+  session.outputCycles = [...outputCycles, {
+    ...cycle,
+    sequence: cycle.sequence ?? lastSequence + 1,
+    createdAt: cycle.createdAt || now(),
+  }];
   session.updatedAt = now();
 }
 

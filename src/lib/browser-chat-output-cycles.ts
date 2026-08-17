@@ -176,6 +176,8 @@ export function browserChatAiOutputCycleFromDebugEvent(input: {
   messageId?: string;
   phase: string;
   stepIndex?: number;
+  sequence?: number;
+  createdAt?: string;
   subagentId?: string;
   batchId?: string;
 }): BrowserChatAiOutputCycle | undefined {
@@ -185,6 +187,7 @@ export function browserChatAiOutputCycleFromDebugEvent(input: {
   const event = asRecord(detailsValue?.event) || detailsValue;
   const aiOutput = asRecord(event?.aiOutput);
   if (!aiOutput) return undefined;
+  const rawAgentStepIndex = Number(aiOutput.agentStepIndex);
   const output = browserChatAiOutputViewFromResponse(aiOutput.response);
   const fallbackText = stringFromUnknown(aiOutput.text);
   if (fallbackText) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text: fallbackText }));
@@ -200,6 +203,9 @@ export function browserChatAiOutputCycleFromDebugEvent(input: {
     messageId: input.messageId,
     output: compacted,
     stepIndex: input.stepIndex,
+    agentStepIndex: Number.isFinite(rawAgentStepIndex) ? rawAgentStepIndex : undefined,
+    sequence: input.sequence,
+    createdAt: input.createdAt,
     subagentId: input.subagentId,
     batchId: input.batchId,
   };

@@ -205,6 +205,10 @@ export type BrowserChatAiOutputCycle = {
   messageId?: string;
   output: BrowserChatAiOutputView;
   stepIndex?: number;
+  agentStepIndex?: number;
+  sequence?: number;
+  createdAt?: string;
+  sourceCycleId?: string;
   subagentId?: string;
   batchId?: string;
 };

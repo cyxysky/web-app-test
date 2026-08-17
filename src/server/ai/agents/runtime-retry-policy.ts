@@ -1,6 +1,7 @@
 export type RuntimeRetryCategory =
   | 'aborted'
   | 'authentication'
+  | 'billing'
   | 'configuration'
   | 'invalid-request'
   | 'network'
@@ -144,6 +145,9 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   if (statusCode === 401 || statusCode === 403 || /\b(api key|authentication|unauthori[sz]ed|forbidden)\b/.test(normalizedMessage)) {
     return { category: 'authentication', reason: `authentication failure${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };
   }
+  if (statusCode === 402 || /\b(insufficient balance|payment required|billing quota)\b/.test(normalizedMessage)) {
+    return { category: 'billing', reason: `provider balance is unavailable${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };
+  }
   if (statusCode === 400 || statusCode === 404 || statusCode === 405 || statusCode === 410 || statusCode === 422 || nonRetryableCodes.has(code)) {
     return { category: 'invalid-request', reason: `deterministic request failure${statusCode ? ` (${statusCode})` : code ? ` (${code})` : ''}`, retryable: false, statusCode };
   }
@@ -167,6 +171,9 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   }
   if (/ai sdk returned retryable finish reason\s+"(?:error|other)"/i.test(message)) {
     return { category: 'server-error', reason: 'provider returned an error finish state', retryAfterMs, retryable: true, statusCode };
+  }
+  if (name === 'AI_NoOutputGeneratedError' || /\bno output generated\b/i.test(message)) {
+    return { category: 'server-error', reason: 'provider stream ended without an output', retryAfterMs, retryable: true, statusCode };
   }
   return { category: 'unknown', reason: 'error is not known to be transient', retryable: false, statusCode };
 }

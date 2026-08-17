@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   browserChatAiCycleAnchorsText,
+  browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
+  browserChatTerminalAnswerCycleIndex,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
@@ -56,6 +58,44 @@ test('keeps text anchored to the tool cycle that emitted it', () => {
       tools: [],
     },
   }, '最终回答'), false);
+});
+
+test('treats the last text-only cycle as the terminal answer even when persisted links were rewritten', () => {
+  const cycles = [
+    {
+      id: 'tool-cycle',
+      output: {
+        texts: ['Generating the document.'],
+        tools: [{ name: 'generateFile' }],
+      },
+    },
+    {
+      id: 'answer-cycle',
+      output: {
+        texts: ['[report.docx](/temporary/model-link)'],
+        tools: [],
+      },
+    },
+  ];
+
+  assert.equal(browserChatTerminalAnswerCycleIndex(cycles), 1);
+  assert.notEqual(cycles[1].output.texts[0], '[report.docx](/canonical/artifact-link)');
+});
+
+test('keeps historical message actions available from step metadata before details are lazy-loaded', () => {
+  assert.equal(browserChatAssistantMessageHasExecutionMetadata({
+    content: 'done',
+    id: 'a1',
+    role: 'assistant',
+    status: 'passed',
+    stepIndexes: [19],
+  }), true);
+  assert.equal(browserChatAssistantMessageHasExecutionMetadata({
+    content: 'done',
+    id: 'a2',
+    role: 'assistant',
+    status: 'passed',
+  }), false);
 });
 
 test('formats the completed assistant processing duration', () => {

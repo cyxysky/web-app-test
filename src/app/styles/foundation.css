@@ -771,7 +771,7 @@ input[type="checkbox"]:focus-visible {
 .ui-modal-header,
 .ui-modal > header {
   min-height: 58px;
-  padding: 14px 18px;
+  padding: 8px 10px;
 }
 
 .ui-modal-title,

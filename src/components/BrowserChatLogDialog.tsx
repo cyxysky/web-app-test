@@ -49,7 +49,8 @@ function aiLogInputTokenCount(log: BrowserChatLogDialogRecord) {
   if (!log.phase.endsWith('ai:runtime:request')) return undefined;
   const details = parseJsonObjectText(log.details);
   const payloadDetails = asRecord(details?.event) || details;
-  return finiteNumber(asRecord(payloadDetails?.aiInputTokens)?.estimatedTextTokens);
+  const stats = asRecord(payloadDetails?.aiInputTokens);
+  return finiteNumber(stats?.estimatedTotalTokens) ?? finiteNumber(stats?.estimatedTextTokens);
 }
 
 function aiLogTimings(details?: Record<string, unknown>) {
@@ -242,14 +243,17 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
     trace: payloadDetails.trace,
   }) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  const requestTokens = isAiRequestLog ? finiteNumber(asRecord(payloadDetails.aiInputTokens)?.estimatedTextTokens) : undefined;
+  const requestTokenStats = asRecord(payloadDetails.aiInputTokens);
+  const requestTokens = isAiRequestLog
+    ? finiteNumber(requestTokenStats?.estimatedTotalTokens) ?? finiteNumber(requestTokenStats?.estimatedTextTokens)
+    : undefined;
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
   return (
     <div className="browser-chat-log-details">
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title={t('耗时明细')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title={t('AI 输入 JSON')} />
       {isAiRequestLog ? (
-        <p className="browser-chat-log-token-count">{t('此次发送给 AI 的文本：{tokens}', {
+        <p className="browser-chat-log-token-count">{t('此次发送给 AI 的内容：{tokens}', {
           tokens: requestTokens === undefined ? t('无法估算') : t('约 {count} tokens', { count: Math.round(requestTokens).toLocaleString() }),
         })}</p>
       ) : null}

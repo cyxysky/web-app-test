@@ -40,6 +40,21 @@ test('runtime retry only accepts transient provider and network failures', () =>
 test('runtime retry accepts SDK error and other finish states', () => {
   assert.equal(classifyRuntimeRetry(new Error('AI SDK returned retryable finish reason "error".')).retryable, true);
   assert.equal(classifyRuntimeRetry(new Error('AI SDK returned retryable finish reason "other".')).retryable, true);
+  assert.deepEqual(classifyRuntimeRetry(Object.assign(new Error('No output generated. Check the stream for errors.'), {
+    name: 'AI_NoOutputGeneratedError',
+  })), {
+    category: 'server-error',
+    reason: 'provider stream ended without an output',
+    retryAfterMs: undefined,
+    retryable: true,
+    statusCode: undefined,
+  });
+  assert.deepEqual(classifyRuntimeRetry(Object.assign(new Error('Insufficient Balance'), { statusCode: 402 })), {
+    category: 'billing',
+    reason: 'provider balance is unavailable (402)',
+    retryable: false,
+    statusCode: 402,
+  });
 });
 
 test('runtime retry honors Retry-After before exponential jitter', () => {

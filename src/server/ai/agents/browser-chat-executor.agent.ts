@@ -1011,13 +1011,23 @@ function createToolTrace(input: {
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
+  toolCallId?: string;
   aiRequest?: AiRequestSnapshot;
   runId?: string;
   stepIndex?: number;
 }) {
-  const { traces, name, toolInput, aiRequest, runId, stepIndex } = input;
+  const { traces, name, toolInput, toolCallId, aiRequest, runId, stepIndex } = input;
+  const existing = toolCallId ? traces.find((trace) => trace.id === toolCallId) : undefined;
+  if (existing) {
+    existing.name = name;
+    existing.input = toolInput;
+    existing.startedAt ??= Date.now();
+    existing.contextBefore ??= toolContextFromAiRequest(aiRequest);
+    existing.screenshots ??= [];
+    return existing;
+  }
   const screenshots: ToolTrace['screenshots'] = [];
-  const traceId = runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
+  const traceId = toolCallId || runtimeToolTraceId({ runId, stepIndex, traceIndex: traces.length + 1 });
   const trace: ToolTrace = {
     id: traceId,
     name,
@@ -1081,6 +1091,7 @@ async function executeTracedBrowserAction(input: {
   traces: ToolTrace[];
   name: string;
   toolInput: unknown;
+  toolCallId?: string;
   action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>;
   aiRequest?: AiRequestSnapshot;
   runId?: string;
@@ -1091,9 +1102,9 @@ async function executeTracedBrowserAction(input: {
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { traces, name, toolInput, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
+  const { traces, name, toolInput, toolCallId, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
-  const trace = createToolTrace({ traces, name, toolInput, aiRequest, runId, stepIndex });
+  const trace = createToolTrace({ traces, name, toolInput, toolCallId, aiRequest, runId, stepIndex });
   const postprocessTimings: Record<string, number> = {};
   trace.postprocessTimings = postprocessTimings;
   let postprocessStartedAt = Date.now();
@@ -1185,7 +1196,12 @@ function makeBrowserTools(
     reason: toolReasonInput,
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
-  async function record(name: string, input: unknown, action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>) {
+  async function record(
+    name: string,
+    input: unknown,
+    action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>,
+    execution?: { abortSignal?: AbortSignal; toolCallId?: string },
+  ) {
     throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
     if (toolExecutionGate.executed) {
       // Do not execute or trace extra calls; just tell the model to stop. This keeps the recorded
@@ -1205,6 +1221,7 @@ function makeBrowserTools(
       traces,
       name,
       toolInput: input,
+      toolCallId: execution?.toolCallId,
       runId: referenceOptions?.runId,
       stepIndex: referenceOptions?.stepIndex,
       visualContext: traceVisualContext,
@@ -1234,7 +1251,7 @@ function makeBrowserTools(
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
       }),
-      execute: (input) => {
+      execute: (input, execution) => {
         return record('browserCode', input, (abortSignal) => {
           const violation = browserCodeServiceFileDeliveryViolation(input.code);
           if (violation) return Promise.resolve({ ok: false, actual: violation });
@@ -1247,7 +1264,7 @@ function makeBrowserTools(
             stepIndex: referenceOptions?.stepIndex || 0,
             abortSignal,
           });
-        });
+        }, execution);
       },
     }),
     } : {
@@ -1257,7 +1274,7 @@ function makeBrowserTools(
           inputSchema: browserToolInput({
             capture: z.enum(['viewport', 'fullPage']).optional(),
           }),
-          execute: (input) => record('takeScreenshot', input, async () => {
+          execute: (input, execution) => record('takeScreenshot', input, async () => {
             const path = await session.takeScreenshot(
               referenceOptions?.runId || 'browser-chat',
               referenceOptions?.stepIndex || 0,
@@ -1265,7 +1282,7 @@ function makeBrowserTools(
               { capture: input.capture },
             );
             return { ok: true, actual: `Captured ${input.capture || 'viewport'} screenshot.`, referenceImagePath: path };
-          }),
+          }, execution),
         }),
       } : {}),
       browser: tool({
@@ -1281,18 +1298,18 @@ function makeBrowserTools(
             context.addIssue({ code: z.ZodIssueCode.custom, message: 'switchTab requires index.' });
           }
         }),
-        execute: (input) => record('browser', input, () => {
+        execute: (input, execution) => record('browser', input, () => {
           if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
           if (input.action === 'listTabs') return session.listTabs();
           if (input.action === 'switchTab') return session.switchTab(input.index || 0);
           const url = input.url || targetUrl;
           return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
-        }),
+        }, execution),
       }),
       interact: tool({
         description: `${browserInteractToolDescription} ${browserInteractTextEditingDescription}`,
         inputSchema: browserToolInput(browserInteractToolShape).superRefine(refineBrowserInteractTarget),
-        execute: (input) => record('interact', input, async (abortSignal) => {
+        execute: (input, execution) => record('interact', input, async (abortSignal) => {
           if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(input.action)) {
             return session.mouse({
               action: input.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
@@ -1338,7 +1355,7 @@ function makeBrowserTools(
             followByEnter: input.followByEnter,
             allowedOrigins: binding?.allowedOrigins,
           });
-        }),
+        }, execution),
       }),
       inspect: tool({
         description: 'Read and backend-bind the current semantic DOM baseline, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before constructing a semantic target or fallback dom-* ref. Later interact calls send only target.',
@@ -1356,7 +1373,7 @@ function makeBrowserTools(
             context.addIssue({ code: z.ZodIssueCode.custom, message: 'search requires query or tag.' });
           }
         }),
-        execute: (input) => record('inspect', input, async () => {
+        execute: (input, execution) => record('inspect', input, async () => {
           if (input.action === 'httpRequests') return session.getCurrentTabHttpRequests({ ids: input.ids });
           if (input.action === 'search') return session.searchSnapshot(input);
           const snapshot = await session.readDomObservationSnapshot({ cursor: input.cursor, mode: input.mode });
@@ -1365,7 +1382,7 @@ function makeBrowserTools(
             actual: [snapshot.pageSummary, snapshot.content].filter(Boolean).join('\n'),
             nextCursor: snapshot.nextCursor,
           };
-        }),
+        }, execution),
       }),
     }),
     waitForHumanVerification: tool({
@@ -1373,7 +1390,7 @@ function makeBrowserTools(
       inputSchema: browserToolInput({
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
       }),
-      execute: (input) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs)),
+      execute: (input, execution) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs), execution),
     }),
     ...(referenceOptions?.runSubagents ? {
       spawnSubagents: tool({
@@ -1385,7 +1402,7 @@ function makeBrowserTools(
             url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
           })).min(1).max(12),
         }),
-        execute: (input) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id)),
+        execute: (input, execution) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id), execution),
       }),
     } : {}),
     ...(referenceOptions?.readSubagent ? {
@@ -1394,7 +1411,7 @@ function makeBrowserTools(
         inputSchema: browserToolInput({
           uuid: z.string().uuid().describe('One child Agent UUID returned by spawnSubagents.'),
         }),
-        execute: (input) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid)),
+        execute: (input, execution) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid), execution),
       }),
     } : {}),
     ...(referenceOptions?.readFile ? {
@@ -1408,7 +1425,7 @@ function makeBrowserTools(
           limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('Returned character count, from 20000 to 40000. Omit to read 20000 characters.'),
           pages: z.array(z.number().int().min(1)).min(1).max(6).optional().describe('Up to six 1-based document pages to render and attach. Omit for pages 1-4 on the first read.'),
         }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
-        execute: (input) => {
+        execute: (input, execution) => {
           const includeVisuals = modelSupportsScreenshotInput()
             && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
           const normalizedInput = {
@@ -1416,7 +1433,7 @@ function makeBrowserTools(
             includeVisuals,
             limit: normalizeBrowserChatFileReadLimit(input.limit),
           };
-          return record('readFile', normalizedInput, () => referenceOptions.readFile!(normalizedInput));
+          return record('readFile', normalizedInput, () => referenceOptions.readFile!(normalizedInput), execution);
         },
       }),
     } : {}),
@@ -1426,7 +1443,7 @@ function makeBrowserTools(
         inputSchema: browserToolInput({
           skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
         }),
-        execute: (input) => record('readSkill', input, () => referenceOptions.readSkill!(input.skillId)),
+        execute: (input, execution) => record('readSkill', input, () => referenceOptions.readSkill!(input.skillId), execution),
       }),
     } : {}),
     downloadFile: tool({
@@ -1437,7 +1454,7 @@ function makeBrowserTools(
         urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
         fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
       }),
-      execute: (input) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() })),
+      execute: (input, execution) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution),
     }),
     generateFile: tool({
       description: 'Generate a styled, real downloadable file. LibreOffice UNO creates and formats every PDF/Word/Excel/PowerPoint document, then renders visual pages back for layout review. Supported outputs: text/data formats; PDF .pdf; Word .doc/.docx/.odt; Excel .xls/.xlsx/.ods; and PowerPoint .ppt/.pptx/.odp. Choose a theme or explicit colors. Word and report PDFs use Markdown-like content; spreadsheets use structured sheets with formatting, formulas, merges, filters, freezing, and charts; presentations use structured slides. For PDF, documentType selects Writer, Calc, or Impress layout. Always inspect returned visual pages, fix visible overflow or weak layout with at most one intentional regeneration, and include the final returned download link. Do not use this to download an existing remote file.',
@@ -1451,11 +1468,11 @@ function makeBrowserTools(
         sheets: generatedFileSheetsSchema.optional().describe('Spreadsheet data and layout. Required for .xls/.xlsx/.ods or a spreadsheet PDF. Use headerRows, freezeRows, autoFilter, columns, formulas, merges, styles, and charts where they improve usability.'),
         slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. LibreOffice applies a 16:9 theme and splits slides with excessive bullets.'),
       }),
-      execute: (input) => record('generateFile', input, () => generateFileArtifact({
+      execute: (input, execution) => record('generateFile', input, () => generateFileArtifact({
         ...input,
         runId: referenceOptions?.runId,
         includeVisualVerification: modelSupportsScreenshotInput(),
-      })),
+      }), execution),
     }),
     fillDocumentTemplate: tool({
       description: 'Fill an uploaded .docx template without recreating the document. The backend copies the original OOXML package, changes only word/document.xml at exact visible-text anchors, verifies that all unrelated package parts are byte-for-byte preserved, then renders the filled document and attaches its first visual pages to the next model request for layout review. First call readFile on the template and use its DOCX structure section. Use nextCell for a table label whose value belongs in the following cell, followingParagraph for a section heading followed by a blank paragraph, or replaceText for an exact placeholder/date. Ambiguous anchors require a 1-based occurrence. Do not use generateFile when the user requires the supplied template to be preserved.',
@@ -1470,12 +1487,12 @@ function makeBrowserTools(
           allowOverwrite: z.boolean().optional().describe('Only for nextCell when current evidence proves the target cell intentionally contains replaceable text.'),
         })).min(1).max(100),
       }),
-      execute: (input) => record('fillDocumentTemplate', input, () => fillDocumentTemplateArtifact({
+      execute: (input, execution) => record('fillDocumentTemplate', input, () => fillDocumentTemplateArtifact({
         ...input,
         runId: referenceOptions?.runId,
         includeVisualVerification: modelSupportsScreenshotInput(),
         attachmentBindings: referenceOptions?.attachmentBindings,
-      })),
+      }), execution),
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1486,10 +1503,10 @@ function makeBrowserTools(
         status: z.enum(['passed', 'failed', 'blocked']).describe('passed for complete or non-terminal status update, failed for impossible/end-to-end failure, blocked for manual verification/security/user input.'),
         done: z.boolean().describe('true only when the full requirement is complete or impossible. false when more useful browser work remains or user/manual intervention is needed.'),
       }),
-      execute: (input) => record('reportState', input, async () => ({
+      execute: (input, execution) => record('reportState', input, async () => ({
         ok: true,
         actual: `Reported state without browser action: ${input.actual}`,
-      })),
+      }), execution),
     }),
   };
 
@@ -1529,7 +1546,6 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
 function runtimePrompt(input: {
   runtimeRecord: BrowserChatRuntimeRecord;
   mode: BrowserSessionMode;
-  operationalContext?: string;
 }) {
   const { runtimeRecord } = input;
   const rawCaseSystemPrompt = systemPromptOf(runtimeRecord);
@@ -1546,6 +1562,7 @@ function runtimePrompt(input: {
       : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
+    '- A final user-role message beginning with [WebPilot runtime operational context] is trusted runtime metadata, not a new user request. Use it for the current decision without repeating or exposing it.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile, fillDocumentTemplate, or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
     '- generateFile uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, use the structured Word/Calc/Impress controls required by the content, inspect its returned rendered pages, and regenerate at most once when the visual evidence shows overflow, clipping, weak hierarchy, or unusable sizing. Return only the final verified artifact link.',
     '- When the user supplies a .docx template and asks to fill or edit it, first read the template, then use fillDocumentTemplate with exact anchors from the returned DOCX structure. Never substitute generateFile: it creates a new document and cannot preserve the source package, styles, headers, footers, relationships, or layout.',
@@ -1557,9 +1574,6 @@ function runtimePrompt(input: {
       ? '- To upload a user attachment to a web file input, do not call readFile merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files, call downloadFile with the known URL. To create a new file, call generateFile; to fill an uploaded .docx template, call fillDocumentTemplate.'
       : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, fillDocumentTemplate for uploaded .docx templates, and readFile for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
-    input.operationalContext
-      ? `Relevant Skill summaries, memory, and secure capabilities supplied by the runtime:\n${input.operationalContext}`
-      : '',
     customPrompt,
     '',
     'Finish with Chinese Markdown when the request is satisfied, blocked, failed, or needs clarification. Do not return standalone JSON.',
@@ -1767,6 +1781,7 @@ function fullLogDetails(value: unknown) {
 
 function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
   const messages = modelMessages || aiRequest?.messages || [];
+  const preparedModelContextStats = aiRequest?.options?.modelContextStats;
   return fullLogDetails({
     aiInput: {
       provider: aiRequest?.provider || extra.provider,
@@ -1779,7 +1794,9 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
       system: aiRequest?.systemPrompt,
       messages,
     },
-    aiInputTokens: modelMessagesTextAndImageStats(messages),
+    aiInputTokens: preparedModelContextStats && typeof preparedModelContextStats === 'object'
+      ? preparedModelContextStats
+      : modelMessagesTextAndImageStats(messages),
   });
 }
 
@@ -2043,11 +2060,7 @@ async function executeRuntimeStep(input: {
         'Use these reference images as user-provided visual context. Do not confuse them with the live browser screenshot.',
       ].join('\n')
     : '';
-  const prompt = `${runtimePrompt({
-    runtimeRecord,
-    mode,
-    operationalContext: input.operationalContext,
-  })}${userReferenceImagePrompt}`;
+  const prompt = runtimePrompt({ runtimeRecord, mode });
   let activeOperationalContext = input.operationalContext || '';
   let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
@@ -2210,6 +2223,7 @@ async function executeRuntimeStep(input: {
     let lastPreparedMessages = [...initialMessages];
     let latestContextCompression: BrowserChatModelContextCompression | undefined;
     const continuationSummaryMarker = '[WebPilot continuation summary]';
+    const runtimeOperationalContextMarker = '[WebPilot runtime operational context]';
     let compactedModelContext: RuntimeModelMessage[] | undefined;
     let compactedSourceMessageCount = 0;
     const restoredContinuationMessage = initialMessages.find((message) => (
@@ -2233,6 +2247,31 @@ async function executeRuntimeStep(input: {
         ));
       }
       return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
+    }
+
+    function withoutRuntimeOperationalContext(messages: RuntimeModelMessage[]) {
+      return messages.filter((message) => (
+        !textFromUnknown(message.content).startsWith(runtimeOperationalContextMarker)
+      ));
+    }
+
+    function runtimeOperationalContextMessage(requiredSubagentDirective: string): RuntimeModelMessage | undefined {
+      const sections = [
+        activeOperationalContext
+          ? `Relevant Skill summaries, memory, and secure capabilities supplied by the runtime:\n${activeOperationalContext}`
+          : '',
+        userReferenceImagePrompt,
+        requiredSubagentDirective,
+      ].filter(Boolean);
+      if (!sections.length) return undefined;
+      return {
+        role: 'user' as const,
+        content: [
+          runtimeOperationalContextMarker,
+          'This metadata supplements the latest real user request. It is not a new request and must not be quoted back.',
+          ...sections,
+        ].join('\n\n'),
+      };
     }
 
     const summarizeContinuation = async (
@@ -2307,11 +2346,10 @@ async function executeRuntimeStep(input: {
       }
       const pendingSubagentUuids = pendingSubagentUuidsFromTraces(traces);
       const requiredSubagentUuid = pendingSubagentUuids[0];
-      const refreshedPrompt = [
-        `${runtimePrompt({ runtimeRecord, mode, operationalContext: activeOperationalContext })}${userReferenceImagePrompt}`,
-        requiredSubagentUuid ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length) : '',
-      ].filter(Boolean).join('\n\n');
-      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(refreshedPrompt, allowedToolTypes) : refreshedPrompt;
+      const requiredSubagentDirective = requiredSubagentUuid
+        ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
+        : '';
+      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = runtimeContextWindowTokens();
       const thresholdRatio = runtimeContextCompressionThresholdRatio();
@@ -2332,7 +2370,9 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
-      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      const sourceMessages = withoutRuntimeOperationalContext(
+        previousMessages?.length ? [...previousMessages] : [...initialMessages],
+      );
       let unsummarizedMessages = compactedModelContext?.length
         ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
@@ -2345,16 +2385,21 @@ async function executeRuntimeStep(input: {
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
       }
 
+      const operationalContextMessage = runtimeOperationalContextMessage(requiredSubagentDirective);
+      const withRuntimeOperationalContext = (messages: RuntimeModelMessage[]) => (
+        operationalContextMessage ? [...messages, operationalContextMessage] : messages
+      );
+      let requestMessages = withRuntimeOperationalContext(messagesToSend);
       let attachedImagePaths = [...messageImagePaths];
-      let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
       let modelContextSegmentation: Record<string, unknown> | undefined;
-      const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths);
+      const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths);
       const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
       if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
         const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
         const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
         const baseStats = modelMessagesTextAndImageStats(
-          sanitizeModelInputForStats(requestSystemPrompt, [], []),
+          sanitizeModelInputForStats(requestSystemPrompt, withRuntimeOperationalContext([]), []),
           codexMode ? undefined : nativeToolsRef.current,
         );
         const summarySourceMessages = messagesToSend.filter((message) => (
@@ -2397,30 +2442,35 @@ async function executeRuntimeStep(input: {
         if (messagesToSend.length === 1) {
           messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
         }
+        requestMessages = withRuntimeOperationalContext(messagesToSend);
         attachedImagePaths = [];
         messageImagePaths = [...attachedImagePaths];
-        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
-        let afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
+        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
+        let afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
         while (afterStats.estimatedTotalTokens < targetFloorTokens && olderBlocks.length) {
           const candidate = olderBlocks.pop()!;
           const candidateMessages = candidate.concat(messagesToSend.slice(1));
           const candidateContext = [messagesToSend[0], ...candidateMessages];
-          const candidateStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, candidateContext, []), codexMode ? undefined : nativeToolsRef.current);
+          const candidateRequestMessages = withRuntimeOperationalContext(candidateContext);
+          const candidateStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, candidateRequestMessages, []), codexMode ? undefined : nativeToolsRef.current);
           if (candidateStats.estimatedTotalTokens > targetCeilingTokens) break;
           messagesToSend = candidateContext;
+          requestMessages = candidateRequestMessages;
           afterStats = candidateStats;
         }
         while (afterStats.estimatedTotalTokens > targetCeilingTokens && messagesToSend.length > 1) {
           const removableBlocks = atomicRuntimeModelMessageBlocks(messagesToSend.slice(1));
           removableBlocks.shift();
           messagesToSend = [messagesToSend[0], ...removableBlocks.flat()];
-          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, []), codexMode ? undefined : nativeToolsRef.current);
+          requestMessages = withRuntimeOperationalContext(messagesToSend);
+          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
         if (messagesToSend.length === 1) {
           messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
-          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, []), codexMode ? undefined : nativeToolsRef.current);
+          requestMessages = withRuntimeOperationalContext(messagesToSend);
+          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
-        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, messagesToSend, attachedImagePaths);
+        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
         latestContextCompression = {
           compressedAt: new Date().toISOString(),
           estimatedTokensBefore: messageStats.estimatedTotalTokens,
@@ -2456,7 +2506,7 @@ async function executeRuntimeStep(input: {
         });
       }
       const finalStats = modelContextSegmentation
-        ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, messagesToSend, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
+        ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
         : messageStats;
       if (compactedModelContext?.length || modelContextSegmentation) {
         // The SDK passes its full pre-segmentation history back to every prepareStep.
@@ -2470,11 +2520,11 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextMessage ? textFromUnknown(operationalContextMessage.content).length : 0, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       return {
         system: requestSystemPrompt || undefined,
-        messages: messagesToSend,
+        messages: requestMessages,
         modelMessagesForLog,
         ...(requiredSubagentUuid ? {
           activeTools: ['readSubagent'] as Array<keyof typeof toolsForRequest>,
@@ -2543,7 +2593,9 @@ async function executeRuntimeStep(input: {
           workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
           await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
           ensureActive();
-          await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+          if (!trace.result || trace.completedAt) {
+            await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+          }
         },
         onReferenceImage: ({ path, source }) => {
           if (!modelSupportsScreenshotInput()) return;
@@ -2600,12 +2652,14 @@ async function executeRuntimeStep(input: {
       workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
       await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
       ensureActive();
-      await onAttemptDebug?.({
-        phase: 'ai:tool',
-        stepIndex,
-        message: `${trace.name} -> ${toolTraceStatus(trace)}`,
-        details: { trace, visualContext: visualContext.snapshot(), workingMemory },
-      });
+      if (!trace.result || trace.completedAt) {
+        await onAttemptDebug?.({
+          phase: 'ai:tool',
+          stepIndex,
+          message: `${trace.name} -> ${toolTraceStatus(trace)}`,
+          details: { trace, visualContext: visualContext.snapshot(), workingMemory },
+        });
+      }
     }, {
       allowedToolTypes,
       runId: input.runId,
@@ -2830,12 +2884,20 @@ async function executeRuntimeStep(input: {
             ensureActive();
           },
         });
-      const [resultText, resultFinishReason, resultSteps, responseMessages] = await Promise.all([
-        result.text,
-        result.finishReason,
-        result.steps,
-        result.responseMessages,
-      ]);
+      let resultText: Awaited<typeof result.text>;
+      let resultFinishReason: Awaited<typeof result.finishReason>;
+      let resultSteps: Awaited<typeof result.steps>;
+      let responseMessages: Awaited<typeof result.responseMessages>;
+      try {
+        [resultText, resultFinishReason, resultSteps, responseMessages] = await Promise.all([
+          result.text,
+          result.finishReason,
+          result.steps,
+          result.responseMessages,
+        ]);
+      } catch (error) {
+        throw streamedRequestError || error;
+      }
       if (streamedRequestError) throw streamedRequestError;
       const responseToolCallCount = responseMessages.reduce((count, message) => (
         count + (Array.isArray(message.content)

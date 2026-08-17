@@ -4,6 +4,7 @@ import {
   beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
   browserChatReachedHistoryTop,
+  browserChatVerticalScrollShadows,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   type BrowserChatHistoryState,
@@ -14,6 +15,29 @@ test('loads earlier messages only on the transition from a nonzero position to t
   assert.equal(browserChatReachedHistoryTop(1, 0), true);
   assert.equal(browserChatReachedHistoryTop(0, 0), false);
   assert.equal(browserChatReachedHistoryTop(0, 10), false);
+});
+
+test('shows inset scroll shadows only toward content outside the visible history viewport', () => {
+  assert.deepEqual(browserChatVerticalScrollShadows({
+    clientHeight: 400,
+    scrollHeight: 400,
+    scrollTop: 0,
+  }), { bottom: false, top: false });
+  assert.deepEqual(browserChatVerticalScrollShadows({
+    clientHeight: 400,
+    scrollHeight: 900,
+    scrollTop: 0,
+  }), { bottom: true, top: false });
+  assert.deepEqual(browserChatVerticalScrollShadows({
+    clientHeight: 400,
+    scrollHeight: 900,
+    scrollTop: 220,
+  }), { bottom: true, top: true });
+  assert.deepEqual(browserChatVerticalScrollShadows({
+    clientHeight: 400,
+    scrollHeight: 900,
+    scrollTop: 500,
+  }), { bottom: false, top: true });
 });
 
 test('historical subagent data is queried only on the first parallel-group expansion', () => {

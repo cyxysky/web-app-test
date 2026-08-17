@@ -103,6 +103,7 @@ import {
   beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
   browserChatReachedHistoryTop,
+  browserChatVerticalScrollShadows,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   normalizeBrowserChatHistory,
@@ -142,8 +143,10 @@ import {
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   browserChatAiCycleAnchorsText,
+  browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
+  browserChatTerminalAnswerCycleIndex,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
   buildBrowserChatMessageRenderEntries,
@@ -836,11 +839,13 @@ function toolInputSignature(value: unknown) {
 export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
   const details = new Map<string, BrowserChatToolDetail>();
   const usedStepTools = new Set<string>();
+  const fallbackMatchedSourceCycles = new Set<string>();
 
   cycles.forEach((cycle) => {
     const candidateSteps = typeof cycle.stepIndex === 'number'
       ? steps.filter((step) => step.index === cycle.stepIndex)
       : steps;
+    const sourceCycleId = cycle.sourceCycleId || cycle.id;
 
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
       const exactInput = toolInputSignature(aiTool.input);
@@ -856,18 +861,23 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
 
           const detail = { stepIndex: step.index, step, toolIndex, tool };
           sameNameCandidates.push(detail);
-          if (aiTool.id && tool.id === aiTool.id) {
-            details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-            usedStepTools.add(usedKey);
-            return;
-          }
-          if (!exactInput || toolInputSignature(tool.input) === exactInput) {
-            details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-            usedStepTools.add(usedKey);
-            return;
-          }
         }
       }
+
+      const exactIdDetail = aiTool.id
+        ? sameNameCandidates.find((candidate) => candidate.tool.id === aiTool.id)
+        : undefined;
+      if (exactIdDetail) {
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), exactIdDetail);
+        usedStepTools.add(`${exactIdDetail.step.index}:${exactIdDetail.toolIndex}`);
+        return;
+      }
+
+      // The runtime executes at most one native tool from each provider response.
+      // Older persisted traces did not retain the provider toolCallId, so only one
+      // positional fallback may be consumed by a source cycle. Extra tool calls in
+      // that same response were ignored by the execution gate and must stay hidden.
+      if (fallbackMatchedSourceCycles.has(sourceCycleId)) return;
 
       // Tool inputs are normalized before execution (for example readFile adds
       // its default limit), so the persisted input is not always byte-for-byte
@@ -875,12 +885,15 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
       // prefer the matching reason, then consume the next unused same-name call.
       const normalizedReason = aiTool.reason?.replace(/\s+/g, ' ').trim();
       const detail = sameNameCandidates.find((candidate) => (
+        Boolean(exactInput) && toolInputSignature(candidate.tool.input) === exactInput
+      )) || sameNameCandidates.find((candidate) => (
         normalizedReason
         && candidate.tool.reason?.replace(/\s+/g, ' ').trim() === normalizedReason
       )) || sameNameCandidates[0];
       if (detail) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
         usedStepTools.add(`${detail.step.index}:${detail.toolIndex}`);
+        fallbackMatchedSourceCycles.add(sourceCycleId);
       }
     });
   });
@@ -946,6 +959,10 @@ function summarizeToolFields(fields: unknown, t: (value: string, params?: Record
 function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
+    downloadFile: '下载文件',
+    fillDocumentTemplate: '填充文档模板',
+    generateFile: '生成文件',
+    readFile: '读取文件',
     readSubagent: '读取子 Agent',
     reportState: '确认状态',
     spawnSubagents: '并行子 Agent',
@@ -3682,11 +3699,17 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       },
     }))
     .filter((cycle) => hasAiOutputView(cycle.output)), [outputCycles, showReasoning]);
+  const terminalAnswerCycleIndex = message.status === 'passed'
+    ? browserChatTerminalAnswerCycleIndex(aiOutputCycles)
+    : -1;
   const processAiOutputCycles = useMemo(() => {
     if (!normalizedFinalText) return aiOutputCycles;
-    return aiOutputCycles.map((cycle) => {
+    return aiOutputCycles.map((cycle, cycleIndex) => {
       const texts = cycle.output.texts.map((text) => (
-        !cycle.output.tools.length && text.replace(/\s+/g, ' ').trim() === normalizedFinalText ? '' : text
+        cycleIndex === terminalAnswerCycleIndex
+        || (!cycle.output.tools.length && text.replace(/\s+/g, ' ').trim() === normalizedFinalText)
+          ? ''
+          : text
       ));
       return {
         ...cycle,
@@ -3699,7 +3722,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         },
       };
     });
-  }, [aiOutputCycles, normalizedFinalText]);
+  }, [aiOutputCycles, normalizedFinalText, terminalAnswerCycleIndex]);
   const finalTextAnchoredToToolCycle = useMemo(() => (
     aiOutputCycles.some((cycle) => browserChatAiCycleAnchorsText(cycle, finalText))
   ), [aiOutputCycles, finalText]);
@@ -3718,6 +3741,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       return [{
         ...cycle,
         id: `${cycle.id}:tool-${part.index}-${partOrder}`,
+        sourceCycleId: cycle.sourceCycleId || cycle.id,
         output: {
           parts: reason
             ? [{ index: 0, kind: 'text' as const }, { index: 0, kind: 'tool' as const }]
@@ -3835,20 +3859,16 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     ...matchedAiCycleToolDetails,
     ...syntheticHistoricalOutput.toolDetails,
   ]), [matchedAiCycleToolDetails, syntheticHistoricalOutput.toolDetails]);
+  const renderedProviderCycles = useMemo(() => pairedAiOutputCycles.filter((cycle) => (
+    !cycle.sourceCycleId
+    || cycle.output.tools.some((_tool, index) => matchedAiCycleToolDetails.has(aiCycleToolKey(cycle.id, index)))
+  )), [matchedAiCycleToolDetails, pairedAiOutputCycles]);
   const renderAiOutputCycles = useMemo(() => {
-    const cycleToolIndex = (cycle: BrowserChatAiOutputCycle) => cycle.output.tools.reduce((lowest, _tool, index) => {
-      const detail = aiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
-      return detail ? Math.min(lowest, detail.toolIndex) : lowest;
-    }, Number.MAX_SAFE_INTEGER);
     return [
-      ...pairedAiOutputCycles,
+      ...renderedProviderCycles,
       ...syntheticHistoricalOutput.cycles,
-    ].sort((left, right) => {
-      const stepOrder = (left.stepIndex ?? Number.MAX_SAFE_INTEGER) - (right.stepIndex ?? Number.MAX_SAFE_INTEGER);
-      if (stepOrder) return stepOrder;
-      return cycleToolIndex(left) - cycleToolIndex(right);
-    });
-  }, [aiCycleToolDetails, pairedAiOutputCycles, syntheticHistoricalOutput.cycles]);
+    ];
+  }, [renderedProviderCycles, syntheticHistoricalOutput.cycles]);
   const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(
     renderAiOutputCycles,
     (cycle) => cycle.output.tools.some((_tool, index) => aiCycleToolDetails.has(aiCycleToolKey(cycle.id, index))),
@@ -3976,7 +3996,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           resuming={resumingHumanVerification}
         />
       ) : null}
-      {!running && hasFinalText && !finalTextAnchoredToToolCycle ? (
+      {!running && hasFinalText && (message.status === 'passed' || !finalTextAnchoredToToolCycle) ? (
         <BrowserChatStreamingAnswer
           hidden={hideManualVerificationStatusText}
           running={false}
@@ -4038,7 +4058,10 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   const { t } = useI18n();
   const operationRunning = item.role === 'assistant' && item.status === 'running';
   const waitingInQueue = item.role === 'user' && item.status === 'queued';
-  const canGenerateSkill = item.role === 'assistant' && item.status !== 'running' && itemSteps.length > 0;
+  const hasExecutionRecords = browserChatAssistantMessageHasExecutionMetadata(item)
+    || itemSteps.length > 0
+    || itemLogs.length > 0;
+  const canGenerateSkill = item.role === 'assistant' && item.status !== 'running' && hasExecutionRecords;
   const canGenerateAutomationCase = canGenerateSkill;
   const actionDisabled = Boolean(generatingSkillMessageId || generatingAutomationMessageId);
   const messageSkills = useMemo(() => {
@@ -4090,7 +4113,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
         )}
         {item.role === 'assistant' ? (
           <div className="browser-chat-message-actions">
-            {itemLogs.length ? (
+            {hasExecutionRecords ? (
               <button className="browser-chat-log-button" onClick={() => onShowLogs(item.id)} type="button">
                 <ScrollText size={14} />
                 {t('查看日志')}
@@ -4328,12 +4351,9 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           outputCycles.filter((cycle) => cycle.messageId === message.id && !cycle.subagentId),
         )
       ),
-      (message) => (message.stepIndexes || []).some((stepIndex) => {
-        const step = stepsByIndex.get(stepIndex);
-        return step?.messageId === message.id && Boolean(step.tools?.length);
-      }),
+      browserChatAssistantMessageHasExecutionMetadata,
     ),
-    [lastAssistantMessageId, logIndex, messages, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman, stepsByIndex],
+    [lastAssistantMessageId, logIndex, messages, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
   );
   const scrollKey = [
     sessionId || '',
@@ -8417,7 +8437,11 @@ export function BrowserChatWorkspace({
     const ownedSteps = steps.filter((step) => (
       step.messageId === message.id || declaredStepIndexes.has(step.index)
     ));
-    if (!ownedSteps.length) return [];
+    const knownStepIndexes = new Set([
+      ...declaredStepIndexes,
+      ...ownedSteps.map((step) => step.index),
+    ]);
+    if (!knownStepIndexes.size) return [];
     const previousUser = [...visibleMessages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user');
     const titleMessage = previousUser || message;
     return [{
@@ -8432,7 +8456,7 @@ export function BrowserChatWorkspace({
         fallbackSkillLabel: 'Skill',
         max: 160,
       }),
-      stepCount: ownedSteps.length,
+      stepCount: knownStepIndexes.size,
     }];
   }), [generationSkillsById, steps, t, visibleMessages]);
   const selectedGenerationMessageIdSet = useMemo(
@@ -8680,6 +8704,42 @@ export function BrowserChatWorkspace({
     if (!query) return recentSessions;
     return sidebarSessions.filter((item) => sessionDisplayTitle(item).toLocaleLowerCase().includes(query));
   }, [historyFilter, recentSessions, sidebarSessions]);
+  const syncRecentSessionScrollShadows = useCallback((list = recentSessionListRef.current) => {
+    if (!list) return;
+    const stage = list.closest<HTMLElement>('.browser-chat-history-stage');
+    if (!stage) return;
+    const shadows = browserChatVerticalScrollShadows(list);
+    stage.toggleAttribute('data-scroll-shadow-top', shadows.top);
+    stage.toggleAttribute('data-scroll-shadow-bottom', shadows.bottom);
+  }, []);
+  useLayoutEffect(() => {
+    const list = recentSessionListRef.current;
+    if (!list) return undefined;
+    const stage = list.closest<HTMLElement>('.browser-chat-history-stage');
+    if (!stage) return undefined;
+    let frame = 0;
+    const scheduleSync = () => {
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        syncRecentSessionScrollShadows(list);
+      });
+    };
+    const resizeObserver = new ResizeObserver(scheduleSync);
+    const mutationObserver = new MutationObserver(scheduleSync);
+    resizeObserver.observe(list);
+    resizeObserver.observe(stage);
+    mutationObserver.observe(list, { childList: true, subtree: true });
+    syncRecentSessionScrollShadows(list);
+    scheduleSync();
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+      stage.removeAttribute('data-scroll-shadow-top');
+      stage.removeAttribute('data-scroll-shadow-bottom');
+    };
+  }, [filteredRecentSessions.length, historyFilter, loadingMoreSessions, loadingSessionHistory, mobileHistoryOpen, sessionListPage.hasMore, sidebarCollapsed, syncRecentSessionScrollShadows]);
   useEffect(() => {
     if (loadingSessionHistory || loadingMoreSessions || !sessionListPage.hasMore || !sessionListPage.next) return undefined;
     const list = recentSessionListRef.current;
@@ -9764,6 +9824,7 @@ export function BrowserChatWorkspace({
               className="browser-chat-recent-list"
               onScroll={(event) => {
                 const list = event.currentTarget;
+                syncRecentSessionScrollShadows(list);
                 const verticalRemaining = list.scrollHeight - list.scrollTop - list.clientHeight;
                 const horizontalRemaining = list.scrollWidth - list.scrollLeft - list.clientWidth;
                 if (verticalRemaining > 160 || horizontalRemaining > 160) {
