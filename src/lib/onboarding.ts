@@ -1,12 +1,15 @@
-export const WEBPILOT_ONBOARDING_VERSION = 1;
+export const WEBPILOT_ONBOARDING_VERSION = 2;
 export const WEBPILOT_ONBOARDING_RESTART_EVENT = 'webpilot:onboarding-restart';
 
 export const webPilotOnboardingSteps = [
   'welcome',
+  'accounts',
+  'skills',
+  'memory',
+  'permissions',
+  'model',
   'readiness',
   'browser_task',
-  'file_task',
-  'automation',
 ] as const;
 
 export type WebPilotOnboardingStep = typeof webPilotOnboardingSteps[number];

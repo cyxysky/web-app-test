@@ -3,8 +3,13 @@ import test from 'node:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ReactMarkdown from 'react-markdown';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
-import { normalizeBrowserChatMarkdown } from './browser-chat-markdown';
+import remarkMath from 'remark-math';
+import {
+  normalizeBrowserChatMarkdown,
+  remarkBrowserChatCjkStrong,
+} from './browser-chat-markdown';
 
 test('restores headings and tables from a collapsed model Markdown reply', () => {
   const collapsed = '已找到目标需求！以下是搜索结果： --- ## 找到需求：薪酬管理2期 | 字段 | 内容 | |------|------| | **标题** | 薪酬管理2期 | | **编号** | **31465** | | **截止日期** | 2026/07/15 | **需求详情页链接**：[详情](https://example.com/31465) --- 需要继续查看吗？';
@@ -58,4 +63,26 @@ test('renders emphasized URLs correctly before Chinese punctuation', () => {
     assert.match(html, /<strong><a href="https:\/\/10\.10\.0\.90">https:\/\/10\.10\.0\.90<\/a><\/strong>。/);
     assert.doesNotMatch(html, /\*\*https:\/\//);
   }
+});
+
+test('renders emphasis whose closing delimiter touches Chinese text', () => {
+  const markdown = '核心产生的高能**光子（伽马射线）**向外传播：';
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm, remarkBrowserChatCjkStrong],
+  }, normalizeBrowserChatMarkdown(markdown)));
+
+  assert.match(html, /核心产生的高能<strong>光子（伽马射线）<\/strong>向外传播：/);
+  assert.doesNotMatch(html, /\*\*/);
+});
+
+test('renders block math with KaTeX instead of exposing TeX delimiters', () => {
+  const markdown = '$$\\Delta v = v_e \\cdot \\ln\\frac{m_0}{m_f}$$';
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    rehypePlugins: [rehypeKatex],
+    remarkPlugins: [remarkGfm, remarkMath, remarkBrowserChatCjkStrong],
+  }, normalizeBrowserChatMarkdown(markdown)));
+
+  assert.match(html, /class="katex-display"/);
+  assert.match(html, /<math/);
+  assert.doesNotMatch(html, /\$\$/);
 });

@@ -35,6 +35,10 @@ export function browserChatHasEarlierMessages(value: BrowserChatHistoryState | u
   return Boolean(value?.messages.hasMore && value.messages.cursor);
 }
 
+export function browserChatReachedHistoryTop(previousScrollTop: number, currentScrollTop: number) {
+  return previousScrollTop > 0 && currentScrollTop === 0;
+}
+
 export function beginHistoricalSubagentQuery(queriedKeys: Set<string>, key: string) {
   if (queriedKeys.has(key)) return false;
   queriedKeys.add(key);

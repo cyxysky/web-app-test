@@ -1,5 +1,6 @@
 import { BrowserChatWorkspaceLoader } from '@/components/BrowserChatWorkspaceLoader';
 import { readWorkspacePageContext } from '@/server/workspace/workspace-page-context';
+import 'katex/dist/katex.min.css';
 import '../../styles/domains/browser-chat.css';
 
 export default async function BrowserChatPage() {

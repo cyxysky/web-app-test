@@ -3,7 +3,6 @@ import test from 'node:test';
 import {
   browserChatSessionNavigationHref,
   browserChatViewNavigationHref,
-  findRequestedBrowserChatSession,
   loadRequestedBrowserChatSessionDetail,
   shouldAcceptBrowserChatViewportPosition,
   shouldActivateRequestedBrowserChatSession,
@@ -12,7 +11,7 @@ import {
 
 test('updates the selected conversation and drops client-declared identity', () => {
   assert.equal(
-    browserChatSessionNavigationHref('https://example.com/webpilot/browser-chat?userId=42&sessionId=old&targetUrl=https%3A%2F%2Fexample.com', 'chat-new'),
+    browserChatSessionNavigationHref('https://example.com/webpilot/browser-chat?userId=42&sessionId=old&targetUrl=https%3A%2F%2Fexample.com&onboarding=1', 'chat-new'),
     '/webpilot/browser-chat?sessionId=chat-new',
   );
   assert.equal(
@@ -21,24 +20,11 @@ test('updates the selected conversation and drops client-declared identity', () 
   );
 });
 
-test('selects the session requested by the mounted browser-chat URL', () => {
-  const sessions = [{ id: 'chat-old' }, { id: 'chat-mounted' }];
-
-  assert.equal(findRequestedBrowserChatSession(sessions, ' chat-mounted '), sessions[1]);
-});
-
 test('preserves mounted view state without carrying client-declared identity', () => {
   assert.equal(
     browserChatViewNavigationHref('/webpilot/settings', 'https://example.com/webpilot/browser-chat?webpilotEmbed=1&userId=42&sessionId=chat-1'),
     '/webpilot/settings?webpilotEmbed=1&sessionId=chat-1',
   );
-});
-
-test('does not activate an unrelated session when the requested id is absent', () => {
-  const sessions = [{ id: 'chat-old' }];
-
-  assert.equal(findRequestedBrowserChatSession(sessions, ''), undefined);
-  assert.equal(findRequestedBrowserChatSession(sessions, 'chat-missing'), undefined);
 });
 
 test('does not let a stale route request replace the conversation selected by the user', () => {
@@ -85,13 +71,12 @@ test('keeps session loading visible until time and viewport gates are both ready
   }), true);
 });
 
-test('loads the requested session detail instead of rendering the list summary as history', async () => {
-  const summary = { id: 'chat-mounted', messages: [] as string[], title: 'Mounted chat' };
-  const detail = { ...summary, messages: ['existing message'] };
+test('loads a requested session even when it is outside the first summary page', async () => {
+  const detail = { id: 'chat-mounted', messages: ['existing message'], title: 'Mounted chat' };
   const requestedIds: string[] = [];
 
-  const loaded = await loadRequestedBrowserChatSessionDetail([summary], summary.id, async (session) => {
-    requestedIds.push(session.id);
+  const loaded = await loadRequestedBrowserChatSessionDetail(' chat-mounted ', async (sessionId) => {
+    requestedIds.push(sessionId);
     return detail;
   });
 

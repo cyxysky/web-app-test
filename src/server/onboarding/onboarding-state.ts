@@ -67,14 +67,17 @@ function userHasExistingWork(userId: string) {
   return Boolean(row.has_messages || row.has_automation);
 }
 
-export function readOnboardingState(userId: string) {
+export function readOnboardingState(userId: string): WebPilotOnboardingState {
   const database = getSqliteDatabase();
   const existing = database.prepare(`
     SELECT tutorial_version, status, completed_steps_json, dismissed_at, updated_at
     FROM user_onboarding_state
     WHERE user_id = ?
   `).get(userId) as OnboardingRow | undefined;
-  if (existing) return stateFromRow(existing);
+  if (existing) {
+    if (existing.tutorial_version === WEBPILOT_ONBOARDING_VERSION) return stateFromRow(existing);
+    return writeOnboardingState(userId, { completedSteps: [], status: 'not_started' });
+  }
 
   const timestamp = new Date().toISOString();
   const legacyComplete = userHasExistingWork(userId);
@@ -103,7 +106,7 @@ function writeOnboardingState(userId: string, input: {
   completedSteps: WebPilotOnboardingStep[];
   dismissedAt?: string;
   status: WebPilotOnboardingStatus;
-}) {
+}): WebPilotOnboardingState {
   const timestamp = new Date().toISOString();
   getSqliteDatabase().prepare(`
     INSERT INTO user_onboarding_state (
@@ -143,15 +146,14 @@ export function updateOnboardingState(userId: string, input: {
     status: 'completed',
   });
   if (input.action === 'start') return writeOnboardingState(userId, {
-    completedSteps: Array.from(new Set([...current.completedSteps, 'welcome', 'readiness'])),
+    completedSteps: current.completedSteps,
     status: 'in_progress',
   });
   if (!input.step) throw new Error('complete_step requires a valid onboarding step.');
   const completedSteps = Array.from(new Set([...current.completedSteps, input.step]));
-  const requiredSteps: WebPilotOnboardingStep[] = ['welcome', 'readiness', 'browser_task'];
   return writeOnboardingState(userId, {
     completedSteps,
-    status: requiredSteps.every((step) => completedSteps.includes(step)) ? 'completed' : 'in_progress',
+    status: webPilotOnboardingSteps.every((step) => completedSteps.includes(step)) ? 'completed' : 'in_progress',
   });
 }
 

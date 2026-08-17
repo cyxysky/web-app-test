@@ -9,12 +9,19 @@ import type {
   BrowserChatSessionSnapshot,
 } from '@/server/ai/agents/browser-chat.service';
 import {
+  activeBrowserChatAssistantMessage,
+  browserChatClientRecordsForMessage,
+} from '@/server/ai/agents/browser-chat-client-window';
+import {
+  BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   browserChatHistoryLimit,
+  readBrowserChatLatestActiveAssistantMessage,
   readBrowserChatLogsPage,
+  readBrowserChatMessageById,
   readBrowserChatMessagesPage,
   readBrowserChatSessionHeader,
-  readBrowserChatSessionWindow,
-  readBrowserChatStepsPage,
+  readBrowserChatSessionOwner,
+  readBrowserChatStepsByIndexes,
 } from '@/server/storage/browser-chat-history-store';
 import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-store';
 
@@ -42,17 +49,57 @@ export function listBrowserChatSessionSummaries(
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  const persisted = readBrowserChatSessionWindow<
-    BrowserChatSessionSnapshot,
-    BrowserChatMessage,
-    StepExecutionResult,
-    BrowserChatLogRecord
-  >(sessionId);
-  if (!persisted || !belongsToUser(persisted, userId)) return undefined;
+  const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  if (!session || !belongsToUser(session, userId)) return undefined;
+  let messages = readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+    limit: BROWSER_CHAT_MESSAGE_PAGE_SIZE,
+  });
+  const pendingMessage = session.pendingToolConfirmation?.messageId
+    ? readBrowserChatMessageById<BrowserChatMessage>(sessionId, session.pendingToolConfirmation.messageId)
+    : undefined;
+  const persistedActiveMessage = session.busy || session.status === 'running'
+    ? pendingMessage?.role === 'assistant'
+      ? pendingMessage
+      : readBrowserChatLatestActiveAssistantMessage<BrowserChatMessage>(sessionId)
+    : undefined;
+  const activeMessage = persistedActiveMessage
+    || activeBrowserChatAssistantMessage({ ...session, messages: messages.items });
+  if (activeMessage && !messages.items.some((message) => message.id === activeMessage.id)) {
+    const latestMessages = readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+      limit: BROWSER_CHAT_MESSAGE_PAGE_SIZE - 1,
+    });
+    messages = {
+      ...latestMessages,
+      items: [activeMessage, ...latestMessages.items]
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+    };
+  }
+  const activeSteps = activeMessage
+    ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, activeMessage.stepIndexes || [])
+        .filter((step) => !step.messageId || step.messageId === activeMessage.id)
+    : [];
+  const activeLogs = activeMessage
+    ? readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { limit: 500, messageId: activeMessage.id }).items
+    : [];
+  const activeRecords = activeMessage
+    ? browserChatClientRecordsForMessage(
+        { ...session, messages: [activeMessage] },
+        activeMessage.id,
+        { includeSubagents: true },
+      )
+    : { outputCycles: [], subagents: [] };
   return {
-    ...persisted,
-    steps: persisted.steps.map(compactStepForClient),
-    logs: compactBrowserChatLogsForClient(persisted.logs),
+    ...session,
+    messages: messages.items,
+    steps: activeSteps.map(compactStepForClient),
+    logs: compactBrowserChatLogsForClient(activeLogs),
+    outputCycles: activeRecords.outputCycles,
+    subagents: activeRecords.subagents,
+    history: {
+      messages: { cursor: messages.cursor, hasMore: messages.hasMore },
+      steps: { hasMore: false },
+      logs: { hasMore: false },
+    },
   };
 }
 
@@ -60,44 +107,25 @@ export function readBrowserChatSessionHistoryPage(
   sessionId: string,
   userId: string | number | undefined,
   input: {
-    logCursor?: string;
-    logLimit?: number;
     messageCursor?: string;
     messageLimit?: number;
-    stepCursor?: string;
-    stepLimit?: number;
   },
 ) {
-  const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  const session = readBrowserChatSessionOwner(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
   const messages = input.messageCursor
-    ? readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+      ? readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
         cursor: input.messageCursor,
-        limit: browserChatHistoryLimit(input.messageLimit, 80),
-      })
-    : undefined;
-  const steps = input.stepCursor
-    ? readBrowserChatStepsPage<StepExecutionResult>(sessionId, {
-        cursor: input.stepCursor,
-        limit: browserChatHistoryLimit(input.stepLimit, 120),
-      })
-    : undefined;
-  const logs = input.logCursor
-    ? readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, {
-        cursor: input.logCursor,
-        limit: browserChatHistoryLimit(input.logLimit, 200),
+        limit: Math.min(
+          BROWSER_CHAT_MESSAGE_PAGE_SIZE,
+          browserChatHistoryLimit(input.messageLimit, BROWSER_CHAT_MESSAGE_PAGE_SIZE),
+        ),
       })
     : undefined;
   return {
-    outputCycles: session.outputCycles || [],
-    subagents: session.subagents || [],
     ...(messages ? { messages: messages.items } : {}),
-    ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
-    ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),
     history: {
       ...(messages ? { messages: { cursor: messages.cursor, hasMore: messages.hasMore } } : {}),
-      ...(steps ? { steps: { cursor: steps.cursor, hasMore: steps.hasMore } } : {}),
-      ...(logs ? { logs: { cursor: logs.cursor, hasMore: logs.hasMore } } : {}),
     },
   };
 }
@@ -118,9 +146,27 @@ export function readBrowserChatSessionLogs(
       history: { hasMore: false },
     };
   }
-  const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, input);
+  const messageId = input.messageId?.trim();
+  const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { ...input, messageId });
+  const message = messageId && !input.cursor
+    ? readBrowserChatMessageById<BrowserChatMessage>(sessionId, messageId)
+    : undefined;
+  const steps = message
+    ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, message.stepIndexes || [])
+        .filter((step) => !step.messageId || step.messageId === messageId)
+    : [];
+  const records = messageId && !input.cursor
+    ? browserChatClientRecordsForMessage(
+        { ...session, messages: message ? [message] : [] },
+        messageId,
+      )
+    : { outputCycles: [], subagents: [] };
   return {
-    logs: page.items,
+    logs: compactBrowserChatLogsForClient(page.items),
+    ...(messageId && !input.cursor ? {
+      outputCycles: records.outputCycles,
+      steps: steps.map(compactStepForClient),
+    } : {}),
     history: { cursor: page.cursor, hasMore: page.hasMore },
   };
 }

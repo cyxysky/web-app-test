@@ -3,10 +3,18 @@ import test from 'node:test';
 import {
   beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
+  browserChatReachedHistoryTop,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   type BrowserChatHistoryState,
 } from './browser-chat-history-controller';
+
+test('loads earlier messages only on the transition from a nonzero position to the exact top', () => {
+  assert.equal(browserChatReachedHistoryTop(120, 1), false);
+  assert.equal(browserChatReachedHistoryTop(1, 0), true);
+  assert.equal(browserChatReachedHistoryTop(0, 0), false);
+  assert.equal(browserChatReachedHistoryTop(0, 10), false);
+});
 
 test('historical subagent data is queried only on the first parallel-group expansion', () => {
   const queried = new Set<string>();

@@ -42,6 +42,40 @@ test('browser chat history uses stable cursors and returns oldest-to-newest chun
       LIMIT ?
     `).all(snapshot.id, 'b', 10) as Array<{ detail?: string }>;
     assert.match(plan.map((item) => item.detail || '').join('\n'), /browser_chat_log_session_message_time_idx/);
+
+    const defaultSnapshot = {
+      id: 'chat_default_window',
+      title: 'default window',
+      status: 'idle',
+      createdAt: at(0),
+      updatedAt: at(20),
+    };
+    records.writeBrowserChatSessionRecord(
+      defaultSnapshot,
+      defaultSnapshot,
+      Array.from({ length: 12 }, (_, index) => ({
+        id: `d${index + 1}`,
+        createdAt: at(index + 1),
+        content: `${index + 1}`,
+        role: index === 1 ? 'assistant' : 'user',
+        status: index === 1 ? 'running' : undefined,
+      })),
+      Array.from({ length: 12 }, (_, index) => ({ index: index + 1 })),
+      [],
+    );
+    const defaultPage = history.readBrowserChatMessagesPage<{ id: string }>(defaultSnapshot.id);
+    assert.equal(defaultPage.items.length, 10);
+    assert.deepEqual(defaultPage.items.map((item) => item.id), Array.from({ length: 10 }, (_, index) => `d${index + 3}`));
+    assert.equal(defaultPage.hasMore, true);
+    assert.equal(history.readBrowserChatMessageById<{ id: string }>(defaultSnapshot.id, 'd4')?.id, 'd4');
+    assert.equal(
+      history.readBrowserChatLatestActiveAssistantMessage<{ id: string }>(defaultSnapshot.id)?.id,
+      'd2',
+    );
+    assert.deepEqual(
+      history.readBrowserChatStepsByIndexes<{ index: number }>(defaultSnapshot.id, [5, 2, 5]).map((step) => step.index),
+      [2, 5],
+    );
   } finally {
     databaseModule.getSqliteDatabase().close();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

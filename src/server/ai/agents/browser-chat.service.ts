@@ -29,6 +29,7 @@ import {
   type BrowserChatAttachment,
 } from '@/server/ai/agents/browser-chat-attachments';
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
+import { browserChatSessionTitleParts } from '@/lib/browser-chat-title';
 import {
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
@@ -84,6 +85,10 @@ import {
 import { createPersonalMemoryTools } from '@/server/ai/personal-memory-tools';
 import { withModelSettings } from '@/server/ai/model';
 import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
+import {
+  activeBrowserChatAssistantMessage,
+  browserChatClientRecordsForMessage,
+} from '@/server/ai/agents/browser-chat-client-window';
 import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
 import type {
   BrowserChatAiOutputCycle,
@@ -103,12 +108,7 @@ import {
   writeBrowserChatSessionDeltaQueued,
 } from '@/server/storage/sqlite-record-store';
 import {
-  browserChatHistoryLimit,
-  readBrowserChatLogsPage,
-  readBrowserChatMessagesPage,
-  readBrowserChatSessionHeader,
-  readBrowserChatSessionWindow,
-  readBrowserChatStepsPage,
+  BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   type BrowserChatHistoryState,
 } from '@/server/storage/browser-chat-history-store';
 import {
@@ -193,6 +193,7 @@ export type BrowserChatToolConfirmation = {
 export type BrowserChatSessionSnapshot = {
   id: string;
   title: string;
+  titleFileName?: string;
   userId?: string;
   browserGroupId: string;
   targetUrl: string;
@@ -218,10 +219,6 @@ export type BrowserChatSessionSnapshot = {
   logs: BrowserChatLogRecord[];
   queuedTurns: BrowserChatQueuedTurn[];
   pendingToolConfirmation?: BrowserChatToolConfirmation;
-};
-
-export type BrowserChatSessionPage = BrowserChatSessionSnapshot & {
-  history: BrowserChatHistoryState;
 };
 
 type BrowserChatPersistedSessionSnapshot = BrowserChatSessionSnapshot & {
@@ -1485,9 +1482,12 @@ function sessionSnapshotHeader(
 ): Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> {
   finalizeIdleRunningAssistantMessages(session);
   if (!session.busy && session.status !== 'running') session.mode = configuredBrowserChatMode();
+  const firstUserMessage = session.messages.find((message) => message.role === 'user');
+  const titleFileName = browserChatSessionTitleParts(session.title, firstUserMessage?.attachments).fileName;
   return {
     id: session.id,
     title: session.title,
+    ...(titleFileName ? { titleFileName } : {}),
     userId: session.userId,
     browserGroupId: session.browserGroupId,
     targetUrl: session.targetUrl,
@@ -1521,6 +1521,47 @@ function snapshot(session: BrowserChatSessionRecord, options: { fullSteps?: bool
     outputCycles: [...session.outputCycles],
     subagents: [...session.subagents],
     logs: compactBrowserChatLogsForClient(session.logs || []),
+  };
+}
+
+type BrowserChatClientSessionSnapshot = BrowserChatSessionSnapshot & {
+  history: BrowserChatHistoryState;
+};
+
+function clientSnapshot(session: BrowserChatSessionRecord): BrowserChatClientSessionSnapshot {
+  const header = sessionSnapshotHeader(session);
+  const activeMessage = activeBrowserChatAssistantMessage(session);
+  const activeStepIndexes = new Set(activeMessage?.stepIndexes || []);
+  const latestMessages = session.messages.slice(-BROWSER_CHAT_MESSAGE_PAGE_SIZE);
+  const messages = activeMessage && !latestMessages.some((message) => message.id === activeMessage.id)
+    ? [
+        activeMessage,
+        ...session.messages
+          .filter((message) => message.id !== activeMessage.id)
+          .slice(-(BROWSER_CHAT_MESSAGE_PAGE_SIZE - 1)),
+      ].sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    : latestMessages;
+  const records = activeMessage
+    ? browserChatClientRecordsForMessage(session, activeMessage.id, { includeSubagents: true })
+    : { outputCycles: [], subagents: [] };
+  return {
+    ...header,
+    messages,
+    steps: activeMessage
+      ? session.steps
+          .filter((step) => activeStepIndexes.has(step.index) && (!step.messageId || step.messageId === activeMessage.id))
+          .map(compactStepForClient)
+      : [],
+    logs: activeMessage
+      ? compactBrowserChatLogsForClient(session.logs.filter((log) => log.messageId === activeMessage.id))
+      : [],
+    outputCycles: records.outputCycles,
+    subagents: records.subagents,
+    history: {
+      messages: { hasMore: false },
+      steps: { hasMore: false },
+      logs: { hasMore: false },
+    },
   };
 }
 
@@ -1887,8 +1928,15 @@ function writeSessionSnapshot(item: BrowserChatPersistedSessionSnapshot): Browse
   delete sessionRecord.logs;
   const persistedSession = sessionRecord as Omit<BrowserChatPersistedSessionSnapshot, 'logs' | 'messages' | 'steps'>;
   const { modelContext: _modelContext, ...session } = persistedSession;
+  void _modelContext;
+  const activeMessage = activeBrowserChatAssistantMessage(persistedItem);
+  const realtimeRecords = activeMessage
+    ? browserChatClientRecordsForMessage(persistedItem, activeMessage.id, { includeSubagents: true })
+    : { outputCycles: [], subagents: [] };
   const realtimeSession: BrowserChatSessionRealtimePatch['session'] = {
     ...session,
+    outputCycles: realtimeRecords.outputCycles,
+    subagents: realtimeRecords.subagents,
     pendingToolConfirmation: session.pendingToolConfirmation ?? null,
   };
   const summary = summaryFromSnapshot(persistedItem);
@@ -1930,9 +1978,12 @@ async function publishBrowserChatTextStreamSnapshot(sessionId: string, assistant
   const message = session?.messages.find((item) => item.id === assistantMessageId);
   if (!session || !message || message.role !== 'assistant') return;
   const header = sessionSnapshotHeader(session);
+  const realtimeRecords = browserChatClientRecordsForMessage(session, message.id, { includeSubagents: true });
   const patch: BrowserChatSessionRealtimePatch = {
     session: {
       ...header,
+      outputCycles: realtimeRecords.outputCycles,
+      subagents: realtimeRecords.subagents,
       pendingToolConfirmation: header.pendingToolConfirmation ?? null,
     },
     messages: [{
@@ -2475,110 +2526,13 @@ export function createBrowserChatSession(input: {
   session.browserGroupId = `session:${session.id}`;
   sessions.set(session.id, session);
   persistAndNotify(session.id);
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 export function getBrowserChatSession(sessionId: string, userId?: string | number) {
   const session = hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   return session ? snapshot(session) : undefined;
-}
-
-export function getBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  const persisted = readBrowserChatSessionWindow<
-    BrowserChatPersistedSessionSnapshot,
-    BrowserChatMessage,
-    StepExecutionResult,
-    BrowserChatLogRecord
-  >(sessionId);
-  const live = sessions.get(sessionId);
-  if (!persisted && !live) return undefined;
-  const baseWithModelContext = live ? {
-    ...sessionSnapshotHeader(live),
-    messages: [],
-    steps: [],
-    logs: [],
-  } : persisted as BrowserChatSessionPage;
-  if (!sessionBelongsToUser(baseWithModelContext, userId)) return undefined;
-  const { modelContext: _modelContext, ...base } = baseWithModelContext as BrowserChatPersistedSessionSnapshot & Partial<BrowserChatSessionPage>;
-  const includeLiveSubagentDetails = Boolean(base.busy || base.status === 'running');
-  const publicBase = {
-    ...base,
-    subagents: includeLiveSubagentDetails ? base.subagents : [],
-    outputCycles: includeLiveSubagentDetails
-      ? base.outputCycles
-      : (base.outputCycles || []).filter((cycle) => !cycle.subagentId),
-  };
-  if (!persisted) {
-    return {
-      ...publicBase,
-      messages: live?.messages.slice(-80) || [],
-      steps: live?.steps.slice(-120).map(compactStepForClient) || [],
-      logs: compactBrowserChatLogsForClient(live?.logs.slice(-200) || []),
-      history: {
-        messages: { hasMore: false },
-        steps: { hasMore: false },
-        logs: { hasMore: false },
-      },
-    } satisfies BrowserChatSessionPage;
-  }
-  return {
-    ...publicBase,
-    messages: persisted.messages,
-    steps: persisted.steps.map(compactStepForClient),
-    logs: compactBrowserChatLogsForClient(persisted.logs),
-    history: persisted.history,
-  } satisfies BrowserChatSessionPage;
-}
-
-export function getBrowserChatSessionHistory(
-  sessionId: string,
-  userId: string | number | undefined,
-  input: {
-    logCursor?: string;
-    logLimit?: number;
-    messageCursor?: string;
-    messageLimit?: number;
-    stepCursor?: string;
-    stepLimit?: number;
-  },
-) {
-  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId);
-  if (session && !sessionBelongsToUser(session, userId)) return undefined;
-  if (!session) return undefined;
-  const messages = input.messageCursor
-    ? readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
-        cursor: input.messageCursor,
-        limit: browserChatHistoryLimit(input.messageLimit, 80),
-      })
-    : undefined;
-  const steps = input.stepCursor
-    ? readBrowserChatStepsPage<StepExecutionResult>(sessionId, {
-        cursor: input.stepCursor,
-        limit: browserChatHistoryLimit(input.stepLimit, 120),
-      })
-    : undefined;
-  const logs = input.logCursor
-    ? readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, {
-        cursor: input.logCursor,
-        limit: browserChatHistoryLimit(input.logLimit, 200),
-      })
-    : undefined;
-  const includeLiveSubagentState = Boolean(session.busy || session.status === 'running');
-  return {
-    outputCycles: includeLiveSubagentState
-      ? session.outputCycles || []
-      : (session.outputCycles || []).filter((cycle) => !cycle.subagentId),
-    subagents: includeLiveSubagentState ? session.subagents || [] : [],
-    ...(messages ? { messages: messages.items } : {}),
-    ...(steps ? { steps: steps.items.map(compactStepForClient) } : {}),
-    ...(logs ? { logs: compactBrowserChatLogsForClient(logs.items) } : {}),
-    history: {
-      ...(messages ? { messages: { cursor: messages.cursor, hasMore: messages.hasMore } } : {}),
-      ...(steps ? { steps: { cursor: steps.cursor, hasMore: steps.hasMore } } : {}),
-      ...(logs ? { logs: { cursor: logs.cursor, hasMore: logs.hasMore } } : {}),
-    },
-  };
 }
 
 export function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
@@ -2589,28 +2543,7 @@ export function setBrowserChatSessionGroup(sessionId: string, groupId: string, u
   session.browserGroupId = normalized;
   session.updatedAt = now();
   persistAndNotify(session.id);
-  return snapshot(session);
-}
-
-export function getBrowserChatSessionLogs(
-  sessionId: string,
-  userId?: string | number,
-  input: { cursor?: string; limit?: number; messageId?: string } = {},
-) {
-  const session = sessions.get(sessionId) || readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId);
-  if (session && !sessionBelongsToUser(session, userId)) return undefined;
-  if (!session) return undefined;
-  const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, input);
-  return {
-    logs: page.items,
-    subagents: input.messageId
-      ? (session.subagents || []).filter((subagent) => subagent.messageId === input.messageId)
-      : [],
-    outputCycles: input.messageId
-      ? (session.outputCycles || []).filter((cycle) => cycle.messageId === input.messageId && Boolean(cycle.subagentId))
-      : [],
-    history: { cursor: page.cursor, hasMore: page.hasMore },
-  };
+  return clientSnapshot(session);
 }
 
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
@@ -2701,7 +2634,7 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
   session.closedAt = now();
   session.updatedAt = session.closedAt;
   persistAndNotify(session.id);
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 export async function deleteBrowserChatSession(sessionId: string, userId?: string | number) {
@@ -2750,7 +2683,7 @@ export async function switchBrowserChatTab(sessionId: string, tabId: string, use
   session.error = undefined;
   if (!session.busy) transitionBrowserChatSession(session, { type: 'sessionRecovered', at: session.updatedAt });
   persistAndNotify(session.id);
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 export async function startBrowserChatScreencast(
@@ -3137,7 +3070,7 @@ export async function sendBrowserChatMessage(
   const modelMessageText = [inlineMessageText, skillReferences, attachmentReferences].filter(Boolean).join('\n\n');
   const normalizedClientMessageId = clientMessageId?.trim().slice(0, 120) || undefined;
   if (normalizedClientMessageId && session.messages.some((message) => message.clientMessageId === normalizedClientMessageId)) {
-    return snapshot(session);
+    return clientSnapshot(session);
   }
   const requestedSafetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
   const requestedModelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
@@ -3179,7 +3112,7 @@ export async function sendBrowserChatMessage(
       messageId: null,
       details: { queuedTurnId: session.queuedTurns.at(-1)?.id, queueLength: session.queuedTurns.length },
     });
-    return snapshot(session);
+    return clientSnapshot(session);
   }
   // Operation mode is shared application configuration. A conversation or
   // mounted user must never preserve or override an older mode value.
@@ -3251,7 +3184,7 @@ export async function sendBrowserChatMessage(
     attachments,
     selectedSkills,
   );
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 function latestManualVerificationAssistant(session: BrowserChatSessionRecord) {
@@ -3342,7 +3275,7 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
       [],
     );
   }
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 function updateAssistantMessage(
@@ -3796,7 +3729,7 @@ export function resolveBrowserChatToolConfirmation(
     throw new Error('Tool confirmation is no longer active');
   }
   resolver.resolve(action === 'confirm' ? 'confirmed' : 'cancelled');
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
@@ -3862,7 +3795,7 @@ export function interruptBrowserChatSession(sessionId: string, userId?: string |
   // this finalized snapshot immediately after the response; if SQLite is
   // briefly unavailable, keep retrying the current in-memory snapshot.
   persistInterruptedSessionInBackground(session.id);
-  return snapshot(session);
+  return clientSnapshot(session);
 }
 
 async function runBrowserChatSubagents(input: {

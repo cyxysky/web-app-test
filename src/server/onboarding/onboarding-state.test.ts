@@ -17,13 +17,22 @@ test('persists onboarding progress per user and treats existing users as complet
 
     const started = updateOnboardingState('new-user', { action: 'start' });
     assert.equal(started.status, 'in_progress');
-    assert.deepEqual(started.completedSteps, ['welcome', 'readiness']);
-    const progressed = updateOnboardingState('new-user', { action: 'complete_step', step: 'browser_task' });
+    assert.deepEqual(started.completedSteps, []);
+    let progressed = started;
+    for (const step of ['welcome', 'accounts', 'skills', 'memory', 'permissions', 'model', 'readiness', 'browser_task'] as const) {
+      progressed = updateOnboardingState('new-user', { action: 'complete_step', step });
+    }
     assert.equal(progressed.completedSteps.includes('browser_task'), true);
     assert.equal(progressed.status, 'completed');
     assert.deepEqual(readOnboardingState('new-user'), progressed);
 
     const database = getSqliteDatabase();
+    database.prepare('UPDATE user_onboarding_state SET tutorial_version = 1 WHERE user_id = ?').run('new-user');
+    const upgraded = readOnboardingState('new-user');
+    assert.equal(upgraded.tutorialVersion, 2);
+    assert.equal(upgraded.status, 'not_started');
+    assert.deepEqual(upgraded.completedSteps, []);
+
     const timestamp = new Date().toISOString();
     database.prepare(`
       INSERT INTO browser_chat_session (

@@ -31,7 +31,6 @@ import {
   AppWindow,
   ArrowLeft,
   ArrowRight,
-  ArrowUp,
   BadgeCheck,
   Brain,
   Braces,
@@ -45,6 +44,7 @@ import {
   CheckCircle2,
   Download,
   FileSearch,
+  FileText,
   Folder,
   FolderOpen,
   GalleryHorizontalEnd,
@@ -60,6 +60,7 @@ import {
   MousePointer2,
   Network,
   PanelRight,
+  Paperclip,
   PencilLine,
   Pin,
   Plus,
@@ -71,6 +72,7 @@ import {
   ScrollText,
   SendHorizontal,
   Settings,
+  ShieldCheck,
   Sparkles,
   SquareArrowOutUpRight,
   SquareTerminal,
@@ -85,7 +87,9 @@ import {
 } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import ReactMarkdown from 'react-markdown';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import { CustomSelect } from '@/components/CustomSelect';
 import { FloatingLayer } from '@/components/FloatingLayer';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
@@ -98,12 +102,17 @@ import {
 import {
   beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
+  browserChatReachedHistoryTop,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   normalizeBrowserChatHistory,
   type BrowserChatHistoryState,
 } from '@/components/browser-chat-history-controller';
-import { normalizeBrowserChatMarkdown } from '@/components/browser-chat-markdown';
+import {
+  normalizeBrowserChatMarkdown,
+  remarkBrowserChatCjkStrong,
+} from '@/components/browser-chat-markdown';
+import { browserChatGenerationPreviewText } from '@/components/browser-chat-message-generation-preview';
 import {
   mergeBrowserChatRealtimeCollections,
   mergeBrowserChatRealtimeRecords,
@@ -157,6 +166,10 @@ import {
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { browserSessionGroupLabel } from '@/lib/browser-session-group';
+import {
+  browserChatSessionDisplayTitle,
+  browserChatSessionTitleParts,
+} from '@/lib/browser-chat-title';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import { WEBPILOT_ONBOARDING_RESTART_EVENT } from '@/lib/onboarding';
@@ -280,6 +293,7 @@ type BrowserChatSession = {
   id: string;
   userId?: string;
   title: string;
+  titleFileName?: string;
   browserGroupId: string;
   targetUrl: string;
   mode: BrowserChatMode;
@@ -1722,7 +1736,16 @@ function isOlderSessionSnapshot(incoming: BrowserChatSession, existing?: Browser
 }
 
 function sessionDisplayTitle(session: BrowserChatSession) {
-  return compactText(session.title || '新对话', 38);
+  return browserChatSessionDisplayTitle(session.title, 220, sessionTitleAttachments(session));
+}
+
+function sessionTitleAttachments(session: BrowserChatSession) {
+  if (session.titleFileName) return [{ kind: 'file' as const, name: session.titleFileName }];
+  return session.messages.find((message) => message.role === 'user')?.attachments || [];
+}
+
+function sessionTitleParts(session: BrowserChatSession) {
+  return browserChatSessionTitleParts(session.title, sessionTitleAttachments(session));
 }
 
 const BROWSER_CHAT_DOWNLOAD_EXTENSIONS = new Set([
@@ -1809,7 +1832,8 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
   return (
     <div className="browser-chat-agent-markdown">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeKatex]}
+        remarkPlugins={[remarkGfm, remarkMath, remarkBrowserChatCjkStrong]}
         components={{
           a: ({ href, onClick, ...props }) => (
             <a
@@ -3467,17 +3491,21 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   children,
   label,
   message,
+  onExpand,
   running,
 }: {
   autoOpen: boolean;
   children: ReactNode;
   label: string;
   message: BrowserChatMessage;
+  onExpand?: () => Promise<void> | void;
   running: boolean;
 }) {
+  const { t } = useI18n();
   const bodyId = useId();
   const [expanded, setExpanded] = useState(autoOpen);
   const [bodyMounted, setBodyMounted] = useState(autoOpen);
+  const [loadingRecords, setLoadingRecords] = useState(false);
   const desiredExpandedRef = useRef(autoOpen);
   const openFrameRef = useRef(0);
   const previousAutoOpenRef = useRef(autoOpen);
@@ -3501,6 +3529,22 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
       if (desiredExpandedRef.current) setExpanded(true);
     });
   }, []);
+  const toggleDisclosure = useCallback(() => {
+    const nextExpanded = !desiredExpandedRef.current;
+    setDisclosureExpanded(nextExpanded);
+    if (!nextExpanded || !onExpand || loadingRecords) return;
+    try {
+      const pending = onExpand();
+      if (!pending) return;
+      setLoadingRecords(true);
+      void Promise.resolve(pending).then(
+        () => setLoadingRecords(false),
+        () => setLoadingRecords(false),
+      );
+    } catch {
+      setLoadingRecords(false);
+    }
+  }, [loadingRecords, onExpand, setDisclosureExpanded]);
 
   useEffect(() => {
     if (autoOpen) {
@@ -3539,7 +3583,7 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
         aria-controls={bodyId}
         aria-expanded={expanded}
         className="browser-chat-process-summary"
-        onClick={() => setDisclosureExpanded(!desiredExpandedRef.current)}
+        onClick={toggleDisclosure}
         type="button"
       >
         {running ? <Loader2 aria-hidden="true" className="spin" size={13} /> : null}
@@ -3553,7 +3597,19 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
         id={bodyId}
         inert={!expanded}
       >
-        {bodyMounted ? <div className="browser-chat-process-body">{children}</div> : null}
+        {bodyMounted ? (
+          <div className="browser-chat-process-body">
+            <div className="browser-chat-process-body-content">
+              {loadingRecords ? (
+                <div aria-live="polite" className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
+                  <Loader2 aria-hidden="true" className="spin" size={14} />
+                  <span>{t('正在加载工具记录')}</span>
+                </div>
+              ) : null}
+              {children}
+            </div>
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -3580,6 +3636,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   logs,
   manualVerificationRequired,
   message,
+  onLoadProcessRecords,
   onLoadSubagentRecords,
   outputCycles,
   onResolveToolConfirmation,
@@ -3596,6 +3653,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   logs: BrowserChatLogRecord[];
   manualVerificationRequired?: boolean;
   message: BrowserChatMessage;
+  onLoadProcessRecords?: () => Promise<void> | void;
   onLoadSubagentRecords?: () => void;
   outputCycles: BrowserChatAiOutputCycle[];
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -3803,11 +3861,12 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const hasFinalText = Boolean(finalText.trim());
   const hideManualVerificationStatusText = manualVerificationPaused && isBrowserChatManualVerificationStatusText(finalText);
   const hasHistoricalAiOutput = aiOutputCycleEntries.length > 0;
-  const hasProcessContent = hasHistoricalAiOutput || shouldShowStepTimeline || running || hasPendingConfirmation;
+  const hasPersistedProcess = Boolean(message.stepIndexes?.length);
+  const hasProcessContent = hasHistoricalAiOutput || hasPersistedProcess || shouldShowStepTimeline || running || hasPendingConfirmation;
   const runningActivityLabel = message.activity?.label?.trim()
     ? t(message.activity.label)
     : t('正在分析页面状态并准备下一步操作');
-  const processAutoOpen = running || hasPendingConfirmation || message.status === 'blocked';
+  const processAutoOpen = running || hasPendingConfirmation;
   const processLabel = running
     ? t('处理中')
     : message.status === 'blocked'
@@ -3835,7 +3894,13 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   return (
     <div className="browser-chat-agent-timeline">
       {hasProcessContent ? (
-        <BrowserChatProcessDisclosure autoOpen={processAutoOpen} label={processLabel} message={message} running={running}>
+        <BrowserChatProcessDisclosure
+          autoOpen={processAutoOpen}
+          label={processLabel}
+          message={message}
+          onExpand={!running ? onLoadProcessRecords : undefined}
+          running={running}
+        >
           {aiOutputCycleEntries.map((entry) => (
             entry.kind === 'executed' ? (
               <BrowserChatExecutedCycleGroup
@@ -3995,6 +4060,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
             logs={itemLogs}
             manualVerificationRequired={manualVerificationRequired}
             message={item}
+            onLoadProcessRecords={!operationRunning ? () => onLoadMessageLogs(item.id) : undefined}
             onLoadSubagentRecords={() => onLoadMessageLogs(item.id, { historicalSubagents: !operationRunning })}
             outputCycles={itemOutputCycles}
             onResolveToolConfirmation={onResolveToolConfirmation}
@@ -4140,6 +4206,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
                   logs={logs}
                   manualVerificationRequired={Boolean(sessionAwaitingHuman && item.id === lastAssistantMessageId)}
                   message={item}
+                  onLoadProcessRecords={!running ? () => onLoadMessageLogs(item.id) : undefined}
                   onLoadSubagentRecords={() => onLoadMessageLogs(item.id, { historicalSubagents: !running })}
                   outputCycles={itemOutputCycles}
                   onResolveToolConfirmation={onResolveToolConfirmation}
@@ -4224,17 +4291,17 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const historySentinelRef = useRef<HTMLDivElement | null>(null);
   const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
   const followLatestRef = useRef(true);
   const earlierLoadInFlightRef = useRef(false);
-  const earlierLoadArmedRef = useRef(false);
-  const previousRunStateRef = useRef({ sessionBusy, sessionId });
-  const pendingHistoryAnchorRef = useRef<{
-    element: HTMLElement;
+  const earlierLoadArmedRef = useRef(true);
+  const historyHeightFrameRef = useRef(0);
+  const pendingHistoryHeightRef = useRef<{
+    appliedAddedHeight: number;
+    baselineScrollHeight: number;
     firstMessageId: string;
-    top: number;
   } | null>(null);
+  const previousRunStateRef = useRef({ sessionBusy, sessionId });
   const previousSessionIdRef = useRef(sessionId);
   const closeSubagent = useCallback(() => setSelectedSubagentId(null), []);
   const openSubagent = useCallback((subagentId: string) => setSelectedSubagentId(subagentId), []);
@@ -4277,17 +4344,41 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     sessionBusy ? 'busy' : 'idle',
   ].join(':');
 
-  const settleHistoryAnchor = useCallback(() => {
-    const pending = pendingHistoryAnchorRef.current;
+  const addLoadedHistoryHeight = useCallback(() => {
+    const pending = pendingHistoryHeightRef.current;
     const container = getScrollContainer();
-    if (pending && container && pending.element.isConnected) {
-      const nextTop = pending.element.getBoundingClientRect().top;
-      const offset = nextTop - pending.top;
-      if (Math.abs(offset) > 0.5) container.scrollTop += offset;
+    if (!pending || !container) return;
+    const addedHeight = Math.max(0, container.scrollHeight - pending.baselineScrollHeight);
+    const unappliedHeight = addedHeight - pending.appliedAddedHeight;
+    if (Math.abs(unappliedHeight) > 0.5) {
+      const previousScrollBehavior = container.style.scrollBehavior;
+      container.style.scrollBehavior = 'auto';
+      container.scrollTop += unappliedHeight;
+      container.style.scrollBehavior = previousScrollBehavior;
     }
-    pendingHistoryAnchorRef.current = null;
-    earlierLoadInFlightRef.current = false;
+    pending.appliedAddedHeight = addedHeight;
+    followLatestRef.current = false;
   }, [getScrollContainer]);
+
+  const settleHistoryHeight = useCallback(() => {
+    if (!pendingHistoryHeightRef.current) return;
+    if (historyHeightFrameRef.current) cancelAnimationFrame(historyHeightFrameRef.current);
+    addLoadedHistoryHeight();
+    let remainingFrames = 3;
+    const settle = () => {
+      addLoadedHistoryHeight();
+      remainingFrames -= 1;
+      if (remainingFrames > 0) {
+        historyHeightFrameRef.current = requestAnimationFrame(settle);
+        return;
+      }
+      historyHeightFrameRef.current = 0;
+      pendingHistoryHeightRef.current = null;
+      earlierLoadInFlightRef.current = false;
+      earlierLoadArmedRef.current = true;
+    };
+    historyHeightFrameRef.current = requestAnimationFrame(settle);
+  }, [addLoadedHistoryHeight]);
 
   useLayoutEffect(() => {
     const sessionChanged = previousSessionIdRef.current !== sessionId;
@@ -4295,10 +4386,22 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     const messageList = scrollRef.current;
     const initialPositioning = messageList?.dataset.scrollReady !== 'true';
     if (sessionChanged) {
-      earlierLoadArmedRef.current = false;
-      pendingHistoryAnchorRef.current = null;
+      if (historyHeightFrameRef.current) cancelAnimationFrame(historyHeightFrameRef.current);
+      historyHeightFrameRef.current = 0;
+      pendingHistoryHeightRef.current = null;
       earlierLoadInFlightRef.current = false;
+      earlierLoadArmedRef.current = true;
     }
+    const pendingHistoryHeight = pendingHistoryHeightRef.current;
+    if (
+      !sessionChanged
+      && pendingHistoryHeight
+      && messages[0]?.id !== pendingHistoryHeight.firstMessageId
+    ) {
+      settleHistoryHeight();
+      return undefined;
+    }
+    if (earlierLoadInFlightRef.current) return undefined;
     if (!initialPositioning && !sessionChanged && !followLatestRef.current) return undefined;
     let settleFrame = 0;
     let readyFrame = 0;
@@ -4341,14 +4444,15 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       if (settleFrame) cancelAnimationFrame(settleFrame);
       if (readyFrame) cancelAnimationFrame(readyFrame);
     };
-  }, [getScrollContainer, onInitialPositioned, scrollKey, sessionId]);
+  }, [getScrollContainer, messages, onInitialPositioned, scrollKey, sessionId, settleHistoryHeight]);
 
   const trackScrollPosition = useCallback(() => {
     const container = getScrollContainer();
     if (!container) return;
-    const pendingAnchor = pendingHistoryAnchorRef.current;
-    if (pendingAnchor?.element.isConnected) {
-      pendingAnchor.top = pendingAnchor.element.getBoundingClientRect().top;
+    if (container.scrollTop > 0) earlierLoadArmedRef.current = true;
+    if (earlierLoadInFlightRef.current) {
+      followLatestRef.current = false;
+      return;
     }
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     followLatestRef.current = distanceFromBottom <= 16;
@@ -4358,7 +4462,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     const previous = previousRunStateRef.current;
     previousRunStateRef.current = { sessionBusy, sessionId };
     const turnCompleted = previous.sessionId === sessionId && previous.sessionBusy && !sessionBusy;
-    if (!turnCompleted || !followLatestRef.current) return undefined;
+    if (!turnCompleted || !followLatestRef.current || earlierLoadInFlightRef.current) return undefined;
     const container = getScrollContainer();
     if (!container) return undefined;
 
@@ -4386,12 +4490,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     };
   }, [getScrollContainer, sessionBusy, sessionId]);
 
-  useLayoutEffect(() => {
-    const pending = pendingHistoryAnchorRef.current;
-    if (!pending || messages[0]?.id === pending.firstMessageId) return;
-    settleHistoryAnchor();
-  }, [messages, settleHistoryAnchor]);
-
   useEffect(() => {
     const messageList = scrollRef.current;
     const scrollContainer = getScrollContainer();
@@ -4399,11 +4497,11 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     let frame = 0;
     const observedChildren = new Set<Element>();
     const scheduleScrollToBottom = () => {
-      if (!followLatestRef.current) return;
+      if (!followLatestRef.current || earlierLoadInFlightRef.current) return;
       if (frame) cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
         frame = 0;
-        if (!followLatestRef.current) return;
+        if (!followLatestRef.current || earlierLoadInFlightRef.current) return;
         scrollContainer.scrollTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
       });
     };
@@ -4439,47 +4537,59 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const loadEarlier = useCallback(async () => {
     if (!onLoadEarlier || !historyHasMore || historyLoading || earlierLoadInFlightRef.current) return;
     const container = getScrollContainer();
-    const anchor = scrollRef.current?.querySelector<HTMLElement>('.browser-chat-message');
-    if (!container || !anchor) return;
-    earlierLoadInFlightRef.current = true;
-    pendingHistoryAnchorRef.current = {
-      element: anchor,
+    if (!container || container.scrollTop > 0) return;
+    pendingHistoryHeightRef.current = {
+      appliedAddedHeight: 0,
+      baselineScrollHeight: container.scrollHeight,
       firstMessageId: messages[0]?.id || '',
-      top: anchor.getBoundingClientRect().top,
     };
+    earlierLoadInFlightRef.current = true;
+    earlierLoadArmedRef.current = false;
     followLatestRef.current = false;
     try {
       await onLoadEarlier();
     } finally {
       requestAnimationFrame(() => {
-        if (pendingHistoryAnchorRef.current) settleHistoryAnchor();
+        if (!pendingHistoryHeightRef.current) {
+          earlierLoadInFlightRef.current = false;
+          return;
+        }
+        const currentContainer = getScrollContainer();
+        if (currentContainer && currentContainer.scrollHeight !== pendingHistoryHeightRef.current.baselineScrollHeight) {
+          settleHistoryHeight();
+          return;
+        }
+        pendingHistoryHeightRef.current = null;
+        earlierLoadInFlightRef.current = false;
+        earlierLoadArmedRef.current = true;
       });
     }
-  }, [getScrollContainer, historyHasMore, historyLoading, messages, onLoadEarlier, settleHistoryAnchor]);
+  }, [getScrollContainer, historyHasMore, historyLoading, messages, onLoadEarlier, settleHistoryHeight]);
 
   useEffect(() => {
     const scrollContainer = getScrollContainer();
-    const sentinel = historySentinelRef.current;
-    if (!scrollContainer || !sentinel || !historyHasMore || !onLoadEarlier) return undefined;
-    const observer = new IntersectionObserver((entries) => {
-      const isIntersecting = entries.some((entry) => entry.isIntersecting);
-      if (!isIntersecting) {
+    if (!scrollContainer || !historyHasMore || !onLoadEarlier) return undefined;
+    let previousScrollTop = scrollContainer.scrollTop;
+    const handleScroll = () => {
+      const currentScrollTop = scrollContainer.scrollTop;
+      if (currentScrollTop > 0) {
         earlierLoadArmedRef.current = true;
-        return;
       }
-      if (!earlierLoadArmedRef.current || followLatestRef.current) return;
+      const reachedTop = browserChatReachedHistoryTop(previousScrollTop, currentScrollTop);
+      previousScrollTop = currentScrollTop;
+      if (!reachedTop || !earlierLoadArmedRef.current) return;
       earlierLoadArmedRef.current = false;
       void loadEarlier();
-    }, {
-      root: scrollContainer,
-      rootMargin: '96px 0px 0px',
-      threshold: 0,
-    });
-    observer.observe(sentinel);
+    };
+    scrollContainer.addEventListener('scroll', handleScroll, { passive: true });
     return () => {
-      observer.disconnect();
+      scrollContainer.removeEventListener('scroll', handleScroll);
     };
   }, [getScrollContainer, historyHasMore, loadEarlier, onLoadEarlier]);
+
+  useEffect(() => () => {
+    if (historyHeightFrameRef.current) cancelAnimationFrame(historyHeightFrameRef.current);
+  }, []);
 
   return (
     <BrowserChatSubagentPanelContext.Provider value={subagentPanelContext}>
@@ -4488,7 +4598,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         data-scroll-ready={revealImmediately ? 'true' : undefined}
         ref={scrollRef}
       >
-        {historyHasMore ? <div aria-hidden="true" className="browser-chat-history-sentinel" ref={historySentinelRef} /> : null}
         {historyHasMore && historyLoading ? (
           <div aria-live="polite" className="browser-chat-history-loader" role="status">
             <Loader2 className="spin" size={15} />
@@ -4585,7 +4694,7 @@ function BrowserChatModeSelector({
   const [open, setOpen] = useState(false);
   const menuId = useId();
   const triggerRef = useRef<HTMLButtonElement | null>(null);
-  const safetyLabel = safetyMode === 'full' ? t('完全') : t('严谨');
+  const safetyLabel = safetyMode === 'full' ? t('完全模式') : t('严格模式');
 
   useEffect(() => {
     if (!disabled) return;
@@ -4605,6 +4714,7 @@ function BrowserChatModeSelector({
         ref={triggerRef}
         type="button"
       >
+        <ShieldCheck aria-hidden="true" size={18} />
         <span>{safetyLabel}</span>
         <ChevronDown aria-hidden="true" className={open ? 'is-open' : undefined} size={14} />
       </button>
@@ -4713,6 +4823,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   interrupting,
   loading,
   loadingMoreSkills,
+  managementActions,
   mode,
   modeLocked,
   modelSelection,
@@ -4742,6 +4853,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   interrupting: boolean;
   loading: boolean;
   loadingMoreSkills: boolean;
+  managementActions: ReactNode;
   mode: BrowserChatMode;
   modeLocked: boolean;
   modelSelection: string;
@@ -4773,6 +4885,10 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
   const [activeSkillIndex, setActiveSkillIndex] = useState(0);
   const attachmentsById = useMemo(() => new Map(attachments.map((attachment) => [attachment.id, attachment])), [attachments]);
+  const compactModelSelectionOptions = useMemo(() => modelSelectionOptions.map((option) => ({
+    ...option,
+    selectedLabel: option.label,
+  })), [modelSelectionOptions]);
 
   useEffect(() => {
     setDraft('');
@@ -5270,7 +5386,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!busy && !loading}
-          data-placeholder={t('有问题，尽管问；需要时可并行调用子 Agent')}
+          data-placeholder={t('问问题，尽管问')}
           onInput={() => syncEditorState({ scrollToBottom: true })}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
@@ -5353,7 +5469,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               title={t('上传文件')}
               type="button"
             >
-              {uploadingImage ? <Loader2 className="spin" size={17} /> : <Plus size={19} />}
+              {uploadingImage ? <Loader2 className="spin" size={17} /> : <Paperclip size={20} />}
             </button>
             <BrowserChatModeSelector
               disabled={currentBusy || loading}
@@ -5361,13 +5477,14 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               safetyMode={safetyMode}
             />
           </div>
+          {managementActions}
           <div className="browser-chat-compose-submit">
             <div className="browser-chat-model-control">
               <CustomSelect
                 className="browser-chat-provider-select"
                 disabled={currentBusy || loading || !modelSelectionOptions.length}
                 onChange={(value) => onModelSelectionChange(parseModelSelectionValue(value))}
-                options={modelSelectionOptions.length ? modelSelectionOptions : [{ label: t('未启用模型服务商'), value: modelSelection }]}
+                options={compactModelSelectionOptions.length ? compactModelSelectionOptions : [{ label: t('未启用模型服务商'), value: modelSelection }]}
                 searchable
                 searchPlaceholder={t('搜索模型')}
                 title={modelSelectionTitle}
@@ -5392,7 +5509,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               type="submit"
               aria-label={t('发送')}
             >
-              {busy ? <Loader2 className="spin" size={18} /> : <ArrowUp size={20} strokeWidth={2.2} />}
+              {busy ? <Loader2 className="spin" size={18} /> : <SendHorizontal size={20} strokeWidth={2.1} />}
             </button>
           </div>
         </div>
@@ -8261,6 +8378,7 @@ export function BrowserChatWorkspace({
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
+  const generationSkillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
   const liveToolDialog = useMemo(() => {
     if (!toolDialog) return null;
     const expectedSignature = toolInputSignature(toolDialog.tool.input);
@@ -8301,13 +8419,22 @@ export function BrowserChatWorkspace({
     ));
     if (!ownedSteps.length) return [];
     const previousUser = [...visibleMessages.slice(0, messageIndex)].reverse().find((item) => item.role === 'user');
+    const titleMessage = previousUser || message;
     return [{
       id: message.id,
-      title: compactText(previousUser?.content || message.content || `AI 消息 ${messageIndex + 1}`, 120),
-      summary: compactText(message.content, 160),
+      title: browserChatGenerationPreviewText(titleMessage, generationSkillsById, {
+        fallbackFileLabel: t('文件'),
+        fallbackSkillLabel: 'Skill',
+        max: 120,
+      }) || t('AI 消息 {index}', { index: messageIndex + 1 }),
+      summary: browserChatGenerationPreviewText(message, generationSkillsById, {
+        fallbackFileLabel: t('文件'),
+        fallbackSkillLabel: 'Skill',
+        max: 160,
+      }),
       stepCount: ownedSteps.length,
     }];
-  }), [steps, visibleMessages]);
+  }), [generationSkillsById, steps, t, visibleMessages]);
   const selectedGenerationMessageIdSet = useMemo(
     () => new Set(messageGenerationDialog?.selectedMessageIds || []),
     [messageGenerationDialog?.selectedMessageIds],
@@ -8485,23 +8612,24 @@ export function BrowserChatWorkspace({
             logs?: BrowserChatLogRecord[];
             outputCycles?: BrowserChatAiOutputCycle[];
             subagents?: BrowserChatSubagentRecord[];
+            steps?: StepExecutionResult[];
           }>(response, '加载对话日志失败');
-          if (Array.isArray(data.logs) || Array.isArray(data.outputCycles) || Array.isArray(data.subagents)) {
+          if (Array.isArray(data.logs) || Array.isArray(data.outputCycles) || Array.isArray(data.subagents) || Array.isArray(data.steps)) {
             setSession((current) => {
               if (current?.id !== sessionId) return current;
               return mergeBrowserChatHistoryChunk(current, {
                 logs: data.logs,
                 outputCycles: data.outputCycles,
                 subagents: data.subagents,
+                steps: data.steps,
               });
             });
           }
           cursor = data.history?.hasMore && data.history.cursor ? data.history.cursor : '';
         } while (cursor);
       } catch {
-        // The dialog can still show realtime summary logs when the full-log request fails.
-      } finally {
         loadedLogMessageKeysRef.current.delete(key);
+        // The dialog can still show realtime summary logs when the full-log request fails.
       }
     })();
   }, [browserChatApiUrl]);
@@ -8519,8 +8647,6 @@ export function BrowserChatWorkspace({
     if (!current || !history || !browserChatHasEarlierMessages(history) || loadingEarlierHistory) return;
     const params = new URLSearchParams();
     if (history.messages.hasMore && history.messages.cursor) params.set('messageCursor', history.messages.cursor);
-    if (history.steps.hasMore && history.steps.cursor) params.set('stepCursor', history.steps.cursor);
-    if (history.logs.hasMore && history.logs.cursor) params.set('logCursor', history.logs.cursor);
     if (!params.size) return;
     const loadingStartedAt = Date.now();
     setLoadingEarlierHistory(true);
@@ -8529,9 +8655,7 @@ export function BrowserChatWorkspace({
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${current.id}/history?${params.toString()}`), { cache: 'no-store' });
       const chunk = await readApiJson<{
         history?: Partial<BrowserChatHistoryState>;
-        logs?: BrowserChatLogRecord[];
         messages?: BrowserChatMessage[];
-        steps?: StepExecutionResult[];
       }>(response, '加载更早对话记录失败');
       setSession((active) => active?.id === current.id ? mergeBrowserChatHistoryChunk(active, chunk) : active);
       setSessions((items) => items.map((item) => item.id === current.id ? mergeBrowserChatHistoryChunk(item, chunk) : item));
@@ -8590,6 +8714,9 @@ export function BrowserChatWorkspace({
   const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
+  const selectedModelLabel = modelSelectionOptions.find((option) => option.value === modelSelection)?.selectedLabel
+    || modelSelectionOptions.find((option) => option.value === modelSelection)?.label
+    || modelSelectionDiagnostic;
   const downloadPanelWidth = embeddedBrowserActive
     ? Math.max(260, Math.min(360, embeddedChatWidth - 36))
     : 380;
@@ -8807,19 +8934,22 @@ export function BrowserChatWorkspace({
     });
     setSessions(nextSessions);
     if (sessionSelectionIntentRef.current !== selectionIntent) return;
-    await loadRequestedBrowserChatSessionDetail(nextSessions, requestedSessionId, async (requestedSession) => {
+    await loadRequestedBrowserChatSessionDetail(requestedSessionId, async (requestedSessionId) => {
       if (!shouldActivateRequestedBrowserChatSession({
         activeSessionId: activeSessionIdRef.current,
         currentSelectionIntent: sessionSelectionIntentRef.current,
-        requestedSessionId: requestedSession.id,
+        requestedSessionId,
         selectionIntent,
       })) return undefined;
-      if (mountedSessionActivationRef.current === requestedSession.id) return;
-      mountedSessionActivationRef.current = requestedSession.id;
+      if (mountedSessionActivationRef.current === requestedSessionId) return;
+      mountedSessionActivationRef.current = requestedSessionId;
+      if (!mountedIdentityRef.current) {
+        window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href, requestedSessionId));
+      }
       try {
-        await activateSession(requestedSession.id);
+        await activateSession(requestedSessionId);
       } catch (loadError) {
-        if (mountedSessionActivationRef.current === requestedSession.id) mountedSessionActivationRef.current = '';
+        if (mountedSessionActivationRef.current === requestedSessionId) mountedSessionActivationRef.current = '';
         throw loadError;
       }
     });
@@ -8885,6 +9015,12 @@ export function BrowserChatWorkspace({
 
   const handleRealtimeRefresh = useCallback((event: import('@/lib/realtime-refresh').RealtimeRefreshEvent) => {
     if (event.deleted) {
+      for (const key of loadedLogMessageKeysRef.current) {
+        if (key.startsWith(`${event.id}\u0000`)) loadedLogMessageKeysRef.current.delete(key);
+      }
+      for (const key of loadedHistoricalSubagentKeysRef.current) {
+        if (key.startsWith(`${event.id}\u0000`)) loadedHistoricalSubagentKeysRef.current.delete(key);
+      }
       interruptGuardsRef.current.delete(event.id);
       setSessions((current) => current.filter((item) => item.id !== event.id));
       if (activeSessionIdRef.current === event.id) {
@@ -8897,7 +9033,18 @@ export function BrowserChatWorkspace({
     }
     const patch = browserChatRealtimePatch(event.patch);
     if (!patch) return;
-    if (patch.logs?.length || patch.removedLogIds?.length) {
+    if (patch.logs?.length) {
+      const changedMessageIds = new Set(patch.logs
+        .map((log) => log.messageId)
+        .filter((messageId): messageId is string => Boolean(messageId)));
+      for (const key of loadedLogMessageKeysRef.current) {
+        const prefix = `${event.id}\u0000`;
+        if (key.startsWith(prefix) && changedMessageIds.has(key.slice(prefix.length))) {
+          loadedLogMessageKeysRef.current.delete(key);
+        }
+      }
+    }
+    if (patch.removedLogIds?.length) {
       for (const key of loadedLogMessageKeysRef.current) {
         if (key.startsWith(`${event.id}\u0000`)) loadedLogMessageKeysRef.current.delete(key);
       }
@@ -9625,69 +9772,77 @@ export function BrowserChatWorkspace({
               }}
               ref={recentSessionListRef}
             >
-              {filteredRecentSessions.map((item) => (
-                <li key={item.id}>
-                  <div
-                    className={`${(loadingSessionId || session?.id || requestedSessionId) === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
-                  >
-                  {recentSelectionMode ? (
-                    <input
-                      aria-label={t('选择 {name}', { name: sessionDisplayTitle(item) })}
-                      checked={selectedSessionIdSet.has(item.id)}
-                      className="browser-chat-recent-check"
-                      disabled={item.busy || deletingSelectedSessions}
-                      onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
-                      type="checkbox"
-                    />
-                  ) : null}
-                  <button
-                    aria-label={sessionDisplayTitle(item)}
-                    className="browser-chat-recent-open"
-                    disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
-                    onClick={() => {
-                      setMobileHistoryOpen(false);
-                      void loadSession(item.id);
-                    }}
-                    title={sessionDisplayTitle(item)}
-                    type="button"
-                  >
-                    {sidebarCollapsed ? <MessageSquare className="browser-chat-recent-icon" size={17} /> : null}
-                    <span>{sessionDisplayTitle(item)}</span>
-                  </button>
-                  {sidebarCollapsed ? (
-                    <button
-                      aria-label={t('删除对话“{name}”', { name: sessionDisplayTitle(item) })}
-                      className="browser-chat-recent-delete browser-chat-collapsed-delete"
-                      disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
-                      onClick={() => void deleteSessionHistory(item.id)}
-                      title={item.busy ? t('执行中，无法删除') : t('删除对话')}
-                      type="button"
+              {filteredRecentSessions.map((item) => {
+                const displayTitle = sessionDisplayTitle(item);
+                const titleParts = sessionTitleParts(item);
+                return (
+                  <li key={item.id}>
+                    <div
+                      className={`${(loadingSessionId || session?.id || requestedSessionId) === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
                     >
-                      {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={10} /> : <X size={11} />}
-                    </button>
-                  ) : null}
-                  <BrowserChatOverflowMenu
-                    className="browser-chat-recent-row-menu"
-                    icon={deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
-                    label={t('{name} 操作', { name: sessionDisplayTitle(item) })}
-                    title={t('更多操作')}
-                  >
+                      {recentSelectionMode ? (
+                        <input
+                          aria-label={t('选择 {name}', { name: displayTitle })}
+                          checked={selectedSessionIdSet.has(item.id)}
+                          className="browser-chat-recent-check"
+                          disabled={item.busy || deletingSelectedSessions}
+                          onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
+                          type="checkbox"
+                        />
+                      ) : null}
                       <button
-                        className="danger"
-                        disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                        aria-label={displayTitle}
+                        className="browser-chat-recent-open"
+                        disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
                         onClick={() => {
-                          closeSidebarOverflowMenu();
-                          void deleteSessionHistory(item.id);
+                          setMobileHistoryOpen(false);
+                          void loadSession(item.id);
                         }}
+                        title={displayTitle}
                         type="button"
                       >
-                        <Trash2 size={15} />
-                        <span>{item.busy ? t('执行中，无法删除') : t('删除对话')}</span>
+                        {sidebarCollapsed ? (
+                          <MessageSquare className="browser-chat-recent-icon" size={17} />
+                        ) : titleParts.fileName ? (
+                          <FileText aria-hidden="true" className="browser-chat-recent-file-icon" size={15} />
+                        ) : null}
+                        <span>{displayTitle}</span>
                       </button>
-                  </BrowserChatOverflowMenu>
-                  </div>
-                </li>
-              ))}
+                      {sidebarCollapsed ? (
+                        <button
+                          aria-label={t('删除对话“{name}”', { name: displayTitle })}
+                          className="browser-chat-recent-delete browser-chat-collapsed-delete"
+                          disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                          onClick={() => void deleteSessionHistory(item.id)}
+                          title={item.busy ? t('执行中，无法删除') : t('删除对话')}
+                          type="button"
+                        >
+                          {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={10} /> : <X size={11} />}
+                        </button>
+                      ) : null}
+                      <BrowserChatOverflowMenu
+                        className="browser-chat-recent-row-menu"
+                        icon={deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+                        label={t('{name} 操作', { name: displayTitle })}
+                        title={t('更多操作')}
+                      >
+                        <button
+                          className="danger"
+                          disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                          onClick={() => {
+                            closeSidebarOverflowMenu();
+                            void deleteSessionHistory(item.id);
+                          }}
+                          type="button"
+                        >
+                          <Trash2 size={15} />
+                          <span>{item.busy ? t('执行中，无法删除') : t('删除对话')}</span>
+                        </button>
+                      </BrowserChatOverflowMenu>
+                    </div>
+                  </li>
+                );
+              })}
               {sessionListPage.hasMore && sessionListPage.next ? (
                 <li
                   className={`browser-chat-history-scroll-sentinel${loadingMoreSessions ? ' is-loading' : ''}`}
@@ -9820,7 +9975,16 @@ export function BrowserChatWorkspace({
       ) : (
         <BrowserChatOnboarding
           busy={currentBusy || Boolean(loadingSessionId)}
+          modelLabel={selectedModelLabel}
+          onOpenManagement={(tab) => setManagementTab(tab)}
+          onOpenModelSelector={() => {
+            const trigger = document.querySelector<HTMLButtonElement>('.browser-chat-provider-select .custom-select-button');
+            trigger?.focus();
+            trigger?.click();
+          }}
+          onSafetyModeChange={setSafetyMode}
           onSubmit={(content) => sendMessage(content)}
+          safetyMode={safetyMode}
         />
       )}
       {messageViewportPositioning ? (
@@ -9841,6 +10005,22 @@ export function BrowserChatWorkspace({
           interrupting={interrupting}
           loading={Boolean(loadingSessionId)}
           loadingMoreSkills={loadingMoreSkills}
+          managementActions={(
+            <div aria-label={t('快捷管理')} className="browser-chat-management-shortcuts" role="group">
+              <button aria-label={t('Skills 管理')} onClick={() => setManagementTab('skills')} title={t('Skills 管理')} type="button">
+                <Braces aria-hidden="true" size={14} />
+                <span>{t('技能')}</span>
+              </button>
+              <button aria-label={t('个性化记忆')} onClick={() => setManagementTab('memory')} title={t('个性化记忆')} type="button">
+                <Brain aria-hidden="true" size={14} />
+                <span>{t('记忆')}</span>
+              </button>
+              <button aria-label={t('登录账号')} onClick={() => setManagementTab('accounts')} title={t('登录账号')} type="button">
+                <KeyRound aria-hidden="true" size={14} />
+                <span>{t('账号')}</span>
+              </button>
+            </div>
+          )}
           mode={mode}
           modeLocked={modeLocked}
           modelSelection={modelSelection}
@@ -9862,20 +10042,6 @@ export function BrowserChatWorkspace({
           skillsHasMore={Boolean(skillListPage.hasMore)}
           uploadingImage={uploadingImage}
         />
-        <div aria-label={t('快捷管理')} className="browser-chat-management-shortcuts" role="group">
-          <button aria-label={t('Skills 管理')} onClick={() => setManagementTab('skills')} title={t('Skills 管理')} type="button">
-            <Braces aria-hidden="true" size={14} />
-            <span>{t('技能')}</span>
-          </button>
-          <button aria-label={t('个性化记忆')} onClick={() => setManagementTab('memory')} title={t('个性化记忆')} type="button">
-            <Brain aria-hidden="true" size={14} />
-            <span>{t('记忆')}</span>
-          </button>
-          <button aria-label={t('登录账号')} onClick={() => setManagementTab('accounts')} title={t('登录账号')} type="button">
-            <KeyRound aria-hidden="true" size={14} />
-            <span>{t('账号')}</span>
-          </button>
-        </div>
       </div>
     </div>
   );
@@ -10111,13 +10277,9 @@ export function BrowserChatWorkspace({
                       type="checkbox"
                     />
                     <div className="browser-chat-message-generation-content">
-                      <div className="browser-chat-message-generation-title">
-                        <BrowserChatMarkdown markdown={item.title} />
-                      </div>
+                      <div className="browser-chat-message-generation-title" title={item.title}>{item.title}</div>
                       {item.summary && item.summary !== item.title ? (
-                        <div className="browser-chat-message-generation-summary">
-                          <BrowserChatMarkdown markdown={item.summary} />
-                        </div>
+                        <div className="browser-chat-message-generation-summary" title={item.summary}>{item.summary}</div>
                       ) : null}
                     </div>
                     <em>{t('{count} 个步骤', { count: item.stepCount })}</em>

@@ -78,7 +78,7 @@
   overflow-y: auto;
   overflow-anchor: none;
   position: relative;
-  scrollbar-gutter: stable;
+  scrollbar-gutter: auto;
   max-width: none;
   padding: 50px 0 8px;
   width: 100%;
@@ -97,8 +97,6 @@
 
 .browser-chat-message {
   box-sizing: border-box;
-  content-visibility: auto;
-  contain-intrinsic-size: 180px;
   min-width: 0;
   max-width: 780px;
 }
@@ -297,8 +295,6 @@
 
 .browser-chat-agent-step,
 .browser-chat-executed-entry {
-  content-visibility: auto;
-  contain-intrinsic-size: 92px;
   background: transparent;
   border-color: transparent;
   border-radius: var(--radius-sm);
@@ -439,8 +435,8 @@
 .browser-chat-composer-shell:has(.browser-chat-compose--reference) {
   bottom: max(30px, env(safe-area-inset-bottom));
   gap: 8px;
-  max-width: 860px;
-  width: min(100%, 860px);
+  max-width: 896px;
+  width: min(100%, 896px);
 }
 
 .browser-chat-management-shortcuts {
@@ -469,7 +465,7 @@
 }
 
 .browser-chat-management-shortcuts button:hover {
-  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  background: transparent;
   color: var(--foreground);
 }
 
@@ -555,15 +551,15 @@
   overflow: visible;
   padding: 0;
   position: relative;
-  background: color-mix(in srgb, var(--panel) 97%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border-strong) 72%, var(--border));
-  border-radius: 20px;
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--border-strong) 66%, var(--border));
+  border-radius: 18px;
   box-shadow:
-    0 12px 34px color-mix(in srgb, #111827 8%, transparent),
-    var(--shadow-xs);
+    0 10px 28px color-mix(in srgb, #111827 7%, transparent),
+    0 1px 2px color-mix(in srgb, #111827 4%, transparent);
   gap: 0;
-  grid-template-rows: minmax(86px, auto) 56px;
-  min-height: 142px;
+  grid-template-rows: minmax(90px, auto) 56px;
+  min-height: 146px;
 }
 
 .browser-chat-compose.browser-chat-compose--reference:focus-within {
@@ -578,8 +574,8 @@
   font-size: 14px;
   line-height: 1.6;
   max-height: 176px;
-  min-height: 86px;
-  padding: 17px 18px 6px;
+  min-height: 90px;
+  padding: 18px 18px 6px;
 }
 
 .browser-chat-compose--reference .browser-chat-inline-editor:empty::before {
@@ -591,10 +587,10 @@
   background: transparent;
   border: 0;
   display: grid;
-  gap: 10px;
+  gap: 12px;
   grid-template-columns: auto minmax(0, 1fr) auto;
   min-height: 56px;
-  padding: 7px 10px 10px 12px;
+  padding: 7px 12px 9px;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-tools,
@@ -602,15 +598,36 @@
   align-items: center;
   flex: 0 0 auto;
   flex-wrap: nowrap;
-  display: grid;
   justify-self: stretch;
   min-width: 0;
   gap: 7px;
 }
 
-.browser-chat-compose--reference .browser-chat-compose-tools,
+.browser-chat-compose--reference .browser-chat-compose-tools {
+  display: flex;
+  gap: 10px;
+  justify-self: start;
+}
+
 .browser-chat-compose--reference .browser-chat-compose-submit {
+  border-left: 0;
+  display: grid;
+  gap: 16px;
   grid-template-columns: minmax(0, 1fr) 42px;
+  justify-self: end;
+  padding-left: 18px;
+  position: relative;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-submit::before {
+  background: color-mix(in srgb, var(--border) 72%, transparent);
+  content: '';
+  height: 18px;
+  left: 0;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
@@ -627,6 +644,58 @@
 }
 
 .browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
+  background: transparent;
+  color: var(--foreground);
+}
+
+.browser-chat-compose--reference .browser-chat-mode-selector {
+  border-left: 0;
+  padding-left: 12px;
+  position: relative;
+}
+
+.browser-chat-compose--reference .browser-chat-mode-selector::before {
+  background: color-mix(in srgb, var(--border) 76%, transparent);
+  content: '';
+  height: 18px;
+  left: 0;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+}
+
+.browser-chat-compose-actions > .browser-chat-management-shortcuts {
+  gap: 0;
+  justify-self: end;
+  min-width: 0;
+}
+
+.browser-chat-compose-actions > .browser-chat-management-shortcuts button {
+  font-size: 13px;
+  height: 30px;
+  padding-inline: 16px;
+  position: relative;
+}
+
+.browser-chat-compose-actions > .browser-chat-management-shortcuts button + button {
+  border-left: 0;
+  border-radius: 999px;
+  margin-left: 1px;
+}
+
+.browser-chat-compose-actions > .browser-chat-management-shortcuts button + button::before {
+  background: color-mix(in srgb, var(--border) 72%, transparent);
+  content: '';
+  height: 18px;
+  left: -1px;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+}
+
+.browser-chat-compose-actions > .browser-chat-management-shortcuts button:hover {
   background: transparent;
   color: var(--foreground);
 }
@@ -662,22 +731,22 @@
   box-shadow: none;
   color: #ffffff;
   border-radius: 50%;
-  height: 38px;
-  width: 38px;
+  height: 40px;
+  width: 40px;
 }
 
 .browser-chat-compose--reference .browser-chat-send {
   border-radius: 50%;
-  height: 38px;
-  width: 38px;
-  background: transparent;
-  box-shadow: none;
-  color: var(--accent-strong);
+  height: 40px;
+  width: 40px;
+  background: var(--accent-strong);
+  box-shadow: 0 5px 14px color-mix(in srgb, var(--accent-strong) 22%, transparent);
+  color: #ffffff;
 }
 
 .browser-chat-compose--reference .browser-chat-send:not(:disabled):hover {
-  background: transparent;
-  color: var(--accent-hover);
+  background: var(--accent-hover);
+  color: #ffffff;
   transform: translateY(-1px);
 }
 
@@ -690,8 +759,8 @@
 
 .browser-chat-compose--reference .browser-chat-send:disabled {
   opacity: 1;
-  background: var(--panel-warm);
-  color: var(--muted);
+  background: var(--accent-strong) !important;
+  color: #ffffff !important;
 }
 
 .browser-chat-mode-selector-trigger {
@@ -1461,6 +1530,43 @@
   border-color: var(--border);
 }
 
+/* Screenshot-matched selected conversation marker. */
+@media (min-width: 1025px) {
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item.active {
+    padding-right: 28px;
+    position: relative;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item.active::after {
+    background: var(--accent-strong);
+    border-radius: 50%;
+    content: '';
+    height: 7px;
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 7px;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item.active .browser-chat-recent-row-menu {
+    pointer-events: none;
+    visibility: hidden;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item.active:hover::after,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item.selecting::after,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item:has(.browser-chat-recent-row-menu[open])::after {
+    display: none;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-item:hover .browser-chat-recent-row-menu,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-recent-row-menu[open] {
+    pointer-events: auto;
+    visibility: visible;
+  }
+}
+
 /* Tablet and narrow-window workspace: two compact top rows, no lost actions. */
 @media (max-width: 1024px) {
   .browser-chat-layout,
@@ -1816,6 +1922,10 @@
     padding: 6px 7px 8px 8px;
   }
 
+  .browser-chat-compose-actions > .browser-chat-management-shortcuts {
+    display: none;
+  }
+
   .browser-chat-compose--reference .browser-chat-compose-tools,
   .browser-chat-compose--reference .browser-chat-compose-submit {
     gap: 4px;
@@ -2169,4 +2279,15 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   display: inline-flex;
   font-size: 12px;
   gap: 6px;
+}
+
+.browser-chat-layout *::-webkit-scrollbar-button,
+.browser-chat-layout *::-webkit-scrollbar-button:single-button,
+.browser-chat-message-generation-dialog *::-webkit-scrollbar-button,
+.browser-chat-message-generation-dialog *::-webkit-scrollbar-button:single-button {
+  -webkit-appearance: none;
+  background: transparent;
+  display: none;
+  height: 0;
+  width: 0;
 }
