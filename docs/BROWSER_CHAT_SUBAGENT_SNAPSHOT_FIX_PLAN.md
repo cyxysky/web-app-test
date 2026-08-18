@@ -72,7 +72,7 @@ type BrowserChatAttempt = {
 1. 工具调用、子 Agent、`shouldContinue` 和日志写入均同时校验 `assistantMessageId` 与 `attemptId`。
 2. Agent Loop 超时后先把当前 attempt 标记为 `cancelling`，传播 abort，并等待旧 attempt 与活动工具完成清理。
 3. 旧 attempt 未进入终态前禁止启动重试 attempt。
-4. 已取消 attempt 的工具结果不得继续写入当前会话、Working Memory 或模型上下文。
+4. 已取消 attempt 的工具结果不得继续写入当前会话或模型上下文。
 5. 原生 `generateText` 的整体超时不得把一个仍有心跳的长时间工具误判为模型请求超时。模型请求超时与工具执行超时必须分开。
 
 建议取消当前包住整个原生工具循环的 `AI_AGENT_LOOP_TIMEOUT_MS + Promise.race` 行为，改成：

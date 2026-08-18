@@ -102,7 +102,6 @@ export type StepExecutionResult = {
     current?: VisualFrameRecord;
     history: VisualFrameRecord[];
   };
-  workingMemory?: RuntimeWorkingMemory;
 };
 
 export type VisualFrameRecord = {
@@ -117,23 +116,6 @@ export type VisualFrameRecord = {
   toolName?: string;
   capture?: 'viewport' | 'fullPage';
   createdAt: string;
-};
-
-export type RuntimeWorkingMemory = {
-  taskGoal: string;
-  phase: string;
-  completed: string[];
-  findings: string[];
-  blockers: string[];
-  lastAction?: string;
-  lastResult?: string;
-  pageUnderstanding?: string;
-  currentState?: string;
-  scrollSummary?: string;
-  userConstraints: string[];
-  nextStep?: string;
-  taskFrame?: TaskFrame;
-  ledgerItems?: TaskLedgerItem[];
 };
 
 export type AiToolContextSnapshot = {
@@ -259,6 +241,7 @@ export type ModelProvider =
   | 'huggingface'
   | 'lmstudio'
   | 'llama-cpp'
+  | 'minimax'
   | 'mistral'
   | 'ollama'
   | 'openai'

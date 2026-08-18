@@ -16,10 +16,10 @@ import {
   ListChecks,
   Loader2,
   MessageSquare,
+  MoreHorizontal,
   Play,
   Plus,
   RefreshCw,
-  Search,
   Settings,
   Sparkles,
   StopCircle,
@@ -31,6 +31,13 @@ import {
 import { CustomSelect } from '@/components/CustomSelect';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import {
+  WorkspaceSidebarArchiveFilter,
+  WorkspaceSidebarArchiveHeader,
+  WorkspaceSidebarArchiveList,
+  WorkspaceSidebarArchiveRow,
+} from '@/components/WorkspaceSidebarArchive';
+import { WorkspaceOverflowMenu } from '@/components/WorkspaceOverflowMenu';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import type { Language } from '@/i18n/language';
@@ -1019,128 +1026,134 @@ export function AutomationWorkspace({
           <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
         </nav>
 
-        <section className="browser-chat-sidebar-section browser-chat-recent-section automation-case-history">
-          <div className="browser-chat-recent-header automation-case-history-header">
-            <h2>{t('用例')}</h2>
-            <span aria-label={t('共 {count} 个用例', { count: cases.length })} className="automation-case-history-total">
-              {cases.length}
-            </span>
-          </div>
-          <label className="domain-list-search browser-chat-history-filter">
-            <Search aria-hidden="true" size={16} />
-            <input
-              aria-label={t('筛选用例历史')}
-              className="domain-list-search-input"
-              disabled={loading}
-              onChange={(event) => setCaseFilter(event.currentTarget.value)}
-              placeholder={t('筛选用例')}
-              type="search"
-              value={caseFilter}
-            />
-            {caseFilter ? (
-              <button
-                aria-label={t('清空用例筛选')}
-                onClick={() => setCaseFilter('')}
-                title={t('清空筛选')}
-                type="button"
-              >
-                <X size={14} />
-              </button>
-            ) : null}
-          </label>
-          <div className={loading ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loading}>
+        <section className="browser-chat-sidebar-section browser-chat-recent-section workspace-sidebar-archive">
+          <div className="browser-chat-recent-panel">
+            <WorkspaceSidebarArchiveHeader
+              actions={(
+                <>
+                <button
+                  aria-label={t('新建用例')}
+                  className="ui-icon-button browser-chat-section-create"
+                  disabled={loading}
+                  onClick={openCaseDialog}
+                  title={t('新建用例')}
+                  type="button"
+                >
+                  <Plus size={18} />
+                </button>
+                <WorkspaceOverflowMenu
+                  className="browser-chat-recent-actions"
+                  icon={<MoreHorizontal size={16} />}
+                  label={t('更多操作')}
+                  title={t('更多操作')}
+                >
+                  <button
+                    disabled={loading}
+                    onClick={(event) => {
+                      event.currentTarget.closest('details')?.removeAttribute('open');
+                      void loadAll(true);
+                    }}
+                    type="button"
+                  >
+                    <RefreshCw size={14} />
+                    <span>{t('刷新')}</span>
+                  </button>
+                </WorkspaceOverflowMenu>
+                </>
+              )}
+            >
+              <WorkspaceSidebarArchiveFilter
+                ariaLabel={t('筛选用例历史')}
+                clearLabel={t('清空用例筛选')}
+                clearTitle={t('清空筛选')}
+                disabled={loading}
+                onChange={setCaseFilter}
+                placeholder={t('筛选用例')}
+                value={caseFilter}
+              />
+            </WorkspaceSidebarArchiveHeader>
+            <div className={loading ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loading}>
             {loading ? (
               <div className="browser-chat-history-loading" role="status" aria-live="polite" aria-label={t('正在加载用例')}>
                 <Loader2 className="spin" size={16} />
                 <span>{t('正在加载用例')}</span>
               </div>
             ) : filteredCases.length ? (
-              <ol className="automation-case-history-list">
-              {filteredCases.map((item) => {
-                const itemRuns = runsByCase.get(item.id) || [];
-                const itemLatestRun = itemRuns[0];
-                const itemActiveRuns = itemRuns.filter((run) => activeRunStatuses.has(run.status));
-                const active = item.id === selectedCase?.id;
-                return (
-                  <li
-                    className={active ? 'automation-case-history-row active' : 'automation-case-history-row'}
-                    key={item.id}
-                  >
-                    {active ? <span aria-hidden="true" className="automation-case-history-active-marker" /> : null}
-                    <div
-                      className={active ? 'automation-case-history-item active' : 'automation-case-history-item'}
-                      id={`automation-case-${item.id}`}
+              <WorkspaceSidebarArchiveList
+                footer={!loading && caseListPage.hasMore ? (
+                  <li className="workspace-sidebar-archive-footer">
+                    <button
+                      className="browser-chat-history-load-more"
+                      disabled={loadingMoreCases}
+                      onClick={() => void loadMoreCases()}
+                      type="button"
                     >
-                      <button
-                        aria-current={active ? 'true' : undefined}
-                        aria-label={item.name}
-                        className="automation-case-history-open"
-                        onClick={() => setSelectedCaseId(item.id)}
-                        title={item.name}
-                        type="button"
-                      >
-                        {sidebarCollapsed ? (
-                          <ListChecks
-                            aria-hidden="true"
-                            className={itemActiveRuns.length
-                              ? 'automation-case-history-icon is-running'
-                              : item.enabled
-                                ? 'automation-case-history-icon is-enabled'
-                                : 'automation-case-history-icon'}
-                            size={17}
-                          />
-                        ) : (
-                          <span
-                            aria-hidden="true"
-                            className={itemActiveRuns.length ? 'automation-state-dot is-running' : item.enabled ? 'automation-state-dot is-enabled' : 'automation-state-dot'}
-                          />
-                        )}
-                        <span className="automation-case-history-copy">
-                          <strong>{item.name}</strong>
-                          <small>
-                            {itemActiveRuns.length
-                              ? t('{count} 个任务执行中', { count: itemActiveRuns.length })
-                              : itemLatestRun
-                                ? t('{status} · {time}', {
-                                  status: statusLabel(itemLatestRun.status, t),
-                                  time: formatDateTime(itemLatestRun.startedAt, language),
-                                })
-                                : t('尚未运行')}
-                          </small>
-                        </span>
-                      </button>
-                      <span aria-label={t('{count} 次运行', { count: itemRuns.length })} className="automation-case-history-count">{itemRuns.length}</span>
-                      <button
-                        aria-label={t('删除用例“{name}”', { name: item.name })}
-                        className="ui-icon-button ui-icon-button--danger automation-case-history-delete browser-chat-collapsed-delete"
-                        disabled={Boolean(deletingCaseId)}
-                        onClick={() => openDeleteCaseDialog(item)}
-                        title={t('删除用例')}
-                        type="button"
-                      >
-                        {sidebarCollapsed ? <X size={12} /> : <Trash2 size={14} />}
-                      </button>
-                    </div>
+                      {loadingMoreCases ? <Loader2 className="spin" size={13} /> : null}
+                      {t(loadingMoreCases ? '正在加载' : '加载更多')}
+                    </button>
                   </li>
-                );
-              })}
-              </ol>
+                ) : null}
+                getKey={(item) => item.id}
+                items={filteredCases}
+                language={language}
+                renderItem={(item) => {
+                  const itemRuns = runsByCase.get(item.id) || [];
+                  const itemLatestRun = itemRuns[0];
+                  const itemActiveRuns = itemRuns.filter((run) => activeRunStatuses.has(run.status));
+                  const active = item.id === selectedCase?.id;
+                  const statusDescription = itemActiveRuns.length
+                    ? t('{count} 个任务执行中', { count: itemActiveRuns.length })
+                    : itemLatestRun
+                      ? t('{status} · {time}', {
+                        status: statusLabel(itemLatestRun.status, t),
+                        time: formatDateTime(itemLatestRun.startedAt, language),
+                      })
+                      : t('尚未运行');
+                  return (
+                    <WorkspaceSidebarArchiveRow
+                      active={active}
+                      ariaLabel={`${item.name}，${statusDescription}`}
+                      collapsed={sidebarCollapsed}
+                      collapsedAction={(
+                        <button
+                          aria-label={t('删除用例“{name}”', { name: item.name })}
+                          className="workspace-sidebar-archive-row-delete browser-chat-collapsed-delete"
+                          disabled={Boolean(deletingCaseId)}
+                          onClick={() => openDeleteCaseDialog(item)}
+                          title={t('删除用例')}
+                          type="button"
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                      collapsedIcon={<ListChecks aria-hidden="true" size={17} />}
+                      expandedAction={(
+                        <button
+                          aria-label={t('删除用例“{name}”', { name: item.name })}
+                          className="workspace-sidebar-archive-row-delete"
+                          disabled={Boolean(deletingCaseId)}
+                          onClick={() => openDeleteCaseDialog(item)}
+                          title={t('删除用例')}
+                          type="button"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      )}
+                      id={`automation-case-${item.id}`}
+                      iconTone={itemActiveRuns.length ? 'running' : item.enabled ? 'enabled' : 'muted'}
+                      onOpen={() => setSelectedCaseId(item.id)}
+                      title={item.name}
+                      titleAttribute={`${item.name} · ${statusDescription}`}
+                    />
+                  );
+                }}
+              />
             ) : cases.length ? (
               <p className="browser-chat-history-filter-empty">{t('没有匹配的用例')}</p>
             ) : (
               <p className="browser-chat-history-filter-empty">{t('暂无用例')}</p>
             )}
-            {!loading && caseListPage.hasMore ? (
-              <button
-                className="browser-chat-history-load-more"
-                disabled={loadingMoreCases}
-                onClick={() => void loadMoreCases()}
-                type="button"
-              >
-                {loadingMoreCases ? <Loader2 className="spin" size={13} /> : null}
-                {t(loadingMoreCases ? '正在加载' : '加载更多')}
-              </button>
-            ) : null}
+          </div>
           </div>
         </section>
 

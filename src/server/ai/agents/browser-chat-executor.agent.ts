@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, RuntimeWorkingMemory, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { aiReasoningEffort, aiRequestTimeoutMs, aiStreamTimeouts, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiMaxOutputTokens, aiReasoningEffort, aiRequestTimeoutMs, aiStreamTimeouts, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { structuredLog } from '@/server/observability/runtime-observability';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import {
@@ -47,7 +47,11 @@ import {
   type RuntimeRetryDecision,
 } from './runtime-retry-policy';
 
-import { runtimeAllowedToolTypes } from './runtime-tool-selection';
+import {
+  requiresBrowserStatePreflight,
+  runtimeAllowedToolTypes,
+  toolsAllowedBeforeBrowserState,
+} from './runtime-tool-selection';
 import { browserToolApprovalRequest } from './browser-tool-approval';
 import {
   estimateRuntimeTextTokens,
@@ -166,7 +170,6 @@ type ToolTrace = {
 };
 
 type ToolTraceProgress = {
-  workingMemory: RuntimeWorkingMemory;
   visualContext: ReturnType<VisualContextManager['snapshot']>;
 };
 
@@ -226,7 +229,6 @@ type BrowserChatOperationalContext = {
 type BrowserAgentRuntimeContext = {
   operationalContext: string;
   credentialRefs: string[];
-  workingMemory: RuntimeWorkingMemory;
   visualContext: ReturnType<VisualContextManager['snapshot']>;
 };
 
@@ -293,7 +295,10 @@ function modelSupportsScreenshotInput() {
 
   const { provider, model: configuredModel } = getModelSettings();
   const model = configuredModel.toLowerCase();
-  return provider !== 'deepseek' && !model.startsWith('deepseek');
+  return provider !== 'deepseek'
+    && provider !== 'minimax'
+    && !model.startsWith('deepseek')
+    && !model.startsWith('minimax');
 }
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
@@ -816,17 +821,26 @@ function agentStepLabel(stepIndex: number) {
   return String(stepIndex + 1);
 }
 
-function continuationRuntimeState(memory: RuntimeWorkingMemory) {
+function continuationRuntimeStateFromTraces(traces: ToolTrace[]) {
+  const finished = traces.filter((trace) => trace.result);
+  const completed = finished
+    .filter((trace) => trace.result?.ok)
+    .slice(-12)
+    .map((trace) => summarizeTraceForContinuation(trace));
+  const blockers = finished
+    .filter((trace) => isEffectiveToolTraceFailure(trace))
+    .slice(-8)
+    .map((trace) => concise(trace.result?.actual || '', 220));
+  const last = finished.at(-1);
+  const lastResult = last ? concise(userFacingToolResult(last.name, last.result, 400) || last.result?.actual || '', 240) : '';
   return {
-    completed: memory.completed,
-    findings: memory.findings,
-    blockers: memory.blockers,
-    userConstraints: memory.userConstraints,
-    pageUnderstanding: memory.pageUnderstanding,
-    currentState: memory.currentState,
-    lastAction: memory.lastAction,
-    lastResult: memory.lastResult,
-    nextStep: memory.nextStep,
+    completed,
+    findings: completed,
+    blockers,
+    currentState: last ? `${last.name}: ${lastResult}` : '',
+    lastAction: last ? summarizeTraceForContinuation(last) : '',
+    lastResult,
+    nextStep: 'Continue from the latest live browser state and the newest tool result.',
   };
 }
 
@@ -852,7 +866,7 @@ function sanitizeHistoricalToolText(value: unknown, max = 180) {
   );
 }
 
-function summarizeTraceForMemory(trace: ToolTrace) {
+function summarizeTraceForContinuation(trace: ToolTrace) {
   const input = trace.input && typeof trace.input === 'object' && !Array.isArray(trace.input)
     ? trace.input as Record<string, unknown>
     : {};
@@ -878,29 +892,6 @@ function summarizeTraceForMemory(trace: ToolTrace) {
 function toolTraceStatus(trace: ToolTrace) {
   if (!trace.result) return 'started';
   return trace.result.ok ? 'ok' : 'failed';
-}
-
-function updateWorkingMemoryFromTrace(memory: RuntimeWorkingMemory, trace: ToolTrace, sourceStep?: number) {
-  void sourceStep;
-  const next: RuntimeWorkingMemory = { ...memory };
-  const displayResult = userFacingToolResult(trace.name, trace.result, 400);
-  const resultText = sanitizeHistoricalToolText(displayResult || '', 400);
-  next.lastAction = summarizeTraceForMemory(trace);
-  next.lastResult = concise(displayResult || trace.result?.actual || '工具调用已开始，正在等待页面反馈。', 240);
-  if (resultText) {
-    next.pageUnderstanding = resultText;
-    next.currentState = concise(`${trace.name}: ${resultText}`, 260);
-  }
-  if (isEffectiveToolTraceFailure(trace)) {
-    next.blockers = Array.from(new Set([...next.blockers, concise(trace.result?.actual || '', 220)])).slice(-8);
-  }
-  if (trace.name === 'reportState') {
-    next.phase = '正在汇报当前状态或最终结论';
-  } else {
-    next.phase = '正在执行网页操作并等待页面反馈';
-  }
-  next.nextStep = trace.name === 'reportState' ? '根据报告状态决定是否结束' : '根据当前截图继续完成任务';
-  return next;
 }
 
 class VisualContextManager {
@@ -1154,6 +1145,38 @@ async function executeTracedBrowserAction(input: {
   return result;
 }
 
+const initialBrowserStateCode = 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
+
+async function readCurrentBrowserState(
+  session: BrowserSession,
+  mode: BrowserSessionMode,
+  options: { runId?: string; stepIndex?: number; abortSignal?: AbortSignal } = {},
+): Promise<BrowserActionResult> {
+  if (mode === 'code') {
+    return session.executeBrowserCode({
+      code: initialBrowserStateCode,
+      maxOutputChars: 40_000,
+      runId: options.runId || 'browser-state',
+      stepIndex: options.stepIndex || 0,
+      abortSignal: options.abortSignal,
+    });
+  }
+
+  const [tabs, pageState] = await Promise.all([
+    session.listTabs(),
+    session.readDomObservationSnapshot({ mode: 'full' }),
+  ]);
+  return {
+    ok: tabs.ok,
+    actual: JSON.stringify({
+      tabs: tabs.actual,
+      activePageState: [pageState.pageSummary, pageState.content].filter(Boolean).join('\n'),
+    }),
+    snapshotId: pageState.snapshotId,
+    nextCursor: pageState.nextCursor,
+  };
+}
+
 function makeBrowserTools(
   session: BrowserSession,
   targetUrl: string,
@@ -1244,6 +1267,15 @@ function makeBrowserTools(
   const credentialBinding = (ref?: string) => credentialBindings().find((item) => item.ref === ref);
 
   const sharedTools = {
+    readBrowserState: tool({
+      description: 'When a request needs live browser evidence or browser interaction, this must be its first browser tool. It reads the current conversation tab group, all tabs in that group, the active page URL/title, and the current page state without changing the browser. Do not call it for a request that can be answered without the live browser.',
+      inputSchema: browserToolInput({}),
+      execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, mode, {
+        runId: referenceOptions?.runId,
+        stepIndex: referenceOptions?.stepIndex,
+        abortSignal,
+      }), execution),
+    }),
     ...(mode === 'code' ? {
     browserCode: tool({
       description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call readFile merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
@@ -1556,9 +1588,9 @@ function runtimePrompt(input: {
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
     '',
     'Operating rules:',
-    '- In one model step, either answer in Chinese Markdown without a tool or call at most one relevant tool. A new action request is a new occurrence even when its wording repeats an earlier request.',
+    '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
     input.mode === 'code'
-      ? '- Code mode may execute multiple bounded browser operations in one browserCode cell after the model has inspected current evidence in a preceding tool result. At the beginning of every new or resumed user request, first use a separate read-only browserCode cell to inspect existing tabs/groups, the active page identity, and enough current AX/DOM/Playwright evidence chosen by the model. Use targeted Playwright reads before a dependent operation when an earlier action can change later target assumptions. Treat opened nonmodal surfaces as bounded transactions and verify that they close before moving outside them. Before completion, read both business success and page.activeSurface(), resolve or disclose residual surfaces, and report every failed tool call. Never infer control type, editability, interaction sequence, or completion from labels, appearance, or prior experience.'
+      ? '- Code mode may execute multiple bounded browser operations in one browserCode cell after readBrowserState has returned current evidence. Use targeted Playwright reads before a dependent operation when an earlier action can change later target assumptions. Treat opened nonmodal surfaces as bounded transactions and verify that they close before moving outside them. Before completion, read both business success and page.activeSurface(), resolve or disclose residual surfaces, and report every failed tool call. Never infer control type, editability, interaction sequence, or completion from labels, appearance, or prior experience.'
       : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
@@ -1585,6 +1617,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     ? ['browserCode']
     : ['takeScreenshot', 'browser', 'interact', 'inspect'];
   return [
+    'readBrowserState',
     ...operationTools,
     'waitForHumanVerification',
     'spawnSubagents',
@@ -1599,6 +1632,7 @@ function runtimeToolNames(mode: BrowserSessionMode) {
 }
 
 const browserSessionToolNames = new Set([
+  'readBrowserState',
   'browserCode',
   'takeScreenshot',
   'browser',
@@ -1795,7 +1829,7 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
       messages,
     },
     aiInputTokens: preparedModelContextStats && typeof preparedModelContextStats === 'object'
-      ? preparedModelContextStats
+      ? { ...preparedModelContextStats }
       : modelMessagesTextAndImageStats(messages),
   });
 }
@@ -1822,7 +1856,6 @@ function aiResponseLogDetails(input: {
   stepStartedAt?: number;
   traces?: ToolTrace[];
   visualContext?: ReturnType<VisualContextManager['snapshot']>;
-  workingMemory?: RuntimeWorkingMemory;
   extra?: Record<string, unknown>;
 }) {
   return fullLogDetails({
@@ -1897,7 +1930,7 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
   // Earlier failed attempts are diagnostic history, not the terminal outcome.
   // A later successful tool or final report means the branch recovered.
   const failed = last ? isEffectiveToolTraceFailure(last) : false;
-  const names = executed.map((trace) => summarizeTraceForMemory(trace)).join('; ');
+  const names = executed.map((trace) => summarizeTraceForContinuation(trace)).join('; ');
   const note = extractProgressNote(text);
   const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
   const toolReason = executed.map((trace) => readableActionFromTrace(trace)).find(Boolean);
@@ -1969,17 +2002,15 @@ function progressFieldsFromToolTraces(
   progress?: ToolTraceProgress,
 ): Partial<StepExecutionResult> {
   const assistantInfo = extractAssistantStepInfoFromToolInputs(traces, goal);
-  const workingMemory = progress?.workingMemory;
   const ledgerItems = mergeLedgerItems(
     assistantInfo.ledgerItems || [],
-    workingMemory?.ledgerItems || [],
+    [],
     ledgerMemoryLimit(),
   ).map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex }));
 
   return {
-    taskFrame: assistantInfo.taskFrame || workingMemory?.taskFrame,
+    taskFrame: assistantInfo.taskFrame,
     ledgerItems,
-    workingMemory,
     visualContext: progress?.visualContext,
   };
 }
@@ -2002,6 +2033,7 @@ async function executeRuntimeStep(input: {
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
+  browserStatePreflightComplete?: boolean;
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
@@ -2121,25 +2153,11 @@ async function executeRuntimeStep(input: {
     });
     const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
     const allowedToolTypes = requestedToolTypes
-      ? runtimeTools.filter((toolType) => requestedToolTypes.has(toolType))
+      ? runtimeTools.filter((toolType) => toolType === 'readBrowserState' || requestedToolTypes.has(toolType))
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
     let requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
-    let workingMemory: RuntimeWorkingMemory = {
-      taskGoal: requirementOf(runtimeRecord),
-      phase: 'Browser chat turn; answer directly when current evidence is enough, otherwise use one browser tool.',
-      completed: [],
-      findings: [],
-      blockers: [],
-      pageUnderstanding: '',
-      currentState: mode === 'code'
-        ? 'No page state is preloaded; use browserCode when browser evidence is needed.'
-        : 'No page state is preloaded; use inspect action=capture mode=full when browser evidence is needed.',
-      scrollSummary: '',
-      userConstraints: systemPromptOf(runtimeRecord) ? [systemPromptOf(runtimeRecord)] : [],
-      nextStep: 'Satisfy the latest user message; do not use a tool when a Markdown answer is already supported by evidence.',
-    };
     let latestText = '';
     const initialVisualPaths: string[] = [];
     const initialUserReferenceImagePaths = userReferenceImages.filter((item) => item.image).map((item) => item.imagePath);
@@ -2212,7 +2230,7 @@ async function executeRuntimeStep(input: {
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), workingMemory, imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -2291,7 +2309,7 @@ async function executeRuntimeStep(input: {
         agentStep: agentStepIndex,
         previousSummary: continuationSummaryText,
         recentToolAttempts: formatCurrentToolAttemptSummary(traces, 5),
-        runtimeState: continuationRuntimeState(workingMemory),
+        runtimeState: continuationRuntimeStateFromTraces(traces),
       });
       try {
         const result = await generateText({
@@ -2307,7 +2325,7 @@ async function executeRuntimeStep(input: {
               thresholdTokens,
               previousSummary: continuationSummaryText,
               deltaModelMessages,
-              runtimeState: continuationRuntimeState(workingMemory),
+              runtimeState: continuationRuntimeStateFromTraces(traces),
             }),
           }],
           temperature: 0.1,
@@ -2349,7 +2367,11 @@ async function executeRuntimeStep(input: {
       const requiredSubagentDirective = requiredSubagentUuid
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
         : '';
-      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
+      const browserStateGatePending = requiresBrowserStatePreflight(Boolean(input.browserStatePreflightComplete), traces);
+      const stepAllowedToolTypes = browserStateGatePending
+        ? toolsAllowedBeforeBrowserState(allowedToolTypes, browserSessionToolNames)
+        : allowedToolTypes;
+      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = runtimeContextWindowTokens();
       const thresholdRatio = runtimeContextCompressionThresholdRatio();
@@ -2520,22 +2542,29 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: allowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), workingMemory, imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextMessage ? textFromUnknown(operationalContextMessage.content).length : 0, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextMessage ? textFromUnknown(operationalContextMessage.content).length : 0, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
+      const activeTools = browserStateGatePending
+        ? stepAllowedToolTypes as Array<keyof typeof toolsForRequest>
+        : requiredSubagentUuid
+          ? ['readSubagent'] as Array<keyof typeof toolsForRequest>
+          : undefined;
+      const toolChoice = !browserStateGatePending && requiredSubagentUuid
+        ? { type: 'tool' as const, toolName: 'readSubagent' as keyof typeof toolsForRequest }
+        : undefined;
       return {
         system: requestSystemPrompt || undefined,
         messages: requestMessages,
         modelMessagesForLog,
-        ...(requiredSubagentUuid ? {
-          activeTools: ['readSubagent'] as Array<keyof typeof toolsForRequest>,
-          toolChoice: { type: 'tool' as const, toolName: 'readSubagent' as keyof typeof toolsForRequest },
-        } : {}),
+        allowedTypes: stepAllowedToolTypes,
+        activeTools,
+        toolChoice,
       };
     }
 
     if (codexMode) {
       const aiStartedAt = Date.now();
-      const { system, messages, modelMessagesForLog } = await prepareStep(0);
+      const { system, messages, modelMessagesForLog, allowedTypes: stepAllowedToolTypes } = await prepareStep(0);
       ensureActive();
       await onAttemptDebug?.({
         phase: 'ai:runtime:request',
@@ -2553,6 +2582,7 @@ async function executeRuntimeStep(input: {
         messages,
         temperature: 0.1,
         reasoning: aiReasoningEffort(),
+        maxOutputTokens: aiMaxOutputTokens(),
         maxRetries: 0,
         abortSignal,
         timeout: aiRequestTimeoutMs(),
@@ -2561,8 +2591,8 @@ async function executeRuntimeStep(input: {
       const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
       const object = alignCodexRuntimeObjectTool(
-        codexRuntimeObjectFromText(result.text, allowedToolTypes.includes('answer') ? 'answer' : 'reportState'),
-        allowedToolTypes,
+        codexRuntimeObjectFromText(result.text, stepAllowedToolTypes.includes('answer') ? 'answer' : 'reportState'),
+        stepAllowedToolTypes,
       );
       const execution = await executeCodexRuntimeObject({
         session,
@@ -2572,7 +2602,7 @@ async function executeRuntimeStep(input: {
         type: object.type,
         message: object.message || undefined,
         params: object.params,
-        allowedTypes: allowedToolTypes,
+        allowedTypes: stepAllowedToolTypes,
         traces,
         aiRequest,
         visualContext,
@@ -2590,11 +2620,10 @@ async function executeRuntimeStep(input: {
         onToolTrace: async (trace) => {
           ensureActive();
           upsertToolTrace(durableTraces, trace);
-          workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-          await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+          await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
           ensureActive();
           if (!trace.result || trace.completedAt) {
-            await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot(), workingMemory } });
+            await onAttemptDebug?.({ phase: 'ai:tool', stepIndex, message: `${trace.name} -> ${toolTraceStatus(trace)}`, details: { trace, visualContext: visualContext.snapshot() } });
           }
         },
         onReferenceImage: ({ path, source }) => {
@@ -2620,7 +2649,6 @@ async function executeRuntimeStep(input: {
           aiElapsedMs,
           traces,
           visualContext: visualContext.snapshot(),
-          workingMemory,
           extra: { responseType: 'object', objectType: object.type, usage: result.usage },
         }),
       });
@@ -2639,7 +2667,6 @@ async function executeRuntimeStep(input: {
         turnMessages: [...turnInputMessages, ...result.responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
-        workingMemory,
         finishReason: finishState.finishReason,
         responseFinished: finishState.terminatesTurn,
         responseStatus: finishState.status,
@@ -2649,15 +2676,14 @@ async function executeRuntimeStep(input: {
     const browserTools = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
       ensureActive();
       upsertToolTrace(durableTraces, trace);
-      workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-      await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+      await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       ensureActive();
       if (!trace.result || trace.completedAt) {
         await onAttemptDebug?.({
           phase: 'ai:tool',
           stepIndex,
           message: `${trace.name} -> ${toolTraceStatus(trace)}`,
-          details: { trace, visualContext: visualContext.snapshot(), workingMemory },
+          details: { trace, visualContext: visualContext.snapshot() },
         });
       }
     }, {
@@ -2712,7 +2738,6 @@ async function executeRuntimeStep(input: {
       const runtimeContext = {
         operationalContext: activeOperationalContext,
         credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
-        workingMemory,
         visualContext: visualContext.snapshot(),
       } satisfies BrowserAgentRuntimeContext;
       const prepareAgentStep = async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
@@ -2746,7 +2771,6 @@ async function executeRuntimeStep(input: {
           runtimeContext: {
             operationalContext: activeOperationalContext,
             credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
-            workingMemory,
             visualContext: visualContext.snapshot(),
           } satisfies BrowserAgentRuntimeContext,
         };
@@ -2776,7 +2800,7 @@ async function executeRuntimeStep(input: {
         };
         upsertToolTrace(traces, trace);
         upsertToolTrace(durableTraces, trace);
-        await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+        await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       };
       const onAgentToolExecutionEnd = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown }; toolExecutionMs: number; toolOutput: unknown }) => {
         if (!externalToolNames.has(event.toolCall.toolName)) return;
@@ -2802,8 +2826,7 @@ async function executeRuntimeStep(input: {
         };
         upsertToolTrace(traces, trace);
         upsertToolTrace(durableTraces, trace);
-        workingMemory = updateWorkingMemoryFromTrace(workingMemory, trace, stepIndex);
-        await onToolTrace?.(trace, { workingMemory, visualContext: visualContext.snapshot() });
+        await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       };
       const onAgentStepEnd = async (event: { text?: string; stepNumber?: number }) => {
         ensureActive();
@@ -2824,7 +2847,6 @@ async function executeRuntimeStep(input: {
             stepStartedAt: startedAt,
             traces: newTraces,
             visualContext: visualContext.snapshot(),
-            workingMemory,
             extra: {
               responseType: 'text',
               text: latestText,
@@ -2854,6 +2876,7 @@ async function executeRuntimeStep(input: {
         onStepEnd: onAgentStepEnd,
         temperature: 0.1,
         reasoning: aiReasoningEffort(),
+        maxOutputTokens: aiMaxOutputTokens(),
         maxRetries: 0,
         onError: ({ error }: { error: unknown }) => {
           streamedRequestError ??= error;
@@ -2941,7 +2964,6 @@ async function executeRuntimeStep(input: {
         turnMessages: [...turnInputMessages, ...responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
-        workingMemory,
         finishReason: finishState.finishReason,
         responseFinished: finishState.terminatesTurn,
         responseStatus: finishState.status,
@@ -3269,6 +3291,7 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
+  let browserStatePreflightComplete = false;
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
@@ -3304,10 +3327,11 @@ export async function executeInteractiveBrowserTurn(input: {
         conversation: activeModelMessages,
         referenceImagePaths: input.referenceImagePaths,
         getRuntimeOperationalContext: input.getRuntimeOperationalContext,
+        browserStatePreflightComplete,
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
-        allowedToolTypes: requiredSubagentUuid ? ['readSubagent'] : input.allowedToolTypes,
+        allowedToolTypes: requiredSubagentUuid ? ['readBrowserState', 'readSubagent'] : input.allowedToolTypes,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
@@ -3336,6 +3360,7 @@ export async function executeInteractiveBrowserTurn(input: {
       activeModelMessages = actionResult.modelMessages;
       turnModelMessages.push(...actionResult.turnMessages);
       contextCompression = actionResult.contextCompression || contextCompression;
+      browserStatePreflightComplete ||= actionResult.traces.some((trace) => trace.name === 'readBrowserState' && Boolean(trace.result));
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
       const retryInfo = runtimeRetryFromError(error);
@@ -3408,13 +3433,12 @@ export async function executeInteractiveBrowserTurn(input: {
       actual: decision.actual,
       status: decision.status,
       note: decision.note,
-      taskFrame: decision.taskFrame || actionResult.workingMemory.taskFrame,
-      ledgerItems: mergeLedgerItems(decision.ledgerItems || [], actionResult.workingMemory.ledgerItems || [], ledgerMemoryLimit())
+      taskFrame: decision.taskFrame,
+      ledgerItems: mergeLedgerItems(decision.ledgerItems || [], [], ledgerMemoryLimit())
         .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
       aiRequest: actionResult.aiRequest,
       tools: summarizeToolTraces(actionResult.traces),
       visualContext: actionResult.visualContext,
-      workingMemory: actionResult.workingMemory,
     };
     upsertStep(steps, completedStep);
     newSteps.push(completedStep);
@@ -3619,7 +3643,6 @@ async function createRuntimeErrorStep(input: {
     status: 'failed',
     taskFrame: recoveredState?.taskFrame,
     ledgerItems: recoveredState?.ledgerItems,
-    workingMemory: recoveredState?.workingMemory,
     visualContext: recoveredState?.visualContext,
     tools,
     aiRequest,
@@ -3633,6 +3656,7 @@ function flowInput(input: unknown) {
 export type RecordedBrowserOperationExecutionOptions = {
   runId?: string;
   targetUrl?: string;
+  mode?: BrowserSessionMode;
   abortSignal?: AbortSignal;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
@@ -3656,6 +3680,12 @@ export async function executeRecordedBrowserOperation(
   const credentialBindings = options.credentialBindings;
 
   switch (flow.name) {
+    case 'readBrowserState':
+      return readCurrentBrowserState(session, options.mode || 'code', {
+        runId,
+        stepIndex: flow.index,
+        abortSignal,
+      });
     case 'browserCode': {
       const code = typeof input.code === 'string' ? input.code : '';
       const violation = browserCodeServiceFileDeliveryViolation(code);
@@ -3946,6 +3976,7 @@ async function executeCodexRuntimeObject(input: {
     }
     return executeRecordedBrowserOperation(session, flow, {
       runId,
+      mode: input.mode,
       abortSignal,
       attachmentBindings,
       credentialBindings,

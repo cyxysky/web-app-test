@@ -73,6 +73,7 @@ import {
   runtimeSkillsForUrl,
   skillMatchesUrl,
 } from '@/server/ai/agents/skill-context';
+import { expandMultilingualRetrievalQuery } from '@/server/ai/retrieval-query';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import {
   extractPersonalMemoryFromTurn,
@@ -641,13 +642,16 @@ function browserChatPersonalMemoryContext(input: {
   domainOnly?: boolean;
   excludedIds?: ReadonlySet<string>;
   logPhase?: string;
+  retrievalQueries?: string[];
 }) {
   const currentUrl = input.currentUrl || browserChatMemoryUrl(input.browser, input.session);
   const currentDomain = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
   if (!personalMemoryEnabled()) return { context: '', itemIds: [] as string[], domain: currentDomain };
   const results = searchPersonalMemory({
     userId: input.session.userId,
-    query: [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
+    query: input.retrievalQueries?.length
+      ? input.retrievalQueries
+      : [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
     domain: currentUrl || input.session.targetUrl,
   }).filter((result) => (
     (!input.domainOnly || result.item.scope === 'domain')
@@ -1262,7 +1266,7 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
   ].join('\n');
 }
 
-function createBrowserChatRuntimeOperationalContext(input: {
+async function createBrowserChatRuntimeOperationalContext(input: {
   session: BrowserChatSessionRecord;
   browser: BrowserSession;
   text: string;
@@ -1274,6 +1278,7 @@ function createBrowserChatRuntimeOperationalContext(input: {
   const usedMemoryIds = input.usedMemoryIds || new Set<string>();
   const explicitlySelectedSkillIds = new Set((input.explicitlySelectedSkills || []).map((skill) => skill.id));
   const query = [input.text, input.modelText, input.session.title].filter(Boolean).join('\n');
+  const retrievalQueries = await expandMultilingualRetrievalQuery(query);
   let availableSkillIds = new Set<string>();
   const getContext = () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
@@ -1292,7 +1297,7 @@ function createBrowserChatRuntimeOperationalContext(input: {
       explicitlySelectedSkills,
       effectiveUrl,
       activeLoadedSkillIds,
-      query,
+      retrievalQueries,
     );
     availableSkillIds = new Set(skills.map((skill) => skill.id));
     const memory = browserChatPersonalMemoryContext({
@@ -1302,6 +1307,7 @@ function createBrowserChatRuntimeOperationalContext(input: {
       modelText: input.modelText,
       currentUrl,
       logPhase: 'memory:prompt:runtime-refresh',
+      retrievalQueries,
     });
     const unusedMemoryIds = memory.itemIds.filter((memoryId) => !usedMemoryIds.has(memoryId));
     if (unusedMemoryIds.length) {
@@ -1429,7 +1435,6 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   const clientStep = { ...step };
   delete clientStep.aiRequest;
   delete clientStep.visualContext;
-  delete clientStep.workingMemory;
   return clientStep;
 }
 
@@ -2109,7 +2114,6 @@ function stepCompletenessScore(step: StepExecutionResult) {
   if (step.afterScreenshotPath) score += 4;
   if (step.screenshotPath) score += 2;
   if (step.visualContext) score += 2;
-  if (step.workingMemory) score += 2;
   if (step.status && step.status !== 'running') score += 10;
   return score;
 }
@@ -4025,7 +4029,7 @@ async function executeBrowserChatSubagentBatch(input: {
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
       if (task.url) await child.open(task.url);
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
-      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
+      const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
         browser: child,
         text: task.instruction,
@@ -4179,13 +4183,16 @@ async function resumeBlockedBrowserChatSubagent(input: {
 }) {
   const { session, binding, userMessage, assistantMessageId, fromStepIndex, abortController } = input;
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-  const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
-    session,
-    browser: binding.browser,
-    text: binding.task.instruction,
-    modelText: binding.task.instruction,
-    usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
-  });
+  const getRuntimeOperationalContext = await withModelSettings(
+    browserChatModelSettings(session.modelProvider, session.model),
+    () => createBrowserChatRuntimeOperationalContext({
+      session,
+      browser: binding.browser,
+      text: binding.task.instruction,
+      modelText: binding.task.instruction,
+      usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
+    }),
+  );
   const initialRuntimeContext = getRuntimeOperationalContext();
   const requestSubagentToolConfirmation = createBrowserChatTurnToolConfirmation(
     session,
@@ -4345,7 +4352,7 @@ async function runBrowserChatMessage(
       const browser = await browserForTurnDecision(session, assertTurnActive);
       assertTurnActive();
       const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
-      const getRuntimeOperationalContext = createBrowserChatRuntimeOperationalContext({
+      const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
         browser,
         text,

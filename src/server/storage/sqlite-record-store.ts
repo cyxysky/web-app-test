@@ -87,7 +87,7 @@ export function readSkills(userId?: string, input: {
     values.push(input.beforeUpdatedAt.trim(), input.beforeUpdatedAt.trim(), input.beforeId.trim());
   }
   const limit = Number.isFinite(input.limit)
-    ? Math.max(1, Math.min(500, Math.floor(Number(input.limit))))
+    ? Math.max(1, Math.min(5_000, Math.floor(Number(input.limit))))
     : undefined;
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const sql = `

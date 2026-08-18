@@ -1,9 +1,27 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  modelListForProvider,
+  modelProviderDefinition,
   normalizeRuntimeEnvValue,
   runtimeEnvDefinition,
 } from './settings';
+
+test('MiniMax exposes its official AI SDK endpoint and language models', () => {
+  const definition = modelProviderDefinition('minimax');
+  assert.equal(definition.defaultModel, 'minimax-m3');
+  assert.equal(definition.defaultBaseURL, 'https://api.minimax.io/anthropic/v1');
+  assert.deepEqual(modelListForProvider(definition), [
+    'minimax-m3',
+    'minimax-m2.7',
+    'minimax-m2.7-highspeed',
+    'minimax-m2.5',
+    'minimax-m2.5-highspeed',
+    'minimax-m2.1',
+    'minimax-m2.1-highspeed',
+    'minimax-m2',
+  ]);
+});
 
 test('browser preview FPS setting is a bounded integer input', () => {
   const definition = runtimeEnvDefinition('BROWSER_PREVIEW_FPS');

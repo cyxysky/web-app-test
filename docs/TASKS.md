@@ -8,7 +8,6 @@ AI 选择一个工具操作
 系统自动截取新图并重新编号
 Visual Context Manager 判断新图是 replace、append、保留 before/after，还是清空旧图
 保存完整步骤记录
-更新 working memory
 进入下一步
 2.增加 Visual Context Manager
 新增一个核心模块：Visual Context Manager。
@@ -98,51 +97,10 @@ prepareStep 是上下文控制的关键。
 
 system prompt
 用户任务目标
-当前 working memory
 最近 3 到 5 步文字摘要
 当前 Visual Context Manager 渲染出的图片上下文
 当前工具规则
-6.工作记忆 Working Memory
-
-不要把每一步完整过程都传给 AI。
-
-维护一个短 working memory。
-
-内容包括：
-
-任务目标
-当前阶段
-已完成事项
-重要发现
-阻塞点
-最近一次动作
-最近一次结果
-当前页面理解
-滚动阅读摘要
-用户限制条件
-
-例如：
-
-当前阶段：
-
-正在查看搜索结果列表。
-
-已完成：
-
-已经打开目标网页，输入关键词并提交搜索。
-
-重要发现：
-
-列表中前 3 项没有符合条件的结果。
-
-滚动摘要：
-
-已查看页面顶部和第一屏结果，当前位于结果列表中段。
-
-下一步：
-
-继续向下滚动，查找目标按钮。
-7.最终报告生成
+6.最终报告生成
 
 最终报告不要只依赖 agent 最后一轮。
 
@@ -169,7 +127,7 @@ ai loop时进行上下文检测，超过70，将历史上下文内容压缩，�
 已完成
 已按你的架构方向做了一版可运行改造，核心链路现在变成：
 
-prepareStep 重建上下文 -> AI 调一个工具 -> 工具执行 -> 系统等待稳定 -> 自动截图并重新编号 -> Visual Context Manager 更新 current/history -> 更新 working memory -> 下一轮继续
+prepareStep 重建上下文 -> AI 调一个工具 -> 工具执行 -> 系统等待稳定 -> 自动截图并重新编号 -> Visual Context Manager 更新 current/history -> 下一轮继续
 
 主要改动：
 
@@ -195,16 +153,13 @@ runtime loop 改成 prepareStep 模式
 
 不再把完整 messages 历史一直塞给模型
 每轮重新构建上下文
-包含任务目标、working memory、最近工具摘要、VCM 图片上下文
+包含任务目标、最近工具摘要、VCM 图片上下文
 图片由 VCM 控制，现读现传
-新增 workingMemory
-
 保存阶段、已完成、发现、阻塞、最近动作、最近结果、页面理解、滚动摘要、下一步等
 每次工具调用后根据 tool input/result 更新
 步骤记录扩展
 
 visualContext
-workingMemory
 tool.visualAfter
 tool.screenshots
 前端运行页更新
@@ -244,7 +199,7 @@ prepareStep 渲染 VCM 文本时会显示每张图的 capture 类型和 region �
 可通过 AI_CONTEXT_WINDOW_TOKENS / AI_MODEL_CONTEXT_TOKENS 调整窗口
 可通过 AI_CONTEXT_COMPRESSION_THRESHOLD / AI_CONTEXT_COMPRESSION_RATIO 调整阈值
 图片按 AI_IMAGE_CONTEXT_ESTIMATE_TOKENS 估算，默认每张 1200 tokens
-触发后会压缩历史 visual frames、裁剪 working memory，并用压缩后的 current visual context + compact memory + 最近工具摘要开启新的 prepareStep 对话轮次
+触发后会压缩历史 visual frames，并用压缩后的 current visual context + 最近工具摘要开启新的 prepareStep 对话轮次
 如果一次压缩后仍超过阈值，会进一步 keepLatestOnly，只保留 current 视觉帧给下一轮
 压缩事件会写入 debug：ai:context-compressed
 

@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { generateText, Output } from 'ai';
 import { z } from 'zod';
+import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
-import { aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiMaxOutputTokens, aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
@@ -508,15 +509,6 @@ export function deletePersonalMemoryItem(id: string, userId?: unknown) {
   return deleted && deletePersonalMemoryRecord(id, normalizedUserId) ? deleted : undefined;
 }
 
-function normalizedSearchText(value: unknown) {
-  return textFromUnknown(value).toLowerCase().replace(/\s+/g, ' ').trim();
-}
-
-function termMatches(query: string, term: string) {
-  const normalized = normalizedSearchText(term);
-  return normalized.length >= 2 && query.includes(normalized);
-}
-
 export function searchPersonalMemory(input: {
   userId?: unknown;
   query?: unknown;
@@ -526,7 +518,6 @@ export function searchPersonalMemory(input: {
   if (!personalMemoryEnabled()) return [];
   const userId = normalizePersonalMemoryUserId(input.userId);
   const domain = normalizePersonalMemoryDomain(input.domain);
-  const query = normalizedSearchText(input.query);
   const limit = typeof input.limit === 'number' ? input.limit : personalMemoryPromptLimit();
   if (limit <= 0) return [];
   const results: PersonalMemorySearchResult[] = [];
@@ -542,19 +533,24 @@ export function searchPersonalMemory(input: {
       score += item.type === 'preference' || item.type === 'workflow' ? 2 : 1;
       reasons.push('global');
     }
-    const terms = [item.key, ...item.aliases];
-    for (const term of terms) {
-      if (termMatches(query, term)) {
-        score += term === item.key ? 10 : 8;
-        reasons.push(term === item.key ? 'key' : 'alias');
-        break;
-      }
+    const keyRelevance = fuzzyRetrievalScore(input.query, [item.key]);
+    const aliasRelevance = fuzzyRetrievalScore(input.query, item.aliases);
+    const valueRelevance = fuzzyRetrievalScore(input.query, [item.value, item.text]);
+    if (keyRelevance >= 0.38) {
+      score += keyRelevance * 10;
+      reasons.push('semantic-key');
+    } else if (aliasRelevance >= 0.38) {
+      score += aliasRelevance * 8;
+      reasons.push('semantic-alias');
+    } else if (valueRelevance >= 0.38) {
+      score += valueRelevance * 7;
+      reasons.push('semantic-value');
     }
-    if (item.domain && termMatches(query, item.domain)) {
+    if (item.domain && fuzzyRetrievalScore(input.query, [item.domain]) >= 0.8) {
       score += 3;
       reasons.push('domain-mentioned');
     }
-    if (item.scope === 'global' && !reasons.some((reason) => reason === 'key' || reason === 'alias') && !['preference', 'workflow'].includes(item.type)) {
+    if (item.scope === 'global' && !reasons.some((reason) => reason.startsWith('semantic-')) && !['preference', 'workflow'].includes(item.type)) {
       continue;
     }
     score += item.confidence;
@@ -914,6 +910,7 @@ export async function extractPersonalMemoryFromTurn(input: {
   });
   const result = await generateText({
     model: getModel(),
+    maxOutputTokens: aiMaxOutputTokens(4_096),
     temperature: 0.1,
     reasoning: aiReasoningEffort(),
     maxRetries: 3,

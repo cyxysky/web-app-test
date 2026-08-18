@@ -247,6 +247,11 @@ async function main() {
     dir: appDir,
     hostname,
     port,
+    // Next 16 defaults custom development servers to Turbopack. Its HMR graph can
+    // lose EcmascriptMergedChunkVersion cells after repeated edits, leaving the
+    // server in a permanent resubscribe/panic loop. Webpack is the supported
+    // deterministic development bundler for this custom server.
+    ...(dev ? { webpack: true } : {}),
     ...(compiledConfig ? { conf: compiledConfig } : {}),
   });
   const handle = application.getRequestHandler();

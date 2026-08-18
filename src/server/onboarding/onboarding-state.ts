@@ -171,7 +171,13 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const screenshotSetting = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase();
   const selectedModel = String(providerSettings?.model || '').toLowerCase();
   const visionReady = screenshotSetting === 'true'
-    || (screenshotSetting !== 'false' && provider !== 'deepseek' && !selectedModel.startsWith('deepseek'));
+    || (
+      screenshotSetting !== 'false'
+      && provider !== 'deepseek'
+      && provider !== 'minimax'
+      && !selectedModel.startsWith('deepseek')
+      && !selectedModel.startsWith('minimax')
+    );
   const libreOfficeExecutable = await resolveLibreOfficeExecutable();
   const libreOfficePython = libreOfficeExecutable
     ? await resolveLibreOfficePythonExecutable(libreOfficeExecutable)

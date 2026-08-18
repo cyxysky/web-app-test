@@ -26,6 +26,10 @@ export function aiRequestTimeoutMs(fallback = 30_000) {
   return positiveInteger(process.env.AI_REQUEST_TIMEOUT_MS, fallback);
 }
 
+export function aiMaxOutputTokens(fallback = 32_768) {
+  return Math.min(131_072, positiveInteger(process.env.AI_MAX_OUTPUT_TOKENS, fallback));
+}
+
 export function aiStreamTimeouts() {
   const requestMs = aiRequestTimeoutMs();
   const toolMs = positiveInteger(process.env.AI_TOOL_TIMEOUT_MS, 120_000);

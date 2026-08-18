@@ -9,6 +9,7 @@ import {
   Cpu,
   Database,
   Gauge,
+  LockKeyhole,
   MessageSquare,
   RefreshCw,
   Settings,
@@ -288,13 +289,17 @@ export function AiOperationsWorkspace({
           <WorkspaceNavItem active href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
           <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
         </nav>
-        <section className="browser-chat-sidebar-section ai-operations-sidebar-summary">
-          <h2>{t('管理员')}</h2>
-          <div>
-            <Gauge aria-hidden="true" size={16} />
+        <section aria-label={t('管理员')} className="browser-chat-sidebar-section ai-operations-sidebar-summary">
+          <div aria-current="page" className="ai-operations-sidebar-current">
+            <span className="ai-operations-sidebar-current-icon">
+              <Gauge aria-hidden="true" size={16} />
+            </span>
             <span>{t('运营视图')}</span>
           </div>
-          <small>{t('仅用户 1 可访问')}</small>
+          <small className="ai-operations-sidebar-access">
+            <LockKeyhole aria-hidden="true" size={12} />
+            <span>{t('仅用户 1 可访问')}</span>
+          </small>
         </section>
       </WorkspaceSidebar>
 

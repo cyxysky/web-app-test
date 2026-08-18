@@ -153,10 +153,10 @@ export function SettingsWorkspace({
           <WorkspaceNavItem active icon={<Settings size={17} />} label={t('设置')} onClick={() => undefined} />
         </nav>
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
-          <h2>{t('设置')}</h2>
           <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
             {visibleSettingsTabs.map((tab) => (
               <button
+                aria-current={selectedTab === tab.id ? 'page' : undefined}
                 aria-label={t(tab.label)}
                 className={selectedTab === tab.id ? 'active' : undefined}
                 key={tab.id}

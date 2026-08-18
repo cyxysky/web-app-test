@@ -18,29 +18,61 @@
 .ai-operations-sidebar-summary {
   align-content: start;
   flex: 1 1 auto;
-  gap: 7px;
+  gap: 4px;
   min-height: 0;
-  padding-top: 6px;
+  padding: 0 2px;
 }
 
-.ai-operations-sidebar-summary > div {
+.ai-operations-sidebar-current {
   align-items: center;
+  background: color-mix(in srgb, var(--foreground) 5.5%, transparent);
+  border-radius: 0 4px 4px 0;
   color: var(--foreground);
   display: flex;
-  font-size: 12.5px;
+  font-size: 13px;
+  font-weight: 540;
   gap: 8px;
-  min-height: 34px;
-  padding: 0 10px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0 9px;
+  position: relative;
 }
 
-.ai-operations-sidebar-summary small {
+.ai-operations-sidebar-current::before {
+  background: var(--accent-strong);
+  bottom: 0;
+  content: "";
+  left: -1px;
+  position: absolute;
+  top: 0;
+  width: 2px;
+}
+
+.ai-operations-sidebar-current-icon {
+  align-items: center;
+  color: var(--accent-strong);
+  display: inline-flex;
+  flex: 0 0 18px;
+  justify-content: center;
+}
+
+.ai-operations-sidebar-access {
+  align-items: center;
   color: var(--muted);
+  display: flex;
   font-size: 10.5px;
-  padding-inline: 10px;
+  gap: 6px;
+  line-height: 16px;
+  padding: 6px 9px 0;
+}
+
+.ai-operations-sidebar-access svg {
+  color: var(--muted-strong);
+  flex: 0 0 auto;
 }
 
 .browser-chat-layout.sidebar-collapsed .ai-operations-sidebar-summary {
-  visibility: hidden;
+  display: none;
 }
 
 .ai-operations-main {

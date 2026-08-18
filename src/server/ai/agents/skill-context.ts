@@ -1,4 +1,5 @@
 import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
+import { fuzzyRetrievalScore, retrievalQueryTexts } from '@/lib/fuzzy-retrieval';
 
 function compactText(value: string, max = 900) {
   const text = value.replace(/\s+/g, ' ').trim();
@@ -55,21 +56,11 @@ export function skillMatchesUrl(skill: SkillRecord, currentUrl: string) {
   });
 }
 
-function normalizedRelevanceText(value: string) {
-  return value.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
-}
-
-function skillRelevanceScore(skill: SkillRecord, query: string) {
-  const normalizedQuery = normalizedRelevanceText(query);
-  if (!normalizedQuery) return 0;
-  const scoreFor = (value: string, weight: number) => {
-    const term = normalizedRelevanceText(value);
-    return term.length >= 2 && (normalizedQuery.includes(term) || term.includes(normalizedQuery)) ? weight : 0;
-  };
+function skillRelevanceScore(skill: SkillRecord, query: unknown) {
   return Math.max(
-    scoreFor(skill.title, 8),
-    scoreFor(skill.description, 5),
-    ...skill.triggerPhrases.map((phrase) => scoreFor(phrase, 10)),
+    fuzzyRetrievalScore(query, [skill.title]) * 8,
+    fuzzyRetrievalScore(query, [skill.description]) * 5,
+    fuzzyRetrievalScore(query, skill.triggerPhrases) * 10,
   );
 }
 
@@ -78,7 +69,7 @@ export function runtimeSkillsForUrl(
   explicitlySelected: SkillRecord[],
   currentUrl: string,
   loadedSkillIds: ReadonlySet<string> = new Set(),
-  query = '',
+  query: unknown = '',
 ) {
   const activeExplicitlySelected = explicitlySelected.filter((skill) => skillMatchesUrl(skill, currentUrl));
   const selectedIds = new Set(activeExplicitlySelected.map((skill) => skill.id));
@@ -89,7 +80,7 @@ export function runtimeSkillsForUrl(
       relevance: skillRelevanceScore(skill, query),
       domainScoped: normalizeSkillDomains(skill.domains).length > 0,
     }))
-    .filter((item) => !query.trim() || item.domainScoped || item.relevance > 0)
+    .filter((item) => !retrievalQueryTexts(query).length || item.domainScoped || item.relevance >= 3.8)
     .sort((left, right) => right.relevance - left.relevance)
     .map((item) => item.skill);
   return activeSkills([

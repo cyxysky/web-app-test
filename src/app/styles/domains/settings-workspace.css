@@ -3,3 +3,96 @@
 @import "../workspace-shared.css";
 @import "./settings.css";
 @import "./onboarding.css";
+
+@media (min-width: 1025px) {
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-settings-section {
+    align-content: start;
+    flex: 1 1 auto;
+    gap: 4px;
+    margin-top: 8px;
+    min-height: 0;
+    padding: 0 2px;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav {
+    align-content: start;
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button {
+    align-items: center;
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-radius: 0 4px 4px 0;
+    box-shadow: none;
+    color: var(--muted-strong);
+    cursor: pointer;
+    display: flex;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    gap: 8px;
+    height: 38px;
+    justify-content: flex-start;
+    min-height: 38px;
+    min-width: 0;
+    padding: 0 9px;
+    position: relative;
+    text-align: left;
+    transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease;
+    width: 100%;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button:hover {
+    background: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+    color: var(--foreground);
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active,
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active:hover {
+    background: color-mix(in srgb, var(--foreground) 5.5%, transparent);
+    box-shadow: none;
+    color: var(--foreground);
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active::before {
+    background: var(--accent-strong);
+    bottom: 0;
+    content: "";
+    left: -1px;
+    position: absolute;
+    top: 0;
+    width: 2px;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button > svg:not(.browser-chat-settings-tab-lock) {
+    animation: none;
+    color: var(--muted-strong);
+    flex: 0 0 16px;
+    height: 16px;
+    transform: none;
+    width: 16px;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active > svg:not(.browser-chat-settings-tab-lock) {
+    color: var(--accent-strong);
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button > span {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-settings-tab-lock {
+    animation: none;
+    color: var(--muted);
+    margin-left: 4px;
+    transform: none;
+  }
+}

@@ -45,12 +45,28 @@ function aiLogResponsePayload(details?: Record<string, unknown>) {
   return details?.aiOutput !== undefined ? formatToolPayload(details.aiOutput) : '';
 }
 
+function aiLogPayloadDetails(details?: Record<string, unknown>) {
+  return asRecord(details?.event) || asRecord(details?.value) || details;
+}
+
+function estimatedAiInputTokens(details?: Record<string, unknown>) {
+  const stats = asRecord(details?.aiInputTokens);
+  const exact = finiteNumber(stats?.estimatedTotalTokens) ?? finiteNumber(stats?.estimatedTextTokens);
+  if (exact !== undefined) return exact;
+  if (details?.aiInput === undefined) return undefined;
+  try {
+    const serialized = JSON.stringify(details.aiInput);
+    const imageCount = finiteNumber(asRecord(asRecord(details.aiInput)?.options)?.imageCount) || 0;
+    return Math.ceil(serialized.length / 4) + imageCount * 1_024;
+  } catch {
+    return undefined;
+  }
+}
+
 function aiLogInputTokenCount(log: BrowserChatLogDialogRecord) {
   if (!log.phase.endsWith('ai:runtime:request')) return undefined;
   const details = parseJsonObjectText(log.details);
-  const payloadDetails = asRecord(details?.event) || details;
-  const stats = asRecord(payloadDetails?.aiInputTokens);
-  return finiteNumber(stats?.estimatedTotalTokens) ?? finiteNumber(stats?.estimatedTextTokens);
+  return estimatedAiInputTokens(aiLogPayloadDetails(details));
 }
 
 function aiLogTimings(details?: Record<string, unknown>) {
@@ -212,7 +228,7 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
   const isConversationSummaryRequest = log.phase === 'conversation:context:request';
   const isConversationSummaryResponse = log.phase === 'conversation:context:response';
   if (!parsed) return null;
-  const payloadDetails = asRecord(parsed.event) || parsed;
+  const payloadDetails = aiLogPayloadDetails(parsed) || parsed;
   const requestPayload = isAiRequestLog
     ? aiLogRequestPayload(payloadDetails)
     : isConversationSummaryRequest
@@ -243,9 +259,8 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
     trace: payloadDetails.trace,
   }) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  const requestTokenStats = asRecord(payloadDetails.aiInputTokens);
   const requestTokens = isAiRequestLog
-    ? finiteNumber(requestTokenStats?.estimatedTotalTokens) ?? finiteNumber(requestTokenStats?.estimatedTextTokens)
+    ? estimatedAiInputTokens(payloadDetails)
     : undefined;
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
   return (

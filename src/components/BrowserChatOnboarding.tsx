@@ -365,7 +365,7 @@ export function BrowserChatOnboarding({
     return (
       <section className="browser-chat-empty-start" aria-label={t('开始新对话')}>
         <div className="browser-chat-empty-heading">
-          <span>WEBPILOT</span>
+          <span>DOMP WEBPILOT</span>
           <h1>{t('今天想让浏览器帮你做什么？')}</h1>
           <p>{t('描述目标，剩下的交给我。')}</p>
         </div>
@@ -377,7 +377,7 @@ export function BrowserChatOnboarding({
     <section className="browser-chat-onboarding" aria-label={t('WebPilot 新手教程')}>
       <header className="browser-chat-onboarding-header">
         <div>
-          <span className="browser-chat-onboarding-kicker">WEBPILOT · {t('新手引导')}</span>
+          <span className="browser-chat-onboarding-kicker">DOMP WEBPILOT · {t('新手引导')}</span>
           <strong>{t('第 {current} 步，共 {total} 步', { current: activeStepIndex + 1, total: guideSteps.length })}</strong>
         </div>
         <div className="browser-chat-onboarding-progress" aria-hidden="true"><span style={{ width: `${((activeStepIndex + 1) / guideSteps.length) * 100}%` }} /></div>

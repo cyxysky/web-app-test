@@ -13,6 +13,8 @@ test('blank provider base URLs are treated as unset before lazy provider imports
   const previousAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
   const previousOpenAIBaseURL = process.env.OPENAI_BASE_URL;
   const previousOpenAIApiKey = process.env.OPENAI_API_KEY;
+  const previousMiniMaxBaseURL = process.env.MINIMAX_BASE_URL;
+  const previousMiniMaxApiKey = process.env.MINIMAX_API_KEY;
   globalThis.fetch = async () => {
     throw new Error('provider-loaded');
   };
@@ -20,16 +22,20 @@ test('blank provider base URLs are treated as unset before lazy provider imports
   process.env.ANTHROPIC_API_KEY = 'test-key';
   process.env.OPENAI_BASE_URL = '   ';
   process.env.OPENAI_API_KEY = 'test-key';
+  process.env.MINIMAX_BASE_URL = '   ';
+  process.env.MINIMAX_API_KEY = 'test-key';
 
   try {
     for (const settings of [
       { provider: 'anthropic', model: 'claude-sonnet-4-5' },
+      { provider: 'minimax', model: 'minimax-m3' },
       { provider: 'openai', model: 'gpt-5.5' },
     ]) {
       const model = withModelSettings(settings, () => getModel()) as LanguageModelV4;
       await assert.rejects(async () => await model.doGenerate(minimalCall), /provider-loaded/);
     }
     assert.equal(process.env.ANTHROPIC_BASE_URL, undefined);
+    assert.equal(process.env.MINIMAX_BASE_URL, undefined);
     assert.equal(process.env.OPENAI_BASE_URL, undefined);
   } finally {
     globalThis.fetch = previousFetch;
@@ -37,6 +43,8 @@ test('blank provider base URLs are treated as unset before lazy provider imports
     restoreEnvironmentValue('ANTHROPIC_API_KEY', previousAnthropicApiKey);
     restoreEnvironmentValue('OPENAI_BASE_URL', previousOpenAIBaseURL);
     restoreEnvironmentValue('OPENAI_API_KEY', previousOpenAIApiKey);
+    restoreEnvironmentValue('MINIMAX_BASE_URL', previousMiniMaxBaseURL);
+    restoreEnvironmentValue('MINIMAX_API_KEY', previousMiniMaxApiKey);
   }
 });
 

@@ -31,12 +31,7 @@ export function compactBrowserChatLogForClient<TLog extends BrowserChatClientLog
       const details = parsedDetails(log.details);
       const aiInput = asRecord(details?.aiInput);
       const compactedDetails = JSON.stringify({
-        aiInput: aiInput ? {
-          model: aiInput.model,
-          options: aiInput.options,
-          provider: aiInput.provider,
-          tools: aiInput.tools,
-        } : undefined,
+        aiInput,
         aiInputTokens: details?.aiInputTokens,
         execution: details?.execution,
       });

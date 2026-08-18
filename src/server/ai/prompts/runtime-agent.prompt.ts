@@ -71,6 +71,8 @@ export function buildCompletionVerificationPrompt(input: CompletionVerificationP
 
 export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
   const answerAllowed = allowedTypes.includes('answer');
+  const browserStateGatePending = allowedTypes.includes('readBrowserState')
+    && !allowedTypes.some((type) => ['browserCode', 'takeScreenshot', 'browser', 'interact', 'inspect'].includes(type));
   const browserCodeMode = allowedTypes.includes('browserCode');
   const domMode = allowedTypes.includes('inspect') && allowedTypes.includes('interact');
   return [
@@ -86,6 +88,7 @@ export function buildCodexObjectPrompt(prompt: string, allowedTypes: string[]) {
     answerAllowed ? '- In browser chat strict safety mode, important actions must still return the intended tool object; add params.requiresConfirmation=true and a concise Chinese params.confirmationMessage so the UI can pause with Confirm/Cancel buttons before execution. Do not ask the user to type confirmation text.' : '',
     '- Do not include separate state summaries, memory notes, finding lists, task frames, ledger JSON, old tool params, or tool input JSON.',
     '- In message/reason/action/expected/actual, do not output coordinates, screenshot ids/file names, or tool input JSON as business meaning.',
+    browserStateGatePending ? '- If the request can be answered without the live browser, return type="answer" directly and do not call readBrowserState. If live browser evidence or interaction is needed, return type="readBrowserState" with only a concise Chinese params.reason; it must be the first browser tool before any browser operation becomes available.' : '',
     browserCodeMode ? '- browserCode is the only browser inspection and operation entrypoint. Put one ordinary JavaScript cell in params.code. Use top-level await and do not wrap it in a function or module.' : '',
     browserCodeMode ? '- The JavaScript kernel persists across browserCode calls. Prefer top-level var for reusable bindings or fresh names, and emit the result with nodeRepl.write(<JSON-serializable value>). Once repeated rows or fields are exactly observed, update the deterministic batch in one bounded cell instead of spending one model cycle per item; wait for concrete DOM/navigation state instead of routine fixed waitForTimeout delays.' : '',
     browserCodeMode ? '- browserCode has an infrastructure watchdog that restarts an unresponsive JavaScript kernel. Keep each cell bounded. Locator/action operations default to 5000ms and navigation defaults to 30000ms, so a missing target fails the current cell without destroying persistent bindings. Add a longer explicit Playwright timeout only for a known slow transition.' : '',

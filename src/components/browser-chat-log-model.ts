@@ -2,6 +2,7 @@ import { asRecord, finiteNumber } from '@/lib/unknown-value';
 
 export type BrowserChatLogRecordLike = {
   details?: unknown;
+  message?: string;
   phase: string;
 };
 
@@ -31,7 +32,7 @@ function parsedLogDetails(details: unknown) {
 function runtimeLogTimings(log: BrowserChatLogRecordLike) {
   if (!log.phase.endsWith('ai:runtime:response') && !log.phase.endsWith('ai:runtime:object')) return undefined;
   const details = parsedLogDetails(log.details);
-  const payload = asRecord(details?.event) || details;
+  const payload = asRecord(details?.event) || asRecord(details?.value) || details;
   return asRecord(asRecord(payload?.aiOutput)?.timings);
 }
 
@@ -102,6 +103,10 @@ export function isBrowserChatToolLifecycleLog(log: BrowserChatLogRecordLike) {
   return log.phase === 'ai:tool' || log.phase.endsWith(':ai:tool');
 }
 
+export function isBrowserChatToolStartLog(log: BrowserChatLogRecordLike) {
+  return isBrowserChatToolLifecycleLog(log) && /\s->\sstarted\s*$/i.test(log.message || '');
+}
+
 export function isBrowserChatScreenshotPerformanceLog(log: BrowserChatLogRecordLike) {
   const phase = log.phase.toLowerCase();
   return phase.startsWith('browser:screenshot:')
@@ -111,7 +116,7 @@ export function isBrowserChatScreenshotPerformanceLog(log: BrowserChatLogRecordL
 
 export function isBrowserChatVisibleExecutionLog(log: BrowserChatLogRecordLike) {
   return isBrowserChatAiLog(log)
-    || isBrowserChatToolLifecycleLog(log)
+    || (isBrowserChatToolLifecycleLog(log) && !isBrowserChatToolStartLog(log))
     || isBrowserChatContextCompressionLog(log)
     || isBrowserChatScreenshotPerformanceLog(log);
 }

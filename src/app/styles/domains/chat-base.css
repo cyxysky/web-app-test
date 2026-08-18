@@ -3350,10 +3350,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   position: relative;
 }
 
-.browser-chat-composer-shell>.browser-chat-skill-chips {
-  display: none;
-}
-
 .browser-chat-reference-chip {
   align-items: center;
   color: #1f676d;
@@ -3408,35 +3404,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   font-weight: 850;
 }
 
-.browser-chat-skill-chips {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.browser-chat-skill-chips button {
-  align-items: center;
-  background: #eef7f7;
-  border: 1px solid #b8dada;
-  border-radius: 999px;
-  color: #1f676d;
-  cursor: pointer;
-  display: inline-flex;
-  font-size: 12px;
-  font-weight: 850;
-  gap: 6px;
-  max-width: 220px;
-  min-height: 28px;
-  padding: 4px 9px;
-}
-
-.browser-chat-skill-chips span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .browser-chat-skill-menu {
   background: #ffffff;
   border: 1px solid var(--border);
@@ -3454,9 +3421,7 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 }
 
 .browser-chat-compose-context {
-  display: none;
-  gap: 8px;
-  min-width: 0;
+  display: contents;
 }
 
 .browser-chat-inline-editor {
@@ -3547,14 +3512,15 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 }
 
 .browser-chat-compose .browser-chat-skill-menu {
-  background: var(--panel-soft);
-  bottom: auto;
-  box-shadow: none;
-  left: auto;
-  max-height: 210px;
-  position: static;
+  background: var(--panel);
+  bottom: calc(100% + 8px);
+  box-shadow: 0 16px 36px rgba(13, 13, 13, 0.12);
+  left: 0;
+  max-height: 260px;
+  position: absolute;
   right: auto;
-  z-index: auto;
+  width: min(520px, 100%);
+  z-index: 30;
 }
 
 .browser-chat-skill-menu-head {
@@ -3811,7 +3777,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   border-top-color: color-mix(in srgb, var(--border) 72%, transparent);
 }
 
-:root[data-theme="dark"] .browser-chat-skill-chips button,
 :root[data-theme="dark"] .browser-chat-inline-skill,
 :root[data-theme="dark"] .browser-chat-inline-reference {
   color: var(--foreground);
@@ -4054,6 +4019,7 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   grid-auto-rows: auto;
   min-height: 94px;
   padding: 14px;
+  position: relative;
   border-color: color-mix(in srgb, var(--border) 88%, transparent);
   transition:
     border-color var(--motion-normal) ease,

@@ -68,7 +68,6 @@ import {
   RefreshCw,
   Route,
   ScanSearch,
-  Search,
   ScrollText,
   SendHorizontal,
   Settings,
@@ -126,6 +125,13 @@ import {
   type EmbeddedBrowserTabDensity,
 } from '@/components/embedded-browser-tab-layout';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import {
+  WorkspaceSidebarArchiveFilter,
+  WorkspaceSidebarArchiveHeader,
+  WorkspaceSidebarArchiveList,
+  WorkspaceSidebarArchiveRow,
+} from '@/components/WorkspaceSidebarArchive';
+import { WorkspaceOverflowMenu } from '@/components/WorkspaceOverflowMenu';
 import { BrowserChatOnboarding } from '@/components/BrowserChatOnboarding';
 import {
   useBrowserChatSkillCatalog,
@@ -169,6 +175,7 @@ import {
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { browserSessionGroupLabel } from '@/lib/browser-session-group';
+import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import {
   browserChatSessionDisplayTitle,
   browserChatSessionTitleParts,
@@ -2234,7 +2241,7 @@ function browserChatReferenceMeta(attachment: BrowserChatAttachment, kind: Brows
 function BrowserChatReferenceIcon({ kind }: { kind: BrowserChatAttachmentKind }) {
   if (kind === 'image') return <ImageUp size={14} />;
   if (kind === 'tab') return <AppWindow size={14} />;
-  return <FileSearch size={14} />;
+  return <FileText size={14} />;
 }
 
 function inlineTokenSvg(paths: string) {
@@ -2252,7 +2259,7 @@ function inlineReferenceIconSvg(kind: BrowserChatAttachmentKind) {
   if (kind === 'tab') {
     return inlineTokenSvg('<rect width="18" height="14" x="3" y="5" rx="2"/><path d="M3 9h18"/><path d="M8 5v4"/>');
   }
-  return inlineTokenSvg('<rect x="3.5" y="4" width="17" height="16" rx="3"/><circle cx="9" cy="9.5" r="1.25"/><path d="m5.5 17 4.2-4.2 3.1 3 2.2-2.2 3.5 3.4"/>');
+  return inlineTokenSvg('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h6"/>');
 }
 
 function browserChatReferenceKey(attachment: BrowserChatAttachment) {
@@ -2320,7 +2327,7 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
     </>
   );
   return (
-    <span className={`browser-chat-reference-chip ${kind}${className ? ` ${className}` : ''}`} title={t(browserChatReferenceMeta(attachment, kind))}>
+    <span className={`browser-chat-inline-token browser-chat-reference-chip ${kind}${className ? ` ${className}` : ''}`} title={t(browserChatReferenceMeta(attachment, kind))}>
       {kind === 'image' ? (
         <button
           aria-label={t('放大查看 {name}', { name: attachment.name })}
@@ -2350,9 +2357,11 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
 
 function BrowserChatSkillChip({ skill }: { skill: { description: string; id: string; title: string } }) {
   return (
-    <span className="browser-chat-message-skill" title={skill.description}>
-      <Braces size={16} />
-      <span>{skill.title}</span>
+    <span className="browser-chat-inline-token browser-chat-message-skill" title={skill.description}>
+      <span className="browser-chat-message-skill-icon">
+        <Braces size={14} />
+      </span>
+      <span className="browser-chat-message-skill-title">{skill.title}</span>
     </span>
   );
 }
@@ -4792,48 +4801,6 @@ function BrowserChatModeSelector({
   );
 }
 
-function BrowserChatOverflowMenu({
-  children,
-  className,
-  icon,
-  label,
-  title,
-}: {
-  children: ReactNode;
-  className?: string;
-  icon: ReactNode;
-  label: string;
-  title: string;
-}) {
-  const menuId = useId();
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const triggerRef = useRef<HTMLElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const close = useCallback(() => detailsRef.current?.removeAttribute('open'), []);
-
-  return (
-    <details
-      className={className ? `browser-chat-overflow ${className}` : 'browser-chat-overflow'}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-      ref={detailsRef}
-    >
-      <summary aria-controls={menuId} aria-expanded={open} aria-label={label} ref={triggerRef} title={title}>
-        {icon}
-      </summary>
-      <FloatingLayer
-        anchorRef={triggerRef}
-        className="browser-chat-overflow-menu"
-        id={menuId}
-        maxHeight={320}
-        onDismiss={close}
-        present={open}
-      >
-        {children}
-      </FloatingLayer>
-    </details>
-  );
-}
-
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
   availableSkills,
@@ -5017,11 +4984,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     setSelectedSkillIds((current) => current.filter((skillId) => readySkillIds.has(skillId)));
   }, [availableSkills, syncEditorState]);
 
-  const selectedSkills = useMemo(() => (
-    selectedSkillIds
-      .map((skillId) => availableSkills.find((skill) => skill.id === skillId))
-      .filter((skill): skill is SkillRecord => Boolean(skill))
-  ), [availableSkills, selectedSkillIds]);
   const composerText = useMemo(() => draft.replace(/\s+/g, ' ').trim(), [draft]);
   const slashMatch = draft.match(/(?:^|\s)\/([^\s/]*)$/);
   const skillQuery = slashMatch?.[1]?.toLowerCase() || '';
@@ -5033,11 +4995,11 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       .filter((skill) => skill.status === 'ready' && !selected.has(skill.id))
       .filter((skill) => {
         if (!skillQuery) return true;
-        return [
+        return fuzzyRetrievalScore(skillQuery, [
           skill.title,
           skill.description,
           ...skill.triggerPhrases,
-        ].some((value) => value.toLowerCase().includes(skillQuery));
+        ]) >= 0.38;
       })
       .slice(0, 8);
   }, [availableSkills, selectedSkillIds, skillMenuOpen, skillQuery]);
@@ -5090,12 +5052,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     setSelectedSkillIds((current) => current.includes(skill.id) ? current : [...current, skill.id]);
     setDismissedSlashDraft('');
     requestAnimationFrame(() => editorRef.current?.focus());
-  }
-
-  function removeSkill(skillId: string) {
-    editorRef.current?.querySelectorAll<HTMLElement>(`[data-skill-id="${CSS.escape(skillId)}"]`).forEach((node) => node.remove());
-    setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
-    syncEditorState();
   }
 
   function isInlineToken(node: Node | null): node is HTMLElement {
@@ -5288,6 +5244,18 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     syncEditorState(scrollToBottom ? { scrollToBottom: true } : undefined);
   }
 
+  function appendInlineTokenRemoveButton(token: HTMLElement, name: string) {
+    const button = document.createElement('button');
+    button.className = 'browser-chat-inline-token-remove';
+    button.contentEditable = 'false';
+    button.tabIndex = -1;
+    button.type = 'button';
+    button.title = t('移除 {name}', { name });
+    button.setAttribute('aria-label', t('移除 {name}', { name }));
+    button.innerHTML = inlineTokenSvg('<path d="m18 6-12 12"/><path d="m6 6 12 12"/>');
+    token.append(button);
+  }
+
   function insertSkillToken(skill: SkillRecord) {
     const editor = editorRef.current;
     if (!editor) return;
@@ -5295,12 +5263,13 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     range.deleteContents();
 
     const token = document.createElement('span');
-    token.className = 'browser-chat-inline-skill';
+    token.className = 'browser-chat-inline-token browser-chat-inline-skill';
     token.contentEditable = 'false';
     token.dataset.skillId = skill.id;
     token.title = skill.description;
     token.innerHTML = `<span class="browser-chat-inline-skill-icon">${inlineSkillIconSvg()}</span><span class="browser-chat-inline-skill-title"></span>`;
     token.querySelector('.browser-chat-inline-skill-title')!.textContent = skill.title;
+    appendInlineTokenRemoveButton(token, skill.title);
 
     finishInlineTokenInsertion(range, token);
   }
@@ -5313,7 +5282,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     range.deleteContents();
 
     const token = document.createElement('span');
-    token.className = `browser-chat-inline-reference ${kind}`;
+    token.className = `browser-chat-inline-token browser-chat-inline-reference ${kind}`;
     token.contentEditable = 'false';
     token.dataset.attachmentId = attachment.id;
     token.dataset.attachmentJson = JSON.stringify(attachment);
@@ -5321,6 +5290,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     token.title = `${t(browserChatReferenceLabel(kind))}: ${attachment.name}`;
     token.innerHTML = `<span class="browser-chat-inline-reference-icon">${inlineReferenceIconSvg(kind)}</span><span class="browser-chat-inline-reference-title"></span>`;
     token.querySelector('.browser-chat-inline-reference-title')!.textContent = attachment.name || t(browserChatReferenceLabel(kind));
+    appendInlineTokenRemoveButton(token, attachment.name || t(browserChatReferenceLabel(kind)));
 
     finishInlineTokenInsertion(range, token, true);
   }
@@ -5346,21 +5316,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             if (files?.length) void onUploadFiles(Array.from(files)).then((uploaded) => uploaded.forEach(insertReferenceToken));
           }}
         />
-        {(selectedSkills.length || skillMenuOpen) ? (
+        {skillMenuOpen ? (
           <div className="browser-chat-compose-context">
-            {selectedSkills.length ? (
-              <div className="browser-chat-skill-chips">
-                {selectedSkills.map((skill) => (
-                  <button key={skill.id} onClick={() => removeSkill(skill.id)} title={skill.description} type="button">
-                    <Braces size={14} />
-                    <span>{skill.title}</span>
-                    <X size={13} />
-                  </button>
-                ))}
-              </div>
-            ) : null}
-            {skillMenuOpen ? (
-              <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
+            <div className="browser-chat-skill-menu" role="listbox" aria-label="Skills">
                 <div className="browser-chat-skill-menu-head">
                   <b>Skills</b>
                   {skillQuery ? <span>/{skillQuery}</span> : <span>/</span>}
@@ -5398,8 +5356,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                     <span>{t(loadingMoreSkills ? '正在加载' : '加载更多')}</span>
                   </button>
                 ) : null}
-              </div>
-            ) : null}
+            </div>
           </div>
         ) : null}
         <div
@@ -5408,6 +5365,15 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           contentEditable={!busy && !loading}
           data-placeholder={t('问问题，尽管问')}
           onInput={() => syncEditorState({ scrollToBottom: true })}
+          onMouseDown={(event) => {
+            const removeButton = (event.target as HTMLElement).closest<HTMLElement>('.browser-chat-inline-token-remove');
+            const token = removeButton?.closest<HTMLElement>('[data-skill-id],[data-attachment-id]');
+            if (!removeButton || !token || !editorRef.current?.contains(token)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            removeInlineTokenNode(token);
+            requestAnimationFrame(() => editorRef.current?.focus());
+          }}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
             if (event.key === 'Backspace' || event.key === 'Delete') {
@@ -8291,7 +8257,7 @@ export function BrowserChatWorkspace({
   const requestedSessionId = mountedIdentityRef.current?.sessionId || querySessionId;
   const requestedTargetUrl = mountedIdentityRef.current?.targetUrl || queryTargetUrl;
   const browserChatApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const {
     initialize: initializeSkills,
     loadMore: loadMoreSkills,
@@ -9666,7 +9632,7 @@ export function BrowserChatWorkspace({
 
   function renderSidebarDetail() {
     return (
-      <section className="browser-chat-sidebar-section browser-chat-recent-section browser-chat-conversation-history">
+      <section className="browser-chat-sidebar-section browser-chat-recent-section workspace-sidebar-archive browser-chat-conversation-history">
         <div className="browser-chat-mobile-history-bar">
           <button
             aria-controls="browser-chat-mobile-history-panel"
@@ -9709,202 +9675,97 @@ export function BrowserChatWorkspace({
           id="browser-chat-mobile-history-panel"
           role={mobileHistoryOpen ? 'dialog' : undefined}
         >
-        <div className="browser-chat-recent-header">
-          <h2>{t('对话')}</h2>
-          <div className="browser-chat-recent-header-actions">
-            <button
-              aria-label={t('关闭对话历史')}
-              className="ui-icon-button browser-chat-mobile-history-close"
-              onClick={() => setMobileHistoryOpen(false)}
-              title={t('关闭')}
-              type="button"
-            >
-              <X size={17} />
-            </button>
-            <button
-              aria-label={t('新建对话')}
-              className="ui-icon-button browser-chat-section-create"
-              disabled={Boolean(loadingSessionHistory || loadingSessionId)}
-              onClick={() => void startNewConversation()}
-              title={t('新建对话')}
-              type="button"
-            >
-              <Plus size={18} />
-            </button>
-            {recentSelectionMode ? (
-              <button
-                aria-label={t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })}
-                className="ui-icon-button ui-icon-button--danger browser-chat-section-create"
-                disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
-                onClick={() => void deleteSelectedSessionHistory()}
-                title={selectedDeletableSessionIds.length
-                  ? t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })
-                  : t('请选择要删除的对话')}
-                type="button"
-              >
-                {deletingSelectedSessions ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
-              </button>
-            ) : null}
-            <BrowserChatOverflowMenu
-              className="browser-chat-recent-actions"
-              icon={<MoreHorizontal size={16} />}
-              label={t('对话操作')}
-              title={t('对话操作')}
-            >
-                {recentSessions.length ? (
-                  <button
-                    onClick={() => {
-                      closeSidebarOverflowMenu();
-                      setRecentSelectionMode((current) => !current);
-                      if (recentSelectionMode) setSelectedSessionIds([]);
-                    }}
-                    type="button"
-                  >
-                    <Square size={14} />
-                    <span>{recentSelectionMode ? t('退出选择') : t('选择对话')}</span>
-                  </button>
-                ) : null}
+          <WorkspaceSidebarArchiveHeader
+            actions={(
+              <>
+                <button
+                  aria-label={t('关闭对话历史')}
+                  className="ui-icon-button browser-chat-mobile-history-close"
+                  onClick={() => setMobileHistoryOpen(false)}
+                  title={t('关闭')}
+                  type="button"
+                >
+                  <X size={17} />
+                </button>
+                <button
+                  aria-label={t('新建对话')}
+                  className="ui-icon-button browser-chat-section-create"
+                  disabled={Boolean(loadingSessionHistory || loadingSessionId)}
+                  onClick={() => void startNewConversation()}
+                  title={t('新建对话')}
+                  type="button"
+                >
+                  <Plus size={18} />
+                </button>
                 {recentSelectionMode ? (
                   <button
-                    onClick={() => {
-                      closeSidebarOverflowMenu();
-                      toggleAllRecentSelections();
-                    }}
+                    aria-label={t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })}
+                    className="ui-icon-button ui-icon-button--danger browser-chat-section-create"
+                    disabled={!selectedDeletableSessionIds.length || deletingSelectedSessions}
+                    onClick={() => void deleteSelectedSessionHistory()}
+                    title={selectedDeletableSessionIds.length
+                      ? t('删除已选对话（{count}）', { count: selectedDeletableSessionIds.length })
+                      : t('请选择要删除的对话')}
                     type="button"
                   >
-                    <CheckCircle2 size={15} />
-                    <span>{allSelectableRecentSessionsSelected ? t('取消全选') : t('全选')}</span>
+                    {deletingSelectedSessions ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
                   </button>
                 ) : null}
-            </BrowserChatOverflowMenu>
-          </div>
-        </div>
-        <button
-          aria-label={t('新建对话')}
-          className="ui-button ui-button--neutral browser-chat-new-chat-button"
-          disabled={Boolean(loadingSessionHistory || loadingSessionId)}
-          onClick={() => void startNewConversation()}
-          title={t('新建对话')}
-          type="button"
-        >
-          <Plus size={16} />
-          <span>{t('新建对话')}</span>
-        </button>
-        <label className="domain-list-search browser-chat-history-filter">
-          <Search aria-hidden="true" size={16} />
-          <input
-            aria-label={t('筛选对话历史')}
-            className="domain-list-search-input"
-            disabled={loadingSessionHistory}
-            onChange={(event) => setHistoryFilter(event.currentTarget.value)}
-            placeholder={t('筛选对话')}
-            type="search"
-            value={historyFilter}
-          />
-          {historyFilter ? (
-            <button
-              aria-label={t('清空对话筛选')}
-              onClick={() => setHistoryFilter('')}
-              title={t('清空筛选')}
-              type="button"
-            >
-              <X size={14} />
-            </button>
-          ) : null}
-        </label>
-        <div className={loadingSessionHistory ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loadingSessionHistory}>
-          {loadingSessionHistory ? (
+                <WorkspaceOverflowMenu
+                  className="browser-chat-recent-actions"
+                  icon={<MoreHorizontal size={16} />}
+                  label={t('对话操作')}
+                  title={t('对话操作')}
+                >
+                  {recentSessions.length ? (
+                    <button
+                      onClick={() => {
+                        closeSidebarOverflowMenu();
+                        setRecentSelectionMode((current) => !current);
+                        if (recentSelectionMode) setSelectedSessionIds([]);
+                      }}
+                      type="button"
+                    >
+                      <Square size={14} />
+                      <span>{recentSelectionMode ? t('退出选择') : t('选择对话')}</span>
+                    </button>
+                  ) : null}
+                  {recentSelectionMode ? (
+                    <button
+                      onClick={() => {
+                        closeSidebarOverflowMenu();
+                        toggleAllRecentSelections();
+                      }}
+                      type="button"
+                    >
+                      <CheckCircle2 size={15} />
+                      <span>{allSelectableRecentSessionsSelected ? t('取消全选') : t('全选')}</span>
+                    </button>
+                  ) : null}
+                </WorkspaceOverflowMenu>
+              </>
+            )}
+          >
+            <WorkspaceSidebarArchiveFilter
+              ariaLabel={t('筛选对话历史')}
+              clearLabel={t('清空对话筛选')}
+              clearTitle={t('清空筛选')}
+              disabled={loadingSessionHistory}
+              onChange={setHistoryFilter}
+              placeholder={t('筛选对话')}
+              value={historyFilter}
+            />
+          </WorkspaceSidebarArchiveHeader>
+          <div className={loadingSessionHistory ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loadingSessionHistory}>
+            {loadingSessionHistory ? (
             <div className="browser-chat-history-loading" role="status" aria-live="polite" aria-label={t('正在加载对话')}>
               <Loader2 className="spin" size={16} />
               <span>{t('正在加载对话')}</span>
             </div>
           ) : filteredRecentSessions.length || (!historyFilter.trim() && sessionListPage.hasMore) ? (
-            <ol
+            <WorkspaceSidebarArchiveList
               aria-busy={loadingMoreSessions}
-              className="browser-chat-recent-list"
-              onScroll={(event) => {
-                const list = event.currentTarget;
-                syncRecentSessionScrollShadows(list);
-                const verticalRemaining = list.scrollHeight - list.scrollTop - list.clientHeight;
-                const horizontalRemaining = list.scrollWidth - list.scrollLeft - list.clientWidth;
-                if (verticalRemaining > 160 || horizontalRemaining > 160) {
-                  recentSessionListFailedCursorRef.current = '';
-                }
-              }}
-              ref={recentSessionListRef}
-            >
-              {filteredRecentSessions.map((item) => {
-                const displayTitle = sessionDisplayTitle(item);
-                const titleParts = sessionTitleParts(item);
-                return (
-                  <li key={item.id}>
-                    <div
-                      className={`${(loadingSessionId || session?.id || requestedSessionId) === item.id ? 'browser-chat-recent-item active' : 'browser-chat-recent-item'}${recentSelectionMode ? ' selecting' : ''}`}
-                    >
-                      {recentSelectionMode ? (
-                        <input
-                          aria-label={t('选择 {name}', { name: displayTitle })}
-                          checked={selectedSessionIdSet.has(item.id)}
-                          className="browser-chat-recent-check"
-                          disabled={item.busy || deletingSelectedSessions}
-                          onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
-                          type="checkbox"
-                        />
-                      ) : null}
-                      <button
-                        aria-label={displayTitle}
-                        className="browser-chat-recent-open"
-                        disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
-                        onClick={() => {
-                          setMobileHistoryOpen(false);
-                          void loadSession(item.id);
-                        }}
-                        title={displayTitle}
-                        type="button"
-                      >
-                        {sidebarCollapsed ? (
-                          <MessageSquare className="browser-chat-recent-icon" size={17} />
-                        ) : titleParts.fileName ? (
-                          <FileText aria-hidden="true" className="browser-chat-recent-file-icon" size={15} />
-                        ) : null}
-                        <span>{displayTitle}</span>
-                      </button>
-                      {sidebarCollapsed ? (
-                        <button
-                          aria-label={t('删除对话“{name}”', { name: displayTitle })}
-                          className="browser-chat-recent-delete browser-chat-collapsed-delete"
-                          disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
-                          onClick={() => void deleteSessionHistory(item.id)}
-                          title={item.busy ? t('执行中，无法删除') : t('删除对话')}
-                          type="button"
-                        >
-                          {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={10} /> : <X size={11} />}
-                        </button>
-                      ) : null}
-                      <BrowserChatOverflowMenu
-                        className="browser-chat-recent-row-menu"
-                        icon={deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
-                        label={t('{name} 操作', { name: displayTitle })}
-                        title={t('更多操作')}
-                      >
-                        <button
-                          className="danger"
-                          disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
-                          onClick={() => {
-                            closeSidebarOverflowMenu();
-                            void deleteSessionHistory(item.id);
-                          }}
-                          type="button"
-                        >
-                          <Trash2 size={15} />
-                          <span>{item.busy ? t('执行中，无法删除') : t('删除对话')}</span>
-                        </button>
-                      </BrowserChatOverflowMenu>
-                    </div>
-                  </li>
-                );
-              })}
-              {sessionListPage.hasMore && sessionListPage.next ? (
+              footer={sessionListPage.hasMore && sessionListPage.next ? (
                 <li
                   className={`browser-chat-history-scroll-sentinel${loadingMoreSessions ? ' is-loading' : ''}`}
                   ref={recentSessionListEndRef}
@@ -9917,7 +9778,87 @@ export function BrowserChatWorkspace({
                   ) : null}
                 </li>
               ) : null}
-            </ol>
+              getKey={(item) => item.id}
+              items={filteredRecentSessions}
+              language={language}
+              onScroll={(event) => {
+                const list = event.currentTarget;
+                syncRecentSessionScrollShadows(list);
+                const verticalRemaining = list.scrollHeight - list.scrollTop - list.clientHeight;
+                const horizontalRemaining = list.scrollWidth - list.scrollLeft - list.clientWidth;
+                if (verticalRemaining > 160 || horizontalRemaining > 160) {
+                  recentSessionListFailedCursorRef.current = '';
+                }
+              }}
+              listRef={recentSessionListRef}
+              renderItem={(item) => {
+                const displayTitle = sessionDisplayTitle(item);
+                const titleParts = sessionTitleParts(item);
+                const active = (loadingSessionId || session?.id || requestedSessionId) === item.id;
+                  return (
+                    <WorkspaceSidebarArchiveRow
+                      active={active}
+                      ariaLabel={displayTitle}
+                      collapsed={sidebarCollapsed}
+                      collapsedAction={(
+                        <button
+                          aria-label={t('删除对话“{name}”', { name: displayTitle })}
+                          className="workspace-sidebar-archive-row-delete browser-chat-collapsed-delete"
+                          disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                          onClick={() => void deleteSessionHistory(item.id)}
+                          title={item.busy ? t('执行中，无法删除') : t('删除对话')}
+                          type="button"
+                        >
+                          {deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={10} /> : <X size={11} />}
+                        </button>
+                      )}
+                      collapsedIcon={<MessageSquare size={17} />}
+                      disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
+                      expandedAction={(
+                        <WorkspaceOverflowMenu
+                          className="workspace-sidebar-archive-row-menu"
+                          icon={deletingSessionIds.has(item.id) ? <Loader2 className="spin" size={13} /> : <MoreHorizontal size={16} />}
+                          label={t('{name} 操作', { name: displayTitle })}
+                          title={t('更多操作')}
+                        >
+                          <button
+                            className="danger"
+                            disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
+                            onClick={() => {
+                              closeSidebarOverflowMenu();
+                              void deleteSessionHistory(item.id);
+                            }}
+                            type="button"
+                          >
+                            <Trash2 size={15} />
+                            <span>{item.busy ? t('执行中，无法删除') : t('删除对话')}</span>
+                          </button>
+                        </WorkspaceOverflowMenu>
+                      )}
+                      expandedIcon={titleParts.fileName
+                        ? <FileText aria-hidden="true" size={16} />
+                        : undefined}
+                      iconTone={active ? 'accent' : 'muted'}
+                      onOpen={() => {
+                        setMobileHistoryOpen(false);
+                        void loadSession(item.id);
+                      }}
+                      selecting={recentSelectionMode}
+                      selectionControl={recentSelectionMode ? (
+                        <input
+                          aria-label={t('选择 {name}', { name: displayTitle })}
+                          checked={selectedSessionIdSet.has(item.id)}
+                          className="browser-chat-recent-check"
+                          disabled={item.busy || deletingSelectedSessions}
+                          onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
+                          type="checkbox"
+                        />
+                      ) : undefined}
+                      title={displayTitle}
+                    />
+                );
+              }}
+            />
           ) : recentSessions.length ? (
             <p className="browser-chat-history-filter-empty">{t('没有匹配的对话')}</p>
           ) : null}

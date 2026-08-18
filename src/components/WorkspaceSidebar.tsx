@@ -28,11 +28,12 @@ type WorkspaceNavItemProps = {
 
 export function WorkspaceNavItem({ active = false, href, icon, label, onClick }: WorkspaceNavItemProps) {
   const className = active ? 'browser-chat-nav-item active' : 'browser-chat-nav-item';
+  const visibleLabel = href === '/browser-chat' ? label.replace(/(?:模式| Mode)$/u, '') : label;
   if (onClick) {
     return (
       <button aria-current={active ? 'page' : undefined} aria-label={label} className={className} onClick={onClick} title={label} type="button">
         {icon}
-        <span>{label}</span>
+        <span>{visibleLabel}</span>
       </button>
     );
   }
@@ -40,7 +41,7 @@ export function WorkspaceNavItem({ active = false, href, icon, label, onClick }:
   return (
     <Link aria-current={active ? 'page' : undefined} aria-label={label} className={className} href={href} title={label}>
       {icon}
-      <span>{label}</span>
+      <span>{visibleLabel}</span>
     </Link>
   );
 }
@@ -59,7 +60,7 @@ export function WorkspaceSidebar({
   return (
     <aside className={className ? `browser-chat-sidebar ${className}` : 'browser-chat-sidebar'}>
       <div className="browser-chat-brand">
-        <strong>WebPilot</strong>
+        <strong>DOMP WebPilot</strong>
         <button
           aria-label={collapseLabel}
           className="ui-icon-button"

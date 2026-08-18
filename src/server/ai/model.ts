@@ -27,6 +27,7 @@ type AiProvider =
   | 'huggingface'
   | 'llama-cpp'
   | 'lmstudio'
+  | 'minimax'
   | 'mistral'
   | 'ollama'
   | 'openai'
@@ -194,6 +195,11 @@ export function getModel(): GenerateTextModel {
   if (provider === 'lmstudio') return openAiCompatibleModel(provider, model, 'LMSTUDIO_BASE_URL', 'http://localhost:1234/v1', 'LMSTUDIO_API_KEY');
   if (provider === 'llama-cpp') return openAiCompatibleModel(provider, model, 'LLAMA_CPP_BASE_URL', 'http://localhost:8080/v1', 'LLAMA_CPP_API_KEY');
   if (provider === 'ollama') return openAiCompatibleModel(provider, model, 'OLLAMA_BASE_URL', 'http://localhost:11434/v1', 'OLLAMA_API_KEY');
+  if (provider === 'minimax') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('MINIMAX_BASE_URL');
+    const { createMiniMax } = await import('@ai-sdk/minimax');
+    return createMiniMax({ apiKey: process.env.MINIMAX_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+  });
   if (provider === 'openai') return lazyLanguageModel(provider, model, async () => {
     const baseURL = optionalEnvironmentValue('OPENAI_BASE_URL');
     const { createOpenAI } = await import('@ai-sdk/openai');
@@ -255,6 +261,7 @@ export function getModelSettings() {
     huggingface: 'meta-llama/Llama-3.1-8B-Instruct',
     'llama-cpp': 'local-model',
     lmstudio: 'qwen3-vl-2b-instruct',
+    minimax: 'minimax-m3',
     mistral: 'mistral-large-latest',
     ollama: 'llama3.1',
     openai: 'gpt-5.5',
@@ -326,6 +333,7 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'huggingface' || provider === 'hugging-face') return 'huggingface';
   if (provider === 'llama-cpp' || provider === 'llamacpp' || provider === 'llama.cpp') return 'llama-cpp';
   if (provider === 'lmstudio' || provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  if (provider === 'minimax') return 'minimax';
   if (provider === 'mistral' || provider === 'mistral-ai') return 'mistral';
   if (provider === 'ollama') return 'ollama';
   if (provider === 'openai') return 'openai';

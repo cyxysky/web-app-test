@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { compactBrowserChatLogForClient, compactBrowserChatLogsForClient } from './browser-chat-log-client';
 
-test('keeps compact request metadata and token estimates while removing messages', () => {
+test('keeps the complete AI request input and token estimates', () => {
   const compacted = compactBrowserChatLogForClient({
     id: 'request',
     phase: 'ai:runtime:request',
@@ -12,6 +12,7 @@ test('keeps compact request metadata and token estimates while removing messages
         aiInput: {
           provider: 'azure-openai',
           model: 'deepseek-v4-flash',
+          system: 'system prompt',
           messages: [{ role: 'user', content: 'large prompt' }],
           tools: ['readFile'],
         },
@@ -24,8 +25,9 @@ test('keeps compact request metadata and token estimates while removing messages
 
   assert.equal(details.aiInput.provider, 'azure-openai');
   assert.equal(details.aiInput.model, 'deepseek-v4-flash');
+  assert.equal(details.aiInput.system, 'system prompt');
   assert.deepEqual(details.aiInput.tools, ['readFile']);
-  assert.equal(details.aiInput.messages, undefined);
+  assert.deepEqual(details.aiInput.messages, [{ role: 'user', content: 'large prompt' }]);
   assert.equal(details.aiInputTokens.estimatedTotalTokens, 140);
   assert.equal(details.execution.attemptId, 'attempt-1');
 });

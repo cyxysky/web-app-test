@@ -33,7 +33,6 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   const compacted = { ...step };
   delete compacted.aiRequest;
   delete compacted.visualContext;
-  delete compacted.workingMemory;
   return compacted;
 }
 
