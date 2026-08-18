@@ -124,10 +124,10 @@ function artifactResultPayload(input: {
 }
 
 export function formatFileArtifactResult(toolName: string, actual?: string) {
-  if (toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
+  if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
-    const label = toolName === 'downloadFile'
+    const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
       ? 'File downloaded'
       : toolName === 'fillDocumentTemplate'
         ? 'Document template filled'
@@ -383,7 +383,7 @@ function verifiedArtifactDownloadUrl(value: unknown) {
 }
 
 export function fileArtifactDownloadFromToolResult(tool: FileArtifactToolResult): FileArtifactDownload | undefined {
-  if (tool.name !== 'downloadFile' && tool.name !== 'generateFile' && tool.name !== 'fillDocumentTemplate') return undefined;
+  if (tool.name !== 'file' && tool.name !== 'downloadFile' && tool.name !== 'generateFile' && tool.name !== 'fillDocumentTemplate') return undefined;
   if (!tool.result || typeof tool.result !== 'object' || !('ok' in tool.result) || tool.result.ok !== true) return undefined;
   try {
     const actual = 'actual' in tool.result && typeof tool.result.actual === 'string'

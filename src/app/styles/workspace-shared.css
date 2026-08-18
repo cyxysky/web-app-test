@@ -1692,30 +1692,77 @@
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav {
-    align-items: stretch;
+    align-items: center;
+    background: color-mix(in srgb, var(--foreground) 5.5%, transparent);
+    border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+    border-radius: 6px;
+    box-sizing: border-box;
     display: flex;
-    gap: 0;
-    justify-content: flex-start;
+    gap: 2px;
+    justify-content: stretch;
     min-width: 0;
-    padding: 0;
+    padding: 2px;
+    position: relative;
+    width: 100%;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav::before {
+    background: var(--panel);
+    border: 1px solid color-mix(in srgb, var(--border-strong) 58%, transparent);
+    border-radius: 4px;
+    bottom: 2px;
+    box-shadow:
+      0 1px 2px color-mix(in srgb, #111827 9%, transparent),
+      inset 0 1px 0 color-mix(in srgb, #ffffff 72%, transparent);
+    content: "";
+    left: 2px;
+    pointer-events: none;
+    position: absolute;
+    top: 2px;
+    transform: translateX(0);
+    width: calc((100% - 8px) / 3);
+    z-index: 0;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav:has(> .browser-chat-nav-item:nth-child(4))::before {
+    width: calc((100% - 10px) / 4);
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav:has(> .browser-chat-nav-item:nth-child(2).active)::before {
+    transform: translateX(calc(100% + 2px));
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav:has(> .browser-chat-nav-item:nth-child(3).active)::before {
+    transform: translateX(calc(200% + 4px));
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav:has(> .browser-chat-nav-item:nth-child(4).active)::before {
+    transform: translateX(calc(300% + 6px));
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav-item {
     background: transparent;
-    border-radius: 0;
-    color: var(--muted);
-    flex: 0 0 64px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--muted-strong);
+    flex: 1 1 0;
     font-size: 12px;
     font-weight: 520;
     gap: 0;
-    justify-content: flex-start;
-    height: 34px;
+    justify-content: center;
+    height: 32px;
     line-height: 18px;
-    min-height: 34px;
+    min-height: 32px;
     min-width: 0;
-    padding: 0 3px;
+    padding: 0 6px;
     position: relative;
-    width: 64px;
+    transition:
+      background-color var(--motion-fast) ease,
+      border-color var(--motion-fast) ease,
+      box-shadow var(--motion-fast) ease,
+      color var(--motion-fast) ease;
+    width: auto;
+    z-index: 1;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav-item > svg {
@@ -1724,27 +1771,31 @@
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav-item > span {
     min-width: 0;
-    overflow: visible;
+    overflow: hidden;
     position: relative;
+    text-align: center;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item:is(:hover, .active),
-  :root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item:is(:hover, .active) {
-    background: transparent !important;
-    box-shadow: none;
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item:hover {
+    background: color-mix(in srgb, var(--panel) 58%, transparent);
     color: var(--foreground);
   }
 
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item.active,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item.active:hover,
+  :root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item.active,
+  :root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav > .browser-chat-nav-item.active:hover {
+    background: transparent !important;
+    border-color: transparent;
+    box-shadow: none !important;
+    color: var(--foreground);
+    font-weight: 600;
+  }
+
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-nav-item.active > span::after {
-    background: var(--accent-strong);
-    border-radius: 999px;
-    bottom: -8px;
-    content: "";
-    height: 2px;
-    left: 0;
-    position: absolute;
-    width: 100%;
+    content: none;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive {

@@ -29,7 +29,6 @@ import {
 import {
   appendMissingFileArtifactDownloadLinks,
   downloadFileArtifact,
-  fillDocumentTemplateArtifact,
   formatFileArtifactResult,
   generateFileArtifact,
 } from './file-artifact-tools';
@@ -481,7 +480,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, _max =
   void _max;
   if (!result) return undefined;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
-  if (name === 'downloadFile' || name === 'generateFile' || name === 'fillDocumentTemplate') return formatFileArtifactResult(name, result.actual);
+  if (name === 'file' || name === 'downloadFile' || name === 'generateFile') return formatFileArtifactResult(name, result.actual);
   return result.actual;
 }
 
@@ -739,14 +738,14 @@ function pendingSubagentUuidsFromTraces(traces: ToolTrace[]) {
   const spawned: string[] = [];
   const read = new Set<string>();
   for (const trace of traces) {
-    if (trace.name === 'spawnSubagents') {
+    const input = recordFromUnknown(trace.input);
+    if (trace.name === 'spawnSubagents' || (trace.name === 'subagent' && input.action === 'spawn')) {
       for (const uuid of subagentUuidsFromToolResult(trace.result)) {
         if (!spawned.includes(uuid)) spawned.push(uuid);
       }
       continue;
     }
-    if (trace.name !== 'readSubagent' || !trace.result?.ok) continue;
-    const input = recordFromUnknown(trace.input);
+    if (!(trace.name === 'readSubagent' || (trace.name === 'subagent' && input.action === 'read')) || !trace.result?.ok) continue;
     const uuid = typeof input.uuid === 'string' ? input.uuid.trim() : '';
     if (uuid) read.add(uuid);
   }
@@ -761,14 +760,14 @@ function pendingSubagentUuidsFromSteps(steps: StepExecutionResult[]) {
       const rawResult = toolCall.rawResult && typeof toolCall.rawResult === 'object' && !Array.isArray(toolCall.rawResult)
         ? toolCall.rawResult as BrowserActionResult
         : undefined;
-      if (toolCall.name === 'spawnSubagents') {
+      const input = recordFromUnknown(toolCall.input);
+      if (toolCall.name === 'spawnSubagents' || (toolCall.name === 'subagent' && input.action === 'spawn')) {
         for (const uuid of subagentUuidsFromToolResult(rawResult)) {
           if (!spawned.includes(uuid)) spawned.push(uuid);
         }
         continue;
       }
-      if (toolCall.name !== 'readSubagent' || rawResult?.ok !== true) continue;
-      const input = recordFromUnknown(toolCall.input);
+      if (!(toolCall.name === 'readSubagent' || (toolCall.name === 'subagent' && input.action === 'read')) || rawResult?.ok !== true) continue;
       const uuid = typeof input.uuid === 'string' ? input.uuid.trim() : '';
       if (uuid) read.add(uuid);
     }
@@ -780,7 +779,7 @@ function requiredSubagentReadDirective(uuid: string, remaining: number) {
   return [
     '[Required child Agent result read]',
     `There are ${remaining} completed child Agent result(s) that have not been read.`,
-    `In this model step, call readSubagent with exactly this UUID: ${uuid}`,
+    `In this model step, call subagent with action="read" and exactly this UUID: ${uuid}`,
     'Do not answer, synthesize, or call another tool until every returned child UUID has been read.',
   ].join('\n');
 }
@@ -1278,7 +1277,7 @@ function makeBrowserTools(
     }),
     ...(mode === 'code' ? {
     browserCode: tool({
-      description: 'Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call readFile merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
+      description: 'This is the real browser control tool. It CAN navigate or open URLs, claim/open/switch tabs, click links and controls, type, select, upload, inspect, and verify the visible page. Use await page.goto(url) for same-tab navigation, browser.tabs.new(url) for a new tab, and Playwright locators for observed links and controls. Never claim browser navigation/clicking is unavailable, never replace navigation with a file download, and never ask the user to navigate manually while browserCode is present unless an actual browserCode call failed and that failure is reported. Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call file merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
@@ -1424,40 +1423,82 @@ function makeBrowserTools(
       }),
       execute: (input, execution) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs), execution),
     }),
-    ...(referenceOptions?.runSubagents ? {
-      spawnSubagents: tool({
-        description: 'Run independent research, reading, comparison, or testing branches concurrently with full browser-agent tools. Use this by default when two or more URLs, documents, pages, or other items can be handled without depending on one another; for example, eight independent links should become eight child tasks in one batch instead of eight serial main-Agent reads. Do not delegate dependent steps or multiple actions on the same interactive page. The main Agent strictly waits for the original batch barrier, including retries. This returns one backend-maintained UUID per child, never the child content. Read child results one at a time in later model steps with readSubagent. One child failure does not cancel its siblings.',
-        inputSchema: browserToolInput({
-          tasks: z.array(z.object({
-            title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
-            instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
-            url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
-          })).min(1).max(12),
-        }),
-        execute: (input, execution) => record('spawnSubagents', input, (abortSignal, trace) => referenceOptions.runSubagents!(input.tasks, abortSignal, trace?.id), execution),
-      }),
-    } : {}),
-    ...(referenceOptions?.readSubagent ? {
-      readSubagent: tool({
-        description: 'Read exactly one completed child Agent result. Call this once per child UUID in separate model steps. Failed children still return any partial summary they produced.',
-        inputSchema: browserToolInput({
-          uuid: z.string().uuid().describe('One child Agent UUID returned by spawnSubagents.'),
-        }),
-        execute: (input, execution) => record('readSubagent', input, () => referenceOptions.readSubagent!(input.uuid), execution),
-      }),
-    } : {}),
-    ...(referenceOptions?.readFile ? {
-      readFile: tool({
-        description: 'Inspect one registered file on demand while preserving the original attachment. User attachments are listed with attachmentId; downloaded/generated artifacts return an Artifact ID. Use exactly one of attachmentId or artifactId. On the first read, omit offset and limit to read the first 20000 characters. Every text read returns at least 20000 characters. Continue only from the exact next offset returned by the previous read. Rich documents return semantic package structure before extracted text. On the first read, visual-capable models also receive up to four rendered pages; pass pages to inspect other exact 1-based pages, or includeVisuals=false when only text is needed. PDF pages are rendered exactly. Office files use LibreOffice PDF rendering when configured, with DOCX/spreadsheet HTML preview and embedded-media fallback otherwise. Images are attached directly instead of encoded as text.',
-        inputSchema: browserToolInput({
-          attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in the conversation metadata.'),
-          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by downloadFile or generateFile.'),
-          includeVisuals: z.boolean().optional().describe('Whether to attach rendered pages/media to the next model request. Defaults to true for the first segment when the current model supports images.'),
-          offset: z.number().int().min(0).optional().describe('Zero-based character offset. Omit for the first segment.'),
-          limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional().describe('Returned character count, from 20000 to 40000. Omit to read 20000 characters.'),
-          pages: z.array(z.number().int().min(1)).min(1).max(6).optional().describe('Up to six 1-based document pages to render and attach. Omit for pages 1-4 on the first read.'),
-        }).refine((input) => Boolean(input.attachmentId) !== Boolean(input.artifactId), { message: 'Provide exactly one of attachmentId or artifactId.' }),
+    ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
+      subagent: tool({
+        description: 'Manage child Agents through one action-based tool. Use action=spawn for independent research, reading, comparison, or testing branches that can run concurrently; it returns one UUID per child. Use action=read with exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
+        inputSchema: z.discriminatedUnion('action', [
+          browserToolInput({
+            action: z.literal('spawn'),
+            tasks: z.array(z.object({
+              title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
+              instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
+              url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
+            })).min(1).max(12),
+          }),
+          browserToolInput({
+            action: z.literal('read'),
+            uuid: z.string().uuid().describe('One child Agent UUID returned by action=spawn.'),
+          }),
+        ]),
         execute: (input, execution) => {
+          if (input.action === 'spawn') {
+            return record('subagent', input, (abortSignal, trace) => referenceOptions?.runSubagents
+              ? referenceOptions.runSubagents(input.tasks, abortSignal, trace?.id)
+              : Promise.resolve({ ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' }), execution);
+          }
+          return record('subagent', input, () => referenceOptions?.readSubagent
+            ? referenceOptions.readSubagent(input.uuid)
+            : Promise.resolve({ ok: false, actual: 'subagent action=read is unavailable in this runtime.' }), execution);
+        },
+      }),
+    } : {}),
+    ...(referenceOptions?.readSkill ? {
+      skill: tool({
+        description: 'Manage Skills through one action-based tool. Use action=read with the exact Skill id from the system prompt before performing browser actions governed by that Skill. Do not read it again while it remains loaded.',
+        inputSchema: browserToolInput({
+          action: z.literal('read'),
+          skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
+        }),
+        execute: (input, execution) => record('skill', input, () => referenceOptions.readSkill!(input.skillId), execution),
+      }),
+    } : {}),
+    file: tool({
+      description: 'Read, download, or generate files through one action-based tool. action=read inspects one registered attachment/artifact while preserving it; action=download saves an existing remote URL/path; action=generate creates a new downloadable text/PDF/Office file and returns rendered pages for visual review when supported. This tool does not navigate the visible browser: use browserCode for opening URLs and clicking links.',
+      inputSchema: z.discriminatedUnion('action', [
+        browserToolInput({
+          action: z.literal('read'),
+          attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in conversation metadata.'),
+          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by action=download or action=generate.'),
+          includeVisuals: z.boolean().optional(),
+          offset: z.number().int().min(0).optional(),
+          limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
+          pages: z.array(z.number().int().min(1)).min(1).max(6).optional(),
+        }),
+        browserToolInput({
+          action: z.literal('download'),
+          url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
+          path: z.string().optional().describe('Origin-relative or page-relative download path.'),
+          urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path.'),
+          fileName: z.string().optional().describe('Optional saved file name, including extension.'),
+        }),
+        browserToolInput({
+          action: z.literal('generate'),
+          fileName: z.string().min(1).max(180).describe('Required file name with a supported output extension.'),
+          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional(),
+          title: z.string().max(300).optional(),
+          subtitle: z.string().max(500).optional(),
+          theme: generatedFileThemeSchema.optional(),
+          content: z.string().min(1).max(4 * 1024 * 1024).optional(),
+          sheets: generatedFileSheetsSchema.optional(),
+          slides: generatedFileSlidesSchema.optional(),
+        }),
+      ]).superRefine((input, refinement) => {
+        if (input.action === 'read' && Boolean(input.attachmentId) === Boolean(input.artifactId)) {
+          refinement.addIssue({ code: z.ZodIssueCode.custom, message: 'action=read requires exactly one attachmentId or artifactId.' });
+        }
+      }),
+      execute: (input, execution) => {
+        if (input.action === 'read') {
           const includeVisuals = modelSupportsScreenshotInput()
             && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
           const normalizedInput = {
@@ -1465,66 +1506,19 @@ function makeBrowserTools(
             includeVisuals,
             limit: normalizeBrowserChatFileReadLimit(input.limit),
           };
-          return record('readFile', normalizedInput, () => referenceOptions.readFile!(normalizedInput), execution);
-        },
-      }),
-    } : {}),
-    ...(referenceOptions?.readSkill ? {
-      readSkill: tool({
-        description: 'Load the complete current content of one Skill listed in the system prompt into the next model context. Call this before performing browser actions governed by that Skill. Do not call it again while that Skill remains loaded.',
-        inputSchema: browserToolInput({
-          skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
-        }),
-        execute: (input, execution) => record('readSkill', input, () => referenceOptions.readSkill!(input.skillId), execution),
-      }),
-    } : {}),
-    downloadFile: tool({
-      description: 'Download a file into the configured local output directory or this run artifacts. Pass an absolute URL, an origin-relative path starting with / resolved against the current page origin, or a page-relative path resolved against the current page directory. Use this when the user asks to download/save a file; include the returned download target as a clickable Markdown link in the final answer.',
-      inputSchema: browserToolInput({
-        url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
-        path: z.string().optional().describe('Download path. /files/a.pdf resolves against current page origin; report/a.pdf resolves against current page directory.'),
-        urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path to download.'),
-        fileName: z.string().optional().describe('Optional saved file name, including extension when known.'),
-      }),
-      execute: (input, execution) => record('downloadFile', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution),
-    }),
-    generateFile: tool({
-      description: 'Generate a styled, real downloadable file. LibreOffice UNO creates and formats every PDF/Word/Excel/PowerPoint document, then renders visual pages back for layout review. Supported outputs: text/data formats; PDF .pdf; Word .doc/.docx/.odt; Excel .xls/.xlsx/.ods; and PowerPoint .ppt/.pptx/.odp. Choose a theme or explicit colors. Word and report PDFs use Markdown-like content; spreadsheets use structured sheets with formatting, formulas, merges, filters, freezing, and charts; presentations use structured slides. For PDF, documentType selects Writer, Calc, or Impress layout. Always inspect returned visual pages, fix visible overflow or weak layout with at most one intentional regeneration, and include the final returned download link. Do not use this to download an existing remote file.',
-      inputSchema: browserToolInput({
-        fileName: z.string().min(1).max(180).describe('Required file name with output extension, for example report.pdf, plan.docx, legacy.doc, data.xls, data.xlsx, table.ods, slides.pptx, slides.odp, notes.md, result.jsonl, or export.tsv.'),
-        documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('Layout engine for PDF output. Omit for native Office files because the extension determines it.'),
-        title: z.string().max(300).optional().describe('Optional document or presentation title.'),
-        subtitle: z.string().max(500).optional().describe('Optional document or presentation subtitle.'),
-        theme: generatedFileThemeSchema.optional().describe('Visual design system. Prefer a preset and override colors/font only when the user requests a brand style.'),
-        content: z.string().min(1).max(4 * 1024 * 1024).optional().describe('Complete text or Markdown-like content. Required for text, PDF, and Word; optional for CSV/TSV when sheets are provided and as a fallback for PowerPoint.'),
-        sheets: generatedFileSheetsSchema.optional().describe('Spreadsheet data and layout. Required for .xls/.xlsx/.ods or a spreadsheet PDF. Use headerRows, freezeRows, autoFilter, columns, formulas, merges, styles, and charts where they improve usability.'),
-        slides: generatedFileSlidesSchema.optional().describe('PowerPoint slide definitions. LibreOffice applies a 16:9 theme and splits slides with excessive bullets.'),
-      }),
-      execute: (input, execution) => record('generateFile', input, () => generateFileArtifact({
-        ...input,
-        runId: referenceOptions?.runId,
-        includeVisualVerification: modelSupportsScreenshotInput(),
-      }), execution),
-    }),
-    fillDocumentTemplate: tool({
-      description: 'Fill an uploaded .docx template without recreating the document. The backend copies the original OOXML package, changes only word/document.xml at exact visible-text anchors, verifies that all unrelated package parts are byte-for-byte preserved, then renders the filled document and attaches its first visual pages to the next model request for layout review. First call readFile on the template and use its DOCX structure section. Use nextCell for a table label whose value belongs in the following cell, followingParagraph for a section heading followed by a blank paragraph, or replaceText for an exact placeholder/date. Ambiguous anchors require a 1-based occurrence. Do not use generateFile when the user requires the supplied template to be preserved.',
-      inputSchema: browserToolInput({
-        templateAttachmentId: z.string().min(1).max(160).describe('Exact attachmentId of the uploaded .docx template in this conversation.'),
-        fileName: z.string().min(1).max(180).refine((value) => value.toLowerCase().endsWith('.docx'), { message: 'fileName must end with .docx.' }).describe('Required output .docx file name.'),
-        operations: z.array(z.object({
-          anchor: z.string().min(1).max(1_000).describe('Exact visible text copied from readFile template evidence.'),
-          content: z.string().max(2 * 1024 * 1024).describe('Text to insert. Newlines become Word line breaks.'),
-          target: z.enum(['nextCell', 'followingParagraph', 'replaceText']),
-          occurrence: z.number().int().min(1).optional().describe('1-based occurrence when the exact anchor appears more than once.'),
-          allowOverwrite: z.boolean().optional().describe('Only for nextCell when current evidence proves the target cell intentionally contains replaceable text.'),
-        })).min(1).max(100),
-      }),
-      execute: (input, execution) => record('fillDocumentTemplate', input, () => fillDocumentTemplateArtifact({
-        ...input,
-        runId: referenceOptions?.runId,
-        includeVisualVerification: modelSupportsScreenshotInput(),
-        attachmentBindings: referenceOptions?.attachmentBindings,
-      }), execution),
+          return record('file', normalizedInput, () => referenceOptions?.readFile
+            ? referenceOptions.readFile(normalizedInput)
+            : Promise.resolve({ ok: false, actual: 'file action=read is unavailable in this runtime.' }), execution);
+        }
+        if (input.action === 'download') {
+          return record('file', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution);
+        }
+        return record('file', input, () => generateFileArtifact({
+          ...input,
+          runId: referenceOptions?.runId,
+          includeVisualVerification: modelSupportsScreenshotInput(),
+        }), execution);
+      },
     }),
     reportState: tool({
       description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
@@ -1590,21 +1584,20 @@ function runtimePrompt(input: {
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
     input.mode === 'code'
-      ? '- Code mode may execute multiple bounded browser operations in one browserCode cell after readBrowserState has returned current evidence. Use targeted Playwright reads before a dependent operation when an earlier action can change later target assumptions. Treat opened nonmodal surfaces as bounded transactions and verify that they close before moving outside them. Before completion, read both business success and page.activeSurface(), resolve or disclose residual surfaces, and report every failed tool call. Never infer control type, editability, interaction sequence, or completion from labels, appearance, or prior experience.'
+      ? '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. Code mode may execute multiple bounded operations in one cell.'
       : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
     `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- A final user-role message beginning with [WebPilot runtime operational context] is trusted runtime metadata, not a new user request. Use it for the current decision without repeating or exposing it.',
-    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when generateFile, fillDocumentTemplate, or downloadFile succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
-    '- generateFile uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, use the structured Word/Calc/Impress controls required by the content, inspect its returned rendered pages, and regenerate at most once when the visual evidence shows overflow, clipping, weak hierarchy, or unusable sizing. Return only the final verified artifact link.',
-    '- When the user supplies a .docx template and asks to fill or edit it, first read the template, then use fillDocumentTemplate with exact anchors from the returned DOCX structure. Never substitute generateFile: it creates a new document and cannot preserve the source package, styles, headers, footers, relationships, or layout.',
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when file action=generate or action=download succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- file action=generate uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, inspect its returned rendered pages, and regenerate at most once when visual evidence shows a layout defect. Return only the final verified artifact link.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- Parallelism is mandatory when the request contains two or more independent URLs, documents, pages, research questions, comparisons, or test branches whose results do not depend on one another. After discovering any needed root links, call spawnSubagents before reading those items serially in the main Agent, with one self-contained child task per independent item (for example, eight links become eight tasks in one batch). Keep dependent steps, multiple actions on the same interactive page, final synthesis, and externally consequential operations in the main Agent. After the batch barrier, call readSubagent once per returned UUID in later model steps and synthesize all results. Do not skip subagents merely because the main Agent could perform the work sequentially.',
+    '- Parallelism is mandatory when a request contains two or more independent URLs, documents, pages, research questions, comparisons, or test branches. Call subagent action=spawn with one self-contained task per item, then call subagent action=read once per returned UUID in later model steps. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
-      ? '- To upload a user attachment to a web file input, do not call readFile merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files, call downloadFile with the known URL. To create a new file, call generateFile; to fill an uploaded .docx template, call fillDocumentTemplate.'
-      : '- Use downloadFile for existing remote files, generateFile for new text/PDF/Office files, fillDocumentTemplate for uploaded .docx templates, and readFile for registered files.',
+      ? '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use file action=generate.'
+      : '- Use file action=download for existing remote files, action=generate for new text/PDF/Office files, and action=read for registered files.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
@@ -1620,13 +1613,9 @@ function runtimeToolNames(mode: BrowserSessionMode) {
     'readBrowserState',
     ...operationTools,
     'waitForHumanVerification',
-    'spawnSubagents',
-    'readSubagent',
-    'readFile',
-    'readSkill',
-    'downloadFile',
-    'generateFile',
-    'fillDocumentTemplate',
+    'subagent',
+    'file',
+    'skill',
     'reportState',
   ];
 }
@@ -1639,7 +1628,7 @@ const browserSessionToolNames = new Set([
   'interact',
   'inspect',
   'waitForHumanVerification',
-  'spawnSubagents',
+  'subagent',
 ]);
 
 function toolRequiresBrowserSession(name: string) {
@@ -2140,10 +2129,8 @@ async function executeRuntimeStep(input: {
     const externalToolNames = new Set(Object.keys(externalTools));
     const availableRuntimeToolNames = [...runtimeToolNames(mode), ...externalToolNames].filter((name) => (
       (name !== 'takeScreenshot' || screenshotToolEnabled)
-      && (name !== 'spawnSubagents' || Boolean(input.runSubagents))
-      && (name !== 'readSubagent' || Boolean(input.readSubagent))
-      && (name !== 'readFile' || Boolean(input.readFile))
-      && (name !== 'readSkill' || Boolean(input.readSkill))
+      && (name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent))
+      && (name !== 'skill' || Boolean(input.readSkill))
     ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode: true,
@@ -2547,10 +2534,10 @@ async function executeRuntimeStep(input: {
       const activeTools = browserStateGatePending
         ? stepAllowedToolTypes as Array<keyof typeof toolsForRequest>
         : requiredSubagentUuid
-          ? ['readSubagent'] as Array<keyof typeof toolsForRequest>
+          ? ['subagent'] as Array<keyof typeof toolsForRequest>
           : undefined;
       const toolChoice = !browserStateGatePending && requiredSubagentUuid
-        ? { type: 'tool' as const, toolName: 'readSubagent' as keyof typeof toolsForRequest }
+        ? { type: 'tool' as const, toolName: 'subagent' as keyof typeof toolsForRequest }
         : undefined;
       return {
         system: requestSystemPrompt || undefined,
@@ -2629,8 +2616,8 @@ async function executeRuntimeStep(input: {
         onReferenceImage: ({ path, source }) => {
           if (!modelSupportsScreenshotInput()) return;
           pendingObservationMessages.push({
-            text: source === 'readFile'
-              ? '[附件视觉内容]\nreadFile 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片、图表和模板内容。'
+            text: source === 'file' || source === 'readFile'
+              ? '[附件视觉内容]\nfile action=read 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片和图表。'
               : '[browserCode visual output]\nThe JavaScript cell emitted this image. Use it as fresh visual evidence for the next decision.',
             imagePaths: [path],
           });
@@ -2706,8 +2693,8 @@ async function executeRuntimeStep(input: {
       onReferenceImage: ({ path, source }) => {
         if (!modelSupportsScreenshotInput()) return;
         pendingObservationMessages.push({
-          text: source === 'readFile'
-            ? '[附件视觉内容]\nreadFile 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片、图表和模板内容。'
+          text: source === 'file' || source === 'readFile'
+            ? '[附件视觉内容]\nfile action=read 已从原始附件渲染或提取这张图像。请结合附件结构和文本直接分析其中的布局、图片和图表。'
             : '[显式视觉内容]\n工具返回了一张图片；该图片已附加到下一轮模型请求。请直接基于图片内容进行分析。',
           imagePaths: [path],
         });
@@ -3331,7 +3318,7 @@ export async function executeInteractiveBrowserTurn(input: {
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
-        allowedToolTypes: requiredSubagentUuid ? ['readBrowserState', 'readSubagent'] : input.allowedToolTypes,
+        allowedToolTypes: requiredSubagentUuid ? ['readBrowserState', 'subagent'] : input.allowedToolTypes,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
@@ -3451,7 +3438,7 @@ export async function executeInteractiveBrowserTurn(input: {
       await input.onDebug?.({
         phase: 'chat:subagent-read-required',
         stepIndex,
-        message: `${pendingSubagentUuids.length} completed child Agent result(s) remain unread; forcing readSubagent before final synthesis.`,
+        message: `${pendingSubagentUuids.length} completed child Agent result(s) remain unread; forcing subagent action=read before final synthesis.`,
         details: { pendingSubagentUuids },
       });
       continue;
@@ -3813,6 +3800,34 @@ export async function executeRecordedBrowserOperation(
     }
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
+    case 'file':
+      if (input.action === 'download') {
+        return downloadFileArtifact({
+          runId,
+          url: typeof input.url === 'string' ? input.url : undefined,
+          path: typeof input.path === 'string' ? input.path : undefined,
+          urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
+          sourcePageUrl: session.currentUrl(),
+          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        });
+      }
+      if (input.action === 'generate') {
+        return generateFileArtifact({
+          runId,
+          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+          documentType: input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation'
+            ? input.documentType
+            : undefined,
+          title: typeof input.title === 'string' ? input.title : undefined,
+          subtitle: typeof input.subtitle === 'string' ? input.subtitle : undefined,
+          content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
+          theme: generatedFileThemeSchema.safeParse(input.theme).data,
+          sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
+          slides: generatedFileSlidesSchema.safeParse(input.slides).data,
+          includeVisualVerification: modelSupportsScreenshotInput(),
+        });
+      }
+      return { ok: false, actual: `Unsupported recorded file action: ${String(input.action || '')}.${reason}` };
     case 'downloadFile':
       return downloadFileArtifact({
         runId,
@@ -3836,29 +3851,6 @@ export async function executeRecordedBrowserOperation(
         sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
         slides: generatedFileSlidesSchema.safeParse(input.slides).data,
         includeVisualVerification: modelSupportsScreenshotInput(),
-      });
-    case 'fillDocumentTemplate':
-      return fillDocumentTemplateArtifact({
-        runId,
-        templateAttachmentId: typeof input.templateAttachmentId === 'string' ? input.templateAttachmentId : undefined,
-        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-        includeVisualVerification: modelSupportsScreenshotInput(),
-        operations: Array.isArray(input.operations) ? input.operations.flatMap((value) => {
-          if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
-          const operation = value as Record<string, unknown>;
-          const target = operation.target === 'nextCell' || operation.target === 'followingParagraph' || operation.target === 'replaceText'
-            ? operation.target
-            : undefined;
-          if (typeof operation.anchor !== 'string' || typeof operation.content !== 'string' || !target) return [];
-          return [{
-            anchor: operation.anchor,
-            content: operation.content,
-            target,
-            occurrence: typeof operation.occurrence === 'number' ? operation.occurrence : undefined,
-            allowOverwrite: operation.allowOverwrite === true,
-          }];
-        }) : undefined,
-        attachmentBindings,
       });
     case 'reportState':
       return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };
@@ -3916,7 +3908,7 @@ async function executeCodexRuntimeObject(input: {
   }
 
   const normalizedParams = { ...params };
-  if (type === 'readFile') {
+  if (type === 'file' && normalizedParams.action === 'read') {
     normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
     normalizedParams.pages = Array.isArray(normalizedParams.pages)
       ? Array.from(new Set(normalizedParams.pages
@@ -3935,8 +3927,8 @@ async function executeCodexRuntimeObject(input: {
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
   const runTool = async (toolCallId?: string) => {
-    if (type === 'spawnSubagents') {
-      if (!runSubagents) return { ok: false, actual: 'spawnSubagents is unavailable in this runtime.' };
+    if (type === 'subagent' && normalizedParams.action === 'spawn') {
+      if (!runSubagents) return { ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' };
       const tasks = Array.isArray(normalizedParams.tasks) ? normalizedParams.tasks.flatMap((raw): BrowserChatSubagentTask[] => {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
         const item = raw as Record<string, unknown>;
@@ -3945,20 +3937,20 @@ async function executeCodexRuntimeObject(input: {
         if (!title || !instruction) return [];
         return [{ title, instruction, url: typeof item.url === 'string' ? item.url : undefined }];
       }).slice(0, 12) : [];
-      if (!tasks.length) return { ok: false, actual: 'spawnSubagents requires at least one valid task.' };
+      if (!tasks.length) return { ok: false, actual: 'subagent action=spawn requires at least one valid task.' };
       return runSubagents(tasks, abortSignal, toolCallId);
     }
-    if (type === 'readSubagent') {
-      if (!readSubagent) return { ok: false, actual: 'readSubagent is unavailable in this runtime.' };
+    if (type === 'subagent' && normalizedParams.action === 'read') {
+      if (!readSubagent) return { ok: false, actual: 'subagent action=read is unavailable in this runtime.' };
       const uuid = typeof normalizedParams.uuid === 'string' ? normalizedParams.uuid.trim() : '';
-      if (!uuid) return { ok: false, actual: 'readSubagent requires one UUID.' };
+      if (!uuid) return { ok: false, actual: 'subagent action=read requires one UUID.' };
       return readSubagent(uuid);
     }
-    if (type === 'readFile') {
-      if (!readFile) return { ok: false, actual: 'readFile is unavailable in this runtime.' };
+    if (type === 'file' && normalizedParams.action === 'read') {
+      if (!readFile) return { ok: false, actual: 'file action=read is unavailable in this runtime.' };
       const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : undefined;
       const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : undefined;
-      if (Boolean(attachmentId) === Boolean(artifactId)) return { ok: false, actual: 'readFile requires exactly one attachmentId or artifactId.' };
+      if (Boolean(attachmentId) === Boolean(artifactId)) return { ok: false, actual: 'file action=read requires exactly one attachmentId or artifactId.' };
       return readFile({
         attachmentId,
         artifactId,
@@ -3968,10 +3960,10 @@ async function executeCodexRuntimeObject(input: {
         pages: Array.isArray(normalizedParams.pages) ? normalizedParams.pages as number[] : undefined,
       });
     }
-    if (type === 'readSkill') {
-      if (!readSkill) return { ok: false, actual: 'readSkill is unavailable in this runtime.' };
+    if (type === 'skill' && normalizedParams.action === 'read') {
+      if (!readSkill) return { ok: false, actual: 'skill action=read is unavailable in this runtime.' };
       const skillId = typeof normalizedParams.skillId === 'string' ? normalizedParams.skillId.trim() : '';
-      if (!skillId) return { ok: false, actual: 'readSkill requires one Skill id.' };
+      if (!skillId) return { ok: false, actual: 'skill action=read requires one Skill id.' };
       return readSkill(skillId);
     }
     return executeRecordedBrowserOperation(session, flow, {

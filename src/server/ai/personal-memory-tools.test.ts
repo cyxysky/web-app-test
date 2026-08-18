@@ -25,7 +25,8 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       sourceMessageIds: ['message-1'],
       userMessages: ['From now on, always use DOM inspection before screenshots.'],
     });
-    const saved = await execute(saveTools, 'saveMemory', {
+    const saved = await execute(saveTools, 'memory', {
+      action: 'save',
       scope: 'global',
       type: 'preference',
       key: 'browser inspection method',
@@ -45,12 +46,14 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       readOnly: true,
       usedMemoryIds,
     });
-    const searched = await execute(searchTools, 'searchMemory', {
+    const searched = await execute(searchTools, 'memory', {
+      action: 'search',
       query: 'DOM first browser inspection method',
     }) as { items: Array<{ id: string; value: string }> };
     assert.equal(searched.items[0]?.id, saved.item.id);
     assert.equal(searched.items[0]?.value, 'Use DOM inspection before screenshots.');
-    await execute(searchTools, 'searchMemory', {
+    await execute(searchTools, 'memory', {
+      action: 'search',
       query: 'DOM first browser inspection method',
     });
     const memoryModule = await import('./personal-memory');
@@ -73,11 +76,11 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       value: 'Use Wiki documentation workflow.',
     });
     currentUrl = 'https://domp.example.com/project';
-    const dompSearch = await execute(searchTools, 'searchMemory', { query: 'active project system' }) as { items: Array<{ id: string }> };
+    const dompSearch = await execute(searchTools, 'memory', { action: 'search', query: 'active project system' }) as { items: Array<{ id: string }> };
     assert.equal(dompSearch.items.some((item) => item.id === dompMemory.id), true);
     assert.equal(dompSearch.items.some((item) => item.id === wikiMemory.id), false);
     currentUrl = 'https://wiki.example.com/page';
-    const wikiSearch = await execute(searchTools, 'searchMemory', { query: 'active project system' }) as { items: Array<{ id: string }> };
+    const wikiSearch = await execute(searchTools, 'memory', { action: 'search', query: 'active project system' }) as { items: Array<{ id: string }> };
     assert.equal(wikiSearch.items.some((item) => item.id === wikiMemory.id), true);
     assert.equal(wikiSearch.items.some((item) => item.id === dompMemory.id), false);
 
@@ -86,7 +89,8 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       currentUrl: 'https://example.com',
       userMessages: ['Please inspect this page once.'],
     });
-    await assert.rejects(() => execute(invalidWrite, 'saveMemory', {
+    await assert.rejects(() => execute(invalidWrite, 'memory', {
+      action: 'save',
       scope: 'global',
       type: 'preference',
       key: 'invented preference',
@@ -100,7 +104,8 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       currentUrl: 'https://example.com',
       userMessages: ['Update the memory: change the browser inspection method to accessibility tree first.'],
     });
-    const updated = await execute(updateTools, 'updateMemory', {
+    const updated = await execute(updateTools, 'memory', {
+      action: 'update',
       id: saved.item.id,
       value: 'Use the accessibility tree before screenshots.',
       evidence: ['Update the memory: change the browser inspection method to accessibility tree first.'],
@@ -112,7 +117,8 @@ test('personal memory tools keep SQLite storage and enforce user-authored write 
       currentUrl: 'https://example.com',
       userMessages: ['Forget this browser inspection preference.'],
     });
-    const disabled = await execute(disableTools, 'disableMemory', {
+    const disabled = await execute(disableTools, 'memory', {
+      action: 'disable',
       id: saved.item.id,
       evidence: ['Forget this browser inspection preference.'],
     }) as { item: { status: string } };

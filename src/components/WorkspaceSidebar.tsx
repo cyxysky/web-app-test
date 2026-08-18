@@ -29,6 +29,7 @@ type WorkspaceNavItemProps = {
 export function WorkspaceNavItem({ active = false, href, icon, label, onClick }: WorkspaceNavItemProps) {
   const className = active ? 'browser-chat-nav-item active' : 'browser-chat-nav-item';
   const visibleLabel = href === '/browser-chat' ? label.replace(/(?:模式| Mode)$/u, '') : label;
+
   if (onClick) {
     return (
       <button aria-current={active ? 'page' : undefined} aria-label={label} className={className} onClick={onClick} title={label} type="button">

@@ -14,10 +14,7 @@ import {
 } from '@/server/ai/personal-memory';
 
 export const personalMemoryToolNames = [
-  'searchMemory',
-  'saveMemory',
-  'updateMemory',
-  'disableMemory',
+  'memory',
 ] as const;
 
 export type PersonalMemoryToolName = (typeof personalMemoryToolNames)[number];
@@ -112,97 +109,106 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
     unusedIds.forEach((id) => usedMemoryIds.add(id));
   };
 
+  const inputSchema = z.discriminatedUnion('action', [
+    z.object({
+      action: z.literal('search'),
+      query: z.string().min(1).max(1_000),
+      limit: z.number().int().min(1).max(20).optional(),
+    }),
+    z.object({
+      action: z.literal('save'),
+      ...memoryDraftShape,
+      evidence: evidenceSchema,
+      durability: durabilitySchema,
+    }),
+    z.object({
+      action: z.literal('update'),
+      id: z.string().min(1).max(160),
+      scope: memoryScopeSchema.optional(),
+      domain: z.string().max(253).optional(),
+      type: memoryTypeSchema.optional(),
+      key: z.string().min(1).max(120).optional(),
+      aliases: z.array(z.string().min(1).max(120)).max(8).optional(),
+      value: z.string().min(1).max(500).optional(),
+      confidence: z.number().min(0).max(1).optional(),
+      evidence: evidenceSchema,
+    }),
+    z.object({
+      action: z.literal('disable'),
+      id: z.string().min(1).max(160),
+      evidence: evidenceSchema,
+    }),
+  ]).superRefine((input, refinement) => {
+    if (input.action !== 'update') return;
+    if (
+      input.scope === undefined
+      && input.domain === undefined
+      && input.type === undefined
+      && input.key === undefined
+      && input.aliases === undefined
+      && input.value === undefined
+      && input.confidence === undefined
+    ) refinement.addIssue({ code: z.ZodIssueCode.custom, message: 'Provide at least one memory field to update.' });
+  });
+
   return {
-    searchMemory: tool({
-      description: 'Search the current user\'s durable SQLite personal memory. Use this only when injected short memory is insufficient or the user explicitly asks what is remembered. Results are scoped to the current user and current domain.',
-      inputSchema: z.object({
-        query: z.string().min(1).max(1_000),
-        limit: z.number().int().min(1).max(20).optional(),
-      }),
-      execute: async ({ query, limit }) => {
-        const results = searchPersonalMemory({
-          userId,
-          query,
-          domain: currentDomain(),
-          limit,
-        });
-        markUsedOnce(results.map((result) => result.item.id));
-        return {
-          items: results.map((result) => ({
-            ...toolMemoryItem(result.item),
-            score: result.score,
-            reasons: result.reasons,
-          })),
-        };
-      },
-    }),
-    saveMemory: tool({
-      description: 'Create or upsert one durable personal memory only when the user explicitly states a lasting preference/workflow/alias, asks to remember it, or independently repeats the same behavior. Evidence must quote the user exactly; never store assistant discoveries, page content, secrets, or one-off task data.',
-      inputSchema: z.object({
-        ...memoryDraftShape,
-        evidence: evidenceSchema,
-        durability: durabilitySchema,
-      }),
+    memory: tool({
+      description: 'Manage the current user\'s durable personal memory through one action-based tool. Use action=search only when injected memory is insufficient or the user asks what is remembered; action=save only for an explicit durable preference/workflow/alias/remember request; action=update or action=disable only when the user explicitly asks to change or forget a known memory. Never store assistant discoveries, page content, secrets, or one-off task data.',
+      inputSchema,
       execute: async (input) => {
-        assertWritable(context);
-        const draft = durableDraft(input, context);
-        const domain = draft.scope === 'domain' ? draft.domain || currentDomain() : '';
-        if (draft.scope === 'domain' && !domain) {
-          throw new Error('Domain-scoped memory requires a current URL or an explicit domain.');
+        if (input.action === 'search') {
+          const { query, limit } = input;
+          const results = searchPersonalMemory({
+            userId,
+            query,
+            domain: currentDomain(),
+            limit,
+          });
+          markUsedOnce(results.map((result) => result.item.id));
+          return {
+            items: results.map((result) => ({
+              ...toolMemoryItem(result.item),
+              score: result.score,
+              reasons: result.reasons,
+            })),
+          };
         }
-        const item = savePersonalMemoryItem({
-          ...draft,
-          userId,
-          domain,
-          sourceSessionId: context.sourceSessionId,
-          sourceMessageIds: context.sourceMessageIds,
-          sourceUrl: currentUrl(),
-        });
-        return { item: toolMemoryItem(item) };
-      },
-    }),
-    updateMemory: tool({
-      description: 'Update one existing personal memory when the current user explicitly asks to change that remembered fact. Supply exact user evidence for the change. The memory ID must come from searchMemory or injected runtime context.',
-      inputSchema: z.object({
-        id: z.string().min(1).max(160),
-        scope: memoryScopeSchema.optional(),
-        domain: z.string().max(253).optional(),
-        type: memoryTypeSchema.optional(),
-        key: z.string().min(1).max(120).optional(),
-        aliases: z.array(z.string().min(1).max(120)).max(8).optional(),
-        value: z.string().min(1).max(500).optional(),
-        confidence: z.number().min(0).max(1).optional(),
-        evidence: evidenceSchema,
-      }).refine((input) => (
-        input.scope !== undefined
-        || input.domain !== undefined
-        || input.type !== undefined
-        || input.key !== undefined
-        || input.aliases !== undefined
-        || input.value !== undefined
-        || input.confidence !== undefined
-      ), { message: 'Provide at least one memory field to update.' }),
-      execute: async ({ id, evidence, ...patch }) => {
-        assertWritable(context);
-        if (!explicitMemoryManagementRequest(context, evidence)) {
-          throw new Error('Memory update rejected: the current user must explicitly request the memory change.');
+
+        if (input.action === 'save') {
+          assertWritable(context);
+          const draft = durableDraft(input, context);
+          const domain = draft.scope === 'domain' ? draft.domain || currentDomain() : '';
+          if (draft.scope === 'domain' && !domain) {
+            throw new Error('Domain-scoped memory requires a current URL or an explicit domain.');
+          }
+          const item = savePersonalMemoryItem({
+            ...draft,
+            userId,
+            domain,
+            sourceSessionId: context.sourceSessionId,
+            sourceMessageIds: context.sourceMessageIds,
+            sourceUrl: currentUrl(),
+          });
+          return { item: toolMemoryItem(item) };
         }
-        const existing = getPersonalMemoryItem(id, userId);
-        if (!existing || (existing.userId !== userId && existing.shared)) {
-          throw new Error('Personal memory was not found or is not editable by the current user.');
+
+        if (input.action === 'update') {
+          const { action: _action, id, evidence, ...patch } = input;
+          void _action;
+          assertWritable(context);
+          if (!explicitMemoryManagementRequest(context, evidence)) {
+            throw new Error('Memory update rejected: the current user must explicitly request the memory change.');
+          }
+          const existing = getPersonalMemoryItem(id, userId);
+          if (!existing || (existing.userId !== userId && existing.shared)) {
+            throw new Error('Personal memory was not found or is not editable by the current user.');
+          }
+          const item = updatePersonalMemoryItem(id, patch, userId);
+          if (!item) throw new Error('Personal memory was not found.');
+          return { item: toolMemoryItem(item) };
         }
-        const item = updatePersonalMemoryItem(id, patch, userId);
-        if (!item) throw new Error('Personal memory was not found.');
-        return { item: toolMemoryItem(item) };
-      },
-    }),
-    disableMemory: tool({
-      description: 'Disable one existing personal memory when the current user explicitly asks to forget, remove, or stop using it. Supply exact user evidence. This is recoverable and does not physically delete the SQLite record.',
-      inputSchema: z.object({
-        id: z.string().min(1).max(160),
-        evidence: evidenceSchema,
-      }),
-      execute: async ({ id, evidence }) => {
+
+        const { id, evidence } = input;
         assertWritable(context);
         if (!explicitMemoryManagementRequest(context, evidence)) {
           throw new Error('Memory disable rejected: the current user must explicitly ask to forget or disable it.');

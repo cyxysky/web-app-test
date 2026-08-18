@@ -12,7 +12,9 @@ function combinedRules(screenshotAvailable: boolean) {
 
 test('browserCode rules describe direct Playwright execution with bounded operations', () => {
   const rules = combinedRules(true);
-  assert.match(rules, /primary browser inspection and operation tool/);
+  assert.match(rules, /real browser inspection and operation tool/);
+  assert.match(rules, /page\.goto\(url\)/);
+  assert.match(rules, /Never claim these capabilities are unavailable/);
   assert.match(rules, /ordinary JavaScript cell/);
   assert.match(rules, /real Playwright page and context objects/);
   assert.match(rules, /ordinary Playwright APIs directly/);
@@ -38,7 +40,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /never read the filled field value/);
   assert.match(rules, /attachmentVault\.setInputFiles/);
-  assert.match(rules, /upload-only request, do not call readFile/i);
+  assert.match(rules, /upload-only request, do not call file/i);
   assert.match(rules, /FileChooser\.setFiles/);
   assert.match(rules, /exactly one attachment at the requested destination/i);
   assert.match(rules, /incremental domChanges/);

@@ -36,7 +36,7 @@ test('Skill prompt exposes tagged summaries without injecting full content', () 
   assert.match(prompt, /<skill id="skill-search-room" version="1" index="1">/);
   assert.equal((prompt.match(/通过主播名进入指定直播间/g) || []).length, 1);
   assert.match(prompt, /Triggers: 打开指定主播直播间/);
-  assert.match(prompt, /call readSkill/);
+  assert.match(prompt, /call skill with action="read"/);
   assert.doesNotMatch(prompt, /打开直播平台并定位主播搜索入口/);
   assert.doesNotMatch(prompt, /搜索建议未出现时改用房间号/);
   assert.doesNotMatch(prompt, /地址和页面标题均对应目标主播/);

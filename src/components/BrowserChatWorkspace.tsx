@@ -966,6 +966,10 @@ function summarizeToolFields(fields: unknown, t: (value: string, params?: Record
 function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
+    file: '文件操作',
+    memory: '记忆管理',
+    skill: '读取 Skill',
+    subagent: '子 Agent',
     downloadFile: '下载文件',
     fillDocumentTemplate: '填充文档模板',
     generateFile: '生成文件',
@@ -998,6 +1002,18 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
 
   const lower = name.toLowerCase();
   if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
+  if (name === 'file') {
+    const action = toolInputValue(record, ['action']);
+    const actionLabel = action === 'read' ? t('读取') : action === 'download' ? t('下载') : action === 'generate' ? t('生成') : action;
+    return [actionLabel, toolInputValue(record, ['fileName', 'attachmentId', 'artifactId', 'url', 'path'])].filter(Boolean).join(' · ');
+  }
+  if (name === 'subagent') {
+    return record.action === 'spawn' && Array.isArray(record.tasks)
+      ? t('{count} 个任务', { count: record.tasks.length })
+      : toolInputValue(record, ['uuid', 'action']);
+  }
+  if (name === 'skill') return toolInputValue(record, ['skillId', 'action']);
+  if (name === 'memory') return toolInputValue(record, ['action', 'query', 'key', 'id']);
   if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
   if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? t('{count} 个任务', { count: record.tasks.length }) : '';
@@ -1009,6 +1025,11 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
   if (lower.includes('find')) return toolInputValue(record, ['targetText', 'scopeId']);
   if (lower.includes('text')) return toolInputValue(record, ['text', 'targetText', 'id']);
   return toolInputValue(record, ['url', 'text', 'query', 'action', 'status']);
+}
+
+function isSubagentSpawnTool(name: string, input: unknown) {
+  if (name === 'spawnSubagents') return true;
+  return name === 'subagent' && asRecord(input)?.action === 'spawn';
 }
 
 function BrowserChatToolIcon({ name }: { name: string }) {
@@ -2799,11 +2820,11 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           : toolUserActionForTool(logs, step.index, tool.name, tool.input);
         return (
           <div
-            className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}
+            className={`browser-chat-tool-call${isSubagentSpawnTool(tool.name, tool.input) ? ' has-subagents' : ''}`}
             key={`${step.index}-${toolIndex}-${tool.name}`}
           >
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
-            {tool.name === 'spawnSubagents' ? (
+            {isSubagentSpawnTool(tool.name, tool.input) ? (
               <BrowserChatSubagentToolDisclosure
                 cardContent={(
                   <BrowserChatToolCardContent label={label} meta={meta} name={tool.name} userAction={userAction} />
@@ -2957,8 +2978,8 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
             </summary>
             <div className="browser-chat-ai-cycle-tools">
-              <div className={`browser-chat-tool-call${tool.name === 'spawnSubagents' ? ' has-subagents' : ''}`}>
-                {tool.name === 'spawnSubagents' ? (
+              <div className={`browser-chat-tool-call${isSubagentSpawnTool(tool.name, tool.input) ? ' has-subagents' : ''}`}>
+                {isSubagentSpawnTool(tool.name, tool.input) ? (
                   <BrowserChatSubagentToolDisclosure
                     cardContent={card}
                     className={stateClass}
@@ -4801,6 +4822,53 @@ function BrowserChatModeSelector({
   );
 }
 
+const BROWSER_CHAT_INLINE_TEXT_CLASS = 'browser-chat-inline-text';
+
+function normalizeBrowserChatEditorText(editor: HTMLElement | null) {
+  if (!editor) return;
+
+  const nestedTokens = Array.from(editor.querySelectorAll<HTMLElement>(
+    `.${BROWSER_CHAT_INLINE_TEXT_CLASS} > [data-skill-id], .${BROWSER_CHAT_INLINE_TEXT_CLASS} > [data-attachment-id]`,
+  ));
+  nestedTokens.forEach((token) => {
+    const textSpan = token.parentElement;
+    if (!textSpan?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)) return;
+
+    const trailingSpan = document.createElement('span');
+    trailingSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
+    while (token.nextSibling) trailingSpan.append(token.nextSibling);
+    textSpan.after(token);
+    if (trailingSpan.childNodes.length) token.after(trailingSpan);
+    if (!textSpan.childNodes.length) textSpan.remove();
+  });
+
+  const textNodes: Text[] = [];
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+  let current = walker.nextNode();
+  while (current) {
+    textNodes.push(current as Text);
+    current = walker.nextNode();
+  }
+
+  textNodes.forEach((textNode) => {
+    const parent = textNode.parentElement;
+    if (
+      !textNode.data
+      || !parent
+      || parent.closest('[data-skill-id],[data-attachment-id]')
+      || parent.closest(`.${BROWSER_CHAT_INLINE_TEXT_CLASS}`)
+    ) return;
+    const textSpan = document.createElement('span');
+    textSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
+    textNode.before(textSpan);
+    textSpan.append(textNode);
+  });
+
+  editor.querySelectorAll<HTMLElement>(`.${BROWSER_CHAT_INLINE_TEXT_CLASS}`).forEach((textSpan) => {
+    if (!textSpan.textContent) textSpan.remove();
+  });
+}
+
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
   availableSkills,
@@ -4867,6 +4935,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   void onModeChange;
   const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
+  const composingRef = useRef(false);
   const [draft, setDraft] = useState('');
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
@@ -4894,7 +4963,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (node.tagName === 'BR') return '\n';
       return Array.from(node.childNodes).map(walk).join('');
     };
-    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+    return Array.from(root.childNodes).map(walk).join('')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\u200B/g, '');
   }, []);
 
   const attachmentFromToken = useCallback((node: HTMLElement) => {
@@ -4922,7 +4993,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (node.tagName === 'BR') return '\n';
       return Array.from(node.childNodes).map(walk).join('');
     };
-    return Array.from(root.childNodes).map(walk).join('').replace(/\u00A0/g, ' ');
+    return Array.from(root.childNodes).map(walk).join('')
+      .replace(/\u00A0/g, ' ')
+      .replace(/\u200B/g, '');
   }, []);
 
   const editorAttachmentsForSubmit = useCallback(() => {
@@ -4939,8 +5012,50 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     return next;
   }, [attachmentFromToken]);
 
+  const ensureEmptyEditorLine = useCallback((editor: HTMLElement | null) => {
+    if (
+      !editor
+      || editor.querySelector('[data-skill-id],[data-attachment-id]')
+      || (editor.textContent || '').replace(/[\u00A0\u200B]/g, '').trim()
+    ) return false;
+
+    let textSpan = editor.childNodes.length === 1
+      && editor.firstElementChild?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)
+      ? editor.firstElementChild as HTMLElement
+      : null;
+    if (!textSpan) {
+      editor.innerHTML = '';
+      textSpan = document.createElement('span');
+      textSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
+      editor.append(textSpan);
+    }
+
+    let textNode = textSpan.childNodes.length === 1 && textSpan.firstChild?.nodeType === Node.TEXT_NODE
+      ? textSpan.firstChild as Text
+      : null;
+    if (!textNode) {
+      textSpan.textContent = '';
+      textNode = document.createTextNode('\u200B');
+      textSpan.append(textNode);
+    } else if (textNode.data !== '\u200B') {
+      textNode.data = '\u200B';
+    }
+
+    const selection = window.getSelection();
+    if (selection) {
+      const range = document.createRange();
+      range.setStart(textNode, 1);
+      range.collapse(true);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+    return true;
+  }, []);
+
   const syncEditorState = useCallback((options: { scrollToBottom?: boolean } = {}) => {
     const editor = editorRef.current;
+    if (!composingRef.current) normalizeBrowserChatEditorText(editor);
+    if (!composingRef.current && editor === document.activeElement) ensureEmptyEditorLine(editor);
     const skillIds = editor
       ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
       : [];
@@ -4951,7 +5066,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         editor.scrollTop = editor.scrollHeight;
       });
     }
-  }, [editorPlainText]);
+  }, [editorPlainText, ensureEmptyEditorLine]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -5058,8 +5173,16 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     return node instanceof HTMLElement && Boolean(node.dataset.skillId || node.dataset.attachmentId);
   }
 
+  function adjacentEditorSibling(node: Node, direction: 'next' | 'previous') {
+    const sibling = direction === 'previous' ? node.previousSibling : node.nextSibling;
+    if (sibling) return sibling;
+    const parent = node.parentElement;
+    if (!parent?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)) return null;
+    return direction === 'previous' ? parent.previousSibling : parent.nextSibling;
+  }
+
   function isBlankText(value: string) {
-    return value.replace(/\u00A0/g, ' ').trim() === '';
+    return value.replace(/\u00A0/g, ' ').replace(/\u200B/g, '').trim() === '';
   }
 
   function setEditorSelection(container: Node, offset: number) {
@@ -5075,11 +5198,31 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     selection.addRange(range);
   }
 
+  function normalizeTrailingTokenCaret() {
+    const editor = editorRef.current;
+    const selection = window.getSelection();
+    if (!editor || !selection?.rangeCount) return;
+    const range = selection.getRangeAt(0);
+    const textNode = range.startContainer;
+    if (
+      !range.collapsed
+      || textNode.nodeType !== Node.TEXT_NODE
+      || range.startOffset !== 0
+      || !editor.contains(textNode)
+    ) return;
+    const parent = textNode.parentElement;
+    if (
+      !parent?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)
+      || !isInlineToken(parent.previousSibling)
+      || !/^[\u00A0\u200B]/.test((textNode as Text).data)
+    ) return;
+    setEditorSelection(textNode, 1);
+  }
+
   function clearEditorIfBlank() {
     const editor = editorRef.current;
     if (!editor || editor.querySelector('[data-skill-id],[data-attachment-id]') || !isBlankText(editorPlainText(editor))) return false;
-    editor.innerHTML = '';
-    setEditorSelection(editor, 0);
+    ensureEmptyEditorLine(editor);
     return true;
   }
 
@@ -5130,7 +5273,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (container.nodeType === Node.TEXT_NODE) {
         const textNode = container as Text;
         const beforeCaret = textNode.data.slice(0, offset);
-        const previous = textNode.previousSibling;
+        const previous = adjacentEditorSibling(textNode, 'previous');
         if (isInlineToken(previous) && isBlankText(beforeCaret)) {
           textNode.data = textNode.data.slice(offset);
           removeInlineTokenNode(previous, { container: textNode, offset: 0 });
@@ -5142,8 +5285,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           removeInlineTokenNode(before, { container, offset: offset - 1 });
           return true;
         }
-        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isInlineToken(before.previousSibling)) {
-          const token = before.previousSibling;
+        const previous = before ? adjacentEditorSibling(before, 'previous') : null;
+        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isInlineToken(previous)) {
+          const token = previous;
           before.remove();
           removeInlineTokenNode(token, { container, offset: offset - 2 });
           return true;
@@ -5155,7 +5299,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (container.nodeType === Node.TEXT_NODE) {
         const textNode = container as Text;
         const afterCaret = textNode.data.slice(offset);
-        const next = textNode.nextSibling;
+        const next = adjacentEditorSibling(textNode, 'next');
         if (isInlineToken(next) && isBlankText(afterCaret)) {
           textNode.data = textNode.data.slice(0, offset);
           removeInlineTokenNode(next, { container: textNode, offset });
@@ -5167,8 +5311,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           removeInlineTokenNode(after, { container, offset });
           return true;
         }
-        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isInlineToken(after.nextSibling)) {
-          const token = after.nextSibling;
+        const next = after ? adjacentEditorSibling(after, 'next') : null;
+        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isInlineToken(next)) {
+          const token = next;
           after.remove();
           removeInlineTokenNode(token, { container, offset });
           return true;
@@ -5233,14 +5378,19 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
 
   function finishInlineTokenInsertion(range: Range, token: HTMLElement, scrollToBottom = false) {
     range.insertNode(token);
-    const trailingText = document.createTextNode('\u00A0');
+    normalizeBrowserChatEditorText(editorRef.current);
+
+    if (!token.previousSibling) {
+      const leadingSpan = document.createElement('span');
+      leadingSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
+      leadingSpan.append(document.createTextNode('\u200B'));
+      token.before(leadingSpan);
+    }
+
+    const trailingText = document.createTextNode('\u200B');
     token.after(trailingText);
-    const nextRange = document.createRange();
-    nextRange.setStart(trailingText, trailingText.data.length);
-    nextRange.collapse(true);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(nextRange);
+    normalizeBrowserChatEditorText(editorRef.current);
+    setEditorSelection(trailingText, trailingText.data.length);
     syncEditorState(scrollToBottom ? { scrollToBottom: true } : undefined);
   }
 
@@ -5363,7 +5513,25 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!busy && !loading}
+          onCompositionEnd={() => {
+            composingRef.current = false;
+            syncEditorState({ scrollToBottom: true });
+          }}
+          onCompositionStart={() => {
+            composingRef.current = true;
+          }}
           data-placeholder={t('问问题，尽管问')}
+          onBlur={(event) => {
+            const editor = event.currentTarget;
+            requestAnimationFrame(() => {
+              if (
+                document.activeElement !== editor
+                && !editor.querySelector('[data-skill-id],[data-attachment-id]')
+                && isBlankText(editorPlainText(editor))
+              ) editor.innerHTML = '';
+            });
+          }}
+          onFocus={() => syncEditorState()}
           onInput={() => syncEditorState({ scrollToBottom: true })}
           onMouseDown={(event) => {
             const removeButton = (event.target as HTMLElement).closest<HTMLElement>('.browser-chat-inline-token-remove');
@@ -5374,6 +5542,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             removeInlineTokenNode(token);
             requestAnimationFrame(() => editorRef.current?.focus());
           }}
+          onMouseUp={() => normalizeTrailingTokenCaret()}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
             if (event.key === 'Backspace' || event.key === 'Delete') {
@@ -5411,6 +5580,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           }}
           onKeyUp={(event) => {
             if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState({ scrollToBottom: true });
+            if (event.key === 'ArrowRight') normalizeTrailingTokenCaret();
           }}
           onPaste={(event) => {
             const itemFiles = Array.from(event.clipboardData.items || [])

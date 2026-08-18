@@ -36,7 +36,7 @@ test('appends only missing current-turn Artifact download links', () => {
   const reply = `第一个文件：[first.md](${firstUrl})`;
   const result = appendMissingFileArtifactDownloadLinks(reply, [
     {
-      name: 'generateFile',
+      name: 'file',
       result: {
         ok: true,
         actual: JSON.stringify({
@@ -47,7 +47,7 @@ test('appends only missing current-turn Artifact download links', () => {
       },
     },
     {
-      name: 'generateFile',
+      name: 'file',
       result: {
         ok: true,
         actual: JSON.stringify({
@@ -95,11 +95,11 @@ test('repairs multiple model-authored Artifact links by their verified file labe
     '[first.md](/webpilot/api/artifacts/chat_test/generated/wrong-first.md?download=1)\n[second.docx](/webpilot/api/artifacts/chat_test/generated/wrong-second.docx?download=1)',
     [
       {
-        name: 'generateFile',
+        name: 'file',
         result: { ok: true, actual: JSON.stringify({ artifactId: 'chat_test/generated/first.md', downloadUrl: firstUrl, fileName: 'first.md' }) },
       },
       {
-        name: 'generateFile',
+        name: 'file',
         result: { ok: true, actual: JSON.stringify({ artifactId: 'chat_test/generated/second.docx', downloadUrl: secondUrl, fileName: 'second.docx' }) },
       },
     ],
@@ -114,7 +114,7 @@ test('does not expose failed or non-Artifact file tool URLs', () => {
   const reply = '生成失败。';
   const result = appendMissingFileArtifactDownloadLinks(reply, [
     {
-      name: 'generateFile',
+      name: 'file',
       result: {
         ok: false,
         actual: JSON.stringify({
@@ -125,7 +125,7 @@ test('does not expose failed or non-Artifact file tool URLs', () => {
       },
     },
     {
-      name: 'downloadFile',
+      name: 'file',
       result: {
         ok: true,
         actual: JSON.stringify({

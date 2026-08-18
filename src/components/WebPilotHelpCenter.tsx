@@ -113,7 +113,7 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
               <section>
                 <h3>{t('常见问题')}</h3>
                 <details><summary>{t('为什么有些操作需要确认？')}</summary><p>{t('严格安全模式会在提交、删除、上传和其他会产生外部影响的操作前请求确认。')}</p></details>
-                <details><summary>{t('文件为什么没有自动全文读取？')}</summary><p>{t('附件默认只提供名称、类型和大小，避免把无关大文件全部放进模型上下文。需要分析时模型会调用 readFile 分段读取。')}</p></details>
+                <details><summary>{t('文件为什么没有自动全文读取？')}</summary><p>{t('附件默认只提供名称、类型和大小，避免把无关大文件全部放进模型上下文。需要分析时模型会调用 file 的 read 操作分段读取。')}</p></details>
                 <details><summary>{t('浏览器登录状态在哪里？')}</summary><p>{t('登录状态保存在当前用户的受控浏览器配置中；每个对话只接管属于自己标签组的页面。')}</p></details>
               </section>
             </div>

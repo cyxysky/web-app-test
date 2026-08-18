@@ -1119,7 +1119,7 @@ async function readFileForSession(
   if (!attachment) {
     return {
       ok: false,
-      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 downloadFile/generateFile 返回的 Artifact ID。',
+      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 file action=download/action=generate 返回的 Artifact ID。',
     };
   }
   const result = await readBrowserChatAttachment({
@@ -3928,7 +3928,7 @@ function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
           uuid: record.uuid,
           title: record.title,
           status: record.status,
-          error: '该子 Agent 仍在执行中；spawnSubagents 的批次屏障尚未完成。',
+          error: '该子 Agent 仍在执行中；subagent action=spawn 的批次屏障尚未完成。',
         }),
       };
     }
@@ -4168,7 +4168,7 @@ async function executeBrowserChatSubagentBatch(input: {
       })),
       summary: `${completedCount}/${results.length} 个子 Agent 完成，${partialCount} 个失败分支保留了部分有效内容；任一失败均未中止其他分支。`,
       batchId,
-      next: '使用 readSubagent({ uuid }) 每次读取一个结果；如需读取其他结果，必须在后续模型步骤逐个调用。',
+      next: '使用 subagent({ action: "read", uuid }) 每次读取一个结果；如需读取其他结果，必须在后续模型步骤逐个调用。',
     }),
   };
 }

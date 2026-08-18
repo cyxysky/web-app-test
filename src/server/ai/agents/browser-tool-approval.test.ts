@@ -41,8 +41,8 @@ test('does not require approval for read-only page fetches', () => {
 
 test('requires approval before delivering a downloaded file', () => {
   const request = browserToolApprovalRequest({
-    toolName: 'downloadFile',
-    toolInput: { reason: '下载测试报告', artifactId: 'artifact-1' },
+    toolName: 'file',
+    toolInput: { action: 'download', reason: '下载测试报告', artifactId: 'artifact-1' },
   });
   assert.match(request?.prompt || '', /下载测试报告/);
 });

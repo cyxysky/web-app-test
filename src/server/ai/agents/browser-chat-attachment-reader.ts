@@ -56,7 +56,7 @@ export function isBrowserChatImageAttachment(attachment: BrowserChatReadableAtta
 }
 
 export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAttachment) {
-  return `[文件] ${attachment.name} | attachmentId: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 仅在任务需要分析文件内容时调用 readFile；纯上传不要读取或重建内容，使用浏览器运行时提供的受控附件上传接口。`;
+  return `[文件] ${attachment.name} | attachmentId: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 仅在任务需要分析文件内容时调用 file action=read；纯上传不要读取或重建内容，使用浏览器运行时提供的受控附件上传接口。`;
 }
 
 async function extractAttachmentText(attachment: BrowserChatReadableAttachment, buffer?: Buffer) {
@@ -81,7 +81,7 @@ async function extractAttachmentText(attachment: BrowserChatReadableAttachment, 
     ...(structure.commentTexts.length ? [`批注文本：${structure.commentTexts.map((text) => JSON.stringify(text)).join(' | ')}`] : []),
     ...(structure.footnoteTexts.length ? [`脚注文本：${structure.footnoteTexts.map((text) => JSON.stringify(text)).join(' | ')}`] : []),
     ...(structure.endnoteTexts.length ? [`尾注文本：${structure.endnoteTexts.map((text) => JSON.stringify(text)).join(' | ')}`] : []),
-    '原始 DOCX 包会一直保留；如需基于此模板填充，必须使用 fillDocumentTemplate，不能使用 generateFile 重建文档。表格标签后的空单元格使用 target=nextCell；标题后的空段落使用 target=followingParagraph；精确占位文本或日期使用 target=replaceText。',
+    '原始 DOCX 包会一直保留；file action=read 只提取结构和预览，不会改写原文件。',
     ...rows,
     ...(structure.followingParagraphAnchors.length ? [
       `标题后空段落候选：${structure.followingParagraphAnchors.map((anchor) => JSON.stringify(anchor)).join(' | ')}`,

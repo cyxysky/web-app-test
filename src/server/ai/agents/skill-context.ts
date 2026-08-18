@@ -104,8 +104,8 @@ export function formatSkillSummariesForPrompt(skills: SkillRecord[]) {
   if (!selected.length) return '';
   return [
     'Available Skill summaries for the current task and browser domain:',
-    'When a Skill is relevant, call readSkill with its id before performing the related browser actions. The complete current Skill is loaded into the next model context.',
-    'Do not call readSkill repeatedly while a Skill remains loaded. Prefer current page evidence when it contradicts a Skill.',
+    'When a Skill is relevant, call skill with action="read" and its id before performing the related browser actions. The complete current Skill is loaded into the next model context.',
+    'Do not call skill action="read" repeatedly while a Skill remains loaded. Prefer current page evidence when it contradicts a Skill.',
     ...selected.map((skill, index) => [
       '',
       `<skill id="${xmlAttribute(skill.id)}" version="${xmlAttribute(skill.version)}" index="${index + 1}">`,
