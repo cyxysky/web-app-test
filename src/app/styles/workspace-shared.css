@@ -747,6 +747,12 @@
     width: 100%;
   }
 
+  .browser-chat-layout.sidebar-collapsed .browser-chat-conversation-history .browser-chat-recent-list {
+    justify-items: start;
+    scrollbar-gutter: stable;
+    transform: none;
+  }
+
   /* Keep the 36px history button centered inside the 52px collapsed sidebar. */
   .browser-chat-layout.sidebar-collapsed .browser-chat-recent-panel {
     justify-self: center;
@@ -1934,6 +1940,70 @@
     position: absolute;
     top: 0;
     width: 3px;
+  }
+
+  /* Conversation history uses a compact, cardless selected state. */
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-group {
+    grid-template-columns: 4px minmax(0, 1fr);
+    row-gap: 0;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-group + .browser-chat-history-date-group {
+    margin-top: 4px;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-group::before,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-label::after {
+    content: none;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-label {
+    padding-top: 8px;
+    top: 0;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-date-items {
+    padding-top: 4px;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row {
+    border-radius: 8px;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row:not(.active):is(:hover, :focus-within) {
+    background: transparent;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row-title {
+    color: var(--foreground);
+    font-weight: 400;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row-open {
+    padding-left: 20px;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row.active,
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row.active:hover {
+    background: transparent;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row.active:not(.selecting)::before {
+    background: #1fa8a2;
+    border-radius: 50%;
+    bottom: auto;
+    height: 5px;
+    left: 6px;
+    pointer-events: none;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 5px;
+    z-index: 1;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .workspace-sidebar-archive-row.active .workspace-sidebar-archive-row-title {
+    color: var(--foreground);
+    font-weight: 600;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive-row.selecting {
