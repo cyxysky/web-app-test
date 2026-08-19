@@ -234,3 +234,4 @@ Recent completed user/assistant exchanges:
 2. User: 你不要并行读取子agent结果，你一个一个读取啊
    Assistant: 好的，明白了，我后续会一次只读取一个子agent的结果，逐个处理。
 The latest real user message in the native message chain remains the only current request.？？？？
+5.主子agent渲染的样式完全不同啊，我说了，子agent渲染的样式完全参照主agent实现
