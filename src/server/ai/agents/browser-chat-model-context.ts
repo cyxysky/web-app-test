@@ -49,6 +49,49 @@ export function serializableBrowserChatModelMessages(messages: ModelMessage[]) {
   return normalizeBrowserChatModelMessages(serializableValue(messages));
 }
 
+function modelMessageText(message: ModelMessage) {
+  if (typeof message.content === 'string') return message.content.trim();
+  if (!Array.isArray(message.content)) return '';
+  return message.content.flatMap((part) => {
+    if (!part || typeof part !== 'object') return [];
+    const text = 'text' in part && typeof part.text === 'string' ? part.text.trim() : '';
+    return text ? [text] : [];
+  }).join('\n').trim();
+}
+
+function messagesContainText(messages: ModelMessage[], role: 'user' | 'assistant', text: string) {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return false;
+  return messages.slice(-16).some((message) => {
+    if (message.role !== role) return false;
+    const candidate = modelMessageText(message).replace(/\s+/g, ' ').trim();
+    return Boolean(candidate) && (candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate));
+  });
+}
+
+export function appendInterruptedBrowserChatTurn(
+  messages: ModelMessage[],
+  userContent: string,
+  assistantContent: string,
+) {
+  const next = [...messages];
+  const partial = assistantContent.trim();
+  const interruptionMarker = partial
+    ? '[This response was interrupted by the user before completion.]'
+    : '[The user interrupted this turn before the assistant produced text. Any completed tool messages remain valid conversation history.]';
+  if (!messagesContainText(next, 'user', userContent)) {
+    next.push({ role: 'user', content: userContent });
+  }
+  const partialAlreadyStored = partial && messagesContainText(next, 'assistant', partial);
+  if (!messagesContainText(next, 'assistant', interruptionMarker)) {
+    next.push({
+      role: 'assistant',
+      content: partialAlreadyStored ? interruptionMarker : [partial, interruptionMarker].filter(Boolean).join('\n\n'),
+    });
+  }
+  return serializableBrowserChatModelMessages(next);
+}
+
 export function normalizeBrowserChatModelMessages(value: unknown): ModelMessage[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((message) => {

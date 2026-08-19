@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ModelMessage } from 'ai';
 import {
+  appendInterruptedBrowserChatTurn,
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
 } from './browser-chat-model-context';
@@ -51,4 +52,27 @@ test('falls back to the transcript when an active chain was not stored', () => {
     transcript: [{ role: 'user', content: '继续' }],
   });
   assert.deepEqual(context.activeMessages, context.transcript);
+});
+
+test('an interrupted turn keeps completed tool messages and the partial assistant response in the native chain', () => {
+  const messages: ModelMessage[] = [
+    { role: 'user', content: '读取需求 31471' },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'browserCode', input: { code: 'read page' } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'call-1', toolName: 'browserCode', output: { type: 'text', value: 'PRD data' } }],
+    },
+  ];
+
+  const interrupted = appendInterruptedBrowserChatTurn(messages, '读取需求 31471', '已经读取到 PRD 数据');
+  assert.equal(interrupted.filter((message) => message.role === 'user').length, 1);
+  assert.equal(interrupted[2]?.role, 'tool');
+  assert.match(String(interrupted.at(-1)?.content), /已经读取到 PRD 数据/);
+  assert.match(String(interrupted.at(-1)?.content), /interrupted by the user/);
+
+  const repeated = appendInterruptedBrowserChatTurn(interrupted, '读取需求 31471', '已经读取到 PRD 数据');
+  assert.deepEqual(repeated, interrupted);
 });

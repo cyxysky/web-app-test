@@ -146,12 +146,21 @@ test('child Agent summary length is prompt guidance from configuration and never
   assert.equal(complete.summaryTruncated, false);
 });
 
-test('a failed child Agent does not cancel successful siblings', async () => {
+test('child Agents execute strictly in task order and a failure does not cancel later tasks', async () => {
+  const executionOrder: string[] = [];
   const results = await settleBrowserChatSubagents(['prd-a', 'prd-b', 'prd-c'], async (task) => {
+    executionOrder.push(`start:${task}`);
+    await Promise.resolve();
+    executionOrder.push(`end:${task}`);
     if (task === 'prd-b') throw new Error('unavailable');
     return `${task}:ok`;
   });
 
+  assert.deepEqual(executionOrder, [
+    'start:prd-a', 'end:prd-a',
+    'start:prd-b', 'end:prd-b',
+    'start:prd-c', 'end:prd-c',
+  ]);
   assert.deepEqual(results.map((item) => item.result), ['prd-a:ok', undefined, 'prd-c:ok']);
   assert.match(String(results[1].error), /unavailable/);
 });

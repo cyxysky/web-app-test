@@ -1197,6 +1197,7 @@ function makeBrowserTools(
     requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
+    requiredSubagentUuid?: string;
     readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
     readSkill?: BrowserChatReadSkill;
     onReferenceImage?: (input: { path: string; source: string }) => void;
@@ -1425,7 +1426,7 @@ function makeBrowserTools(
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
       subagent: tool({
-        description: 'Manage child Agents through one action-based tool. Use action=spawn for independent research, reading, comparison, or testing branches that can run concurrently; it returns one UUID per child. Use action=read with exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
+        description: 'Manage child Agents through one action-based tool. Use action=spawn to queue independent research, reading, comparison, or testing branches; the runtime executes them strictly in task order and returns one UUID per child. Use action=read with exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
         inputSchema: z.discriminatedUnion('action', [
           browserToolInput({
             action: z.literal('spawn'),
@@ -1446,9 +1447,18 @@ function makeBrowserTools(
               ? referenceOptions.runSubagents(input.tasks, abortSignal, trace?.id)
               : Promise.resolve({ ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' }), execution);
           }
-          return record('subagent', input, () => referenceOptions?.readSubagent
-            ? referenceOptions.readSubagent(input.uuid)
-            : Promise.resolve({ ok: false, actual: 'subagent action=read is unavailable in this runtime.' }), execution);
+          return record('subagent', input, () => {
+            const requiredUuid = referenceOptions?.requiredSubagentUuid || pendingSubagentUuidsFromTraces(traces)[0];
+            if (requiredUuid && input.uuid !== requiredUuid) {
+              return Promise.resolve({
+                ok: false,
+                actual: `Read rejected: child Agent results must be read in order. The required UUID is ${requiredUuid}.`,
+              });
+            }
+            return referenceOptions?.readSubagent
+              ? referenceOptions.readSubagent(input.uuid)
+              : Promise.resolve({ ok: false, actual: 'subagent action=read is unavailable in this runtime.' });
+          }, execution);
         },
       }),
     } : {}),
@@ -1593,7 +1603,7 @@ function runtimePrompt(input: {
     '- file action=generate uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, inspect its returned rendered pages, and regenerate at most once when visual evidence shows a layout defect. Return only the final verified artifact link.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- Parallelism is mandatory when a request contains two or more independent URLs, documents, pages, research questions, comparisons, or test branches. Call subagent action=spawn with one self-contained task per item, then call subagent action=read once per returned UUID in later model steps. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
+    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, subagent action=spawn may queue one self-contained task per item. Child Agents execute strictly in the submitted order. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
       ? '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use file action=generate.'
@@ -2027,6 +2037,7 @@ async function executeRuntimeStep(input: {
   allowedToolTypes?: string[];
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
+  requiredSubagentUuid?: string;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
@@ -2680,6 +2691,7 @@ async function executeRuntimeStep(input: {
       requestToolConfirmation: input.requestToolConfirmation,
       runSubagents: input.runSubagents,
       readSubagent: input.readSubagent,
+      requiredSubagentUuid: input.requiredSubagentUuid,
       readFile: input.readFile,
       readSkill: input.readSkill,
       attachmentBindings: input.attachmentBindings,
@@ -3251,6 +3263,10 @@ export async function executeInteractiveBrowserTurn(input: {
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   onProgress?: (step: StepExecutionResult) => void | Promise<void>;
   onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
+  onModelMessages?: (update: {
+    activeMessages: ModelMessage[];
+    turnMessages: ModelMessage[];
+  }) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
@@ -3322,6 +3338,7 @@ export async function executeInteractiveBrowserTurn(input: {
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
         allowedToolTypes: requiredSubagentUuid ? ['readBrowserState', 'subagent'] : input.allowedToolTypes,
+        requiredSubagentUuid,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
@@ -3349,6 +3366,11 @@ export async function executeInteractiveBrowserTurn(input: {
       ensureActive();
       activeModelMessages = actionResult.modelMessages;
       turnModelMessages.push(...actionResult.turnMessages);
+      await input.onModelMessages?.({
+        activeMessages: [...activeModelMessages],
+        turnMessages: [...turnModelMessages],
+      });
+      ensureActive();
       contextCompression = actionResult.contextCompression || contextCompression;
       browserStatePreflightComplete ||= actionResult.traces.some((trace) => trace.name === 'readBrowserState' && Boolean(trace.result));
     } catch (error) {

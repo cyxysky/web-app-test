@@ -2437,216 +2437,24 @@
 }
 
 .browser-chat-subagent-detail {
+  align-content: start;
   display: grid;
-  gap: 12px;
+  gap: 22px;
   max-width: 100%;
   min-width: 0;
   width: 100%;
 }
 
-.browser-chat-subagent-detail :where(.browser-chat-tool-card, .browser-chat-tool-confirmation) {
-  max-width: 100%;
-}
-
-.browser-chat-subagent-summary {
-  min-width: 0;
-}
-
-.browser-chat-subagent-message {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-}
-
-.browser-chat-subagent-message > header {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  line-height: 1.3;
-}
-
-.browser-chat-subagent-message-content {
-  display: grid;
-  gap: 7px;
+.browser-chat-subagent-detail > .browser-chat-message {
+  box-sizing: border-box;
   max-width: 100%;
   min-width: 0;
-}
-
-.browser-chat-subagent-message-content .browser-chat-agent-markdown,
-.browser-chat-subagent-summary .browser-chat-agent-markdown,
-.browser-chat-subagent-message-content .browser-chat-agent-markdown > *,
-.browser-chat-subagent-summary .browser-chat-agent-markdown > * {
-  max-width: 100%;
-  min-width: 0;
-}
-
-.browser-chat-subagent-message-content .browser-chat-agent-markdown pre,
-.browser-chat-subagent-message-content .browser-chat-agent-markdown table,
-.browser-chat-subagent-summary .browser-chat-agent-markdown pre,
-.browser-chat-subagent-summary .browser-chat-agent-markdown table {
   width: 100%;
 }
 
-.browser-chat-subagent-message.is-user .browser-chat-subagent-message-content {
-  background: var(--panel-soft);
-  border-radius: 12px;
-  padding: 10px 12px;
-}
-
-.browser-chat-subagent-message-content .is-reasoning {
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.browser-chat-subagent-message-data {
-  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-  border-radius: 10px;
-  min-width: 0;
-  overflow: hidden;
-}
-
-.browser-chat-subagent-message-data.is-tool {
-  border: 0;
-  overflow: visible;
-}
-
-.browser-chat-subagent-message-data.is-tool > .browser-chat-tool-card {
-  max-width: 100%;
-}
-
-.browser-chat-subagent-message-chevron {
-  margin-left: auto;
-}
-
-.browser-chat-subagent-message-data > summary {
-  align-items: center;
-  cursor: pointer;
-  display: grid;
-  font-size: 12px;
-  font-weight: 650;
-  gap: 8px;
-  grid-template-columns: 16px minmax(0, 1fr) 14px;
-  list-style: none;
-  min-height: 38px;
-  padding: 8px 10px;
-}
-
-.browser-chat-subagent-message-data > summary::-webkit-details-marker {
-  display: none;
-}
-
-.browser-chat-subagent-message-data > summary > :last-child {
-  color: var(--muted);
-  transition: transform 0.16s ease;
-}
-
-.browser-chat-subagent-message-data[open] > summary > :last-child {
-  transform: rotate(180deg);
-}
-
-.browser-chat-subagent-message-data pre {
-  background: color-mix(in srgb, var(--panel-soft) 82%, transparent);
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  font: 11px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
-  margin: 0;
-  max-height: 360px;
-  overflow: auto;
-  overflow-wrap: normal;
-  padding: 10px 12px;
-  tab-size: 2;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.browser-chat-subagent-message-data.is-tool pre {
-  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
-  border-radius: 10px;
-  margin-top: 6px;
-  max-width: 100%;
-  width: 100%;
-}
-
-.browser-chat-subagent-confirmation {
-  border: 1px solid color-mix(in srgb, var(--warning, #b7791f) 36%, var(--border));
-  border-radius: 11px;
-  display: grid;
-  gap: 9px;
-  padding: 10px 11px;
-}
-
-.browser-chat-subagent-confirmation-heading {
-  align-items: center;
-  display: grid;
-  font-size: 12px;
-  gap: 8px;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
-}
-
-.browser-chat-subagent-confirmation-heading > :first-child {
-  align-items: center;
-  display: inline-flex;
-}
-
-.browser-chat-subagent-confirmation-heading > :last-child {
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 650;
-  padding: 2px 7px;
-}
-
-.browser-chat-subagent-confirmation-heading > .is-confirmed {
-  background: color-mix(in srgb, var(--success, #15803d) 12%, transparent);
-  color: var(--success, #15803d);
-}
-
-.browser-chat-subagent-confirmation-heading > .is-cancelled {
-  background: color-mix(in srgb, var(--danger, #b91c1c) 10%, transparent);
-  color: var(--danger, #b91c1c);
-}
-
-.browser-chat-subagent-confirmation > p {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.55;
-  margin: 0;
-}
-
-.browser-chat-subagent-confirmation-actions {
-  align-items: center;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-}
-
-.browser-chat-subagent-confirmation-actions > details > summary {
-  align-items: center;
-  color: var(--muted);
-  cursor: pointer;
-  display: inline-flex;
-  font-size: 12px;
-  gap: 5px;
-  list-style: none;
-}
-
-.browser-chat-subagent-confirmation-actions > details > summary::-webkit-details-marker {
-  display: none;
-}
-
-.browser-chat-subagent-confirmation-actions > details[open] {
-  flex-basis: 100%;
-}
-
-.browser-chat-subagent-confirmation-actions pre {
-  background: var(--panel-soft);
-  border-radius: 8px;
-  font: 11px/1.55 var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
-  margin: 8px 0 0;
-  max-height: 280px;
-  overflow: auto;
-  padding: 9px 10px;
-  white-space: pre-wrap;
-  word-break: break-word;
+.browser-chat-subagent-detail > .browser-chat-message.user {
+  justify-self: end;
+  max-width: min(700px, 88%);
 }
 
 @keyframes browser-chat-subagent-panel-enter {

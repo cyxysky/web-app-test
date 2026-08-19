@@ -31,11 +31,11 @@ import {
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import { browserChatSessionTitleParts } from '@/lib/browser-chat-title';
 import {
+  appendInterruptedBrowserChatTurn,
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
   type BrowserChatModelContext,
 } from '@/server/ai/agents/browser-chat-model-context';
-import { browserChatConversationAttentionContext } from '@/server/ai/agents/browser-chat-conversation-attention';
 import {
   alignBrowserChatMessageStepIndexes,
   attachBrowserChatStepOwners,
@@ -263,6 +263,7 @@ type BrowserChatBlockedSubagentRuntime = {
   task: BrowserChatSubagentTask;
   browser: BrowserSession;
   steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
 };
 
 type BrowserChatStoredSubagent = {
@@ -273,13 +274,16 @@ type BrowserChatStoredSubagent = {
   index: number;
   title: string;
   task: BrowserChatSubagentTask;
-  status: 'running' | 'passed' | 'failed' | 'blocked';
+  status: 'queued' | 'running' | 'passed' | 'failed' | 'blocked';
+  content: string;
   summary: string;
   summaryChars: number;
   summaryOriginalChars: number;
   summaryTruncated: boolean;
   toolCount: number;
   currentAction?: string;
+  steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
   messages: BrowserChatSubagentMessage[];
   error?: string;
   createdAt: string;
@@ -1318,14 +1322,12 @@ async function createBrowserChatRuntimeOperationalContext(input: {
       }] : [],
       input.modelText,
     );
-    const conversationAttention = browserChatConversationAttentionContext(input.session.messages);
     return {
       operationalContext: [
         formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
         browserChatCredentialPrompt(credentials.credentials),
-        conversationAttention,
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
     };
@@ -1719,12 +1721,38 @@ function markAssistantMessageInterrupted(assistantMessageId?: string) {
   if (oldest) interruptedAssistantMessageIds.delete(oldest);
 }
 
-const browserChatInterruptedReply = '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。';
+const browserChatInterruptedReply = '本轮对话已由用户中止。';
+const browserChatInterruptionNote = '> 本轮对话已由用户中止。中止前已经生成的内容和工具记录已保留。';
+
+function preserveInterruptedModelContext(
+  session: BrowserChatSessionRecord,
+  assistantMessageId: string,
+  assistantContent: string,
+) {
+  const assistantIndex = session.messages.findIndex((message) => message.id === assistantMessageId);
+  if (assistantIndex < 0) return;
+  const userMessage = [...session.messages.slice(0, assistantIndex)].reverse()
+    .find((message) => message.role === 'user');
+  if (!userMessage) return;
+  session.modelContext = {
+    ...session.modelContext,
+    version: 1,
+    transcript: appendInterruptedBrowserChatTurn(session.modelContext.transcript, userMessage.content, assistantContent),
+    activeMessages: appendInterruptedBrowserChatTurn(session.modelContext.activeMessages, userMessage.content, assistantContent),
+  };
+}
 
 function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMessageId: string, timestamp: string) {
+  const currentMessage = session.messages.find((message) => message.id === assistantMessageId);
+  const currentContent = currentMessage?.content.trim() || '';
+  preserveInterruptedModelContext(session, assistantMessageId, currentContent);
   updateAssistantMessage(session, assistantMessageId, (message) => ({
     ...message,
-    content: browserChatInterruptedReply,
+    content: currentContent
+      ? currentContent.includes(browserChatInterruptionNote)
+        ? currentContent
+        : `${currentContent}\n\n${browserChatInterruptionNote}`
+      : browserChatInterruptedReply,
     status: 'interrupted',
     activity: undefined,
     updatedAt: timestamp,
@@ -1779,9 +1807,7 @@ function recordFromSnapshot(
     const safeMessage: BrowserChatMessage = {
       ...rawMessage,
       role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
-      content: rawMessage.role === 'assistant' && rawMessage.status === 'interrupted'
-        ? browserChatInterruptedReply
-        : textFromUnknown(rawMessage.content),
+      content: textFromUnknown(rawMessage.content),
       attachments: Array.isArray(rawMessage.attachments) ? rawMessage.attachments : [],
       stepIndexes: Array.isArray(rawMessage.stepIndexes) ? rawMessage.stepIndexes : [],
     };
@@ -2168,7 +2194,13 @@ function mergePersistedSubagents(existing: BrowserChatSubagentRecord[] = [], inc
     }
     const messages = new Map((previous.messages || []).map((message) => [message.id, message]));
     for (const message of subagent.messages || []) messages.set(message.id, message);
-    byId.set(subagent.id, { ...previous, ...subagent, messages: [...messages.values()] });
+    byId.set(subagent.id, {
+      ...previous,
+      ...subagent,
+      steps: mergePersistedSteps(previous.steps, subagent.steps),
+      outputCycles: mergePersistedOutputCycles(previous.outputCycles, subagent.outputCycles),
+      messages: [...messages.values()],
+    });
   }
   return [...byId.values()].sort((left, right) => left.index - right.index);
 }
@@ -2649,7 +2681,7 @@ function preserveInterruptedSubagents(sessionId: string, assistantMessageId?: st
   const registry = subagentResults.get(sessionId);
   if (!registry) return;
   for (const record of registry.values()) {
-    if (record.status !== 'running' || (assistantMessageId && record.assistantMessageId !== assistantMessageId)) continue;
+    if ((record.status !== 'running' && record.status !== 'queued') || (assistantMessageId && record.assistantMessageId !== assistantMessageId)) continue;
     updateBrowserChatStoredSubagent(sessionId, record.uuid, {
       status: 'blocked',
       error: '用户已中止主对话；该子 Agent 已停止，已保留此前结果。',
@@ -3885,7 +3917,12 @@ async function runBrowserChatSubagents(input: {
     instruction: task.instruction.replace(/\s+/g, ' ').trim(),
     url: task.url?.trim().toLowerCase() || '',
   }));
-  const key = `${input.session.id}:${input.assistantMessageId}:${JSON.stringify(normalizedTasks)}`;
+  const key = [
+    input.session.id,
+    input.assistantMessageId,
+    input.toolCallId || 'missing-tool-call-id',
+    JSON.stringify(normalizedTasks),
+  ].join(':');
   return runOrReuseBrowserChatSubagentBatch(key, () => executeBrowserChatSubagentBatch({
     ...input,
     tasks: requestedTasks,
@@ -3904,7 +3941,7 @@ function browserChatSubagentSessionRegistry(sessionId: string) {
 function updateBrowserChatStoredSubagent(
   sessionId: string,
   uuid: string,
-  update: Partial<Pick<BrowserChatStoredSubagent, 'status' | 'summary' | 'summaryChars' | 'summaryOriginalChars' | 'summaryTruncated' | 'toolCount' | 'currentAction' | 'messages' | 'error'>>,
+  update: Partial<Pick<BrowserChatStoredSubagent, 'status' | 'content' | 'summary' | 'summaryChars' | 'summaryOriginalChars' | 'summaryTruncated' | 'toolCount' | 'currentAction' | 'steps' | 'outputCycles' | 'messages' | 'error'>>,
 ) {
   const record = browserChatSubagentSessionRegistry(sessionId).get(uuid);
   if (!record) return;
@@ -3917,11 +3954,17 @@ function updateBrowserChatStoredSubagent(
       batchId: record.batchId,
       index: record.index,
       title: record.title,
+      instruction: record.task.instruction,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
       status: record.status,
+      content: record.content,
       summary: record.summary || undefined,
       resumable: blockedSubagents.has(record.uuid),
       toolCount: record.toolCount,
       currentAction: record.currentAction,
+      steps: [...record.steps],
+      outputCycles: [...record.outputCycles],
       messages: [...record.messages],
       error: record.error,
     });
@@ -3958,7 +4001,7 @@ function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
         }),
       };
     }
-    if (record.status === 'running') {
+    if (record.status === 'running' || record.status === 'queued') {
       return {
         ok: false,
         actual: JSON.stringify({
@@ -4009,13 +4052,16 @@ async function executeBrowserChatSubagentBatch(input: {
       index,
       title: task.title,
       task: { title: task.title, instruction: task.instruction, url: task.url },
-      status: 'running',
+      status: index === 0 ? 'running' : 'queued',
+      content: '',
       summary: '',
       summaryChars: 0,
       summaryOriginalChars: 0,
       summaryTruncated: false,
       toolCount: 0,
-      currentAction: '正在启动',
+      currentAction: index === 0 ? '正在启动' : '等待前序子 Agent 完成',
+      steps: [],
+      outputCycles: [],
       messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
       createdAt,
       updatedAt: createdAt,
@@ -4026,10 +4072,16 @@ async function executeBrowserChatSubagentBatch(input: {
       batchId,
       index,
       title: task.title,
-      status: 'running',
+      instruction: task.instruction,
+      createdAt,
+      updatedAt: createdAt,
+      status: index === 0 ? 'running' : 'queued',
+      content: '',
       resumable: false,
       toolCount: 0,
-      currentAction: '正在启动',
+      currentAction: index === 0 ? '正在启动' : '等待前序子 Agent 完成',
+      steps: [],
+      outputCycles: [],
       messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
     });
   });
@@ -4048,6 +4100,11 @@ async function executeBrowserChatSubagentBatch(input: {
 
   const settled = await settleBrowserChatSubagents(tasks, async (task) => {
     if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+    updateBrowserChatStoredSubagent(session.id, task.id, {
+      status: 'running',
+      currentAction: '正在启动',
+    });
+    persistAndNotify(session.id);
     const browserProfileKey = browserChatBrowserProfileKey(session);
     const child = new BrowserSession(session.mode, {
       browserSurface: 'external',
@@ -4061,6 +4118,7 @@ async function executeBrowserChatSubagentBatch(input: {
       runId: `${session.id}_${task.id}`,
     });
     const childSteps = new Map<number, StepExecutionResult>();
+    const childOutputCycles: BrowserChatAiOutputCycle[] = [];
     let streamedSubagentText = '';
     const liveSubagentMessages = () => {
       const confirmationMessages = (registry.get(task.id)?.messages || [])
@@ -4093,8 +4151,8 @@ async function executeBrowserChatSubagentBatch(input: {
         targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
-          `你是并行子 Agent“${task.title}”。只完成这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
-          '你拥有完整浏览器工具集。不要等待其他子 Agent，也不要因为其他分支失败而停止。',
+          `你是串行执行的子 Agent“${task.title}”。只完成当前这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
+          '你拥有完整浏览器工具集。当前批次中只有你在执行；完成当前分支后立即返回，不要读取或等待其他子 Agent。',
           inheritedStorageState
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
@@ -4131,7 +4189,28 @@ async function executeBrowserChatSubagentBatch(input: {
           if (!ownsTurn()) return;
           streamedSubagentText = text;
           updateBrowserChatStoredSubagent(session.id, task.id, {
+            content: text,
             messages: liveSubagentMessages(),
+          });
+          persistAndNotify(session.id, { defer: true });
+        },
+        onDebug: (event) => {
+          if (!ownsTurn()) return;
+          const outputCycle = browserChatAiOutputCycleFromDebugEvent({
+            details: event.details,
+            id: id('subagent_cycle'),
+            messageId: task.id,
+            phase: event.phase,
+            stepIndex: event.stepIndex,
+            sequence: childOutputCycles.length + 1,
+            createdAt: now(),
+            subagentId: task.id,
+            batchId,
+          });
+          if (!outputCycle) return;
+          childOutputCycles.push(outputCycle);
+          updateBrowserChatStoredSubagent(session.id, task.id, {
+            outputCycles: [...childOutputCycles],
           });
           persistAndNotify(session.id, { defer: true });
         },
@@ -4143,6 +4222,7 @@ async function executeBrowserChatSubagentBatch(input: {
             status: step.status === 'blocked' ? 'blocked' : 'running',
             currentAction: step.action || step.actual || '正在执行',
             toolCount: steps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
+            steps,
             messages: liveSubagentMessages(),
           });
           persistAndNotify(session.id, { defer: true });
@@ -4167,9 +4247,12 @@ async function executeBrowserChatSubagentBatch(input: {
       const messages = limitBrowserChatSubagentMessages(task.id, [...modelMessages, ...confirmationMessages]);
       updateBrowserChatStoredSubagent(session.id, task.id, {
         status,
+        content: summary,
         ...summaryResult,
         currentAction: undefined,
         toolCount: result.newSteps.reduce((count, step) => count + (step.tools || []).length, 0),
+        steps: result.steps,
+        outputCycles: [...childOutputCycles],
         messages,
       });
       persistAndNotify(session.id);
@@ -4185,9 +4268,12 @@ async function executeBrowserChatSubagentBatch(input: {
       const storedMessages = registry.get(task.id)?.messages || [];
       updateBrowserChatStoredSubagent(session.id, task.id, {
         status: 'failed',
+        content: partialContent,
         ...partialSummaryResult,
         currentAction: undefined,
         toolCount: steps.reduce((count, step) => count + (step.tools || []).length, 0),
+        steps,
+        outputCycles: [...childOutputCycles],
         messages: partialContent
           ? [...storedMessages, { id: `${task.id}:message:error`, role: 'assistant' as const, content: partialContent }]
           : storedMessages,
@@ -4264,6 +4350,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     abortController.signal,
     { recordLogs: false },
   );
+  const childOutputCycles = [...binding.outputCycles];
   let streamedSubagentText = '';
   const liveSubagentMessages = (steps: readonly StepExecutionResult[]) => browserChatSubagentMessagesFromProgress({
     subagentId: binding.id,
@@ -4280,7 +4367,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       targetUrl: binding.task.url || binding.browser.currentUrl() || session.targetUrl || 'about:blank',
       instruction: `${binding.task.instruction}\n\n[系统续跑] 用户已完成当前可见页面的人工校验，请立即读取最新页面并从暂停点继续。`,
       modelInstruction: [
-        `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
+        `你是串行执行的子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
         '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed，并在总结中说明失败尝试；只有目标结果仍未取得时才报告 failed。',
         binding.task.instruction,
@@ -4307,7 +4394,30 @@ async function resumeBlockedBrowserChatSubagent(input: {
         if (!ownsTurn()) return;
         streamedSubagentText = text;
         updateBrowserChatStoredSubagent(session.id, binding.id, {
+          content: text,
           messages: liveSubagentMessages(binding.steps),
+        });
+        persistAndNotify(session.id, { defer: true });
+      },
+      onDebug: (event) => {
+        if (!ownsTurn()) return;
+        const stored = browserChatSubagentSessionRegistry(session.id).get(binding.id);
+        const outputCycle = browserChatAiOutputCycleFromDebugEvent({
+          details: event.details,
+          id: id('subagent_cycle'),
+          messageId: binding.id,
+          phase: event.phase,
+          stepIndex: event.stepIndex,
+          sequence: childOutputCycles.length + 1,
+          createdAt: now(),
+          subagentId: binding.id,
+          batchId: stored?.batchId,
+        });
+        if (!outputCycle) return;
+        childOutputCycles.push(outputCycle);
+        binding.outputCycles = [...childOutputCycles];
+        updateBrowserChatStoredSubagent(session.id, binding.id, {
+          outputCycles: [...childOutputCycles],
         });
         persistAndNotify(session.id, { defer: true });
       },
@@ -4319,6 +4429,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
           status: step.status === 'blocked' ? 'blocked' : 'running',
           currentAction: step.action || step.actual || '正在继续',
           toolCount: nextSteps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
+          steps: nextSteps,
           messages: liveSubagentMessages(nextSteps),
         });
         persistAndNotify(session.id, { defer: true });
@@ -4343,9 +4454,12 @@ async function resumeBlockedBrowserChatSubagent(input: {
     );
     updateBrowserChatStoredSubagent(session.id, binding.id, {
       status,
+      content: summary,
       ...summaryResult,
       currentAction: undefined,
       toolCount: result.steps.reduce((count, step) => count + (step.tools || []).length, 0),
+      steps: result.steps,
+      outputCycles: [...childOutputCycles],
       messages: limitBrowserChatSubagentMessages(
         binding.id,
         [...(stored?.messages || []), ...resumedMessages],
@@ -4456,6 +4570,7 @@ async function runBrowserChatMessage(
       const requestTurnToolConfirmation = session.safetyMode === 'strict'
         ? createBrowserChatTurnToolConfirmation(session, assistantMessageId, abortController.signal)
         : undefined;
+      const turnTranscriptBase = [...session.modelContext.transcript];
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
@@ -4511,6 +4626,19 @@ async function runBrowserChatMessage(
           }));
           session.updatedAt = timestamp;
           scheduleBrowserChatTextStreamPublish(session.id, assistantMessageId);
+          persistAndNotify(session.id, { defer: true, mergePersisted: false });
+        },
+        onModelMessages: ({ activeMessages, turnMessages }) => {
+          if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          session.modelContext = {
+            ...session.modelContext,
+            version: 1,
+            transcript: [
+              ...turnTranscriptBase,
+              ...serializableBrowserChatModelMessages(turnMessages),
+            ],
+            activeMessages: serializableBrowserChatModelMessages(activeMessages),
+          };
           persistAndNotify(session.id, { defer: true, mergePersisted: false });
         },
         onProgress: (step) => {
@@ -4569,7 +4697,7 @@ async function runBrowserChatMessage(
       session.modelContext = {
         version: 1,
         transcript: [
-          ...session.modelContext.transcript,
+          ...turnTranscriptBase,
           ...turnMessages,
         ],
         activeMessages: serializableBrowserChatModelMessages(result.modelMessages),

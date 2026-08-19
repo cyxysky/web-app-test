@@ -206,11 +206,17 @@ export type BrowserChatSubagentRecord = {
   batchId: string;
   index: number;
   title: string;
-  status: 'running' | 'passed' | 'blocked' | 'failed';
+  instruction: string;
+  createdAt: string;
+  updatedAt: string;
+  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed';
+  content: string;
   summary?: string;
   resumable: boolean;
   toolCount: number;
   currentAction?: string;
+  steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
   messages: BrowserChatSubagentMessage[];
   error?: string;
 };

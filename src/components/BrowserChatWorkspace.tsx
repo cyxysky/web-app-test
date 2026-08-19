@@ -37,6 +37,7 @@ import {
   Bug,
   Check,
   CircleAlert,
+  Clock3,
   ChevronDown,
   ClipboardCheck,
   Compass,
@@ -107,6 +108,7 @@ import {
   normalizeBrowserChatHistory,
   type BrowserChatHistoryState,
 } from '@/components/browser-chat-history-controller';
+import { browserChatSubagentRecordsForToolCall } from '@/components/browser-chat-subagent-model';
 import {
   normalizeBrowserChatMarkdown,
   remarkBrowserChatCjkStrong,
@@ -199,7 +201,6 @@ import type {
   BrowserChatAiOutputPart,
   BrowserChatAiOutputTool,
   BrowserChatAiOutputView,
-  BrowserChatSubagentMessage,
   BrowserChatSubagentRecord,
   ModelProvider,
   SkillRecord,
@@ -939,7 +940,7 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
     readFile: '读取文件',
     readSubagent: '读取子 Agent',
     reportState: '确认状态',
-    spawnSubagents: '并行子 Agent',
+    spawnSubagents: '子 Agent',
     waitForHumanVerification: '等待人工验证',
   };
   if (labels[name]) return t(labels[name]);
@@ -2619,10 +2620,12 @@ const BrowserChatPendingToolConfirmationCard = memo(function BrowserChatPendingT
 });
 
 const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolDisclosure({
+  batchId,
   cardContent,
   className,
   isActive,
   onLoadSubagentRecords,
+  onSelectTool,
   onResume,
   resuming,
   running,
@@ -2630,10 +2633,12 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   title,
   toolResult,
 }: {
+  batchId?: string;
   cardContent: ReactNode;
   className: string;
   isActive: boolean;
   onLoadSubagentRecords?: () => void;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
   resuming?: boolean;
   running: boolean;
@@ -2643,9 +2648,13 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
 }) {
   const [loadingRecords, setLoadingRecords] = useState(false);
   const [bodyMounted, setBodyMounted] = useState(running);
+  const batchSubagents = useMemo(
+    () => browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult, batchId),
+    [batchId, structuredSubagents, toolResult],
+  );
   const structuredSubagentsComplete = Boolean(
-    structuredSubagents?.length
-    && structuredSubagents.every((subagent) => subagent.status !== 'running'),
+    batchSubagents.length
+    && batchSubagents.every((subagent) => subagent.status !== 'running' && subagent.status !== 'queued'),
   );
   const loadSubagentRecords = useCallback(async () => {
     if (!onLoadSubagentRecords || loadingRecords || structuredSubagentsComplete) return;
@@ -2657,10 +2666,8 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
     }
   }, [loadingRecords, onLoadSubagentRecords, structuredSubagentsComplete]);
   const subagents = useMemo(
-    () => bodyMounted
-      ? browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult)
-      : [],
-    [bodyMounted, structuredSubagents, toolResult],
+    () => bodyMounted ? batchSubagents : [],
+    [batchSubagents, bodyMounted],
   );
   const hasProblem = subagents.some((subagent) => subagent.status === 'failed' || subagent.status === 'blocked');
   useEffect(() => {
@@ -2688,9 +2695,9 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
       {bodyMounted ? (
         <BrowserChatSubagentList
           loadingRecords={loadingRecords}
+          onSelectTool={onSelectTool}
           onResume={onResume}
           resuming={resuming}
-          running={running}
           subagents={subagents}
         />
       ) : null}
@@ -2789,12 +2796,14 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
             {tool.reason ? <p className="browser-chat-tool-reason">{tool.reason}</p> : null}
             {isSubagentSpawnTool(tool.name, tool.input) ? (
               <BrowserChatSubagentToolDisclosure
+                batchId={tool.id}
                 cardContent={(
                   <BrowserChatToolCardContent label={label} meta={meta} name={tool.name} userAction={userAction} />
                 )}
                 className={stateClass}
                 isActive={isActiveTool}
                 onLoadSubagentRecords={onLoadSubagentRecords}
+                onSelectTool={onSelectTool}
                 onResume={onResumeHumanVerification}
                 resuming={resumingHumanVerification}
                 running={running}
@@ -2945,10 +2954,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               <div className={`browser-chat-tool-call${isSubagentSpawnTool(executedTool.name, executedTool.input) ? ' has-subagents' : ''}`}>
                 {isSubagentSpawnTool(executedTool.name, executedTool.input) ? (
                   <BrowserChatSubagentToolDisclosure
+                    batchId={executedTool.id || tool.id}
                     cardContent={card}
                     className={stateClass}
                     isActive={isActive}
                     onLoadSubagentRecords={onLoadSubagentRecords}
+                    onSelectTool={onSelectTool}
                     onResume={onResumeHumanVerification}
                     resuming={resumingHumanVerification}
                     running={running}
@@ -3087,12 +3098,17 @@ const BrowserChatManualVerificationCard = memo(function BrowserChatManualVerific
 type BrowserChatSubagentView = {
   id: string;
   title: string;
-  status: 'running' | 'passed' | 'blocked' | 'failed';
+  instruction: string;
+  createdAt: string;
+  updatedAt: string;
+  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed';
+  content: string;
   summary?: string;
   resumable: boolean;
   toolCount: number;
   currentAction?: string;
-  messages: BrowserChatSubagentMessage[];
+  steps: StepExecutionResult[];
+  outputCycles: BrowserChatAiOutputCycle[];
 };
 
 type BrowserChatSubagentPanelContextValue = {
@@ -3108,276 +3124,99 @@ function browserChatSubagentStatusPresentation(subagent: Pick<BrowserChatSubagen
   if (subagent.status === 'failed' && subagent.summary?.trim()) return { className: 'status-partial', label: '已返回结果' };
   if (subagent.status === 'failed') return { className: 'status-failed', label: '执行失败' };
   if (subagent.status === 'blocked') return { className: 'status-blocked', label: '等待处理' };
+  if (subagent.status === 'queued') return { className: 'status-running', label: '等待执行' };
   return { className: 'status-running', label: '正在执行' };
 }
 
-function browserChatSubagentToolResultRecord(value: unknown) {
-  const resultRecord = asRecord(value);
-  const rawActual = typeof resultRecord?.actual === 'string' ? resultRecord.actual : typeof value === 'string' ? value : '';
-  return parseJsonObjectText(rawActual);
-}
-
-function browserChatSubagentBatchIdFromToolResult(value: unknown) {
-  return stringFromUnknown(browserChatSubagentToolResultRecord(value)?.batchId).trim();
-}
-
-function browserChatSubagentViewsFromRecords(records: BrowserChatSubagentRecord[], toolResult?: unknown): BrowserChatSubagentView[] {
-  const batchId = browserChatSubagentBatchIdFromToolResult(toolResult);
-  return records
-    .filter((record) => !batchId || record.batchId === batchId)
+function browserChatSubagentViewsFromRecords(
+  records: BrowserChatSubagentRecord[],
+  toolResult?: unknown,
+  toolCallId?: string,
+): BrowserChatSubagentView[] {
+  return browserChatSubagentRecordsForToolCall(records, toolResult, toolCallId)
     .map((record) => ({
       id: record.id,
       title: record.title,
+      instruction: record.instruction,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
       status: record.status,
+      content: record.content,
       summary: record.summary,
       resumable: record.resumable,
       toolCount: record.toolCount,
       currentAction: record.currentAction,
-      messages: record.messages || [],
+      steps: record.steps,
+      outputCycles: record.outputCycles,
     }));
 }
 
-type BrowserChatSubagentDisplayPart = {
-  id: string;
-  kind: 'text' | 'reasoning' | 'tool-call' | 'tool-result' | 'confirmation' | 'data';
-  name?: string;
-  text?: string;
-  value?: unknown;
-};
-
-function browserChatSubagentDisplayParts(message: BrowserChatSubagentMessage): BrowserChatSubagentDisplayPart[] {
-  if (typeof message.content === 'string') {
-    return [{ id: `${message.id}:text`, kind: 'text', text: message.content }];
-  }
-  const values = Array.isArray(message.content) ? message.content : [message.content];
-  return values.flatMap<BrowserChatSubagentDisplayPart>((value, index) => {
-    const part = asRecord(value);
-    if (!part) return [{ id: `${message.id}:${index}`, kind: 'data' as const, value }];
-    const type = stringFromUnknown(part.type);
-    if (type === 'text' || type === 'reasoning') {
-      return [{
-        id: `${message.id}:${index}`,
-        kind: type,
-        text: stringFromUnknown(part.text),
-      } satisfies BrowserChatSubagentDisplayPart];
-    }
-    if (type === 'tool-call') {
-      return [{
-        id: `${message.id}:${index}`,
-        kind: 'tool-call',
-        name: stringFromUnknown(part.toolName) || 'tool',
-        value: part.input,
-      } satisfies BrowserChatSubagentDisplayPart];
-    }
-    if (type === 'tool-result') {
-      return [{
-        id: `${message.id}:${index}`,
-        kind: 'tool-result',
-        name: stringFromUnknown(part.toolName) || 'tool',
-        value: part.output ?? part.result,
-      } satisfies BrowserChatSubagentDisplayPart];
-    }
-    if (type === 'tool-confirmation') {
-      return [{
-        id: `${message.id}:${index}`,
-        kind: 'confirmation',
-        name: stringFromUnknown(part.toolName) || 'tool',
-        value: part,
-      } satisfies BrowserChatSubagentDisplayPart];
-    }
-    return [{ id: `${message.id}:${index}`, kind: 'data' as const, name: type || undefined, value }];
-  });
-}
-
-function browserChatSubagentValueText(value: unknown) {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return stringFromUnknown(value);
-  }
-}
-
-const BrowserChatSubagentDataPart = memo(function BrowserChatSubagentDataPart({
-  kind,
-  name,
-  value,
-}: Pick<BrowserChatSubagentDisplayPart, 'kind' | 'name' | 'value'>) {
-  const { t } = useI18n();
-  const [bodyMounted, setBodyMounted] = useState(false);
-  const [screenshotOpen, setScreenshotOpen] = useState(false);
-  const screenshotTitleId = useId();
-  useEscapeDismiss(screenshotOpen, () => setScreenshotOpen(false));
-  const confirmation = kind === 'confirmation' ? asRecord(value) : undefined;
-  if (confirmation) {
-    const screenshotUrl = stringFromUnknown(confirmation.screenshotUrl).trim();
-    const prompt = stringFromUnknown(confirmation.reason || confirmation.prompt).trim();
-    const decision = stringFromUnknown(confirmation.decision);
-    const confirmed = decision === 'confirmed';
-    return (
-      <section className="browser-chat-subagent-confirmation">
-        <div className="browser-chat-subagent-confirmation-heading">
-          <span aria-hidden="true"><BrowserChatToolIcon name={name || 'tool'} /></span>
-          <strong>{browserChatToolLabel(name || 'tool', t)}</strong>
-          <span className={confirmed ? 'is-confirmed' : 'is-cancelled'}>
-            {t(confirmed ? '用户已确认' : '用户已取消')}
-          </span>
-        </div>
-        {prompt ? <p>{prompt}</p> : null}
-        <div className="browser-chat-subagent-confirmation-actions">
-          {screenshotUrl ? (
-            <button className="browser-chat-tool-screenshot" onClick={() => setScreenshotOpen(true)} type="button">
-              <ScanSearch size={14} />
-              {t('查看确认时页面')}
-            </button>
-          ) : null}
-          {confirmation.input !== undefined ? (
-            <details onToggle={(event) => {
-              if ((event.currentTarget as HTMLDetailsElement).open) setBodyMounted(true);
-            }}>
-              <summary>{t('查看请求内容')}<ChevronDown aria-hidden="true" size={13} /></summary>
-              {bodyMounted ? <pre>{browserChatSubagentValueText(confirmation.input)}</pre> : null}
-            </details>
-          ) : null}
-        </div>
-        {screenshotOpen && screenshotUrl ? createPortal((
-          <div className="ui-modal-overlay browser-chat-confirmation-screenshot-overlay" onMouseDown={() => setScreenshotOpen(false)}>
-            <section
-              aria-labelledby={screenshotTitleId}
-              aria-modal="true"
-              className="ui-modal browser-chat-confirmation-screenshot-dialog"
-              onMouseDown={(event) => event.stopPropagation()}
-              role="dialog"
-            >
-              <header className="ui-modal-header">
-                <div className="ui-modal-heading ui-modal-heading--with-icon">
-                  <span aria-hidden="true" className="ui-modal-heading-icon"><ScanSearch size={18} /></span>
-                  <div className="ui-modal-heading-copy">
-                    <h2 className="ui-modal-title" id={screenshotTitleId}>{t('用户确认时的页面')}</h2>
-                    <p className="ui-modal-subtitle">{t('执行该子 Agent 工具前自动截取的浏览器可视区域')}</p>
-                  </div>
-                </div>
-                <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" onClick={() => setScreenshotOpen(false)} type="button">
-                  <X size={16} />
-                </button>
-              </header>
-              <div className="ui-modal-body browser-chat-confirmation-screenshot-body">
-                <img alt={t('用户确认时的页面截图')} src={screenshotUrl} />
-              </div>
-            </section>
-          </div>
-        ), document.body) : null}
-      </section>
-    );
-  }
-  const isResult = kind === 'tool-result';
-  const label = kind === 'tool-call'
-    ? t('调用 {name}', { name: browserChatToolLabel(name || 'tool', t) })
-    : isResult ? t('{name} 返回结果', { name: browserChatToolLabel(name || 'tool', t) }) : t('消息数据');
-  const toolName = name || 'tool';
-  const isToolData = kind === 'tool-call' || isResult;
-  return (
-    <details
-      className={`browser-chat-subagent-message-data${isResult ? ' is-result' : ''}${isToolData ? ' is-tool' : ''}`}
-      onToggle={(event) => {
-        if ((event.currentTarget as HTMLDetailsElement).open) setBodyMounted(true);
-      }}
-    >
-      <summary className={isToolData ? 'browser-chat-tool-card' : undefined}>
-        {isToolData ? (
-          <>
-            <BrowserChatToolCardContent
-              label={browserChatToolLabel(toolName, t)}
-              meta={t(isResult ? '返回结果' : '调用参数')}
-              name={toolName}
-            />
-            <ChevronDown aria-hidden="true" className="browser-chat-subagent-message-chevron" size={13} />
-          </>
-        ) : (
-          <>
-            <Braces aria-hidden="true" size={14} />
-            <span>{label}</span>
-            <ChevronDown aria-hidden="true" size={13} />
-          </>
-        )}
-      </summary>
-      {bodyMounted ? <pre>{browserChatSubagentValueText(value)}</pre> : null}
-    </details>
-  );
-});
-
-const BrowserChatSubagentMessageItem = memo(function BrowserChatSubagentMessageItem({
-  message,
-}: {
-  message: BrowserChatSubagentMessage;
-}) {
-  const { t } = useI18n();
-  const parts = useMemo(() => browserChatSubagentDisplayParts(message), [message]);
-  const roleLabel = message.role === 'user' ? t('任务') : t('工具');
-  return (
-    <article className={`browser-chat-subagent-message is-${message.role}`}>
-      {message.role === 'assistant' ? null : <header>{roleLabel}</header>}
-      <div className="browser-chat-subagent-message-content">
-        {parts.map((part) => part.kind === 'text' || part.kind === 'reasoning' ? (
-          part.text ? (
-            <div className={part.kind === 'reasoning' ? 'browser-chat-ai-reasoning-text' : undefined} key={part.id}>
-              <BrowserChatMarkdown markdown={part.text} />
-            </div>
-          ) : null
-        ) : (
-          <BrowserChatSubagentDataPart key={part.id} kind={part.kind} name={part.name} value={part.value} />
-        ))}
-      </div>
-    </article>
-  );
-});
-
 const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
+  onSelectTool,
   onResume,
   resuming,
-  running,
   subagent,
 }: {
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
   resuming?: boolean;
-  running: boolean;
   subagent: BrowserChatSubagentView;
 }) {
-  const { t } = useI18n();
-  const hasAssistantText = useMemo(() => subagent.messages.some((message) => (
-    message.role === 'assistant'
-    && browserChatSubagentDisplayParts(message).some((part) => part.kind === 'text' && Boolean(part.text?.trim()))
-  )), [subagent.messages]);
-  const hasDetails = subagent.messages.length > 0 || Boolean(subagent.summary);
+  const assistantMessageId = `${subagent.id}:assistant`;
+  const operationRunning = subagent.status === 'running' || subagent.status === 'queued';
+  const assistantMessage = useMemo<BrowserChatMessage>(() => ({
+    id: assistantMessageId,
+    role: 'assistant',
+    content: operationRunning ? subagent.content : subagent.summary || subagent.content,
+    createdAt: subagent.createdAt,
+    updatedAt: subagent.updatedAt,
+    status: subagent.status === 'queued' ? 'running' : subagent.status,
+    stepIndexes: subagent.steps.map((step) => step.index),
+    activity: operationRunning && subagent.currentAction
+      ? {
+          phase: 'subagent:running',
+          label: subagent.currentAction,
+          updatedAt: subagent.updatedAt,
+        }
+      : undefined,
+  }), [assistantMessageId, operationRunning, subagent]);
+  const steps = useMemo(() => subagent.steps.map((step) => ({
+    ...step,
+    messageId: assistantMessageId,
+  })), [assistantMessageId, subagent.steps]);
+  const outputCycles = useMemo(() => subagent.outputCycles.map((cycle) => ({
+    ...cycle,
+    messageId: assistantMessageId,
+    subagentId: undefined,
+  })), [assistantMessageId, subagent.outputCycles]);
 
   return (
     <div className="browser-chat-subagent-detail">
-      {subagent.messages.map((message) => <BrowserChatSubagentMessageItem key={message.id} message={message} />)}
-      {subagent.status === 'running' && subagent.currentAction ? (
-        <div className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
-          <Loader2 className="spin" size={14} />
-          <span>{subagent.currentAction}</span>
+      <article className="browser-chat-message user">
+        <div>
+          <BrowserChatInlineMessageContent
+            content={subagent.instruction}
+            onPreviewImage={() => undefined}
+            skills={[]}
+          />
         </div>
-      ) : null}
-      {subagent.summary && !hasAssistantText ? (
-        <div className="browser-chat-subagent-summary">
-          <BrowserChatMarkdown markdown={subagent.summary} />
+      </article>
+      <article className={`browser-chat-message assistant${operationRunning ? ' is-running' : ''}`}>
+        <div>
+          <BrowserChatAssistantTimeline
+            logs={[]}
+            manualVerificationRequired={subagent.status === 'blocked' && subagent.resumable}
+            message={assistantMessage}
+            outputCycles={outputCycles}
+            onResumeHumanVerification={onResume}
+            onSelectTool={onSelectTool}
+            resumingHumanVerification={resuming}
+            running={operationRunning}
+            steps={steps}
+            subagents={[]}
+          />
         </div>
-      ) : null}
-      {!hasDetails ? (
-        <div className="browser-chat-agent-empty browser-chat-agent-thinking" role="status">
-          {subagent.status === 'running' ? <Loader2 className="spin" size={14} /> : null}
-          <span>{t(subagent.status === 'running' ? '正在等待子 Agent 输出' : '暂无可展示的执行详情')}</span>
-        </div>
-      ) : null}
-      {subagent.status === 'blocked' && subagent.resumable && onResume ? (
-        <button className="ui-button ui-button--primary browser-chat-verification-resume" disabled={running || resuming} onClick={() => void onResume()} type="button">
-          <span aria-hidden="true" className="browser-chat-verification-resume-icon">
-            {resuming ? <Loader2 className="spin" size={14} /> : <CheckCircle2 size={14} />}
-          </span>
-          {resuming ? t('正在继续') : t('校验完成，继续执行')}
-        </button>
-      ) : null}
+      </article>
     </div>
   );
 });
@@ -3385,16 +3224,16 @@ const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
 const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
   loadingRecords,
   onClose,
+  onSelectTool,
   onResume,
   resuming,
-  running,
   subagent,
 }: {
   loadingRecords?: boolean;
   onClose: () => void;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
   resuming?: boolean;
-  running: boolean;
   subagent: BrowserChatSubagentView;
 }) {
   const { t } = useI18n();
@@ -3415,6 +3254,8 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
             <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
               {loadingRecords || subagent.status === 'running'
                 ? <Loader2 className="spin" size={14} />
+                : subagent.status === 'queued'
+                  ? <Clock3 size={14} />
                 : subagent.status === 'passed' || status.className === 'status-partial'
                   ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
             </span>
@@ -3433,9 +3274,9 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
         </header>
         <div className="browser-chat-subagent-panel-body">
           <BrowserChatSubagentDetail
+            onSelectTool={onSelectTool}
             onResume={onResume}
             resuming={resuming}
-            running={running}
             subagent={subagent}
           />
         </div>
@@ -3446,15 +3287,15 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
 
 const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   loadingRecords,
+  onSelectTool,
   onResume,
   resuming,
-  running,
   subagents = [],
 }: {
   loadingRecords?: boolean;
+  onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
   resuming?: boolean;
-  running: boolean;
   subagents?: BrowserChatSubagentView[];
 }) {
   const { t } = useI18n();
@@ -3486,6 +3327,8 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
             <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
               {loadingRecords || subagent.status === 'running'
                 ? <Loader2 className="spin" size={14} />
+                : subagent.status === 'queued'
+                  ? <Clock3 size={14} />
                 : subagent.status === 'passed' || status.className === 'status-partial'
                   ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
             </span>
@@ -3505,9 +3348,9 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
         <BrowserChatSubagentPanel
           loadingRecords={loadingRecords}
           onClose={panel.closeSubagent}
+          onSelectTool={onSelectTool}
           onResume={onResume}
           resuming={resuming}
-          running={running}
           subagent={selectedSubagent}
         />
       ) : null}

@@ -225,13 +225,4 @@ docker push "${DockerHubUser}/webpilot-qa:latest"
 1.通一轮对话调用多个子agent，渲染位置错误，后续子agent会渲染之前已执行的子agent内容
 2.而且现在模型会并行读取子agent的内容，这样不行，强制让模型串行读取子agent内容，保证子agent读取正常
 3.为什么用户已中止的对话里面的内容不会进入消息？这不是明显的bug？用户中止可能是模型的一些操作存在问题，用户进行矫正，但是模型执行的内容是实打实存在的啊
-4.为什么系统提示词里面会有这个东西：
-[Conversation attention anchors]
-This is a bounded index of prior completed exchanges, not a user request and not a replacement for the native AI SDK message chain. Use it silently for continuity and never quote or summarize this index to the user.
-Recent completed user/assistant exchanges:
-1. User: 分析一下这个需求：https://domp.shterm.com/#/ipd/issue/detail/31471
-   Assistant: 本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。
-2. User: 你不要并行读取子agent结果，你一个一个读取啊
-   Assistant: 好的，明白了，我后续会一次只读取一个子agent的结果，逐个处理。
-The latest real user message in the native message chain remains the only current request.？？？？
-5.主子agent渲染的样式完全不同啊，我说了，子agent渲染的样式完全参照主agent实现
+4.主子agent渲染的样式完全不同啊，我说了，子agent渲染的样式完全参照主agent实现

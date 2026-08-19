@@ -26,9 +26,15 @@ test('selects records only for the active assistant message', () => {
         batchId: 'batch-1',
         index: 0,
         title: 'child',
+        instruction: 'read child data',
+        createdAt: '2026-08-19T00:00:00.000Z',
+        updatedAt: '2026-08-19T00:00:01.000Z',
         status: 'running' as const,
+        content: '',
         resumable: false,
         toolCount: 1,
+        steps: [],
+        outputCycles: [],
         messages: [],
       },
     ],
@@ -41,4 +47,3 @@ test('selects records only for the active assistant message', () => {
   assert.deepEqual(records.subagents.map((subagent) => subagent.id), ['child-1']);
   assert.equal(activeBrowserChatAssistantMessage({ ...source, busy: false, status: 'idle' }), undefined);
 });
-

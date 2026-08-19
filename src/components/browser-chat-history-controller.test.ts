@@ -16,7 +16,7 @@ test('loads earlier messages only on the transition from a nonzero position to t
   assert.equal(browserChatReachedHistoryTop(0, 10), false);
 });
 
-test('historical subagent data is queried only on the first parallel-group expansion', () => {
+test('historical subagent data is queried only on the first subagent-group expansion', () => {
   const queried = new Set<string>();
   assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), true);
   assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), false);
