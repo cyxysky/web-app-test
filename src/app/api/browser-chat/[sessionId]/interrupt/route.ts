@@ -16,7 +16,12 @@ function requestUserId(request: Request) {
 export async function POST(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
-    const session = interruptBrowserChatSession(sessionId, requestUserId(request));
+    const body = await request.json().catch(() => ({})) as { clientMessageId?: unknown };
+    const clientMessageId = typeof body.clientMessageId === 'string' ? body.clientMessageId.trim() : '';
+    if (!clientMessageId) {
+      throw new ApiRequestError('Browser chat turn id is required', { code: 'invalid_request', status: 400 });
+    }
+    const session = interruptBrowserChatSession(sessionId, clientMessageId, requestUserId(request));
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {

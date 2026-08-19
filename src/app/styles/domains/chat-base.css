@@ -165,7 +165,6 @@
   min-height: 116px;
   overflow-x: hidden;
   overflow-y: auto;
-  scrollbar-gutter: auto;
 }
 
 .browser-chat-message-generation-item {
@@ -742,8 +741,6 @@
   overflow-x: hidden;
   overflow-y: auto;
   padding: 0;
-  scrollbar-gutter: auto;
-  scrollbar-width: thin;
 }
 
 .browser-chat-recent-list li {
@@ -889,10 +886,6 @@
   padding: 6px 12px 0;
   position: relative;
   z-index: 2;
-}
-
-.browser-chat-embedded-tab-stack::-webkit-scrollbar {
-  display: none;
 }
 
 .browser-chat-embedded-tab-group-shell {
@@ -2008,7 +2001,6 @@
   flex: 1 1 auto;
   margin-inline: calc(0px - var(--browser-chat-pane-inline-padding));
   overflow-y: auto;
-  scrollbar-gutter: auto;
   width: calc(100% + var(--browser-chat-pane-inline-padding) + var(--browser-chat-pane-inline-padding));
 }
 
@@ -2324,14 +2316,22 @@
 }
 
 .browser-chat-subagent-status-icon {
-  align-items: center;
   border: 1px solid currentColor;
   border-radius: 999px;
-  display: inline-flex;
+  box-sizing: border-box;
+  display: inline-grid;
   flex: 0 0 auto;
   height: 24px;
-  justify-content: center;
+  line-height: 0;
+  place-items: center;
   width: 24px;
+}
+
+.browser-chat-subagent-status-icon > svg {
+  display: block;
+  height: 14px;
+  margin: 0;
+  width: 14px;
 }
 
 .browser-chat-subagent-row-copy {
@@ -2430,7 +2430,8 @@
 
 .browser-chat-subagent-panel-body {
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   overscroll-behavior: contain;
   padding: 18px 20px 28px;
 }
@@ -2438,7 +2439,9 @@
 .browser-chat-subagent-detail {
   display: grid;
   gap: 12px;
+  max-width: 100%;
   min-width: 0;
+  width: 100%;
 }
 
 .browser-chat-subagent-detail :where(.browser-chat-tool-card, .browser-chat-tool-confirmation) {
@@ -2446,9 +2449,7 @@
 }
 
 .browser-chat-subagent-summary {
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
-  margin-top: 4px;
-  padding-top: 14px;
+  min-width: 0;
 }
 
 .browser-chat-subagent-message {
@@ -2468,7 +2469,23 @@
 .browser-chat-subagent-message-content {
   display: grid;
   gap: 7px;
+  max-width: 100%;
   min-width: 0;
+}
+
+.browser-chat-subagent-message-content .browser-chat-agent-markdown,
+.browser-chat-subagent-summary .browser-chat-agent-markdown,
+.browser-chat-subagent-message-content .browser-chat-agent-markdown > *,
+.browser-chat-subagent-summary .browser-chat-agent-markdown > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.browser-chat-subagent-message-content .browser-chat-agent-markdown pre,
+.browser-chat-subagent-message-content .browser-chat-agent-markdown table,
+.browser-chat-subagent-summary .browser-chat-agent-markdown pre,
+.browser-chat-subagent-summary .browser-chat-agent-markdown table {
+  width: 100%;
 }
 
 .browser-chat-subagent-message.is-user .browser-chat-subagent-message-content {
@@ -2487,6 +2504,19 @@
   border-radius: 10px;
   min-width: 0;
   overflow: hidden;
+}
+
+.browser-chat-subagent-message-data.is-tool {
+  border: 0;
+  overflow: visible;
+}
+
+.browser-chat-subagent-message-data.is-tool > .browser-chat-tool-card {
+  max-width: 100%;
+}
+
+.browser-chat-subagent-message-chevron {
+  margin-left: auto;
 }
 
 .browser-chat-subagent-message-data > summary {
@@ -2527,6 +2557,14 @@
   tab-size: 2;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.browser-chat-subagent-message-data.is-tool pre {
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 10px;
+  margin-top: 6px;
+  max-width: 100%;
+  width: 100%;
 }
 
 .browser-chat-subagent-confirmation {
@@ -3248,22 +3286,24 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 }
 
 .browser-chat-tool-icon {
-  align-items: center;
   background: var(--panel);
   border: 1px solid var(--accent-border);
   border-radius: 999px;
   box-sizing: border-box;
   color: var(--accent-strong);
-  display: inline-flex;
+  display: inline-grid;
   flex: 0 0 24px;
   height: 24px;
-  justify-content: center;
+  line-height: 0;
   min-width: 24px;
   width: 24px;
+  place-items: center;
 }
 
 .browser-chat-tool-icon>svg {
+  display: block;
   flex: 0 0 auto;
+  margin: 0;
 }
 
 .browser-chat-tool-card.is-failed .browser-chat-tool-icon {
@@ -3352,12 +3392,12 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 
 .browser-chat-reference-chip {
   align-items: center;
-  color: #1f676d;
+  color: var(--foreground);
   display: inline-flex;
   line-height: 1;
   margin: 0 2px;
   max-width: min(100%, 200px);
-  min-height: 30px;
+  min-height: 20px;
   vertical-align: middle;
 }
 
@@ -3368,11 +3408,17 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   color: inherit;
   cursor: pointer;
   display: inline-flex;
-  gap: 7px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 5px;
+  line-height: 20px;
   max-width: 100%;
   min-width: 0;
-  padding: 4px 9px;
+  overflow: hidden;
+  padding: 0;
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .browser-chat-reference-main:hover {
@@ -3392,16 +3438,6 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 
 .browser-chat-reference-icon.tab {
   color: #7b5f2a;
-}
-
-.browser-chat-reference-name {
-  display: inline-block;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-  font-weight: 850;
 }
 
 .browser-chat-skill-menu {
@@ -3439,7 +3475,8 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   word-break: break-word;
 }
 
-.browser-chat-inline-editor:empty::before {
+.browser-chat-inline-editor:empty::after,
+.browser-chat-inline-editor[data-empty="true"]::after {
   color: #8e8ea0;
   content: attr(data-placeholder);
   pointer-events: none;
@@ -3448,27 +3485,19 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
 .browser-chat-inline-skill,
 .browser-chat-inline-reference {
   align-items: center;
-  color: #1f676d;
+  color: var(--foreground);
   cursor: pointer;
   display: inline-flex;
-  font-size: 13px;
-  font-weight: 850;
-  gap: 6px;
-  line-height: 16px;
-  padding: 0 2px;
+  font-size: 12px;
+  font-weight: 500;
+  gap: 5px;
+  line-height: 20px;
+  padding: 0;
   max-width: min(200px, 100%);
   min-width: 0;
+  overflow: hidden;
   user-select: none;
   vertical-align: -0.14em;
-  white-space: nowrap;
-}
-
-.browser-chat-inline-skill-title,
-.browser-chat-inline-reference-title {
-  display: inline-block;
-  line-height: 16px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -3478,37 +3507,27 @@ html .browser-chat-tool-confirmation button.browser-chat-tool-confirm:disabled {
   color: var(--accent-strong);
   display: inline-flex;
   flex: 0 0 auto;
-  height: 16px;
+  height: 14px;
   justify-content: center;
-  width: 16px;
+  width: 14px;
 }
 
 .browser-chat-inline-skill-icon svg,
 .browser-chat-inline-reference-icon svg {
   display: block;
   fill: none;
-  height: 14px;
+  height: 13px;
   stroke: currentColor;
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2;
-  width: 14px;
-}
-
-.browser-chat-inline-reference:active {
-  background: #ffffff;
+  width: 13px;
 }
 
 .browser-chat-inline-reference-icon svg {
   height: 13px;
   stroke-width: 1.5;
   width: 13px;
-}
-
-.browser-chat-inline-reference-title {
-  font-size: 12.5px;
-  font-weight: 500;
-  line-height: 18px;
 }
 
 .browser-chat-compose .browser-chat-skill-menu {
@@ -4256,7 +4275,8 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
   width: 100%;
 }
 
-:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor:empty::before {
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor:empty::after,
+:root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor[data-empty="true"]::after {
   color: #444748;
 }
 
@@ -4265,8 +4285,6 @@ body.is-dragging-embedded-tab .browser-chat-compose--reference .browser-chat-inl
 }
 
 :root[data-theme="dark"] .browser-chat-inline-reference {
-  background: #242728;
-  border-color: #3d4143;
   color: #e1e3e4;
 }
 

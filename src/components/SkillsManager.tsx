@@ -20,7 +20,6 @@ type SkillDraft = {
   shared: boolean;
   title: string;
   description: string;
-  domains: string;
   status: SkillRecord['status'];
   triggerPhrases: string;
   details: string;
@@ -40,7 +39,6 @@ const emptyDraft: SkillDraft = {
   shared: false,
   title: '',
   description: '',
-  domains: '',
   status: 'ready',
   triggerPhrases: '',
   details: '',
@@ -51,7 +49,6 @@ function draftFromSkill(skill: SkillRecord): SkillDraft {
     shared: skill.shared,
     title: skill.title,
     description: skill.description,
-    domains: (skill.domains || []).join('\n'),
     status: skill.status,
     triggerPhrases: skill.triggerPhrases.join('\n'),
     details: skill.content.details,
@@ -67,7 +64,6 @@ function payloadFromDraft(draft: SkillDraft) {
     shared: draft.shared,
     title: draft.title.trim(),
     description: draft.description.trim(),
-    domains: splitList(draft.domains),
     status: draft.status,
     triggerPhrases: splitList(draft.triggerPhrases),
     content: {
@@ -311,21 +307,13 @@ export function SkillsManager({
                   },
                   {
                     key: 'scope',
-                    label: t('适用范围'),
+                    label: t('共享范围'),
                     className: 'skills-manager-scope-column',
                     filter: {
-                      getValue: (skill) => [
-                        ...(skill.domains || []),
-                        skill.shared ? t('所有 ID 共享') : t('仅创建 ID'),
-                      ],
+                      getValue: (skill) => skill.shared ? t('所有 ID 共享') : t('仅创建 ID'),
                       type: 'text',
                     },
-                    render: (skill) => (
-                      <div className="management-table-cell-stack">
-                        <span>{skill.domains?.length ? skill.domains.join(' · ') : t('所有域名')}</span>
-                        <small>{skill.shared ? t('所有 ID 共享') : t('仅创建 ID')}</small>
-                      </div>
-                    ),
+                    render: (skill) => <span>{skill.shared ? t('所有 ID 共享') : t('仅创建 ID')}</span>,
                   },
                   {
                     key: 'triggers',
@@ -399,7 +387,6 @@ export function SkillsManager({
                 getSearchText={(skill) => [
                   skill.title,
                   skill.description,
-                  ...(skill.domains || []),
                   ...skill.triggerPhrases,
                   skill.content.details,
                   t(statusLabel(skill.status)),
@@ -494,10 +481,6 @@ export function SkillsManager({
               <label className="skills-manager-field wide">
                 <span>{t('描述')}</span>
                 <textarea className="textarea settings-control" value={draft.description} onChange={(event) => update({ description: event.target.value })} placeholder={t('一句话说明能力和适用场景')} />
-              </label>
-              <label className="skills-manager-field wide">
-                <span>{t('适用域名')}</span>
-                <textarea className="textarea settings-control compact" value={draft.domains} onChange={(event) => update({ domains: event.target.value })} placeholder={t('留空表示所有域名；每行一个域名，可使用 *.example.com')} />
               </label>
               <label className="skills-manager-field wide">
                 <span>{t('触发词')}</span>

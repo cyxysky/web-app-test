@@ -39,7 +39,6 @@ const skillItemSchema = z.object({
   id: z.string().trim().min(1).max(200),
   title: z.string().trim().min(1).max(500),
   description: z.string().trim().max(4_000),
-  domains: z.array(z.string().trim().max(1_000)).max(100),
   triggerPhrases: z.array(z.string().trim().max(500)).max(100),
   content: z.object({
     details: z.string().max(30_000),
@@ -209,8 +208,8 @@ function fileTimestamp(value: string) {
   return value.replace(/[:.]/g, '-');
 }
 
-function skillIdentity(item: Pick<SkillItem, 'title' | 'domains'>) {
-  return `${item.title.trim().toLowerCase()}\u0001${[...item.domains].map((domain) => domain.trim().toLowerCase()).sort().join(',')}`;
+function skillIdentity(item: Pick<SkillItem, 'title'>) {
+  return item.title.trim().toLowerCase();
 }
 
 export async function exportPortableData(input: {
@@ -258,7 +257,6 @@ export async function exportPortableData(input: {
         id: skill.id,
         title: skill.title,
         description: skill.description,
-        domains: skill.domains || [],
         triggerPhrases: skill.triggerPhrases,
         content: skill.content,
         status: skill.status,
@@ -302,10 +300,7 @@ async function importSkills(items: SkillItem[], userId: unknown) {
   const existingSkills = store.listSkills(undefined, normalizedUserId)
     .filter((skill) => skill.userId === normalizedUserId);
   const byId = new Map(existingSkills.map((skill) => [skill.id, skill]));
-  const targetIdByIdentity = new Map(existingSkills.map((skill) => [skillIdentity({
-    title: skill.title,
-    domains: skill.domains || [],
-  }), skill.id]));
+  const targetIdByIdentity = new Map(existingSkills.map((skill) => [skillIdentity(skill), skill.id]));
   const batch: Parameters<typeof store.upsertSkillsBatch>[0] = [];
   let created = 0;
   let updated = 0;
@@ -317,7 +312,6 @@ async function importSkills(items: SkillItem[], userId: unknown) {
       id,
       title: item.title,
       description: item.description,
-      domains: item.domains,
       triggerPhrases: item.triggerPhrases,
       content: item.content,
       status: item.status,

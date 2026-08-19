@@ -13,11 +13,6 @@
   overflow-x: hidden;
   overflow-y: hidden;
   padding: 0;
-  scrollbar-width: none;
-}
-
-.browser-chat-embedded-tab-list::-webkit-scrollbar {
-  display: none;
 }
 
 .browser-chat-embedded-tab-group-shell {
@@ -57,12 +52,7 @@
   overscroll-behavior-inline: contain;
   padding: 0 10px;
   scroll-padding-inline: 10px;
-  scrollbar-width: none;
   transition: max-width 160ms cubic-bezier(0.2, 0, 0, 1);
-}
-
-.browser-chat-embedded-tab-stack::-webkit-scrollbar {
-  display: none;
 }
 
 .browser-chat-embedded-tab {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseSkillContent, type SkillRecord } from '@/server/ai/schemas/runtime.schema';
-import { formatLoadedSkillsForPrompt, formatSkillReferencesForUser, formatSkillSummariesForPrompt, runtimeSkillsForUrl, skillMatchesUrl } from './skill-context';
+import { formatLoadedSkillsForPrompt, formatSkillReferencesForUser, formatSkillSummariesForPrompt, runtimeSkills } from './skill-context';
 
 const skill: SkillRecord = {
   id: 'skill-search-room',
@@ -52,61 +52,50 @@ test('Skill content keeps the detailed Markdown block intact', () => {
   });
 });
 
-test('domain-scoped skills only match their configured host', () => {
-  const domainSkill = { ...skill, id: 'domain-skill', domains: ['10.10.0.90'] };
-  assert.equal(skillMatchesUrl(domainSkill, 'https://10.10.0.90/ipd'), true);
-  assert.equal(skillMatchesUrl(domainSkill, 'https://example.com'), false);
-});
-
-test('runtime skills drop explicit domain Skills after leaving their domain and keep global matches', () => {
-  const explicit = { ...skill, id: 'explicit', domains: ['other.example'] };
-  const global = { ...skill, id: 'global', domains: [] };
-  const matching = { ...skill, id: 'matching', domains: ['*.example.com'] };
-  const unrelated = { ...skill, id: 'unrelated', domains: ['unrelated.example'] };
+test('explicitly selected Skills stay available across page changes', () => {
+  const explicit = { ...skill, id: 'explicit' };
+  const automatic = { ...skill, id: 'automatic' };
   assert.deepEqual(
-    runtimeSkillsForUrl([global, matching, unrelated], [explicit], 'https://app.example.com/path').map((item) => item.id),
-    ['global', 'matching'],
+    runtimeSkills([automatic], [explicit]).map((item) => item.id),
+    ['explicit', 'automatic'],
   );
 });
 
-test('shared global Skills remain valid candidates without domain matching', () => {
-  const sharedGlobal = { ...skill, id: 'shared-global', shared: true, domains: [] };
+test('shared Skills remain valid candidates', () => {
+  const sharedSkill = { ...skill, id: 'shared-skill', shared: true };
   assert.deepEqual(
-    runtimeSkillsForUrl(
-      [sharedGlobal],
+    runtimeSkills(
+      [sharedSkill],
       [],
-      'https://wiki.example.com/path',
       new Set(),
       '请打开指定主播直播间',
     ).map((item) => item.id),
-    ['shared-global'],
+    ['shared-skill'],
   );
-  assert.match(formatLoadedSkillsForPrompt([sharedGlobal]), /Content:/);
+  assert.match(formatLoadedSkillsForPrompt([sharedSkill]), /Content:/);
 });
 
 test('runtime Skill summaries exclude Skills already read in the current user turn', () => {
-  const matching = { ...skill, id: 'matching', domains: ['example.com'] };
+  const matching = { ...skill, id: 'matching' };
   assert.deepEqual(
-    runtimeSkillsForUrl([matching], [], 'https://example.com/path', new Set(['matching'])),
+    runtimeSkills([matching], [], new Set(['matching'])),
     [],
   );
 });
 
-test('runtime Skill summaries use the current conversation to filter global Skills', () => {
-  const relevant = { ...skill, id: 'relevant', domains: [] };
+test('runtime Skill summaries use the current conversation to filter Skills', () => {
+  const relevant = { ...skill, id: 'relevant' };
   const unrelated = {
     ...skill,
     id: 'unrelated',
     title: '导出财务报表',
     description: '导出财务数据。',
     triggerPhrases: ['导出报表'],
-    domains: [],
   };
   assert.deepEqual(
-    runtimeSkillsForUrl(
+    runtimeSkills(
       [unrelated, relevant],
       [],
-      'https://example.com/path',
       new Set(),
       '请帮我打开指定主播直播间',
     ).map((item) => item.id),

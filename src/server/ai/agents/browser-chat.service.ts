@@ -44,9 +44,11 @@ import {
   browserChatSubagentConfirmationMessage,
   browserChatSubagentInputMessage,
   browserChatSubagentMessagesFromModelMessages,
+  browserChatSubagentMessagesFromProgress,
   browserChatSubagentSuggestedSummaryChars,
   limitBrowserChatSubagentMessages,
   preserveBrowserChatSubagentSummary,
+  resolvedBrowserChatSubagentStatus,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
   type BrowserChatSubagentConfirmationInteraction,
@@ -57,6 +59,7 @@ import {
   registeredBrowserChatTurnIsActive,
   revokeBrowserChatTurn,
   revokeRegisteredBrowserChatTurn,
+  revokeRegisteredBrowserChatTurnByAssistantMessageId,
   runtimeSnapshotIsNewer,
   type RegisteredBrowserChatTurn,
 } from '@/server/ai/agents/browser-chat-interrupt-state';
@@ -69,9 +72,7 @@ import {
   formatLoadedSkillsForPrompt,
   formatSkillReferencesForUser,
   formatSkillSummariesForPrompt,
-  normalizeSkillDomains,
-  runtimeSkillsForUrl,
-  skillMatchesUrl,
+  runtimeSkills,
 } from '@/server/ai/agents/skill-context';
 import { expandMultilingualRetrievalQuery } from '@/server/ai/retrieval-query';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
@@ -1282,20 +1283,13 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   let availableSkillIds = new Set<string>();
   const getContext = () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
-    const effectiveUrl = currentUrl || input.session.targetUrl;
     const allSkills = store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready');
-    for (const [skillId, loadedSkill] of loadedSkills) {
-      if (normalizeSkillDomains(loadedSkill.domains).length && !skillMatchesUrl(loadedSkill, effectiveUrl)) {
-        loadedSkills.delete(skillId);
-      }
-    }
     const activeLoadedSkills = [...loadedSkills.values()];
     const activeLoadedSkillIds = new Set(activeLoadedSkills.map((skill) => skill.id));
     const explicitlySelectedSkills = allSkills.filter((skill) => explicitlySelectedSkillIds.has(skill.id));
-    const skills = runtimeSkillsForUrl(
+    const skills = runtimeSkills(
       allSkills,
       explicitlySelectedSkills,
-      effectiveUrl,
       activeLoadedSkillIds,
       retrievalQueries,
     );
@@ -1339,22 +1333,18 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   return Object.assign(getContext, {
     readSkill: async (skillId: string): Promise<BrowserActionResult> => {
       const normalizedSkillId = skillId.trim();
-      const currentUrl = browserChatMemoryUrl(input.browser, input.session) || input.session.targetUrl;
       const skill = store.getSkill(normalizedSkillId, input.session.userId);
       if (!availableSkillIds.has(normalizedSkillId) || !skill || skill.status !== 'ready') {
         return { ok: false, actual: 'Skill is not available in the current runtime candidate list.' };
       }
-      if (normalizeSkillDomains(skill.domains).length && !skillMatchesUrl(skill, currentUrl)) {
-        return { ok: false, actual: 'Skill is not available for the current browser domain.' };
-      }
       if (loadedSkills.has(skill.id)) {
-        return { ok: false, actual: 'Skill is already loaded in the current browser context.' };
+        return { ok: false, actual: 'Skill is already loaded in the current runtime context.' };
       }
       loadedSkills.set(skill.id, skill);
       availableSkillIds.delete(skill.id);
       return {
         ok: true,
-        actual: `Skill loaded into the current runtime context: ${skill.id} (${normalizeSkillDomains(skill.domains).length ? 'domain-scoped' : 'global'}).`,
+        actual: `Skill loaded into the current runtime context: ${skill.id}.`,
       };
     },
   });
@@ -1666,12 +1656,27 @@ function hasRunningAssistantMessage(session: Pick<BrowserChatSessionSnapshot, 'm
   ));
 }
 
-function latestRunningAssistantMessageId(session: Pick<BrowserChatSessionSnapshot, 'messages'>) {
-  for (let index = (session.messages || []).length - 1; index >= 0; index -= 1) {
-    const message = session.messages[index];
-    if (message.role === 'assistant' && message.status === 'running') return message.id;
-  }
-  return undefined;
+function assistantMessageMatchesClientTurn(
+  session: Pick<BrowserChatSessionSnapshot, 'messages'>,
+  assistantMessageId: string | undefined,
+  clientMessageId: string,
+) {
+  if (!assistantMessageId) return false;
+  const message = session.messages.find((item) => item.id === assistantMessageId);
+  return message?.role === 'assistant' && message.clientMessageId === clientMessageId;
+}
+
+function runningAssistantMessageIdsForClientTurn(
+  session: Pick<BrowserChatSessionSnapshot, 'messages'>,
+  clientMessageId: string,
+) {
+  return session.messages
+    .filter((message) => (
+      message.role === 'assistant'
+      && message.status === 'running'
+      && message.clientMessageId === clientMessageId
+    ))
+    .map((message) => message.id);
 }
 
 function recoveredStatusForStaleAssistantMessage(
@@ -1716,18 +1721,17 @@ function markAssistantMessageInterrupted(assistantMessageId?: string) {
 
 const browserChatInterruptedReply = '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。';
 
-function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMessageId: string | undefined, timestamp: string) {
-  if (assistantMessageId) {
-    updateAssistantMessage(session, assistantMessageId, (message) => ({
-      ...message,
-      content: browserChatInterruptedReply,
-      status: 'interrupted',
-      activity: undefined,
-      updatedAt: timestamp,
-    }));
-  }
+function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMessageId: string, timestamp: string) {
+  updateAssistantMessage(session, assistantMessageId, (message) => ({
+    ...message,
+    content: browserChatInterruptedReply,
+    status: 'interrupted',
+    activity: undefined,
+    updatedAt: timestamp,
+  }));
   replaceSessionSteps(session, session.steps.map((step) => {
     if (step.status !== 'queued' && step.status !== 'running') return step;
+    if (step.messageId !== assistantMessageId) return step;
     const interruptionNote = '用户已中止本轮对话；已保留中止前的工具执行记录。';
     return {
       ...step,
@@ -2946,7 +2950,6 @@ export async function generateBrowserChatMessagesSkill(
   const skill = store.upsertSkill({
     title: generated.title,
     description: generated.description,
-    domains: generated.domains,
     triggerPhrases: generated.triggerPhrases,
     content: generated.content,
     sourceSessionId: session.id,
@@ -3769,45 +3772,79 @@ export function resolveBrowserChatToolConfirmation(
   return clientSnapshot(session);
 }
 
-export function interruptBrowserChatSession(sessionId: string, userId?: string | number) {
+export function interruptBrowserChatSession(
+  sessionId: string,
+  targetClientMessageId: string,
+  userId?: string | number,
+) {
+  const normalizedTargetClientMessageId = targetClientMessageId.trim();
+  if (!normalizedTargetClientMessageId) throw new Error('Browser chat turn id is required');
   // Prefer the live runtime record. Interrupt must not wait for persistence
   // rehydration while an AI request is actively running.
-  const registeredTurn = activeTurns.get(sessionId);
-  const session = sessions.get(sessionId) || registeredTurn?.session || hydrateSession(sessionId);
+  const registeredCandidate = activeTurns.get(sessionId);
+  const session = sessions.get(sessionId) || registeredCandidate?.session || hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
+  const registeredTurn = registeredCandidate && assistantMessageMatchesClientTurn(
+    registeredCandidate.session,
+    registeredCandidate.assistantMessageId,
+    normalizedTargetClientMessageId,
+  ) ? registeredCandidate : undefined;
   const timestamp = now();
   const reason = new Error('Browser chat operation interrupted by user.');
-  transitionBrowserChatSession(session, { type: 'turnStopping', at: timestamp });
-  const assistantMessageIds = new Set([
-    registeredTurn?.assistantMessageId,
-    session.activeAssistantMessageId,
-    latestRunningAssistantMessageId(session),
-  ].filter((value): value is string => Boolean(value)));
+  const runtimeRecords = new Set<BrowserChatSessionRecord>([
+    session,
+    ...(registeredTurn?.session ? [registeredTurn.session] : []),
+  ]);
+  const assistantMessageIds = new Set<string>();
+  for (const runtimeRecord of runtimeRecords) {
+    for (const messageId of runningAssistantMessageIdsForClientTurn(
+      runtimeRecord,
+      normalizedTargetClientMessageId,
+    )) assistantMessageIds.add(messageId);
+    if (assistantMessageMatchesClientTurn(
+      runtimeRecord,
+      runtimeRecord.activeAssistantMessageId,
+      normalizedTargetClientMessageId,
+    )) assistantMessageIds.add(runtimeRecord.activeAssistantMessageId!);
+  }
+  if (registeredTurn) assistantMessageIds.add(registeredTurn.assistantMessageId);
+  if (!assistantMessageIds.size) return clientSnapshot(session);
   const assistantMessageId = registeredTurn?.assistantMessageId
-    || session.activeAssistantMessageId
-    || latestRunningAssistantMessageId(session);
+    || [...assistantMessageIds][0];
+  if (assistantMessageMatchesClientTurn(
+    session,
+    session.activeAssistantMessageId,
+    normalizedTargetClientMessageId,
+  )) transitionBrowserChatSession(session, { type: 'turnStopping', at: timestamp });
 
   // Delete the execution registration before dispatching abort. This is the
   // irreversible stop boundary: persisted state, delayed request retries, and
   // child-Agent completions cannot recreate ownership for this execution.
   for (const messageId of assistantMessageIds) markAssistantMessageInterrupted(messageId);
-  const registeredRevocation = revokeRegisteredBrowserChatTurn(activeTurns, sessionId, reason);
-  const runtimeRecords = new Set<BrowserChatSessionRecord>([
-    session,
-    ...(registeredTurn?.session ? [registeredTurn.session] : []),
-  ]);
+  const registeredRevocation = registeredTurn
+    ? revokeRegisteredBrowserChatTurnByAssistantMessageId(
+        activeTurns,
+        sessionId,
+        registeredTurn.assistantMessageId,
+        reason,
+      )
+    : undefined;
   let sessionAbortDispatched = false;
   for (const runtimeRecord of runtimeRecords) {
-    cancelPendingToolConfirmation(runtimeRecord);
-    const revoked = revokeBrowserChatTurn(runtimeRecord, timestamp, reason);
-    sessionAbortDispatched ||= revoked.abortDispatched;
-    if (assistantMessageIds.size === 0) {
-      preserveInterruptedTurn(runtimeRecord, undefined, timestamp);
-    } else {
-      for (const messageId of assistantMessageIds) {
-        preserveInterruptedTurn(runtimeRecord, messageId, timestamp);
-      }
+    const activeAssistantMessageId = runtimeRecord.activeAssistantMessageId;
+    if (activeAssistantMessageId && assistantMessageIds.has(activeAssistantMessageId)) {
+      cancelPendingToolConfirmation(runtimeRecord);
+      const revoked = revokeBrowserChatTurn(runtimeRecord, timestamp, reason);
+      sessionAbortDispatched ||= revoked.abortDispatched;
+    } else if (
+      runtimeRecord.pendingToolConfirmation?.messageId
+      && assistantMessageIds.has(runtimeRecord.pendingToolConfirmation.messageId)
+    ) {
+      cancelPendingToolConfirmation(runtimeRecord);
+    }
+    for (const messageId of assistantMessageIds) {
+      preserveInterruptedTurn(runtimeRecord, messageId, timestamp);
     }
   }
   preserveInterruptedSubagents(session.id, assistantMessageId);
@@ -4024,6 +4061,18 @@ async function executeBrowserChatSubagentBatch(input: {
       runId: `${session.id}_${task.id}`,
     });
     const childSteps = new Map<number, StepExecutionResult>();
+    let streamedSubagentText = '';
+    const liveSubagentMessages = () => {
+      const confirmationMessages = (registry.get(task.id)?.messages || [])
+        .filter((message) => message.id.includes(':message:confirmation:'));
+      return browserChatSubagentMessagesFromProgress({
+        subagentId: task.id,
+        instruction: task.instruction,
+        steps: [...childSteps.values()],
+        streamedText: streamedSubagentText,
+        preservedMessages: confirmationMessages,
+      });
+    };
     try {
       await child.start();
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
@@ -4054,6 +4103,7 @@ async function executeBrowserChatSubagentBatch(input: {
             ? '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。'
             : '浏览器检查与操作使用 inspect 获取当前结构化页面状态，再使用 browser/interact 完成动作；只操作 inspect 返回的可见、可交互节点。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
+          '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed，并在总结中说明失败尝试；只有目标结果仍未取得时才报告 failed。',
           summaryGuidanceChars
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
@@ -4077,6 +4127,14 @@ async function executeBrowserChatSubagentBatch(input: {
             (interaction) => recordBrowserChatSubagentConfirmation(session.id, task.id, interaction),
           )
           : undefined,
+        onTextStream: ({ text }) => {
+          if (!ownsTurn()) return;
+          streamedSubagentText = text;
+          updateBrowserChatStoredSubagent(session.id, task.id, {
+            messages: liveSubagentMessages(),
+          });
+          persistAndNotify(session.id, { defer: true });
+        },
         onProgress: (step) => {
           if (!ownsTurn()) return;
           childSteps.set(step.index, step);
@@ -4085,6 +4143,7 @@ async function executeBrowserChatSubagentBatch(input: {
             status: step.status === 'blocked' ? 'blocked' : 'running',
             currentAction: step.action || step.actual || '正在执行',
             toolCount: steps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
+            messages: liveSubagentMessages(),
           });
           persistAndNotify(session.id, { defer: true });
         },
@@ -4094,6 +4153,11 @@ async function executeBrowserChatSubagentBatch(input: {
         textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 已完成，但没有返回额外文本。'),
       );
       const summary = summaryResult.summary;
+      const status = resolvedBrowserChatSubagentStatus({
+        status: result.status,
+        summary,
+        steps: result.newSteps,
+      });
       const resultMessages = browserChatSubagentMessagesFromModelMessages(task.id, result.turnMessages);
       const modelMessages = resultMessages.some((message) => message.role === 'user')
         ? resultMessages
@@ -4102,14 +4166,14 @@ async function executeBrowserChatSubagentBatch(input: {
         .filter((message) => message.id.includes(':message:confirmation:'));
       const messages = limitBrowserChatSubagentMessages(task.id, [...modelMessages, ...confirmationMessages]);
       updateBrowserChatStoredSubagent(session.id, task.id, {
-        status: result.status,
+        status,
         ...summaryResult,
         currentAction: undefined,
         toolCount: result.newSteps.reduce((count, step) => count + (step.tools || []).length, 0),
         messages,
       });
       persistAndNotify(session.id);
-      return { id: task.id, title: task.title, task, status: result.status, summary, content: summary };
+      return { id: task.id, title: task.title, task, status, summary, content: summary };
     } catch (error) {
       if (!ownsTurn()) throw error;
       const message = userFacingErrorMessage(error);
@@ -4200,6 +4264,14 @@ async function resumeBlockedBrowserChatSubagent(input: {
     abortController.signal,
     { recordLogs: false },
   );
+  let streamedSubagentText = '';
+  const liveSubagentMessages = (steps: readonly StepExecutionResult[]) => browserChatSubagentMessagesFromProgress({
+    subagentId: binding.id,
+    instruction: binding.task.instruction,
+    steps,
+    streamedText: streamedSubagentText,
+    preservedMessages: browserChatSubagentSessionRegistry(session.id).get(binding.id)?.messages || [],
+  });
   try {
     const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
@@ -4210,6 +4282,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       modelInstruction: [
         `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
+        '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed，并在总结中说明失败尝试；只有目标结果仍未取得时才报告 failed。',
         binding.task.instruction,
       ].filter(Boolean).join('\n\n'),
       operationalContext: initialRuntimeContext.operationalContext,
@@ -4228,8 +4301,16 @@ async function resumeBlockedBrowserChatSubagent(input: {
           request,
           binding.browser,
           (interaction) => recordBrowserChatSubagentConfirmation(session.id, binding.id, interaction),
-        )
+          )
         : undefined,
+      onTextStream: ({ text }) => {
+        if (!ownsTurn()) return;
+        streamedSubagentText = text;
+        updateBrowserChatStoredSubagent(session.id, binding.id, {
+          messages: liveSubagentMessages(binding.steps),
+        });
+        persistAndNotify(session.id, { defer: true });
+      },
       onProgress: (step) => {
         if (!ownsTurn()) return;
         const nextSteps = [...binding.steps.filter((item) => item.index !== step.index), step].sort((left, right) => left.index - right.index);
@@ -4238,6 +4319,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
           status: step.status === 'blocked' ? 'blocked' : 'running',
           currentAction: step.action || step.actual || '正在继续',
           toolCount: nextSteps.reduce((count, childStep) => count + (childStep.tools || []).length, 0),
+          messages: liveSubagentMessages(nextSteps),
         });
         persistAndNotify(session.id, { defer: true });
       },
@@ -4247,6 +4329,11 @@ async function resumeBlockedBrowserChatSubagent(input: {
       textFromUnknown(result.reply || result.newSteps.at(-1)?.actual || '子 Agent 续跑完成。'),
     );
     const summary = summaryResult.summary;
+    const status = resolvedBrowserChatSubagentStatus({
+      status: result.status,
+      summary,
+      steps: result.newSteps,
+    });
     binding.steps = result.steps;
     const stored = browserChatSubagentSessionRegistry(session.id).get(binding.id);
     const resumedMessages = browserChatSubagentMessagesFromModelMessages(
@@ -4255,7 +4342,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       stored?.messages.length || 0,
     );
     updateBrowserChatStoredSubagent(session.id, binding.id, {
-      status: result.status,
+      status,
       ...summaryResult,
       currentAction: undefined,
       toolCount: result.steps.reduce((count, step) => count + (step.tools || []).length, 0),
@@ -4266,7 +4353,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       ),
       error: undefined,
     });
-    if (result.status === 'blocked') {
+    if (status === 'blocked') {
       const timestamp = now();
       updateAssistantMessage(session, assistantMessageId, (message) => ({
         ...message,

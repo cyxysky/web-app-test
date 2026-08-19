@@ -185,7 +185,6 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
     shared: record.shared === true,
     title: record.title,
     description: record.description,
-    domains: normalizeSkillItems(record.domains, 12),
     triggerPhrases: normalizeSkillItems(record.triggerPhrases, 8),
     content: normalizeSkillContent(record.content),
     sourceSessionId: record.sourceSessionId,
@@ -229,7 +228,6 @@ export const store = {
     id?: string;
     title: string;
     description: string;
-    domains?: string[];
     triggerPhrases?: string[];
     content: SkillContent;
     sourceSessionId?: string;
@@ -250,7 +248,6 @@ export const store = {
       shared: input.shared ?? existing?.shared ?? false,
       title: input.title.trim() || existing?.title || 'Runtime Skill',
       description: input.description.trim() || existing?.description || '',
-      domains: input.domains || existing?.domains || [],
       triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
       content: normalizeSkillContent(input.content),
       sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
@@ -266,7 +263,6 @@ export const store = {
     id?: string;
     title: string;
     description: string;
-    domains?: string[];
     triggerPhrases?: string[];
     content: SkillContent;
     sourceSessionId?: string;
@@ -288,7 +284,6 @@ export const store = {
         shared: input.shared ?? existing?.shared ?? false,
         title: input.title.trim() || existing?.title || 'Runtime Skill',
         description: input.description.trim() || existing?.description || '',
-        domains: input.domains || existing?.domains || [],
         triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
         content: normalizeSkillContent(input.content),
         sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,

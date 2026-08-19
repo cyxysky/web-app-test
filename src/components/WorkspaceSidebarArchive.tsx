@@ -3,9 +3,7 @@
 import { Search, X } from 'lucide-react';
 import {
   useCallback,
-  useEffect,
   useMemo,
-  useRef,
   type ReactNode,
   type Ref,
   type UIEventHandler,
@@ -92,48 +90,19 @@ export function WorkspaceSidebarArchiveList<T extends WorkspaceSidebarArchiveIte
   renderItem,
 }: WorkspaceSidebarArchiveListProps<T>) {
   const groups = useMemo(() => groupWorkspaceSidebarArchive(items, language), [items, language]);
-  const hasFooter = Boolean(footer);
-  const internalListRef = useRef<HTMLOListElement | null>(null);
-  const syncScrollShadows = useCallback((list: HTMLOListElement) => {
-    const stage = list.closest<HTMLElement>('.browser-chat-history-stage');
-    if (!stage) return;
-    const remaining = list.scrollHeight - list.scrollTop - list.clientHeight;
-    const scrollable = list.scrollHeight - list.clientHeight > 1;
-    stage.toggleAttribute('data-scroll-shadow-top', scrollable && list.scrollTop > 1);
-    stage.toggleAttribute('data-scroll-shadow-bottom', scrollable && remaining > 1);
-  }, []);
   const assignListRef = useCallback((node: HTMLOListElement | null) => {
-    internalListRef.current = node;
     if (typeof listRef === 'function') {
       listRef(node);
     } else if (listRef) {
       (listRef as { current: HTMLOListElement | null }).current = node;
     }
   }, [listRef]);
-  const handleScroll = useCallback<UIEventHandler<HTMLOListElement>>((event) => {
-    syncScrollShadows(event.currentTarget);
-    onScroll?.(event);
-  }, [onScroll, syncScrollShadows]);
-
-  useEffect(() => {
-    const list = internalListRef.current;
-    if (!list) return;
-    const frame = window.requestAnimationFrame(() => syncScrollShadows(list));
-    const observer = typeof ResizeObserver === 'undefined'
-      ? null
-      : new ResizeObserver(() => syncScrollShadows(list));
-    observer?.observe(list);
-    return () => {
-      window.cancelAnimationFrame(frame);
-      observer?.disconnect();
-    };
-  }, [groups.length, hasFooter, items.length, syncScrollShadows]);
 
   return (
     <ol
       aria-busy={ariaBusy}
       className="browser-chat-recent-list workspace-sidebar-archive-list"
-      onScroll={handleScroll}
+      onScroll={onScroll}
       ref={assignListRef}
     >
       {groups.map((group) => (

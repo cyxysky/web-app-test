@@ -17,7 +17,7 @@ test('keeps text and tool calls in the provider content order', () => {
   )), ['tool:0', 'text:try again', 'tool:1']);
 });
 
-test('matches normalized same-name tool traces by AI call order', () => {
+test('matches persisted tool traces only by exact call ID', () => {
   const firstOutput = aiOutputViewFromResponse({
     content: [{
       type: 'tool-call',
@@ -41,8 +41,8 @@ test('matches normalized same-name tool traces by AI call order', () => {
     expected: 'file content',
     status: 'failed',
     tools: [
-      { id: 'trace-1', input: { attachmentId: 'file.pdf', limit: 20_000 }, name: 'readFile', ok: false, reason: 'first read', result: 'failed' },
-      { id: 'trace-2', input: { attachmentId: 'file.pdf', limit: 20_000 }, name: 'readFile', ok: false, reason: 'second read', result: 'failed' },
+      { id: 'read-1', input: { attachmentId: 'file.pdf', limit: 20_000 }, name: 'readFile', ok: false, reason: 'first read', result: 'failed' },
+      { id: 'read-2', input: { attachmentId: 'file.pdf', limit: 20_000 }, name: 'readFile', ok: false, reason: 'second read', result: 'failed' },
     ],
   }];
 
@@ -51,11 +51,11 @@ test('matches normalized same-name tool traces by AI call order', () => {
     { id: 'cycle-2', output: secondOutput, stepIndex: 1 },
   ], steps);
 
-  assert.equal(details.get('cycle-1:0')?.tool.id, 'trace-1');
-  assert.equal(details.get('cycle-2:0')?.tool.id, 'trace-2');
+  assert.equal(details.get('cycle-1:0')?.tool.id, 'read-1');
+  assert.equal(details.get('cycle-2:0')?.tool.id, 'read-2');
 });
 
-test('does not assign ignored parallel tool calls to later executed traces', () => {
+test('does not synthesize matches for traces without the provider call ID', () => {
   const toolCycle = (id: string, sourceCycleId: string, fileName: string) => ({
     id,
     sourceCycleId,
@@ -85,9 +85,65 @@ test('does not assign ignored parallel tool calls to later executed traces', () 
     toolCycle('provider-call-5', 'provider-cycle-3', '陈劲帆.docx'),
   ], steps);
 
-  assert.equal(details.get('provider-call-1:0')?.tool.id, 'legacy-trace-1');
+  assert.equal(details.get('provider-call-1:0'), undefined);
   assert.equal(details.get('provider-call-ignored-2:0'), undefined);
   assert.equal(details.get('provider-call-ignored-3:0'), undefined);
-  assert.equal(details.get('provider-call-4:0')?.tool.id, 'legacy-trace-2');
-  assert.equal(details.get('provider-call-5:0')?.tool.id, 'legacy-trace-3');
+  assert.equal(details.get('provider-call-4:0'), undefined);
+  assert.equal(details.get('provider-call-5:0'), undefined);
+});
+
+test('keeps unmatched requests hidden while matching later exact tool IDs', () => {
+  const steps: StepExecutionResult[] = [{
+    index: 2,
+    action: 'read attendance',
+    actual: 'done',
+    expected: 'attendance data',
+    status: 'passed',
+    tools: [
+      { id: 'executed-hover', input: { code: 'hover()' }, name: 'browserCode', ok: true, reason: 'hover menu' },
+      { id: 'executed-read', input: { code: 'read()' }, name: 'browserCode', ok: true, reason: 'read attendance' },
+    ],
+  }];
+  const details = buildAiCycleToolDetailMap([
+    {
+      id: 'phantom-cycle',
+      output: aiOutputViewFromResponse({
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'unexecuted-call',
+          toolName: 'browserCode',
+          input: { cell: 'navigate()', reason: 'unexecuted request' },
+        }],
+      }),
+      stepIndex: 2,
+    },
+    {
+      id: 'hover-cycle',
+      output: aiOutputViewFromResponse({
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'executed-hover',
+          toolName: 'browserCode',
+          input: { code: 'hover()', reason: 'hover menu' },
+        }],
+      }),
+      stepIndex: 2,
+    },
+    {
+      id: 'read-cycle',
+      output: aiOutputViewFromResponse({
+        content: [{
+          type: 'tool-call',
+          toolCallId: 'executed-read',
+          toolName: 'browserCode',
+          input: { code: 'read()', reason: 'read attendance' },
+        }],
+      }),
+      stepIndex: 2,
+    },
+  ], steps);
+
+  assert.equal(details.get('phantom-cycle:0'), undefined);
+  assert.equal(details.get('hover-cycle:0')?.tool.id, 'executed-hover');
+  assert.equal(details.get('read-cycle:0')?.tool.id, 'executed-read');
 });

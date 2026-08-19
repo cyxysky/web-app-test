@@ -65,6 +65,17 @@ export function revokeRegisteredBrowserChatTurn<TSession>(
   return { ...registered, abortDispatched };
 }
 
+export function revokeRegisteredBrowserChatTurnByAssistantMessageId<TSession>(
+  registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
+  sessionId: string,
+  assistantMessageId: string,
+  reason: Error,
+) {
+  const registered = registry.get(sessionId);
+  if (registered?.assistantMessageId !== assistantMessageId) return undefined;
+  return revokeRegisteredBrowserChatTurn(registry, sessionId, reason);
+}
+
 export function racePromiseWithAbort<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return Promise.resolve(operation);
   const abortError = () => signal.reason instanceof Error

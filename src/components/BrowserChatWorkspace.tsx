@@ -102,7 +102,6 @@ import {
   beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
   browserChatReachedHistoryTop,
-  browserChatVerticalScrollShadows,
   mergeBrowserChatHistoryChunkData,
   mergeBrowserChatSessionWindowData,
   normalizeBrowserChatHistory,
@@ -845,63 +844,27 @@ function toolInputSignature(value: unknown) {
 
 export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[]) {
   const details = new Map<string, BrowserChatToolDetail>();
-  const usedStepTools = new Set<string>();
-  const fallbackMatchedSourceCycles = new Set<string>();
+  const persistedToolsById = new Map<string, BrowserChatToolDetail>();
+
+  steps.forEach((step) => {
+    (step.tools || []).forEach((tool, toolIndex) => {
+      if (!tool.id) return;
+      persistedToolsById.set(tool.id, {
+        stepIndex: step.index,
+        step,
+        toolIndex,
+        tool,
+      });
+    });
+  });
 
   cycles.forEach((cycle) => {
-    const candidateSteps = typeof cycle.stepIndex === 'number'
-      ? steps.filter((step) => step.index === cycle.stepIndex)
-      : steps;
-    const sourceCycleId = cycle.sourceCycleId || cycle.id;
-
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
-      const exactInput = toolInputSignature(aiTool.input);
-      const sameNameCandidates: BrowserChatToolDetail[] = [];
-
-      for (const step of candidateSteps) {
-        const toolCalls = step.tools || [];
-        for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex += 1) {
-          const tool = toolCalls[toolIndex];
-          if (!tool) continue;
-          const usedKey = `${step.index}:${toolIndex}`;
-          if (usedStepTools.has(usedKey) || tool.name !== aiTool.name) continue;
-
-          const detail = { stepIndex: step.index, step, toolIndex, tool };
-          sameNameCandidates.push(detail);
-        }
-      }
-
-      const exactIdDetail = aiTool.id
-        ? sameNameCandidates.find((candidate) => candidate.tool.id === aiTool.id)
-        : undefined;
-      if (exactIdDetail) {
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), exactIdDetail);
-        usedStepTools.add(`${exactIdDetail.step.index}:${exactIdDetail.toolIndex}`);
-        return;
-      }
-
-      // The runtime executes at most one native tool from each provider response.
-      // Older persisted traces did not retain the provider toolCallId, so only one
-      // positional fallback may be consumed by a source cycle. Extra tool calls in
-      // that same response were ignored by the execution gate and must stay hidden.
-      if (fallbackMatchedSourceCycles.has(sourceCycleId)) return;
-
-      // Tool inputs are normalized before execution (for example readFile adds
-      // its default limit), so the persisted input is not always byte-for-byte
-      // equal to the model request. Within one step both sources are ordered;
-      // prefer the matching reason, then consume the next unused same-name call.
-      const normalizedReason = aiTool.reason?.replace(/\s+/g, ' ').trim();
-      const detail = sameNameCandidates.find((candidate) => (
-        Boolean(exactInput) && toolInputSignature(candidate.tool.input) === exactInput
-      )) || sameNameCandidates.find((candidate) => (
-        normalizedReason
-        && candidate.tool.reason?.replace(/\s+/g, ' ').trim() === normalizedReason
-      )) || sameNameCandidates[0];
-      if (detail) {
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-        usedStepTools.add(`${detail.step.index}:${detail.toolIndex}`);
-        fallbackMatchedSourceCycles.add(sourceCycleId);
-      }
+      if (!aiTool.id) return;
+      const detail = persistedToolsById.get(aiTool.id);
+      if (!detail || detail.tool.name !== aiTool.name) return;
+      if (typeof cycle.stepIndex === 'number' && detail.stepIndex !== cycle.stepIndex) return;
+      details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
     });
   });
 
@@ -2344,7 +2307,7 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
       <span className={`browser-chat-reference-icon ${kind}`}>
         <BrowserChatReferenceIcon kind={kind} />
       </span>
-      <span className="browser-chat-reference-name">{attachment.name || label}</span>
+      {attachment.name || label}
     </>
   );
   return (
@@ -2382,7 +2345,7 @@ function BrowserChatSkillChip({ skill }: { skill: { description: string; id: str
       <span className="browser-chat-message-skill-icon">
         <Braces size={14} />
       </span>
-      <span className="browser-chat-message-skill-title">{skill.title}</span>
+      {skill.title}
     </span>
   );
 }
@@ -2944,25 +2907,26 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           );
         }
         const { tool, toolDetail } = entry;
-        const label = browserChatToolLabel(tool.name, t);
-        const meta = browserChatToolMeta(tool.name, tool.input, t) || tool.reason;
-        const presentation = browserChatToolPresentation(toolDetail.tool, toolDetail.step, running);
+        const executedTool = toolDetail.tool;
+        const label = browserChatToolLabel(executedTool.name, t);
+        const meta = executedTool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
+        const presentation = browserChatToolPresentation(executedTool, toolDetail.step, running);
         const { isActive, stateClass } = presentation;
         const pendingConfirmation = pendingConfirmationForTool({
           pending: pendingToolConfirmation,
           stepIndex: toolDetail.stepIndex,
-          toolName: tool.name,
-          toolInput: toolDetail.tool.input,
-          toolOk: toolDetail.tool.ok,
+          toolName: executedTool.name,
+          toolInput: executedTool.input,
+          toolOk: executedTool.ok,
         });
         const userAction = pendingConfirmation
           ? undefined
-          : toolUserActionForTool(logs, toolDetail.stepIndex, tool.name, toolDetail.tool.input);
+          : toolUserActionForTool(logs, toolDetail.stepIndex, executedTool.name, executedTool.input);
         const card = (
           <BrowserChatToolCardContent
             label={label}
             meta={meta ? compactText(meta, 150) : undefined}
-            name={tool.name}
+            name={executedTool.name}
             userAction={userAction}
           />
         );
@@ -2978,8 +2942,8 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
               <ChevronDown className="browser-chat-ai-tool-chevron" size={14} />
             </summary>
             <div className="browser-chat-ai-cycle-tools">
-              <div className={`browser-chat-tool-call${isSubagentSpawnTool(tool.name, tool.input) ? ' has-subagents' : ''}`}>
-                {isSubagentSpawnTool(tool.name, tool.input) ? (
+              <div className={`browser-chat-tool-call${isSubagentSpawnTool(executedTool.name, executedTool.input) ? ' has-subagents' : ''}`}>
+                {isSubagentSpawnTool(executedTool.name, executedTool.input) ? (
                   <BrowserChatSubagentToolDisclosure
                     cardContent={card}
                     className={stateClass}
@@ -2990,7 +2954,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                     running={running}
                     structuredSubagents={structuredSubagents}
                     title={`${label}${meta ? ` - ${meta}` : ''}`}
-                    toolResult={toolDetail.tool.rawResult ?? toolDetail.tool.result}
+                    toolResult={executedTool.rawResult ?? executedTool.result}
                   />
                 ) : (
                   <button
@@ -3139,10 +3103,11 @@ type BrowserChatSubagentPanelContextValue = {
 
 const BrowserChatSubagentPanelContext = createContext<BrowserChatSubagentPanelContextValue | null>(null);
 
-function browserChatSubagentStatusPresentation(status: BrowserChatSubagentView['status']) {
-  if (status === 'passed') return { className: 'status-passed', label: '已完成' };
-  if (status === 'failed') return { className: 'status-failed', label: '执行失败' };
-  if (status === 'blocked') return { className: 'status-blocked', label: '等待处理' };
+function browserChatSubagentStatusPresentation(subagent: Pick<BrowserChatSubagentView, 'status' | 'summary'>) {
+  if (subagent.status === 'passed') return { className: 'status-passed', label: '已完成' };
+  if (subagent.status === 'failed' && subagent.summary?.trim()) return { className: 'status-partial', label: '已返回结果' };
+  if (subagent.status === 'failed') return { className: 'status-failed', label: '执行失败' };
+  if (subagent.status === 'blocked') return { className: 'status-blocked', label: '等待处理' };
   return { className: 'status-running', label: '正在执行' };
 }
 
@@ -3309,17 +3274,32 @@ const BrowserChatSubagentDataPart = memo(function BrowserChatSubagentDataPart({
   const label = kind === 'tool-call'
     ? t('调用 {name}', { name: browserChatToolLabel(name || 'tool', t) })
     : isResult ? t('{name} 返回结果', { name: browserChatToolLabel(name || 'tool', t) }) : t('消息数据');
+  const toolName = name || 'tool';
+  const isToolData = kind === 'tool-call' || isResult;
   return (
     <details
-      className={`browser-chat-subagent-message-data${isResult ? ' is-result' : ''}`}
+      className={`browser-chat-subagent-message-data${isResult ? ' is-result' : ''}${isToolData ? ' is-tool' : ''}`}
       onToggle={(event) => {
         if ((event.currentTarget as HTMLDetailsElement).open) setBodyMounted(true);
       }}
     >
-      <summary>
-        <Braces aria-hidden="true" size={14} />
-        <span>{label}</span>
-        <ChevronDown aria-hidden="true" size={13} />
+      <summary className={isToolData ? 'browser-chat-tool-card' : undefined}>
+        {isToolData ? (
+          <>
+            <BrowserChatToolCardContent
+              label={browserChatToolLabel(toolName, t)}
+              meta={t(isResult ? '返回结果' : '调用参数')}
+              name={toolName}
+            />
+            <ChevronDown aria-hidden="true" className="browser-chat-subagent-message-chevron" size={13} />
+          </>
+        ) : (
+          <>
+            <Braces aria-hidden="true" size={14} />
+            <span>{label}</span>
+            <ChevronDown aria-hidden="true" size={13} />
+          </>
+        )}
       </summary>
       {bodyMounted ? <pre>{browserChatSubagentValueText(value)}</pre> : null}
     </details>
@@ -3333,14 +3313,14 @@ const BrowserChatSubagentMessageItem = memo(function BrowserChatSubagentMessageI
 }) {
   const { t } = useI18n();
   const parts = useMemo(() => browserChatSubagentDisplayParts(message), [message]);
-  const roleLabel = message.role === 'user' ? t('任务') : message.role === 'assistant' ? t('子 Agent') : t('工具');
+  const roleLabel = message.role === 'user' ? t('任务') : t('工具');
   return (
     <article className={`browser-chat-subagent-message is-${message.role}`}>
-      <header>{roleLabel}</header>
+      {message.role === 'assistant' ? null : <header>{roleLabel}</header>}
       <div className="browser-chat-subagent-message-content">
         {parts.map((part) => part.kind === 'text' || part.kind === 'reasoning' ? (
           part.text ? (
-            <div className={part.kind === 'reasoning' ? 'is-reasoning' : undefined} key={part.id}>
+            <div className={part.kind === 'reasoning' ? 'browser-chat-ai-reasoning-text' : undefined} key={part.id}>
               <BrowserChatMarkdown markdown={part.text} />
             </div>
           ) : null
@@ -3419,7 +3399,7 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
 }) {
   const { t } = useI18n();
   const titleId = useId();
-  const status = browserChatSubagentStatusPresentation(subagent.status);
+  const status = browserChatSubagentStatusPresentation(subagent);
 
   return createPortal((
     <div className="browser-chat-subagent-panel-layer" onMouseDown={onClose}>
@@ -3434,8 +3414,9 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
           <div className="browser-chat-subagent-panel-heading">
             <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
               {loadingRecords || subagent.status === 'running'
-                ? <Loader2 className="spin" size={15} />
-                : subagent.status === 'passed' ? <CheckCircle2 size={15} /> : <CircleAlert size={15} />}
+                ? <Loader2 className="spin" size={14} />
+                : subagent.status === 'passed' || status.className === 'status-partial'
+                  ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
             </span>
             <div>
               <h2 id={titleId}>{subagent.title}</h2>
@@ -3491,7 +3472,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
         </div>
       ) : null}
       {subagents.map((subagent) => {
-        const status = browserChatSubagentStatusPresentation(subagent.status);
+        const status = browserChatSubagentStatusPresentation(subagent);
         return (
           <button
             aria-haspopup="dialog"
@@ -3504,8 +3485,9 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
           >
             <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
               {loadingRecords || subagent.status === 'running'
-                ? <Loader2 className="spin" size={13} />
-                : subagent.status === 'passed' ? <CheckCircle2 size={13} /> : <CircleAlert size={13} />}
+                ? <Loader2 className="spin" size={14} />
+                : subagent.status === 'passed' || status.className === 'status-partial'
+                  ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
             </span>
             <span className="browser-chat-subagent-row-copy">
               <span className="browser-chat-subagent-row-title">{subagent.title}</span>
@@ -3553,6 +3535,7 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   const [expanded, setExpanded] = useState(autoOpen);
   const [bodyMounted, setBodyMounted] = useState(autoOpen);
   const [loadingRecords, setLoadingRecords] = useState(false);
+  const loadingRecordsRef = useRef(false);
   const desiredExpandedRef = useRef(autoOpen);
   const openFrameRef = useRef(0);
   const previousAutoOpenRef = useRef(autoOpen);
@@ -3576,28 +3559,38 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
       if (desiredExpandedRef.current) setExpanded(true);
     });
   }, []);
-  const toggleDisclosure = useCallback(() => {
-    const nextExpanded = !desiredExpandedRef.current;
-    setDisclosureExpanded(nextExpanded);
-    if (!nextExpanded || !onExpand || loadingRecords) return;
+  const loadProcessRecords = useCallback(() => {
+    if (!onExpand || loadingRecordsRef.current) return;
     try {
       const pending = onExpand();
       if (!pending) return;
+      loadingRecordsRef.current = true;
       setLoadingRecords(true);
-      void Promise.resolve(pending).then(
-        () => setLoadingRecords(false),
-        () => setLoadingRecords(false),
-      );
+      void Promise.resolve(pending).finally(() => {
+        loadingRecordsRef.current = false;
+        setLoadingRecords(false);
+      });
     } catch {
+      loadingRecordsRef.current = false;
       setLoadingRecords(false);
     }
-  }, [loadingRecords, onExpand, setDisclosureExpanded]);
+  }, [onExpand]);
+  const toggleDisclosure = useCallback(() => {
+    const nextExpanded = !desiredExpandedRef.current;
+    setDisclosureExpanded(nextExpanded);
+    if (nextExpanded) loadProcessRecords();
+  }, [loadProcessRecords, setDisclosureExpanded]);
 
   useEffect(() => {
+    const wasAutoOpen = previousAutoOpenRef.current;
     if (autoOpen) {
-      if (!previousAutoOpenRef.current) autoOpenedAtRef.current = Date.now();
+      if (!wasAutoOpen) autoOpenedAtRef.current = Date.now();
       setDisclosureExpanded(true);
-    } else if (previousAutoOpenRef.current) {
+    } else if (wasAutoOpen) {
+      // Re-read the persisted process once the run finishes. A tool-details
+      // request made while the turn was still running may only contain an
+      // intermediate subset of the final traces.
+      loadProcessRecords();
       const minimumOpenMs = 1_200;
       const remainingOpenMs = Math.max(0, minimumOpenMs - (Date.now() - autoOpenedAtRef.current));
       if (remainingOpenMs > 0) {
@@ -3610,7 +3603,7 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
       }
     }
     previousAutoOpenRef.current = autoOpen;
-  }, [autoOpen, setDisclosureExpanded]);
+  }, [autoOpen, loadProcessRecords, setDisclosureExpanded]);
 
   useEffect(() => () => {
     if (openFrameRef.current) cancelAnimationFrame(openFrameRef.current);
@@ -4822,53 +4815,6 @@ function BrowserChatModeSelector({
   );
 }
 
-const BROWSER_CHAT_INLINE_TEXT_CLASS = 'browser-chat-inline-text';
-
-function normalizeBrowserChatEditorText(editor: HTMLElement | null) {
-  if (!editor) return;
-
-  const nestedTokens = Array.from(editor.querySelectorAll<HTMLElement>(
-    `.${BROWSER_CHAT_INLINE_TEXT_CLASS} > [data-skill-id], .${BROWSER_CHAT_INLINE_TEXT_CLASS} > [data-attachment-id]`,
-  ));
-  nestedTokens.forEach((token) => {
-    const textSpan = token.parentElement;
-    if (!textSpan?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)) return;
-
-    const trailingSpan = document.createElement('span');
-    trailingSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
-    while (token.nextSibling) trailingSpan.append(token.nextSibling);
-    textSpan.after(token);
-    if (trailingSpan.childNodes.length) token.after(trailingSpan);
-    if (!textSpan.childNodes.length) textSpan.remove();
-  });
-
-  const textNodes: Text[] = [];
-  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-  let current = walker.nextNode();
-  while (current) {
-    textNodes.push(current as Text);
-    current = walker.nextNode();
-  }
-
-  textNodes.forEach((textNode) => {
-    const parent = textNode.parentElement;
-    if (
-      !textNode.data
-      || !parent
-      || parent.closest('[data-skill-id],[data-attachment-id]')
-      || parent.closest(`.${BROWSER_CHAT_INLINE_TEXT_CLASS}`)
-    ) return;
-    const textSpan = document.createElement('span');
-    textSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
-    textNode.before(textSpan);
-    textSpan.append(textNode);
-  });
-
-  editor.querySelectorAll<HTMLElement>(`.${BROWSER_CHAT_INLINE_TEXT_CLASS}`).forEach((textSpan) => {
-    if (!textSpan.textContent) textSpan.remove();
-  });
-}
-
 const BrowserChatComposer = memo(function BrowserChatComposer({
   attachments,
   availableSkills,
@@ -4935,7 +4881,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   void onModeChange;
   const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
-  const composingRef = useRef(false);
   const [draft, setDraft] = useState('');
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
@@ -4951,7 +4896,10 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     setSelectedSkillIds([]);
     setDismissedSlashDraft('');
     setActiveSkillIndex(0);
-    if (editorRef.current) editorRef.current.innerHTML = '';
+    if (editorRef.current) {
+      editorRef.current.innerHTML = '';
+      delete editorRef.current.dataset.empty;
+    }
   }, [resetToken]);
 
   const editorPlainText = useCallback((root: HTMLElement | null) => {
@@ -5012,39 +4960,31 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     return next;
   }, [attachmentFromToken]);
 
-  const ensureEmptyEditorLine = useCallback((editor: HTMLElement | null) => {
-    if (
-      !editor
-      || editor.querySelector('[data-skill-id],[data-attachment-id]')
-      || (editor.textContent || '').replace(/[\u00A0\u200B]/g, '').trim()
-    ) return false;
-
-    let textSpan = editor.childNodes.length === 1
-      && editor.firstElementChild?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)
-      ? editor.firstElementChild as HTMLElement
-      : null;
-    if (!textSpan) {
-      editor.innerHTML = '';
-      textSpan = document.createElement('span');
-      textSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
-      editor.append(textSpan);
+  const ensureEmptyEditorCaret = useCallback((editor: HTMLElement | null) => {
+    if (!editor) return false;
+    const hasTokens = Boolean(editor.querySelector('[data-skill-id],[data-attachment-id]'));
+    const hasText = (editor.textContent || '').replace(/[\u00A0\u200B]/g, '').trim().length > 0;
+    if (hasTokens || hasText) {
+      delete editor.dataset.empty;
+      return false;
     }
 
-    let textNode = textSpan.childNodes.length === 1 && textSpan.firstChild?.nodeType === Node.TEXT_NODE
-      ? textSpan.firstChild as Text
+    let textNode = editor.childNodes.length === 1 && editor.firstChild?.nodeType === Node.TEXT_NODE
+      ? editor.firstChild as Text
       : null;
     if (!textNode) {
-      textSpan.textContent = '';
+      editor.textContent = '';
       textNode = document.createTextNode('\u200B');
-      textSpan.append(textNode);
+      editor.append(textNode);
     } else if (textNode.data !== '\u200B') {
       textNode.data = '\u200B';
     }
+    editor.dataset.empty = 'true';
 
     const selection = window.getSelection();
     if (selection) {
       const range = document.createRange();
-      range.setStart(textNode, 1);
+      range.setStart(textNode, textNode.data.length);
       range.collapse(true);
       selection.removeAllRanges();
       selection.addRange(range);
@@ -5054,8 +4994,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
 
   const syncEditorState = useCallback((options: { scrollToBottom?: boolean } = {}) => {
     const editor = editorRef.current;
-    if (!composingRef.current) normalizeBrowserChatEditorText(editor);
-    if (!composingRef.current && editor === document.activeElement) ensureEmptyEditorLine(editor);
+    if (editor === document.activeElement) ensureEmptyEditorCaret(editor);
     const skillIds = editor
       ? Array.from(editor.querySelectorAll<HTMLElement>('[data-skill-id]')).map((node) => node.dataset.skillId || '').filter(Boolean)
       : [];
@@ -5066,25 +5005,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         editor.scrollTop = editor.scrollHeight;
       });
     }
-  }, [editorPlainText, ensureEmptyEditorLine]);
-
-  useEffect(() => {
-    const editor = editorRef.current;
-    if (!editor || typeof MutationObserver === 'undefined') return undefined;
-    let frame = 0;
-    const observer = new MutationObserver(() => {
-      if (frame) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        syncEditorState();
-      });
-    });
-    observer.observe(editor, { childList: true, characterData: true, subtree: true });
-    return () => {
-      if (frame) cancelAnimationFrame(frame);
-      observer.disconnect();
-    };
-  }, [syncEditorState]);
+  }, [editorPlainText, ensureEmptyEditorCaret]);
 
   useEffect(() => {
     const readySkillIds = new Set(availableSkills.filter((skill) => skill.status === 'ready').map((skill) => skill.id));
@@ -5136,14 +5057,24 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   const submitDraft = useCallback(async () => {
     const content = editorContentForSubmit(editorRef.current).trim();
     const nextAttachments = editorAttachmentsForSubmit();
-    if ((!content && !nextAttachments.length && !selectedSkillIds.length) || !modelSelectionOptions.length || busy || loading || uploadingImage) return;
+    if (
+      (!content && !nextAttachments.length && !selectedSkillIds.length)
+      || !modelSelectionOptions.length
+      || busy
+      || interrupting
+      || loading
+      || uploadingImage
+    ) return;
     const sent = await onSubmitMessage(content, selectedSkillIds, nextAttachments);
     if (sent) {
       setDraft('');
       setSelectedSkillIds([]);
-      if (editorRef.current) editorRef.current.innerHTML = '';
+      if (editorRef.current) {
+        editorRef.current.innerHTML = '';
+        delete editorRef.current.dataset.empty;
+      }
     }
-  }, [busy, editorAttachmentsForSubmit, editorContentForSubmit, loading, modelSelectionOptions.length, onSubmitMessage, selectedSkillIds, uploadingImage]);
+  }, [busy, editorAttachmentsForSubmit, editorContentForSubmit, interrupting, loading, modelSelectionOptions.length, onSubmitMessage, selectedSkillIds, uploadingImage]);
 
   function handleReferenceDragOver(event: ReactDragEvent<HTMLElement>) {
     if (!dataTransferHasBrowserChatReferences(event.dataTransfer) || currentBusy || loading || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES) return;
@@ -5173,14 +5104,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     return node instanceof HTMLElement && Boolean(node.dataset.skillId || node.dataset.attachmentId);
   }
 
-  function adjacentEditorSibling(node: Node, direction: 'next' | 'previous') {
-    const sibling = direction === 'previous' ? node.previousSibling : node.nextSibling;
-    if (sibling) return sibling;
-    const parent = node.parentElement;
-    if (!parent?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)) return null;
-    return direction === 'previous' ? parent.previousSibling : parent.nextSibling;
-  }
-
   function isBlankText(value: string) {
     return value.replace(/\u00A0/g, ' ').replace(/\u200B/g, '').trim() === '';
   }
@@ -5198,32 +5121,24 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     selection.addRange(range);
   }
 
-  function normalizeTrailingTokenCaret() {
-    const editor = editorRef.current;
-    const selection = window.getSelection();
-    if (!editor || !selection?.rangeCount) return;
-    const range = selection.getRangeAt(0);
-    const textNode = range.startContainer;
-    if (
-      !range.collapsed
-      || textNode.nodeType !== Node.TEXT_NODE
-      || range.startOffset !== 0
-      || !editor.contains(textNode)
-    ) return;
-    const parent = textNode.parentElement;
-    if (
-      !parent?.classList.contains(BROWSER_CHAT_INLINE_TEXT_CLASS)
-      || !isInlineToken(parent.previousSibling)
-      || !/^[\u00A0\u200B]/.test((textNode as Text).data)
-    ) return;
-    setEditorSelection(textNode, 1);
-  }
-
   function clearEditorIfBlank() {
     const editor = editorRef.current;
     if (!editor || editor.querySelector('[data-skill-id],[data-attachment-id]') || !isBlankText(editorPlainText(editor))) return false;
-    ensureEmptyEditorLine(editor);
+    ensureEmptyEditorCaret(editor);
     return true;
+  }
+
+  function isAtBlankBoundaryBeforeToken(editor: HTMLElement, container: Node, offset: number) {
+    let next = container.nodeType === Node.TEXT_NODE
+      ? (isBlankText((container as Text).data.slice(offset)) ? container.nextSibling : null)
+      : container.childNodes[offset];
+    while (next?.nodeType === Node.TEXT_NODE && isBlankText(next.textContent || '')) next = next.nextSibling;
+    if (!isInlineToken(next)) return false;
+
+    const beforeCaret = document.createRange();
+    beforeCaret.selectNodeContents(editor);
+    beforeCaret.setEnd(container, offset);
+    return isBlankText(beforeCaret.cloneContents().textContent || '');
   }
 
   function removeInlineTokenNode(token: HTMLElement, selectionTarget?: { container: Node; offset: number }) {
@@ -5273,7 +5188,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
       if (container.nodeType === Node.TEXT_NODE) {
         const textNode = container as Text;
         const beforeCaret = textNode.data.slice(0, offset);
-        const previous = adjacentEditorSibling(textNode, 'previous');
+        const previous = textNode.previousSibling;
         if (isInlineToken(previous) && isBlankText(beforeCaret)) {
           textNode.data = textNode.data.slice(offset);
           removeInlineTokenNode(previous, { container: textNode, offset: 0 });
@@ -5285,21 +5200,21 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           removeInlineTokenNode(before, { container, offset: offset - 1 });
           return true;
         }
-        const previous = before ? adjacentEditorSibling(before, 'previous') : null;
-        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isInlineToken(previous)) {
-          const token = previous;
+        if (before?.nodeType === Node.TEXT_NODE && isBlankText(before.textContent || '') && isInlineToken(before.previousSibling)) {
+          const token = before.previousSibling;
           before.remove();
           removeInlineTokenNode(token, { container, offset: offset - 2 });
           return true;
         }
       }
+      if (isAtBlankBoundaryBeforeToken(editor, container, offset)) return true;
     }
 
     if (key === 'Delete') {
       if (container.nodeType === Node.TEXT_NODE) {
         const textNode = container as Text;
         const afterCaret = textNode.data.slice(offset);
-        const next = adjacentEditorSibling(textNode, 'next');
+        const next = textNode.nextSibling;
         if (isInlineToken(next) && isBlankText(afterCaret)) {
           textNode.data = textNode.data.slice(0, offset);
           removeInlineTokenNode(next, { container: textNode, offset });
@@ -5311,9 +5226,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           removeInlineTokenNode(after, { container, offset });
           return true;
         }
-        const next = after ? adjacentEditorSibling(after, 'next') : null;
-        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isInlineToken(next)) {
-          const token = next;
+        if (after?.nodeType === Node.TEXT_NODE && isBlankText(after.textContent || '') && isInlineToken(after.nextSibling)) {
+          const token = after.nextSibling;
           after.remove();
           removeInlineTokenNode(token, { container, offset });
           return true;
@@ -5363,47 +5277,56 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   }
 
   function removeSlashTrigger(range: Range) {
-    if (!range.collapsed || range.startContainer.nodeType !== Node.TEXT_NODE) return range;
-    const node = range.startContainer as Text;
-    const before = node.data.slice(0, range.startOffset);
-    const match = before.match(/(^|\s)\/[^\s/]*$/);
-    if (!match) return range;
-    const deleteFrom = before.length - match[0].length + match[1].length;
-    node.data = `${node.data.slice(0, deleteFrom)}${node.data.slice(range.startOffset)}`;
-    const nextRange = document.createRange();
-    nextRange.setStart(node, deleteFrom);
-    nextRange.collapse(true);
-    return nextRange;
+    const editor = editorRef.current;
+    if (!editor || !range.collapsed) return range;
+
+    const candidates: Array<{ node: Text; offset: number }> = [];
+    const addCandidate = (node: Text, offset: number) => {
+      if (node.parentElement?.closest('[data-skill-id],[data-attachment-id]')) return;
+      if (candidates.some((candidate) => candidate.node === node && candidate.offset === offset)) return;
+      candidates.push({ node, offset });
+    };
+
+    if (range.startContainer.nodeType === Node.TEXT_NODE) {
+      addCandidate(range.startContainer as Text, range.startOffset);
+    }
+
+    const textNodes: Text[] = [];
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
+    let current = walker.nextNode();
+    while (current) {
+      const textNode = current as Text;
+      if (!textNode.parentElement?.closest('[data-skill-id],[data-attachment-id]')) textNodes.push(textNode);
+      current = walker.nextNode();
+    }
+    textNodes.reverse().forEach((node) => addCandidate(node, node.data.length));
+
+    for (const candidate of candidates) {
+      const before = candidate.node.data.slice(0, candidate.offset);
+      const match = before.match(/(^|[\s\u200B])\/[^\s/]*$/);
+      if (!match) continue;
+      const deleteFrom = before.length - match[0].length + match[1].length;
+      candidate.node.data = `${candidate.node.data.slice(0, deleteFrom)}${candidate.node.data.slice(candidate.offset)}`;
+      const nextRange = document.createRange();
+      nextRange.setStart(candidate.node, deleteFrom);
+      nextRange.collapse(true);
+      return nextRange;
+    }
+
+    return range;
   }
 
   function finishInlineTokenInsertion(range: Range, token: HTMLElement, scrollToBottom = false) {
     range.insertNode(token);
-    normalizeBrowserChatEditorText(editorRef.current);
-
     if (!token.previousSibling) {
-      const leadingSpan = document.createElement('span');
-      leadingSpan.className = BROWSER_CHAT_INLINE_TEXT_CLASS;
-      leadingSpan.append(document.createTextNode('\u200B'));
-      token.before(leadingSpan);
+      token.before(document.createTextNode('\u200B'));
+    } else if (token.previousSibling.nodeType === Node.TEXT_NODE && isBlankText(token.previousSibling.textContent || '')) {
+      (token.previousSibling as Text).data = '\u200B';
     }
-
-    const trailingText = document.createTextNode('\u200B');
+    const trailingText = document.createTextNode('\u00A0');
     token.after(trailingText);
-    normalizeBrowserChatEditorText(editorRef.current);
     setEditorSelection(trailingText, trailingText.data.length);
     syncEditorState(scrollToBottom ? { scrollToBottom: true } : undefined);
-  }
-
-  function appendInlineTokenRemoveButton(token: HTMLElement, name: string) {
-    const button = document.createElement('button');
-    button.className = 'browser-chat-inline-token-remove';
-    button.contentEditable = 'false';
-    button.tabIndex = -1;
-    button.type = 'button';
-    button.title = t('移除 {name}', { name });
-    button.setAttribute('aria-label', t('移除 {name}', { name }));
-    button.innerHTML = inlineTokenSvg('<path d="m18 6-12 12"/><path d="m6 6 12 12"/>');
-    token.append(button);
   }
 
   function insertSkillToken(skill: SkillRecord) {
@@ -5417,9 +5340,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     token.contentEditable = 'false';
     token.dataset.skillId = skill.id;
     token.title = skill.description;
-    token.innerHTML = `<span class="browser-chat-inline-skill-icon">${inlineSkillIconSvg()}</span><span class="browser-chat-inline-skill-title"></span>`;
-    token.querySelector('.browser-chat-inline-skill-title')!.textContent = skill.title;
-    appendInlineTokenRemoveButton(token, skill.title);
+    token.innerHTML = `<span class="browser-chat-inline-skill-icon">${inlineSkillIconSvg()}</span>`;
+    token.append(document.createTextNode(skill.title));
 
     finishInlineTokenInsertion(range, token);
   }
@@ -5438,9 +5360,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
     token.dataset.attachmentJson = JSON.stringify(attachment);
     token.dataset.attachmentKind = kind;
     token.title = `${t(browserChatReferenceLabel(kind))}: ${attachment.name}`;
-    token.innerHTML = `<span class="browser-chat-inline-reference-icon">${inlineReferenceIconSvg(kind)}</span><span class="browser-chat-inline-reference-title"></span>`;
-    token.querySelector('.browser-chat-inline-reference-title')!.textContent = attachment.name || t(browserChatReferenceLabel(kind));
-    appendInlineTokenRemoveButton(token, attachment.name || t(browserChatReferenceLabel(kind)));
+    token.innerHTML = `<span class="browser-chat-inline-reference-icon">${inlineReferenceIconSvg(kind)}</span>`;
+    token.append(document.createTextNode(attachment.name || t(browserChatReferenceLabel(kind))));
 
     finishInlineTokenInsertion(range, token, true);
   }
@@ -5513,36 +5434,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!busy && !loading}
-          onCompositionEnd={() => {
-            composingRef.current = false;
-            syncEditorState({ scrollToBottom: true });
-          }}
-          onCompositionStart={() => {
-            composingRef.current = true;
-          }}
           data-placeholder={t('问问题，尽管问')}
-          onBlur={(event) => {
-            const editor = event.currentTarget;
-            requestAnimationFrame(() => {
-              if (
-                document.activeElement !== editor
-                && !editor.querySelector('[data-skill-id],[data-attachment-id]')
-                && isBlankText(editorPlainText(editor))
-              ) editor.innerHTML = '';
-            });
-          }}
           onFocus={() => syncEditorState()}
           onInput={() => syncEditorState({ scrollToBottom: true })}
-          onMouseDown={(event) => {
-            const removeButton = (event.target as HTMLElement).closest<HTMLElement>('.browser-chat-inline-token-remove');
-            const token = removeButton?.closest<HTMLElement>('[data-skill-id],[data-attachment-id]');
-            if (!removeButton || !token || !editorRef.current?.contains(token)) return;
-            event.preventDefault();
-            event.stopPropagation();
-            removeInlineTokenNode(token);
-            requestAnimationFrame(() => editorRef.current?.focus());
-          }}
-          onMouseUp={() => normalizeTrailingTokenCaret()}
           onKeyDown={(event) => {
             if (event.nativeEvent.isComposing) return;
             if (event.key === 'Backspace' || event.key === 'Delete') {
@@ -5580,7 +5474,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           }}
           onKeyUp={(event) => {
             if (event.key === 'Backspace' || event.key === 'Delete') syncEditorState({ scrollToBottom: true });
-            if (event.key === 'ArrowRight') normalizeTrailingTokenCaret();
           }}
           onPaste={(event) => {
             const itemFiles = Array.from(event.clipboardData.items || [])
@@ -5661,7 +5554,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             ) : null}
             <button
               className="browser-chat-send"
-              disabled={(!composerText && !attachments.length && !selectedSkillIds.length) || !modelSelectionOptions.length || busy || loading || uploadingImage}
+              disabled={(!composerText && !attachments.length && !selectedSkillIds.length) || !modelSelectionOptions.length || busy || interrupting || loading || uploadingImage}
               type="submit"
               aria-label={t('发送')}
             >
@@ -8451,6 +8344,7 @@ export function BrowserChatWorkspace({
   const sessionSelectionIntentRef = useRef(0);
   const mountedSessionActivationRef = useRef('');
   const interruptRequestSequenceRef = useRef(0);
+  const interruptingRef = useRef(false);
   const interruptGuardsRef = useRef(new Map<string, BrowserChatInterruptGuard>());
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [session, setSession] = useState<BrowserChatSession | null>(null);
@@ -8509,7 +8403,7 @@ export function BrowserChatWorkspace({
   const [messageViewportGeneration, setMessageViewportGeneration] = useState(0);
   const [loadingEarlierHistory, setLoadingEarlierHistory] = useState(false);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
-  const loadedLogMessageKeysRef = useRef(new Set<string>());
+  const loadingLogMessageKeysRef = useRef(new Set<string>());
   const loadedHistoricalSubagentKeysRef = useRef(new Set<string>());
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
   const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
@@ -8537,22 +8431,14 @@ export function BrowserChatWorkspace({
   const generationSkillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
   const liveToolDialog = useMemo(() => {
     if (!toolDialog) return null;
-    const expectedSignature = toolInputSignature(toolDialog.tool.input);
-    const indexedStep = steps.find((step) => step.index === toolDialog.stepIndex);
-    const indexedTool = indexedStep?.tools?.[toolDialog.toolIndex];
     let resolvedDetail = toolDialog;
-    if (indexedStep && indexedTool?.name === toolDialog.tool.name
-      && toolInputSignature(indexedTool.input) === expectedSignature) {
-      resolvedDetail = { ...toolDialog, step: indexedStep, tool: indexedTool };
-    } else {
+    if (toolDialog.tool.id) {
       for (const step of steps) {
-        const toolIndex = (step.tools || []).findIndex((tool) => (
-          tool.name === toolDialog.tool.name && toolInputSignature(tool.input) === expectedSignature
-        ));
-        if (toolIndex >= 0) {
-          resolvedDetail = { stepIndex: step.index, step, toolIndex, tool: step.tools![toolIndex]! };
-          break;
-        }
+        const toolIndex = (step.tools || []).findIndex((tool) => tool.id === toolDialog.tool.id);
+        if (toolIndex < 0) continue;
+        const tool = step.tools?.[toolIndex];
+        if (tool) resolvedDetail = { stepIndex: step.index, step, toolIndex, tool };
+        break;
       }
     }
     const confirmation = toolUserActionForTool(
@@ -8758,8 +8644,8 @@ export function BrowserChatWorkspace({
         }
       })();
     }
-    if (loadedLogMessageKeysRef.current.has(key)) return;
-    loadedLogMessageKeysRef.current.add(key);
+    if (loadingLogMessageKeysRef.current.has(key)) return;
+    loadingLogMessageKeysRef.current.add(key);
     return (async () => {
       try {
         let cursor = '';
@@ -8788,8 +8674,12 @@ export function BrowserChatWorkspace({
           cursor = data.history?.hasMore && data.history.cursor ? data.history.cursor : '';
         } while (cursor);
       } catch {
-        loadedLogMessageKeysRef.current.delete(key);
         // The dialog can still show realtime summary logs when the full-log request fails.
+      } finally {
+        // This set only deduplicates concurrent requests. Keeping completed
+        // requests cached forever can freeze an intermediate running-state
+        // snapshot and hide tools that were persisted later in the same turn.
+        loadingLogMessageKeysRef.current.delete(key);
       }
     })();
   }, [browserChatApiUrl]);
@@ -8840,42 +8730,6 @@ export function BrowserChatWorkspace({
     if (!query) return recentSessions;
     return sidebarSessions.filter((item) => sessionDisplayTitle(item).toLocaleLowerCase().includes(query));
   }, [historyFilter, recentSessions, sidebarSessions]);
-  const syncRecentSessionScrollShadows = useCallback((list = recentSessionListRef.current) => {
-    if (!list) return;
-    const stage = list.closest<HTMLElement>('.browser-chat-history-stage');
-    if (!stage) return;
-    const shadows = browserChatVerticalScrollShadows(list);
-    stage.toggleAttribute('data-scroll-shadow-top', shadows.top);
-    stage.toggleAttribute('data-scroll-shadow-bottom', shadows.bottom);
-  }, []);
-  useLayoutEffect(() => {
-    const list = recentSessionListRef.current;
-    if (!list) return undefined;
-    const stage = list.closest<HTMLElement>('.browser-chat-history-stage');
-    if (!stage) return undefined;
-    let frame = 0;
-    const scheduleSync = () => {
-      if (frame) cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        syncRecentSessionScrollShadows(list);
-      });
-    };
-    const resizeObserver = new ResizeObserver(scheduleSync);
-    const mutationObserver = new MutationObserver(scheduleSync);
-    resizeObserver.observe(list);
-    resizeObserver.observe(stage);
-    mutationObserver.observe(list, { childList: true, subtree: true });
-    syncRecentSessionScrollShadows(list);
-    scheduleSync();
-    return () => {
-      if (frame) cancelAnimationFrame(frame);
-      resizeObserver.disconnect();
-      mutationObserver.disconnect();
-      stage.removeAttribute('data-scroll-shadow-top');
-      stage.removeAttribute('data-scroll-shadow-bottom');
-    };
-  }, [filteredRecentSessions.length, historyFilter, loadingMoreSessions, loadingSessionHistory, mobileHistoryOpen, sessionListPage.hasMore, sidebarCollapsed, syncRecentSessionScrollShadows]);
   useEffect(() => {
     if (loadingSessionHistory || loadingMoreSessions || !sessionListPage.hasMore || !sessionListPage.next) return undefined;
     const list = recentSessionListRef.current;
@@ -9211,8 +9065,8 @@ export function BrowserChatWorkspace({
 
   const handleRealtimeRefresh = useCallback((event: import('@/lib/realtime-refresh').RealtimeRefreshEvent) => {
     if (event.deleted) {
-      for (const key of loadedLogMessageKeysRef.current) {
-        if (key.startsWith(`${event.id}\u0000`)) loadedLogMessageKeysRef.current.delete(key);
+      for (const key of loadingLogMessageKeysRef.current) {
+        if (key.startsWith(`${event.id}\u0000`)) loadingLogMessageKeysRef.current.delete(key);
       }
       for (const key of loadedHistoricalSubagentKeysRef.current) {
         if (key.startsWith(`${event.id}\u0000`)) loadedHistoricalSubagentKeysRef.current.delete(key);
@@ -9233,16 +9087,16 @@ export function BrowserChatWorkspace({
       const changedMessageIds = new Set(patch.logs
         .map((log) => log.messageId)
         .filter((messageId): messageId is string => Boolean(messageId)));
-      for (const key of loadedLogMessageKeysRef.current) {
+      for (const key of loadingLogMessageKeysRef.current) {
         const prefix = `${event.id}\u0000`;
         if (key.startsWith(prefix) && changedMessageIds.has(key.slice(prefix.length))) {
-          loadedLogMessageKeysRef.current.delete(key);
+          loadingLogMessageKeysRef.current.delete(key);
         }
       }
     }
     if (patch.removedLogIds?.length) {
-      for (const key of loadedLogMessageKeysRef.current) {
-        if (key.startsWith(`${event.id}\u0000`)) loadedLogMessageKeysRef.current.delete(key);
+      for (const key of loadingLogMessageKeysRef.current) {
+        if (key.startsWith(`${event.id}\u0000`)) loadingLogMessageKeysRef.current.delete(key);
       }
     }
     if (activeSessionIdRef.current === event.id) {
@@ -9360,7 +9214,13 @@ export function BrowserChatWorkspace({
   async function sendMessage(content: string, skillIds: string[] = [], messageAttachments?: BrowserChatAttachment[]) {
     const trimmedContent = content.trim();
     const nextAttachments = messageAttachments ?? attachments;
-    if ((!trimmedContent && !nextAttachments.length && !skillIds.length) || loadingSessionId || sendingRef.current || uploadingImage) return false;
+    if (
+      (!trimmedContent && !nextAttachments.length && !skillIds.length)
+      || loadingSessionId
+      || sendingRef.current
+      || interruptingRef.current
+      || uploadingImage
+    ) return false;
     sendingRef.current = true;
     const clientMessageId = temporaryId('client_msg');
     setError('');
@@ -9434,11 +9294,22 @@ export function BrowserChatWorkspace({
 
   async function interruptConversation() {
     const targetId = interruptSessionId;
-    if (!targetId || interrupting) return;
+    if (!targetId || interruptingRef.current) return;
+    const targetSession = session?.id === targetId ? session : sessions.find((item) => item.id === targetId);
+    const targetAssistantMessage = [...(targetSession?.messages || [])].reverse().find((message) => (
+      message.role === 'assistant'
+      && message.status === 'running'
+      && Boolean(message.clientMessageId)
+    ));
+    const targetClientMessageId = targetAssistantMessage?.clientMessageId;
+    if (!targetClientMessageId) {
+      setError('无法确定要中止的对话回合，请刷新后重试');
+      return;
+    }
+    interruptingRef.current = true;
     setInterrupting(true);
     setError('');
     const timestamp = new Date().toISOString();
-    const targetSession = session?.id === targetId ? session : sessions.find((item) => item.id === targetId);
     interruptGuardsRef.current.set(targetId, {
       assistantMessageIds: new Set((targetSession?.messages || [])
         .filter((message) => message.role === 'assistant' && message.status === 'running')
@@ -9455,7 +9326,9 @@ export function BrowserChatWorkspace({
       : item));
     const interruptRequestSequence = ++interruptRequestSequenceRef.current;
     const releaseInterrupting = () => {
-      if (interruptRequestSequenceRef.current === interruptRequestSequence) setInterrupting(false);
+      if (interruptRequestSequenceRef.current !== interruptRequestSequence) return;
+      interruptingRef.current = false;
+      setInterrupting(false);
     };
     const requestController = new AbortController();
     const requestTimeout = window.setTimeout(() => requestController.abort(), 30000);
@@ -9463,6 +9336,8 @@ export function BrowserChatWorkspace({
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${targetId}/interrupt`), {
         keepalive: true,
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientMessageId: targetClientMessageId }),
         signal: requestController.signal,
       });
       const data = await readApiJson<Record<string, unknown>>(response, '中断对话失败');
@@ -9953,7 +9828,6 @@ export function BrowserChatWorkspace({
               language={language}
               onScroll={(event) => {
                 const list = event.currentTarget;
-                syncRecentSessionScrollShadows(list);
                 const verticalRemaining = list.scrollHeight - list.scrollTop - list.clientHeight;
                 const horizontalRemaining = list.scrollWidth - list.scrollLeft - list.clientWidth;
                 if (verticalRemaining > 160 || horizontalRemaining > 160) {

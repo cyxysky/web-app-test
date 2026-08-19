@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { generateText, Output } from 'ai';
+import { generateText } from 'ai';
 import { z } from 'zod';
 import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
-import { aiMaxOutputTokens, aiReasoningEffort, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiMaxOutputTokens, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
@@ -141,6 +141,27 @@ const personalMemoryExtractionSchema = z.object({
     ]),
   })).max(8),
 });
+
+export function parsePersonalMemoryExtractionOutput(value: unknown) {
+  const text = textFromUnknown(value).trim();
+  if (!text) return personalMemoryExtractionSchema.parse({ items: [] });
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  const source = (fenced?.[1] || text).trim();
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start < 0 || end < start) throw new Error('Personal memory extraction returned no JSON object.');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source.slice(start, end + 1));
+  } catch (error) {
+    throw new Error('Personal memory extraction returned invalid JSON.', { cause: error });
+  }
+  const validated = personalMemoryExtractionSchema.safeParse(parsed);
+  if (!validated.success) {
+    throw new Error(`Personal memory extraction returned an invalid object: ${validated.error.message}`);
+  }
+  return validated.data;
+}
 
 function now() {
   return new Date().toISOString();
@@ -780,7 +801,8 @@ function buildExtractionPrompt(input: {
   };
   return [
     'You extract durable personal short memory for a browser assistant.',
-    'Return one object matching the configured output schema.',
+    'Return raw JSON only. Do not use Markdown fences or add explanatory text.',
+    'The exact top-level shape is {"items":[]}. Each item must use only the fields defined below.',
     '',
     'Allowed item fields:',
     '- scope: "global" or "domain"',
@@ -912,17 +934,16 @@ export async function extractPersonalMemoryFromTurn(input: {
     model: getModel(),
     maxOutputTokens: aiMaxOutputTokens(4_096),
     temperature: 0.1,
-    reasoning: aiReasoningEffort(),
     maxRetries: 3,
     prompt,
-    output: Output.object({ schema: personalMemoryExtractionSchema }),
     telemetry: aiTelemetry('personal-memory-extraction'),
   });
+  const output = parsePersonalMemoryExtractionOutput(result.text);
   const userMessages = [
     ...(input.conversation || []).filter((message) => message.role === 'user').map((message) => message.content),
     input.userMessage,
   ];
-  const filtered = analyzeDurablePersonalMemoryDrafts(result.output.items, userMessages);
+  const filtered = analyzeDurablePersonalMemoryDrafts(output.items, userMessages);
   const items = upsertExtractedPersonalMemoryItems({
     userId,
     domain: currentDomain,
@@ -937,10 +958,10 @@ export async function extractPersonalMemoryFromTurn(input: {
   }, {});
   return {
     items,
-    rawText: safeJson(result.output),
+    rawText: result.text,
     skipped: false,
     diagnostics: {
-      candidateCount: result.output.items.length,
+      candidateCount: output.items.length,
       acceptedCount: filtered.items.length,
       rejectedCount: filtered.rejected.length,
       savedCount: items.length,

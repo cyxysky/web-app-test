@@ -17,7 +17,6 @@
   min-width: 0;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
 }
 
 .automation-page-header > div:first-child {

@@ -47,6 +47,25 @@ test('keeps a hash table header and artifact links as one GFM table', () => {
   assert.match(html, /report\.docx/);
 });
 
+test('does not turn spaced GFM table delimiters into horizontal rules', () => {
+  const markdown = [
+    '| 参数 | 说明 | 示例 |',
+    '| --- | --- | --- |',
+    '| **产品** | 要查看的产品名 | `DOMP` |',
+    '| **版本号** | 要查看的发布版本号 | `2.4.9` |',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.equal(normalized, markdown);
+  assert.match(html, /<table>/);
+  assert.match(html, /<th>参数<\/th>/);
+  assert.match(html, /<strong>产品<\/strong>/);
+  assert.doesNotMatch(html, /<hr/);
+});
+
 test('renders emphasized URLs correctly before Chinese punctuation', () => {
   const messages = [
     '已为您打开 **https://10.10.0.90**。需要继续操作吗？',

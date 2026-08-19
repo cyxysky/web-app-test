@@ -2260,7 +2260,7 @@ async function executeRuntimeStep(input: {
       ));
     }
 
-    function runtimeOperationalContextMessage(requiredSubagentDirective: string): RuntimeModelMessage | undefined {
+    function runtimeOperationalContextSystemSection(requiredSubagentDirective: string) {
       const sections = [
         activeOperationalContext
           ? `Relevant Skill summaries, memory, and secure capabilities supplied by the runtime:\n${activeOperationalContext}`
@@ -2268,15 +2268,12 @@ async function executeRuntimeStep(input: {
         userReferenceImagePrompt,
         requiredSubagentDirective,
       ].filter(Boolean);
-      if (!sections.length) return undefined;
-      return {
-        role: 'user' as const,
-        content: [
-          runtimeOperationalContextMarker,
-          'This metadata supplements the latest real user request. It is not a new request and must not be quoted back.',
-          ...sections,
-        ].join('\n\n'),
-      };
+      if (!sections.length) return '';
+      return [
+        runtimeOperationalContextMarker,
+        'This runtime metadata is system context, not a user message. Use it silently and never quote or summarize it to the user.',
+        ...sections,
+      ].join('\n\n');
     }
 
     const summarizeContinuation = async (
@@ -2358,7 +2355,7 @@ async function executeRuntimeStep(input: {
       const stepAllowedToolTypes = browserStateGatePending
         ? toolsAllowedBeforeBrowserState(allowedToolTypes, browserSessionToolNames)
         : allowedToolTypes;
-      requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
+      const baseSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = runtimeContextWindowTokens();
       const thresholdRatio = runtimeContextCompressionThresholdRatio();
@@ -2394,11 +2391,9 @@ async function executeRuntimeStep(input: {
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
       }
 
-      const operationalContextMessage = runtimeOperationalContextMessage(requiredSubagentDirective);
-      const withRuntimeOperationalContext = (messages: RuntimeModelMessage[]) => (
-        operationalContextMessage ? [...messages, operationalContextMessage] : messages
-      );
-      let requestMessages = withRuntimeOperationalContext(messagesToSend);
+      const operationalContextSystemSection = runtimeOperationalContextSystemSection(requiredSubagentDirective);
+      requestSystemPrompt = [baseSystemPrompt, operationalContextSystemSection].filter(Boolean).join('\n\n');
+      let requestMessages = [...messagesToSend];
       let attachedImagePaths = [...messageImagePaths];
       let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
       let modelContextSegmentation: Record<string, unknown> | undefined;
@@ -2408,7 +2403,7 @@ async function executeRuntimeStep(input: {
         const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
         const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
         const baseStats = modelMessagesTextAndImageStats(
-          sanitizeModelInputForStats(requestSystemPrompt, withRuntimeOperationalContext([]), []),
+          sanitizeModelInputForStats(requestSystemPrompt, [], []),
           codexMode ? undefined : nativeToolsRef.current,
         );
         const summarySourceMessages = messagesToSend.filter((message) => (
@@ -2451,7 +2446,7 @@ async function executeRuntimeStep(input: {
         if (messagesToSend.length === 1) {
           messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
         }
-        requestMessages = withRuntimeOperationalContext(messagesToSend);
+        requestMessages = [...messagesToSend];
         attachedImagePaths = [];
         messageImagePaths = [...attachedImagePaths];
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
@@ -2460,7 +2455,7 @@ async function executeRuntimeStep(input: {
           const candidate = olderBlocks.pop()!;
           const candidateMessages = candidate.concat(messagesToSend.slice(1));
           const candidateContext = [messagesToSend[0], ...candidateMessages];
-          const candidateRequestMessages = withRuntimeOperationalContext(candidateContext);
+          const candidateRequestMessages = [...candidateContext];
           const candidateStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, candidateRequestMessages, []), codexMode ? undefined : nativeToolsRef.current);
           if (candidateStats.estimatedTotalTokens > targetCeilingTokens) break;
           messagesToSend = candidateContext;
@@ -2471,12 +2466,12 @@ async function executeRuntimeStep(input: {
           const removableBlocks = atomicRuntimeModelMessageBlocks(messagesToSend.slice(1));
           removableBlocks.shift();
           messagesToSend = [messagesToSend[0], ...removableBlocks.flat()];
-          requestMessages = withRuntimeOperationalContext(messagesToSend);
+          requestMessages = [...messagesToSend];
           afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
         if (messagesToSend.length === 1) {
           messagesToSend.push({ role: 'user' as const, content: 'Continue from the continuation summary. Treat completed, confirmedFacts, negativeResults, and failedAttempts as durable facts.' });
-          requestMessages = withRuntimeOperationalContext(messagesToSend);
+          requestMessages = [...messagesToSend];
           afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
@@ -2529,7 +2524,7 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextMessage ? textFromUnknown(operationalContextMessage.content).length : 0, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       const activeTools = browserStateGatePending
         ? stepAllowedToolTypes as Array<keyof typeof toolsForRequest>
@@ -2819,6 +2814,14 @@ async function executeRuntimeStep(input: {
         ensureActive();
         latestText = event.text || '';
         const turnIndex = typeof event.stepNumber === 'number' ? event.stepNumber : toolExecutionGate.stepNumber;
+        if (latestText) {
+          await onTextStream?.({
+            delta: latestText,
+            stepNumber: turnIndex,
+            text: latestText,
+          });
+          ensureActive();
+        }
         const traceStart = stepTraceStarts.get(turnIndex) ?? 0;
         const newTraces = traces.slice(traceStart);
         const startedAt = stepStartedAt.get(turnIndex) || Date.now();

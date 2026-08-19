@@ -79,6 +79,19 @@ body {
   line-height: 1.5;
 }
 
+*::-webkit-scrollbar {
+  height: 10px;
+  width: 8px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  background-clip: padding-box;
+  border: 2px dashed transparent;
+  border-radius: 5px;
+  padding: 2px;
+}
+
 :where(button, input, textarea, select) {
   font-family: inherit;
   letter-spacing: inherit;
@@ -220,7 +233,7 @@ body {
   box-shadow: 0 1px 2px color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
-html :is(button.ui-icon-button, button:not(.ui-button):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-send, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow > summary, .domain-list-search > button) {
+html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow > summary, .domain-list-search > button) {
   backdrop-filter: none !important;
   background: transparent !important;
   border: 0 !important;
@@ -793,7 +806,6 @@ input[type="checkbox"]:focus-visible {
   overflow: auto;
   overscroll-behavior: contain;
   padding: 18px;
-  scrollbar-gutter: stable;
 }
 
 .ui-modal-footer {

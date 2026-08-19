@@ -39,19 +39,6 @@ export function browserChatReachedHistoryTop(previousScrollTop: number, currentS
   return previousScrollTop > 0 && currentScrollTop === 0;
 }
 
-export function browserChatVerticalScrollShadows(
-  metrics: { clientHeight: number; scrollHeight: number; scrollTop: number },
-) {
-  const edgeTolerance = 1;
-  const maxScrollTop = Math.max(0, metrics.scrollHeight - metrics.clientHeight);
-  const scrollTop = Math.max(0, Math.min(metrics.scrollTop, maxScrollTop));
-  const scrollable = maxScrollTop > edgeTolerance;
-  return {
-    bottom: scrollable && maxScrollTop - scrollTop > edgeTolerance,
-    top: scrollable && scrollTop > edgeTolerance,
-  };
-}
-
 export function beginHistoricalSubagentQuery(queriedKeys: Set<string>, key: string) {
   if (queriedKeys.has(key)) return false;
   queriedKeys.add(key);

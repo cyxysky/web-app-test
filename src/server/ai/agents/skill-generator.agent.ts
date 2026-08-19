@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { aiMaxOutputTokens, aiReasoningEffort, aiRequestTimeoutMs, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel } from '@/server/ai/model';
 import { skillContentSchema, type SkillRecord, type StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
-import { normalizeSkillDomain } from './skill-context';
 
 const generatedSkillSchema = z.object({
   title: z.string().min(2).max(80),
@@ -160,7 +159,6 @@ export async function generateSkillFromBrowserHistory(input: {
   return {
     title: generated.title,
     description: generated.description,
-    domains: [normalizeSkillDomain(input.targetUrl)].filter(Boolean),
     triggerPhrases: distinctText(generated.triggerPhrases, 8),
     content: {
       details: generated.content.details.trim(),

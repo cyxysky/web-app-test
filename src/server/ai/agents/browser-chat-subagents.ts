@@ -1,5 +1,9 @@
 import type { ModelMessage } from 'ai';
-import type { BrowserChatSubagentMessage } from '@/server/ai/schemas/runtime.schema';
+import type {
+  BrowserChatSubagentMessage,
+  StepExecutionResult,
+  StepToolCall,
+} from '@/server/ai/schemas/runtime.schema';
 
 export type BrowserChatSubagentSettled<TTask, TResult> = {
   task: TTask;
@@ -122,6 +126,102 @@ export function browserChatSubagentInputMessage(
   instruction: string,
 ): BrowserChatSubagentMessage {
   return { id: `${subagentId}:message:input`, role: 'user', content: instruction };
+}
+
+function browserChatSubagentToolOutput(tool: StepToolCall) {
+  if (tool.rawResult !== undefined) return tool.rawResult;
+  if (tool.result !== undefined) return tool.result;
+  if (tool.ok !== undefined) return { ok: tool.ok };
+  return undefined;
+}
+
+export function browserChatSubagentMessagesFromProgress(input: {
+  subagentId: string;
+  instruction: string;
+  steps: readonly StepExecutionResult[];
+  streamedText?: string;
+  preservedMessages?: readonly BrowserChatSubagentMessage[];
+}) {
+  const messages: BrowserChatSubagentMessage[] = [
+    browserChatSubagentInputMessage(input.subagentId, input.instruction),
+  ];
+  for (const step of [...input.steps].sort((left, right) => left.index - right.index)) {
+    const assistantContent: unknown[] = [];
+    const progressText = [step.action, step.actual]
+      .map((value) => String(value || '').trim())
+      .filter((value, index, values) => value && values.indexOf(value) === index)
+      .join('\n\n');
+    if (progressText) assistantContent.push({ type: 'text', text: progressText });
+    for (const [toolIndex, tool] of (step.tools || []).entries()) {
+      assistantContent.push({
+        type: 'tool-call',
+        toolCallId: tool.id || `${input.subagentId}:step:${step.index}:tool:${toolIndex}`,
+        toolName: tool.name,
+        input: tool.input,
+      });
+    }
+    if (assistantContent.length) {
+      messages.push({
+        id: `${input.subagentId}:message:progress:${step.index}`,
+        role: 'assistant',
+        content: serializableSubagentMessageContent(assistantContent),
+      });
+    }
+    const toolResults = (step.tools || []).flatMap((tool, toolIndex) => {
+      const output = browserChatSubagentToolOutput(tool);
+      if (output === undefined) return [];
+      return [{
+        type: 'tool-result',
+        toolCallId: tool.id || `${input.subagentId}:step:${step.index}:tool:${toolIndex}`,
+        toolName: tool.name,
+        output,
+      }];
+    });
+    if (toolResults.length) {
+      messages.push({
+        id: `${input.subagentId}:message:progress:${step.index}:results`,
+        role: 'tool',
+        content: serializableSubagentMessageContent(toolResults),
+      });
+    }
+  }
+  const streamedText = input.streamedText?.trim();
+  if (streamedText) {
+    messages.push({
+      id: `${input.subagentId}:message:stream`,
+      role: 'assistant',
+      content: streamedText,
+    });
+  }
+  for (const message of input.preservedMessages || []) {
+    if (!messages.some((item) => item.id === message.id)) messages.push(message);
+  }
+  return limitBrowserChatSubagentMessages(input.subagentId, messages);
+}
+
+function browserChatSubagentExplicitReportStatus(steps: readonly StepExecutionResult[]) {
+  const report = [...steps]
+    .flatMap((step) => step.tools || [])
+    .filter((tool) => tool.name === 'reportState')
+    .at(-1);
+  if (!report?.input || typeof report.input !== 'object' || Array.isArray(report.input)) return '';
+  const status = (report.input as Record<string, unknown>).status;
+  return status === 'failed' || status === 'blocked' || status === 'passed' ? status : '';
+}
+
+export function resolvedBrowserChatSubagentStatus(input: {
+  status: 'passed' | 'failed' | 'blocked';
+  summary: string;
+  steps: readonly StepExecutionResult[];
+}) {
+  if (input.status !== 'failed' || !input.summary.trim()) return input.status;
+  const explicitReportStatus = browserChatSubagentExplicitReportStatus(input.steps);
+  if (explicitReportStatus === 'failed' || explicitReportStatus === 'blocked') return explicitReportStatus;
+  const terminalStep = input.steps.at(-1);
+  if (/request.*failed|retries were exhausted|response handling failed/i.test(terminalStep?.action || '')) {
+    return 'failed';
+  }
+  return 'passed';
 }
 
 export function browserChatSubagentSuggestedSummaryChars() {

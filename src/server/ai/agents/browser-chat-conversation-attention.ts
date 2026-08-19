@@ -35,7 +35,6 @@ export function browserChatConversationAttentionContext(
 ) {
   const turns = conversationTurns(messages);
   if (turns.length < 2) return '';
-  const latest = turns.at(-1)!;
   const recentCompleted = turns
     .slice(0, -1)
     .filter((turn) => Boolean(turn.assistant))
@@ -44,14 +43,12 @@ export function browserChatConversationAttentionContext(
 
   return [
     '[Conversation attention anchors]',
-    'This is a bounded attention index over the native AI SDK message chain, not a replacement for it. Preserve continuity with these exchanges, but follow the latest user request when priorities conflict.',
-    'Current user request (highest priority):',
-    compactAttentionText(latest.user, 2_000),
+    'This is a bounded index of prior completed exchanges, not a user request and not a replacement for the native AI SDK message chain. Use it silently for continuity and never quote or summarize this index to the user.',
     'Recent completed user/assistant exchanges:',
     ...recentCompleted.flatMap((turn, index) => [
       `${index + 1}. User: ${compactAttentionText(turn.user, 900)}`,
       `   Assistant: ${compactAttentionText(turn.assistant || '', 1_400)}`,
     ]),
-    'Before answering, check whether the current request depends on facts, constraints, promised follow-ups, or unresolved questions in these exchanges. Do not silently drop them.',
+    'The latest real user message in the native message chain remains the only current request.',
   ].join('\n');
 }

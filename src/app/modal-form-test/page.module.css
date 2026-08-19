@@ -770,7 +770,6 @@
   max-height: 360px;
   overflow: auto;
   gap: 6px;
-  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 .performanceNoise article {
@@ -918,7 +917,6 @@
   min-height: 0;
   overflow: auto;
   background: var(--panel-elevated);
-  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 .grid {
@@ -1298,7 +1296,6 @@
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   color: var(--foreground);
-  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 .popupColumn {

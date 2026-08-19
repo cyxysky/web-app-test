@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { browserChatConversationAttentionContext } from './browser-chat-conversation-attention';
 
-test('builds a bounded attention index from prior completed exchanges and the current request', () => {
+test('builds a bounded attention index from prior completed exchanges without duplicating the current request', () => {
   const context = browserChatConversationAttentionContext([
     { role: 'user', content: '先分析八个链接' },
     { role: 'assistant', content: '已经并行读取并给出结论。', status: 'passed' },
@@ -12,7 +12,7 @@ test('builds a bounded attention index from prior completed exchanges and the cu
     { role: 'assistant', content: '仍在运行，不应进入锚点', status: 'running' },
   ]);
 
-  assert.match(context, /Current user request \(highest priority\):\n确认文档是否覆盖了第一个问题/);
+  assert.doesNotMatch(context, /确认文档是否覆盖了第一个问题/);
   assert.match(context, /User: 先分析八个链接/);
   assert.match(context, /Assistant: 已经并行读取并给出结论/);
   assert.doesNotMatch(context, /仍在运行/);

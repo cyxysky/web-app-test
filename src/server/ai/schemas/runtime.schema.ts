@@ -52,7 +52,6 @@ export type SkillRecord = {
   shared: boolean;
   title: string;
   description: string;
-  domains?: string[];
   triggerPhrases: string[];
   content: SkillContent;
   sourceSessionId?: string;

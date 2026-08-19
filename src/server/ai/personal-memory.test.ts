@@ -5,8 +5,24 @@ import {
   filterDurablePersonalMemoryDrafts,
   formatPersonalMemoryForPrompt,
   normalizePersonalMemoryValue,
+  parsePersonalMemoryExtractionOutput,
   type PersonalMemoryItem,
 } from './personal-memory';
+
+test('parses plain or fenced personal-memory JSON and treats an empty response as no candidates', () => {
+  const item = {
+    scope: 'global',
+    type: 'preference',
+    key: '页面语言',
+    value: '默认使用中文页面。',
+    evidence: ['以后页面默认用中文'],
+    durability: 'explicit_preference',
+  };
+  assert.deepEqual(parsePersonalMemoryExtractionOutput(JSON.stringify({ items: [item] })), { items: [item] });
+  assert.deepEqual(parsePersonalMemoryExtractionOutput(`\`\`\`json\n${JSON.stringify({ items: [item] })}\n\`\`\``), { items: [item] });
+  assert.deepEqual(parsePersonalMemoryExtractionOutput(''), { items: [] });
+  assert.throws(() => parsePersonalMemoryExtractionOutput('{"items":['), /invalid JSON|no JSON object/);
+});
 
 test('keeps complete personal memory text and normalizes line endings without collapsing lines', () => {
   const longLine = '长'.repeat(400);

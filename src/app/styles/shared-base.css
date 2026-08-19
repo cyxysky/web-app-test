@@ -4,15 +4,6 @@
   box-sizing: border-box;
 }
 
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--scrollbar-thumb-hover);
-  background-clip: content-box;
-}
-
-*::-webkit-scrollbar-corner {
-  background: transparent;
-}
-
 .navigation-loading-overlay--workspace {
   bottom: auto;
   inset: auto;
@@ -138,6 +129,12 @@ select {
   background: #fff1f0;
   border-color: #ffc9c2;
   color: var(--danger);
+}
+
+.status-partial {
+  background: #f0f7ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
 }
 
 .status-blocked {
@@ -1164,32 +1161,6 @@ select {
   overflow-x: hidden;
   overflow-y: auto;
   padding: 0 2px 2px;
-  scrollbar-color: rgba(67, 70, 77, 0.28) transparent;
-  scrollbar-width: thin;
-}
-
-.custom-select-options::-webkit-scrollbar {
-  width: 8px;
-}
-
-.custom-select-options::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.custom-select-options::-webkit-scrollbar-button,
-.custom-select-options::-webkit-scrollbar-button:single-button {
-  -webkit-appearance: none;
-  background: transparent;
-  display: none;
-  height: 0;
-  width: 0;
-}
-
-.custom-select-options::-webkit-scrollbar-thumb {
-  background: rgba(67, 70, 77, 0.28);
-  background-clip: padding-box;
-  border: 2px solid transparent;
-  border-radius: 999px;
 }
 
 .custom-select-empty {
@@ -1282,7 +1253,6 @@ select {
 .browser-chat-main:has(> .browser-chat-settings-pane .settings-loading-panel),
 .automation-main:has(.automation-loading-state) {
   overflow: hidden;
-  scrollbar-gutter: stable;
 }
 
 .browser-chat-main.is-positioning-chat {
@@ -1461,6 +1431,12 @@ body.is-dragging-embedded-tab * {
   color: #fca5a5;
 }
 
+:root[data-theme="dark"] :where(.status-partial) {
+  background: color-mix(in srgb, #60a5fa 14%, var(--panel));
+  border-color: color-mix(in srgb, #60a5fa 34%, var(--border));
+  color: #93c5fd;
+}
+
 :root[data-theme="dark"] :where(.status-blocked) {
   background: color-mix(in srgb, var(--warning) 14%, var(--panel));
   border-color: color-mix(in srgb, var(--warning) 34%, var(--border));
@@ -1586,21 +1562,6 @@ body.is-dragging-embedded-tab * {
 .browser-chat-settings-pane :where(.settings-control, .settings-row-control, .theme-color-picker) {
   min-width: 0;
   width: 100%;
-}
-
-*::-webkit-scrollbar {
-  height: 8px;
-  width: 8px;
-}
-
-*::-webkit-scrollbar-thumb {
-  border-radius: 5px;
-  border-style: dashed;
-  background: var(--scrollbar-thumb);
-  border-color: transparent;
-  padding: 2px;
-  background-clip: padding-box;
-  border-width: 2px;
 }
 
 :where(button, a, input, textarea, select, summary) {

@@ -7,6 +7,7 @@ import {
   registeredBrowserChatTurnIsActive,
   revokeBrowserChatTurn,
   revokeRegisteredBrowserChatTurn,
+  revokeRegisteredBrowserChatTurnByAssistantMessageId,
   runtimeSnapshotIsNewer,
   type RegisteredBrowserChatTurn,
 } from './browser-chat-interrupt-state';
@@ -120,6 +121,34 @@ test('registering a later turn never reactivates an interrupted execution', () =
 
   assert.equal(registeredBrowserChatTurnIsActive(registry, session.id, session, 'assistant-old', oldController), false);
   assert.equal(registeredBrowserChatTurnIsActive(registry, session.id, session, 'assistant-next', nextController), true);
+});
+
+test('a delayed interrupt for an older assistant never revokes the newer registered turn', () => {
+  const registry = new Map<string, RegisteredBrowserChatTurn<{ id: string }>>();
+  const session = { id: 'session-1' };
+  const nextController = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-next',
+    abortController: nextController,
+  });
+
+  const revoked = revokeRegisteredBrowserChatTurnByAssistantMessageId(
+    registry,
+    session.id,
+    'assistant-old',
+    new Error('delayed interrupt'),
+  );
+
+  assert.equal(revoked, undefined);
+  assert.equal(nextController.signal.aborted, false);
+  assert.equal(registeredBrowserChatTurnIsActive(
+    registry,
+    session.id,
+    session,
+    'assistant-next',
+    nextController,
+  ), true);
 });
 
 test('does not revive a newer in-memory interruption from an older persisted snapshot', () => {

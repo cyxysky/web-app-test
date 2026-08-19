@@ -4,12 +4,66 @@ import type { ModelMessage } from 'ai';
 import {
   browserChatSubagentConfirmationMessage,
   browserChatSubagentMessagesFromModelMessages,
+  browserChatSubagentMessagesFromProgress,
   browserChatSubagentSuggestedSummaryChars,
   clearBrowserChatSubagentBatchRegistryForTests,
   preserveBrowserChatSubagentSummary,
+  resolvedBrowserChatSubagentStatus,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
 } from './browser-chat-subagents';
+
+test('running child Agent progress exposes tool calls and results before completion', () => {
+  const messages = browserChatSubagentMessagesFromProgress({
+    subagentId: 'child-live',
+    instruction: '读取工资明细',
+    steps: [{
+      index: 1,
+      action: '读取页面字段',
+      expected: '返回工资明细',
+      actual: '浏览器代码已返回页面文本',
+      status: 'running',
+      tools: [{
+        id: 'call-live-1',
+        name: 'browserCode',
+        input: { code: 'return document.body.innerText' },
+        ok: true,
+        result: '工资明细页面文本',
+      }],
+    }],
+    streamedText: '正在整理页面证据',
+  });
+
+  const serialized = JSON.stringify(messages);
+  assert.match(serialized, /读取页面字段/);
+  assert.match(serialized, /browserCode/);
+  assert.match(serialized, /工资明细页面文本/);
+  assert.match(serialized, /正在整理页面证据/);
+});
+
+test('a recovered child Agent result is passed while explicit task failure stays failed', () => {
+  const recoveredSteps = [{
+    index: 1,
+    action: '截图失败后改用页面文本',
+    expected: '读取页面内容',
+    actual: '文本证据已完整读取',
+    status: 'failed' as const,
+    tools: [{ name: 'browserCode', ok: false, result: '截图超时' }],
+  }];
+  assert.equal(resolvedBrowserChatSubagentStatus({
+    status: 'failed',
+    summary: '已基于文本证据完成工资明细总结。',
+    steps: recoveredSteps,
+  }), 'passed');
+  assert.equal(resolvedBrowserChatSubagentStatus({
+    status: 'failed',
+    summary: '目标页面没有所需数据。',
+    steps: [{
+      ...recoveredSteps[0],
+      tools: [{ name: 'reportState', input: { status: 'failed' }, ok: true, result: '未取得目标结果' }],
+    }],
+  }), 'failed');
+});
 
 test('child Agent persistence keeps messages while removing debug duplicates and binary payloads', () => {
   const messages = browserChatSubagentMessagesFromModelMessages('child-1', [
