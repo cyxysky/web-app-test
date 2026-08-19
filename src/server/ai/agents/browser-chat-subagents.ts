@@ -241,6 +241,28 @@ export function preserveBrowserChatSubagentSummary(value: unknown) {
 
 const inFlightBatches = new Map<string, Promise<unknown>>();
 const completedBatches = new Map<string, unknown>();
+let activeSubagents = 0;
+const subagentWaiters: Array<() => void> = [];
+
+function subagentConcurrency() {
+  const configured = Number(process.env.AI_SUBAGENT_CONCURRENCY || 20);
+  return Number.isFinite(configured) ? Math.max(1, Math.floor(configured)) : 20;
+}
+
+async function withSubagentSlot<TResult>(runner: () => Promise<TResult>) {
+  if (activeSubagents >= subagentConcurrency()) {
+    await new Promise<void>((resolve) => subagentWaiters.push(resolve));
+  } else {
+    activeSubagents += 1;
+  }
+  try {
+    return await runner();
+  } finally {
+    const next = subagentWaiters.shift();
+    if (next) next();
+    else activeSubagents = Math.max(0, activeSubagents - 1);
+  }
+}
 
 /** Reuse the original child-Agent barrier when a main-Agent attempt repeats a batch. */
 export async function runOrReuseBrowserChatSubagentBatch<TResult>(
@@ -270,20 +292,19 @@ export async function runOrReuseBrowserChatSubagentBatch<TResult>(
 export function clearBrowserChatSubagentBatchRegistryForTests() {
   inFlightBatches.clear();
   completedBatches.clear();
+  activeSubagents = 0;
+  subagentWaiters.splice(0).forEach((resolve) => resolve());
 }
 
-/** Run child Agents strictly in task order without allowing one rejected task to cancel the rest. */
+/** Run independent child Agents concurrently without allowing one rejected branch to cancel siblings. */
 export async function settleBrowserChatSubagents<TTask, TResult>(
   tasks: TTask[],
   runner: (task: TTask, index: number) => Promise<TResult>,
 ): Promise<Array<BrowserChatSubagentSettled<TTask, TResult>>> {
-  const settled: Array<BrowserChatSubagentSettled<TTask, TResult>> = [];
-  for (const [index, task] of tasks.entries()) {
-    try {
-      settled.push({ task, result: await runner(task, index) });
-    } catch (error) {
-      settled.push({ task, error });
-    }
-  }
-  return settled;
+  const settled = await Promise.allSettled(tasks.map((task, index) => (
+    withSubagentSlot(() => runner(task, index))
+  )));
+  return settled.map((item, index) => item.status === 'fulfilled'
+    ? { task: tasks[index], result: item.value }
+    : { task: tasks[index], error: item.reason });
 }

@@ -183,6 +183,7 @@ export type BrowserChatQueuedTurn = {
 export type BrowserChatToolConfirmation = {
   id: string;
   messageId: string;
+  subagentId?: string;
   stepIndex?: number;
   toolName: string;
   inputSignature: string;
@@ -851,6 +852,9 @@ function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation 
   return {
     id: confirmationId,
     messageId,
+    subagentId: typeof record.subagentId === 'string' && record.subagentId.trim()
+      ? record.subagentId.trim()
+      : undefined,
     stepIndex: typeof record.stepIndex === 'number' && Number.isFinite(record.stepIndex) ? Math.floor(record.stepIndex) : undefined,
     toolName,
     inputSignature,
@@ -3569,6 +3573,7 @@ function createBrowserChatTurnToolConfirmation(
     request: BrowserToolConfirmationRequest,
     browser?: BrowserSession,
     onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void,
+    subagentId?: string,
   ): Promise<BrowserToolConfirmationDecision> => {
     const inputSignature = toolConfirmationInputSignature(request.input);
     const inputKey = `${request.toolName}:${inputSignature}`;
@@ -3589,7 +3594,7 @@ function createBrowserChatTurnToolConfirmation(
       request,
       abortSignal,
       browser,
-      { onDecision, recordLogs: options.recordLogs !== false },
+      { onDecision, recordLogs: options.recordLogs !== false, subagentId },
     );
     if (decision === 'confirmed') {
       confirmedInputs.add(inputKey);
@@ -3601,14 +3606,15 @@ function createBrowserChatTurnToolConfirmation(
     request: BrowserToolConfirmationRequest,
     browser?: BrowserSession,
     onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void,
+    subagentId?: string,
   ): Promise<BrowserToolConfirmationDecision> => {
-    if (!options.serialize) return requestWithReuse(request, browser, onDecision);
+    if (!options.serialize) return requestWithReuse(request, browser, onDecision, subagentId);
     const previous = confirmationQueue;
     let release!: () => void;
     confirmationQueue = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      return await requestWithReuse(request, browser, onDecision);
+      return await requestWithReuse(request, browser, onDecision, subagentId);
     } finally {
       release();
     }
@@ -3671,6 +3677,7 @@ async function requestBrowserChatToolConfirmation(
   options: {
     onDecision?: (interaction: BrowserChatSubagentConfirmationInteraction) => void;
     recordLogs?: boolean;
+    subagentId?: string;
   } = {},
 ): Promise<BrowserToolConfirmationDecision> {
   if (abortSignal?.aborted) return 'cancelled';
@@ -3681,6 +3688,7 @@ async function requestBrowserChatToolConfirmation(
     existing
     && existingResolver?.sessionId === session.id
     && existing.messageId === assistantMessageId
+    && existing.subagentId === (options.subagentId?.trim() || undefined)
     && existing.toolName === request.toolName
     && existing.inputSignature === inputSignature
   ) {
@@ -3703,6 +3711,7 @@ async function requestBrowserChatToolConfirmation(
   const pending: BrowserChatToolConfirmation = {
     id: confirmationId,
     messageId: assistantMessageId,
+    subagentId: options.subagentId?.trim() || undefined,
     stepIndex: request.stepIndex,
     toolName: request.toolName,
     inputSignature,
@@ -3732,6 +3741,7 @@ async function requestBrowserChatToolConfirmation(
               confirmationId,
               decision,
               toolName: pending.toolName,
+              subagentId: pending.subagentId,
               inputSignature: pending.inputSignature,
               screenshotUrl: pending.screenshotUrl,
             },
@@ -3911,7 +3921,7 @@ async function runBrowserChatSubagents(input: {
   tasks: BrowserChatSubagentTask[];
   toolCallId?: string;
 }): Promise<BrowserActionResult> {
-  const requestedTasks = input.tasks.slice(0, 12);
+  const requestedTasks = input.tasks;
   const normalizedTasks = requestedTasks.map((task) => ({
     title: task.title.replace(/\s+/g, ' ').trim(),
     instruction: task.instruction.replace(/\s+/g, ' ').trim(),
@@ -4038,7 +4048,7 @@ async function executeBrowserChatSubagentBatch(input: {
 }): Promise<BrowserActionResult> {
   const { session, assistantMessageId, abortController } = input;
   const batchId = input.toolCallId || id('subagent_batch');
-  const requestedTasks = input.tasks.slice(0, 12);
+  const requestedTasks = input.tasks;
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   const tasks = requestedTasks.map((task) => ({ ...task, id: randomUUID() }));
   const registry = browserChatSubagentSessionRegistry(session.id);
@@ -4052,14 +4062,14 @@ async function executeBrowserChatSubagentBatch(input: {
       index,
       title: task.title,
       task: { title: task.title, instruction: task.instruction, url: task.url },
-      status: index === 0 ? 'running' : 'queued',
+      status: 'queued',
       content: '',
       summary: '',
       summaryChars: 0,
       summaryOriginalChars: 0,
       summaryTruncated: false,
       toolCount: 0,
-      currentAction: index === 0 ? '正在启动' : '等待前序子 Agent 完成',
+      currentAction: '等待执行',
       steps: [],
       outputCycles: [],
       messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
@@ -4075,11 +4085,11 @@ async function executeBrowserChatSubagentBatch(input: {
       instruction: task.instruction,
       createdAt,
       updatedAt: createdAt,
-      status: index === 0 ? 'running' : 'queued',
+      status: 'queued',
       content: '',
       resumable: false,
       toolCount: 0,
-      currentAction: index === 0 ? '正在启动' : '等待前序子 Agent 完成',
+      currentAction: '等待执行',
       steps: [],
       outputCycles: [],
       messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
@@ -4151,8 +4161,8 @@ async function executeBrowserChatSubagentBatch(input: {
         targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
-          `你是串行执行的子 Agent“${task.title}”。只完成当前这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
-          '你拥有完整浏览器工具集。当前批次中只有你在执行；完成当前分支后立即返回，不要读取或等待其他子 Agent。',
+          `你是并行子 Agent“${task.title}”。只完成当前这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
+          '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
           inheritedStorageState
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
@@ -4161,7 +4171,7 @@ async function executeBrowserChatSubagentBatch(input: {
             ? '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。'
             : '浏览器检查与操作使用 inspect 获取当前结构化页面状态，再使用 browser/interact 完成动作；只操作 inspect 返回的可见、可交互节点。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
-          '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed，并在总结中说明失败尝试；只有目标结果仍未取得时才报告 failed。',
+          '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
           summaryGuidanceChars
             ? `完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。配置建议将篇幅控制在约 ${summaryGuidanceChars} 个字符以内，但这不是截断上限；如果完整证据需要更长内容，必须完整返回。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。`
             : '完成工具执行后，直接在你自己的最终回复中写出信息完整、可独立使用的执行总结。优先覆盖来源 URL、已验证事实、字段和表格、图片与 iframe 信息、失败步骤、限制、未读取区域和未解决项；不要为凑字数重复内容。不要再启动子 Agent，也不要要求主 Agent 另行读取结果。',
@@ -4183,6 +4193,7 @@ async function executeBrowserChatSubagentBatch(input: {
             request,
             child,
             (interaction) => recordBrowserChatSubagentConfirmation(session.id, task.id, interaction),
+            task.id,
           )
           : undefined,
         onTextStream: ({ text }) => {
@@ -4367,9 +4378,9 @@ async function resumeBlockedBrowserChatSubagent(input: {
       targetUrl: binding.task.url || binding.browser.currentUrl() || session.targetUrl || 'about:blank',
       instruction: `${binding.task.instruction}\n\n[系统续跑] 用户已完成当前可见页面的人工校验，请立即读取最新页面并从暂停点继续。`,
       modelInstruction: [
-        `你是串行执行的子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
+        `你是并行子 Agent“${binding.title}”，正在继续同一个已暂停的分支。`,
         '用户已点击“校验完成，继续执行”。不要要求用户再发送文字；先读取当前页面状态，再继续原任务。',
-        '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed，并在总结中说明失败尝试；只有目标结果仍未取得时才报告 failed。',
+        '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
         binding.task.instruction,
       ].filter(Boolean).join('\n\n'),
       operationalContext: initialRuntimeContext.operationalContext,
@@ -4388,6 +4399,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
           request,
           binding.browser,
           (interaction) => recordBrowserChatSubagentConfirmation(session.id, binding.id, interaction),
+          binding.id,
           )
         : undefined,
       onTextStream: ({ text }) => {

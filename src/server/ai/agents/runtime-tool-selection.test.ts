@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  browserToolBlockedBeforeBrowserState,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
-  toolsAllowedBeforeBrowserState,
+  runtimeToolLoopStopToolNames,
 } from './runtime-tool-selection';
 
 const nativeToolNames = ['browserCode', 'reportState'];
@@ -52,12 +53,19 @@ test('browser state gate remains pending until the browser preflight has been at
   assert.equal(requiresBrowserStatePreflight(true, []), false);
 });
 
-test('browser state gate keeps direct answers and non-browser tools available', () => {
-  assert.deepEqual(
-    toolsAllowedBeforeBrowserState(
-      ['readBrowserState', 'browserCode', 'readFile', 'answer'],
-      new Set(['readBrowserState', 'browserCode']),
-    ),
-    ['readBrowserState', 'readFile', 'answer'],
-  );
+test('browser state gate blocks execution without hiding tool schemas', () => {
+  const browserTools = new Set(['readBrowserState', 'browserCode', 'subagent']);
+  assert.equal(browserToolBlockedBeforeBrowserState('readBrowserState', true, browserTools), false);
+  assert.equal(browserToolBlockedBeforeBrowserState('browserCode', true, browserTools), true);
+  assert.equal(browserToolBlockedBeforeBrowserState('subagent', true, browserTools), true);
+  assert.equal(browserToolBlockedBeforeBrowserState('file', true, browserTools), false);
+  assert.equal(browserToolBlockedBeforeBrowserState('subagent', false, browserTools), false);
+});
+
+test('subagent calls end the current runtime tool loop before another child result is selected', () => {
+  assert.deepEqual(runtimeToolLoopStopToolNames, [
+    'reportState',
+    'waitForHumanVerification',
+    'subagent',
+  ]);
 });

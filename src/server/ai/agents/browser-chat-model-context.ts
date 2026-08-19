@@ -1,4 +1,5 @@
 import { modelMessageSchema, type ModelMessage } from 'ai';
+import { browserChatInterruptedTurnContextMarker } from './browser-chat-reply-text';
 
 export type BrowserChatModelContextCompression = {
   compressedAt: string;
@@ -76,9 +77,7 @@ export function appendInterruptedBrowserChatTurn(
 ) {
   const next = [...messages];
   const partial = assistantContent.trim();
-  const interruptionMarker = partial
-    ? '[This response was interrupted by the user before completion.]'
-    : '[The user interrupted this turn before the assistant produced text. Any completed tool messages remain valid conversation history.]';
+  const interruptionMarker = browserChatInterruptedTurnContextMarker;
   if (!messagesContainText(next, 'user', userContent)) {
     next.push({ role: 'user', content: userContent });
   }

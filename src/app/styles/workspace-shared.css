@@ -1882,6 +1882,10 @@
     z-index: 1;
   }
 
+  .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .browser-chat-history-date-group:first-child .browser-chat-history-date-label::before {
+    content: none;
+  }
+
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .browser-chat-history-date-items {
     align-content: start;
     display: grid;

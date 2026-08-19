@@ -146,23 +146,48 @@ test('child Agent summary length is prompt guidance from configuration and never
   assert.equal(complete.summaryTruncated, false);
 });
 
-test('child Agents execute strictly in task order and a failure does not cancel later tasks', async () => {
+test('child Agents execute concurrently within the global limit and a failure does not cancel siblings', async () => {
+  const previousConcurrency = process.env.AI_SUBAGENT_CONCURRENCY;
+  process.env.AI_SUBAGENT_CONCURRENCY = '2';
+  clearBrowserChatSubagentBatchRegistryForTests();
   const executionOrder: string[] = [];
-  const results = await settleBrowserChatSubagents(['prd-a', 'prd-b', 'prd-c'], async (task) => {
-    executionOrder.push(`start:${task}`);
-    await Promise.resolve();
-    executionOrder.push(`end:${task}`);
-    if (task === 'prd-b') throw new Error('unavailable');
-    return `${task}:ok`;
-  });
+  let active = 0;
+  let peakActive = 0;
+  try {
+    const results = await settleBrowserChatSubagents(['prd-a', 'prd-b', 'prd-c'], async (task) => {
+      executionOrder.push(`start:${task}`);
+      active += 1;
+      peakActive = Math.max(peakActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active -= 1;
+      executionOrder.push(`end:${task}`);
+      if (task === 'prd-b') throw new Error('unavailable');
+      return `${task}:ok`;
+    });
 
-  assert.deepEqual(executionOrder, [
-    'start:prd-a', 'end:prd-a',
-    'start:prd-b', 'end:prd-b',
-    'start:prd-c', 'end:prd-c',
-  ]);
-  assert.deepEqual(results.map((item) => item.result), ['prd-a:ok', undefined, 'prd-c:ok']);
-  assert.match(String(results[1].error), /unavailable/);
+    assert.equal(peakActive, 2);
+    assert.deepEqual(executionOrder.slice(0, 2), ['start:prd-a', 'start:prd-b']);
+    assert.deepEqual(results.map((item) => item.result), ['prd-a:ok', undefined, 'prd-c:ok']);
+    assert.match(String(results[1].error), /unavailable/);
+
+    process.env.AI_SUBAGENT_CONCURRENCY = '999';
+    active = 0;
+    peakActive = 0;
+    await settleBrowserChatSubagents(
+      Array.from({ length: 21 }, (_, index) => index),
+      async () => {
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        active -= 1;
+      },
+    );
+    assert.equal(peakActive, 21);
+  } finally {
+    if (previousConcurrency === undefined) delete process.env.AI_SUBAGENT_CONCURRENCY;
+    else process.env.AI_SUBAGENT_CONCURRENCY = previousConcurrency;
+    clearBrowserChatSubagentBatchRegistryForTests();
+  }
 });
 
 test('a repeated child-Agent batch waits for and reuses the original result', async () => {

@@ -71,7 +71,8 @@ test('an interrupted turn keeps completed tool messages and the partial assistan
   assert.equal(interrupted.filter((message) => message.role === 'user').length, 1);
   assert.equal(interrupted[2]?.role, 'tool');
   assert.match(String(interrupted.at(-1)?.content), /已经读取到 PRD 数据/);
-  assert.match(String(interrupted.at(-1)?.content), /interrupted by the user/);
+  assert.match(String(interrupted.at(-1)?.content), /Historical context only/);
+  assert.match(String(interrupted.at(-1)?.content), /never quote or copy this marker/);
 
   const repeated = appendInterruptedBrowserChatTurn(interrupted, '读取需求 31471', '已经读取到 PRD 数据');
   assert.deepEqual(repeated, interrupted);

@@ -47,9 +47,10 @@ import {
 } from './runtime-retry-policy';
 
 import {
+  browserToolBlockedBeforeBrowserState,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
-  toolsAllowedBeforeBrowserState,
+  runtimeToolLoopStopToolNames,
 } from './runtime-tool-selection';
 import { browserToolApprovalRequest } from './browser-tool-approval';
 import {
@@ -73,6 +74,12 @@ import {
   notifyRuntimeToolTrace,
   runtimeToolTraceId,
 } from './runtime-tool-trace';
+import {
+  normalizeBrowserChatSubagentTasks,
+  type BrowserChatSubagentTask,
+} from './browser-chat-subagent-task';
+
+export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
 
 const generatedFileCellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 const generatedFileThemeSchema = z.object({
@@ -184,12 +191,6 @@ export type BrowserToolConfirmationRequest = {
   stepIndex?: number;
 };
 
-export type BrowserChatSubagentTask = {
-  title: string;
-  instruction: string;
-  url?: string;
-};
-
 export type BrowserChatSubagentRunner = (
   tasks: BrowserChatSubagentTask[],
   abortSignal?: AbortSignal,
@@ -246,6 +247,12 @@ const codexRuntimeObjectSchema = z.object({
     path: z.string().nullable().optional(),
     maxMs: z.number().nullable().optional(),
     action: z.string().nullable().optional(),
+    tasks: z.array(z.object({
+      title: z.string().min(1).max(160),
+      instruction: z.string().min(1).max(4_000),
+      url: z.string().url().max(4_000),
+    })).min(1).nullable().optional(),
+    uuid: z.string().uuid().nullable().optional(),
     operation: z.enum(['setSelection', 'insert', 'delete', 'replace']).nullable().optional(),
     selection: browserTextSelectionSchema.nullable().optional(),
     expected: z.string().nullable().optional(),
@@ -1205,6 +1212,7 @@ function makeBrowserTools(
     attachmentBindings?: BrowserCodeAttachmentBinding[];
     credentialBindings?: BrowserCodeCredentialBinding[];
     getCredentialBindings?: () => BrowserCodeCredentialBinding[] | undefined;
+    browserStatePreflightComplete?: () => boolean;
   },
 ) {
   // Enforce one executed browser tool per model step. The native AI SDK loop may call the model
@@ -1236,6 +1244,19 @@ function makeBrowserTools(
     }
     toolExecutionGate.executed = true;
     const actionAfterBrowserStart = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
+      if (
+        referenceOptions?.browserStatePreflightComplete
+        && browserToolBlockedBeforeBrowserState(
+          name,
+          !referenceOptions.browserStatePreflightComplete(),
+          browserSessionToolNames,
+        )
+      ) {
+        return {
+          ok: false,
+          actual: `Tool ${name} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
+        } satisfies BrowserActionResult;
+      }
       if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
       return action(actionSignal, trace);
     };
@@ -1426,15 +1447,15 @@ function makeBrowserTools(
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
       subagent: tool({
-        description: 'Manage child Agents through one action-based tool. Use action=spawn to queue independent research, reading, comparison, or testing branches; the runtime executes them strictly in task order and returns one UUID per child. Use action=read with exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
+        description: 'Manage child Agents. For action=spawn, pass tasks as an array of { title, url, instruction }; all three fields are required and all tasks run concurrently. For action=read, pass exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
         inputSchema: z.discriminatedUnion('action', [
           browserToolInput({
             action: z.literal('spawn'),
             tasks: z.array(z.object({
-              title: z.string().min(1).max(160).describe('Short Chinese display name for this child Agent.'),
+              title: z.string().min(1).max(160).describe('Short display title for this child Agent.'),
               instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
-              url: z.string().url().max(4_000).optional().describe('Optional independent page or PRD entry URL.'),
-            })).min(1).max(12),
+              url: z.string().url().max(4_000).describe('Independent page or PRD entry URL for this child Agent.'),
+            })).min(1),
           }),
           browserToolInput({
             action: z.literal('read'),
@@ -1444,7 +1465,7 @@ function makeBrowserTools(
         execute: (input, execution) => {
           if (input.action === 'spawn') {
             return record('subagent', input, (abortSignal, trace) => referenceOptions?.runSubagents
-              ? referenceOptions.runSubagents(input.tasks, abortSignal, trace?.id)
+              ? referenceOptions.runSubagents(normalizeBrowserChatSubagentTasks(input.tasks), abortSignal, trace?.id)
               : Promise.resolve({ ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' }), execution);
           }
           return record('subagent', input, () => {
@@ -1602,8 +1623,9 @@ function runtimePrompt(input: {
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when file action=generate or action=download succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
     '- file action=generate uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, inspect its returned rendered pages, and regenerate at most once when visual evidence shows a layout defect. Return only the final verified artifact link.',
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
+    '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, subagent action=spawn may queue one self-contained task per item. Child Agents execute strictly in the submitted order. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
+    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
       ? '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use file action=generate.'
@@ -2363,9 +2385,10 @@ async function executeRuntimeStep(input: {
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
         : '';
       const browserStateGatePending = requiresBrowserStatePreflight(Boolean(input.browserStatePreflightComplete), traces);
-      const stepAllowedToolTypes = browserStateGatePending
-        ? toolsAllowedBeforeBrowserState(allowedToolTypes, browserSessionToolNames)
-        : allowedToolTypes;
+      // Keep the complete tool contract visible so a model using the known tool name receives
+      // a normal prerequisite result instead of the SDK's misleading AI_NoSuchToolError.
+      // Execution is still blocked below until readBrowserState has completed.
+      const stepAllowedToolTypes = allowedToolTypes;
       const baseSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const windowTokens = runtimeContextWindowTokens();
@@ -2604,6 +2627,11 @@ async function executeRuntimeStep(input: {
         requestToolConfirmation: input.requestToolConfirmation,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
+        requiredSubagentUuid: input.requiredSubagentUuid,
+        browserStatePreflightComplete: !requiresBrowserStatePreflight(
+          Boolean(input.browserStatePreflightComplete),
+          traces,
+        ),
         readFile: input.readFile,
         readSkill: input.readSkill,
         attachmentBindings: input.attachmentBindings,
@@ -2697,6 +2725,10 @@ async function executeRuntimeStep(input: {
       attachmentBindings: input.attachmentBindings,
       credentialBindings: input.credentialBindings,
       getCredentialBindings: () => activeCredentialBindings,
+      browserStatePreflightComplete: () => !requiresBrowserStatePreflight(
+        Boolean(input.browserStatePreflightComplete),
+        traces,
+      ),
       onReferenceImage: ({ path, source }) => {
         if (!modelSupportsScreenshotInput()) return;
         pendingObservationMessages.push({
@@ -2722,10 +2754,9 @@ async function executeRuntimeStep(input: {
       ...allowedExternalTools,
     };
     const toolsForRequest = nativeToolsRef.current;
-    const stopWhen = [
-      hasToolCall<typeof toolsForRequest>('reportState'),
-      hasToolCall<typeof toolsForRequest>('waitForHumanVerification'),
-    ];
+    const stopWhen = runtimeToolLoopStopToolNames.map((toolName) => (
+      hasToolCall<typeof toolsForRequest>(toolName)
+    ));
     try {
       let streamedStepNumber = 0;
       let streamedStepText = '';
@@ -3192,23 +3223,6 @@ export type InteractiveBrowserTurnResult = {
   contextCompression?: BrowserChatModelContextCompression;
 };
 
-export function appendBrowserChatFailedToolDisclosures(
-  reply: string,
-  steps: StepExecutionResult[],
-) {
-  const failedCalls = steps.flatMap((step) => (step.tools || []).filter((tool) => tool.ok === false));
-  if (!failedCalls.length) return reply;
-  const disclosure = [
-    '## 本轮未成功的工具尝试',
-    '',
-    ...failedCalls.map((tool, index) => {
-      const semanticReason = sanitizeHistoricalToolText(tool.reason, 180);
-      return `${index + 1}. ${semanticReason || '浏览器工具调用'}（未成功，后续操作已基于实际页面状态继续）`;
-    }),
-  ].join('\n');
-  return [reply.trim(), disclosure].filter(Boolean).join('\n\n');
-}
-
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
   if (mode === 'full') {
     return [
@@ -3511,8 +3525,6 @@ export async function executeInteractiveBrowserTurn(input: {
       result: toolCall.rawResult,
     }))),
   );
-  reply = appendBrowserChatFailedToolDisclosures(reply, newSteps);
-
   ensureActive();
   return {
     status: finalStatus,
@@ -3901,6 +3913,8 @@ async function executeCodexRuntimeObject(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
+  requiredSubagentUuid?: string;
+  browserStatePreflightComplete?: boolean;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
@@ -3910,7 +3924,7 @@ async function executeCodexRuntimeObject(input: {
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onReferenceImage?: (input: { path: string; source: string }) => void;
 }) {
-  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, readFile, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
+  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3954,14 +3968,7 @@ async function executeCodexRuntimeObject(input: {
   const runTool = async (toolCallId?: string) => {
     if (type === 'subagent' && normalizedParams.action === 'spawn') {
       if (!runSubagents) return { ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' };
-      const tasks = Array.isArray(normalizedParams.tasks) ? normalizedParams.tasks.flatMap((raw): BrowserChatSubagentTask[] => {
-        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
-        const item = raw as Record<string, unknown>;
-        const title = typeof item.title === 'string' ? item.title.trim() : '';
-        const instruction = typeof item.instruction === 'string' ? item.instruction.trim() : '';
-        if (!title || !instruction) return [];
-        return [{ title, instruction, url: typeof item.url === 'string' ? item.url : undefined }];
-      }).slice(0, 12) : [];
+      const tasks = normalizeBrowserChatSubagentTasks(normalizedParams.tasks);
       if (!tasks.length) return { ok: false, actual: 'subagent action=spawn requires at least one valid task.' };
       return runSubagents(tasks, abortSignal, toolCallId);
     }
@@ -3969,6 +3976,12 @@ async function executeCodexRuntimeObject(input: {
       if (!readSubagent) return { ok: false, actual: 'subagent action=read is unavailable in this runtime.' };
       const uuid = typeof normalizedParams.uuid === 'string' ? normalizedParams.uuid.trim() : '';
       if (!uuid) return { ok: false, actual: 'subagent action=read requires one UUID.' };
+      if (requiredSubagentUuid && uuid !== requiredSubagentUuid) {
+        return {
+          ok: false,
+          actual: `Read rejected: child Agent results must be read in order. The required UUID is ${requiredSubagentUuid}.`,
+        };
+      }
       return readSubagent(uuid);
     }
     if (type === 'file' && normalizedParams.action === 'read') {
@@ -4013,6 +4026,16 @@ async function executeCodexRuntimeObject(input: {
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {
+      if (browserToolBlockedBeforeBrowserState(
+        type,
+        !Boolean(browserStatePreflightComplete),
+        browserSessionToolNames,
+      )) {
+        return {
+          ok: false,
+          actual: `Tool ${type} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
+        } satisfies BrowserActionResult;
+      }
       const approval = await requestBrowserToolApproval({
         session,
         toolName: type,

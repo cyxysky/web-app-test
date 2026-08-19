@@ -2289,6 +2289,18 @@
   width: 100%;
 }
 
+.browser-chat-subagent-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  width: 100%;
+}
+
+.browser-chat-subagent-item > .browser-chat-tool-confirmation {
+  margin-left: 35px;
+  width: calc(100% - 35px);
+}
+
 .browser-chat-subagent-row {
   align-items: center;
   background: transparent;

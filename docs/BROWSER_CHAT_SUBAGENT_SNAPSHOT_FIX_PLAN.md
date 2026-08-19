@@ -452,7 +452,7 @@ isolation: 'shared-readonly-context' | 'isolated-context'
 并行 Agent 数量和浏览器并发数分开控制。模型仍可一次委托多个独立任务，但浏览器调度器必须设置资源上限：
 
 ```text
-AI_SUBAGENT_MAX_CONCURRENCY = 6
+AI_SUBAGENT_CONCURRENCY = 20
 BROWSER_WORKER_PROCESS_LIMIT = 1
 BROWSER_WORKER_CONTEXT_LIMIT = 4
 BROWSER_WORKER_PAGE_LIMIT = 6

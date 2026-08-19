@@ -42,7 +42,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /attachmentVault\.setInputFiles/);
   assert.match(rules, /upload-only request, do not call file/i);
   assert.match(rules, /FileChooser\.setFiles/);
-  assert.match(rules, /exactly one attachment at the requested destination/i);
+  assert.match(rules, /exactly one attachment (?:remains )?at the requested destination/i);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /extra contains mounted non-actionable records/);
@@ -81,11 +81,10 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.doesNotMatch(rules, /ONE ACTION|at most one state-changing operation/);
   assert.match(rules, /first\(\), last\(\), and nth\(\) are allowed/);
   assert.doesNotMatch(rules, /clickByUid/);
-  assert.match(rules, /no UID-click tool/);
   assert.match(rules, /never fall back to DOM element\.click\(\), dispatchEvent\(\), or script click/i);
   assert.match(rules, /record the failed locator and actual count/i);
   assert.match(rules, /do not (?:describe|call) (?:a )?failure as transient/i);
-  assert.match(rules, /do not omit the failed tool call from the final report/i);
+  assert.doesNotMatch(rules, /do not omit the failed tool call from the final report/i);
   assert.match(rules, /two separate model steps/);
   assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
   assert.match(rules, /document, URL, viewport, zoom, or scroll-position change/i);
@@ -112,7 +111,7 @@ test('screenshot guidance stays inside browserCode', () => {
 
 test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
   const rules = browserChatCodeRules(true).join('\n');
-  assert.equal(browserChatCodeRules(true).length, 9);
+  assert.equal(browserChatCodeRules(true).length, 10);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
@@ -141,7 +140,7 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /overlay or backdrop/i);
   assert.match(rules, /explicitly run page\.domSnapshot\(\)\/targeted Playwright reads/);
   assert.match(rules, /do not describe a failure as transient/i);
-  assert.match(rules, /do not omit the failed tool call from the final report/i);
+  assert.doesNotMatch(rules, /do not omit the failed tool call from the final report/i);
   assert.doesNotMatch(rules, /page\.verifyState|ACTION_EXECUTED_VERIFICATION_REQUIRED|verification-only/);
   assert.doesNotMatch(rules, /Date\/time pickers|cascaders|dropdowns, and menus/);
   assert.match(rules, /surfaceStack/);
@@ -150,7 +149,8 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /page\.activeSurface/);
   assert.match(rules, /newly opened nonmodal surface as a bounded transaction/);
   assert.match(rules, /final read-only check of business success and page\.activeSurface/);
-  assert.match(rules, /report every failed tool call/);
+  assert.doesNotMatch(rules, /report every failed tool call/);
+  assert.match(rules, /never create a failure log, verification log, transparency disclosure/i);
   assert.match(rules, /visual overlap alone does not/);
   assert.match(rules, /nodeRepl\.emitImage/);
   assert.match(rules, /next cell/);

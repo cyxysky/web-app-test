@@ -288,6 +288,7 @@ type BrowserChatLogIndex = BrowserChatLogIndexModel<BrowserChatLogRecord>;
 type BrowserChatToolConfirmation = {
   id: string;
   messageId: string;
+  subagentId?: string;
   stepIndex?: number;
   toolName: string;
   inputSignature: string;
@@ -996,6 +997,16 @@ function isSubagentSpawnTool(name: string, input: unknown) {
   return name === 'subagent' && asRecord(input)?.action === 'spawn';
 }
 
+function pendingConfirmationBelongsToSubagentBatch(
+  pending: BrowserChatToolConfirmation | undefined,
+  subagents: BrowserChatSubagentRecord[] | undefined,
+  batchId: string | undefined,
+) {
+  if (!pending?.subagentId) return false;
+  const owner = subagents?.find((subagent) => subagent.id === pending.subagentId);
+  return Boolean(owner && (!batchId || owner.batchId === batchId));
+}
+
 function BrowserChatToolIcon({ name }: { name: string }) {
   const lower = name.toLowerCase();
   if (name === 'browserCode') return <Braces size={13} />;
@@ -1620,6 +1631,9 @@ function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): Browser
   return {
     id,
     messageId,
+    subagentId: typeof value.subagentId === 'string' && value.subagentId.trim()
+      ? value.subagentId.trim()
+      : undefined,
     stepIndex: typeof value.stepIndex === 'number' && Number.isFinite(value.stepIndex) ? Math.floor(value.stepIndex) : undefined,
     toolName,
     inputSignature,
@@ -2625,8 +2639,12 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   className,
   isActive,
   onLoadSubagentRecords,
+  onResolveToolConfirmation,
   onSelectTool,
   onResume,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
   resuming,
   running,
   structuredSubagents,
@@ -2638,8 +2656,12 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   className: string;
   isActive: boolean;
   onLoadSubagentRecords?: () => void;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
   resuming?: boolean;
   running: boolean;
   structuredSubagents?: BrowserChatSubagentRecord[];
@@ -2656,23 +2678,29 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
     batchSubagents.length
     && batchSubagents.every((subagent) => subagent.status !== 'running' && subagent.status !== 'queued'),
   );
+  const hasPendingSubagentConfirmation = pendingConfirmationBelongsToSubagentBatch(
+    pendingToolConfirmation,
+    structuredSubagents,
+    batchId,
+  );
   const loadSubagentRecords = useCallback(async () => {
     if (!onLoadSubagentRecords || loadingRecords || structuredSubagentsComplete) return;
-    setLoadingRecords(true);
+    const showLoading = batchSubagents.length === 0;
+    if (showLoading) setLoadingRecords(true);
     try {
       await onLoadSubagentRecords();
     } finally {
-      setLoadingRecords(false);
+      if (showLoading) setLoadingRecords(false);
     }
-  }, [loadingRecords, onLoadSubagentRecords, structuredSubagentsComplete]);
+  }, [batchSubagents.length, loadingRecords, onLoadSubagentRecords, structuredSubagentsComplete]);
   const subagents = useMemo(
     () => bodyMounted ? batchSubagents : [],
     [batchSubagents, bodyMounted],
   );
   const hasProblem = subagents.some((subagent) => subagent.status === 'failed' || subagent.status === 'blocked');
   useEffect(() => {
-    if (running) setBodyMounted(true);
-  }, [running]);
+    if (running || hasPendingSubagentConfirmation) setBodyMounted(true);
+  }, [hasPendingSubagentConfirmation, running]);
   return (
     <details
       className="browser-chat-ai-line-collapse browser-chat-subagent-tool"
@@ -2681,7 +2709,7 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
         setBodyMounted(true);
         void loadSubagentRecords();
       }}
-      open={running ? isActive || hasProblem || undefined : undefined}
+      open={running ? isActive || hasProblem || hasPendingSubagentConfirmation || undefined : undefined}
     >
       <summary
         aria-label={title}
@@ -2695,8 +2723,12 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
       {bodyMounted ? (
         <BrowserChatSubagentList
           loadingRecords={loadingRecords}
+          onResolveToolConfirmation={onResolveToolConfirmation}
           onSelectTool={onSelectTool}
           onResume={onResume}
+          pendingToolConfirmation={pendingToolConfirmation}
+          resolvingConfirmationAction={resolvingConfirmationAction}
+          resolvingConfirmationId={resolvingConfirmationId}
           resuming={resuming}
           subagents={subagents}
         />
@@ -2803,8 +2835,12 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                 className={stateClass}
                 isActive={isActiveTool}
                 onLoadSubagentRecords={onLoadSubagentRecords}
+                onResolveToolConfirmation={onResolveToolConfirmation}
                 onSelectTool={onSelectTool}
                 onResume={onResumeHumanVerification}
+                pendingToolConfirmation={pendingToolConfirmation}
+                resolvingConfirmationAction={resolvingConfirmationAction}
+                resolvingConfirmationId={resolvingConfirmationId}
                 resuming={resumingHumanVerification}
                 running={running}
                 structuredSubagents={structuredSubagents}
@@ -2928,6 +2964,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           toolInput: executedTool.input,
           toolOk: executedTool.ok,
         });
+        const hasPendingSubagentConfirmation = isSubagentSpawnTool(executedTool.name, executedTool.input)
+          && pendingConfirmationBelongsToSubagentBatch(
+            pendingToolConfirmation,
+            structuredSubagents,
+            executedTool.id || tool.id,
+          );
         const userAction = pendingConfirmation
           ? undefined
           : toolUserActionForTool(logs, toolDetail.stepIndex, executedTool.name, executedTool.input);
@@ -2943,7 +2985,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           <details
             className="browser-chat-ai-line-collapse"
             key={`tool-${tool.id}-${entry.part.index}-${orderedIndex}`}
-            open={Boolean(pendingConfirmation) || undefined}
+            open={Boolean(pendingConfirmation) || hasPendingSubagentConfirmation || undefined}
           >
             <summary className="browser-chat-ai-collapse-summary" title={compactText([label, meta].filter(Boolean).join(': '), 160)}>
               <SquareTerminal size={14} />
@@ -2959,8 +3001,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                     className={stateClass}
                     isActive={isActive}
                     onLoadSubagentRecords={onLoadSubagentRecords}
+                    onResolveToolConfirmation={onResolveToolConfirmation}
                     onSelectTool={onSelectTool}
                     onResume={onResumeHumanVerification}
+                    pendingToolConfirmation={pendingToolConfirmation}
+                    resolvingConfirmationAction={resolvingConfirmationAction}
+                    resolvingConfirmationId={resolvingConfirmationId}
                     resuming={resumingHumanVerification}
                     running={running}
                     structuredSubagents={structuredSubagents}
@@ -3029,13 +3075,24 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
       }));
     })
   ));
+  const hasPendingSubagentConfirmation = cycles.some((cycle) => (
+    cycle.output.tools.some((tool, index) => {
+      const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
+      if (!toolDetail || !isSubagentSpawnTool(toolDetail.tool.name, toolDetail.tool.input)) return false;
+      return pendingConfirmationBelongsToSubagentBatch(
+        pendingToolConfirmation,
+        structuredSubagents,
+        toolDetail.tool.id || tool.id,
+      );
+    })
+  ));
   const meta = [
     toolCount ? t('{count} 个工具', { count: toolCount }) : '',
     reasoningCount ? t('{count} 条思维链', { count: reasoningCount }) : '',
   ].filter(Boolean).join(' · ');
 
   return (
-    <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={hasPendingConfirmation || undefined}>
+    <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse" open={hasPendingConfirmation || hasPendingSubagentConfirmation || undefined}>
       <summary className="browser-chat-ai-collapse-summary" title={meta || undefined}>
         <SquareTerminal size={14} />
         <span>{t('已执行')}</span>
@@ -3287,14 +3344,22 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
 
 const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
   loadingRecords,
+  onResolveToolConfirmation,
   onSelectTool,
   onResume,
+  pendingToolConfirmation,
+  resolvingConfirmationAction,
+  resolvingConfirmationId,
   resuming,
   subagents = [],
 }: {
   loadingRecords?: boolean;
+  onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
   onResume?: () => void | Promise<void>;
+  pendingToolConfirmation?: BrowserChatToolConfirmation;
+  resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
+  resolvingConfirmationId?: string | null;
   resuming?: boolean;
   subagents?: BrowserChatSubagentView[];
 }) {
@@ -3314,34 +3379,44 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
       ) : null}
       {subagents.map((subagent) => {
         const status = browserChatSubagentStatusPresentation(subagent);
+        const pendingConfirmation = pendingToolConfirmation?.subagentId === subagent.id
+          ? pendingToolConfirmation
+          : undefined;
         return (
-          <button
-            aria-haspopup="dialog"
-            aria-pressed={panel?.selectedSubagentId === subagent.id}
-            className="browser-chat-subagent-row"
-            key={subagent.id}
-            onClick={() => panel?.openSubagent(subagent.id)}
-            title={t('查看子 Agent 详情')}
-            type="button"
-          >
-            <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
-              {loadingRecords || subagent.status === 'running'
-                ? <Loader2 className="spin" size={14} />
-                : subagent.status === 'queued'
-                  ? <Clock3 size={14} />
-                : subagent.status === 'passed' || status.className === 'status-partial'
-                  ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
-            </span>
-            <span className="browser-chat-subagent-row-copy">
-              <span className="browser-chat-subagent-row-title">{subagent.title}</span>
-              <span className="browser-chat-subagent-row-meta">
-                {loadingRecords ? t('正在加载消息') : t(status.label)}
-                {' · '}
-                {t('{count} 个工具', { count: subagent.toolCount })}
+          <div className="browser-chat-subagent-item" key={subagent.id}>
+            <button
+              aria-haspopup="dialog"
+              aria-pressed={panel?.selectedSubagentId === subagent.id}
+              className="browser-chat-subagent-row"
+              onClick={() => panel?.openSubagent(subagent.id)}
+              title={t('查看子 Agent 详情')}
+              type="button"
+            >
+              <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
+                {loadingRecords || subagent.status === 'running'
+                  ? <Loader2 className="spin" size={14} />
+                  : subagent.status === 'queued'
+                    ? <Clock3 size={14} />
+                  : subagent.status === 'passed' || status.className === 'status-partial'
+                    ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
               </span>
-            </span>
-            <PanelRight aria-hidden="true" className="browser-chat-subagent-row-open" size={15} />
-          </button>
+              <span className="browser-chat-subagent-row-copy">
+                <span className="browser-chat-subagent-row-title">{subagent.title}</span>
+                <span className="browser-chat-subagent-row-meta">
+                  {loadingRecords ? t('正在加载消息') : t(status.label)}
+                  {' · '}
+                  {t('{count} 个工具', { count: subagent.toolCount })}
+                </span>
+              </span>
+              <PanelRight aria-hidden="true" className="browser-chat-subagent-row-open" size={15} />
+            </button>
+            <BrowserChatToolConfirmationActions
+              pending={pendingConfirmation}
+              resolvingConfirmationAction={resolvingConfirmationAction}
+              resolvingConfirmationId={resolvingConfirmationId}
+              onResolveToolConfirmation={onResolveToolConfirmation}
+            />
+          </div>
         );
       })}
       {selectedSubagent && panel ? (
@@ -3361,6 +3436,7 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
 const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure({
   autoOpen,
   children,
+  hasCachedRecords,
   label,
   message,
   onExpand,
@@ -3368,6 +3444,7 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
 }: {
   autoOpen: boolean;
   children: ReactNode;
+  hasCachedRecords: boolean;
   label: string;
   message: BrowserChatMessage;
   onExpand?: () => Promise<void> | void;
@@ -3408,16 +3485,20 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
       const pending = onExpand();
       if (!pending) return;
       loadingRecordsRef.current = true;
-      setLoadingRecords(true);
+      if (!hasCachedRecords) setLoadingRecords(true);
       void Promise.resolve(pending).finally(() => {
         loadingRecordsRef.current = false;
-        setLoadingRecords(false);
+        if (!hasCachedRecords) setLoadingRecords(false);
       });
     } catch {
       loadingRecordsRef.current = false;
       setLoadingRecords(false);
     }
-  }, [onExpand]);
+  }, [hasCachedRecords, onExpand]);
+
+  useEffect(() => {
+    if (hasCachedRecords) setLoadingRecords(false);
+  }, [hasCachedRecords]);
   const toggleDisclosure = useCallback(() => {
     const nextExpanded = !desiredExpandedRef.current;
     setDisclosureExpanded(nextExpanded);
@@ -3638,6 +3719,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     return [];
   });
   const hasPendingConfirmation = Boolean(pendingToolConfirmation);
+  const hasSubagentPendingConfirmation = Boolean(
+    pendingToolConfirmation?.subagentId
+    && subagents.some((subagent) => subagent.id === pendingToolConfirmation.subagentId),
+  );
   const aiCyclesContainPendingConfirmation = hasPendingConfirmation && pairedAiOutputCycles.some((cycle) => (
     cycle.output.tools.some((tool, index) => {
       const toolDetail = matchedAiCycleToolDetails.get(aiCycleToolKey(cycle.id, index));
@@ -3659,8 +3744,11 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       toolOk: tool.ok,
     })))
   ));
-  const showPendingTimelineFallback = hasPendingConfirmation && !aiCyclesContainPendingConfirmation;
+  const showPendingTimelineFallback = hasPendingConfirmation
+    && !hasSubagentPendingConfirmation
+    && !aiCyclesContainPendingConfirmation;
   const showStandalonePendingConfirmation = hasPendingConfirmation
+    && !hasSubagentPendingConfirmation
     && !aiCyclesContainPendingConfirmation
     && !timelineContainsPendingConfirmation;
   const splitTimelineEntries = unrepresentedTimelineEntries.map(({ step, visibleToolIndexes }) => {
@@ -3782,6 +3870,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       {hasProcessContent ? (
         <BrowserChatProcessDisclosure
           autoOpen={processAutoOpen}
+          hasCachedRecords={
+            pairedAiOutputCycles.some((cycle) => cycle.output.tools.length > 0)
+            || timelineSteps.some((step) => Boolean(step.tools?.length))
+          }
           label={processLabel}
           message={message}
           onExpand={!running ? onLoadProcessRecords : undefined}

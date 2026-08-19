@@ -1,3 +1,9 @@
+export const runtimeToolLoopStopToolNames = [
+  'reportState',
+  'waitForHumanVerification',
+  'subagent',
+] as const;
+
 export function runtimeAllowedToolTypes({
   browserChatMode,
   codexMode,
@@ -25,11 +31,12 @@ export function requiresBrowserStatePreflight(
     && !traces.some((trace) => trace.name === 'readBrowserState' && trace.result !== undefined);
 }
 
-export function toolsAllowedBeforeBrowserState(
-  allowedToolTypes: string[],
+export function browserToolBlockedBeforeBrowserState(
+  toolName: string,
+  preflightPending: boolean,
   browserToolNames: ReadonlySet<string>,
 ) {
-  return allowedToolTypes.filter(
-    (toolType) => toolType === 'readBrowserState' || !browserToolNames.has(toolType),
-  );
+  return preflightPending
+    && toolName !== 'readBrowserState'
+    && browserToolNames.has(toolName);
 }

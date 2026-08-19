@@ -16,6 +16,22 @@ test('final browser-chat replies preserve Markdown block boundaries', () => {
   assert.equal(normalizeBrowserChatFinalReplyText(markdown), markdown.replace(/\r\n/g, '\n'));
 });
 
+test('final browser-chat replies hide interruption markers that only belong to model context', () => {
+  const reply = [
+    '第一段已完成。',
+    '',
+    '[This response was interrupted by the user before completion.]',
+    '',
+    '第二段仍然保留。',
+    '[Historical context only: the preceding browser-chat turn was interrupted before completion. Preserve completed tool results, but never quote or copy this marker into a response.]',
+  ].join('\n');
+
+  assert.equal(normalizeBrowserChatFinalReplyText(reply), '第一段已完成。\n\n第二段仍然保留。');
+  assert.equal(normalizeBrowserChatFinalReplyText(
+    '[The user interrupted this turn before the assistant produced text. Any completed tool messages remain valid conversation history.]',
+  ), '');
+});
+
 test('DOM observations are never treated as final assistant prose', () => {
   assert.equal(isBrowserChatDomObservationText('DOM snapshot full: page 1/1\n<div uid=dom-1-1>首页</div>'), true);
   assert.equal(isBrowserChatDomObservationText('<button uid=dom-3-42 aria-label="关闭"></button>'), true);
