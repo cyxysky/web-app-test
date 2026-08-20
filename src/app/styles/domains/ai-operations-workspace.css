@@ -518,14 +518,12 @@
   overflow: auto;
 }
 
-.ai-operations-table {
-  border-collapse: collapse;
+.ai-operations-data-table table {
   font-size: 11px;
-  min-width: 650px;
   width: 100%;
 }
 
-.ai-operations-table th {
+.ai-operations-data-table th {
   background: color-mix(in srgb, var(--panel-soft) 70%, transparent);
   color: var(--muted);
   font-size: 9.5px;
@@ -539,8 +537,7 @@
   z-index: 1;
 }
 
-.ai-operations-table td {
-  border-top: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+.ai-operations-data-table td {
   color: var(--muted-strong);
   font-variant-numeric: tabular-nums;
   padding: 10px 12px;
@@ -548,17 +545,17 @@
   white-space: nowrap;
 }
 
-.ai-operations-table tbody tr:hover td {
+.ai-operations-data-table tbody tr:hover td {
   background: var(--surface-hover);
 }
 
-.ai-operations-table td:first-child {
+.ai-operations-data-table td:first-child {
   max-width: 310px;
   white-space: normal;
 }
 
-.ai-operations-table a,
-.ai-operations-table strong {
+.ai-operations-data-table a,
+.ai-operations-data-table strong {
   color: var(--foreground);
   display: block;
   font-weight: 590;
@@ -568,13 +565,13 @@
   white-space: nowrap;
 }
 
-.ai-operations-table a:hover {
+.ai-operations-data-table a:hover {
   color: var(--accent-strong);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
 
-.ai-operations-table td small {
+.ai-operations-data-table td small {
   color: var(--muted);
   display: block;
   font-size: 9.5px;
@@ -585,15 +582,11 @@
   white-space: nowrap;
 }
 
-.ai-operations-table.compact {
-  min-width: 680px;
-}
-
-.ai-operations-table .ai-operations-token-usage strong {
+.ai-operations-data-table .ai-operations-token-usage strong {
   font-variant-numeric: tabular-nums;
 }
 
-.ai-operations-table .ai-operations-token-usage small {
+.ai-operations-data-table .ai-operations-token-usage small {
   margin-top: 2px;
 }
 

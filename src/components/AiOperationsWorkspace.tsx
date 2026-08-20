@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useLayoutEffect, useMemo, useState, type ReactNode } from 'react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { DataTable } from '@/components/ui/data-table';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
@@ -404,25 +405,25 @@ export function AiOperationsWorkspace({
                 <span>{data.incidents.length}</span>
               </header>
               {data.incidents.length ? (
-                <div className="ai-operations-table-wrap">
-                  <table className="ai-operations-table">
-                    <thead><tr><th>{t('任务')}</th><th>{t('用户')}</th><th>{t('状态')}</th><th>{t('目标')}</th><th>{t('时间')}</th></tr></thead>
-                    <tbody>
-                      {data.incidents.slice(0, 20).map((item) => (
-                        <tr key={item.id}>
-                          <td>
-                            {item.href ? <Link href={item.href}>{item.title}</Link> : <strong>{item.title}</strong>}
-                            <small title={item.reason}>{item.reason}</small>
-                          </td>
-                          <td>{item.userId}</td>
-                          <td><span className={`ai-operations-status is-${item.status}`}>{statusLabel(item.status)}</span></td>
-                          <td>{item.target}</td>
-                          <td>{dateTime(item.time)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <DataTable<AiOperationsDashboardData['incidents'][number]>
+                  className="ai-operations-data-table"
+                  columns={[
+                    {
+                      accessor: (item) => item.title,
+                      cell: (item) => <>{item.href ? <Link href={item.href}>{item.title}</Link> : <strong>{item.title}</strong>}<small title={item.reason}>{item.reason}</small></>,
+                      header: t('任务'),
+                      id: 'task',
+                    },
+                    { accessor: (item) => item.userId, cell: (item) => item.userId, header: t('用户'), id: 'user' },
+                    { accessor: (item) => item.status, cell: (item) => <span className={`ai-operations-status is-${item.status}`}>{statusLabel(item.status)}</span>, header: t('状态'), id: 'status' },
+                    { accessor: (item) => item.target, cell: (item) => item.target, header: t('目标'), id: 'target' },
+                    { accessor: (item) => item.time, cell: (item) => dateTime(item.time), header: t('时间'), id: 'time' },
+                  ]}
+                  data={data.incidents.slice(0, 20)}
+                  emptyText={t('当前范围内没有异常任务')}
+                  getRowId={(item) => item.id}
+                  minWidth={650}
+                />
               ) : <EmptyState>{t('当前范围内没有异常任务')}</EmptyState>}
             </section>
 
@@ -447,39 +448,50 @@ export function AiOperationsWorkspace({
             <section className="ai-operations-panel">
               <header className="ai-operations-panel-header"><div><h2>{t('用户使用情况')}</h2><p>{t('按用户统计任务量和执行结果')}</p></div></header>
               {data.users.length ? (
-                <div className="ai-operations-table-wrap">
-                  <table className="ai-operations-table compact">
-                    <thead><tr><th>{t('用户')}</th><th>{t('任务')}</th><th>{t('Token 用量')}</th><th>{t('对话')}</th><th>{t('自动化')}</th><th>{t('成功率')}</th><th>{t('最近使用')}</th></tr></thead>
-                    <tbody>{data.users.map((item) => (
-                      <tr key={item.userId}>
-                        <td><strong>{item.userId}</strong></td>
-                        <td>{item.totalTasks}</td>
-                        <td className="ai-operations-token-usage"><strong>{compactNumber(item.totalTokens)}</strong><small>输入 {compactNumber(item.inputTokens)} · 输出 {compactNumber(item.outputTokens)}</small></td>
-                        <td>{item.chatTasks}</td>
-                        <td>{item.automationRuns}</td>
-                        <td>{percent(item.successRate)}</td>
-                        <td>{dateTime(item.lastActiveAt)}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table>
-                </div>
+                <DataTable<AiOperationsDashboardData['users'][number]>
+                  className="ai-operations-data-table"
+                  columns={[
+                    { accessor: (item) => item.userId, cell: (item) => <strong>{item.userId}</strong>, header: t('用户'), id: 'user' },
+                    { accessor: (item) => item.totalTasks, cell: (item) => item.totalTasks, header: t('任务'), id: 'tasks' },
+                    {
+                      accessor: (item) => item.totalTokens,
+                      cell: (item) => <span className="ai-operations-token-usage"><strong>{compactNumber(item.totalTokens)}</strong><small>输入 {compactNumber(item.inputTokens)} · 输出 {compactNumber(item.outputTokens)}</small></span>,
+                      header: t('Token 用量'),
+                      id: 'tokens',
+                    },
+                    { accessor: (item) => item.chatTasks, cell: (item) => item.chatTasks, header: t('对话'), id: 'chat' },
+                    { accessor: (item) => item.automationRuns, cell: (item) => item.automationRuns, header: t('自动化'), id: 'automation' },
+                    { accessor: (item) => item.successRate, cell: (item) => percent(item.successRate), header: t('成功率'), id: 'success' },
+                    { accessor: (item) => item.lastActiveAt, cell: (item) => dateTime(item.lastActiveAt), header: t('最近使用'), id: 'recent' },
+                  ]}
+                  compact
+                  data={data.users}
+                  emptyText={t('暂无用户使用数据')}
+                  getRowId={(item) => item.userId}
+                  minWidth={680}
+                />
               ) : <EmptyState>{t('暂无用户使用数据')}</EmptyState>}
             </section>
 
             <section className="ai-operations-panel">
               <header className="ai-operations-panel-header"><div><h2>{t('模型使用情况')}</h2><p>{t('历史任务与当前服务进程 Token 指标')}</p></div></header>
               {data.models.length ? (
-                <div className="ai-operations-table-wrap">
-                  <table className="ai-operations-table compact">
-                    <thead><tr><th>{t('模型')}</th><th>{t('任务')}</th><th>{t('调用')}</th><th>{t('输入 Token')}</th><th>{t('输出 Token')}</th><th>{t('平均响应')}</th></tr></thead>
-                    <tbody>{data.models.map((item) => (
-                      <tr key={`${item.provider}:${item.model}`}>
-                        <td><strong>{item.model}</strong><small>{item.provider}</small></td>
-                        <td>{item.taskCount}</td><td>{compactNumber(item.calls)}</td><td>{compactNumber(item.inputTokens)}</td><td>{compactNumber(item.outputTokens)}</td><td>{duration(item.averageResponseMs)}</td>
-                      </tr>
-                    ))}</tbody>
-                  </table>
-                </div>
+                <DataTable<AiOperationsDashboardData['models'][number]>
+                  className="ai-operations-data-table"
+                  columns={[
+                    { accessor: (item) => item.model, cell: (item) => <><strong>{item.model}</strong><small>{item.provider}</small></>, header: t('模型'), id: 'model' },
+                    { accessor: (item) => item.taskCount, cell: (item) => item.taskCount, header: t('任务'), id: 'tasks' },
+                    { accessor: (item) => item.calls, cell: (item) => compactNumber(item.calls), header: t('调用'), id: 'calls' },
+                    { accessor: (item) => item.inputTokens, cell: (item) => compactNumber(item.inputTokens), header: t('输入 Token'), id: 'input' },
+                    { accessor: (item) => item.outputTokens, cell: (item) => compactNumber(item.outputTokens), header: t('输出 Token'), id: 'output' },
+                    { accessor: (item) => item.averageResponseMs, cell: (item) => duration(item.averageResponseMs), header: t('平均响应'), id: 'latency' },
+                  ]}
+                  compact
+                  data={data.models}
+                  emptyText={t('暂无模型使用数据')}
+                  getRowId={(item) => `${item.provider}:${item.model}`}
+                  minWidth={680}
+                />
               ) : <EmptyState>{t('暂无模型使用数据')}</EmptyState>}
             </section>
           </div>

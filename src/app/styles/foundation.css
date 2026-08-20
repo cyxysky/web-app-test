@@ -8,6 +8,8 @@
 
 @import "./file-preview.css";
 
+@import "./data-table.css";
+
 /*
  * Canonical visual refinement layer.
  *
@@ -861,4 +863,274 @@ input[type="checkbox"]:focus-visible {
   background: var(--button-danger-bg) !important;
   border-color: var(--button-danger-bg) !important;
   opacity: 1;
+}
+
+/* Compact form dialogs use one quiet, input-first card language. */
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) {
+  --form-dialog-surface: #ffffff;
+  --form-dialog-field: #f5f5f6;
+  --form-dialog-field-border: #e4e4e7;
+  --form-dialog-title: #18181b;
+  --form-dialog-label: #52525b;
+  --form-dialog-value: #18181b;
+  --form-dialog-placeholder: #85858d;
+  background: var(--form-dialog-surface);
+  border-color: var(--form-dialog-field-border);
+  border-radius: 28px;
+  box-shadow: 0 26px 80px color-mix(in srgb, #020617 28%, transparent);
+}
+
+:root[data-theme="dark"] .ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) {
+  --form-dialog-surface: #151515;
+  --form-dialog-field: #242426;
+  --form-dialog-field-border: #3a3a3d;
+  --form-dialog-title: #fafafa;
+  --form-dialog-label: #c4c4c8;
+  --form-dialog-value: #f4f4f5;
+  --form-dialog-placeholder: #98989f;
+  box-shadow: 0 28px 88px rgba(0, 0, 0, .58);
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) > :is(.ui-modal-header, header) {
+  background: var(--form-dialog-surface);
+  border-bottom: 0;
+  min-height: 0;
+  padding: 24px 24px 12px;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) > .ui-modal-body {
+  background: var(--form-dialog-surface);
+  padding: 10px 24px 18px;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) > .ui-modal-footer {
+  background: var(--form-dialog-surface);
+  border-top: 0;
+  min-height: 0;
+  padding: 10px 24px 24px;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(.ui-modal-title, header h2) {
+  color: var(--form-dialog-title);
+  font-size: 17px;
+  font-weight: 720;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(.ui-modal-subtitle, header p) {
+  color: var(--form-dialog-label);
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) .ui-modal-close {
+  border-color: var(--form-dialog-field-border);
+  color: var(--form-dialog-value);
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) .ui-modal-heading-icon {
+  background: var(--panel-soft);
+  border-radius: 12px;
+  height: 42px;
+  width: 42px;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(
+  .modal-field,
+  .automation-dialog-fields label,
+  .login-account-form label > span,
+  .personal-memory-field > span,
+  .admin-settings-password-form label > span
+) {
+  color: var(--form-dialog-label);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(input, textarea, select, .custom-select-button) {
+  background: var(--form-dialog-field);
+  border-color: var(--form-dialog-field-border);
+  border-radius: 12px;
+  box-shadow: none;
+  color: var(--form-dialog-value);
+  min-height: 44px;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(input, textarea)::placeholder {
+  color: var(--form-dialog-placeholder);
+  opacity: 1;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(input, textarea):disabled {
+  color: var(--form-dialog-label);
+  -webkit-text-fill-color: var(--form-dialog-label);
+  opacity: .72;
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) :is(input, textarea, select, .custom-select-button):focus-visible {
+  border-color: color-mix(in srgb, var(--form-dialog-value) 46%, var(--form-dialog-field-border));
+}
+
+.ui-modal--personal-memory :is(.personal-memory-status-label, .resource-sharing-field strong) {
+  color: var(--form-dialog-title);
+}
+
+.ui-modal--personal-memory .resource-sharing-field small {
+  color: var(--form-dialog-label);
+}
+
+.ui-modal:is(
+  .ui-modal--compact,
+  .automation-dialog,
+  .login-account-modal,
+  .ui-modal--personal-memory,
+  .browser-chat-message-generation-dialog
+) .ui-modal-footer .ui-button {
+  border-radius: 999px;
+  min-height: 42px;
+  padding-inline: 18px;
+}
+
+/* Magic UI registry primitives, wired through the local Shadcn component layer. */
+.magic-rainbow-button {
+  --magic-rainbow-surface: #17181a;
+  --magic-rainbow-foreground: #ffffff;
+  --magic-rainbow-1: #ff6b6b;
+  --magic-rainbow-2: #f7c948;
+  --magic-rainbow-3: #55d6be;
+  --magic-rainbow-4: #6c8cff;
+  --magic-rainbow-5: #c874ff;
+  background:
+    linear-gradient(var(--magic-rainbow-surface), var(--magic-rainbow-surface)) padding-box,
+    linear-gradient(100deg, var(--magic-rainbow-1), var(--magic-rainbow-2), var(--magic-rainbow-3), var(--magic-rainbow-4), var(--magic-rainbow-5), var(--magic-rainbow-1)) border-box;
+  background-position: 0 0, 0 50%;
+  background-size: 100% 100%, 240% 100%;
+  border: 2px solid transparent;
+  color: var(--magic-rainbow-foreground);
+  isolation: isolate;
+  overflow: hidden;
+  animation: magic-rainbow-shift 4s linear infinite;
+}
+
+.magic-rainbow-button::after {
+  background: linear-gradient(90deg, var(--magic-rainbow-1), var(--magic-rainbow-3), var(--magic-rainbow-5));
+  border-radius: 50%;
+  bottom: -25%;
+  content: '';
+  filter: blur(11px);
+  height: 24%;
+  left: 20%;
+  opacity: .55;
+  pointer-events: none;
+  position: absolute;
+  width: 60%;
+  z-index: -1;
+}
+
+.magic-rainbow-button--outline {
+  --magic-rainbow-surface: var(--panel);
+  --magic-rainbow-foreground: var(--foreground);
+}
+
+.magic-rainbow-button:focus-visible {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-strong) 28%, transparent);
+}
+
+@keyframes magic-rainbow-shift {
+  to { background-position: 0 0, 240% 50%; }
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+
+::view-transition-new(root) { z-index: 9999; }
+::view-transition-old(root) { z-index: 1; }
+
+@media (prefers-reduced-motion: reduce) {
+  .magic-rainbow-button { animation: none; }
 }

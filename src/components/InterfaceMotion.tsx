@@ -1,6 +1,5 @@
 'use client';
 
-import { animate, createScope } from 'animejs';
 import { usePathname } from 'next/navigation';
 import { useEffect, useRef } from 'react';
 
@@ -24,14 +23,6 @@ function matchingElements(root: ParentNode, selector: string) {
   return matches;
 }
 
-function clearMotionStyles(elements: HTMLElement[]) {
-  elements.forEach((element) => {
-    element.style.removeProperty('opacity');
-    element.style.removeProperty('transform');
-    element.style.removeProperty('will-change');
-  });
-}
-
 export function InterfaceMotion() {
   const pathname = usePathname();
   const previousPathnameRef = useRef(pathname);
@@ -40,51 +31,33 @@ export function InterfaceMotion() {
     if (typeof document === 'undefined') return undefined;
     const isNavigation = previousPathnameRef.current !== pathname;
     previousPathnameRef.current = pathname;
+    if (!isNavigation || window.matchMedia('(prefers-reduced-motion: reduce)').matches) return undefined;
     const animated = new WeakSet<HTMLElement>();
-    const scope = createScope({
-      root: document.body,
-      mediaQueries: {
-        reduceMotion: '(prefers-reduced-motion: reduce)',
-      },
-    }).add((self) => {
-      if (self?.matches.reduceMotion) return undefined;
-
-      const run = (elements: HTMLElement[], type: 'page' | 'panel') => {
-        const fresh = elements.filter((element) => {
-          // The workspace sidebar persists while its URL-controlled content view changes.
-          // Replaying entrance motion here makes the stable navigation look like it reloaded.
-          if (element.closest('.browser-chat-sidebar')) return false;
-          if (animated.has(element)) return false;
-          animated.add(element);
-          return element.getClientRects().length > 0;
-        });
-        const targets = fresh.slice(0, 6);
-        if (!targets.length) return;
-
-        targets.forEach((element) => element.style.setProperty('will-change', 'transform, opacity'));
-        const distance = type === 'page' ? 8 : 5;
-        animate(targets, {
-          opacity: [0, 1],
-          y: [distance, 0],
-          scale: [0.998, 1],
-          duration: type === 'page' ? 260 : 220,
-          ease: 'out(5)',
-          onComplete: () => clearMotionStyles(targets),
-        });
-      };
-
-      const animateWithin = (root: ParentNode) => {
-        run(matchingElements(root, PAGE_SELECTOR), 'page');
-        run(matchingElements(root, PANEL_SELECTOR), 'panel');
-      };
-
-      // Keep motion at the page/panel level. Animating every inserted row makes
-      // dense workspaces feel busy and keeps a costly global observer alive.
-      if (isNavigation) animateWithin(document.body);
-      return undefined;
-    });
-
-    return () => scope.revert();
+    const animations: Animation[] = [];
+    const run = (elements: HTMLElement[], type: 'page' | 'panel') => {
+      const targets = elements.filter((element) => {
+        if (element.closest('.browser-chat-sidebar') || animated.has(element)) return false;
+        animated.add(element);
+        return element.getClientRects().length > 0;
+      }).slice(0, 6);
+      const distance = type === 'page' ? 8 : 5;
+      targets.forEach((element) => {
+        animations.push(element.animate(
+          [
+            { opacity: 0, transform: `translateY(${distance}px) scale(.998)` },
+            { opacity: 1, transform: 'translateY(0) scale(1)' },
+          ],
+          {
+            duration: type === 'page' ? 260 : 220,
+            easing: 'cubic-bezier(.16, 1, .3, 1)',
+            fill: 'none',
+          },
+        ));
+      });
+    };
+    run(matchingElements(document.body, PAGE_SELECTOR), 'page');
+    run(matchingElements(document.body, PANEL_SELECTOR), 'panel');
+    return () => animations.forEach((animation) => animation.cancel());
   }, [pathname]);
 
   return null;

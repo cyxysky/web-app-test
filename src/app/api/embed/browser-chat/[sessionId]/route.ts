@@ -1,5 +1,10 @@
 import { NextRequest } from 'next/server';
-import { closeBrowserChatSession, getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
+import {
+  closeBrowserChatSession,
+  getBrowserChatSession,
+  releaseBrowserChatSessionRuntime,
+  selectBrowserChatSessionRuntime,
+} from '@/server/ai/agents/browser-chat.service';
 import {
   embedErrorJson,
   embedJson,
@@ -22,6 +27,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const auth = readEmbedAuth(request, sessionId);
+    selectBrowserChatSessionRuntime(sessionId, auth.userId);
     const session = getBrowserChatSession(sessionId, auth.userId);
     if (!session) return embedJson({ error: 'Browser chat session not found' }, { status: 404 });
     return embedJson({ session });
@@ -36,6 +42,7 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
     const auth = readEmbedAuth(request, sessionId);
     const session = await closeBrowserChatSession(sessionId, auth.userId);
     if (!session) return embedJson({ error: 'Browser chat session not found' }, { status: 404 });
+    await releaseBrowserChatSessionRuntime(sessionId, auth.userId);
     return embedJson({ session });
   } catch (error) {
     return embedErrorJson(error, 'Failed to close browser chat session');

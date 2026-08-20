@@ -8,6 +8,11 @@ import type {
   BrowserChatMessage,
   BrowserChatSessionSnapshot,
 } from '@/server/ai/agents/browser-chat.service';
+import type { BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';
+import {
+  estimateRuntimeMessageContext,
+  runtimeContextWindowTokens,
+} from '@/server/ai/agents/runtime-context-budget';
 import {
   activeBrowserChatAssistantMessage,
   browserChatClientRecordsForMessage,
@@ -24,6 +29,10 @@ import {
   readBrowserChatStepsByIndexes,
 } from '@/server/storage/browser-chat-history-store';
 import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-store';
+import {
+  browserChatArtifactsFromSteps,
+  mergeBrowserChatArtifactSummaries,
+} from '@/lib/browser-chat-artifacts';
 
 function belongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: string | number) {
   return normalizeApplicationUserId(session.userId) === normalizeApplicationUserId(userId);
@@ -36,20 +45,97 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   return compacted;
 }
 
+type BrowserChatPersistedHeader = BrowserChatSessionSnapshot & {
+  modelContext?: BrowserChatModelContext;
+};
+
+function compactSessionSummary(session: BrowserChatPersistedHeader): BrowserChatSessionSnapshot {
+  const { modelContext: _modelContext, ...summary } = session;
+  void _modelContext;
+  return {
+    ...summary,
+    contextUsage: undefined,
+    error: undefined,
+    hasMessages: true,
+    logs: [],
+    messages: [],
+    networkErrors: [],
+    outputCycles: [],
+    pendingToolConfirmation: undefined,
+    queuedTurns: [],
+    steps: [],
+    subagents: [],
+    targetUrl: '',
+    consoleErrors: [],
+  };
+}
+
+function resolvedContextUsage(
+  session: BrowserChatPersistedHeader,
+  messages: BrowserChatMessage[],
+) {
+  const stored = session.contextUsage;
+  if (stored && stored.currentTokens > 0) return stored;
+  const source = session.modelContext?.activeMessages?.length
+    ? session.modelContext.activeMessages
+    : messages.map((message) => ({
+        role: message.role,
+        content: message.content,
+        attachments: (message.attachments || []).map((attachment) => ({
+          name: attachment.name,
+          type: attachment.kind === 'image' || attachment.type.startsWith('image/') ? 'image' : attachment.type,
+        })),
+      }));
+  const estimated = estimateRuntimeMessageContext(source);
+  return {
+    currentTokens: estimated.totalTokens,
+    imageTokens: estimated.imageTokens,
+    maxTokens: stored?.maxTokens || runtimeContextWindowTokens(),
+    textTokens: estimated.textTokens,
+    toolTokens: stored?.toolTokens || 0,
+  };
+}
+
+function withBrowserChatMessageArtifacts(sessionId: string, messages: BrowserChatMessage[]) {
+  const messagesWithoutArtifactIndex = messages.filter((message) => (
+    message.role === 'assistant' && message.artifacts === undefined
+  ));
+  const stepIndexes = Array.from(new Set(
+    messagesWithoutArtifactIndex.flatMap((message) => message.stepIndexes || []),
+  ));
+  if (!stepIndexes.length) return messages;
+  const steps = readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, stepIndexes);
+  return messages.map((message) => {
+    if (message.role !== 'assistant' || message.artifacts !== undefined) return message;
+    const ownedIndexes = new Set(message.stepIndexes || []);
+    const artifacts = mergeBrowserChatArtifactSummaries(
+      message.artifacts,
+      browserChatArtifactsFromSteps(steps.filter((step) => (
+        step.messageId === message.id || ownedIndexes.has(step.index)
+      ))),
+    );
+    return { ...message, artifacts };
+  });
+}
+
 export function listBrowserChatSessionSummaries(
   userId?: string | number,
   input: { beforeId?: string; beforeUpdatedAt?: string; limit?: number } = {},
 ) {
-  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
+  return readBrowserChatSessionSummaries<BrowserChatPersistedHeader>({
     ...input,
     hasMessagesOnly: true,
     userId: normalizeApplicationUserId(userId),
-  }).filter((session) => session?.id && belongsToUser(session, userId));
+  })
+    .filter((session) => session?.id && belongsToUser(session, userId))
+    .map(compactSessionSummary);
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
-  if (!session || !belongsToUser(session, userId)) return undefined;
+  const persistedSession = readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
+  if (!persistedSession || !belongsToUser(persistedSession, userId)) return undefined;
+  const { modelContext: _modelContext, ...session } = persistedSession;
+  void _modelContext;
   let messages = readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
     limit: BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   });
@@ -73,6 +159,7 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
     };
   }
+  messages = { ...messages, items: withBrowserChatMessageArtifacts(sessionId, messages.items) };
   const activeSteps = activeMessage
     ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, activeMessage.stepIndexes || [])
         .filter((step) => !step.messageId || step.messageId === activeMessage.id)
@@ -89,6 +176,8 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
     : { outputCycles: [], subagents: [] };
   return {
     ...session,
+    contextUsage: resolvedContextUsage(persistedSession, messages.items),
+    hasMessages: messages.items.length > 0 || session.hasMessages === true,
     messages: messages.items,
     steps: activeSteps.map(compactStepForClient),
     logs: compactBrowserChatLogsForClient(activeLogs),
@@ -121,10 +210,15 @@ export function readBrowserChatSessionHistoryPage(
         ),
       })
     : undefined;
+  const enrichedMessages = messages
+    ? { ...messages, items: withBrowserChatMessageArtifacts(sessionId, messages.items) }
+    : undefined;
   return {
-    ...(messages ? { messages: messages.items } : {}),
+    ...(enrichedMessages ? { messages: enrichedMessages.items } : {}),
     history: {
-      ...(messages ? { messages: { cursor: messages.cursor, hasMore: messages.hasMore } } : {}),
+      ...(enrichedMessages ? {
+        messages: { cursor: enrichedMessages.cursor, hasMore: enrichedMessages.hasMore },
+      } : {}),
     },
   };
 }
@@ -164,6 +258,7 @@ export function readBrowserChatSessionLogs(
     logs: compactBrowserChatLogsForClient(page.items),
     ...(messageId && !input.cursor ? {
       outputCycles: records.outputCycles,
+      subagents: records.subagents,
       steps: steps.map(compactStepForClient),
     } : {}),
     history: { cursor: page.cursor, hasMore: page.hasMore },

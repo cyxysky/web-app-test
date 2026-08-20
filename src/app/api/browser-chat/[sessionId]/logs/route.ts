@@ -19,7 +19,7 @@ export async function GET(request: Request, context: RouteContext) {
     const url = new URL(request.url);
     const result = readBrowserChatSessionLogs(sessionId, requestUserId(request), {
       cursor: url.searchParams.get('cursor') || undefined,
-      limit: boundedQueryInteger(url.searchParams.get('limit'), { fallback: 500, max: 2_000 }),
+      limit: boundedQueryInteger(url.searchParams.get('limit'), { fallback: 200, max: 500 }),
       messageId: url.searchParams.get('messageId') || undefined,
       subagentsOnly: url.searchParams.get('subagentsOnly') === 'true',
     });

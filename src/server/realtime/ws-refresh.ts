@@ -58,7 +58,11 @@ function publishToMainServer(event: RefreshWebSocketEvent) {
     const body = JSON.stringify(event);
     const request = http.request({
       host: '127.0.0.1',
-      port: Math.max(1, Math.floor(Number(process.env.PORT || 3000))),
+      port: Math.max(1, Math.floor(Number(
+        process.env.WEBPILOT_REALTIME_PUBLISH_PORT
+        || process.env.PORT
+        || 3000,
+      ))),
       path: '/_webpilot/realtime/publish',
       method: 'POST',
       headers: {

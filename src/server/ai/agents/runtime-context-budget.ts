@@ -25,3 +25,60 @@ export function estimateRuntimeTextTokens(text: string) {
   }
   return Math.ceil(ascii / 4 + nonAscii);
 }
+
+export type RuntimeMessageContextEstimate = {
+  imageCount: number;
+  imageTokens: number;
+  textTokens: number;
+  totalTokens: number;
+};
+
+function runtimeImageContextEstimateTokens() {
+  const configured = Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200);
+  return Number.isFinite(configured) ? Math.max(0, Math.floor(configured)) : 1200;
+}
+
+export function estimateRuntimeMessageContext(messages: unknown): RuntimeMessageContextEstimate {
+  const text: string[] = [];
+  const visited = new WeakSet<object>();
+  let imageCount = 0;
+
+  const walk = (value: unknown, key = '') => {
+    if (typeof value === 'string') {
+      if (key === 'data' || key === 'image' || value.startsWith('data:image/')) return;
+      text.push(value);
+      return;
+    }
+    if (!value || typeof value !== 'object' || visited.has(value)) return;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      value.forEach((item) => walk(item));
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const mediaType = typeof record.mediaType === 'string'
+      ? record.mediaType
+      : typeof record.type === 'string'
+        ? record.type
+        : '';
+    const isImage = record.type === 'image'
+      || mediaType.startsWith('image/')
+      || (record.image !== undefined && typeof record.image !== 'string');
+    if (isImage) imageCount += 1;
+    for (const [childKey, child] of Object.entries(record)) {
+      if (isImage && (childKey === 'data' || childKey === 'image')) continue;
+      walk(child, childKey);
+    }
+  };
+
+  walk(messages);
+  const messageOverhead = Array.isArray(messages) ? messages.length * 4 : 0;
+  const textTokens = estimateRuntimeTextTokens(text.join('\n')) + messageOverhead;
+  const imageTokens = imageCount * runtimeImageContextEstimateTokens();
+  return {
+    imageCount,
+    imageTokens,
+    textTokens,
+    totalTokens: textTokens + imageTokens,
+  };
+}

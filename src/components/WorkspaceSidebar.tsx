@@ -5,6 +5,7 @@ import Link from 'next/link';
 import type { ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
 import { WebPilotHelpCenter } from '@/components/WebPilotHelpCenter';
+import { AnimatedThemeToggler } from '@/components/ui/animated-theme-toggler';
 
 type WorkspaceSidebarProps = {
   children: ReactNode;
@@ -86,15 +87,15 @@ export function WorkspaceSidebar({
         }}
       >
         <WebPilotHelpCenter collapsed={collapsed} />
-        <button
+        <AnimatedThemeToggler
           aria-label={themeToggleLabel}
           className="browser-chat-theme-toggle"
-          onClick={onToggleTheme}
+          onThemeChange={onToggleTheme}
+          theme={themeMode}
           title={themeToggleTitle}
-          type="button"
         >
           {themeMode === 'dark' ? <Sun aria-hidden="true" size={17} /> : <Moon aria-hidden="true" size={17} />}
-        </button>
+        </AnimatedThemeToggler>
       </div>
     </aside>
   );

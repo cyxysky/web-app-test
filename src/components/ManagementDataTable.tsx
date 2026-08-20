@@ -1,10 +1,11 @@
 'use client';
 
-import { Fragment, useDeferredValue, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useDeferredValue, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Filter, Search, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { FloatingLayer } from '@/components/FloatingLayer';
 import { useI18n } from '@/i18n/I18nProvider';
+import { DataTable, type DataTableColumn } from '@/components/ui/data-table';
 
 type ManagementDataTableFilterType = 'datetime' | 'number' | 'select' | 'text';
 
@@ -210,67 +211,51 @@ export function ManagementDataTable<T>({
         </div>
       </div>
 
-      <div className="management-data-table-scroll">
-        <table>
-          <thead>
-            <tr>
-              {columns.map((column) => (
-                <th className={column.className} key={column.key} scope="col">
-                  <div className="management-data-table-heading">
-                    <span>{column.label}</span>
-                    {column.filter ? (
-                      <>
-                        <button
-                          aria-label={t('筛选 {column}', { column: column.label })}
-                          aria-pressed={Boolean(columnFilters[column.key])}
-                          className={columnFilters[column.key] ? 'management-data-table-filter-button active' : 'management-data-table-filter-button'}
-                          onClick={(event) => activeFilterKey === column.key ? closeFilter() : openFilter(column, event.currentTarget)}
-                          title={t('筛选 {column}', { column: column.label })}
-                          type="button"
-                        >
-                          <Filter size={13} />
-                        </button>
-                        {columnFilters[column.key] ? (
-                          <button
-                            aria-label={t('清除 {column} 过滤', { column: column.label })}
-                            className="management-data-table-filter-clear"
-                            onClick={() => clearFilter(column.key)}
-                            title={t('清除 {column} 过滤', { column: column.label })}
-                            type="button"
-                          >
-                            <X size={12} />
-                          </button>
-                        ) : null}
-                      </>
-                    ) : null}
-                  </div>
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filteredItems.length ? filteredItems.map((item) => {
-              const expandedRow = renderExpandedRow?.(item);
-              return (
-                <Fragment key={getId(item)}>
-                  <tr className={rowClassName?.(item)}>
-                    {columns.map((column) => <td className={column.className} key={column.key}>{column.render(item)}</td>)}
-                  </tr>
-                  {expandedRow ? (
-                    <tr className="management-data-table-expanded-row">
-                      <td colSpan={columns.length}>{expandedRow}</td>
-                    </tr>
-                  ) : null}
-                </Fragment>
-              );
-            }) : (
-              <tr className="management-data-table-empty-row">
-                <td colSpan={columns.length}>{hasActiveFilters ? t('没有符合筛选条件的数据') : emptyText}</td>
-              </tr>
-            )}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        className="management-data-table-grid"
+        columns={columns.map((column): DataTableColumn<T> => ({
+          accessor: column.filter ? (item) => {
+            const value = column.filter?.getValue(item);
+            return Array.isArray(value) ? value.join(' ') : value ?? '';
+          } : undefined,
+          cell: column.render,
+          className: column.className,
+          header: column.label,
+          headerActions: column.filter ? (
+            <>
+              <button
+                aria-label={t('筛选 {column}', { column: column.label })}
+                aria-pressed={Boolean(columnFilters[column.key])}
+                className={columnFilters[column.key] ? 'management-data-table-filter-button active' : 'management-data-table-filter-button'}
+                onClick={(event) => activeFilterKey === column.key ? closeFilter() : openFilter(column, event.currentTarget)}
+                title={t('筛选 {column}', { column: column.label })}
+                type="button"
+              >
+                <Filter size={13} />
+              </button>
+              {columnFilters[column.key] ? (
+                <button
+                  aria-label={t('清除 {column} 过滤', { column: column.label })}
+                  className="management-data-table-filter-clear"
+                  onClick={() => clearFilter(column.key)}
+                  title={t('清除 {column} 过滤', { column: column.label })}
+                  type="button"
+                >
+                  <X size={12} />
+                </button>
+              ) : null}
+            </>
+          ) : undefined,
+          id: column.key,
+          sortable: Boolean(column.filter),
+        }))}
+        data={filteredItems}
+        emptyText={hasActiveFilters ? t('没有符合筛选条件的数据') : emptyText}
+        getRowId={getId}
+        minWidth={900}
+        renderExpandedRow={renderExpandedRow}
+        rowClassName={rowClassName}
+      />
 
       <FloatingLayer
         active={Boolean(activeFilterKey)}

@@ -1,5 +1,8 @@
 import { randomUUID } from 'node:crypto';
-import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
+import { access, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
@@ -188,17 +191,33 @@ function resolveDownloadUrl(input: DownloadArtifactInput) {
   }
 }
 
-async function readLimitedResponse(response: Response, maxBytes: number) {
+async function writeLimitedResponse(response: Response, filePath: string, maxBytes: number) {
   const contentLength = Number(response.headers.get('content-length') || '');
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     throw new Error(`Download is too large: ${contentLength} bytes exceeds ${maxBytes} bytes.`);
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.byteLength > maxBytes) {
-    throw new Error(`Download is too large: ${buffer.byteLength} bytes exceeds ${maxBytes} bytes.`);
+  if (!response.body) {
+    await writeFile(filePath, Buffer.alloc(0), { flag: 'wx' });
+    return 0;
   }
-  return buffer;
+  let bytes = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) {
+        callback(new Error(`Download is too large: received more than ${maxBytes} bytes.`));
+        return;
+      }
+      callback(null, chunk);
+    },
+  });
+  await pipeline(
+    Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
+    limiter,
+    createWriteStream(filePath, { flags: 'wx' }),
+  );
+  return bytes;
 }
 
 export async function downloadFileArtifact(input: DownloadArtifactInput): Promise<BrowserActionResult> {
@@ -207,37 +226,40 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
     const abortController = new AbortController();
     const timer = setTimeout(() => abortController.abort(new Error(`Download timed out after ${FILE_DOWNLOAD_TIMEOUT_MS}ms`)), FILE_DOWNLOAD_TIMEOUT_MS);
 
-    let response: Response;
-    let buffer = Buffer.alloc(0);
     try {
-      response = await fetch(url, { signal: abortController.signal });
+      const response = await fetch(url, { signal: abortController.signal });
       if (!response.ok) {
         return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${url}` };
       }
-      buffer = await readLimitedResponse(response, FILE_DOWNLOAD_MAX_BYTES);
+      const suggestedName = input.fileName
+        || parseContentDispositionFileName(response.headers.get('content-disposition'))
+        || fileNameFromUrl(url)
+        || `download-${Date.now()}.bin`;
+      const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
+      const dir = artifactDir(input.runId, 'downloads');
+      await mkdir(dir, { recursive: true });
+      const target = await uniqueArtifactPath(dir, fileName);
+      let bytes = 0;
+      try {
+        bytes = await writeLimitedResponse(response, target.filePath, FILE_DOWNLOAD_MAX_BYTES);
+      } catch (error) {
+        await unlink(target.filePath).catch(() => undefined);
+        throw error;
+      }
+
+      return {
+        ok: true,
+        actual: JSON.stringify(artifactResultPayload({
+          kind: 'download',
+          fileName: target.fileName,
+          filePath: target.filePath,
+          bytes,
+          sourceUrl: url,
+        })),
+      };
     } finally {
       clearTimeout(timer);
     }
-    const suggestedName = input.fileName
-      || parseContentDispositionFileName(response.headers.get('content-disposition'))
-      || fileNameFromUrl(url)
-      || `download-${Date.now()}.bin`;
-    const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
-    const dir = artifactDir(input.runId, 'downloads');
-    await mkdir(dir, { recursive: true });
-    const target = await uniqueArtifactPath(dir, fileName);
-    await writeFile(target.filePath, buffer);
-
-    return {
-      ok: true,
-      actual: JSON.stringify(artifactResultPayload({
-        kind: 'download',
-        fileName: target.fileName,
-        filePath: target.filePath,
-        bytes: buffer.byteLength,
-        sourceUrl: url,
-      })),
-    };
   } catch (error) {
     return { ok: false, actual: `downloadFile failed: ${error instanceof Error ? error.message : String(error)}` };
   }

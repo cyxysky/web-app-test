@@ -148,6 +148,8 @@ export type StepToolCall = {
   name: string;
   input?: unknown;
   reason?: string;
+  invalid?: boolean;
+  error?: string;
   ok?: boolean;
   recovered?: boolean;
   transient?: boolean;
@@ -167,6 +169,8 @@ export type BrowserChatAiOutputTool = {
   input?: unknown;
   name: string;
   reason?: string;
+  invalid?: boolean;
+  error?: string;
 };
 
 export type BrowserChatAiOutputPart =

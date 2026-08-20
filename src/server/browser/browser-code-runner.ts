@@ -108,6 +108,18 @@ export type BrowserCodeRunResult = {
   selectedExecutionId?: string;
   activity?: BrowserCodeActivity;
   aborted?: boolean;
+  kernelReset?: {
+    reason: 'age-limit' | 'execution-limit' | 'heap-limit' | 'rss-limit';
+    memoryUsage?: BrowserCodeKernelMemoryUsage;
+  };
+};
+
+export type BrowserCodeKernelMemoryUsage = {
+  arrayBuffers?: number;
+  external: number;
+  heapTotal: number;
+  heapUsed: number;
+  rss: number;
 };
 
 export type BrowserCodeRisk = {
@@ -212,6 +224,10 @@ export type BrowserCodeExecutionInput = {
 
 export type BrowserCodeKernelOptions = {
   executionTimeoutMs?: number;
+  maxAgeMs?: number;
+  maxExecutions?: number;
+  maxHeapBytes?: number;
+  maxRssBytes?: number;
   readyTimeoutMs?: number;
   sessionGroupId?: string;
 };
@@ -227,7 +243,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 27;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 29;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -315,6 +331,10 @@ export function analyzeBrowserCodeRisk(code: string): BrowserCodeRisk {
 function browserCodeKernelMain() {
   const browserCodeActionTimeoutMs = 5_000;
   const browserCodeNavigationTimeoutMs = 30_000;
+  // Screenshots may wait for web fonts before capture. Keep their timeout
+  // independent from the intentionally short locator/action timeout so a
+  // slow font response does not make an otherwise healthy capture fail.
+  const browserCodeScreenshotTimeoutMs = 30_000;
   const browserCodePointerLookupTimeoutMs = 250;
   const browserCodeFrameObservationTimeoutMs = 1_500;
   const browserCodePageObservationTimeoutMs = 2_500;
@@ -516,6 +536,16 @@ function browserCodeKernelMain() {
     const normalized = [...args];
     normalized[optionsIndex] = { ...options, timeout: browserCodeActionTimeoutMs };
     return normalized;
+  };
+
+  const screenshotArgsWithDefaultTimeout = (args: unknown[]) => {
+    const options = args[0];
+    if (options && typeof options === 'object' && !Array.isArray(options)) {
+      const timeout = Number(Reflect.get(options, 'timeout'));
+      if (Number.isFinite(timeout) && timeout > 0) return args;
+      return [{ ...options, timeout: browserCodeScreenshotTimeoutMs }, ...args.slice(1)];
+    }
+    return [{ timeout: browserCodeScreenshotTimeoutMs }, ...args];
   };
 
   const existingLocator = (locator: import('playwright').Locator) => {
@@ -1134,11 +1164,12 @@ function browserCodeKernelMain() {
           ...args: unknown[]
         ) {
           await captureCoordinateClickState(this);
-          const image = await Reflect.apply(nativeScreenshot, this, args);
+          const screenshotArgs = screenshotArgsWithDefaultTimeout(args);
+          const image = await Reflect.apply(nativeScreenshot, this, screenshotArgs);
           const after = await captureCoordinateClickState(this);
           if (image && typeof image === 'object' && after) {
-            const options = args[0] && typeof args[0] === 'object'
-              ? args[0] as { fullPage?: boolean }
+            const options = screenshotArgs[0] && typeof screenshotArgs[0] === 'object'
+              ? screenshotArgs[0] as { fullPage?: boolean }
               : undefined;
             const provenance = {
               ...after,
@@ -2193,6 +2224,7 @@ function browserCodeKernelMain() {
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       'Every session Page exposes setTextSelection(locator, spec). Call it on the Page that owns the locator, including for frame locators, then use that same Page keyboard.insertText()/press() in the same cell. Use browser.tabs.use(tab) or tab.use() when the global page binding should switch tabs.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
+      `Playwright screenshot timeout: ${browserCodeScreenshotTimeoutMs}ms unless an explicit positive timeout is provided.`,
     ].join('\n'),
     id: 'current',
     name: 'Current browser session',
@@ -2427,6 +2459,7 @@ function browserCodeKernelMain() {
         images,
         selectedExecutionId,
         activity,
+        memoryUsage: hostProcess.memoryUsage(),
       });
     } catch (error: unknown) {
       await publishPendingCoordinateClickEvidence();
@@ -2443,6 +2476,7 @@ function browserCodeKernelMain() {
           tabChanged: false,
           ...(activeExecution.verification ? { verification: activeExecution.verification } : {}),
         },
+        memoryUsage: hostProcess.memoryUsage(),
       });
     } finally {
       activeExecution = undefined;
@@ -2481,6 +2515,7 @@ function browserCodeKernelMain() {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
         logs: activeExecution?.logs || [],
+        memoryUsage: hostProcess.memoryUsage(),
       });
       activeExecution = undefined;
     });
@@ -2540,7 +2575,9 @@ function removeBrowserCodeTempDir(tempDir?: string) {
 
 export class BrowserCodeKernel {
   private child?: ChildProcess;
+  private childStartedAt = 0;
   private closed = false;
+  private executionCount = 0;
   private executionTimer?: ReturnType<typeof setTimeout>;
   private pending?: PendingExecution;
   private readyPromise?: Promise<void>;
@@ -2702,6 +2739,8 @@ export class BrowserCodeKernel {
       return readyPromise;
     }
     this.child = child;
+    this.childStartedAt = Date.now();
+    this.executionCount = 0;
     child.stdin?.end(childSource(), 'utf8');
     child.stderr?.on('data', (chunk: Buffer) => {
       this.stderr = `${this.stderr}${chunk.toString('utf8')}`.slice(-maxDiagnosticChars);
@@ -2747,6 +2786,54 @@ export class BrowserCodeKernel {
     return readyPromise;
   }
 
+  private kernelResetAfterResult(record: Record<string, unknown>): BrowserCodeRunResult['kernelReset'] {
+    this.executionCount += 1;
+    const memoryRecord = record.memoryUsage && typeof record.memoryUsage === 'object' && !Array.isArray(record.memoryUsage)
+      ? record.memoryUsage as Record<string, unknown>
+      : undefined;
+    const numberValue = (key: string) => {
+      const value = Number(memoryRecord?.[key]);
+      return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+    };
+    const memoryUsage: BrowserCodeKernelMemoryUsage | undefined = memoryRecord ? {
+      arrayBuffers: numberValue('arrayBuffers'),
+      external: numberValue('external'),
+      heapTotal: numberValue('heapTotal'),
+      heapUsed: numberValue('heapUsed'),
+      rss: numberValue('rss'),
+    } : undefined;
+    const mb = 1024 * 1024;
+    const maxHeapBytes = boundedInteger(
+      this.options.maxHeapBytes ?? Number(process.env.AI_BROWSER_CODE_KERNEL_MAX_HEAP_MB || 96) * mb,
+      96 * mb,
+      16 * mb,
+      1024 * mb,
+    );
+    const maxRssBytes = boundedInteger(
+      this.options.maxRssBytes ?? Number(process.env.AI_BROWSER_CODE_KERNEL_MAX_RSS_MB || 384) * mb,
+      384 * mb,
+      32 * mb,
+      4 * 1024 * mb,
+    );
+    const maxExecutions = boundedInteger(
+      this.options.maxExecutions ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_EXECUTIONS,
+      80,
+      1,
+      1_000,
+    );
+    const maxAgeMs = boundedInteger(
+      this.options.maxAgeMs ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_AGE_MS,
+      20 * 60_000,
+      60_000,
+      4 * 60 * 60_000,
+    );
+    if (memoryUsage && memoryUsage.heapUsed >= maxHeapBytes) return { reason: 'heap-limit', memoryUsage };
+    if (memoryUsage && memoryUsage.rss >= maxRssBytes) return { reason: 'rss-limit', memoryUsage };
+    if (this.executionCount >= maxExecutions) return { reason: 'execution-limit', memoryUsage };
+    if (this.childStartedAt && Date.now() - this.childStartedAt >= maxAgeMs) return { reason: 'age-limit', memoryUsage };
+    return undefined;
+  }
+
   private handleMessage(message: unknown) {
     if (!message || typeof message !== 'object') return;
     const record = message as Record<string, unknown>;
@@ -2762,8 +2849,9 @@ export class BrowserCodeKernel {
     }
     if (!this.pending || record.requestId !== this.pending.requestId) return;
     if (record.type !== 'result') return;
-      const logs = Array.isArray(record.logs) ? record.logs as BrowserCodeExecutionLog[] : [];
+    const logs = Array.isArray(record.logs) ? record.logs as BrowserCodeExecutionLog[] : [];
     const images = Array.isArray(record.images) ? record.images as BrowserCodeImage[] : [];
+    const kernelReset = this.kernelResetAfterResult(record);
     if (record.ok === true) {
       this.finishPending({
         ok: true,
@@ -2774,6 +2862,7 @@ export class BrowserCodeKernel {
         activity: record.activity && typeof record.activity === 'object'
           ? record.activity as BrowserCodeActivity
           : undefined,
+        kernelReset,
       });
     } else {
       this.finishPending({
@@ -2784,8 +2873,10 @@ export class BrowserCodeKernel {
         activity: record.activity && typeof record.activity === 'object'
           ? record.activity as BrowserCodeActivity
           : undefined,
+        kernelReset,
       });
     }
+    if (kernelReset) this.stopChild();
   }
 
   private finishPending(result: Omit<BrowserCodeRunResult, 'elapsedMs'>) {
@@ -2829,6 +2920,8 @@ export class BrowserCodeKernel {
     const child = this.child;
     const tempDir = this.tempDir;
     this.child = undefined;
+    this.childStartedAt = 0;
+    this.executionCount = 0;
     this.readyPromise = undefined;
     this.tempDir = undefined;
     this.clearExecutionTimer();

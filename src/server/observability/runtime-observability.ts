@@ -12,6 +12,15 @@ const state = ((globalThis as typeof globalThis & {
   timings: new Map(),
 });
 
+const memoryDiagnosticProviders = ((globalThis as typeof globalThis & {
+  __webpilotMemoryDiagnosticProviders?: Map<string, () => unknown>;
+}).__webpilotMemoryDiagnosticProviders ??= new Map());
+memoryDiagnosticProviders.set('runtimeMetrics', () => ({
+  counters: state.counters.size,
+  gauges: state.gauges.size,
+  timings: state.timings.size,
+}));
+
 function metricKey(name: string, labels: Record<string, string | number> = {}) {
   const suffix = Object.entries(labels)
     .sort(([left], [right]) => left.localeCompare(right))

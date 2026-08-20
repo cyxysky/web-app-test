@@ -67,7 +67,7 @@ test('matches persisted tool traces only by exact call ID', () => {
   assert.equal(details.get('cycle-2:0')?.tool.id, 'read-2');
 });
 
-test('does not synthesize matches for traces without the provider call ID', () => {
+test('shows unmatched provider calls without pairing them to unrelated persisted traces', () => {
   const toolCycle = (id: string, sourceCycleId: string, fileName: string) => ({
     id,
     sourceCycleId,
@@ -97,14 +97,14 @@ test('does not synthesize matches for traces without the provider call ID', () =
     toolCycle('provider-call-5', 'provider-cycle-3', '陈劲帆.docx'),
   ], steps);
 
-  assert.equal(details.get('provider-call-1:0'), undefined);
-  assert.equal(details.get('provider-call-ignored-2:0'), undefined);
-  assert.equal(details.get('provider-call-ignored-3:0'), undefined);
-  assert.equal(details.get('provider-call-4:0'), undefined);
-  assert.equal(details.get('provider-call-5:0'), undefined);
+  assert.equal(details.get('provider-call-1:0')?.tool.id, 'provider-call-1');
+  assert.equal(details.get('provider-call-ignored-2:0')?.tool.id, 'provider-call-ignored-2');
+  assert.equal(details.get('provider-call-ignored-3:0')?.tool.ok, false);
+  assert.equal(details.get('provider-call-4:0')?.tool.id, 'provider-call-4');
+  assert.equal(details.get('provider-call-5:0')?.step.status, 'failed');
 });
 
-test('keeps unmatched requests hidden while matching later exact tool IDs', () => {
+test('shows unmatched requests while still matching later exact tool IDs', () => {
   const steps: StepExecutionResult[] = [{
     index: 2,
     action: 'read attendance',
@@ -155,7 +155,38 @@ test('keeps unmatched requests hidden while matching later exact tool IDs', () =
     },
   ], steps);
 
-  assert.equal(details.get('phantom-cycle:0'), undefined);
+  assert.equal(details.get('phantom-cycle:0')?.tool.id, 'unexecuted-call');
+  assert.equal(details.get('phantom-cycle:0')?.tool.ok, false);
   assert.equal(details.get('hover-cycle:0')?.tool.id, 'executed-hover');
   assert.equal(details.get('read-cycle:0')?.tool.id, 'executed-read');
+});
+
+test('renders invalid tool calls even when argument parsing prevented execution', () => {
+  const output = aiOutputViewFromResponse({
+    content: [{
+      type: 'tool-call',
+      toolCallId: 'invalid-browser-code',
+      toolName: 'browserCode',
+      input: '{"code":',
+      dynamic: true,
+      invalid: true,
+      error: { message: 'Invalid tool input: JSON parsing failed' },
+    }],
+  });
+
+  assert.equal(output.tools[0]?.invalid, true);
+  assert.equal(output.tools[0]?.error, 'Invalid tool input: JSON parsing failed');
+
+  const details = buildAiCycleToolDetailMap([{
+    id: 'invalid-cycle',
+    messageId: 'assistant-1',
+    output,
+    stepIndex: 3,
+  }], []);
+  const detail = details.get('invalid-cycle:0');
+
+  assert.equal(detail?.step.status, 'failed');
+  assert.equal(detail?.tool.ok, false);
+  assert.equal(detail?.tool.invalid, true);
+  assert.equal(detail?.tool.result, 'Invalid tool input: JSON parsing failed');
 });

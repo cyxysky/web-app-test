@@ -3,11 +3,41 @@ import test from 'node:test';
 import {
   browserChatSessionNavigationHref,
   browserChatViewNavigationHref,
+  compactBrowserChatSessionForList,
   loadRequestedBrowserChatSessionDetail,
   shouldAcceptBrowserChatViewportPosition,
   shouldActivateRequestedBrowserChatSession,
   shouldFinishBrowserChatSessionLoading,
 } from './browser-chat-session-selection';
+
+test('keeps only list metadata for an inactive conversation', () => {
+  const compacted = compactBrowserChatSessionForList({
+    id: 'chat-1',
+    title: 'Retained title',
+    messages: [{ content: 'large message' }],
+    logs: [{ details: 'large log' }],
+    steps: [{ prompt: 'large prompt' }],
+    outputCycles: [{ text: 'large output' }],
+    subagents: [{ content: 'large child result' }],
+    consoleErrors: ['error'],
+    networkErrors: ['error'],
+    queuedTurns: [{ content: 'queued' }],
+    pendingToolConfirmation: { prompt: 'confirm' },
+    contextUsage: { currentTokens: 100 },
+    targetUrl: 'https://example.com/private',
+  });
+
+  assert.equal(compacted.hasMessages, true);
+  assert.equal(compacted.title, 'Retained title');
+  assert.deepEqual(compacted.messages, []);
+  assert.deepEqual(compacted.logs, []);
+  assert.deepEqual(compacted.steps, []);
+  assert.deepEqual(compacted.outputCycles, []);
+  assert.deepEqual(compacted.subagents, []);
+  assert.equal(compacted.pendingToolConfirmation, undefined);
+  assert.equal(compacted.contextUsage, undefined);
+  assert.equal(compacted.targetUrl, '');
+});
 
 test('updates the selected conversation and drops client-declared identity', () => {
   assert.equal(

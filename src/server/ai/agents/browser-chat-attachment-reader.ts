@@ -59,13 +59,15 @@ export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAtt
   return `[文件] ${attachment.name} | attachmentId: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 仅在任务需要分析文件内容时调用 file action=read；纯上传不要读取或重建内容，使用浏览器运行时提供的受控附件上传接口。`;
 }
 
-async function extractAttachmentText(attachment: BrowserChatReadableAttachment, buffer?: Buffer) {
+async function extractAttachmentText(attachment: BrowserChatReadableAttachment, absolutePath?: string, reusableBuffer?: Buffer) {
   const kind = attachmentKind(attachment);
   if (kind === 'tab') return `[标签页引用：${attachment.sourceUrl || attachment.url || attachment.name}]`;
   if (kind === 'image') return '[图片附件：原始图片会作为图像输入交给支持视觉的模型。]';
-  if (!buffer?.byteLength) throw new Error('文件内容为空，无法解析。');
-  const extracted = await extractAttachmentTextInWorker({ buffer, extension: extensionOf(attachment), kind });
+  if (!absolutePath) throw new Error('无法定位文件，无法解析。');
+  const extracted = await extractAttachmentTextInWorker({ extension: extensionOf(attachment), kind, path: absolutePath });
   if (extensionOf(attachment) !== '.docx') return extracted;
+  const buffer = reusableBuffer || await readFile(absolutePath);
+  if (!buffer.byteLength) throw new Error('文件内容为空，无法解析。');
   const structure = await inspectDocxTemplateBuffer(buffer);
   const rows = structure.rows.map((row) => (
     `表格行 ${row.index}: ${row.cells.map((cell, index) => `单元格${index + 1}=${cell ? JSON.stringify(cell) : '[空]'}`).join(' | ')}`
@@ -111,9 +113,11 @@ export async function readBrowserChatAttachment(input: {
     if (attachment.kind !== 'tab' && size === 0) throw new Error('文件内容为空，无法解析。');
     if (size && size > maxSourceBytes) throw new Error(`文件超过 ${formatSize(maxSourceBytes)}，暂不读取。`);
     const kind = attachmentKind(resolvedAttachment);
-    const buffer = kind === 'tab' || kind === 'image' ? undefined : await readFile(input.absolutePath!);
+    const buffer = input.includeVisuals && kind !== 'tab' && kind !== 'image'
+      ? await readFile(input.absolutePath!)
+      : undefined;
     const [content, visuals] = await Promise.all([
-      extractAttachmentText(resolvedAttachment, buffer),
+      extractAttachmentText(resolvedAttachment, input.absolutePath, buffer),
       input.includeVisuals && buffer
         ? renderBrowserChatAttachmentVisuals({
             absolutePath: input.absolutePath!,

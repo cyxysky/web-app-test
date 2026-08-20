@@ -42,12 +42,18 @@ test('readFile parses text in the CPU worker and returns the requested range', a
   }
 });
 
-test('CPU extraction does not detach the caller Buffer', async () => {
-  const source = Buffer.from('caller-owned attachment bytes', 'utf8');
-  const original = Buffer.from(source);
-  assert.equal(await extractAttachmentTextInWorker({ buffer: source, extension: '.txt', kind: 'text' }), original.toString('utf8'));
-  assert.equal(source.byteLength, original.byteLength);
-  assert.deepEqual(source, original);
+test('CPU extraction reads source bytes inside the worker', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-worker-file-'));
+  const filePath = path.join(directory, 'source.txt');
+  await writeFile(filePath, 'worker-owned attachment bytes', 'utf8');
+  try {
+    assert.equal(
+      await extractAttachmentTextInWorker({ extension: '.txt', kind: 'text', path: filePath }),
+      'worker-owned attachment bytes',
+    );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
 });
 
 test('reads generated line-oriented data extensions without relying on a browser MIME type', async () => {

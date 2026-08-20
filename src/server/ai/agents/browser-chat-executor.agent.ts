@@ -241,6 +241,7 @@ const codexRuntimeObjectSchema = z.object({
     urlOrPath: z.string().nullable().optional(),
     text: z.string().nullable().optional(),
     content: z.string().nullable().optional(),
+    instruction: z.string().nullable().optional(),
     fileName: z.string().nullable().optional(),
     title: z.string().nullable().optional(),
     capture: z.enum(['viewport', 'fullPage']).nullable().optional(),
@@ -1447,37 +1448,55 @@ function makeBrowserTools(
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
       subagent: tool({
-        description: 'Manage child Agents. For action=spawn, pass tasks as an array of { title, url, instruction }; all three fields are required and all tasks run concurrently. For action=read, pass exactly one returned UUID in each later model step. Do not delegate dependent steps or multiple actions on the same interactive page.',
-        inputSchema: z.discriminatedUnion('action', [
-          browserToolInput({
-            action: z.literal('spawn'),
-            tasks: z.array(z.object({
-              title: z.string().min(1).max(160).describe('Short display title for this child Agent.'),
-              instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
-              url: z.string().url().max(4_000).describe('Independent page or PRD entry URL for this child Agent.'),
-            })).min(1),
-          }),
-          browserToolInput({
-            action: z.literal('read'),
-            uuid: z.string().uuid().describe('One child Agent UUID returned by action=spawn.'),
-          }),
-        ]),
+        description: 'Manage child Agents. For action=spawn, pass multiple independent tasks in tasks; for exactly one task, the provider-safe flat title, url, and instruction fields are also accepted. For action=read, pass one returned UUID. Do not repeat a rejected parameter shape, delegate dependent steps, or delegate multiple actions on the same interactive page.',
+        inputSchema: browserToolInput({
+          action: z.enum(['spawn', 'read']),
+          tasks: z.array(z.object({
+            title: z.string().min(1).max(160).describe('Short display title for this child Agent.'),
+            instruction: z.string().min(1).max(4_000).describe('Self-contained task and expected evidence for this child Agent.'),
+            url: z.string().url().max(4_000).describe('Independent page or PRD entry URL for this child Agent.'),
+          })).min(1).optional().describe('Preferred batch form for two or more independent child Agents. Every task runs concurrently.'),
+          title: z.string().min(1).max(160).optional().describe('Flat fallback title when spawning exactly one child Agent.'),
+          instruction: z.string().min(1).max(4_000).optional().describe('Flat fallback instruction when spawning exactly one child Agent.'),
+          url: z.string().url().max(4_000).optional().describe('Flat fallback URL when spawning exactly one child Agent.'),
+          uuid: z.string().uuid().optional().describe('One child Agent UUID returned by action=spawn; required only for action=read.'),
+        }).superRefine((input, context) => {
+          if (input.action === 'spawn') {
+            const hasFlatTask = Boolean(input.title && input.instruction && input.url);
+            if (!input.tasks?.length && !hasFlatTask) {
+              context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'spawn requires tasks, or the flat title, url, and instruction fields.',
+              });
+            }
+          } else if (!input.uuid) {
+            context.addIssue({ code: z.ZodIssueCode.custom, message: 'read requires uuid.' });
+          }
+        }),
         execute: (input, execution) => {
           if (input.action === 'spawn') {
-            return record('subagent', input, (abortSignal, trace) => referenceOptions?.runSubagents
-              ? referenceOptions.runSubagents(normalizeBrowserChatSubagentTasks(input.tasks), abortSignal, trace?.id)
-              : Promise.resolve({ ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' }), execution);
+            const tasks = normalizeBrowserChatSubagentTasks(input.tasks ?? input);
+            return record('subagent', input, (abortSignal, trace) => {
+              if (!tasks.length) {
+                return Promise.resolve({ ok: false, actual: 'subagent action=spawn requires at least one valid task.' });
+              }
+              return referenceOptions?.runSubagents
+                ? referenceOptions.runSubagents(tasks, abortSignal, trace?.id)
+                : Promise.resolve({ ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' });
+            }, execution);
           }
           return record('subagent', input, () => {
+            const uuid = input.uuid?.trim() || '';
+            if (!uuid) return Promise.resolve({ ok: false, actual: 'subagent action=read requires one UUID.' });
             const requiredUuid = referenceOptions?.requiredSubagentUuid || pendingSubagentUuidsFromTraces(traces)[0];
-            if (requiredUuid && input.uuid !== requiredUuid) {
+            if (requiredUuid && uuid !== requiredUuid) {
               return Promise.resolve({
                 ok: false,
                 actual: `Read rejected: child Agent results must be read in order. The required UUID is ${requiredUuid}.`,
               });
             }
             return referenceOptions?.readSubagent
-              ? referenceOptions.readSubagent(input.uuid)
+              ? referenceOptions.readSubagent(uuid)
               : Promise.resolve({ ok: false, actual: 'subagent action=read is unavailable in this runtime.' });
           }, execution);
         },
@@ -1625,7 +1644,7 @@ function runtimePrompt(input: {
     ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
+    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. For exactly one child, omit tasks and send title, url, and instruction as flat fields. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. If spawn is rejected for its input shape, do not retry that shape: use the flat single-task form once or continue in the main Agent. Never produce a chain of schema-debug retries. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     input.mode === 'code'
       ? '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use file action=generate.'
@@ -1830,7 +1849,7 @@ function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDe
 function fullLogDetails(value: unknown) {
   return {
     [fullLogDetailsFlag]: true,
-    value: jsonSafe(value),
+    value,
   };
 }
 
@@ -3968,7 +3987,7 @@ async function executeCodexRuntimeObject(input: {
   const runTool = async (toolCallId?: string) => {
     if (type === 'subagent' && normalizedParams.action === 'spawn') {
       if (!runSubagents) return { ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' };
-      const tasks = normalizeBrowserChatSubagentTasks(normalizedParams.tasks);
+      const tasks = normalizeBrowserChatSubagentTasks(normalizedParams.tasks ?? normalizedParams);
       if (!tasks.length) return { ok: false, actual: 'subagent action=spawn requires at least one valid task.' };
       return runSubagents(tasks, abortSignal, toolCallId);
     }

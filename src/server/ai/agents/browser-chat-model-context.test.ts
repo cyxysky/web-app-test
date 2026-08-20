@@ -3,9 +3,22 @@ import test from 'node:test';
 import type { ModelMessage } from 'ai';
 import {
   appendInterruptedBrowserChatTurn,
+  compactBrowserChatModelTranscript,
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
 } from './browser-chat-model-context';
+
+test('bounds the historical model transcript while retaining the newest messages', () => {
+  const messages = Array.from({ length: 200 }, (_, index) => ({
+    role: 'user' as const,
+    content: `message-${index}`,
+  }));
+  const compacted = compactBrowserChatModelTranscript(messages);
+
+  assert.equal(compacted.length, 160);
+  assert.equal(compacted[0]?.content, 'message-40');
+  assert.equal(compacted.at(-1)?.content, 'message-199');
+});
 
 test('keeps the native AI SDK user, tool call, tool result, and final assistant chain', () => {
   const messages: ModelMessage[] = [
@@ -52,6 +65,17 @@ test('falls back to the transcript when an active chain was not stored', () => {
     transcript: [{ role: 'user', content: '继续' }],
   });
   assert.deepEqual(context.activeMessages, context.transcript);
+});
+
+test('bounds the active model working set as well as the historical transcript', () => {
+  const activeMessages = Array.from({ length: 220 }, (_, index) => ({
+    role: 'user' as const,
+    content: `active-${index}`,
+  }));
+  const context = normalizeBrowserChatModelContext({ version: 1, transcript: [], activeMessages });
+  assert.equal(context.activeMessages.length, 160);
+  assert.equal(context.activeMessages[0]?.content, 'active-60');
+  assert.equal(context.activeMessages.at(-1)?.content, 'active-219');
 });
 
 test('an interrupted turn keeps completed tool messages and the partial assistant response in the native chain', () => {

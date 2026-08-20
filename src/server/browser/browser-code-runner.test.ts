@@ -1033,6 +1033,35 @@ test('browserCode watchdog stops an unresponsive cell and restarts the kernel', 
   }
 });
 
+test('browserCode recycles a persistent kernel after its execution budget', async () => {
+  const rotatingKernel = new BrowserCodeKernel(
+    { protocol: 'cdp', endpoint: cdpEndpoint },
+    { maxExecutions: 1 },
+  );
+  const execute = async (code: string) => {
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    return rotatingKernel.execute({ code, executionId });
+  };
+
+  try {
+    const first = await execute(`var memoryBoundBinding = 'retained'; nodeRepl.write(memoryBoundBinding);`);
+    assert.equal(first.ok, true, first.error);
+    assert.equal(first.kernelReset?.reason, 'execution-limit');
+
+    const second = await execute(`nodeRepl.write(typeof memoryBoundBinding);`);
+    assert.equal(second.ok, true, second.error);
+    assert.equal(second.value, 'undefined');
+  } finally {
+    await rotatingKernel.close();
+  }
+});
+
 test('browserCode truncates oversized return values', async () => {
   const result = await run(`nodeRepl.write('x'.repeat(5_000));`, { maxOutputChars: 1_000 });
   assert.equal(result.ok, true, result.error);

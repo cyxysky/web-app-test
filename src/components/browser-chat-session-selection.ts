@@ -7,6 +7,43 @@ export async function loadRequestedBrowserChatSessionDetail<TResult>(
   return loadDetail(normalizedSessionId);
 }
 
+type BrowserChatSessionListRecord = {
+  consoleErrors?: unknown[];
+  contextUsage?: unknown;
+  error?: unknown;
+  hasMessages?: boolean;
+  logs?: unknown[];
+  messages?: unknown[];
+  networkErrors?: unknown[];
+  outputCycles?: unknown[];
+  pendingToolConfirmation?: unknown;
+  queuedTurns?: unknown[];
+  steps?: unknown[];
+  subagents?: unknown[];
+  targetUrl?: string;
+};
+
+export function compactBrowserChatSessionForList<T extends BrowserChatSessionListRecord>(
+  session: T,
+): T & BrowserChatSessionListRecord {
+  return {
+    ...session,
+    consoleErrors: [],
+    contextUsage: undefined,
+    error: undefined,
+    hasMessages: session.hasMessages === true || Boolean(session.messages?.length),
+    logs: [],
+    messages: [],
+    networkErrors: [],
+    outputCycles: [],
+    pendingToolConfirmation: undefined,
+    queuedTurns: [],
+    steps: [],
+    subagents: [],
+    targetUrl: '',
+  };
+}
+
 export function shouldActivateRequestedBrowserChatSession({
   activeSessionId,
   currentSelectionIntent,

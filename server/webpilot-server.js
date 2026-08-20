@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const http = require('node:http');
 const net = require('node:net');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
@@ -11,6 +12,7 @@ const {
   requestIdentity,
 } = require('./webpilot-identity');
 const { createRealtimeRefreshHub } = require('./realtime-refresh-hub');
+const { startProcessMemoryMonitor } = require('./process-memory-monitor');
 
 function normalizeBasePath(value) {
   const normalized = String(value || '').trim().replace(/^\/+|\/+$/g, '');
@@ -126,6 +128,119 @@ function internalPort(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 65_535 ? Math.floor(parsed) : fallback;
 }
 
+function runtimeApiRequest(pathname) {
+  return pathname.startsWith('/api/') && pathname !== '/api/system/shutdown';
+}
+
+function availableInternalPort(hostname) {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once('error', reject);
+    probe.listen(0, hostname, () => {
+      const address = probe.address();
+      const port = address && typeof address === 'object' ? address.port : 0;
+      probe.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+function waitForInternalPort(port, hostname, child, timeoutMs = 60_000) {
+  const startedAt = Date.now();
+  return new Promise((resolve, reject) => {
+    let timer;
+    let completed = false;
+    const finish = (error) => {
+      if (completed) return;
+      completed = true;
+      if (timer) clearTimeout(timer);
+      child.off('exit', onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = (code, signal) => finish(new Error(
+      `The API runtime exited before it became ready (code=${code ?? 'none'}, signal=${signal || 'none'}).`,
+    ));
+    const probe = () => {
+      if (completed) return;
+      const socket = net.createConnection({ host: hostname, port });
+      let retried = false;
+      socket.setTimeout(500);
+      socket.once('connect', () => {
+        socket.destroy();
+        finish();
+      });
+      const retry = () => {
+        if (retried || completed) return;
+        retried = true;
+        socket.destroy();
+        if (Date.now() - startedAt >= timeoutMs) {
+          finish(new Error(`Timed out waiting for the API runtime on ${hostname}:${port}.`));
+          return;
+        }
+        timer = setTimeout(probe, 100);
+        timer.unref?.();
+      };
+      socket.once('error', retry);
+      socket.once('timeout', retry);
+    };
+    child.once('exit', onExit);
+    probe();
+  });
+}
+
+async function startApiRuntimeChild({ appDir, dev, externalPort }) {
+  const hostname = '127.0.0.1';
+  const configuredPort = Number(process.env.WEBPILOT_RUNTIME_PORT || 0);
+  const port = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535
+    ? configuredPort
+    : await availableInternalPort(hostname);
+  const args = [__filename, '--runtime-child', ...(dev ? ['--dev'] : [])];
+  const child = spawn(process.execPath, args, {
+    cwd: appDir,
+    env: {
+      ...process.env,
+      HOSTNAME: hostname,
+      PORT: String(port),
+      WEBPILOT_REALTIME_PUBLISH_PORT: String(externalPort),
+      WEBPILOT_SERVER_ROLE: 'runtime',
+    },
+    stdio: 'inherit',
+    windowsHide: true,
+  });
+  child.once('error', (error) => {
+    console.error('[webpilot-server] API runtime child failed.', error);
+  });
+  const stopChildOnExit = () => {
+    if (!child.killed) child.kill('SIGTERM');
+  };
+  process.once('exit', stopChildOnExit);
+  child.once('exit', () => process.off('exit', stopChildOnExit));
+  return { child, hostname, port, ready: waitForInternalPort(port, hostname, child) };
+}
+
+function proxyHttpRequest(request, response, target) {
+  const headers = { ...request.headers };
+  headers.host = request.headers.host || `${target.hostname}:${target.port}`;
+  const upstream = http.request({
+    headers,
+    hostname: target.hostname,
+    method: request.method,
+    path: request.url,
+    port: target.port,
+  }, (upstreamResponse) => {
+    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
+    upstreamResponse.pipe(response);
+  });
+  upstream.once('error', (error) => {
+    console.error('[webpilot-server] API runtime proxy failed.', error);
+    if (!response.headersSent) response.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+    response.end('API Runtime Unavailable');
+  });
+  request.once('aborted', () => upstream.destroy());
+  request.pipe(upstream);
+}
+
 function webSocketUpgradeTarget(requestUrl, basePath) {
   const pathname = stripBasePath(requestUrl.pathname, basePath);
   const ticket = requestUrl.searchParams.get('ticket') || '';
@@ -222,16 +337,22 @@ function proxyUpgrade(request, clientSocket, head, port, targetPath) {
 
 async function main() {
   const dev = process.argv.includes('--dev');
+  const runtimeChildMode = process.argv.includes('--runtime-child');
+  process.env.WEBPILOT_SERVER_ROLE = runtimeChildMode ? 'runtime' : 'ui';
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
   const { loadEnvConfig } = requireRuntimeDependency(appDir, '@next/env');
   loadEnvConfig(appDir, dev);
+  const memoryMonitor = startProcessMemoryMonitor();
   process.env.WEBPILOT_REALTIME_PUBLISH_TOKEN ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
+  const apiRuntime = !runtimeChildMode && process.env.WEBPILOT_SPLIT_RUNTIME !== 'false'
+    ? await startApiRuntimeChild({ appDir, dev, externalPort: port })
+    : undefined;
 
   // Load the complete build-time configuration before loading Next itself.
   // This applies to the packaged runtime regardless of whether the build uses
@@ -247,15 +368,16 @@ async function main() {
     dir: appDir,
     hostname,
     port,
-    // Next 16 defaults custom development servers to Turbopack. Its HMR graph can
-    // lose EcmascriptMergedChunkVersion cells after repeated edits, leaving the
-    // server in a permanent resubscribe/panic loop. Webpack is the supported
-    // deterministic development bundler for this custom server.
-    ...(dev ? { webpack: true } : {}),
+    // Next 16.3's default Turbopack development compiler evicts inactive graph
+    // data during long sessions. Keep the compiler default instead of forcing
+    // Webpack into the same long-lived process as the API runtime.
     ...(compiledConfig ? { conf: compiledConfig } : {}),
   });
   const handle = application.getRequestHandler();
-  await application.prepare();
+  await Promise.all([
+    application.prepare(),
+    apiRuntime?.ready,
+  ]);
   const handleNextUpgrade = dev ? application.getUpgradeHandler() : undefined;
 
   // In production the build manifest is the sole source of truth for basePath.
@@ -300,6 +422,10 @@ async function main() {
         rejectMissingIdentity(response);
         return;
       }
+      if (apiRuntime && runtimeApiRequest(pathname)) {
+        proxyHttpRequest(request, response, apiRuntime);
+        return;
+      }
       await handle(request, response);
     })().catch((error) => {
       console.error('[webpilot-server] HTTP request failed.', error);
@@ -331,11 +457,14 @@ async function main() {
   });
 
   server.listen(port, hostname, () => {
-    console.log(`[webpilot-server] Ready on http://${hostname}:${port}${basePath || '/'}`);
+    const role = runtimeChildMode ? 'API runtime' : 'UI';
+    console.log(`[webpilot-server] ${role} ready on http://${hostname}:${port}${basePath || '/'}`);
   });
 
   const close = () => {
+    memoryMonitor.stop();
     refreshHub.close();
+    if (apiRuntime?.child && !apiRuntime.child.killed) apiRuntime.child.kill('SIGTERM');
     server.close(() => {
       process.exit(0);
     });
@@ -358,6 +487,7 @@ module.exports = {
   nextDevelopmentUpgrade,
   normalizeBasePath,
   requireRuntimeDependency,
+  runtimeApiRequest,
   stripBasePath,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,

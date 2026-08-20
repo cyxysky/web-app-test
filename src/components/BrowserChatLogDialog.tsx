@@ -591,13 +591,21 @@ function BrowserChatVirtualLogList({ allEntries, rounds }: { allEntries: Browser
 
 export function BrowserChatLogDialog({
   entries,
+  hasMore = false,
+  loading = false,
+  loadingMore = false,
   messageContent,
   onClose,
+  onLoadMore,
   summaryEntries,
 }: {
   entries: BrowserChatLogDialogRecord[];
+  hasMore?: boolean;
+  loading?: boolean;
+  loadingMore?: boolean;
   messageContent?: string;
   onClose: () => void;
+  onLoadMore?: () => void | Promise<void>;
   summaryEntries: BrowserChatLogDialogRecord[];
 }) {
   const { t } = useI18n();
@@ -716,8 +724,20 @@ export function BrowserChatLogDialog({
           {filteredRounds.length ? (
             <BrowserChatVirtualLogList allEntries={entries} rounds={filteredRounds} />
           ) : (
-            <p className="browser-chat-log-empty">{t(entries.length ? '无匹配日志' : '暂无日志')}</p>
+            <p className="browser-chat-log-empty">
+              {t(loading ? '正在加载日志' : entries.length ? '无匹配日志' : '暂无日志')}
+            </p>
           )}
+          {hasMore && onLoadMore ? (
+            <button
+              className="browser-chat-log-copy-button"
+              disabled={loadingMore}
+              onClick={() => void onLoadMore()}
+              type="button"
+            >
+              {t(loadingMore ? '正在加载更早日志' : '加载更早日志')}
+            </button>
+          ) : null}
         </div>
       </section>
     </div>

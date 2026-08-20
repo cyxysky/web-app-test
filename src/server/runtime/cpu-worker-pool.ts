@@ -8,9 +8,9 @@ type CpuJob = {
   extension: string;
   id: number;
   kind: AttachmentExtractionKind;
+  path: string;
   reject: (error: Error) => void;
   resolve: (value: string) => void;
-  source: ArrayBuffer;
   startedAt: number;
   timeout?: ReturnType<typeof setTimeout>;
 };
@@ -33,6 +33,7 @@ const state: CpuPoolState = ((globalThis as typeof globalThis & {
 
 const workerSource = String.raw`
   const { parentPort } = require('node:worker_threads');
+  const { readFile } = require('node:fs/promises');
 
   function decodeXml(value) {
     return value.replace(/<[^>]+>/g, '').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -61,7 +62,7 @@ const workerSource = String.raw`
       .slice(0, 10000).join('\n').trim();
   }
   async function extract(job) {
-    const buffer = Buffer.from(job.source);
+    const buffer = await readFile(job.path);
     if (job.kind === 'pdf') {
       const { PDFParse } = await import('pdf-parse');
       const parser = new PDFParse({ data: buffer });
@@ -142,7 +143,7 @@ function dispatch() {
       dispatch();
     }, configuredInteger('CPU_WORKER_TASK_TIMEOUT_MS', 60_000, 5_000, 5 * 60_000));
     job.timeout.unref?.();
-    slot.worker.postMessage({ id: job.id, extension: job.extension, kind: job.kind, source: job.source }, [job.source]);
+    slot.worker.postMessage({ id: job.id, extension: job.extension, kind: job.kind, path: job.path });
   }
   updateGauges();
   if (!state.queue.length && !state.slots.some((slot) => slot.active) && !state.idleTimer) {
@@ -198,27 +199,23 @@ function ensureWorkers() {
 }
 
 export function extractAttachmentTextInWorker(input: {
-  buffer: Buffer;
   extension: string;
   kind: AttachmentExtractionKind;
+  path: string;
 }) {
   const maximumQueued = configuredInteger('CPU_WORKER_MAX_QUEUED', 64, 4, 1_000);
   if (state.queue.length >= maximumQueued) {
     incrementMetric('cpu_worker_task_rejected_total', { task: 'attachment_extract' });
     return Promise.reject(new Error('文件解析队列繁忙，请稍后重试。'));
   }
-  // Worker transfer lists detach the transferred ArrayBuffer in the caller. Always copy the
-  // requested Buffer range so callers can continue using the original bytes for package
-  // inspection, rendering, hashing, or template-preserving edits after text extraction.
-  const source = Uint8Array.from(input.buffer).buffer;
   const result = new Promise<string>((resolve, reject) => {
     state.queue.push({
       extension: input.extension,
       id: state.nextId++,
       kind: input.kind,
+      path: input.path,
       reject,
       resolve,
-      source,
       startedAt: 0,
     });
   });

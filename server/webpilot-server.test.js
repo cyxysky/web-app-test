@@ -11,11 +11,19 @@ const {
   nextDevelopmentUpgrade,
   normalizeBasePath,
   requireRuntimeDependency,
+  runtimeApiRequest,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
 } = require('./webpilot-server');
 
 const ticket = 'a'.repeat(43);
+
+test('isolates API routes in the runtime process while keeping shutdown in the UI host', () => {
+  assert.equal(runtimeApiRequest('/api/browser-chat/chat-1/message'), true);
+  assert.equal(runtimeApiRequest('/api/artifacts/chat-1/image.png'), true);
+  assert.equal(runtimeApiRequest('/api/system/shutdown'), false);
+  assert.equal(runtimeApiRequest('/browser-chat'), false);
+});
 
 test('routes realtime upgrades through the configured public base path', () => {
   const basePath = normalizeBasePath('/webpilot');

@@ -539,15 +539,11 @@
   min-width: 0;
 }
 
-.management-data-table-scroll {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  min-width: 0;
-  overflow: auto;
+.management-data-table .openstatus-data-table-scroll {
+  border-radius: 10px;
 }
 
 .management-data-table table {
-  border-collapse: collapse;
   min-width: 900px;
   table-layout: fixed;
   width: 100%;
@@ -555,8 +551,7 @@
 
 .management-data-table th,
 .management-data-table td {
-  border-bottom: 1px solid var(--border);
-  padding: 13px 14px;
+  padding: 11px 13px;
   text-align: left;
   vertical-align: middle;
 }
@@ -571,11 +566,11 @@
 }
 
 .management-data-table tbody tr:last-child > td,
-.management-data-table tbody tr:has(+ .management-data-table-expanded-row) > td {
+.management-data-table tbody tr:has(+ .openstatus-data-table-expanded-row) > td {
   border-bottom: 0;
 }
 
-.management-data-table tbody tr:not(.management-data-table-expanded-row):not(.management-data-table-empty-row):hover > td {
+.management-data-table tbody tr:not(.openstatus-data-table-expanded-row):not(.openstatus-data-table-empty-row):hover > td {
   background: color-mix(in srgb, var(--foreground) 2.8%, transparent);
 }
 
@@ -673,17 +668,17 @@
   opacity: 1;
 }
 
-.management-data-table-expanded-row > td {
+.management-data-table .openstatus-data-table-expanded-row > td {
   background: color-mix(in srgb, var(--panel-soft) 62%, transparent);
   border-bottom: 1px solid var(--border) !important;
   padding: 0;
 }
 
-.management-data-table-expanded-row .skills-manager-item-detail {
+.management-data-table .openstatus-data-table-expanded-row .skills-manager-item-detail {
   padding: 18px 22px 20px 38px;
 }
 
-.management-data-table-empty-row td {
+.management-data-table .openstatus-data-table-empty-row td {
   color: var(--muted);
   padding: 34px 18px;
   text-align: center;

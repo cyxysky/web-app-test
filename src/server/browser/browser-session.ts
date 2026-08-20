@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -4946,6 +4946,12 @@ export class BrowserSession {
         error: execution.error ?? null,
         aborted: execution.aborted === true,
         elapsedMs: execution.elapsedMs,
+        ...(execution.kernelReset ? {
+          kernelReset: {
+            ...execution.kernelReset,
+            note: 'The persistent browserCode kernel was recycled to release memory. Top-level JavaScript bindings from earlier cells are no longer available.',
+          },
+        } : {}),
         finalPage: { url: finalUrl, title: finalTitle },
         ...(inferredActivity.verification ? { verification: inferredActivity.verification } : {}),
         ...(actualDomChanges ? { domChanges: actualDomChanges } : {}),
@@ -8930,8 +8936,14 @@ export class BrowserSession {
   }
 
   private async readPngSize(filePath: string) {
-    const buffer = await readFile(filePath);
-    return this.readPngSizeFromBuffer(buffer);
+    const handle = await open(filePath, 'r');
+    try {
+      const buffer = Buffer.allocUnsafe(24);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return this.readPngSizeFromBuffer(buffer.subarray(0, bytesRead));
+    } finally {
+      await handle.close();
+    }
   }
 
   private async readPngSizeFromBuffer(buffer: Buffer) {

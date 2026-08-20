@@ -38,6 +38,14 @@ function toolReasonFromInput(input: unknown) {
     || stringFromUnknown(record?.action);
 }
 
+function toolErrorFromUnknown(value: unknown) {
+  const record = asRecord(value);
+  return stringFromUnknown(record?.message)
+    || stringFromUnknown(record?.cause)
+    || stringFromUnknown(record?.error)
+    || stringFromUnknown(value);
+}
+
 function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   const record = asRecord(part);
   if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
@@ -54,6 +62,7 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
     const name = stringFromUnknown(record.toolName) || stringFromUnknown(record.name) || stringFromUnknown(record.tool);
     if (!name) return { parts: [], reasoning: [], texts: [], tools: [] };
     const input = record.input ?? record.args ?? record.arguments;
+    const invalid = record.invalid === true;
     return {
       parts: [{ index: 0, kind: 'tool' }],
       reasoning: [],
@@ -63,6 +72,8 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
         input,
         name,
         reason: toolReasonFromInput(input),
+        invalid,
+        error: invalid ? toolErrorFromUnknown(record.error) : undefined,
       }],
     };
   }

@@ -50,6 +50,32 @@ export function serializableBrowserChatModelMessages(messages: ModelMessage[]) {
   return normalizeBrowserChatModelMessages(serializableValue(messages));
 }
 
+export function compactBrowserChatModelTranscript(messages: ModelMessage[]) {
+  const maxMessagesValue = Number(process.env.BROWSER_CHAT_MODEL_TRANSCRIPT_MESSAGE_LIMIT || 160);
+  const maxCharactersValue = Number(process.env.BROWSER_CHAT_MODEL_TRANSCRIPT_CHARACTER_LIMIT || 2 * 1024 * 1024);
+  const maxMessages = Number.isFinite(maxMessagesValue)
+    ? Math.max(16, Math.min(1000, Math.floor(maxMessagesValue)))
+    : 160;
+  const maxCharacters = Number.isFinite(maxCharactersValue)
+    ? Math.max(128 * 1024, Math.min(32 * 1024 * 1024, Math.floor(maxCharactersValue)))
+    : 2 * 1024 * 1024;
+  const retained: ModelMessage[] = [];
+  let characters = 0;
+  for (let index = messages.length - 1; index >= 0 && retained.length < maxMessages; index -= 1) {
+    const message = messages[index];
+    let nextCharacters = 0;
+    try {
+      nextCharacters = JSON.stringify(message).length;
+    } catch {
+      nextCharacters = 1024;
+    }
+    if (retained.length && characters + nextCharacters > maxCharacters) break;
+    retained.push(message);
+    characters += nextCharacters;
+  }
+  return retained.reverse();
+}
+
 function modelMessageText(message: ModelMessage) {
   if (typeof message.content === 'string') return message.content.trim();
   if (!Array.isArray(message.content)) return '';
@@ -103,8 +129,10 @@ export function normalizeBrowserChatModelContext(value: unknown): BrowserChatMod
   const record = value && typeof value === 'object' && !Array.isArray(value)
     ? value as Partial<BrowserChatModelContext>
     : {};
-  const transcript = normalizeBrowserChatModelMessages(record.transcript);
-  const activeMessages = normalizeBrowserChatModelMessages(record.activeMessages);
+  const transcript = compactBrowserChatModelTranscript(normalizeBrowserChatModelMessages(record.transcript));
+  const activeMessages = compactBrowserChatModelTranscript(
+    normalizeBrowserChatModelMessages(record.activeMessages),
+  );
   const compression = record.lastCompression;
   return {
     version: 1,

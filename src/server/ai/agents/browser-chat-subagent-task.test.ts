@@ -14,6 +14,18 @@ test('child Agent spawn input keeps the explicit title, URL, and instruction', (
   }]);
 });
 
+test('a single flat child Agent task is accepted without an array wrapper', () => {
+  assert.deepEqual(normalizeBrowserChatSubagentTasks({
+    title: 'Read package metadata',
+    instruction: 'Return the package metadata and source URL.',
+    url: 'https://example.com/package',
+  }), [{
+    title: 'Read package metadata',
+    instruction: 'Return the package metadata and source URL.',
+    url: 'https://example.com/package',
+  }]);
+});
+
 test('child Agent spawn input has no fixed batch-size ceiling', () => {
   const tasks = normalizeBrowserChatSubagentTasks(Array.from({ length: 25 }, (_, index) => ({
     title: `Read page ${index + 1}`,
