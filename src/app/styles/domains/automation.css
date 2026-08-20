@@ -1090,3 +1090,97 @@
 .automation-timeline-marker {
   box-shadow: 0 0 0 3px var(--panel-soft);
 }
+
+/* Run history reuses the same dated list skeleton as conversation history;
+ * run status, actions, metadata, and traces remain automation-specific. */
+.automation-run-list {
+  list-style: none;
+  margin: 0;
+  min-width: 0;
+  padding: 0 0 8px;
+}
+
+.automation-run-list > .workspace-sidebar-archive-date-group {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr);
+  min-width: 0;
+}
+
+.automation-run-list > .workspace-sidebar-archive-date-group + .workspace-sidebar-archive-date-group {
+  margin-top: 4px;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-label {
+  align-items: baseline;
+  color: var(--foreground);
+  display: flex;
+  gap: 2px;
+  grid-column: 1 / -1;
+  padding: 10px 2px 2px;
+  position: relative;
+  white-space: nowrap;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-label::before {
+  background: color-mix(in srgb, var(--border) 74%, transparent);
+  content: "";
+  height: 1px;
+  left: 58px;
+  position: absolute;
+  right: 0;
+  top: 20px;
+}
+
+.automation-run-list > .workspace-sidebar-archive-date-group:first-child .workspace-sidebar-archive-date-label::before {
+  content: none;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-label strong {
+  font-size: 13px;
+  font-weight: 520;
+  line-height: 18px;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-label strong::after {
+  color: var(--muted);
+  content: " /";
+  font-weight: 400;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-label span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 520;
+  line-height: 18px;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-items {
+  display: grid;
+  grid-column: 2;
+  list-style: none;
+  margin: 0;
+  min-width: 0;
+  padding: 4px 0 0;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-items > li {
+  min-width: 0;
+}
+
+.automation-run-list .automation-run-item {
+  border-bottom: 0;
+}
+
+.automation-run-list .workspace-sidebar-archive-date-items > li:not(:last-child) .automation-run-item {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+@container automation-main (max-width: 480px) {
+  .automation-run-list > .workspace-sidebar-archive-date-group {
+    grid-template-columns: 42px minmax(0, 1fr);
+  }
+
+  .automation-run-list .workspace-sidebar-archive-date-label::before {
+    left: 42px;
+  }
+}

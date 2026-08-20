@@ -1,0 +1,109 @@
+@keyframes beautiful-pixel-on {
+  0%, 100% { opacity: 0.15; transform: scale(1); }
+  44% { opacity: 1; transform: scale(1.18); }
+}
+
+@keyframes beautiful-shimmer-text {
+  to { background-position: -200% 0; }
+}
+
+@keyframes beautiful-orbit-turn {
+  to { transform: rotate(360deg); }
+}
+
+.beautiful-loading-state {
+  align-items: center;
+  color: var(--muted-strong);
+  display: inline-flex;
+  gap: 10px;
+  min-height: 32px;
+  min-width: 0;
+}
+
+.beautiful-loading-grid {
+  display: grid;
+  flex: 0 0 auto;
+  gap: 1.5px;
+  grid-template-columns: repeat(3, 4px);
+}
+
+.beautiful-loading-pixel {
+  animation: beautiful-pixel-on 650ms ease-in-out infinite;
+  background: currentColor;
+  border-radius: 1px;
+  height: 4px;
+  opacity: 0.15;
+  width: 4px;
+}
+
+.beautiful-loading-orbit {
+  animation: beautiful-orbit-turn 850ms linear infinite;
+  border: 1.5px solid color-mix(in srgb, currentColor 24%, transparent);
+  border-radius: 999px;
+  box-sizing: border-box;
+  color: currentColor;
+  flex: 0 0 auto;
+  height: 16px;
+  position: relative;
+  width: 16px;
+}
+
+.beautiful-loading-orbit::after {
+  background: currentColor;
+  border: 2px solid var(--background);
+  border-radius: 999px;
+  box-sizing: border-box;
+  content: '';
+  height: 6px;
+  left: 50%;
+  position: absolute;
+  top: -3px;
+  transform: translateX(-50%);
+  width: 6px;
+}
+
+.beautiful-loading-copy {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.beautiful-loading-label {
+  animation: beautiful-shimmer-text 1.4s linear infinite;
+  background: linear-gradient(90deg, var(--muted) 35%, var(--foreground) 50%, var(--muted) 65%);
+  background-clip: text;
+  background-size: 200% 100%;
+  color: transparent;
+  font-size: 13px;
+  font-weight: 560;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.beautiful-loading-copy small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 430;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.beautiful-loading-elapsed {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .beautiful-loading-orbit,
+  .beautiful-loading-pixel,
+  .beautiful-loading-label {
+    animation: none;
+  }
+}

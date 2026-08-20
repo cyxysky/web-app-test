@@ -63,6 +63,8 @@
 .status div { display: flex; font-size: 13px; justify-content: space-between; }
 .status dt { color: #74817c; }
 .status dd { font-weight: 690; margin: 0; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status dd button { background: none; border: 0; color: inherit; cursor: pointer; font: inherit; max-width: 100%; overflow: hidden; padding: 0; text-decoration: underline; text-decoration-color: #a8b7b0; text-underline-offset: 3px; text-overflow: ellipsis; white-space: nowrap; }
+.status dd button:hover { text-decoration-color: currentColor; }
 
 .files { align-items: center; border-top: 1px solid #dce2de; display: flex; gap: 32px; justify-content: space-between; margin: 0 auto; max-width: 1120px; padding-top: 40px; }
 .files h2 { font-size: 23px; margin: 8px 0; }

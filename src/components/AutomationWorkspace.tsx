@@ -34,7 +34,7 @@ import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSideba
 import {
   WorkspaceSidebarArchiveFilter,
   WorkspaceSidebarArchiveHeader,
-  WorkspaceSidebarArchiveList,
+  WorkspaceHistoryList,
   WorkspaceSidebarArchiveRow,
 } from '@/components/WorkspaceSidebarArchive';
 import { WorkspaceOverflowMenu } from '@/components/WorkspaceOverflowMenu';
@@ -150,6 +150,10 @@ const weekdayOptions = [
 ];
 
 const activeRunStatuses = new Set<AutomationRunStatus>(['queued', 'running']);
+
+function automationRunTimestamp(run: AutomationRun) {
+  return run.startedAt;
+}
 
 function textValue(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
@@ -1079,7 +1083,8 @@ export function AutomationWorkspace({
                 <span>{t('正在加载用例')}</span>
               </div>
             ) : filteredCases.length ? (
-              <WorkspaceSidebarArchiveList
+              <WorkspaceHistoryList
+                className="browser-chat-recent-list workspace-sidebar-archive-list"
                 footer={!loading && caseListPage.hasMore ? (
                   <li className="workspace-sidebar-archive-footer">
                     <button
@@ -1311,15 +1316,20 @@ export function AutomationWorkspace({
                           <span>{t('{count} 次', { count: selectedCaseRuns.length })}</span>
                         </div>
                         {selectedCaseRuns.length ? (
-                          <div className="automation-run-list">
-                            {selectedCaseRuns.map((run) => {
+                          <WorkspaceHistoryList
+                            className="automation-run-list"
+                            getKey={(run) => run.id}
+                            getTimestamp={automationRunTimestamp}
+                            items={selectedCaseRuns}
+                            language={language}
+                            renderItem={(run) => {
                               const runExpanded = openRunIds.includes(run.id);
                               const runTraceId = `automation-run-trace-${run.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
                               const active = activeRunStatuses.has(run.status);
                               const repairedSteps = run.steps.filter((step) => step.status === 'repaired' && step.name !== 'finalVerification').length;
                               const duration = formatDuration(t, run.startedAt, run.finishedAt);
                               return (
-                                <article className={`automation-run-item automation-run-state-${run.status}`} key={run.id}>
+                                <article className={`automation-run-item automation-run-state-${run.status}`}>
                                   <div className="automation-run-summary">
                                     <button
                                       aria-controls={runTraceId}
@@ -1384,8 +1394,8 @@ export function AutomationWorkspace({
                                   ) : null}
                                 </article>
                               );
-                            })}
-                          </div>
+                            }}
+                          />
                         ) : (
                           <div className="automation-inline-empty">{t('还没有运行记录，点击“立即运行”开始第一次执行。')}</div>
                         )}

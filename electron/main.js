@@ -2500,6 +2500,21 @@ function registerSystemIpc() {
     }
   });
 
+  ipcMain.handle('webpilot:system:read-download', async (_event, input = {}) => {
+    try {
+      const download = systemDownloads.get(String(input.id || ''));
+      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+      const filePath = path.resolve(download.path);
+      const fileStat = await fs.promises.stat(filePath);
+      if (!fileStat.isFile()) throw new Error('下载路径不是文件。');
+      const buffer = await fs.promises.readFile(filePath);
+      const data = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+      return { ok: true, data, fileName: download.fileName || path.basename(filePath) };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
   ipcMain.handle('webpilot:system:remove-download', async (_event, input = {}) => {
     try {
       const id = String(input.id || '');

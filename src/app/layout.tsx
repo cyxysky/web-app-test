@@ -1,5 +1,7 @@
 import type { Metadata } from 'next';
+import '@open-file-viewer/core/style.css';
 import { InterfaceMotion } from '@/components/InterfaceMotion';
+import { FilePreviewProvider } from '@/components/FilePreviewProvider';
 import { NavigationLoading } from '@/components/NavigationLoading';
 import { I18nProvider } from '@/i18n/I18nProvider';
 import { ThemeProvider } from '@/theme/ThemeProvider';
@@ -25,9 +27,11 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         <script dangerouslySetInnerHTML={{ __html: themeBootScript }} />
         <ThemeProvider>
           <I18nProvider>
-            <InterfaceMotion />
-            {children}
-            <NavigationLoading />
+            <FilePreviewProvider>
+              <InterfaceMotion />
+              {children}
+              <NavigationLoading />
+            </FilePreviewProvider>
           </I18nProvider>
         </ThemeProvider>
       </body>

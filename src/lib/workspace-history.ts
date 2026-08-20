@@ -1,11 +1,11 @@
 import type { Language } from '@/i18n/language';
 
-export type WorkspaceSidebarArchiveItem = {
+export type WorkspaceHistoryItem = {
   createdAt?: string;
   updatedAt?: string;
 };
 
-export type WorkspaceSidebarArchiveGroup<T> = {
+export type WorkspaceHistoryGroup<T> = {
   ariaLabel: string;
   day: string;
   items: T[];
@@ -43,20 +43,22 @@ const englishMonthLabels = [
   'Dec',
 ] as const;
 
-function workspaceSidebarArchiveDate(value: WorkspaceSidebarArchiveItem) {
-  const timestamp = Date.parse(value.updatedAt || value.createdAt || '');
-  return Number.isFinite(timestamp) ? new Date(timestamp) : null;
+function defaultWorkspaceHistoryTimestamp<T>(value: T) {
+  const item = value as WorkspaceHistoryItem;
+  return item.updatedAt || item.createdAt;
 }
 
-export function groupWorkspaceSidebarArchive<T extends WorkspaceSidebarArchiveItem>(
+export function groupWorkspaceHistory<T>(
   items: readonly T[],
   language: Language,
-): Array<WorkspaceSidebarArchiveGroup<T>> {
-  const groups: Array<WorkspaceSidebarArchiveGroup<T>> = [];
-  const groupsByKey = new Map<string, WorkspaceSidebarArchiveGroup<T>>();
+  getTimestamp: (item: T) => string | undefined = defaultWorkspaceHistoryTimestamp,
+): Array<WorkspaceHistoryGroup<T>> {
+  const groups: Array<WorkspaceHistoryGroup<T>> = [];
+  const groupsByKey = new Map<string, WorkspaceHistoryGroup<T>>();
 
   for (const item of items) {
-    const date = workspaceSidebarArchiveDate(item);
+    const timestamp = Date.parse(getTimestamp(item) || '');
+    const date = Number.isFinite(timestamp) ? new Date(timestamp) : null;
     const year = date?.getFullYear();
     const monthIndex = date?.getMonth();
     const day = date?.getDate();

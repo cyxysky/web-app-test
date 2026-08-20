@@ -1,12 +1,12 @@
 import { expect, test } from 'vitest';
-import { groupWorkspaceSidebarArchive } from './workspace-sidebar-archive';
+import { groupWorkspaceHistory } from './workspace-history';
 
 function localTimestamp(year: number, month: number, day: number, hour = 12) {
   return new Date(year, month - 1, day, hour).toISOString();
 }
 
-test('groups workspace archive items by their local updated date while preserving order', () => {
-  const groups = groupWorkspaceSidebarArchive([
+test('groups workspace history items by their local updated date while preserving order', () => {
+  const groups = groupWorkspaceHistory([
     { id: 'a', createdAt: localTimestamp(2026, 8, 10), updatedAt: localTimestamp(2026, 8, 18) },
     { id: 'b', createdAt: localTimestamp(2026, 8, 18) },
     { id: 'c', createdAt: localTimestamp(2026, 8, 17) },
@@ -24,7 +24,7 @@ test('groups workspace archive items by their local updated date while preservin
 });
 
 test('uses deterministic English month labels and keeps invalid dates together', () => {
-  const groups = groupWorkspaceSidebarArchive([
+  const groups = groupWorkspaceHistory([
     { id: 'a', updatedAt: localTimestamp(2026, 8, 18) },
     { id: 'b', updatedAt: 'invalid' },
     { id: 'c' },
@@ -39,4 +39,16 @@ test('uses deterministic English month labels and keeps invalid dates together',
     key: 'unknown',
     month: 'Unknown',
   });
+});
+
+test('groups specialized history records through a caller-provided timestamp', () => {
+  const groups = groupWorkspaceHistory([
+    { id: 'run-a', startedAt: localTimestamp(2026, 8, 20) },
+    { id: 'run-b', startedAt: localTimestamp(2026, 8, 19) },
+  ], 'zh', (run) => run.startedAt);
+
+  expect(groups.map((group) => ({ day: group.day, ids: group.items.map((run) => run.id) }))).toEqual([
+    { day: '20', ids: ['run-a'] },
+    { day: '19', ids: ['run-b'] },
+  ]);
 });

@@ -4,6 +4,10 @@
 
 @import "./controls.css";
 
+@import "./beautiful-ai.css";
+
+@import "./file-preview.css";
+
 /*
  * Canonical visual refinement layer.
  *

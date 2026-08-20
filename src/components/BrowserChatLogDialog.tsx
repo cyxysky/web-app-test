@@ -1,11 +1,12 @@
 'use client';
 
-import { type CSSProperties, useRef } from 'react';
-import { X } from 'lucide-react';
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
+import { Check, ChevronRight, Copy, Search, X } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetails';
 import {
   isBrowserChatAiFailureLog,
+  isBrowserChatAiLog,
   isBrowserChatContextCompressionLog,
   isBrowserChatScreenshotPerformanceLog,
   isBrowserChatToolLifecycleLog,
@@ -18,6 +19,8 @@ import { asRecord, finiteNumber } from '@/lib/unknown-value';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 
 type Translator = ReturnType<typeof useI18n>['t'];
+type BrowserChatLogFilter = 'all' | 'ai' | 'tool' | 'context' | 'screenshot';
+type BrowserChatLogStatus = 'completed' | 'failed' | 'running';
 
 export type BrowserChatLogDialogRecord = {
   details?: string;
@@ -85,6 +88,121 @@ function formatTotalElapsedMs(value: number) {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}m ${seconds}s`;
+}
+
+function phaseMatches(log: BrowserChatLogDialogRecord, phase: string) {
+  return log.phase === phase || log.phase.endsWith(`:${phase}`);
+}
+
+function isAiAttemptStartLog(log: BrowserChatLogDialogRecord) {
+  return phaseMatches(log, 'ai:runtime:attempt');
+}
+
+function isTerminalFailureLog(log: BrowserChatLogDialogRecord) {
+  return phaseMatches(log, 'ai:runtime:retry-exhausted')
+    || phaseMatches(log, 'ai:runtime:error')
+    || phaseMatches(log, 'chat:runtime:request-aborted')
+    || phaseMatches(log, 'conversation:context:error')
+    || phaseMatches(log, 'target:plan:validation:error')
+    || phaseMatches(log, 'target:plan:error');
+}
+
+function browserChatLogStatus(logs: BrowserChatLogDialogRecord[]): BrowserChatLogStatus {
+  if (logs.some(isTerminalFailureLog)) return 'failed';
+  if (logs.some((log) => (
+    phaseMatches(log, 'ai:runtime:attempt-succeeded')
+    || phaseMatches(log, 'ai:runtime:response')
+    || phaseMatches(log, 'ai:runtime:object')
+    || phaseMatches(log, 'chat:ai-response-finished')
+    || phaseMatches(log, 'chat:no-tool-response')
+    || phaseMatches(log, 'chat:run:done')
+  ))) return 'completed';
+  return 'running';
+}
+
+function browserChatLogStatusLabel(status: BrowserChatLogStatus) {
+  if (status === 'failed') return '失败';
+  if (status === 'running') return '执行中';
+  return '已完成';
+}
+
+function browserChatLogRoundStatusLabel(status: BrowserChatLogStatus) {
+  if (status === 'completed') return '成功';
+  return browserChatLogStatusLabel(status);
+}
+
+function browserChatLogsElapsedMs(logs: BrowserChatLogDialogRecord[]) {
+  const totals = summarizeBrowserChatExecutionTotals(logs);
+  const measuredTotal = totals.aiRequestElapsedMs + totals.toolElapsedMs;
+  if (measuredTotal > 0) return measuredTotal;
+  return logs.reduce((total, log) => total + (typeof log.elapsedMs === 'number' ? log.elapsedMs : 0), 0);
+}
+
+type BrowserChatLogRound = {
+  elapsedMs: number;
+  entries: BrowserChatLogDialogRecord[];
+  index: number;
+  status: BrowserChatLogStatus;
+};
+
+function groupBrowserChatLogs(entries: BrowserChatLogDialogRecord[]): BrowserChatLogRound[] {
+  const groupedEntries: BrowserChatLogDialogRecord[][] = [];
+  const pendingEntries: BrowserChatLogDialogRecord[] = [];
+
+  entries.forEach((log) => {
+    if (isAiAttemptStartLog(log)) {
+      if (!groupedEntries.length) {
+        groupedEntries.push([...pendingEntries, log]);
+        pendingEntries.length = 0;
+      } else {
+        groupedEntries.push([log]);
+      }
+      return;
+    }
+    if (groupedEntries.length) {
+      groupedEntries[groupedEntries.length - 1]?.push(log);
+    } else {
+      pendingEntries.push(log);
+    }
+  });
+
+  if (pendingEntries.length) groupedEntries.push(pendingEntries);
+
+  return groupedEntries.map((logs, index) => ({
+    elapsedMs: browserChatLogsElapsedMs(logs),
+    entries: logs,
+    index: index + 1,
+    status: browserChatLogStatus(logs),
+  }));
+}
+
+function browserChatLogMatchesFilter(log: BrowserChatLogDialogRecord, filter: BrowserChatLogFilter) {
+  if (filter === 'ai') return isBrowserChatAiLog(log);
+  if (filter === 'tool') return isBrowserChatToolLifecycleLog(log);
+  if (filter === 'context') return isBrowserChatContextCompressionLog(log);
+  if (filter === 'screenshot') return isBrowserChatScreenshotPerformanceLog(log);
+  return true;
+}
+
+function browserChatLogEventTitle(log: BrowserChatLogDialogRecord) {
+  if (phaseMatches(log, 'ai:runtime:attempt')) return 'AI 请求已开始';
+  if (phaseMatches(log, 'ai:runtime:request')) return 'AI 输入已发送';
+  if (phaseMatches(log, 'ai:runtime:response') || phaseMatches(log, 'ai:runtime:object')) return '模型已返回';
+  if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return '本轮正常结束';
+  if (isBrowserChatAiFailureLog(log)) return 'AI 请求异常';
+  if (isBrowserChatToolLifecycleLog(log)) return '工具调用';
+  if (isBrowserChatContextCompressionLog(log)) return contextCompressionLabel(log) || '上下文';
+  if (isBrowserChatScreenshotPerformanceLog(log)) return '截图性能';
+  return phaseLabel(log.phase);
+}
+
+function browserChatLogTone(log: BrowserChatLogDialogRecord) {
+  if (isTerminalFailureLog(log) || isBrowserChatAiFailureLog(log)) return 'danger';
+  if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return 'success';
+  if (isBrowserChatToolLifecycleLog(log)) return 'tool';
+  if (isBrowserChatContextCompressionLog(log)) return 'context';
+  if (isBrowserChatScreenshotPerformanceLog(log)) return 'screenshot';
+  return 'ai';
 }
 
 function formatPostprocessTimings(value: unknown) {
@@ -217,9 +335,9 @@ function screenshotPerformancePayload(details: Record<string, unknown>) {
   return lines.join('\n');
 }
 
-function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLogDialogRecord; nextAiInputTokens?: number }) {
+function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded: boolean; log: BrowserChatLogDialogRecord; nextAiInputTokens?: number }) {
   const { t } = useI18n();
-  if (!log.details) return null;
+  if (!expanded || !log.details) return null;
   const parsed = parseJsonObjectText(log.details);
   const isAiRequestLog = log.phase.endsWith('ai:runtime:request');
   const isAiResponseLog = log.phase.endsWith('ai:runtime:response') || log.phase.endsWith('ai:runtime:object');
@@ -259,41 +377,38 @@ function BrowserChatLogDetails({ log, nextAiInputTokens }: { log: BrowserChatLog
     trace: payloadDetails.trace,
   }) : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  const requestTokens = isAiRequestLog
-    ? estimatedAiInputTokens(payloadDetails)
-    : undefined;
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
   return (
     <div className="browser-chat-log-details">
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" payload={timingPayload} title={t('耗时明细')} />
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" payload={requestPayload} title={t('AI 输入 JSON')} />
-      {isAiRequestLog ? (
-        <p className="browser-chat-log-token-count">{t('此次发送给 AI 的内容：{tokens}', {
-          tokens: requestTokens === undefined ? t('无法估算') : t('约 {count} tokens', { count: Math.round(requestTokens).toLocaleString() }),
-        })}</p>
-      ) : null}
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" payload={responsePayload} title={t('AI 输出 JSON')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" defaultOpen payload={timingPayload} title={t('耗时明细')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={requestPayload} title={t('AI 输入 JSON')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" defaultOpen payload={responsePayload} title={t('AI 输出 JSON')} />
       {isAiResponseLog ? (
         <p className="browser-chat-log-token-count">{t('下次发送给 AI 的内容：{tokens}', {
           tokens: nextAiInputTokens === undefined ? t('尚未生成') : t('约 {count} tokens', { count: Math.round(nextAiInputTokens).toLocaleString() }),
         })}</p>
       ) : null}
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" payload={errorPayload} title={t('错误详情')} />
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-tool" payload={toolPayload} title={t('工具日志 JSON')} />
-      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" payload={performancePayload} title={t('截图性能')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-error" defaultOpen payload={errorPayload} title={t('错误详情')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-tool" defaultOpen payload={toolPayload} title={t('工具日志 JSON')} />
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-performance" defaultOpen payload={performancePayload} title={t('截图性能')} />
     </div>
   );
 }
 
-const logVirtualRowEstimate = 104;
+const logVirtualRowEstimate = 96;
+const logVirtualRoundEstimate = 52;
 
 function BrowserChatLogEntry({
+  detailLog,
+  isLastInRound,
   log,
   measureRef,
   style,
   virtualIndex,
   nextAiInputTokens,
 }: {
+  detailLog?: BrowserChatLogDialogRecord;
+  isLastInRound?: boolean;
   log: BrowserChatLogDialogRecord;
   measureRef?: (node: HTMLLIElement | null) => void;
   style?: CSSProperties;
@@ -301,57 +416,124 @@ function BrowserChatLogEntry({
   nextAiInputTokens?: number;
 }) {
   const { t } = useI18n();
-  const compressionLabel = contextCompressionLabel(log);
-  const timingLabel = aiLogTimingInline(log, t);
+  const [expanded, setExpanded] = useState(false);
+  const payloadLog = detailLog || log;
+  const eventTitle = t(browserChatLogEventTitle(log));
+  const eventMessage = detailLog && isAiAttemptStartLog(log)
+    ? t('等待模型判断下一步操作')
+    : t(log.message);
+  const inputTokens = aiLogInputTokenCount(payloadLog);
+  const timingLabel = aiLogTimingInline(payloadLog, t);
+  const tone = browserChatLogTone(log);
+  const canExpand = Boolean(payloadLog.details);
+  const canCopy = phaseMatches(payloadLog, 'ai:runtime:response') || phaseMatches(payloadLog, 'ai:runtime:object');
+  const copyEvent = async () => {
+    if (!navigator.clipboard) return;
+    try {
+      await navigator.clipboard.writeText(eventMessage);
+    } catch {
+      // Keep the row action quiet when clipboard access is unavailable.
+    }
+  };
   return (
     <li
-      className={compressionLabel ? 'has-context-compression' : ''}
+      className={`browser-chat-log-entry is-${tone}${isLastInRound ? ' is-round-last' : ''}`}
       data-index={virtualIndex}
       ref={measureRef}
       style={style}
     >
-      {compressionLabel ? (
-        <div className="browser-chat-context-compression-marker">
-          <span>--------------------------</span>
-          <strong>{t(compressionLabel)}</strong>
-          <span>--------------------------</span>
+      <time className="browser-chat-log-time" dateTime={log.time}>{formatLogTime(log.time)}</time>
+      <span aria-hidden="true" className="browser-chat-log-marker" />
+      <div className="browser-chat-log-entry-content">
+        <div className="browser-chat-log-entry-heading">
+          <strong className="browser-chat-log-event-title">{eventTitle}</strong>
+          {canCopy || canExpand ? (
+            <div className="browser-chat-log-entry-actions">
+              {canCopy ? (
+                <button onClick={() => void copyEvent()} type="button">
+                  <Copy size={15} />
+                  {t('复制')}
+                </button>
+              ) : null}
+              {canExpand ? (
+                <button aria-expanded={expanded} onClick={() => setExpanded((current) => !current)} type="button">
+                  {t(expanded ? '收起' : '展开')}
+                  <ChevronRight className={expanded ? 'is-expanded' : ''} size={17} />
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
-      ) : null}
-      <span>{t(phaseLabel(log.phase))}</span>
-      <div>
-        <strong>{t(log.message)}</strong>
-        <small>
-          {formatLogTime(log.time)}
-          {log.stepIndex ? ` · ${t('步骤 {index}', { index: log.stepIndex })}` : ''}
-          {timingLabel ? ` · ${timingLabel}` : typeof log.elapsedMs === 'number' ? ` · ${log.elapsedMs}ms` : ''}
-        </small>
-        <BrowserChatLogDetails log={log} nextAiInputTokens={nextAiInputTokens} />
+        {eventMessage !== eventTitle ? <p className="browser-chat-log-message">{eventMessage}</p> : null}
+        {payloadLog.stepIndex || inputTokens !== undefined || timingLabel || typeof payloadLog.elapsedMs === 'number' ? (
+          <small className="browser-chat-log-entry-meta">
+            {payloadLog.stepIndex ? <span>{t('步骤 {index}', { index: payloadLog.stepIndex })}</span> : null}
+            {inputTokens !== undefined ? <span>{t('AI 输入 · {tokens}', { tokens: `${Math.round(inputTokens).toLocaleString()} tokens` })}</span> : null}
+            {timingLabel ? <span>{timingLabel}</span> : typeof payloadLog.elapsedMs === 'number' ? <span>{formatTotalElapsedMs(payloadLog.elapsedMs)}</span> : null}
+          </small>
+        ) : null}
+        <BrowserChatLogDetails expanded={expanded} log={payloadLog} nextAiInputTokens={nextAiInputTokens} />
       </div>
     </li>
   );
 }
 
-function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogRecord[] }) {
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const rowVirtualizer = useVirtualizer({
-    count: entries.length,
-    estimateSize: () => logVirtualRowEstimate,
-    getItemKey: (index) => entries[index]?.id || index,
-    getScrollElement: () => scrollRef.current,
-    overscan: 8,
-  });
-  const virtualItems = rowVirtualizer.getVirtualItems();
-  const nextInputTokensByIndex = new Map<number, number>();
+type BrowserChatTimelineRow =
+  | { key: string; kind: 'round'; round: BrowserChatLogRound }
+  | { detailLog?: BrowserChatLogDialogRecord; isLastInRound: boolean; key: string; kind: 'log'; log: BrowserChatLogDialogRecord };
+
+function browserChatTimelineRowsForRound(round: BrowserChatLogRound): BrowserChatTimelineRow[] {
+  const eventRows: Array<{ detailLog?: BrowserChatLogDialogRecord; log: BrowserChatLogDialogRecord }> = [];
+  for (let index = 0; index < round.entries.length; index += 1) {
+    const log = round.entries[index];
+    if (!log) continue;
+    const nextLog = round.entries[index + 1];
+    if (isAiAttemptStartLog(log) && nextLog && phaseMatches(nextLog, 'ai:runtime:request')) {
+      eventRows.push({ detailLog: nextLog, log });
+      index += 1;
+    } else {
+      eventRows.push({ log });
+    }
+  }
+  return [
+    { key: `round-${round.index}`, kind: 'round', round },
+    ...eventRows.map((event, index) => ({
+      ...event,
+      isLastInRound: index === eventRows.length - 1,
+      key: event.detailLog ? `${event.log.id}-${event.detailLog.id}` : event.log.id,
+      kind: 'log' as const,
+    })),
+  ];
+}
+
+function nextInputTokensByLogId(entries: BrowserChatLogDialogRecord[]) {
+  const tokensByLogId = new Map<string, number>();
   let nextInputTokens: number | undefined;
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const log = entries[index];
     if (!log) continue;
-    if (log.phase.endsWith('ai:runtime:response') || log.phase.endsWith('ai:runtime:object')) {
-      if (nextInputTokens !== undefined) nextInputTokensByIndex.set(index, nextInputTokens);
+    if (phaseMatches(log, 'ai:runtime:response') || phaseMatches(log, 'ai:runtime:object')) {
+      if (nextInputTokens !== undefined) tokensByLogId.set(log.id, nextInputTokens);
     }
     const currentInputTokens = aiLogInputTokenCount(log);
     if (currentInputTokens !== undefined) nextInputTokens = currentInputTokens;
   }
+  return tokensByLogId;
+}
+
+function BrowserChatVirtualLogList({ allEntries, rounds }: { allEntries: BrowserChatLogDialogRecord[]; rounds: BrowserChatLogRound[] }) {
+  const { t } = useI18n();
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const rows = useMemo<BrowserChatTimelineRow[]>(() => rounds.flatMap(browserChatTimelineRowsForRound), [rounds]);
+  const tokensByLogId = useMemo(() => nextInputTokensByLogId(allEntries), [allEntries]);
+  const rowVirtualizer = useVirtualizer({
+    count: rows.length,
+    estimateSize: (index) => rows[index]?.kind === 'round' ? logVirtualRoundEstimate : logVirtualRowEstimate,
+    getItemKey: (index) => rows[index]?.key || index,
+    getScrollElement: () => scrollRef.current,
+    overscan: 8,
+  });
+  const virtualItems = rowVirtualizer.getVirtualItems();
 
   return (
     <div className="browser-chat-log-modal-list" ref={scrollRef}>
@@ -360,22 +542,45 @@ function BrowserChatVirtualLogList({ entries }: { entries: BrowserChatLogDialogR
         style={{ height: rowVirtualizer.getTotalSize() }}
       >
         {virtualItems.map((virtualRow) => {
-          const log = entries[virtualRow.index];
-          if (!log) return null;
+          const row = rows[virtualRow.index];
+          if (!row) return null;
+          const virtualStyle: CSSProperties = {
+            left: 0,
+            position: 'absolute',
+            top: 0,
+            transform: `translateY(${virtualRow.start}px)`,
+            width: '100%',
+          };
+          if (row.kind === 'round') {
+            return (
+              <li
+                className="browser-chat-log-round"
+                data-index={virtualRow.index}
+                key={virtualRow.key}
+                ref={rowVirtualizer.measureElement}
+                style={virtualStyle}
+              >
+                <div className="browser-chat-log-round-title">
+                  <span aria-hidden="true">{row.round.index}</span>
+                  <strong>{t('第 {index} 轮', { index: row.round.index })}</strong>
+                </div>
+                <span className={`browser-chat-log-round-status is-${row.round.status}`}>
+                  {t(browserChatLogRoundStatusLabel(row.round.status))}
+                  {row.round.elapsedMs > 0 ? ` · ${formatTotalElapsedMs(row.round.elapsedMs)}` : ''}
+                </span>
+              </li>
+            );
+          }
           return (
             <BrowserChatLogEntry
+              detailLog={row.detailLog}
               key={virtualRow.key}
-              log={log}
+              isLastInRound={row.isLastInRound}
+              log={row.log}
               measureRef={rowVirtualizer.measureElement}
-              style={{
-                left: 0,
-                position: 'absolute',
-                top: 0,
-                transform: `translateY(${virtualRow.start}px)`,
-                width: '100%',
-              }}
+              style={virtualStyle}
               virtualIndex={virtualRow.index}
-              nextAiInputTokens={nextInputTokensByIndex.get(virtualRow.index)}
+              nextAiInputTokens={tokensByLogId.get((row.detailLog || row.log).id)}
             />
           );
         })}
@@ -396,50 +601,123 @@ export function BrowserChatLogDialog({
   summaryEntries: BrowserChatLogDialogRecord[];
 }) {
   const { t } = useI18n();
+  const [activeFilter, setActiveFilter] = useState<BrowserChatLogFilter>('all');
+  const [copied, setCopied] = useState(false);
+  const [query, setQuery] = useState('');
+  const copiedResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEscapeDismiss(true, onClose);
   const summary = summarizeBrowserChatLogs(entries);
   const totals = summarizeBrowserChatExecutionTotals(summaryEntries);
+  const rounds = useMemo(() => groupBrowserChatLogs(entries), [entries]);
+  const status = browserChatLogStatus(summaryEntries.length ? summaryEntries : entries);
+  const totalElapsedMs = totals.aiRequestElapsedMs + totals.toolElapsedMs;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredRounds = useMemo(() => rounds
+    .map((round) => ({
+      ...round,
+      entries: round.entries.filter((log) => {
+        if (!browserChatLogMatchesFilter(log, activeFilter)) return false;
+        if (!normalizedQuery) return true;
+        return `${t(log.message)}\n${t(phaseLabel(log.phase))}\n${log.phase}\n${log.details || ''}`
+          .toLocaleLowerCase()
+          .includes(normalizedQuery);
+      }),
+    }))
+    .filter((round) => round.entries.length > 0), [activeFilter, normalizedQuery, rounds, t]);
+  const filterOptions: Array<{ count: number; filter: BrowserChatLogFilter; label: string }> = [
+    { count: summary.total, filter: 'all', label: t('全部') },
+    { count: summary.ai, filter: 'ai', label: 'AI' },
+    { count: summary.tool, filter: 'tool', label: t('工具') },
+    { count: summary.context, filter: 'context', label: t('上下文') },
+    { count: summary.screenshot, filter: 'screenshot', label: t('截图') },
+  ];
+
+  useEffect(() => () => {
+    if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
+  }, []);
+
+  const copyLogs = async () => {
+    if (!entries.length || !navigator.clipboard) return;
+    const payload = [
+      messageContent ? `${t('当前 AI 消息')}: ${messageContent}` : '',
+      ...entries.map((log) => [
+        `[${formatLogTime(log.time)}] [${t(phaseLabel(log.phase))}] ${t(log.message)}`,
+        log.details || '',
+      ].filter(Boolean).join('\n')),
+    ].filter(Boolean).join('\n\n');
+    try {
+      await navigator.clipboard.writeText(payload);
+      setCopied(true);
+      if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
+      copiedResetTimer.current = setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  };
+
   return (
-    <div className="ui-modal-overlay" onClick={onClose} role="presentation">
-      <section aria-labelledby="browser-chat-log-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide" onClick={(event) => event.stopPropagation()} role="dialog">
-        <header className="ui-modal-header">
+    <div className="ui-modal-overlay browser-chat-log-dialog-overlay" onClick={onClose} role="presentation">
+      <section aria-labelledby="browser-chat-log-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide browser-chat-log-dialog" onClick={(event) => event.stopPropagation()} role="dialog">
+        <header className="ui-modal-header browser-chat-log-dialog-header">
           <div className="ui-modal-heading">
-            <h2 className="ui-modal-title" id="browser-chat-log-dialog-title">{t('执行日志')}</h2>
-            <p className="ui-modal-subtitle">{messageContent || t('当前 AI 消息')}</p>
+            <div className="browser-chat-log-title-row">
+              <h2 className="ui-modal-title" id="browser-chat-log-dialog-title">{t('执行日志')}</h2>
+              <span className={`browser-chat-log-status is-${status}`}>{t(browserChatLogStatusLabel(status))}</span>
+            </div>
+            <p className="ui-modal-subtitle browser-chat-log-dialog-subtitle">
+              <span>{t('{count} 轮 AI 请求', { count: rounds.length })}</span>
+              <span aria-hidden="true">·</span>
+              <span>{t('{count} 条事件', { count: summary.total })}</span>
+              <span aria-hidden="true">·</span>
+              <span>{t('总耗时 {time}', { time: formatTotalElapsedMs(totalElapsedMs) })}</span>
+            </p>
           </div>
-          <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>
-            <X size={18} />
-          </button>
+          <div className="browser-chat-log-header-actions">
+            {entries.length ? (
+              <button className="browser-chat-log-copy-button" onClick={() => void copyLogs()} type="button">
+                {copied ? <Check size={16} /> : <Copy size={16} />}
+                {t(copied ? '已复制' : '复制日志')}
+              </button>
+            ) : null}
+            <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>
+              <X size={19} />
+            </button>
+          </div>
         </header>
         <div className="ui-modal-body browser-chat-log-modal-body">
-        <div className="browser-chat-log-totals" aria-label={t('执行总计')}>
-          <div>
-            <span>{t('工具调用总计')}</span>
-            <strong>{t('{count} 次调用', { count: totals.toolCallCount })}</strong>
-          </div>
-          <div>
-            <span>{t('工具调用总耗时')}</span>
-            <strong>{formatTotalElapsedMs(totals.toolElapsedMs)}</strong>
-          </div>
-          <div>
-            <span>{t('AI 请求总耗时')}</span>
-            <strong>{formatTotalElapsedMs(totals.aiRequestElapsedMs)}</strong>
-          </div>
-        </div>
-        {entries.length ? (
-          <div className="browser-chat-log-summary" aria-label={t('日志摘要')}>
-            <span>AI {summary.ai}</span>
-            <span>{t('工具')} {summary.tool}</span>
-            <span>{t('上下文')} {summary.context}</span>
-            <span>{t('截图')} {summary.screenshot}</span>
-            <span>{t('总计')} {summary.total}</span>
-          </div>
-        ) : null}
-        {entries.length ? (
-          <BrowserChatVirtualLogList entries={entries} />
-        ) : (
-          <p className="browser-chat-log-empty">{t('暂无日志')}</p>
-        )}
+          {entries.length ? (
+            <div className="browser-chat-log-toolbar">
+              <div aria-label={t('日志摘要')} className="browser-chat-log-filters" role="toolbar">
+                {filterOptions.map((option) => (
+                  <button
+                    aria-pressed={activeFilter === option.filter}
+                    className={activeFilter === option.filter ? 'is-active' : ''}
+                    key={option.filter}
+                    onClick={() => setActiveFilter(option.filter)}
+                    type="button"
+                  >
+                    <span>{option.label}</span>
+                    <strong>{option.count}</strong>
+                  </button>
+                ))}
+              </div>
+              <label className="browser-chat-log-search">
+                <Search aria-hidden="true" size={16} />
+                <input
+                  aria-label={t('搜索日志')}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder={t('搜索日志')}
+                  type="search"
+                  value={query}
+                />
+              </label>
+            </div>
+          ) : null}
+          {filteredRounds.length ? (
+            <BrowserChatVirtualLogList allEntries={entries} rounds={filteredRounds} />
+          ) : (
+            <p className="browser-chat-log-empty">{t(entries.length ? '无匹配日志' : '暂无日志')}</p>
+          )}
         </div>
       </section>
     </div>

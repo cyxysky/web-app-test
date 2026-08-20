@@ -98,6 +98,7 @@ type SystemBridge = {
   onDownloadProgress?: (listener: (payload: { completedAt?: number; error?: string; fileName?: string; id: string; path?: string; progress?: number; receivedBytes?: number; startedAt?: number; status?: string; totalBytes?: number; updatedAt?: number; url?: string }) => void) => () => void;
   onDownloadRemoved?: (listener: (payload: { id: string }) => void) => () => void;
   openDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
+  readDownload?: (input: { id: string }) => Promise<{ ok: boolean; data?: ArrayBuffer; fileName?: string; error?: string }>;
   removeDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   selectDirectory: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
   showDownloadInFolder?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;

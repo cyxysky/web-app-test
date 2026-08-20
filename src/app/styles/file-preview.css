@@ -1,0 +1,118 @@
+.file-preview-overlay {
+  align-items: center;
+  background: var(--modal-overlay-bg);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: fixed;
+  z-index: 1300;
+}
+
+.file-preview-dialog {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--modal-shadow);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: min(90vh, 920px);
+  max-width: 1480px;
+  overflow: hidden;
+  width: min(94vw, 1480px);
+}
+
+.file-preview-header {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 58px;
+  padding: 9px 12px 9px 16px;
+}
+
+.file-preview-heading-icon {
+  color: var(--muted-strong);
+  display: inline-grid;
+  place-items: center;
+}
+
+.file-preview-heading-copy {
+  min-width: 0;
+}
+
+.file-preview-heading-copy h2,
+.file-preview-heading-copy p {
+  margin: 0;
+}
+
+.file-preview-heading-copy h2 {
+  font-size: 14px;
+  font-weight: 680;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-preview-heading-copy p {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.file-preview-stage {
+  align-items: center;
+  background: var(--panel-soft);
+  display: flex;
+  justify-content: center;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.file-preview-stage > .ofv-root,
+.file-preview-stage > div:has(> .ofv-root) {
+  height: 100% !important;
+  min-height: 0;
+  width: 100% !important;
+}
+
+.file-preview-stage .ofv-root {
+  border: 0;
+  height: 100% !important;
+}
+
+.file-preview-stage > .beautiful-loading-state {
+  padding: 24px;
+}
+
+.file-preview-error {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 520px;
+  padding: 32px;
+  text-align: center;
+}
+
+.file-preview-error strong {
+  color: var(--foreground);
+  font-size: 14px;
+}
+
+.file-preview-error span {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .file-preview-overlay { padding: 0; }
+  .file-preview-dialog {
+    border: 0;
+    border-radius: 0;
+    height: 100dvh;
+    width: 100vw;
+  }
+}

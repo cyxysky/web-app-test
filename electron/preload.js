@@ -143,6 +143,9 @@ contextBridge.exposeInMainWorld('webPilotSystem', {
   openDownload(input) {
     return ipcRenderer.invoke('webpilot:system:open-download', input || {});
   },
+  readDownload(input) {
+    return ipcRenderer.invoke('webpilot:system:read-download', input || {});
+  },
   removeDownload(input) {
     return ipcRenderer.invoke('webpilot:system:remove-download', input || {});
   },

@@ -9,10 +9,7 @@ import {
   type UIEventHandler,
 } from 'react';
 import type { Language } from '@/i18n/language';
-import {
-  groupWorkspaceSidebarArchive,
-  type WorkspaceSidebarArchiveItem,
-} from '@/lib/workspace-sidebar-archive';
+import { groupWorkspaceHistory } from '@/lib/workspace-history';
 
 type WorkspaceSidebarArchiveHeaderProps = {
   actions?: ReactNode;
@@ -68,10 +65,12 @@ export function WorkspaceSidebarArchiveFilter({
   );
 }
 
-type WorkspaceSidebarArchiveListProps<T extends WorkspaceSidebarArchiveItem> = {
+type WorkspaceHistoryListProps<T> = {
   ariaBusy?: boolean;
+  className?: string;
   footer?: ReactNode;
   getKey: (item: T) => string;
+  getTimestamp?: (item: T) => string | undefined;
   items: readonly T[];
   language: Language;
   listRef?: Ref<HTMLOListElement>;
@@ -79,17 +78,22 @@ type WorkspaceSidebarArchiveListProps<T extends WorkspaceSidebarArchiveItem> = {
   renderItem: (item: T) => ReactNode;
 };
 
-export function WorkspaceSidebarArchiveList<T extends WorkspaceSidebarArchiveItem>({
+export function WorkspaceHistoryList<T>({
   ariaBusy,
+  className = '',
   footer,
   getKey,
+  getTimestamp,
   items,
   language,
   listRef,
   onScroll,
   renderItem,
-}: WorkspaceSidebarArchiveListProps<T>) {
-  const groups = useMemo(() => groupWorkspaceSidebarArchive(items, language), [items, language]);
+}: WorkspaceHistoryListProps<T>) {
+  const groups = useMemo(
+    () => groupWorkspaceHistory(items, language, getTimestamp),
+    [getTimestamp, items, language],
+  );
   const assignListRef = useCallback((node: HTMLOListElement | null) => {
     if (typeof listRef === 'function') {
       listRef(node);
@@ -101,7 +105,7 @@ export function WorkspaceSidebarArchiveList<T extends WorkspaceSidebarArchiveIte
   return (
     <ol
       aria-busy={ariaBusy}
-      className="browser-chat-recent-list workspace-sidebar-archive-list"
+      className={`workspace-history-list${className ? ` ${className}` : ''}`}
       onScroll={onScroll}
       ref={assignListRef}
     >

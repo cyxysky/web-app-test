@@ -1,12 +1,14 @@
 'use client';
 
 import Link from 'next/link';
-import { CheckCircle2, Download, RotateCcw, ShieldCheck } from 'lucide-react';
+import { CheckCircle2, FileSearch, RotateCcw, ShieldCheck } from 'lucide-react';
 import { FormEvent, useRef, useState } from 'react';
+import { useFilePreview } from '@/components/FilePreviewProvider';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import styles from './TutorialSandbox.module.css';
 
 export function TutorialSandbox() {
+  const { openFilePreview } = useFilePreview();
   const [name, setName] = useState('');
   const [department, setDepartment] = useState('');
   const [attachment, setAttachment] = useState<File | null>(null);
@@ -85,7 +87,16 @@ export function TutorialSandbox() {
           <dl className={styles.status} aria-label="表单当前状态" data-testid="tutorial-status">
             <div><dt>姓名</dt><dd>{name || '未填写'}</dd></div>
             <div><dt>部门</dt><dd>{department || '未选择'}</dd></div>
-            <div><dt>测试附件</dt><dd title={attachment?.name}>{attachment?.name || '未选择'}</dd></div>
+            <div>
+              <dt>测试附件</dt>
+              <dd title={attachment?.name}>
+                {attachment ? (
+                  <button onClick={() => openFilePreview({ fileName: attachment.name, mimeType: attachment.type, source: attachment })} type="button">
+                    {attachment.name}
+                  </button>
+                ) : '未选择'}
+              </dd>
+            </div>
             <div><dt>提交状态</dt><dd>{submitted ? '已提交' : '未提交'}</dd></div>
           </dl>
         </section>
@@ -94,8 +105,8 @@ export function TutorialSandbox() {
       <section className={styles.files}>
         <div><span className={styles.kicker}>可选任务</span><h2>继续练习文件读取与生成</h2><p>下载示例文件后回到对话上传，并让 WebPilot 总结内容或生成新的工作簿。</p></div>
         <div className={styles.fileLinks}>
-          <a href={withWebPilotBasePath('/api/tutorial/sample/docx')}><Download size={16} />下载 DOCX 示例</a>
-          <a href={withWebPilotBasePath('/api/tutorial/sample/xlsx')}><Download size={16} />下载 XLSX 示例</a>
+          <a data-file-name="WebPilot-新手示例.docx" href={withWebPilotBasePath('/api/tutorial/sample/docx')}><FileSearch size={16} />预览 DOCX 示例</a>
+          <a data-file-name="WebPilot-新手示例.xlsx" href={withWebPilotBasePath('/api/tutorial/sample/xlsx')}><FileSearch size={16} />预览 XLSX 示例</a>
         </div>
       </section>
     </main>
