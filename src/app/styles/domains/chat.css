@@ -240,11 +240,14 @@
   border: 1px solid var(--border);
   text-align: left;
   vertical-align: top;
-  background: var(--panel-soft);
-  font-weight: 850;
   border-color: var(--border);
   min-width: 112px;
   padding: 8px 10px;
+}
+
+.browser-chat-agent-markdown td {
+  background: transparent;
+  font-weight: 400;
 }
 
 .browser-chat-agent-markdown th {

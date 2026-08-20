@@ -8,11 +8,91 @@ function restoreCollapsedMarkdownBlocks(value: string) {
     .replace(/([^\n|])[ \t]+(?=#{1,6}[ \t]+[^|\n])/g, '$1\n\n')
     .replace(/\|[ \t]+\|/g, '|\n|')
     .replace(/(^|\n)([^\n|]*\S)[ \t]+(?=\|[^\n]+\|\n\|[ \t]*:?-{3,})/g, '$1$2\n\n')
+    .replace(/(^|\n)(\*\*[^*\n]{1,120}\*\*)[ \t]*(?=\|[^\n]+\|\n\|[ \t]*:?-{3,})/g, '$1$2\n\n')
+    .replace(/(^|\n)(#{1,6}[ \t]+[^|\n]+?)(\|[^\n]+\|)\n(?=\|[ \t]*:?-{3,})/g, '$1$2\n\n$3\n')
     .replace(/\|[ \t]+(?=\*\*[^*\n]{1,80}\*\*[ \t]*[:：])/g, '|\n\n');
 }
 
+function pipeRowCells(value: string) {
+  const trimmed = value.trim().replace(/^[-*+][ \t]+/, '');
+  if (!/[|｜]/.test(trimmed)) return undefined;
+  const body = trimmed.replace(/^[|｜]/, '').replace(/[|｜]$/, '');
+  const cells = body.split(/[|｜]/).map((cell) => cell.trim());
+  if (cells.length < 2 || cells.some((cell) => !cell)) return undefined;
+  return cells;
+}
+
+function isPipeDelimiterRow(cells: string[] | undefined) {
+  return Boolean(cells?.length && cells.every((cell) => /^:?-{3,}:?$/.test(cell)));
+}
+
+function orderedListHeadersBefore(lines: string[], rowIndex: number, expectedCount: number) {
+  const lowerBound = Math.max(0, rowIndex - 30);
+  for (let start = rowIndex - 1; start >= lowerBound; start -= 1) {
+    if (!/^1[.、)][ \t]+\S/.test(lines[start].trim())) continue;
+    const headers: string[] = [];
+    for (let cursor = start; cursor < rowIndex; cursor += 1) {
+      const match = lines[cursor].trim().match(/^(\d+)[.、)][ \t]+(.+)$/);
+      if (!match || Number(match[1]) !== headers.length + 1) break;
+      headers.push(match[2].trim());
+    }
+    if (headers.length === expectedCount) return headers;
+  }
+  return undefined;
+}
+
+function normalizeLoosePipeTables(value: string) {
+  const lines = value.split('\n');
+  const normalized: string[] = [];
+  for (let index = 0; index < lines.length;) {
+    const firstCells = pipeRowCells(lines[index]);
+    if (!firstCells || isPipeDelimiterRow(firstCells)) {
+      normalized.push(lines[index]);
+      index += 1;
+      continue;
+    }
+    let delimiterIndex = index + 1;
+    while (delimiterIndex < lines.length && !lines[delimiterIndex].trim()) delimiterIndex += 1;
+    const delimiterCells = pipeRowCells(lines[delimiterIndex] || '');
+    if (delimiterCells?.length === firstCells.length && isPipeDelimiterRow(delimiterCells)) {
+      normalized.push(...lines.slice(index, delimiterIndex + 1));
+      index = delimiterIndex + 1;
+      while (index < lines.length) {
+        const cells = pipeRowCells(lines[index]);
+        if (!cells || cells.length !== firstCells.length || isPipeDelimiterRow(cells)) break;
+        normalized.push(lines[index]);
+        index += 1;
+      }
+      continue;
+    }
+    const rows: string[][] = [firstCells];
+    let cursor = index + 1;
+    while (cursor < lines.length) {
+      let candidateIndex = cursor;
+      while (candidateIndex < lines.length && !lines[candidateIndex].trim()) candidateIndex += 1;
+      const cells = candidateIndex < lines.length ? pipeRowCells(lines[candidateIndex]) : undefined;
+      if (!cells || cells.length !== firstCells.length || isPipeDelimiterRow(cells)) break;
+      rows.push(cells);
+      cursor = candidateIndex + 1;
+    }
+    if (rows.length < 2) {
+      normalized.push(lines[index]);
+      index += 1;
+      continue;
+    }
+    const inferredHeaders = orderedListHeadersBefore(lines, index, firstCells.length);
+    const headers = inferredHeaders || rows[0];
+    const bodyRows = inferredHeaders ? rows : rows.slice(1);
+    normalized.push(`| ${headers.join(' | ')} |`);
+    normalized.push(`| ${headers.map(() => '---').join(' | ')} |`);
+    normalized.push(...bodyRows.map((cells) => `| ${cells.join(' | ')} |`));
+    index = cursor;
+  }
+  return normalized.join('\n');
+}
+
 function normalizeMarkdownSegment(value: string) {
-  return restoreCollapsedMarkdownBlocks(value)
+  return normalizeLoosePipeTables(restoreCollapsedMarkdownBlocks(value))
     .replace(/\\\*\\\*([^\n]+?)\\\*\\\*/g, '**$1**')
     .replace(/\*\*((?:https?:\/\/)[^\s*<>]+)\*\*/gi, '**<$1>**')
     .replace(/\r\n?/g, '\n')

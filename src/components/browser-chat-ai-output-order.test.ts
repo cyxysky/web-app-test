@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
+import { sortBrowserChatAiOutputCycles } from '@/lib/browser-chat-output-cycles';
 import { aiOutputViewFromResponse, buildAiCycleToolDetailMap } from './BrowserChatWorkspace';
+
+test('orders late-arriving child Agent cycles by their original execution step', () => {
+  const cycles = sortBrowserChatAiOutputCycles([
+    { id: 'read-4', output: { parts: [], reasoning: [], texts: [], tools: [] }, sequence: 5, stepIndex: 5 },
+    { id: 'read-5', output: { parts: [], reasoning: [], texts: [], tools: [] }, sequence: 6, stepIndex: 6 },
+    { id: 'spawn', output: { parts: [], reasoning: [], texts: [], tools: [] }, sequence: 1, stepIndex: 1 },
+    { id: 'spawn-fallback', output: { parts: [], reasoning: [], texts: [], tools: [] }, stepIndex: 1 },
+  ]);
+
+  assert.deepEqual(cycles.map((cycle) => cycle.id), ['spawn', 'spawn-fallback', 'read-4', 'read-5']);
+});
 
 test('keeps text and tool calls in the provider content order', () => {
   const output = aiOutputViewFromResponse({

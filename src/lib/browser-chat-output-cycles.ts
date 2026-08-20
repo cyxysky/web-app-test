@@ -170,6 +170,26 @@ function hasBrowserChatAiOutputView(output: BrowserChatAiOutputView) {
   return Boolean(output.reasoning.length || output.texts.length || output.tools.length);
 }
 
+export function sortBrowserChatAiOutputCycles<TCycle extends BrowserChatAiOutputCycle>(cycles: TCycle[]) {
+  return cycles
+    .map((cycle, insertionIndex) => ({ cycle, insertionIndex }))
+    .sort((left, right) => {
+      const leftStep = Number.isFinite(left.cycle.stepIndex) ? Number(left.cycle.stepIndex) : undefined;
+      const rightStep = Number.isFinite(right.cycle.stepIndex) ? Number(right.cycle.stepIndex) : undefined;
+      if (leftStep !== undefined && rightStep !== undefined && leftStep !== rightStep) return leftStep - rightStep;
+      const leftSequence = Number.isFinite(left.cycle.sequence) ? Number(left.cycle.sequence) : undefined;
+      const rightSequence = Number.isFinite(right.cycle.sequence) ? Number(right.cycle.sequence) : undefined;
+      if (leftSequence !== undefined && rightSequence !== undefined && leftSequence !== rightSequence) {
+        return leftSequence - rightSequence;
+      }
+      const leftTime = Date.parse(left.cycle.createdAt || '');
+      const rightTime = Date.parse(right.cycle.createdAt || '');
+      if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime;
+      return left.insertionIndex - right.insertionIndex;
+    })
+    .map(({ cycle }) => cycle);
+}
+
 export function browserChatAiOutputCycleFromDebugEvent(input: {
   details?: unknown;
   id: string;

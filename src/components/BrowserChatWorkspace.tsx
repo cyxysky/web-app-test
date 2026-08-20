@@ -147,6 +147,7 @@ import {
   readSidebarCollapsedPreference,
   writeSidebarCollapsedPreference,
 } from '@/lib/sidebar-collapse';
+import { sortBrowserChatAiOutputCycles } from '@/lib/browser-chat-output-cycles';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import {
   browserChatAiCycleAnchorsText,
@@ -1677,7 +1678,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
               ? 'failed'
               : 'idle'),
     networkErrors: session.networkErrors || [],
-    outputCycles: session.outputCycles || [],
+    outputCycles: sortBrowserChatAiOutputCycles(session.outputCycles || []),
     pendingToolConfirmation: session.busy && session.status === 'running'
       ? normalizeToolConfirmation(session.pendingToolConfirmation)
       : undefined,
@@ -3241,7 +3242,7 @@ const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
     ...step,
     messageId: assistantMessageId,
   })), [assistantMessageId, subagent.steps]);
-  const outputCycles = useMemo(() => subagent.outputCycles.map((cycle) => ({
+  const outputCycles = useMemo(() => sortBrowserChatAiOutputCycles(subagent.outputCycles).map((cycle) => ({
     ...cycle,
     messageId: assistantMessageId,
     subagentId: undefined,
@@ -3636,7 +3637,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const finalText = stringFromUnknown(message.content);
   const textStreaming = browserChatMessageIsTextStreaming(message);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
-  const aiOutputCycles = useMemo(() => outputCycles.filter((cycle) => !cycle.subagentId)
+  const aiOutputCycles = useMemo(() => sortBrowserChatAiOutputCycles(outputCycles.filter((cycle) => !cycle.subagentId)
     .map((cycle) => (showReasoning ? cycle : {
       ...cycle,
       output: {
@@ -3645,7 +3646,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
         reasoning: [],
       },
     }))
-    .filter((cycle) => hasAiOutputView(cycle.output)), [outputCycles, showReasoning]);
+    .filter((cycle) => hasAiOutputView(cycle.output))), [outputCycles, showReasoning]);
   const terminalAnswerCycleIndex = message.status === 'passed'
     ? browserChatTerminalAnswerCycleIndex(aiOutputCycles)
     : -1;
@@ -3818,10 +3819,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     || cycle.output.tools.some((_tool, index) => matchedAiCycleToolDetails.has(aiCycleToolKey(cycle.id, index)))
   )), [matchedAiCycleToolDetails, pairedAiOutputCycles]);
   const renderAiOutputCycles = useMemo(() => {
-    return [
+    return sortBrowserChatAiOutputCycles([
       ...renderedProviderCycles,
       ...syntheticHistoricalOutput.cycles,
-    ];
+    ]);
   }, [renderedProviderCycles, syntheticHistoricalOutput.cycles]);
   const aiOutputCycleEntries = useMemo(() => buildBrowserChatAiCycleRenderEntries(
     renderAiOutputCycles,

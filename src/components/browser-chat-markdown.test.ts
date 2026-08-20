@@ -66,6 +66,45 @@ test('does not turn spaced GFM table delimiters into horizontal rules', () => {
   assert.doesNotMatch(html, /<hr/);
 });
 
+test('repairs full-width list rows and a Markdown heading stuck to the next table header', () => {
+  const markdown = [
+    '#### 主区域 - 列表展示**列表字段（带过滤与排序 ↕）**：',
+    '1. 状态',
+    '2. 薪资期间',
+    '3. 开始日',
+    '4. 结束日',
+    '5. 计算时间',
+    '6. 签发时间',
+    '7. 封账时间',
+    '8. 操作',
+    '',
+    '**分页**：每页显示 100 条，当前 1/2 页，共 45 条',
+    '',
+    '**样例数据（共 3 条可见）**：',
+    '',
+    '- 待计算｜2026/05｜2026/05/01｜2026/05/31｜—｜—｜—｜操作：计算',
+    '',
+    '- 已封账｜2026/04｜2026/04/01｜2026/04/30｜2026/04/22 16:08:15｜2026/04/22 17:08:15｜2026/04/28 17:08:15｜操作：工资明细',
+    '',
+    '- 已封账｜2026/03｜2026/03/01｜2026/03/30｜2026/03/02 16:08:15｜2026/03/02 17:08:15｜2026/03/31 17:08:15｜操作：同上',
+    '',
+    '### 状态机与操作按钮矩阵| 状态 | 可用操作按钮 |',
+    '| --- | --- |',
+    '| 待计算 | 计算 |',
+    '| 待签发 | 计算、签发 |',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.match(normalized, /\| 状态 \| 薪资期间 \| 开始日 \| 结束日 \| 计算时间 \| 签发时间 \| 封账时间 \| 操作 \|/);
+  assert.match(normalized, /\| 待计算 \| 2026\/05 \| 2026\/05\/01 \| 2026\/05\/31 \| — \| — \| — \| 操作：计算 \|/);
+  assert.match(normalized, /### 状态机与操作按钮矩阵\n\n\| 状态 \| 可用操作按钮 \|/);
+  assert.equal((html.match(/<table>/g) || []).length, 2);
+  assert.match(html, /<h3>状态机与操作按钮矩阵<\/h3>/);
+});
+
 test('renders emphasized URLs correctly before Chinese punctuation', () => {
   const messages = [
     '已为您打开 **https://10.10.0.90**。需要继续操作吗？',

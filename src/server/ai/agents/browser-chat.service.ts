@@ -91,7 +91,10 @@ import {
   activeBrowserChatAssistantMessage,
   browserChatClientRecordsForMessage,
 } from '@/server/ai/agents/browser-chat-client-window';
-import { browserChatAiOutputCycleFromDebugEvent } from '@/lib/browser-chat-output-cycles';
+import {
+  browserChatAiOutputCycleFromDebugEvent,
+  sortBrowserChatAiOutputCycles,
+} from '@/lib/browser-chat-output-cycles';
 import type {
   BrowserChatAiOutputCycle,
   BrowserChatSubagentMessage,
@@ -2184,7 +2187,7 @@ function mergePersistedOutputCycles(existing: BrowserChatAiOutputCycle[] = [], i
   const byId = new Map<string, BrowserChatAiOutputCycle>();
   for (const cycle of existing) byId.set(cycle.id, cycle);
   for (const cycle of incoming) byId.set(cycle.id, cycle);
-  return [...byId.values()];
+  return sortBrowserChatAiOutputCycles([...byId.values()]);
 }
 
 function mergePersistedSubagents(existing: BrowserChatSubagentRecord[] = [], incoming: BrowserChatSubagentRecord[] = []) {
