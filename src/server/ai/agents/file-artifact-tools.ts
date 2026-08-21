@@ -500,7 +500,8 @@ export async function editFileArtifact(input: EditArtifactInput): Promise<Browse
         found.list.splice(found.index, 1);
       } else if (operation.op === 'replace') {
         if (!operation.block) throw new Error(`replace requires block for ${blockId}`);
-        const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => block.id !== blockId).map((block) => block.id));
+        const replacedIds = new Set(allBlocks([found.list[found.index]]).map((block) => block.id));
+        const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => !replacedIds.has(block.id)).map((block) => block.id));
         validateUniqueBlockIds([operation.block], remainingIds);
         found.list.splice(found.index, 1, operation.block);
       } else if (operation.op === 'update') {
