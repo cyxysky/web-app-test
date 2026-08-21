@@ -7,6 +7,7 @@ const test = require('node:test');
 const {
   applicationBasePath,
   configureCompiledNextRuntime,
+  configureNextDevelopmentRuntime,
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
@@ -53,6 +54,17 @@ test('loads the complete compiled configuration before Next initializes', () => 
   configureCompiledNextRuntime(compiledConfig, environment);
 
   assert.deepEqual(JSON.parse(environment.__NEXT_PRIVATE_STANDALONE_CONFIG), compiledConfig);
+});
+
+test('marks custom development servers before Next route modules initialize', () => {
+  const developmentEnvironment = {};
+  const productionEnvironment = {};
+
+  configureNextDevelopmentRuntime(true, developmentEnvironment);
+  configureNextDevelopmentRuntime(false, productionEnvironment);
+
+  assert.equal(developmentEnvironment.__NEXT_DEV_SERVER, '1');
+  assert.equal(productionEnvironment.__NEXT_DEV_SERVER, undefined);
 });
 
 test('does not route a prefixed upgrade when the custom server missed the base path', () => {

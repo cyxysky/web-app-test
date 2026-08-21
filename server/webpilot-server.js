@@ -53,6 +53,14 @@ function configureCompiledNextRuntime(compiledConfig, environment = process.env)
   environment.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(compiledConfig);
 }
 
+function configureNextDevelopmentRuntime(dev, environment = process.env) {
+  if (!dev) return;
+  // Next's route modules read this flag when they are constructed. Set it
+  // before spawning the API runtime or loading Next so development routes do
+  // not attempt to read production-only manifests.
+  environment.__NEXT_DEV_SERVER = '1';
+}
+
 function applicationBasePath(dev, compiledConfig, environment = process.env) {
   // Next.js emits basePath into the route and client manifests at build time.
   // Production request and WebSocket routing must use that same value rather
@@ -338,6 +346,7 @@ function proxyUpgrade(request, clientSocket, head, port, targetPath) {
 async function main() {
   const dev = process.argv.includes('--dev');
   const runtimeChildMode = process.argv.includes('--runtime-child');
+  configureNextDevelopmentRuntime(dev);
   process.env.WEBPILOT_SERVER_ROLE = runtimeChildMode ? 'runtime' : 'ui';
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
@@ -483,6 +492,7 @@ if (require.main === module) {
 module.exports = {
   applicationBasePath,
   configureCompiledNextRuntime,
+  configureNextDevelopmentRuntime,
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
