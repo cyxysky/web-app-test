@@ -5,6 +5,7 @@ import { CheckCircle2, FileSearch, RotateCcw, ShieldCheck } from 'lucide-react';
 import { FormEvent, useRef, useState } from 'react';
 import { useFilePreview } from '@/components/FilePreviewProvider';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { AppInput } from '@/components/ui/app-input';
 import styles from './TutorialSandbox.module.css';
 
 export function TutorialSandbox() {
@@ -56,7 +57,7 @@ export function TutorialSandbox() {
           </div>
           <form onSubmit={submit}>
             <label htmlFor="tutorial-name">姓名</label>
-            <input id="tutorial-name" aria-label="姓名" data-testid="tutorial-name" onChange={(event) => setName(event.target.value)} placeholder="请输入姓名" value={name} />
+            <AppInput id="tutorial-name" aria-label="姓名" data-testid="tutorial-name" onChange={(event) => setName(event.target.value)} placeholder="请输入姓名" value={name} />
 
             <label htmlFor="tutorial-department">部门</label>
             <select id="tutorial-department" aria-label="部门" data-testid="tutorial-department" onChange={(event) => setDepartment(event.target.value)} value={department}>

@@ -13,25 +13,6 @@ export const browserOperationRecordSchema = z.object({
   sourceToolIndex: z.number().optional(),
 });
 
-export const taskFrameDimensionSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  description: z.string().optional(),
-  focus: z.array(z.string()).optional(),
-  testIdeas: z.array(z.string()).optional(),
-  risks: z.array(z.string()).optional(),
-});
-
-export const taskFrameSchema = z.object({
-  goal: z.string(),
-  successCriteria: z.array(z.string()),
-  dimensions: z.array(taskFrameDimensionSchema),
-  deliverables: z.array(z.string()).optional(),
-  analysisGuidance: z.array(z.string()).optional(),
-  finalOutputRequirements: z.array(z.string()).optional(),
-  version: z.number().optional(),
-});
-
 export const skillContentSchema = z.object({
   details: z.string().default(''),
 });
@@ -61,23 +42,6 @@ export type SkillRecord = {
   updatedAt: string;
 };
 
-export type TaskFrame = z.infer<typeof taskFrameSchema>;
-
-export type TaskLedgerItem = {
-  id?: string;
-  dimensionId: string;
-  title: string;
-  summary?: string;
-  status?: 'finding' | 'issue' | 'covered' | 'risk' | 'question' | 'evidence' | 'decision';
-  severity?: 'info' | 'minor' | 'major' | 'critical';
-  expected?: string;
-  actual?: string;
-  evidence?: string[];
-  confidence?: number;
-  sourceStep?: number;
-  attributes?: Array<{ key: string; value: string }>;
-};
-
 export type StepExecutionResult = {
   index: number;
   messageId?: string;
@@ -89,11 +53,6 @@ export type StepExecutionResult = {
   tools?: StepToolCall[];
   aiRequest?: AiRequestSnapshot;
   note?: string;
-  observation?: string;
-  findings?: string[];
-  memoryItems?: string[];
-  taskFrame?: TaskFrame;
-  ledgerItems?: TaskLedgerItem[];
   screenshotPath?: string;
   beforeScreenshotPath?: string;
   afterScreenshotPath?: string;

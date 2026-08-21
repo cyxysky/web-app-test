@@ -9,7 +9,6 @@ export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 const browserChatRuntimeKeys = new Set([
-  'AI_BROWSER_MODE',
   'BROWSER_CHAT_SHOW_REASONING',
   'ELECTRON_EMBEDDED_BROWSER',
 ]);

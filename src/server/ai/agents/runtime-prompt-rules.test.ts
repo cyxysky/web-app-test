@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, browserChatCodeRules, browserChatDomRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
@@ -101,7 +101,6 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.doesNotMatch(rules, /postActionObservation|dialogs\/notices\/focus/);
   assert.doesNotMatch(rules, /FRESH_OBSERVATION_REQUIRED|shared \[page-state\] observation|mandatory pre-action freshness gate/);
 });
-
 test('screenshot guidance stays inside browserCode', () => {
   assert.match(combinedRules(true), /nodeRepl\.emitImage/);
   assert.match(combinedRules(true), /page\.screenshot/);
@@ -160,29 +159,4 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /upload-only request do not read or reconstruct the file/i);
   assert.match(rules, /deterministic batch in one bounded cell/i);
   assert.match(rules, /re-establish and verify the intended editable target and focus/i);
-});
-
-test('DOM mode requests screenshots explicitly instead of receiving automatic captures', () => {
-  const visualRules = browserChatDomRules(true).join('\n');
-  assert.match(visualRules, /No screenshot is attached automatically/);
-  assert.match(visualRules, /call takeScreenshot/);
-  assert.match(visualRules, /end that model step/);
-  assert.match(visualRules, /fresh inspect result/);
-  assert.match(visualRules, /inspect again instead of acting/);
-  assert.match(visualRules, /only kind="ref"/);
-  assert.match(visualRules, /does not compare element text, attributes, or a semantic fingerprint/);
-  assert.match(visualRules, /Playwright actionability/);
-  assert.match(visualRules, /verification\.status="failed"/);
-  assert.match(visualRules, /activeSurface/);
-  assert.match(visualRules, /topSurfaceIds/);
-  assert.match(visualRules, /informational hints about likely overlays/);
-  assert.match(visualRules, /newly opened nonmodal surface as a bounded transaction/);
-  assert.match(visualRules, /final read-only business-state and activeSurface check/);
-  assert.doesNotMatch(visualRules, /inactive-by|current-surface membership/);
-  assert.match(visualRules, /virtualized="possible"/);
-  assert.match(visualRules, /backend scans the virtual list/);
-  assert.match(visualRules, /action="editText"/);
-  assert.match(visualRules, /setSelection.*insert.*delete.*replace/);
-  assert.doesNotMatch(visualRules, /kind="semantic"/);
-  assert.doesNotMatch(browserChatDomRules(false).join('\n'), /takeScreenshot/);
 });

@@ -4,8 +4,6 @@ import { browserOperationRecordSchema } from '@/server/ai/schemas/runtime.schema
 const timestampSchema = z.string().trim().min(1);
 const nonEmptyStringSchema = z.string().trim().min(1);
 
-export const automationModeSchema = z.enum(['code', 'dom']);
-
 export const automationOperationRecordSchema = browserOperationRecordSchema.extend({
   recordedStatus: z.enum(['passed', 'failed', 'cancelled']).optional(),
   recordedResult: z.string().optional(),
@@ -21,7 +19,6 @@ export const automationCaseRecordSchema = z.object({
   sourceMessageIds: z.array(nonEmptyStringSchema),
   targetUrl: nonEmptyStringSchema,
   instruction: nonEmptyStringSchema,
-  mode: automationModeSchema,
   operations: z.array(automationOperationRecordSchema),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
@@ -126,7 +123,6 @@ export const automationScheduleRecordSchema = z.object({
   }
 });
 
-export type AutomationMode = z.infer<typeof automationModeSchema>;
 export type AutomationOperationRecord = z.infer<typeof automationOperationRecordSchema>;
 export type AutomationCaseRecord = z.infer<typeof automationCaseRecordSchema>;
 export type AutomationRunTrigger = z.infer<typeof automationRunTriggerSchema>;

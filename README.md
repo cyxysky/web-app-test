@@ -112,10 +112,7 @@ Minimal management API:
 - `PATCH /api/personal-memory/{id}`
 - `DELETE /api/personal-memory/{id}`
 
-New browser conversations use the operation mode saved in Settings:
-
-- `Code mode` executes restricted Playwright code and can fall back to stable DOM node ids.
-- `DOM mode` uses structured inspect and interact tools over visible, actionable DOM nodes.
+Browser conversations execute restricted Playwright code through `browserCode`, with AX/DOM reads, actionability checks, iframe handling, screenshots, and incremental `domChanges` available inside the same runtime.
 
 ## Reuse an Existing Browser
 

@@ -37,7 +37,7 @@ function recordedStatus(tool: StepToolCall): 'passed' | 'failed' | 'cancelled' {
 
 function isRealTool(tool: StepToolCall) {
   const name = text(tool.name);
-  return Boolean(name && name !== 'reportState' && name !== 'answer');
+  return Boolean(name && name !== 'answer');
 }
 
 function sourceStepsForMessage(session: BrowserChatSessionSnapshot, message: BrowserChatMessage) {
@@ -134,7 +134,6 @@ export function compileConversationMessagesCase(input: ConversationMessagesCaseC
     sourceMessageIds: Array.from(new Set(sourceMessageIds)),
     targetUrl: text(input.session.targetUrl) || 'about:blank',
     instruction,
-    mode: input.session.mode,
     operations,
   };
 }

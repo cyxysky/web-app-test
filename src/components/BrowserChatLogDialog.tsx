@@ -1,7 +1,8 @@
 'use client';
 
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, ChevronRight, Copy, Search, X } from 'lucide-react';
+import { type CSSProperties, useMemo, useRef, useState } from 'react';
+import { InputGroup } from '@heroui/react';
+import { ChevronRight, Copy, Search, X } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetails';
 import {
@@ -16,7 +17,7 @@ import {
 import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { asRecord, finiteNumber } from '@/lib/unknown-value';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
+import { AppModal } from '@/components/ui/app-modal';
 
 type Translator = ReturnType<typeof useI18n>['t'];
 type BrowserChatLogFilter = 'all' | 'ai' | 'tool' | 'context' | 'screenshot';
@@ -594,7 +595,6 @@ export function BrowserChatLogDialog({
   hasMore = false,
   loading = false,
   loadingMore = false,
-  messageContent,
   onClose,
   onLoadMore,
   summaryEntries,
@@ -610,10 +610,7 @@ export function BrowserChatLogDialog({
 }) {
   const { t } = useI18n();
   const [activeFilter, setActiveFilter] = useState<BrowserChatLogFilter>('all');
-  const [copied, setCopied] = useState(false);
   const [query, setQuery] = useState('');
-  const copiedResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEscapeDismiss(true, onClose);
   const summary = summarizeBrowserChatLogs(entries);
   const totals = summarizeBrowserChatExecutionTotals(summaryEntries);
   const rounds = useMemo(() => groupBrowserChatLogs(entries), [entries]);
@@ -640,32 +637,13 @@ export function BrowserChatLogDialog({
     { count: summary.screenshot, filter: 'screenshot', label: t('截图') },
   ];
 
-  useEffect(() => () => {
-    if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
-  }, []);
-
-  const copyLogs = async () => {
-    if (!entries.length || !navigator.clipboard) return;
-    const payload = [
-      messageContent ? `${t('当前 AI 消息')}: ${messageContent}` : '',
-      ...entries.map((log) => [
-        `[${formatLogTime(log.time)}] [${t(phaseLabel(log.phase))}] ${t(log.message)}`,
-        log.details || '',
-      ].filter(Boolean).join('\n')),
-    ].filter(Boolean).join('\n\n');
-    try {
-      await navigator.clipboard.writeText(payload);
-      setCopied(true);
-      if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
-      copiedResetTimer.current = setTimeout(() => setCopied(false), 1600);
-    } catch {
-      setCopied(false);
-    }
-  };
-
   return (
-    <div className="ui-modal-overlay browser-chat-log-dialog-overlay" onClick={onClose} role="presentation">
-      <section aria-labelledby="browser-chat-log-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide browser-chat-log-dialog" onClick={(event) => event.stopPropagation()} role="dialog">
+    <AppModal
+      ariaLabelledBy="browser-chat-log-dialog-title"
+      dialogClassName="browser-chat-log-dialog"
+      onClose={onClose}
+      size="log"
+    >
         <header className="ui-modal-header browser-chat-log-dialog-header">
           <div className="ui-modal-heading">
             <div className="browser-chat-log-title-row">
@@ -681,12 +659,6 @@ export function BrowserChatLogDialog({
             </p>
           </div>
           <div className="browser-chat-log-header-actions">
-            {entries.length ? (
-              <button className="browser-chat-log-copy-button" onClick={() => void copyLogs()} type="button">
-                {copied ? <Check size={16} /> : <Copy size={16} />}
-                {t(copied ? '已复制' : '复制日志')}
-              </button>
-            ) : null}
             <button className="ui-icon-button ui-modal-close" onClick={onClose} type="button" aria-label={t('关闭')}>
               <X size={19} />
             </button>
@@ -709,16 +681,16 @@ export function BrowserChatLogDialog({
                   </button>
                 ))}
               </div>
-              <label className="browser-chat-log-search">
-                <Search aria-hidden="true" size={16} />
-                <input
+              <InputGroup fullWidth>
+                <InputGroup.Prefix><Search aria-hidden="true" size={16} /></InputGroup.Prefix>
+                <InputGroup.Input
                   aria-label={t('搜索日志')}
                   onChange={(event) => setQuery(event.target.value)}
                   placeholder={t('搜索日志')}
                   type="search"
                   value={query}
                 />
-              </label>
+              </InputGroup>
             </div>
           ) : null}
           {filteredRounds.length ? (
@@ -739,7 +711,6 @@ export function BrowserChatLogDialog({
             </button>
           ) : null}
         </div>
-      </section>
-    </div>
+    </AppModal>
   );
 }

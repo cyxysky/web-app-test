@@ -68,7 +68,7 @@
 
 .browser-chat-nav-item,
 .browser-chat-subnav button {
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--muted-strong);
   font-size: 13px;
   font-weight: 500;
@@ -77,13 +77,13 @@
 
 .browser-chat-nav-item.active,
 .browser-chat-subnav button.active {
-  background: var(--surface-active);
+  background: var(--app-surface-active);
   color: var(--foreground);
 }
 
 .browser-chat-nav-item:hover,
 .browser-chat-subnav button:hover {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
   color: var(--foreground);
 }
 
@@ -101,7 +101,7 @@
 
 .browser-chat-recent-item {
   align-items: center;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   display: grid;
   gap: 2px;
   grid-template-columns: minmax(0, 1fr) 28px;
@@ -111,7 +111,7 @@
 
 .browser-chat-recent-item:hover,
 .browser-chat-recent-item.active {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
 }
 
 .browser-chat-recent-item.active {
@@ -161,7 +161,7 @@
   align-items: center;
   background: transparent;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--muted-strong);
   cursor: pointer;
   display: flex;
@@ -229,7 +229,7 @@
 
 .workspace-sidebar-archive-row {
   align-items: center;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   min-height: 38px;
@@ -239,7 +239,7 @@
 
 .workspace-sidebar-archive-row:hover,
 .workspace-sidebar-archive-row.active {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
 }
 
 .workspace-sidebar-archive-row-open {
@@ -340,43 +340,49 @@
 }
 
 .browser-chat-overflow {
+  align-items: center;
+  display: inline-flex;
   position: relative;
 }
 
-.browser-chat-overflow > summary {
+.browser-chat-overflow .browser-chat-overflow-trigger {
   align-items: center;
+  border: 0;
   border-radius: 7px;
   color: var(--muted);
   cursor: pointer;
   display: inline-flex;
+  gap: 0;
   height: 28px;
   justify-content: center;
   list-style: none;
+  min-height: 28px;
+  min-width: 28px;
+  padding: 0;
   width: 28px;
 }
 
-.browser-chat-overflow > summary::-webkit-details-marker {
-  display: none;
-}
-
-.browser-chat-overflow > summary:hover,
-.browser-chat-overflow[open] > summary {
+.browser-chat-overflow .browser-chat-overflow-trigger:hover,
+.browser-chat-overflow[data-open="true"] .browser-chat-overflow-trigger {
   background: transparent;
   color: var(--foreground);
 }
 
-.browser-chat-overflow-menu {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  box-shadow: 0 12px 28px color-mix(in srgb, #000000 18%, transparent);
+.browser-chat-overflow-popover {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+.browser-chat-popover-actions {
   display: grid;
   gap: 2px;
   min-width: 168px;
-  padding: 5px;
+  padding: 4px;
 }
 
-.browser-chat-overflow-menu button {
+.browser-chat-popover-actions button {
   align-items: center;
   background: transparent;
   border: 0;
@@ -394,15 +400,15 @@
   white-space: nowrap;
 }
 
-.browser-chat-overflow-menu button:hover {
+.browser-chat-popover-actions button:hover {
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
 }
 
-.browser-chat-overflow-menu button.danger {
+.browser-chat-popover-actions button.danger {
   color: var(--danger);
 }
 
-.browser-chat-overflow-menu button:disabled {
+.browser-chat-popover-actions button:disabled {
   cursor: not-allowed;
   opacity: 0.48;
 }
@@ -553,7 +559,7 @@
 .automation-case-history-item:active {
   align-items: center;
   background: transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   box-shadow: none;
   color: var(--foreground);
   display: grid;
@@ -585,12 +591,12 @@
 }
 
 .automation-case-history-item:hover {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
 }
 
 .automation-case-history-item.active,
 .automation-case-history-item.active:hover {
-  background: var(--surface-active);
+  background: var(--app-surface-active);
 }
 
 .automation-case-history-copy {
@@ -1315,7 +1321,7 @@
 
   .browser-chat-mobile-history-trigger {
     align-items: center;
-    background: var(--surface-hover);
+    background: var(--app-surface-hover);
     border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
     border-radius: 10px;
     color: var(--foreground);
@@ -1502,7 +1508,7 @@
     padding: 10px 16px max(12px, env(safe-area-inset-bottom));
   }
 
-  :where(input, textarea, select, [contenteditable="true"]) {
+  :where(input, textarea, select, [contenteditable="true"]):not([data-slot], [data-slot] *) {
     font-size: 16px;
   }
 
@@ -1537,7 +1543,7 @@
 
 /* Touch devices: enlarge controls only inside the requested surfaces. */
 @media (hover: none), (pointer: coarse) {
-  :where(button, a, input, textarea, select, summary, [role="button"], [role="separator"]) {
+  :where(button, a, input, textarea, select, summary, [role="button"], [role="separator"]):not([data-slot], [data-slot] *) {
     touch-action: manipulation;
   }
 
@@ -1564,7 +1570,7 @@
     .browser-chat-nav-item,
     .browser-chat-subnav button,
     .browser-chat-theme-toggle,
-    .browser-chat-overflow > summary
+    .browser-chat-overflow-trigger
   ),
   .browser-chat-embedded-browser :is(
     .browser-chat-embedded-tool-button,
@@ -1573,7 +1579,7 @@
     min-height: 44px;
   }
 
-  .browser-chat-sidebar :is(.ui-icon-button, .browser-chat-overflow > summary),
+  .browser-chat-sidebar :is(.ui-icon-button, .browser-chat-overflow-trigger),
   .browser-chat-embedded-browser :is(
     .browser-chat-embedded-tool-button,
     .browser-chat-embedded-new-group

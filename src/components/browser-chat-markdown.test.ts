@@ -27,6 +27,44 @@ test('keeps valid Markdown and code spans intact', () => {
   assert.equal(normalizeBrowserChatMarkdown(markdown), markdown);
 });
 
+test('repairs a fenced code block attached to preceding prose', () => {
+  const markdown = '安全提醒：关闭端口 ```bash\nfirewall-cmd --reload\n```\n\n### 关键点\n\n- 后续正文';
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.match(normalized, /关闭端口\n```bash/);
+  assert.match(html, /<pre><code class="language-bash">firewall-cmd --reload/);
+  assert.match(html, /<h3>关键点<\/h3>/);
+  assert.match(html, /<li>后续正文<\/li>/);
+});
+
+test('keeps the text after an attached shell fence outside the code block', () => {
+  const markdown = [
+    '**第 5 步（⚠️ 安全提醒）**：执行**安全扫描**时，必须把 9200 端口关闭，否则会扫出漏洞```bash',
+    'firewall-cmd --permanent --remove-port=9200/tcp',
+    'firewall-cmd --reload',
+    '```',
+    '',
+    '---',
+    '',
+    '### 💡 这份文档的关键点',
+    '',
+    '1. **是个 Chrome 浏览器扩展插件**',
+    '2. **核心价值**：让 Elasticsearch 的数据查看更直观',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.match(normalized, /漏洞\n```bash/);
+  assert.equal((html.match(/<pre>/g) || []).length, 1);
+  assert.match(html, /<h3>💡 这份文档的关键点<\/h3>/);
+  assert.match(html, /<li><strong>核心价值<\/strong>：让 Elasticsearch 的数据查看更直观<\/li>/);
+});
+
 test('keeps a hash table header and artifact links as one GFM table', () => {
   const markdown = [
     '## 文件下载',

@@ -6,8 +6,8 @@ import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetail
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { artifactApiUrl } from '@/lib/artifacts';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
+import { AppModal } from '@/components/ui/app-modal';
 
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 
@@ -107,7 +107,6 @@ export function BrowserChatToolDialog({
   const [wrapOutput, setWrapOutput] = useState(true);
   const [copied, setCopied] = useState(false);
   const copiedResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEscapeDismiss(true, onClose);
   const toolName = toolLabel(detail.tool.name);
   const status = toolStatusLabel(detail.tool, detail.step);
   const emptyPayloadLabel = t('无');
@@ -135,8 +134,12 @@ export function BrowserChatToolDialog({
   };
 
   return (
-    <div className="ui-modal-overlay browser-chat-tool-dialog-overlay" onClick={onClose} role="presentation">
-      <section aria-labelledby="browser-chat-tool-dialog-title" aria-modal="true" className="ui-modal ui-modal--wide browser-chat-tool-dialog" onClick={(event) => event.stopPropagation()} role="dialog">
+    <AppModal
+      ariaLabelledBy="browser-chat-tool-dialog-title"
+      dialogClassName="browser-chat-tool-dialog"
+      onClose={onClose}
+      size="log"
+    >
         <header className="ui-modal-header browser-chat-tool-dialog-header">
           <div className="ui-modal-heading">
             <h2 className="ui-modal-title" id="browser-chat-tool-dialog-title" title={detail.tool.name}>{toolName}</h2>
@@ -266,7 +269,6 @@ export function BrowserChatToolDialog({
             </section>
           </div>
         </div>
-      </section>
-    </div>
+    </AppModal>
   );
 }

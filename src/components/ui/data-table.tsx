@@ -1,36 +1,46 @@
 'use client';
 
-import { Fragment, useMemo, useState, type ReactNode } from 'react';
-import {
-  flexRender,
-  getCoreRowModel,
-  getSortedRowModel,
-  useReactTable,
-  type ColumnDef,
-  type SortingState,
-} from '@tanstack/react-table';
-import { ArrowDown, ArrowUp, ArrowUpDown } from 'lucide-react';
+import { Table, type SortDescriptor } from '@heroui/react';
+import { useDeferredValue, useMemo, useState, type ReactNode } from 'react';
 
 export type DataTableColumn<T> = {
   accessor?: (item: T) => number | string | null | undefined;
   cell: (item: T) => ReactNode;
   className?: string;
   header: ReactNode;
-  headerActions?: ReactNode;
   id: string;
   sortable?: boolean;
 };
 
+type RenderRow<T> = {
+  content?: ReactNode;
+  id: string;
+  item: T;
+  kind: 'data' | 'expanded';
+};
+
+const tableValueCollator = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: 'base',
+});
+
+function compareValues(
+  left: number | string | null | undefined,
+  right: number | string | null | undefined,
+) {
+  if (left == null && right == null) return 0;
+  if (left == null) return 1;
+  if (right == null) return -1;
+  if (typeof left === 'number' && typeof right === 'number') return left - right;
+  return tableValueCollator.compare(String(left), String(right));
+}
+
 export function DataTable<T>({
-  className = '',
   columns,
-  compact = false,
   data,
   emptyText,
   getRowId,
-  minWidth,
   renderExpandedRow,
-  rowClassName,
 }: {
   className?: string;
   columns: DataTableColumn<T>[];
@@ -42,87 +52,73 @@ export function DataTable<T>({
   renderExpandedRow?: (item: T) => ReactNode;
   rowClassName?: (item: T) => string | undefined;
 }) {
-  const [sorting, setSorting] = useState<SortingState>([]);
-  const tableColumns = useMemo<ColumnDef<T>[]>(() => columns.map((column): ColumnDef<T> => {
-    const definition = {
-      cell: ({ row }: { row: { original: T } }) => column.cell(row.original),
-      enableSorting: column.sortable !== false && Boolean(column.accessor),
-      header: () => column.header,
-      id: column.id,
-      meta: { className: column.className },
-    };
-    return column.accessor ? { ...definition, accessorFn: column.accessor } : definition;
-  }), [columns]);
-  const table = useReactTable({
-    columns: tableColumns,
-    data,
-    getCoreRowModel: getCoreRowModel(),
-    getRowId: (row) => getRowId(row),
-    getSortedRowModel: getSortedRowModel(),
-    onSortingChange: setSorting,
-    state: { sorting },
-  });
+  const [sortDescriptor, setSortDescriptor] = useState<SortDescriptor>();
+  const deferredSortDescriptor = useDeferredValue(sortDescriptor);
+  const sortedData = useMemo(() => {
+    if (!deferredSortDescriptor) return data;
+    const column = columns.find((candidate) => candidate.id === String(deferredSortDescriptor.column));
+    if (!column?.accessor || column.sortable === false) return data;
+    const accessor = column.accessor;
+    const multiplier = deferredSortDescriptor.direction === 'descending' ? -1 : 1;
+    return data
+      .map((item, index) => ({ index, item, value: accessor(item) }))
+      .sort((left, right) => (
+        multiplier * compareValues(left.value, right.value) || left.index - right.index
+      ))
+      .map(({ item }) => item);
+  }, [columns, data, deferredSortDescriptor]);
+  const rows = useMemo<RenderRow<T>[]>(() => sortedData.flatMap((item) => {
+    const id = getRowId(item);
+    const content = renderExpandedRow?.(item);
+    return content
+      ? [
+        { id, item, kind: 'data' as const },
+        { content, id: `${id}:expanded`, item, kind: 'expanded' as const },
+      ]
+      : [{ id, item, kind: 'data' as const }];
+  }), [getRowId, renderExpandedRow, sortedData]);
 
   return (
-    <div className={`openstatus-data-table${compact ? ' is-compact' : ''}${className ? ` ${className}` : ''}`}>
-      <div className="openstatus-data-table-scroll">
-        <table style={minWidth ? { minWidth } : undefined}>
-          <thead>
-            {table.getHeaderGroups().map((headerGroup) => (
-              <tr key={headerGroup.id}>
-                {headerGroup.headers.map((header) => {
-                  const meta = header.column.columnDef.meta as { className?: string } | undefined;
-                  const sorted = header.column.getIsSorted();
-                  return (
-                    <th className={meta?.className} key={header.id} scope="col">
-                      {header.isPlaceholder ? null : (
-                        <div className="openstatus-data-table-heading">
-                          {header.column.getCanSort() ? (
-                            <button
-                              aria-label={`按 ${header.column.id} 排序`}
-                              className="openstatus-data-table-sort"
-                              onClick={header.column.getToggleSortingHandler()}
-                              type="button"
-                            >
-                              <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>
-                              {sorted === 'asc' ? <ArrowUp size={13} /> : sorted === 'desc' ? <ArrowDown size={13} /> : <ArrowUpDown size={13} />}
-                            </button>
-                          ) : <span>{flexRender(header.column.columnDef.header, header.getContext())}</span>}
-                          {columns.find((column) => column.id === header.column.id)?.headerActions}
-                        </div>
-                      )}
-                    </th>
-                  );
-                })}
-              </tr>
+    <Table>
+      <Table.ScrollContainer>
+        <Table.Content
+          aria-label="Data table"
+          onSortChange={setSortDescriptor}
+          sortDescriptor={sortDescriptor}
+        >
+          <Table.Header>
+            {columns.map((column, index) => (
+              <Table.Column
+                allowsSorting={column.sortable !== false && Boolean(column.accessor)}
+                id={column.id}
+                isRowHeader={index === 0}
+                key={column.id}
+              >
+                {({ sortDirection }) => column.sortable !== false && column.accessor ? (
+                  <Table.SortableColumnHeader sortDirection={sortDirection}>
+                    {column.header}
+                  </Table.SortableColumnHeader>
+                ) : <span>{column.header}</span>}
+              </Table.Column>
             ))}
-          </thead>
-          <tbody>
-            {table.getRowModel().rows.length ? table.getRowModel().rows.map((row) => {
-              const expanded = renderExpandedRow?.(row.original);
-              return (
-                <Fragment key={row.id}>
-                  <tr className={rowClassName?.(row.original)}>
-                    {row.getVisibleCells().map((cell) => {
-                      const meta = cell.column.columnDef.meta as { className?: string } | undefined;
-                      return <td className={meta?.className} key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>;
-                    })}
-                  </tr>
-                  {expanded ? (
-                    <tr className="openstatus-data-table-expanded-row">
-                      <td colSpan={row.getVisibleCells().length}>{expanded}</td>
-                    </tr>
-                  ) : null}
-                </Fragment>
-              );
-            }) : (
-              <tr className="openstatus-data-table-empty-row">
-                <td colSpan={columns.length}>{emptyText}</td>
-              </tr>
+          </Table.Header>
+          <Table.Body items={rows} renderEmptyState={() => (
+            <div>{emptyText}</div>
+          )}>
+            {(row) => row.kind === 'expanded' ? (
+              <Table.Row id={row.id}>
+                <Table.Cell colSpan={columns.length}>{row.content}</Table.Cell>
+              </Table.Row>
+            ) : (
+              <Table.Row id={row.id}>
+                {columns.map((column) => (
+                  <Table.Cell key={column.id}>{column.cell(row.item)}</Table.Cell>
+                ))}
+              </Table.Row>
             )}
-          </tbody>
-        </table>
-      </div>
-    </div>
+          </Table.Body>
+        </Table.Content>
+      </Table.ScrollContainer>
+    </Table>
   );
 }

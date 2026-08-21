@@ -1,6 +1,7 @@
 'use client';
 
 import { useDeferredValue, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { InputGroup } from '@heroui/react';
 import { ChevronDown, Globe2, Search, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 import {
@@ -66,20 +67,21 @@ export function DomainGroupedAccordion<T>({
   return (
     <div className={rootClassName}>
       <div className="domain-list-toolbar">
-        <label className="domain-list-search">
-          <Search size={15} />
-          <input
+        <div className="domain-list-search">
+          <InputGroup fullWidth>
+            <InputGroup.Prefix><Search size={15} /></InputGroup.Prefix>
+            <InputGroup.Input
             aria-label={searchPlaceholder}
-            className="domain-list-search-input"
             onChange={(event) => setQuery(event.target.value)}
             placeholder={searchPlaceholder}
             type="search"
             value={query}
-          />
-          {query ? (
-            <button aria-label={t('清空筛选')} onClick={() => setQuery('')} type="button"><X size={14} /></button>
-          ) : null}
-        </label>
+            />
+            {query ? (
+              <InputGroup.Suffix><button aria-label={t('清空筛选')} onClick={() => setQuery('')} type="button"><X size={14} /></button></InputGroup.Suffix>
+            ) : null}
+          </InputGroup>
+        </div>
         <div className="domain-list-toolbar-meta">
           <span className="domain-list-count">{t('显示 {visible} / {total} 条', { visible: result.filteredCount, total: items.length })}</span>
           {toolbarActions}

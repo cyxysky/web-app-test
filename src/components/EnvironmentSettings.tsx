@@ -1,8 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { TextArea } from '@heroui/react';
 import Link from 'next/link';
-import { createPortal } from 'react-dom';
 import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
@@ -16,7 +16,6 @@ import {
   type SettingsTab,
 } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { languageOptions } from '@/i18n/language';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
@@ -27,6 +26,9 @@ import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { ManagementDataTable } from '@/components/ManagementDataTable';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
+import { ColorPickerField } from '@/components/ui/color-picker-field';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import {
   environmentSettingsTabs,
@@ -255,7 +257,7 @@ export function EnvironmentSettings({
   const shouldLoadEnvironmentConfig = !controlledActiveTab
     || !['skills', 'memory', 'accounts'].includes(controlledActiveTab);
   const { language, setLanguage, t } = useI18n();
-  const { color, currentColor, scrollbarColor, setColor, setScrollbarColor } = useTheme();
+  const { color, scrollbarColor, setColor, setScrollbarColor } = useTheme();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
@@ -270,7 +272,6 @@ export function EnvironmentSettings({
   const [deletingLoginAccountId, setDeletingLoginAccountId] = useState('');
   const [deleteLoginAccountTarget, setDeleteLoginAccountTarget] = useState<LoginAccountMetadata | null>(null);
   const [deleteLoginAccountError, setDeleteLoginAccountError] = useState('');
-  const [portalReady, setPortalReady] = useState(false);
   const [loading, setLoading] = useState(!initialData && shouldLoadEnvironmentConfig && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
@@ -308,17 +309,6 @@ export function EnvironmentSettings({
   // The server snapshot is immutable for this component instance; saves update local state directly.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminSettingsAccessToken, adminSettingsPasswordRequired]);
-
-  useEffect(() => {
-    setPortalReady(true);
-  }, []);
-
-  useEscapeDismiss(Boolean(personalMemoryEditorMode || deletePersonalMemoryTarget || deleteLoginAccountTarget), () => {
-    if (savingPersonalMemory || deletingPersonalMemoryId || deletingLoginAccountId) return;
-    if (personalMemoryEditorMode) closePersonalMemoryEditor();
-    if (deletePersonalMemoryTarget) closeDeletePersonalMemoryModal();
-    if (deleteLoginAccountTarget) closeDeleteLoginAccountModal();
-  });
 
   async function load() {
     setLoading(true);
@@ -714,8 +704,8 @@ export function EnvironmentSettings({
     if (definition?.control === 'textarea') {
       return (
         <div className="settings-prompt-control">
-          <textarea
-            className="textarea settings-control settings-textarea-control"
+          <TextArea
+            fullWidth
             placeholder={t('未设置')}
             value={item.value}
             onChange={(event) => update(index, { value: event.target.value })}
@@ -727,8 +717,7 @@ export function EnvironmentSettings({
     if (definition?.picker === 'directory') {
       return (
         <div className="settings-directory-control">
-          <input
-            className="input settings-control"
+          <AppInput
             placeholder={t('未设置')}
             type="text"
             value={item.value}
@@ -749,8 +738,7 @@ export function EnvironmentSettings({
     }
 
     return (
-      <input
-        className="input settings-control"
+      <AppInput
         inputMode={definition?.control === 'number' ? 'decimal' : undefined}
         min={definition?.min}
         max={definition?.max}
@@ -764,16 +752,16 @@ export function EnvironmentSettings({
   }
 
   function renderPersonalMemoryEditorModal() {
-    if (!personalMemoryEditorMode || !portalReady) return null;
+    if (!personalMemoryEditorMode) return null;
     const editing = personalMemoryEditorMode === 'edit';
-    return createPortal((
-      <div className="ui-modal-overlay">
-        <section
-          aria-labelledby="personal-memory-modal-title"
-          aria-modal="true"
-          className="ui-modal ui-modal--personal-memory"
-          role="dialog"
-        >
+    return (
+      <AppModal
+        ariaLabelledBy="personal-memory-modal-title"
+        dismissable={!savingPersonalMemory}
+        keyboardDismissable={!savingPersonalMemory}
+        onClose={closePersonalMemoryEditor}
+        size="wide"
+      >
           <header className="ui-modal-header">
             <div className="ui-modal-heading">
               <h2 className="ui-modal-title" id="personal-memory-modal-title">{t(editing ? '编辑记忆' : '新增记忆')}</h2>
@@ -796,8 +784,7 @@ export function EnvironmentSettings({
             </label>
             <label className="personal-memory-field">
               <span>{t('域名')}</span>
-              <input
-                className="input settings-control"
+              <AppInput
                 disabled={personalMemoryDraft.scope !== 'domain'}
                 placeholder="jira.company.local"
                 value={personalMemoryDraft.domain}
@@ -831,8 +818,7 @@ export function EnvironmentSettings({
             </div>
             <label className="personal-memory-field">
               <span>{t('常用短语')}</span>
-              <input
-                className="input settings-control"
+              <AppInput
                 placeholder="jira"
                 value={personalMemoryDraft.key}
                 onChange={(event) => updatePersonalMemoryDraft({ key: event.target.value })}
@@ -840,8 +826,7 @@ export function EnvironmentSettings({
             </label>
             <label className="personal-memory-field">
               <span>{t('等价说法')}</span>
-              <input
-                className="input settings-control"
+              <AppInput
                 placeholder={t('逗号或换行分隔')}
                 value={personalMemoryDraft.aliasesText}
                 onChange={(event) => updatePersonalMemoryDraft({ aliasesText: event.target.value })}
@@ -849,8 +834,8 @@ export function EnvironmentSettings({
             </label>
             <label className="personal-memory-field wide">
               <span>{t('说明')}</span>
-              <textarea
-                className="textarea settings-control"
+              <TextArea
+                fullWidth
                 placeholder={t('公司私域 Jira，地址是 ...')}
                 value={personalMemoryDraft.value}
                 onChange={(event) => updatePersonalMemoryDraft({ value: event.target.value })}
@@ -883,13 +868,12 @@ export function EnvironmentSettings({
               {t(editing ? '保存记忆' : '新增记忆')}
             </button>
           </footer>
-        </section>
-      </div>
-    ), document.body);
+      </AppModal>
+    );
   }
 
   function renderDeletePersonalMemoryModal() {
-    if (!deletePersonalMemoryTarget || !portalReady) return null;
+    if (!deletePersonalMemoryTarget) return null;
     const deleting = deletingPersonalMemoryId === deletePersonalMemoryTarget.id;
     return (
       <ConfirmDeleteModal
@@ -906,7 +890,7 @@ export function EnvironmentSettings({
   }
 
   function renderDeleteLoginAccountModal() {
-    if (!deleteLoginAccountTarget || !portalReady) return null;
+    if (!deleteLoginAccountTarget) return null;
     const deleting = deletingLoginAccountId === deleteLoginAccountTarget.id;
     return (
       <ConfirmDeleteModal
@@ -1025,7 +1009,6 @@ export function EnvironmentSettings({
                       </button>
                       <span className="personal-memory-status-label">{t(item.status === 'active' ? '启用' : '禁用')}</span>
                     </div>
-                    {item.useCount ? <small>{t('使用 {count} 次', { count: item.useCount })}</small> : null}
                   </div>
                 ),
               },
@@ -1180,7 +1163,6 @@ export function EnvironmentSettings({
                 render: (account) => (
                   <div className="management-table-cell-stack">
                     <span>{t(account.status === 'active' ? '可用于目标测试' : '已停用')}</span>
-                    {account.useCount ? <small>{t('已使用 {count} 次', { count: account.useCount })}</small> : null}
                   </div>
                 ),
               },
@@ -1324,16 +1306,11 @@ export function EnvironmentSettings({
                     <span>{t('调整按钮、滚动条和高亮状态使用的主题色。')}</span>
                   </div>
                   <div className="theme-color-picker">
-                    <label>
-                      <span style={{ backgroundColor: currentColor.accent }} />
-                      <input
-                        aria-label={t('主题色')}
-                        type="color"
-                        value={color}
-                        onChange={(event) => setColor(event.target.value)}
-                      />
-                    </label>
-                    <code>{color.toUpperCase()}</code>
+                    <ColorPickerField
+                      ariaLabel={t('主题色')}
+                      onChange={setColor}
+                      value={color}
+                    />
                   </div>
                 </div>
                 <div className="settings-row">
@@ -1342,16 +1319,11 @@ export function EnvironmentSettings({
                     <span>{t('自定义全局滚动条滑块颜色。')}</span>
                   </div>
                   <div className="theme-color-picker">
-                    <label>
-                      <span style={{ backgroundColor: scrollbarColor }} />
-                      <input
-                        aria-label={t('滚动条滑块颜色')}
-                        type="color"
-                        value={scrollbarColor}
-                        onChange={(event) => setScrollbarColor(event.target.value)}
-                      />
-                    </label>
-                    <code>{scrollbarColor.toUpperCase()}</code>
+                    <ColorPickerField
+                      ariaLabel={t('滚动条滑块颜色')}
+                      onChange={setScrollbarColor}
+                      value={scrollbarColor}
+                    />
                   </div>
                 </div>
               </div>
@@ -1436,8 +1408,7 @@ export function EnvironmentSettings({
                   <div className="settings-model-list-control">
                     {activeProviderModels.map((model, index) => (
                       <div className="settings-model-input-row" key={`${activeProvider}-${index}`}>
-                        <input
-                          className="input settings-control"
+                        <AppInput
                           disabled={!activeProviderEnabled}
                           value={model}
                           onChange={(event) => updateActiveProviderModel(index, event.target.value)}
@@ -1466,8 +1437,7 @@ export function EnvironmentSettings({
                     <strong>{t('访问密钥')}</strong>
                     <span>{t(activeProviderOption.keyLabel)}</span>
                   </div>
-                  <input
-                    className="input settings-control"
+                  <AppInput
                     disabled={Boolean(activeProviderOption.localAuth)}
                     type="password"
                     value={activeProviderSettings.apiKey || ''}
@@ -1485,7 +1455,7 @@ export function EnvironmentSettings({
                       <strong>{t(activeProviderOption.baseUrlLabel)}</strong>
                       <span>{t('自定义兼容服务地址，留空使用默认地址。')}</span>
                     </div>
-                    <input className="input settings-control" value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || t('默认地址')} />
+                    <AppInput value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || t('默认地址')} />
                   </div>
                 ) : null}
               </div>

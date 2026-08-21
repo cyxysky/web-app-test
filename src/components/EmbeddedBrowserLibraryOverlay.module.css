@@ -208,7 +208,7 @@
   align-items: center;
   background: transparent;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--foreground);
   cursor: pointer;
   display: grid;

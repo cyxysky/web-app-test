@@ -1,71 +1,128 @@
-export type OfficeThemePreset = 'professional' | 'minimal' | 'executive' | 'warm';
-
-export type OfficeTheme = {
-  preset?: OfficeThemePreset;
-  primaryColor?: string;
-  accentColor?: string;
-  bodyColor?: string;
-  backgroundColor?: string;
-  fontFamily?: string;
-};
-
 export type OfficeCellValue = string | number | boolean | null;
 
-export type OfficeSheetColumn = {
-  format?: string;
-  index: number;
-  width?: number;
-};
+export type OfficeDocumentKind = 'presentation' | 'spreadsheet' | 'word';
 
-export type OfficeSheetFormula = {
-  cell: string;
-  formula: string;
-};
+export type OfficeBlockType =
+  | 'page'
+  | 'sheet'
+  | 'text'
+  | 'heading'
+  | 'list'
+  | 'quote'
+  | 'code'
+  | 'image'
+  | 'svg'
+  | 'chart'
+  | 'table'
+  | 'card'
+  | 'columns'
+  | 'metric'
+  | 'timeline'
+  | 'shape'
+  | 'divider'
+  | 'spacer'
+  | 'pageBreak';
 
-export type OfficeSheetRangeStyle = {
+export type OfficeBlockStyle = {
+  align?: 'center' | 'justify' | 'left' | 'right';
   backgroundColor?: string;
-  bold?: boolean;
+  borderColor?: string;
+  borderRadius?: number;
+  borderWidth?: number;
   color?: string;
-  horizontal?: 'center' | 'left' | 'right';
-  numberFormat?: string;
-  range: string;
+  fontFamily?: string;
+  fontSize?: number;
+  fontStyle?: 'italic' | 'normal';
+  fontWeight?: number | string;
+  gap?: number;
+  height?: number | string;
+  lineHeight?: number;
+  margin?: number | number[];
+  opacity?: number;
+  padding?: number | number[];
+  rotation?: number;
+  width?: number | string;
+  x?: number | string;
+  y?: number | string;
+  [property: string]: unknown;
 };
 
-export type OfficeSheetChart = {
-  range: string;
-  title?: string;
-  type: 'area' | 'bar' | 'column' | 'line' | 'pie';
-};
-
-export type OfficeSheetSpec = {
-  autoFilter?: boolean;
-  charts?: OfficeSheetChart[];
-  columns?: OfficeSheetColumn[];
-  formulas?: OfficeSheetFormula[];
-  freezeColumns?: number;
-  freezeRows?: number;
-  headerRows?: number;
-  landscape?: boolean;
-  merges?: string[];
+export type OfficeBlock = {
+  id: string;
+  type: OfficeBlockType | (string & {});
+  alt?: string;
+  caption?: string;
+  children?: OfficeBlock[];
+  columns?: Array<{ blocks?: OfficeBlock[]; width?: number | string }>;
+  data?: unknown;
+  items?: unknown[];
+  language?: string;
+  level?: number;
+  markdown?: string;
   name?: string;
-  rows: OfficeCellValue[][];
-  styles?: OfficeSheetRangeStyle[];
+  rows?: OfficeCellValue[][];
+  source?: string;
+  style?: OfficeBlockStyle;
+  svg?: string;
+  text?: string;
+  title?: string;
+  [property: string]: unknown;
 };
 
-export type OfficeSlideSpec = {
-  bullets?: string[];
-  content?: string;
-  subtitle?: string;
+export type OfficeDocumentSettings = {
+  author?: string;
+  defaultStyle?: OfficeBlockStyle;
+  description?: string;
+  language?: string;
+  metadata?: Record<string, unknown>;
+  page?: {
+    backgroundColor?: string;
+    footer?: string;
+    header?: string;
+    height?: number;
+    marginBottom?: number;
+    marginLeft?: number;
+    marginRight?: number;
+    marginTop?: number;
+    orientation?: 'landscape' | 'portrait';
+    showPageNumber?: boolean;
+    width?: number;
+    [property: string]: unknown;
+  };
   title?: string;
+  [property: string]: unknown;
 };
 
 export type OfficeDocumentSpec = {
-  content?: string | null;
-  documentType?: 'presentation' | 'spreadsheet' | 'word';
+  blocks: OfficeBlock[];
+  document: OfficeDocumentSettings;
+  documentType: OfficeDocumentKind;
   fileName: string;
-  sheets?: OfficeSheetSpec[];
-  slides?: OfficeSlideSpec[];
-  subtitle?: string | null;
-  theme?: OfficeTheme;
-  title?: string | null;
+};
+
+export type OfficeDocumentOutlineItem = {
+  id: string;
+  title: string;
+  purpose?: string;
+  suggestedBlocks?: string[];
+};
+
+export type OfficeDocumentDraft = OfficeDocumentSpec & {
+  createdAt: string;
+  documentId: string;
+  intent?: string;
+  outline?: OfficeDocumentOutlineItem[];
+  updatedAt: string;
+};
+
+export type OfficeDocumentEditOperation = {
+  op: 'add' | 'move' | 'remove' | 'replace' | 'setDocument' | 'update';
+  afterId?: string;
+  beforeId?: string;
+  block?: OfficeBlock;
+  blockId?: string;
+  blockIds?: string[];
+  blocks?: OfficeBlock[];
+  parentId?: string;
+  patch?: Record<string, unknown>;
 };

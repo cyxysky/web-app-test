@@ -199,24 +199,12 @@ export function browserChatSubagentMessagesFromProgress(input: {
   return limitBrowserChatSubagentMessages(input.subagentId, messages);
 }
 
-function browserChatSubagentExplicitReportStatus(steps: readonly StepExecutionResult[]) {
-  const report = [...steps]
-    .flatMap((step) => step.tools || [])
-    .filter((tool) => tool.name === 'reportState')
-    .at(-1);
-  if (!report?.input || typeof report.input !== 'object' || Array.isArray(report.input)) return '';
-  const status = (report.input as Record<string, unknown>).status;
-  return status === 'failed' || status === 'blocked' || status === 'passed' ? status : '';
-}
-
 export function resolvedBrowserChatSubagentStatus(input: {
   status: 'passed' | 'failed' | 'blocked';
   summary: string;
   steps: readonly StepExecutionResult[];
 }) {
   if (input.status !== 'failed' || !input.summary.trim()) return input.status;
-  const explicitReportStatus = browserChatSubagentExplicitReportStatus(input.steps);
-  if (explicitReportStatus === 'failed' || explicitReportStatus === 'blocked') return explicitReportStatus;
   const terminalStep = input.steps.at(-1);
   if (/request.*failed|retries were exhausted|response handling failed/i.test(terminalStep?.action || '')) {
     return 'failed';

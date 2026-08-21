@@ -92,13 +92,12 @@ function compactStep(step: StepExecutionResult) {
     goal: action,
     expected: expected && normalizedText(expected) !== normalizedText(action) ? expected : undefined,
     outcome: actual && normalizedText(actual) !== normalizedText(expected) ? actual : undefined,
-    findings: distinctText([step.note, ...(step.findings || [])], 4),
+    findings: distinctText([step.note], 4),
     tools: (step.tools || []).map((tool) => compactTool(tool, action)).slice(0, 6),
   };
 }
 
 export async function generateSkillFromBrowserHistory(input: {
-  browserMode: 'code' | 'dom';
   consoleErrors?: string[];
   constraints?: string;
   goal: string;
@@ -148,7 +147,6 @@ export async function generateSkillFromBrowserHistory(input: {
         targetUrl: input.targetUrl,
         goal: input.goal,
         constraints: input.constraints || undefined,
-        browserMode: input.browserMode,
         status: input.status,
         diagnostics: diagnostics.length ? diagnostics : undefined,
         steps: steps.map(compactStep),

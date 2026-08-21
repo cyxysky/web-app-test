@@ -13,7 +13,7 @@ function markedPage(groupId: string, nativeTabId: number) {
 }
 
 test('reclaims shared pages only from exact session markers and keeps their native tab id', async () => {
-  const session = new BrowserSession('code', {
+  const session = new BrowserSession({
     headless: true,
     runId: 'chat_current',
   });

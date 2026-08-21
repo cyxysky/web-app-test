@@ -7,7 +7,7 @@ import {
   runtimeToolLoopStopToolNames,
 } from './runtime-tool-selection';
 
-const nativeToolNames = ['browserCode', 'reportState'];
+const nativeToolNames = ['browserCode', 'file'];
 const observationToolNames = new Set<string>();
 
 test('runtimeAllowedToolTypes keeps native tools outside Codex mode', () => {
@@ -34,7 +34,7 @@ test('runtimeAllowedToolTypes keeps browserCode in Codex object mode', () => {
   );
 });
 
-test('runtimeAllowedToolTypes swaps reportState for answer in Codex browser chat', () => {
+test('runtimeAllowedToolTypes adds answer in Codex browser chat', () => {
   assert.deepEqual(
     runtimeAllowedToolTypes({
       browserChatMode: true,
@@ -42,7 +42,7 @@ test('runtimeAllowedToolTypes swaps reportState for answer in Codex browser chat
       nativeToolNames,
       observationToolNames,
     }),
-    ['browserCode', 'answer'],
+    ['browserCode', 'file', 'answer'],
   );
 });
 
@@ -64,7 +64,6 @@ test('browser state gate blocks execution without hiding tool schemas', () => {
 
 test('subagent calls end the current runtime tool loop before another child result is selected', () => {
   assert.deepEqual(runtimeToolLoopStopToolNames, [
-    'reportState',
     'waitForHumanVerification',
     'subagent',
   ]);

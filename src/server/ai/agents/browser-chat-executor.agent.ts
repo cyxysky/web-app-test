@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelMessage, type ToolSet } from 'ai';
 import { z } from 'zod';
-import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, TaskFrame, TaskLedgerItem, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
+import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { aiMaxOutputTokens, aiReasoningEffort, aiRequestTimeoutMs, aiStreamTimeouts, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { structuredLog } from '@/server/observability/runtime-observability';
@@ -9,14 +9,11 @@ import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/
 import {
   BrowserSession,
   type BrowserActionResult,
-  type BrowserElementTarget,
-  type BrowserSessionMode,
 } from '@/server/browser/browser-session';
 import {
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
-import { browserElementTargetSchema, browserInteractTextEditingDescription, browserInteractToolDescription, browserInteractToolShape, browserTextSelectionSchema, refineBrowserInteractTarget } from './browser-input-tool-schema';
 import { richTextToPlainText } from '@/lib/rich-text';
 import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
@@ -27,12 +24,14 @@ import {
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
 import {
-  appendMissingFileArtifactDownloadLinks,
+  repairFileArtifactDownloadLinks,
   downloadFileArtifact,
+  editFileArtifact,
   formatFileArtifactResult,
-  generateFileArtifact,
+  generateFileArtifactBlocks,
+  planFileArtifact,
 } from './file-artifact-tools';
-import { browserChatCodeRules, browserChatDomRules } from './runtime-prompt-rules';
+import { browserChatCodeRules } from './runtime-prompt-rules';
 import { readScreenshotForAi } from './browser-chat-image-input';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
@@ -61,6 +60,7 @@ import {
   runtimeContextWindowTokens,
 } from './runtime-context-budget';
 import type { BrowserChatModelContextCompression } from './browser-chat-model-context';
+import type { OfficeBlock, OfficeDocumentEditOperation } from '@/server/files/office-document-spec';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
@@ -81,57 +81,53 @@ import {
 
 export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
 
-const generatedFileCellSchema = z.union([z.string(), z.number(), z.boolean(), z.null()]);
-const generatedFileThemeSchema = z.object({
-  preset: z.enum(['professional', 'minimal', 'executive', 'warm']).optional(),
-  primaryColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  accentColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  bodyColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  backgroundColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  fontFamily: z.string().min(1).max(120).optional(),
-});
-const generatedFileSheetColumnSchema = z.object({
-  index: z.number().int().min(0).max(255),
-  width: z.number().min(8).max(60).optional(),
-  format: z.string().min(1).max(160).optional(),
-});
-const generatedFileSheetFormulaSchema = z.object({
-  cell: z.string().min(1).max(40),
-  formula: z.string().min(1).max(2_000),
-});
-const generatedFileSheetStyleSchema = z.object({
-  range: z.string().min(1).max(80),
-  bold: z.boolean().optional(),
-  color: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  backgroundColor: z.string().regex(/^#?[0-9a-fA-F]{6}$/).optional(),
-  horizontal: z.enum(['left', 'center', 'right']).optional(),
-  numberFormat: z.string().min(1).max(160).optional(),
-});
-const generatedFileSheetChartSchema = z.object({
-  type: z.enum(['area', 'bar', 'column', 'line', 'pie']),
-  range: z.string().min(1).max(80),
-  title: z.string().max(300).optional(),
-});
-const generatedFileSheetsSchema = z.array(z.object({
-  name: z.string().max(31).optional(),
-  rows: z.array(z.array(generatedFileCellSchema).max(100)).min(1).max(5_000),
-  headerRows: z.number().int().min(0).max(10).optional(),
-  freezeRows: z.number().int().min(0).max(100).optional(),
-  freezeColumns: z.number().int().min(0).max(100).optional(),
-  autoFilter: z.boolean().optional(),
-  landscape: z.boolean().optional(),
-  columns: z.array(generatedFileSheetColumnSchema).max(100).optional(),
-  formulas: z.array(generatedFileSheetFormulaSchema).max(5_000).optional(),
-  merges: z.array(z.string().min(1).max(80)).max(500).optional(),
-  styles: z.array(generatedFileSheetStyleSchema).max(1_000).optional(),
-  charts: z.array(generatedFileSheetChartSchema).max(20).optional(),
-})).min(1).max(20);
-const generatedFileSlidesSchema = z.array(z.object({
-  title: z.string().max(300).optional(),
-  subtitle: z.string().max(500).optional(),
-  content: z.string().max(20_000).optional(),
-  bullets: z.array(z.string().max(2_000)).max(100).optional(),
-})).min(1).max(100);
+const generatedFileBlockSchema: z.ZodType<OfficeBlock> = z.lazy(() => z.object({
+  id: z.string().min(1),
+  type: z.string().min(1),
+  children: z.array(generatedFileBlockSchema).optional(),
+  columns: z.array(z.object({
+    width: z.union([z.number(), z.string()]).optional(),
+    blocks: z.array(generatedFileBlockSchema).optional(),
+  }).passthrough()).optional(),
+  rows: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).optional(),
+  style: z.record(z.string(), z.unknown()).optional(),
+}).passthrough());
+const generatedFileDocumentSchema = z.object({
+  title: z.string().optional(),
+  author: z.string().optional(),
+  description: z.string().optional(),
+  language: z.string().optional(),
+  defaultStyle: z.record(z.string(), z.unknown()).optional(),
+  page: z.object({
+    orientation: z.enum(['portrait', 'landscape']).optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+    marginTop: z.number().optional(),
+    marginRight: z.number().optional(),
+    marginBottom: z.number().optional(),
+    marginLeft: z.number().optional(),
+    backgroundColor: z.string().optional(),
+    header: z.string().optional(),
+    footer: z.string().optional(),
+    showPageNumber: z.boolean().optional(),
+  }).passthrough().optional(),
+}).passthrough();
+const generatedFileOutlineSchema = z.array(z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  purpose: z.string().optional(),
+  suggestedBlocks: z.array(z.string()).optional(),
+}));
+const generatedFileEditOperationSchema: z.ZodType<OfficeDocumentEditOperation> = z.object({
+  op: z.enum(['add', 'move', 'remove', 'replace', 'setDocument', 'update']),
+  blockId: z.string().optional(),
+  parentId: z.string().optional(),
+  beforeId: z.string().optional(),
+  afterId: z.string().optional(),
+  block: generatedFileBlockSchema.optional(),
+  blocks: z.array(generatedFileBlockSchema).optional(),
+  patch: z.record(z.string(), z.unknown()).optional(),
+}).passthrough();
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -206,13 +202,7 @@ type RuntimeDecision = {
   expected: string;
   actual: string;
   status: 'passed' | 'failed' | 'blocked';
-  done: boolean;
   note?: string;
-  observation?: string;
-  findings?: string[];
-  memoryItems?: string[];
-  taskFrame?: TaskFrame;
-  ledgerItems?: TaskLedgerItem[];
 };
 
 type BrowserChatRuntimeRecord = {
@@ -233,7 +223,7 @@ type BrowserAgentRuntimeContext = {
 };
 
 const codexRuntimeObjectSchema = z.object({
-  type: z.string().min(1).describe('Tool type to execute. Use reportState when the requirement is complete, blocked, impossible, or only needs a no-op status update.'),
+  type: z.string().min(1).describe('Allowed tool type to execute, or answer when the current browser-chat request is complete.'),
   message: z.string().nullable().optional().describe('Optional short Chinese progress text that must match the selected tool.'),
   params: z.object({
     reason: z.string().nullable().optional(),
@@ -244,7 +234,6 @@ const codexRuntimeObjectSchema = z.object({
     instruction: z.string().nullable().optional(),
     fileName: z.string().nullable().optional(),
     title: z.string().nullable().optional(),
-    capture: z.enum(['viewport', 'fullPage']).nullable().optional(),
     path: z.string().nullable().optional(),
     maxMs: z.number().nullable().optional(),
     action: z.string().nullable().optional(),
@@ -254,42 +243,12 @@ const codexRuntimeObjectSchema = z.object({
       url: z.string().url().max(4_000),
     })).min(1).nullable().optional(),
     uuid: z.string().uuid().nullable().optional(),
-    operation: z.enum(['setSelection', 'insert', 'delete', 'replace']).nullable().optional(),
-    selection: browserTextSelectionSchema.nullable().optional(),
-    expected: z.string().nullable().optional(),
-    actual: z.string().nullable().optional(),
-    status: z.enum(['passed', 'failed', 'blocked']).nullable().optional(),
-    done: z.boolean().nullable().optional(),
     limit: z.number().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
-    target: z.union([z.enum(['current', 'new']), browserElementTargetSchema]).nullable().optional(),
-    ms: z.number().nullable().optional(),
-    index: z.number().nullable().optional(),
-    mode: z.enum(['full', 'text', 'changes']).nullable().optional(),
-    cursor: z.string().nullable().optional(),
-    query: z.string().nullable().optional(),
-    tag: z.string().nullable().optional(),
-    roles: z.array(z.string()).nullable().optional(),
-    x_thousandth: z.number().nullable().optional(),
-    y_thousandth: z.number().nullable().optional(),
-    toTarget: browserElementTargetSchema.nullable().optional(),
-    toX_thousandth: z.number().nullable().optional(),
-    toY_thousandth: z.number().nullable().optional(),
-    button: z.enum(['left', 'right', 'middle']).nullable().optional(),
-    clickCount: z.number().nullable().optional(),
-    deltaX: z.number().nullable().optional(),
-    deltaY: z.number().nullable().optional(),
-    credentialRef: z.string().nullable().optional(),
-    key: z.string().nullable().optional(),
-    keys: z.array(z.string()).nullable().optional(),
-    replace: z.boolean().nullable().optional(),
-    followByEnter: z.boolean().nullable().optional(),
-    value: z.string().nullable().optional(),
-    label: z.string().nullable().optional(),
     skillId: z.string().nullable().optional(),
   }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
 });
@@ -319,8 +278,6 @@ function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextS
 // 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
 
 // Default to inline marker labels so visual mode screenshots show interactive targets.
-
-// 只有视觉点击模式才允许把截图作为 AI 输入；DOM 模式即使模型支持图片也不会发送。
 
 // 将调试数据转成可安全 JSON 序列化的结构，避免 Buffer/BigInt 破坏持久化。
 function jsonSafe(value: unknown) {
@@ -531,23 +488,15 @@ function splitToolInputAndReason(input: unknown) {
 }
 
 async function requestBrowserToolApproval(input: {
-  session: BrowserSession;
   toolName: string;
   toolInput: unknown;
   stepIndex?: number;
   request?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
 }) {
   if (!input.request) return 'not-applicable' as const;
-  const record = input.toolInput && typeof input.toolInput === 'object' && !Array.isArray(input.toolInput)
-    ? input.toolInput as Record<string, unknown>
-    : {};
-  const target = record.target && typeof record.target === 'object' && !Array.isArray(record.target)
-    ? record.target as BrowserElementTarget
-    : undefined;
   const approval = browserToolApprovalRequest({
     toolName: input.toolName,
     toolInput: input.toolInput,
-    targetDescription: input.session.describeElementTarget(target),
   });
   if (!approval) return 'not-applicable' as const;
   const decision = await input.request({
@@ -576,7 +525,7 @@ function parseJsonObjectText(text?: string) {
 
 function toolNameLike(value?: string) {
   if (!value) return false;
-  const names = new Set<string>(runtimeToolNames('dom'));
+  const names = new Set<string>(runtimeToolNames());
   return names.has(value);
 }
 
@@ -596,10 +545,8 @@ function cleanFinalDisplayText(value?: string) {
   return trimmed;
 }
 
-function readableTextFromToolRecord(record: Record<string, unknown>, options: { reportState?: boolean } = {}) {
-  const preferredKeys = options.reportState
-    ? ['action', 'actual', 'reason']
-    : ['reason', 'targetVisual', 'action', 'actual'];
+function readableTextFromToolRecord(record: Record<string, unknown>) {
+  const preferredKeys = ['reason', 'targetVisual', 'action', 'actual'];
   for (const key of preferredKeys) {
     const value = typeof record[key] === 'string' ? cleanDisplayText(record[key] as string) : undefined;
     if (!value || toolNameLike(value)) continue;
@@ -608,17 +555,17 @@ function readableTextFromToolRecord(record: Record<string, unknown>, options: { 
   return undefined;
 }
 
-function readableActionFromRawText(value?: string, options: { reportState?: boolean } = {}) {
+function readableActionFromRawText(value?: string) {
   const parsed = parseJsonObjectText(value);
-  if (parsed) return readableTextFromToolRecord(parsed, options);
+  if (parsed) return readableTextFromToolRecord(parsed);
   const cleaned = cleanDisplayText(value);
   if (!cleaned || toolNameLike(cleaned)) return undefined;
   return cleaned;
 }
 
-function readableActionFromTrace(trace?: ToolTrace, options: { reportState?: boolean } = {}) {
+function readableActionFromTrace(trace?: ToolTrace) {
   if (!trace?.input || typeof trace.input !== 'object' || Array.isArray(trace.input)) return undefined;
-  return readableTextFromToolRecord(trace.input as Record<string, unknown>, options);
+  return readableTextFromToolRecord(trace.input as Record<string, unknown>);
 }
 
 function toolConsistentAssistantText(value: string | undefined, toolName?: string) {
@@ -667,20 +614,17 @@ function recordFromUnknown(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
-function codexRuntimeObjectFromText(text: string, fallbackType: 'answer' | 'reportState' = 'reportState'): CodexRuntimeObject {
+function codexRuntimeObjectFromText(text: string): CodexRuntimeObject {
   let raw: Record<string, unknown> | undefined;
   try {
     raw = recordFromUnknown(extractJson(text));
   } catch {
     const fallbackText = trimDebugText((text || '').trim() || 'Codex did not return a valid action JSON.', 2000);
     return {
-      type: fallbackType,
+      type: 'answer',
       message: fallbackText,
       params: {
         content: fallbackText,
-        actual: fallbackText,
-        status: fallbackType === 'reportState' ? 'blocked' : undefined,
-        done: fallbackType === 'reportState' ? true : undefined,
       },
     };
   }
@@ -688,7 +632,7 @@ function codexRuntimeObjectFromText(text: string, fallbackType: 'answer' | 'repo
   const rawRecord = raw || {};
   const params = recordFromUnknown(rawRecord.params);
   const candidate = {
-    type: typeof rawRecord.type === 'string' && rawRecord.type.trim() ? rawRecord.type.trim() : fallbackType,
+    type: typeof rawRecord.type === 'string' && rawRecord.type.trim() ? rawRecord.type.trim() : 'answer',
     message: typeof rawRecord.message === 'string' && rawRecord.message.trim() ? rawRecord.message.trim() : undefined,
     params,
   };
@@ -1156,38 +1100,19 @@ const initialBrowserStateCode = 'nodeRepl.write({ tabs: await browser.user.openT
 
 async function readCurrentBrowserState(
   session: BrowserSession,
-  mode: BrowserSessionMode,
   options: { runId?: string; stepIndex?: number; abortSignal?: AbortSignal } = {},
 ): Promise<BrowserActionResult> {
-  if (mode === 'code') {
-    return session.executeBrowserCode({
-      code: initialBrowserStateCode,
-      maxOutputChars: 40_000,
-      runId: options.runId || 'browser-state',
-      stepIndex: options.stepIndex || 0,
-      abortSignal: options.abortSignal,
-    });
-  }
-
-  const [tabs, pageState] = await Promise.all([
-    session.listTabs(),
-    session.readDomObservationSnapshot({ mode: 'full' }),
-  ]);
-  return {
-    ok: tabs.ok,
-    actual: JSON.stringify({
-      tabs: tabs.actual,
-      activePageState: [pageState.pageSummary, pageState.content].filter(Boolean).join('\n'),
-    }),
-    snapshotId: pageState.snapshotId,
-    nextCursor: pageState.nextCursor,
-  };
+  return session.executeBrowserCode({
+    code: initialBrowserStateCode,
+    maxOutputChars: 40_000,
+    runId: options.runId || 'browser-state',
+    stepIndex: options.stepIndex || 0,
+    abortSignal: options.abortSignal,
+  });
 }
 
 function makeBrowserTools(
   session: BrowserSession,
-  targetUrl: string,
-  mode: BrowserSessionMode,
   traces: ToolTrace[],
   aiRequest?: AiRequestSnapshot,
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
@@ -1285,20 +1210,16 @@ function makeBrowserTools(
     });
   }
 
-  const credentialBindings = () => referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings || [];
-  const credentialBinding = (ref?: string) => credentialBindings().find((item) => item.ref === ref);
-
   const sharedTools = {
     readBrowserState: tool({
       description: 'When a request needs live browser evidence or browser interaction, this must be its first browser tool. It reads the current conversation tab group, all tabs in that group, the active page URL/title, and the current page state without changing the browser. Do not call it for a request that can be answered without the live browser.',
       inputSchema: browserToolInput({}),
-      execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, mode, {
+      execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, {
         runId: referenceOptions?.runId,
         stepIndex: referenceOptions?.stepIndex,
         abortSignal,
       }), execution),
     }),
-    ...(mode === 'code' ? {
     browserCode: tool({
       description: 'This is the real browser control tool. It CAN navigate or open URLs, claim/open/switch tabs, click links and controls, type, select, upload, inspect, and verify the visible page. Use await page.goto(url) for same-tab navigation, browser.tabs.new(url) for a new tab, and Playwright locators for observed links and controls. Never claim browser navigation/clicking is unavailable, never replace navigation with a file download, and never ask the user to navigate manually while browserCode is present unless an actual browserCode call failed and that failure is reported. Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call file merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
       inputSchema: browserToolInput({
@@ -1320,124 +1241,6 @@ function makeBrowserTools(
           });
         }, execution);
       },
-    }),
-    } : {
-      ...(modelSupportsScreenshotInput() ? {
-        takeScreenshot: tool({
-          description: 'Capture the current browser as explicit visual evidence. Only a viewport screenshot may authorize a later coordinate interaction; fullPage is read-only.',
-          inputSchema: browserToolInput({
-            capture: z.enum(['viewport', 'fullPage']).optional(),
-          }),
-          execute: (input, execution) => record('takeScreenshot', input, async () => {
-            const path = await session.takeScreenshot(
-              referenceOptions?.runId || 'browser-chat',
-              referenceOptions?.stepIndex || 0,
-              'manual',
-              { capture: input.capture },
-            );
-            return { ok: true, actual: `Captured ${input.capture || 'viewport'} screenshot.`, referenceImagePath: path };
-          }, execution),
-        }),
-      } : {}),
-      browser: tool({
-        description: 'Navigate and manage tabs. open navigates, wait waits for a known transition, listTabs returns current tabs, and switchTab activates an index returned by listTabs.',
-        inputSchema: browserToolInput({
-          action: z.enum(['open', 'wait', 'listTabs', 'switchTab']),
-          url: z.string().optional(),
-          target: z.enum(['current', 'new']).optional(),
-          ms: z.number().int().nonnegative().optional(),
-          index: z.number().int().nonnegative().optional(),
-        }).superRefine((input, context) => {
-          if (input.action === 'switchTab' && typeof input.index !== 'number') {
-            context.addIssue({ code: z.ZodIssueCode.custom, message: 'switchTab requires index.' });
-          }
-        }),
-        execute: (input, execution) => record('browser', input, () => {
-          if (input.action === 'wait') return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
-          if (input.action === 'listTabs') return session.listTabs();
-          if (input.action === 'switchTab') return session.switchTab(input.index || 0);
-          const url = input.url || targetUrl;
-          return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
-        }, execution),
-      }),
-      interact: tool({
-        description: `${browserInteractToolDescription} ${browserInteractTextEditingDescription}`,
-        inputSchema: browserToolInput(browserInteractToolShape).superRefine(refineBrowserInteractTarget),
-        execute: (input, execution) => record('interact', input, async (abortSignal) => {
-          if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(input.action)) {
-            return session.mouse({
-              action: input.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
-              abortSignal,
-              target: input.target,
-              xThousandth: input.x_thousandth,
-              yThousandth: input.y_thousandth,
-              toTarget: input.toTarget,
-              toXThousandth: input.toX_thousandth,
-              toYThousandth: input.toY_thousandth,
-              button: input.button,
-              clickCount: input.clickCount,
-              force: input.force,
-              deltaX: input.deltaX,
-              deltaY: input.deltaY,
-            });
-          }
-          if (input.action === 'selectOption') {
-            return session.selectOption({ target: input.target, value: input.value, label: input.label, abortSignal });
-          }
-          if (input.action === 'editText') {
-            return session.keyboard({
-              action: 'editText',
-              target: input.target,
-              text: input.text,
-              selection: input.selection,
-              operation: input.operation,
-            });
-          }
-          const binding = credentialBinding(input.credentialRef);
-          if (input.credentialRef && (!binding || input.action !== 'type' || !input.target)) {
-            return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current backend-bound field target.' };
-          }
-          return session.keyboard({
-            action: input.action as 'type' | 'press' | 'shortcut',
-            target: input.target,
-            xThousandth: input.x_thousandth,
-            yThousandth: input.y_thousandth,
-            text: binding ? binding.value : input.text,
-            key: input.key,
-            keys: input.keys,
-            replace: input.replace,
-            followByEnter: input.followByEnter,
-            allowedOrigins: binding?.allowedOrigins,
-          });
-        }, execution),
-      }),
-      inspect: tool({
-        description: 'Read and backend-bind the current semantic DOM baseline, query that frozen baseline, or inspect recent HTTP requests. Use capture mode=full before constructing a semantic target or fallback dom-* ref. Later interact calls send only target.',
-        inputSchema: browserToolInput({
-          action: z.enum(['capture', 'search', 'httpRequests']).default('capture'),
-          cursor: z.string().min(1).optional(),
-          mode: z.enum(['full', 'text', 'changes']).default('full'),
-          query: z.string().min(1).max(500).optional(),
-          tag: z.string().min(1).max(80).optional(),
-          roles: z.array(z.string().min(1)).max(20).optional(),
-          limit: z.number().int().min(1).max(100).optional(),
-          ids: z.array(z.string().min(1)).min(1).max(20).optional(),
-        }).superRefine((input, context) => {
-          if (input.action === 'search' && !input.query && !input.tag) {
-            context.addIssue({ code: z.ZodIssueCode.custom, message: 'search requires query or tag.' });
-          }
-        }),
-        execute: (input, execution) => record('inspect', input, async () => {
-          if (input.action === 'httpRequests') return session.getCurrentTabHttpRequests({ ids: input.ids });
-          if (input.action === 'search') return session.searchSnapshot(input);
-          const snapshot = await session.readDomObservationSnapshot({ cursor: input.cursor, mode: input.mode });
-          return {
-            ok: true,
-            actual: [snapshot.pageSummary, snapshot.content].filter(Boolean).join('\n'),
-            nextCursor: snapshot.nextCursor,
-          };
-        }, execution),
-      }),
     }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
@@ -1513,12 +1316,12 @@ function makeBrowserTools(
       }),
     } : {}),
     file: tool({
-      description: 'Read, download, or generate files through one action-based tool. action=read inspects one registered attachment/artifact while preserving it; action=download saves an existing remote URL/path; action=generate creates a new downloadable text/PDF/Office file and returns rendered pages for visual review when supported. This tool does not navigate the visible browser: use browserCode for opening URLs and clicking links.',
+      description: 'Read, download, or author files. New files use a staged document editor: action=plan creates an empty document and returns documentId; call action=generate repeatedly with small batches of free-form blocks; call action=edit to add, update, replace, move, or remove blocks by stable ID and render the current draft. Blocks may be text, headings, lists, images, inline SVG, native charts, tables, cards, columns, metric groups, timelines, shapes, spacers, dividers, pages, sheets, or any renderer-supported custom type. There are no presets or fixed templates: geometry, hierarchy, styling, assets, and composition belong to the model. PDF is a first-class LibreOffice-backed output. This tool does not navigate the visible browser.',
       inputSchema: z.discriminatedUnion('action', [
         browserToolInput({
           action: z.literal('read'),
           attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in conversation metadata.'),
-          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by action=download or action=generate.'),
+          artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by action=download or a rendered document draft.'),
           includeVisuals: z.boolean().optional(),
           offset: z.number().int().min(0).optional(),
           limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
@@ -1532,15 +1335,27 @@ function makeBrowserTools(
           fileName: z.string().optional().describe('Optional saved file name, including extension.'),
         }),
         browserToolInput({
+          action: z.literal('plan'),
+          fileName: z.string().min(1).describe('Required file name with a supported output extension.'),
+          documentType: z.enum(['word', 'spreadsheet', 'presentation']),
+          intent: z.string().optional().describe('Creative direction and functional goal. This is not a template name.'),
+          document: generatedFileDocumentSchema.optional(),
+          outline: generatedFileOutlineSchema.optional(),
+        }),
+        browserToolInput({
           action: z.literal('generate'),
-          fileName: z.string().min(1).max(180).describe('Required file name with a supported output extension.'),
-          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional(),
-          title: z.string().max(300).optional(),
-          subtitle: z.string().max(500).optional(),
-          theme: generatedFileThemeSchema.optional(),
-          content: z.string().min(1).max(4 * 1024 * 1024).optional(),
-          sheets: generatedFileSheetsSchema.optional(),
-          slides: generatedFileSlidesSchema.optional(),
+          documentId: z.string().min(1).describe('Document ID returned by action=plan.'),
+          blocks: z.array(generatedFileBlockSchema).min(1).describe('One coherent batch of blocks. Use stable unique IDs and multiple calls instead of one huge payload.'),
+          parentId: z.string().optional(),
+          beforeId: z.string().optional(),
+          afterId: z.string().optional(),
+          render: z.boolean().optional().describe('Render after this batch. Usually false until the planned sections are present.'),
+        }),
+        browserToolInput({
+          action: z.literal('edit'),
+          documentId: z.string().min(1),
+          operations: z.array(generatedFileEditOperationSchema).min(1),
+          render: z.boolean().optional().describe('Defaults to true. Set false while applying several local edit batches.'),
         }),
       ]).superRefine((input, refinement) => {
         if (input.action === 'read' && Boolean(input.attachmentId) === Boolean(input.artifactId)) {
@@ -1563,26 +1378,14 @@ function makeBrowserTools(
         if (input.action === 'download') {
           return record('file', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution);
         }
-        return record('file', input, () => generateFileArtifact({
-          ...input,
-          runId: referenceOptions?.runId,
-          includeVisualVerification: modelSupportsScreenshotInput(),
-        }), execution);
+        if (input.action === 'plan') {
+          return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId }), execution);
+        }
+        if (input.action === 'generate') {
+          return record('file', input, () => generateFileArtifactBlocks({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+        }
+        return record('file', input, () => editFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
       },
-    }),
-    reportState: tool({
-      description: 'No-op reporting tool. Use exactly this tool when no browser action is needed: requirement complete, blocked, failed, or a short textual status update is enough. This tool does not change the browser.',
-      inputSchema: browserToolInput({
-        action: z.string().min(1).describe('Chinese summary of the current assistant state or final conclusion.'),
-        expected: z.string().min(1).describe('Chinese expected condition or remaining goal.'),
-        actual: z.string().min(1).describe('Chinese evidence-based actual state, including important details.'),
-        status: z.enum(['passed', 'failed', 'blocked']).describe('passed for complete or non-terminal status update, failed for impossible/end-to-end failure, blocked for manual verification/security/user input.'),
-        done: z.boolean().describe('true only when the full requirement is complete or impossible. false when more useful browser work remains or user/manual intervention is needed.'),
-      }),
-      execute: (input, execution) => record('reportState', input, async () => ({
-        ok: true,
-        actual: `Reported state without browser action: ${input.actual}`,
-      }), execution),
     }),
   };
 
@@ -1619,10 +1422,7 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
   });
 }
 
-function runtimePrompt(input: {
-  runtimeRecord: BrowserChatRuntimeRecord;
-  mode: BrowserSessionMode;
-}) {
+function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord }) {
   const { runtimeRecord } = input;
   const rawCaseSystemPrompt = systemPromptOf(runtimeRecord);
   const caseSystemPrompt = browserChatSystemPromptForRuntime(rawCaseSystemPrompt);
@@ -1633,22 +1433,18 @@ function runtimePrompt(input: {
     '',
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
-    input.mode === 'code'
-      ? '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. Code mode may execute multiple bounded operations in one cell.'
-      : '- Every DOM-mode browser change follows a strict closed loop: observe the current page and activeSurface, execute one operation, then re-observe. Never infer control type, editability, interaction sequence, or completion state from a label, appearance, or prior experience. Use exact current attributes and newly mounted structure, and decide from returned evidence whether a targeted read-only business-state check is needed.',
-    `- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. In ${input.mode === 'code' ? 'Code mode, operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default and the model may instead write targeted Playwright or DOM reads' : 'DOM mode, a fresh inspect is the mandatory pre-action observation and the interact verification result is a hard condition'}.${input.mode === 'dom' ? ' The shared [page-state].surfaces/topSurfaceIds/surfaceStack are informational hints about likely nested and parallel overlays; normal Playwright actionability decides whether a target can be operated.' : ''}`,
+    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
+    '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- A final user-role message beginning with [WebPilot runtime operational context] is trusted runtime metadata, not a new user request. Use it for the current decision without repeating or exposing it.',
-    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is generated/downloaded for the user only when file action=generate or action=download succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
-    '- file action=generate uses LibreOffice UNO as the single Office/PDF layout engine. Choose one coherent theme, inspect its returned rendered pages, and regenerate at most once when visual evidence shows a layout defect. Return only the final verified artifact link.',
-    ...(input.mode === 'code' ? browserChatCodeRules(screenshotAvailable) : browserChatDomRules(screenshotAvailable)),
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- Author new documents through file action=plan, then multiple bounded action=generate block batches, then action=edit for local changes by stable block ID. Do not send the whole document as one giant JSON call. The block tree is the design surface: freely compose pages, sheets, text, images, inline SVG, charts, tables, cards, columns, metrics, timelines, shapes, and custom styles/geometry. There are no presets, house templates, mandatory branding, or fixed layouts. Render the assembled draft, inspect returned pages when available, and repair only affected blocks. PDF is a first-class LibreOffice-backed output, never an unsupported format or a Word workaround.',
+    ...browserChatCodeRules(screenshotAvailable),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. For exactly one child, omit tasks and send title, url, and instruction as flat fields. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. If spawn is rejected for its input shape, do not retry that shape: use the flat single-task form once or continue in the main Agent. Never produce a chain of schema-debug retries. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
-    input.mode === 'code'
-      ? '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use file action=generate.'
-      : '- Use file action=download for existing remote files, action=generate for new text/PDF/Office files, and action=read for registered files.',
+    '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → edit document flow.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
@@ -1656,28 +1452,20 @@ function runtimePrompt(input: {
   ].filter(Boolean).join('\n');
 }
 
-function runtimeToolNames(mode: BrowserSessionMode) {
-  const operationTools = mode === 'code'
-    ? ['browserCode']
-    : ['takeScreenshot', 'browser', 'interact', 'inspect'];
+function runtimeToolNames() {
   return [
     'readBrowserState',
-    ...operationTools,
+    'browserCode',
     'waitForHumanVerification',
     'subagent',
     'file',
     'skill',
-    'reportState',
   ];
 }
 
 const browserSessionToolNames = new Set([
   'readBrowserState',
   'browserCode',
-  'takeScreenshot',
-  'browser',
-  'interact',
-  'inspect',
   'waitForHumanVerification',
   'subagent',
 ]);
@@ -1943,54 +1731,15 @@ function textFromUnknown(value: unknown): string {
   return '';
 }
 
-function ledgerMemoryLimit() {
-  const raw = Number(process.env.AI_LEDGER_MEMORY_LIMIT || 1000);
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1000;
-}
-
-function ledgerKey(item: TaskLedgerItem) {
-  return item.id || `${item.dimensionId}:${item.status || ''}:${item.title}`.toLowerCase();
-}
-
-function mergeLedgerItems(existing: TaskLedgerItem[] = [], incoming: TaskLedgerItem[] = [], limit = 80) {
-  const map = new Map<string, TaskLedgerItem>();
-  for (const item of [...existing, ...incoming]) map.set(ledgerKey(item), item);
-  return [...map.values()].slice(-limit);
-}
-
-function extractAssistantStepInfoFromToolInputs(traces: ToolTrace[], goal = ''): Pick<RuntimeDecision, 'taskFrame' | 'ledgerItems'> {
-  void traces;
-  void goal;
-  return {};
-}
-
-function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal = ''): RuntimeDecision {
+function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[]): RuntimeDecision {
   const executed = traces.filter((trace) => trace.name && trace.result);
   const last = executed.at(-1);
   // Earlier failed attempts are diagnostic history, not the terminal outcome.
-  // A later successful tool or final report means the branch recovered.
+  // A later successful tool means the branch recovered.
   const failed = last ? isEffectiveToolTraceFailure(last) : false;
   const names = executed.map((trace) => summarizeTraceForContinuation(trace)).join('; ');
   const note = extractProgressNote(text);
-  const assistantInfo = extractAssistantStepInfoFromToolInputs(executed, goal);
   const toolReason = executed.map((trace) => readableActionFromTrace(trace)).find(Boolean);
-
-  if (last?.name === 'reportState' && last.result && last.input && typeof last.input === 'object' && !Array.isArray(last.input)) {
-    const input = last.input as Record<string, unknown>;
-    const status = input.status === 'failed' || input.status === 'blocked' || input.status === 'passed' ? input.status : 'passed';
-    return {
-      action: readableActionFromRawText(typeof input.action === 'string' ? input.action : undefined, { reportState: true })
-        || readableActionFromTrace(last, { reportState: true })
-        || toolReason
-        || 'AI reported current browser-chat state',
-      expected: typeof input.expected === 'string' ? input.expected : 'AI should report progress or conclusion based on current page state.',
-      actual: typeof input.actual === 'string' ? input.actual : last.result.actual,
-      status,
-      done: typeof input.done === 'boolean' ? input.done : true,
-      note,
-      ...assistantInfo,
-    };
-  }
 
   if (last?.name === 'waitForHumanVerification') {
     return {
@@ -1998,9 +1747,7 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
       expected: 'The user should complete captcha, login, security verification, or other manual work in the visible browser.',
       actual: last.result?.actual || 'AI requested human intervention before continuing browser-chat work.',
       status: 'blocked',
-      done: false,
       note,
-      ...assistantInfo,
     };
   }
 
@@ -2011,18 +1758,15 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[], goal =
       ? userFacingToolResult(last.name, last.result, 500) || 'Tool call finished; waiting for the next browser-chat turn.'
       : text || 'Browser chat returned no browser tool result.',
     status: failed ? 'failed' : 'passed',
-    done: false,
     note,
-    ...assistantInfo,
   };
 }
 
 // 执行单个运行时步骤：采集页面上下文，调用 AI 选择一个动作，并记录请求快照。
-function browserChatReplyFromDecision(decision: RuntimeDecision, lastToolName?: string) {
+function browserChatReplyFromDecision(decision: RuntimeDecision) {
   const candidates = [
     decision.actual,
     decision.note,
-    decision.observation,
     decision.action,
   ].map((item) => String(item || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
   const text = candidates.find((item) => (
@@ -2031,33 +1775,18 @@ function browserChatReplyFromDecision(decision: RuntimeDecision, lastToolName?: 
     && !/^Browser chat returned no browser tool/i.test(item)
     && !/^AI executed browser-chat action/i.test(item)
   )) || candidates[0] || '';
-  if (!text) return lastToolName === 'reportState' ? '已完成本轮操作。' : '';
+  if (!text) return '';
   return text.length > 900 ? `${text.slice(0, 900)}...` : text;
 }
 
-function progressFieldsFromToolTraces(
-  traces: ToolTrace[],
-  goal: string,
-  stepIndex: number,
-  progress?: ToolTraceProgress,
-): Partial<StepExecutionResult> {
-  const assistantInfo = extractAssistantStepInfoFromToolInputs(traces, goal);
-  const ledgerItems = mergeLedgerItems(
-    assistantInfo.ledgerItems || [],
-    [],
-    ledgerMemoryLimit(),
-  ).map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex }));
-
+function visualContextFieldsFromProgress(progress?: ToolTraceProgress): Partial<StepExecutionResult> {
   return {
-    taskFrame: assistantInfo.taskFrame,
-    ledgerItems,
     visualContext: progress?.visualContext,
   };
 }
 
 async function executeRuntimeStep(input: {
   session: BrowserSession;
-  mode: BrowserSessionMode;
   runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
   turnId?: string;
@@ -2097,19 +1826,17 @@ async function executeRuntimeStep(input: {
     onToolTrace,
     onTextStream,
   } = input;
-  const mode = input.mode;
   const screenshotInputEnabled = false;
   const imageInputAvailable = modelSupportsScreenshotInput();
-  const screenshotToolEnabled = mode === 'dom' && imageInputAvailable;
-  const browserCodeImageOutputEnabled = mode === 'code' && imageInputAvailable;
+  const browserCodeImageOutputEnabled = imageInputAvailable;
   const markerEnabled = false;
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
   ensureActive();
   await onDebug?.({
     phase: 'ai:runtime-input:start',
     stepIndex,
-    message: `Preparing runtime input for ${mode} mode.`,
-    details: { browserMode: mode, screenshotInputEnabled, markerEnabled },
+    message: 'Preparing runtime input for browserCode execution.',
+    details: { screenshotInputEnabled, markerEnabled },
   });
   const contextMs = 0;
   const screenshotReadStartedAt = Date.now();
@@ -2133,7 +1860,7 @@ async function executeRuntimeStep(input: {
         'Use these reference images as user-provided visual context. Do not confuse them with the live browser screenshot.',
       ].join('\n')
     : '';
-  const prompt = runtimePrompt({ runtimeRecord, mode });
+  const prompt = runtimePrompt({ runtimeRecord });
   let activeOperationalContext = input.operationalContext || '';
   let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
@@ -2150,7 +1877,6 @@ async function executeRuntimeStep(input: {
       markerScreenshotBytes: undefined,
       selectedReferenceScreenshotCount: 0,
       userReferenceImageCount: userReferenceImages.filter((item) => item.image).length,
-      browserMode: mode,
     },
   });
   let lastAiRequest: AiRequestSnapshot | undefined;
@@ -2179,9 +1905,8 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const externalTools = codexMode ? {} : (input.memoryTools || {});
     const externalToolNames = new Set(Object.keys(externalTools));
-    const availableRuntimeToolNames = [...runtimeToolNames(mode), ...externalToolNames].filter((name) => (
-      (name !== 'takeScreenshot' || screenshotToolEnabled)
-      && (name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent))
+    const availableRuntimeToolNames = [...runtimeToolNames(), ...externalToolNames].filter((name) => (
+      (name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent))
       && (name !== 'skill' || Boolean(input.readSkill))
     ));
     const runtimeTools = runtimeAllowedToolTypes({
@@ -2269,7 +1994,7 @@ async function executeRuntimeStep(input: {
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, browserMode: mode, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, browserCodeImageOutputEnabled, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0, executed: false };
@@ -2340,7 +2065,6 @@ async function executeRuntimeStep(input: {
       const startedAt = Date.now();
       const fallback = () => fallbackRuntimeContinuationSummary({
         goal: requirementOf(runtimeRecord),
-        browserMode: mode,
         stepIndex,
         agentStep: agentStepIndex,
         previousSummary: continuationSummaryText,
@@ -2354,7 +2078,6 @@ async function executeRuntimeStep(input: {
             role: 'user' as const,
             content: buildRuntimeContinuationSummaryPrompt({
               goal: requirementOf(runtimeRecord),
-              browserMode: mode,
               stepIndex,
               agentStep: agentStepIndex,
               estimatedTokens,
@@ -2577,7 +2300,7 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, screenshotToolEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       const activeTools = browserStateGatePending
         ? stepAllowedToolTypes as Array<keyof typeof toolsForRequest>
@@ -2626,14 +2349,13 @@ async function executeRuntimeStep(input: {
       const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
       const object = alignCodexRuntimeObjectTool(
-        codexRuntimeObjectFromText(result.text, stepAllowedToolTypes.includes('answer') ? 'answer' : 'reportState'),
+        codexRuntimeObjectFromText(result.text),
         stepAllowedToolTypes,
       );
       const execution = await executeCodexRuntimeObject({
         session,
         runId: input.runId,
         stepIndex,
-        mode,
         type: object.type,
         message: object.message || undefined,
         params: object.params,
@@ -2713,7 +2435,7 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    const browserTools = makeBrowserTools(session, runtimeRecord.targetUrl, mode, traces, aiRequest, async (trace) => {
+    const browserTools = makeBrowserTools(session, traces, aiRequest, async (trace) => {
       ensureActive();
       upsertToolTrace(durableTraces, trace);
       await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
@@ -2822,7 +2544,6 @@ async function executeRuntimeStep(input: {
       const approveAgentTool = input.requestToolConfirmation ? async ({ toolCall }: { toolCall?: { toolName: string; input: unknown } }) => {
         if (!toolCall) return 'not-applicable' as const;
         const approval = await requestBrowserToolApproval({
-          session,
           toolName: toolCall.toolName,
           toolInput: toolCall.input,
           stepIndex,
@@ -3290,7 +3011,6 @@ export async function executeInteractiveBrowserTurn(input: {
   operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
   completedSteps?: StepExecutionResult[];
-  mode?: BrowserSessionMode;
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
@@ -3326,7 +3046,6 @@ export async function executeInteractiveBrowserTurn(input: {
     targetUrl: input.targetUrl,
     instruction: input.instruction,
   });
-  const runtimeMode = input.mode === 'dom' ? 'dom' : 'code';
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
   let endedWithFinalAnswer = false;
@@ -3352,7 +3071,6 @@ export async function executeInteractiveBrowserTurn(input: {
       const requiredSubagentUuid = pendingSubagentUuids[0];
       actionResult = await executeRuntimeStep({
         session: input.session,
-        mode: runtimeMode,
         runtimeRecord,
         runId: input.runId,
         turnId: input.turnId || input.runId,
@@ -3391,7 +3109,7 @@ export async function executeInteractiveBrowserTurn(input: {
             ...runningStep,
             actual: 'AI called a browser tool; waiting for page feedback.',
             tools: summarizeToolTraces(liveToolTraces),
-            ...progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress),
+            ...visualContextFieldsFromProgress(latestToolProgress),
           });
           ensureActive();
         },
@@ -3410,13 +3128,13 @@ export async function executeInteractiveBrowserTurn(input: {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
       const retryInfo = runtimeRetryFromError(error);
       ensureActive();
-      const recoveredState = progressFieldsFromToolTraces(liveToolTraces, requirementOf(runtimeRecord), stepIndex, latestToolProgress);
+      const recoveredVisualContext = latestToolProgress?.visualContext;
       const errorStep = await createRuntimeErrorStep({
         stepIndex,
         error,
         tools: summarizeToolTraces(liveToolTraces),
         aiRequest: error && typeof error === 'object' ? (error as { aiRequest?: AiRequestSnapshot }).aiRequest : undefined,
-        recoveredState,
+        visualContext: recoveredVisualContext,
       });
       ensureActive();
       upsertStep(steps, errorStep);
@@ -3470,7 +3188,7 @@ export async function executeInteractiveBrowserTurn(input: {
       continue;
     }
 
-    const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces, requirementOf(runtimeRecord));
+    const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces);
     const completedStep: StepExecutionResult = {
       index: stepIndex,
       action: decision.action,
@@ -3478,9 +3196,6 @@ export async function executeInteractiveBrowserTurn(input: {
       actual: decision.actual,
       status: decision.status,
       note: decision.note,
-      taskFrame: decision.taskFrame,
-      ledgerItems: mergeLedgerItems(decision.ledgerItems || [], [], ledgerMemoryLimit())
-        .map((item) => ({ ...item, sourceStep: item.sourceStep ?? stepIndex })),
       aiRequest: actionResult.aiRequest,
       tools: summarizeToolTraces(actionResult.traces),
       visualContext: actionResult.visualContext,
@@ -3512,9 +3227,7 @@ export async function executeInteractiveBrowserTurn(input: {
           tools: completedStep.tools,
         },
       });
-      reply = browserChatReply
-        || (lastToolName === 'reportState' ? browserChatReplyFromDecision(decision, lastToolName) : '')
-        || aiSdkFinishMessage(actionResult.finishReason);
+      reply = browserChatReply || aiSdkFinishMessage(actionResult.finishReason);
       finalStatus = actionResult.responseStatus === 'passed'
         ? decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed'
         : actionResult.responseStatus;
@@ -3523,13 +3236,7 @@ export async function executeInteractiveBrowserTurn(input: {
     }
     if (lastToolName === 'waitForHumanVerification') {
       finalStatus = 'blocked';
-      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
-      endedWithFinalAnswer = true;
-      break;
-    }
-    if (decision.done || lastToolName === 'reportState') {
-      finalStatus = decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed';
-      if (!reply) reply = browserChatReplyFromDecision(decision, lastToolName);
+      if (!reply) reply = browserChatReplyFromDecision(decision);
       endedWithFinalAnswer = true;
       break;
     }
@@ -3537,7 +3244,7 @@ export async function executeInteractiveBrowserTurn(input: {
 
   if (!endedWithFinalAnswer) reply = '';
 
-  reply = appendMissingFileArtifactDownloadLinks(
+  reply = repairFileArtifactDownloadLinks(
     reply,
     newSteps.flatMap((step) => (step.tools || []).map((toolCall) => ({
       name: toolCall.name,
@@ -3669,9 +3376,9 @@ async function createRuntimeErrorStep(input: {
   error: unknown;
   tools?: StepToolCall[];
   aiRequest?: AiRequestSnapshot;
-  recoveredState?: Partial<StepExecutionResult>;
+  visualContext?: StepExecutionResult['visualContext'];
 }): Promise<StepExecutionResult> {
-  const { stepIndex, error, tools, aiRequest, recoveredState } = input;
+  const { stepIndex, error, tools, aiRequest, visualContext } = input;
   const retryInfo = runtimeRetryFromError(error);
 
   return {
@@ -3684,9 +3391,7 @@ async function createRuntimeErrorStep(input: {
       : 'The assistant should stop this turn and preserve the latest browser state.',
     actual: userFacingRecoverableRuntimeError(error),
     status: 'failed',
-    taskFrame: recoveredState?.taskFrame,
-    ledgerItems: recoveredState?.ledgerItems,
-    visualContext: recoveredState?.visualContext,
+    visualContext,
     tools,
     aiRequest,
   };
@@ -3698,8 +3403,6 @@ function flowInput(input: unknown) {
 
 export type RecordedBrowserOperationExecutionOptions = {
   runId?: string;
-  targetUrl?: string;
-  mode?: BrowserSessionMode;
   abortSignal?: AbortSignal;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
@@ -3724,7 +3427,7 @@ export async function executeRecordedBrowserOperation(
 
   switch (flow.name) {
     case 'readBrowserState':
-      return readCurrentBrowserState(session, options.mode || 'code', {
+      return readCurrentBrowserState(session, {
         runId,
         stepIndex: flow.index,
         abortSignal,
@@ -3743,117 +3446,6 @@ export async function executeRecordedBrowserOperation(
         abortSignal,
       });
     }
-    case 'takeScreenshot': {
-      const capture = input.capture === 'fullPage' ? 'fullPage' : 'viewport';
-      const path = await session.takeScreenshot(runId || 'automation', flow.index, 'manual', { capture });
-      return { ok: true, actual: `Captured ${capture} screenshot.`, referenceImagePath: path };
-    }
-    case 'browser': {
-      if (input.action === 'wait') {
-        return typeof input.ms === 'number' ? session.wait(input.ms) : session.waitForPage();
-      }
-      if (input.action === 'listTabs') return session.listTabs();
-      if (input.action === 'switchTab') {
-        return session.switchTab(typeof input.index === 'number' ? input.index : 0);
-      }
-      if (input.action !== 'open') {
-        return { ok: false, actual: `Unsupported recorded browser action: ${String(input.action || '')}.${reason}` };
-      }
-      const url = typeof input.url === 'string' && input.url.trim()
-        ? input.url
-        : options.targetUrl || '';
-      if (!url) return { ok: false, actual: `Recorded browser open requires a URL.${reason}` };
-      return input.target === 'new' ? session.openInNewTab(url) : session.open(url);
-    }
-    case 'interact': {
-      const parsed = z.object(browserInteractToolShape)
-        .superRefine(refineBrowserInteractTarget)
-        .safeParse(input);
-      if (!parsed.success) {
-        return { ok: false, actual: `Invalid recorded interact input: ${parsed.error.message}.${reason}` };
-      }
-      const action = parsed.data;
-      if (['click', 'move', 'drag', 'scroll', 'scrollIntoView'].includes(action.action)) {
-        return session.mouse({
-          action: action.action as 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView',
-          abortSignal,
-          target: action.target,
-          xThousandth: action.x_thousandth,
-          yThousandth: action.y_thousandth,
-          toTarget: action.toTarget,
-          toXThousandth: action.toX_thousandth,
-          toYThousandth: action.toY_thousandth,
-          button: action.button,
-          clickCount: action.clickCount,
-          force: action.force,
-          deltaX: action.deltaX,
-          deltaY: action.deltaY,
-        });
-      }
-      if (action.action === 'selectOption') {
-        return session.selectOption({
-          target: action.target,
-          value: action.value,
-          label: action.label,
-          abortSignal,
-        });
-      }
-      if (action.action === 'editText') {
-        return session.keyboard({
-          action: 'editText',
-          target: action.target,
-          text: action.text,
-          selection: action.selection,
-          operation: action.operation,
-        });
-      }
-      const credential = action.credentialRef
-        ? credentialBindings?.find((item) => item.ref === action.credentialRef)
-        : undefined;
-      if (action.credentialRef && (!credential || action.action !== 'type' || !action.target)) {
-        return { ok: false, actual: 'Credential entry requires a valid runtime reference and a current backend-bound field target.' };
-      }
-      return session.keyboard({
-        action: action.action as 'type' | 'press' | 'shortcut',
-        target: action.target,
-        xThousandth: action.x_thousandth,
-        yThousandth: action.y_thousandth,
-        text: credential ? credential.value : action.text,
-        key: action.key,
-        keys: action.keys,
-        replace: action.replace,
-        followByEnter: action.followByEnter,
-        allowedOrigins: credential?.allowedOrigins,
-      });
-    }
-    case 'inspect': {
-      if (input.action === 'httpRequests') {
-        const ids = Array.isArray(input.ids)
-          ? input.ids.filter((item): item is string => typeof item === 'string')
-          : undefined;
-        return session.getCurrentTabHttpRequests({ ids });
-      }
-      if (input.action === 'search') {
-        return session.searchSnapshot({
-          query: typeof input.query === 'string' ? input.query : undefined,
-          tag: typeof input.tag === 'string' ? input.tag : undefined,
-          roles: Array.isArray(input.roles)
-            ? input.roles.filter((item): item is string => typeof item === 'string')
-            : undefined,
-          limit: typeof input.limit === 'number' ? input.limit : undefined,
-        });
-      }
-      const mode = input.mode === 'text' || input.mode === 'changes' ? input.mode : 'full';
-      const snapshot = await session.readDomObservationSnapshot({
-        cursor: typeof input.cursor === 'string' ? input.cursor : undefined,
-        mode,
-      });
-      return {
-        ok: true,
-        actual: [snapshot.pageSummary, snapshot.content].filter(Boolean).join('\n'),
-        nextCursor: snapshot.nextCursor,
-      };
-    }
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'file':
@@ -3867,19 +3459,35 @@ export async function executeRecordedBrowserOperation(
           fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
         });
       }
-      if (input.action === 'generate') {
-        return generateFileArtifact({
+      if (input.action === 'plan') {
+        const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
+        return planFileArtifact({
           runId,
           fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-          documentType: input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation'
-            ? input.documentType
-            : undefined,
-          title: typeof input.title === 'string' ? input.title : undefined,
-          subtitle: typeof input.subtitle === 'string' ? input.subtitle : undefined,
-          content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
-          theme: generatedFileThemeSchema.safeParse(input.theme).data,
-          sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
-          slides: generatedFileSlidesSchema.safeParse(input.slides).data,
+          documentType,
+          intent: typeof input.intent === 'string' ? input.intent : undefined,
+          document: generatedFileDocumentSchema.safeParse(input.document).data,
+          outline: generatedFileOutlineSchema.safeParse(input.outline).data,
+        });
+      }
+      if (input.action === 'generate') {
+        return generateFileArtifactBlocks({
+          runId,
+          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
+          blocks: z.array(generatedFileBlockSchema).safeParse(input.blocks).data,
+          parentId: typeof input.parentId === 'string' ? input.parentId : undefined,
+          beforeId: typeof input.beforeId === 'string' ? input.beforeId : undefined,
+          afterId: typeof input.afterId === 'string' ? input.afterId : undefined,
+          render: input.render === true,
+          includeVisualVerification: modelSupportsScreenshotInput(),
+        });
+      }
+      if (input.action === 'edit') {
+        return editFileArtifact({
+          runId,
+          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
+          operations: z.array(generatedFileEditOperationSchema).safeParse(input.operations).data,
+          render: input.render !== false,
           includeVisualVerification: modelSupportsScreenshotInput(),
         });
       }
@@ -3893,23 +3501,6 @@ export async function executeRecordedBrowserOperation(
         sourcePageUrl: session.currentUrl(),
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
       });
-    case 'generateFile':
-      return generateFileArtifact({
-        runId,
-        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-        documentType: input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation'
-          ? input.documentType
-          : undefined,
-        title: typeof input.title === 'string' ? input.title : undefined,
-        subtitle: typeof input.subtitle === 'string' ? input.subtitle : undefined,
-        content: typeof input.content === 'string' ? input.content : typeof input.text === 'string' ? input.text : undefined,
-        theme: generatedFileThemeSchema.safeParse(input.theme).data,
-        sheets: generatedFileSheetsSchema.safeParse(input.sheets).data,
-        slides: generatedFileSlidesSchema.safeParse(input.slides).data,
-        includeVisualVerification: modelSupportsScreenshotInput(),
-      });
-    case 'reportState':
-      return { ok: true, actual: `Reported state without browser action: ${String(input.actual || input.reason || '')}` };
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
   }
@@ -3919,7 +3510,6 @@ async function executeCodexRuntimeObject(input: {
   session: BrowserSession;
   runId: string;
   stepIndex: number;
-  mode: BrowserSessionMode;
   type: string;
   message?: string;
   params: Record<string, unknown>;
@@ -3957,7 +3547,6 @@ async function executeCodexRuntimeObject(input: {
       message,
       typeof params.text === 'string' ? params.text : '',
       typeof params.content === 'string' ? params.content : '',
-      typeof params.actual === 'string' ? params.actual : '',
     ].map((item) => (item || '').trim()).find(Boolean) || '';
     return {
       text: readableActionFromRawText(answerText) || answerText,
@@ -4025,7 +3614,6 @@ async function executeCodexRuntimeObject(input: {
     }
     return executeRecordedBrowserOperation(session, flow, {
       runId,
-      mode: input.mode,
       abortSignal,
       attachmentBindings,
       credentialBindings,
@@ -4056,7 +3644,6 @@ async function executeCodexRuntimeObject(input: {
         } satisfies BrowserActionResult;
       }
       const approval = await requestBrowserToolApproval({
-        session,
         toolName: type,
         toolInput: normalizedParams,
         stepIndex,

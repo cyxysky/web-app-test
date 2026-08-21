@@ -525,7 +525,7 @@
   align-items: center;
   background: transparent;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--muted-strong);
   cursor: pointer;
   display: flex;

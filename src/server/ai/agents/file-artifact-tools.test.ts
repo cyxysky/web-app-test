@@ -4,8 +4,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  appendMissingFileArtifactDownloadLinks,
-  generateFileArtifact,
+  repairFileArtifactDownloadLinks,
+  generateFileArtifactBlocks,
+  planFileArtifact,
 } from './file-artifact-tools';
 
 test('stores generated files in the session generated-artifact directory', async () => {
@@ -13,9 +14,18 @@ test('stores generated files in the session generated-artifact directory', async
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
   try {
-    const result = await generateFileArtifact({
-      content: 'name,value\nstatus,passed',
+    const planned = await planFileArtifact({
+      documentType: 'spreadsheet',
       fileName: 'result.csv',
+      runId: 'chat_test',
+    });
+    assert.equal(planned.ok, true, planned.actual);
+    const documentId = (JSON.parse(planned.actual || '{}') as { documentId?: string }).documentId;
+    const result = await generateFileArtifactBlocks({
+      blocks: [{ id: 'data', type: 'table', rows: [['name', 'value'], ['status', 'passed']] }],
+      documentId,
+      includeVisualVerification: false,
+      render: true,
       runId: 'chat_test',
     });
     assert.equal(result.ok, true, result.actual);
@@ -30,11 +40,11 @@ test('stores generated files in the session generated-artifact directory', async
   }
 });
 
-test('appends only missing current-turn Artifact download links', () => {
+test('does not append a download section for files already exposed as message artifacts', () => {
   const firstUrl = '/webpilot/api/artifacts/chat_test/generated/first.md?download=1';
   const secondUrl = '/webpilot/api/artifacts/chat_test/generated/second.docx?download=1';
   const reply = `第一个文件：[first.md](${firstUrl})`;
-  const result = appendMissingFileArtifactDownloadLinks(reply, [
+  const result = repairFileArtifactDownloadLinks(reply, [
     {
       name: 'file',
       result: {
@@ -60,15 +70,15 @@ test('appends only missing current-turn Artifact download links', () => {
   ]);
 
   assert.equal(result.match(new RegExp(firstUrl.replace(/[?]/g, '\\?'), 'g'))?.length, 1);
-  assert.match(result, /## 文件下载/);
-  assert.match(result, new RegExp(`\\[second\\.docx\\]\\(${secondUrl.replace(/[?]/g, '\\?')}\\)`));
+  assert.doesNotMatch(result, /## 文件下载/);
+  assert.doesNotMatch(result, new RegExp(secondUrl.replace(/[?]/g, '\\?')));
 });
 
 test('repairs a model-authored Artifact link from the verified tool result instead of appending a duplicate', () => {
   const fileName = '研发部员工年中工作总结报告-陈劲帆-丰富版.docx';
   const correctUrl = `/webpilot/api/artifacts/chat_test/generated/${encodeURIComponent(fileName)}?download=1`;
   const wrongUrl = `/webpilot/api/artifacts/chat_test/generated/${encodeURIComponent('研发部员工工作总结报告-陈劲帆-丰富版.docx')}?download=1`;
-  const result = appendMissingFileArtifactDownloadLinks(
+  const result = repairFileArtifactDownloadLinks(
     `下载：[${fileName}](${wrongUrl})`,
     [{
       name: 'fillDocumentTemplate',
@@ -91,7 +101,7 @@ test('repairs a model-authored Artifact link from the verified tool result inste
 test('repairs multiple model-authored Artifact links by their verified file labels', () => {
   const firstUrl = '/webpilot/api/artifacts/chat_test/generated/first.md?download=1';
   const secondUrl = '/webpilot/api/artifacts/chat_test/generated/second.docx?download=1';
-  const result = appendMissingFileArtifactDownloadLinks(
+  const result = repairFileArtifactDownloadLinks(
     '[first.md](/webpilot/api/artifacts/chat_test/generated/wrong-first.md?download=1)\n[second.docx](/webpilot/api/artifacts/chat_test/generated/wrong-second.docx?download=1)',
     [
       {
@@ -112,7 +122,7 @@ test('repairs multiple model-authored Artifact links by their verified file labe
 
 test('does not expose failed or non-Artifact file tool URLs', () => {
   const reply = '生成失败。';
-  const result = appendMissingFileArtifactDownloadLinks(reply, [
+  const result = repairFileArtifactDownloadLinks(reply, [
     {
       name: 'file',
       result: {

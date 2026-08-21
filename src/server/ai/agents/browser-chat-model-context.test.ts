@@ -25,11 +25,11 @@ test('keeps the native AI SDK user, tool call, tool result, and final assistant 
     { role: 'user', content: '读取订单状态' },
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'inspect', input: { action: 'capture' } }],
+      content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'browserCode', input: { code: 'nodeRepl.write(await page.title())' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'call-1', toolName: 'inspect', output: { type: 'text', value: '订单已完成' } }],
+      content: [{ type: 'tool-result', toolCallId: 'call-1', toolName: 'browserCode', output: { type: 'text', value: '订单已完成' } }],
     },
     { role: 'assistant', content: '订单已完成。' },
   ];

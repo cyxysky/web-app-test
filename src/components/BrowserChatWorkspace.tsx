@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Children, createContext, isValidElement, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -26,6 +26,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
+import { Button, Checkbox, Popover, Table, TextArea } from '@heroui/react';
 import dynamic from 'next/dynamic';
 import {
   AppWindow,
@@ -90,8 +91,11 @@ import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import { CustomSelect } from '@/components/CustomSelect';
-import { FloatingLayer } from '@/components/FloatingLayer';
+import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
+import { AppModal } from '@/components/ui/app-modal';
+import { AppInput } from '@/components/ui/app-input';
+import { AnimatedShinyText } from '@/components/ui/animated-shiny-text';
 import {
   browserChatDownloadPercent,
   browserChatDownloadStatusLabel,
@@ -325,7 +329,6 @@ type BrowserChatSession = {
   titleFileName?: string;
   browserGroupId: string;
   targetUrl: string;
-  mode: BrowserChatMode;
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
@@ -402,7 +405,6 @@ type BrowserChatSessionRealtimePatch = {
   removedStepIndexes?: number[];
 };
 
-type BrowserChatMode = 'code' | 'dom';
 type BrowserChatSafetyMode = 'strict' | 'full';
 type BrowserChatModelConfig = RuntimeModelConfig;
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
@@ -1126,7 +1128,6 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
     generateFile: '生成文件',
     readFile: '读取文件',
     readSubagent: '读取子 Agent',
-    reportState: '确认状态',
     spawnSubagents: '子 Agent',
     waitForHumanVerification: '等待人工验证',
   };
@@ -1168,7 +1169,6 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
   if (name === 'readSubagent') return toolInputValue(record, ['uuid']);
   if (name === 'waitForHumanVerification') return toolInputValue(record, ['maxMs']);
   if (name === 'spawnSubagents') return Array.isArray(record.tasks) ? t('{count} 个任务', { count: record.tasks.length }) : '';
-  if (name === 'reportState') return toolInputValue(record, ['action', 'actual', 'status']);
   if (lower.includes('fill')) return summarizeToolFields(record.fields, t) || toolInputValue(record, ['text', 'content', 'value']);
   if (lower.includes('click') || lower.includes('hover') || lower.includes('drag')) {
     return toolInputValue(record, ['text', 'targetVisual', 'targetText', 'id', 'fromId']);
@@ -1183,19 +1183,10 @@ function isSubagentSpawnTool(name: string, input: unknown) {
   return name === 'subagent' && asRecord(input)?.action === 'spawn';
 }
 
-function pendingConfirmationBelongsToSubagentBatch(
-  pending: BrowserChatToolConfirmation | undefined,
-  subagents: BrowserChatSubagentRecord[] | undefined,
-  batchId: string | undefined,
-) {
-  if (!pending?.subagentId) return false;
-  const owner = subagents?.find((subagent) => subagent.id === pending.subagentId);
-  return Boolean(owner && (!batchId || owner.batchId === batchId));
-}
-
 function BrowserChatToolIcon({ name }: { name: string }) {
   const lower = name.toLowerCase();
   if (name === 'browserCode') return <Braces size={13} />;
+  if (lower === 'file' || lower.includes('fileoperation')) return <FileText size={13} />;
   if (lower.includes('subagent')) return <Waypoints size={13} />;
   if (lower.includes('screenshot') || lower.includes('capture')) return <ImageIcon size={13} />;
   if (lower.includes('type') || lower.includes('fill')) return <PencilLine size={13} />;
@@ -1798,10 +1789,6 @@ function temporaryId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function normalizeMode(value?: string): BrowserChatMode {
-  return value === 'dom' ? 'dom' : 'code';
-}
-
 function normalizeSafetyMode(value?: string): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
@@ -1848,7 +1835,6 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
       role: message.role === 'assistant' ? 'assistant' : 'user',
       stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
     })),
-    mode: normalizeMode(session.mode),
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: modelSelection.provider,
     model: modelSelection.model,
@@ -2036,6 +2022,14 @@ function handleBrowserChatMarkdownLinkClick(event: ReactMouseEvent<HTMLAnchorEle
   bridge.createTab({ url }).catch(() => undefined);
 }
 
+function BrowserChatMarkdownTableHeader({ children }: { children?: ReactNode }) {
+  const headerRow = Children.toArray(children).find((child) => isValidElement<{ children?: ReactNode }>(child));
+  const columns = isValidElement<{ children?: ReactNode }>(headerRow)
+    ? headerRow.props.children
+    : children;
+  return <Table.Header>{columns}</Table.Header>;
+}
+
 const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   const normalizedMarkdown = useMemo(() => normalizeBrowserChatMarkdown(markdown), [markdown]);
   return (
@@ -2057,10 +2051,19 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
             />
           ),
           table: ({ children }) => (
-            <div className="browser-chat-markdown-table-scroll">
-              <table>{children}</table>
-            </div>
+            <Table>
+              <Table.ScrollContainer>
+                <Table.Content aria-label="Markdown table">
+                  {children}
+                </Table.Content>
+              </Table.ScrollContainer>
+            </Table>
           ),
+          thead: ({ children }) => <BrowserChatMarkdownTableHeader>{children}</BrowserChatMarkdownTableHeader>,
+          tbody: ({ children }) => <Table.Body>{children}</Table.Body>,
+          tr: ({ children }) => <Table.Row>{children}</Table.Row>,
+          th: ({ children }) => <Table.Column>{children}</Table.Column>,
+          td: ({ children }) => <Table.Cell>{children}</Table.Cell>,
         }}
       >
         {normalizedMarkdown}
@@ -2088,12 +2091,12 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
 }) {
   const { t } = useI18n();
   const popoverId = useId();
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const activeCount = downloads.filter((download) => download.status === 'selecting' || download.status === 'pending' || download.status === 'downloading').length;
   const recentDownloads = downloads.slice(0, 12);
   const [downloadDirectory, setDownloadDirectory] = useState('');
   const [downloadDirectoryError, setDownloadDirectoryError] = useState('');
   const [downloadActionError, setDownloadActionError] = useState('');
+  const [downloadPendingDelete, setDownloadPendingDelete] = useState<SystemDownloadItem | null>(null);
   const [removingDownloadIds, setRemovingDownloadIds] = useState<Set<string>>(() => new Set());
   const [selectingDownloadDirectory, setSelectingDownloadDirectory] = useState(false);
 
@@ -2137,8 +2140,6 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   async function removeDownload(id: string) {
     const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
     if (!bridge?.removeDownload || removingDownloadIds.has(id)) return;
-    const download = downloads.find((item) => item.id === id);
-    if (!window.confirm(t('确定删除“{name}”吗？文件将移入回收站。', { name: download?.fileName || t('该文件') }))) return;
     setDownloadActionError('');
     setRemovingDownloadIds((current) => new Set(current).add(id));
     try {
@@ -2148,6 +2149,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
         return;
       }
       onRemove(id);
+      setDownloadPendingDelete(null);
     } catch (reason) {
       setDownloadActionError(reason instanceof Error ? reason.message : '删除文件失败');
     } finally {
@@ -2173,30 +2175,30 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
 
   return (
     <div className="browser-chat-download-center">
-      <button
-        aria-controls={popoverId}
-        aria-expanded={open}
-        aria-label={t('下载')}
-        className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
-        onClick={onToggle}
-        ref={triggerRef}
-        title={t('下载')}
-        type="button"
+      <Popover
+        isOpen={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen && !open) onToggle();
+          else if (!nextOpen && open) onClose();
+        }}
       >
-        <Download size={17} />
-        {activeCount ? <span className="browser-chat-download-badge">{activeCount}</span> : null}
-      </button>
-      <FloatingLayer
-        anchorRef={triggerRef}
-        ariaLabel={t('下载进度')}
-        className="browser-chat-download-popover"
-        id={popoverId}
-        maxHeight={520}
-        onDismiss={onClose}
-        preferredWidth={panelWidth}
-        present={open}
-        role="dialog"
-      >
+        <Button
+          aria-controls={popoverId}
+          aria-expanded={open}
+          aria-label={t('下载')}
+          className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
+          variant="ghost"
+        >
+          <Download size={17} />
+          {activeCount ? <span className="browser-chat-download-badge">{activeCount}</span> : null}
+        </Button>
+        <Popover.Content
+          containerPadding={8}
+          offset={6}
+          placement="bottom end"
+        >
+          <Popover.Dialog aria-label={t('下载进度')} id={popoverId}>
+          <div className="browser-chat-download-popover" style={{ maxHeight: 520, width: panelWidth }}>
           <header>
             <strong>{t('下载')}</strong>
             <div className="browser-chat-download-header-actions">
@@ -2267,7 +2269,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
                               aria-label={t('删除下载文件')}
                               className="browser-chat-download-item-action browser-chat-download-remove"
                               disabled={removingDownloadIds.has(download.id)}
-                              onClick={() => void removeDownload(download.id)}
+                              onClick={() => setDownloadPendingDelete(download)}
                               title={t('删除文件')}
                               type="button"
                             >
@@ -2288,7 +2290,24 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
           ) : (
             <div className="browser-chat-download-empty">{t('暂无下载')}</div>
           )}
-      </FloatingLayer>
+          </div>
+          </Popover.Dialog>
+        </Popover.Content>
+      </Popover>
+      {downloadPendingDelete ? (
+        <ConfirmDeleteModal
+          deleting={removingDownloadIds.has(downloadPendingDelete.id)}
+          description={t('文件将移入回收站。')}
+          error={downloadActionError}
+          id="browser-chat-download-delete-title"
+          itemTitle={downloadPendingDelete.fileName || t('该文件')}
+          onClose={() => {
+            if (!removingDownloadIds.has(downloadPendingDelete.id)) setDownloadPendingDelete(null);
+          }}
+          onConfirm={() => removeDownload(downloadPendingDelete.id)}
+          title={t('删除下载文件')}
+        />
+      ) : null}
     </div>
   );
 });
@@ -2312,7 +2331,6 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
 }) {
   const { t } = useI18n();
   const popoverId = useId();
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const [groups, setGroups] = useState<EmbeddedBrowserGroup[]>([]);
   const [error, setError] = useState('');
   const [pendingGroupId, setPendingGroupId] = useState('');
@@ -2353,31 +2371,31 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
 
   return (
     <div className="browser-chat-group-binding-center">
-      <button
-        aria-controls={popoverId}
-        aria-expanded={open}
-        aria-label={t('绑定浏览器标签组')}
-        className="ui-icon-button browser-chat-group-binding-button"
-        disabled={disabled}
-        onClick={onToggle}
-        ref={triggerRef}
-        style={{ '--browser-chat-bound-group-color': embeddedBrowserGroupIconColor(displayedGroupId) } as CSSProperties}
-        title={t('绑定浏览器标签组')}
-        type="button"
+      <Popover
+        isOpen={open}
+        onOpenChange={(nextOpen) => {
+          if (nextOpen && !open && !disabled) onToggle();
+          else if (!nextOpen && open) onClose();
+        }}
       >
-        {pendingGroupId ? <Loader2 className="spin" size={17} /> : <Folder size={17} />}
-      </button>
-      <FloatingLayer
-        anchorRef={triggerRef}
-        ariaLabel={t('选择浏览器标签组')}
-        className="browser-chat-group-binding-popover"
-        id={popoverId}
-        maxHeight={520}
-        onDismiss={onClose}
-        preferredWidth={panelWidth}
-        present={open}
-        role="dialog"
-      >
+        <Button
+          aria-controls={popoverId}
+          aria-expanded={open}
+          aria-label={t('绑定浏览器标签组')}
+          className="ui-icon-button browser-chat-group-binding-button"
+          isDisabled={disabled}
+          style={{ '--browser-chat-bound-group-color': embeddedBrowserGroupIconColor(displayedGroupId) } as CSSProperties}
+          variant="ghost"
+        >
+          {pendingGroupId ? <Loader2 className="spin" size={17} /> : <Folder size={17} />}
+        </Button>
+        <Popover.Content
+          containerPadding={8}
+          offset={6}
+          placement="bottom end"
+        >
+          <Popover.Dialog aria-label={t('选择浏览器标签组')} id={popoverId}>
+          <div className="browser-chat-group-binding-popover" style={{ maxHeight: 520, width: panelWidth }}>
           <header>
             <strong>{t('绑定标签组')}</strong>
             <button className="ui-icon-button" onClick={onClose} type="button" aria-label={t('关闭标签组面板')}>
@@ -2411,7 +2429,10 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
           ) : (
             <div className="browser-chat-group-binding-empty">{t('暂无可绑定的标签组')}</div>
           )}
-      </FloatingLayer>
+          </div>
+          </Popover.Dialog>
+        </Popover.Content>
+      </Popover>
     </div>
   );
 });
@@ -2682,28 +2703,39 @@ function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof t
 }
 
 function BrowserChatToolCardContent({
+  active = false,
   label,
   meta,
   name,
   userAction,
 }: {
+  active?: boolean;
   label: string;
   meta?: string;
   name: string;
   userAction?: ReturnType<typeof toolUserActionForTool>;
 }) {
+  const copy = (
+    <>
+      <span className="browser-chat-tool-label">
+        <span className="browser-chat-tool-name">{label}</span>
+        <BrowserChatToolUserActionTag action={userAction} />
+      </span>
+      {meta ? <span className="browser-chat-tool-meta">{meta}</span> : null}
+    </>
+  );
   return (
     <>
       <span className="browser-chat-tool-icon" aria-hidden="true">
         <BrowserChatToolIcon name={name} />
       </span>
-      <span className="browser-chat-tool-content">
-        <span className="browser-chat-tool-label">
-          <span className="browser-chat-tool-name">{label}</span>
-          <BrowserChatToolUserActionTag action={userAction} />
-        </span>
-        {meta ? <span className="browser-chat-tool-meta">{meta}</span> : null}
-      </span>
+      {active ? (
+        <AnimatedShinyText className="browser-chat-tool-content browser-chat-tool-shiny-text">
+          {copy}
+        </AnimatedShinyText>
+      ) : (
+        <span className="browser-chat-tool-content">{copy}</span>
+      )}
     </>
   );
 }
@@ -2827,31 +2859,28 @@ function BrowserChatScreenshotPreviewDialog({
   preview: BrowserChatScreenshotPreview | null;
 }) {
   const { t } = useI18n();
-  useEscapeDismiss(Boolean(preview), onClose);
-  if (!preview || typeof document === 'undefined') return null;
+  if (!preview) return null;
   const screenshot = preview.screenshots[preview.index];
   if (!screenshot) return null;
   const hasMultiple = preview.screenshots.length > 1;
-  return createPortal((
-    <div className="ui-modal-overlay browser-chat-tool-image-overlay" onMouseDown={onClose}>
-      <section
-        aria-label={t('截图预览')}
-        aria-modal="true"
-        className="ui-modal browser-chat-tool-image-dialog"
-        onMouseDown={(event) => event.stopPropagation()}
-        role="dialog"
-      >
+  return (
+    <AppModal
+      ariaLabel={t('截图预览')}
+      dialogClassName="browser-chat-tool-image-dialog"
+      onClose={onClose}
+      size="media"
+    >
         <header className="browser-chat-tool-image-dialog-header">
-          <div>
+          <div className="browser-chat-tool-image-dialog-title">
             <strong>{screenshot.title}</strong>
             <span>{t('{current} / {total}', { current: preview.index + 1, total: preview.screenshots.length })}</span>
           </div>
           <div className="browser-chat-tool-image-dialog-actions">
-            <a href={screenshot.url} rel="noopener noreferrer" target="_blank">
+            <a data-file-preview="false" href={screenshot.url} rel="noopener noreferrer" target="_blank">
               <SquareArrowOutUpRight size={15} />
               {t('打开原图')}
             </a>
-            <button aria-label={t('关闭')} onClick={onClose} type="button"><X size={17} /></button>
+            <button aria-label={t('关闭')} className="ui-modal-close" onClick={onClose} type="button"><X size={17} /></button>
           </div>
         </header>
         <div className="browser-chat-tool-image-stage">
@@ -2873,9 +2902,8 @@ function BrowserChatScreenshotPreviewDialog({
             ><ArrowRight size={19} /></button>
           ) : null}
         </div>
-      </section>
-    </div>
-  ), document.body);
+    </AppModal>
+  );
 }
 
 const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirmationActions({
@@ -2892,7 +2920,6 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
   const { t } = useI18n();
   const [screenshotOpen, setScreenshotOpen] = useState(false);
   const screenshotTitleId = useId();
-  useEscapeDismiss(screenshotOpen, () => setScreenshotOpen(false));
   useEffect(() => setScreenshotOpen(false), [pending?.id]);
   if (!pending || !onResolveToolConfirmation) return null;
   const resolving = resolvingConfirmationId === pending.id;
@@ -2947,15 +2974,12 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
           </RainbowButton>
         </div>
       </BlurFade>
-      {screenshotOpen && pending.screenshotUrl ? createPortal((
-        <div className="ui-modal-overlay browser-chat-confirmation-screenshot-overlay" onMouseDown={() => setScreenshotOpen(false)}>
-          <section
-            aria-labelledby={screenshotTitleId}
-            aria-modal="true"
-            className="ui-modal browser-chat-confirmation-screenshot-dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
+      {screenshotOpen && pending.screenshotUrl ? (
+        <AppModal
+          ariaLabelledBy={screenshotTitleId}
+          onClose={() => setScreenshotOpen(false)}
+          size="media"
+        >
             <header className="ui-modal-header">
               <div className="ui-modal-heading ui-modal-heading--with-icon">
                 <span aria-hidden="true" className="ui-modal-heading-icon"><ScanSearch size={18} /></span>
@@ -2971,9 +2995,8 @@ const BrowserChatToolConfirmationActions = memo(function BrowserChatToolConfirma
             <div className="ui-modal-body browser-chat-confirmation-screenshot-body">
               <img alt={t('确认操作前的当前页面截图')} src={pending.screenshotUrl} />
             </div>
-          </section>
-        </div>
-      ), document.body) : null}
+        </AppModal>
+      ) : null}
     </>
   );
 });
@@ -3020,7 +3043,6 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   resolvingConfirmationAction,
   resolvingConfirmationId,
   resuming,
-  running,
   structuredSubagents,
   title,
   tool,
@@ -3044,8 +3066,8 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
   tool: BrowserChatToolCall;
   toolResult?: unknown;
 }) {
-  const bodyId = useId();
   const [loadingRecords, setLoadingRecords] = useState(false);
+  const requestedBatchRef = useRef<string | undefined>(undefined);
   const batchSubagents = useMemo(
     () => browserChatSubagentViewsFromRecords(structuredSubagents || [], toolResult, batchId),
     [batchId, structuredSubagents, toolResult],
@@ -3054,16 +3076,6 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
     batchSubagents.length
     && batchSubagents.every((subagent) => subagent.status !== 'running' && subagent.status !== 'queued'),
   );
-  const hasPendingSubagentConfirmation = pendingConfirmationBelongsToSubagentBatch(
-    pendingToolConfirmation,
-    structuredSubagents,
-    batchId,
-  );
-  const hasProblem = batchSubagents.some((subagent) => subagent.status === 'failed' || subagent.status === 'blocked');
-  const autoExpanded = running && (isActive || hasProblem || hasPendingSubagentConfirmation);
-  const [expanded, setExpanded] = useState(autoExpanded);
-  const [bodyMounted, setBodyMounted] = useState(autoExpanded);
-  const previousAutoExpandedRef = useRef(autoExpanded);
   const loadSubagentRecords = useCallback(async () => {
     if (!onLoadSubagentRecords || loadingRecords || structuredSubagentsComplete) return;
     const showLoading = batchSubagents.length === 0;
@@ -3074,69 +3086,40 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
       if (showLoading) setLoadingRecords(false);
     }
   }, [batchSubagents.length, loadingRecords, onLoadSubagentRecords, structuredSubagentsComplete]);
-  const subagents = useMemo(
-    () => bodyMounted ? batchSubagents : [],
-    [batchSubagents, bodyMounted],
-  );
-  const toggleExpanded = useCallback(() => {
-    const nextExpanded = !expanded;
-    if (nextExpanded) {
-      setBodyMounted(true);
-      void loadSubagentRecords();
-    }
-    setExpanded(nextExpanded);
-  }, [expanded, loadSubagentRecords]);
   useEffect(() => {
-    const wasAutoExpanded = previousAutoExpandedRef.current;
-    if (autoExpanded) {
-      setBodyMounted(true);
-      setExpanded(true);
-    } else if (wasAutoExpanded) {
-      setExpanded(false);
-    }
-    previousAutoExpandedRef.current = autoExpanded;
-  }, [autoExpanded]);
+    const requestKey = batchId || tool.id || title;
+    if (!onLoadSubagentRecords || structuredSubagentsComplete || requestedBatchRef.current === requestKey) return;
+    requestedBatchRef.current = requestKey;
+    void loadSubagentRecords();
+  }, [batchId, loadSubagentRecords, onLoadSubagentRecords, structuredSubagentsComplete, title, tool.id]);
   return (
-    <section className={`browser-chat-ai-line-collapse browser-chat-subagent-tool browser-chat-tool-chips${expanded ? ' is-expanded' : ''}`}>
+    <section aria-label={title} className="browser-chat-ai-line-collapse browser-chat-subagent-tool browser-chat-tool-chips is-expanded">
       <div className="browser-chat-tool-card-row">
-        <button
-          aria-controls={bodyId}
-          aria-expanded={expanded}
-          aria-label={title}
-          className={`browser-chat-tool-card browser-chat-ai-tool-summary-card browser-chat-subagent-tool-chip${className}`}
-          onClick={toggleExpanded}
-          type="button"
+        <div
+          className={`browser-chat-tool-card browser-chat-ai-tool-summary-card browser-chat-subagent-tool-chip is-static${className}`}
         >
           {cardContent}
           <span className="browser-chat-subagent-tool-actions" aria-hidden="true">
             {loadingRecords ? <Loader2 className="spin" size={13} /> : null}
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
             {isActive ? <BrowserChatToolTailParticles /> : null}
           </span>
-        </button>
+        </div>
         <BrowserChatToolScreenshotButton tool={tool} />
       </div>
-      <div
-        aria-hidden={!expanded}
-        className="browser-chat-subagent-body-shell"
-        id={bodyId}
-        inert={!expanded}
-      >
-        {bodyMounted ? (
-          <div className="browser-chat-subagent-body">
-            <BrowserChatSubagentList
-              loadingRecords={loadingRecords}
-              onResolveToolConfirmation={onResolveToolConfirmation}
-              onSelectTool={onSelectTool}
-              onResume={onResume}
-              pendingToolConfirmation={pendingToolConfirmation}
-              resolvingConfirmationAction={resolvingConfirmationAction}
-              resolvingConfirmationId={resolvingConfirmationId}
-              resuming={resuming}
-              subagents={subagents}
-            />
-          </div>
-        ) : null}
+      <div className="browser-chat-subagent-body-shell">
+        <div className="browser-chat-subagent-body">
+          <BrowserChatSubagentList
+            loadingRecords={loadingRecords}
+            onResolveToolConfirmation={onResolveToolConfirmation}
+            onSelectTool={onSelectTool}
+            onResume={onResume}
+            pendingToolConfirmation={pendingToolConfirmation}
+            resolvingConfirmationAction={resolvingConfirmationAction}
+            resolvingConfirmationId={resolvingConfirmationId}
+            resuming={resuming}
+            subagents={batchSubagents}
+          />
+        </div>
       </div>
     </section>
   );
@@ -3234,7 +3217,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
               <BrowserChatSubagentToolDisclosure
                 batchId={tool.id}
                 cardContent={(
-                  <BrowserChatToolCardContent label={label} meta={meta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={meta} name={tool.name} userAction={userAction} />
                 )}
                 className={stateClass}
                 isActive={isActiveTool}
@@ -3260,7 +3243,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                   onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
                   type="button"
                 >
-                  <BrowserChatToolCardContent label={label} meta={meta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={meta} name={tool.name} userAction={userAction} />
                   {isActiveTool ? <BrowserChatToolTailParticles /> : null}
                 </button>
                 <BrowserChatToolScreenshotButton tool={tool} />
@@ -3380,6 +3363,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
           : toolUserActionForTool(logs, toolDetail.stepIndex, executedTool.name, executedTool.input);
         const card = (
           <BrowserChatToolCardContent
+            active={isActive}
             label={label}
             meta={meta ? compactText(meta, 150) : undefined}
             name={executedTool.name}
@@ -3454,40 +3438,10 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   cycles: BrowserChatAiOutputCycle[];
 }) {
   const showReasoning = useContext(BrowserChatReasoningVisibilityContext);
-  const { t } = useI18n();
   const toolCount = cycles.reduce((count, cycle) => (
     count + cycle.output.tools.filter((_tool, index) => toolDetails.has(aiCycleToolKey(cycle.id, index))).length
   ), 0);
   const reasoningCount = showReasoning ? cycles.reduce((count, cycle) => count + cycle.output.reasoning.length, 0) : 0;
-  const hasPendingConfirmation = cycles.some((cycle) => (
-    cycle.output.tools.some((tool, index) => {
-      const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
-      if (!toolDetail) return false;
-      return Boolean(pendingConfirmationForTool({
-        pending: pendingToolConfirmation,
-        stepIndex: toolDetail.stepIndex,
-        toolName: tool.name,
-        toolInput: toolDetail.tool.input,
-        toolOk: toolDetail.tool.ok,
-      }));
-    })
-  ));
-  const hasPendingSubagentConfirmation = cycles.some((cycle) => (
-    cycle.output.tools.some((tool, index) => {
-      const toolDetail = toolDetails.get(aiCycleToolKey(cycle.id, index));
-      if (!toolDetail || !isSubagentSpawnTool(toolDetail.tool.name, toolDetail.tool.input)) return false;
-      return pendingConfirmationBelongsToSubagentBatch(
-        pendingToolConfirmation,
-        structuredSubagents,
-        toolDetail.tool.id || tool.id,
-      );
-    })
-  ));
-  const meta = [
-    toolCount ? t('{count} 个工具', { count: toolCount }) : '',
-    reasoningCount ? t('{count} 条思维链', { count: reasoningCount }) : '',
-  ].filter(Boolean).join(' · ');
-
   if (toolCount === 1 && reasoningCount === 0) {
     return (
       <div className="browser-chat-single-tool-group">
@@ -3514,11 +3468,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
   }
 
   return (
-    <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse browser-chat-tool-chips" open={running || hasPendingConfirmation || hasPendingSubagentConfirmation || undefined}>
-      <summary className="browser-chat-ai-collapse-summary browser-chat-tool-chips-summary" title={meta || undefined}>
-        <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
-        <span>{meta || t('执行详情')}</span>
-      </summary>
+    <section className="browser-chat-ai-line-collapse browser-chat-executed-collapse browser-chat-tool-chips is-expanded">
       <div className="browser-chat-executed-body">
         {cycles.map((cycle) => (
           <div className="browser-chat-executed-entry" key={cycle.id}>
@@ -3540,7 +3490,7 @@ const BrowserChatExecutedCycleGroup = memo(function BrowserChatExecutedCycleGrou
           </div>
         ))}
       </div>
-    </details>
+    </section>
   );
 });
 
@@ -4599,7 +4549,6 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
-  const { t } = useI18n();
   const itemViews = items.map((item) => {
     const steps = (item.stepIndexes || [])
       .map((stepIndex) => stepsByIndex.get(stepIndex))
@@ -4613,23 +4562,10 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
       steps,
     };
   });
-  const groupRunning = itemViews.some((item) => item.running);
-  const groupHasPendingConfirmation = Boolean(pendingToolConfirmation && items.some((item) => item.id === pendingToolConfirmation.messageId));
-  const toolCount = itemViews.reduce((count, item) => (
-    count + item.steps.reduce((stepCount, step) => stepCount + (step.tools || []).length, 0)
-  ), 0);
-  const summaryMeta = toolCount
-    ? t('{count} 次工具调用', { count: toolCount })
-    : t('{count} 轮执行', { count: items.length });
-
   return (
     <article className="browser-chat-message assistant browser-chat-executed-message">
       <div>
-        <details className="browser-chat-ai-line-collapse browser-chat-executed-collapse browser-chat-tool-chips" open={groupRunning || groupHasPendingConfirmation}>
-          <summary className="browser-chat-ai-collapse-summary browser-chat-tool-chips-summary">
-            <ChevronDown className="browser-chat-ai-tool-chevron" size={13} />
-            <span>{summaryMeta}</span>
-          </summary>
+        <section className="browser-chat-ai-line-collapse browser-chat-executed-collapse browser-chat-tool-chips is-expanded">
           <div className="browser-chat-executed-body">
             {itemViews.map(({ item, logs, outputCycles: itemOutputCycles, running, steps, subagents: itemSubagents }) => (
               <div className="browser-chat-executed-entry" key={item.id}>
@@ -4653,7 +4589,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
               </div>
             ))}
           </div>
-        </details>
+        </section>
       </div>
     </article>
   );
@@ -5137,7 +5073,7 @@ function compactContextTokens(tokens: number) {
   return { decimalPlaces: 0, suffix: '', value: tokens };
 }
 
-function BrowserChatModeSelector({
+function BrowserChatSafetySelector({
   contextUsage,
   disabled,
   onSafetyModeChange,
@@ -5151,7 +5087,6 @@ function BrowserChatModeSelector({
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const menuId = useId();
-  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const safetyLabel = safetyMode === 'full' ? t('完全模式') : t('严格模式');
   const currentTokens = Math.max(0, contextUsage?.currentTokens || 0);
   const maxTokens = Math.max(1, contextUsage?.maxTokens || 256_000);
@@ -5172,21 +5107,64 @@ function BrowserChatModeSelector({
 
   return (
     <div className="browser-chat-mode-selector" data-i18n-skip>
-      <button
-        aria-controls={menuId}
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        aria-label={t('执行权限：{mode}', { mode: safetyLabel })}
-        className="browser-chat-mode-selector-trigger"
-        disabled={disabled}
-        onClick={() => setOpen((current) => !current)}
-        ref={triggerRef}
-        type="button"
-      >
-        <ShieldCheck aria-hidden="true" size={18} />
-        <span>{safetyLabel}</span>
-        <ChevronDown aria-hidden="true" className={open ? 'is-open' : undefined} size={14} />
-      </button>
+      <Popover isOpen={open} onOpenChange={setOpen}>
+        <Button
+          aria-controls={menuId}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          aria-label={t('执行权限：{mode}', { mode: safetyLabel })}
+          className="browser-chat-mode-selector-trigger"
+          isDisabled={disabled}
+          variant="ghost"
+        >
+          <ShieldCheck aria-hidden="true" size={18} />
+          <span>{safetyLabel}</span>
+          <ChevronDown aria-hidden="true" className={open ? 'is-open' : undefined} size={14} />
+        </Button>
+        <Popover.Content
+          containerPadding={8}
+          offset={6}
+          placement="top start"
+        >
+          <Popover.Dialog aria-label={t('执行权限')} className="browser-chat-mode-selector-dialog" id={menuId}>
+            <section className="browser-chat-mode-selector-section">
+              <header>
+                <strong>{t('执行权限')}</strong>
+              </header>
+              <div aria-label={t('安全性')} className="browser-chat-mode-selector-options" role="radiogroup">
+                <button
+                  aria-checked={safetyMode === 'strict'}
+                  className={safetyMode === 'strict' ? 'active' : undefined}
+                  onClick={() => {
+                    onSafetyModeChange('strict');
+                    setOpen(false);
+                  }}
+                  role="radio"
+                  title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
+                  type="button"
+                >
+                  <span>{t('严谨')}</span>
+                  {safetyMode === 'strict' ? <Check aria-hidden="true" size={14} /> : null}
+                </button>
+                <button
+                  aria-checked={safetyMode === 'full'}
+                  className={safetyMode === 'full' ? 'active' : undefined}
+                  onClick={() => {
+                    onSafetyModeChange('full');
+                    setOpen(false);
+                  }}
+                  role="radio"
+                  title={t('完全模式下，模型不需要征求用户手动确认执行')}
+                  type="button"
+                >
+                  <span>{t('完全')}</span>
+                  {safetyMode === 'full' ? <Check aria-hidden="true" size={14} /> : null}
+                </button>
+              </div>
+            </section>
+          </Popover.Dialog>
+        </Popover.Content>
+      </Popover>
 
       <div
         aria-label={t('当前上下文 {current} / 最大上下文 {max}', {
@@ -5244,55 +5222,6 @@ function BrowserChatModeSelector({
         </div>
       </div>
 
-      <FloatingLayer
-        align="start"
-        anchorRef={triggerRef}
-        ariaLabel={t('执行权限')}
-        className="browser-chat-mode-selector-menu"
-        id={menuId}
-        maxHeight={320}
-        onDismiss={() => setOpen(false)}
-        placement="top"
-        preferredWidth={226}
-        present={open}
-        role="dialog"
-      >
-          <section className="browser-chat-mode-selector-section">
-            <header>
-              <strong>{t('执行权限')}</strong>
-            </header>
-            <div aria-label={t('安全性')} className="browser-chat-mode-selector-options" role="radiogroup">
-              <button
-                aria-checked={safetyMode === 'strict'}
-                className={safetyMode === 'strict' ? 'active' : undefined}
-                onClick={() => {
-                  onSafetyModeChange('strict');
-                  setOpen(false);
-                }}
-                role="radio"
-                title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
-                type="button"
-              >
-                <span>{t('严谨')}</span>
-                {safetyMode === 'strict' ? <Check aria-hidden="true" size={14} /> : null}
-              </button>
-              <button
-                aria-checked={safetyMode === 'full'}
-                className={safetyMode === 'full' ? 'active' : undefined}
-                onClick={() => {
-                  onSafetyModeChange('full');
-                  setOpen(false);
-                }}
-                role="radio"
-                title={t('完全模式下，模型不需要征求用户手动确认执行')}
-                type="button"
-              >
-                <span>{t('完全')}</span>
-                {safetyMode === 'full' ? <Check aria-hidden="true" size={14} /> : null}
-              </button>
-            </div>
-          </section>
-      </FloatingLayer>
     </div>
   );
 }
@@ -5308,15 +5237,12 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading,
   loadingMoreSkills,
   managementActions,
-  mode,
-  modeLocked,
   modelSelection,
   modelSelectionTitle,
   modelSelectionOptions,
   safetyMode,
   onInterrupt,
   onModelSelectionChange,
-  onModeChange,
   onLoadMoreSkills,
   onPreviewAttachment,
   onRemoveAttachment,
@@ -5340,15 +5266,12 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   loading: boolean;
   loadingMoreSkills: boolean;
   managementActions: ReactNode;
-  mode: BrowserChatMode;
-  modeLocked: boolean;
   modelSelection: string;
   modelSelectionTitle: string;
   modelSelectionOptions: Array<{ description?: string; group?: string; label: string; selectedLabel?: string; value: string }>;
   safetyMode: BrowserChatSafetyMode;
   onInterrupt: () => void | Promise<void>;
   onModelSelectionChange: (selection: { provider: ModelProvider; model: string }) => void;
-  onModeChange: (mode: BrowserChatMode) => void;
   onLoadMoreSkills: () => void | Promise<void>;
   onPreviewAttachment: (attachment: BrowserChatAttachment) => void;
   onRemoveAttachment: (id: string) => void;
@@ -5362,9 +5285,6 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   skillsHasMore: boolean;
   uploadingImage: boolean;
 }) {
-  void mode;
-  void modeLocked;
-  void onModeChange;
   const { t } = useI18n();
   const editorRef = useRef<HTMLDivElement | null>(null);
   const [draft, setDraft] = useState('');
@@ -6016,7 +5936,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
             >
               {uploadingImage ? <Loader2 className="spin" size={17} /> : <Paperclip size={20} />}
             </button>
-            <BrowserChatModeSelector
+            <BrowserChatSafetySelector
               contextUsage={contextUsage}
               disabled={currentBusy || loading}
               onSafetyModeChange={onSafetyModeChange}
@@ -6103,17 +6023,12 @@ function BrowserChatManagementDialog({
   const Icon = tab === 'skills' ? Braces : tab === 'memory' ? Brain : KeyRound;
   const title = tab === 'skills' ? t('Skills 管理') : tab === 'memory' ? t('个性化记忆') : t('登录账号');
 
-  useEscapeDismiss(true, onClose);
-
-  return createPortal((
-    <div className="ui-modal-overlay browser-chat-management-overlay" onMouseDown={onClose}>
-      <section
-        aria-labelledby={titleId}
-        aria-modal="true"
-        className="ui-modal ui-modal--wide browser-chat-management-dialog"
-        onMouseDown={(event) => event.stopPropagation()}
-        role="dialog"
-      >
+  return (
+    <AppModal
+      ariaLabelledBy={titleId}
+      onClose={onClose}
+      size="management"
+    >
         <header className="ui-modal-header">
           <div className="ui-modal-heading ui-modal-heading--with-icon ui-modal-heading--single-line browser-chat-management-heading">
             <span aria-hidden="true" className="ui-modal-heading-icon"><Icon size={18} /></span>
@@ -6140,9 +6055,8 @@ function BrowserChatManagementDialog({
             />
           </div>
         </div>
-      </section>
-    </div>
-  ), document.body);
+    </AppModal>
+  );
 }
 
 function embeddedBoundsFromElement(element: HTMLElement, options: { leftInset?: number } = {}): EmbeddedBrowserBounds {
@@ -7021,8 +6935,6 @@ function BrowserChatWebPreviewModal({
     };
   }, [beginVideoPipeline, deliverPreviewDownload, disposeVideoPipeline, enqueueVideoChunk, fallbackToImagePreview, queuePreviewFrame, sessionId, userId]);
 
-  useEscapeDismiss(true, onClose);
-
   useEffect(() => {
     // React Strict Mode mounts effects again after a simulated cleanup. Reset
     // this flag on every setup so the remounted preview continues accepting frames.
@@ -7386,14 +7298,11 @@ function BrowserChatWebPreviewModal({
   const hasPreviewVisual = videoDisplayReady || Boolean(frame?.imageUrl);
 
   return (
-    <div className="ui-modal-overlay browser-chat-web-preview-overlay" onClick={onClose} role="presentation">
-      <div
-        aria-label={t('实时界面')}
-        aria-modal="true"
-        className="ui-modal browser-chat-web-preview-modal"
-        onClick={(event) => event.stopPropagation()}
-        role="dialog"
-      >
+    <AppModal
+      ariaLabel={t('实时界面')}
+      onClose={onClose}
+      size="full"
+    >
         <header className="ui-modal-header browser-chat-web-preview-header" style={{ padding: '0px 16px'}}>
           <div className="ui-modal-heading">
             <div className="browser-chat-web-preview-title-row">
@@ -7564,7 +7473,7 @@ function BrowserChatWebPreviewModal({
                   </strong>
                   <p>{nativeDialog.message}</p>
                   {nativeDialog.dialogType === 'prompt' ? (
-                    <input
+                    <AppInput
                       autoFocus
                       onChange={(event) => setNativeDialogPrompt(event.target.value)}
                       onKeyDown={(event) => {
@@ -7618,8 +7527,7 @@ function BrowserChatWebPreviewModal({
           ) : null}
         </div>
 
-      </div>
-    </div>
+    </AppModal>
   );
 }
 
@@ -7676,11 +7584,6 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   const [creatingNewGroup, setCreatingNewGroup] = useState(false);
   const [runtimeActivatedSessionId, setRuntimeActivatedSessionId] = useState('');
   const requestedGroupId = browserGroupId || embeddedGroupIdForSession(sessionId);
-  useEscapeDismiss(newGroupDialogOpen, () => {
-    if (creatingNewGroup) return;
-    setNewGroupDialogOpen(false);
-    onDialogOpenChange?.(false);
-  });
   const requestedGroupAvailable = useMemo(() => (
     Boolean(requestedGroupId) && (
       browserGroups.some((group) => (
@@ -8676,10 +8579,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             </button>
           </div>
           <form className="browser-chat-embedded-address-bar" onSubmit={navigateEmbeddedBrowserAddress}>
-            <span className="browser-chat-embedded-address-icon" aria-hidden="true">
-              {addressValue.startsWith('https://') ? <Lock size={14} /> : <Globe size={14} />}
-            </span>
-            <input
+            <AppInput
               ref={addressInputRef}
               aria-label={t('地址')}
               disabled={!bridgeAvailable}
@@ -8691,6 +8591,9 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
               onFocus={() => {
                 addressFocusedRef.current = true;
               }}
+              prefix={<span className="browser-chat-embedded-address-icon" aria-hidden="true">
+                {addressValue.startsWith('https://') ? <Lock size={14} /> : <Globe size={14} />}
+              </span>}
               spellCheck={false}
               value={addressValue}
             />
@@ -8736,21 +8639,23 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
       </div>
     </section>
     {newGroupDialogOpen ? (
-      <div className="ui-modal-overlay" onClick={() => {
-        if (creatingNewGroup) return;
-        setNewGroupDialogOpen(false);
-        onDialogOpenChange?.(false);
-      }} role="presentation">
+      <AppModal
+        ariaLabel={t('新建浏览器标签组')}
+        dismissable={!creatingNewGroup}
+        keyboardDismissable={!creatingNewGroup}
+        onClose={() => {
+          if (creatingNewGroup) return;
+          setNewGroupDialogOpen(false);
+          onDialogOpenChange?.(false);
+        }}
+        size="sm"
+      >
         <form
-          aria-modal="true"
-          className="ui-modal ui-modal--compact"
-          onClick={(event) => event.stopPropagation()}
+          className="webpilot-modal-form"
           onSubmit={(event) => {
             event.preventDefault();
             void createEmbeddedBrowserGroup();
           }}
-          role="dialog"
-          aria-label={t('新建浏览器标签组')}
         >
           <header className="ui-modal-header">
             <div className="ui-modal-heading">
@@ -8773,9 +8678,8 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
           <div className="ui-modal-body">
             <label className="modal-field">
               {t('标签组名称')}
-              <input
+              <AppInput
                 autoFocus
-                className="input"
                 disabled={creatingNewGroup}
                 onChange={(event) => setNewGroupName(event.target.value)}
                 placeholder={t('新建标签组')}
@@ -8790,7 +8694,7 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
             </button>
           </footer>
         </form>
-      </div>
+      </AppModal>
     ) : null}
     </>
   );
@@ -8828,7 +8732,7 @@ export function BrowserChatWorkspace({
     search: searchSkills,
     skills,
   } = useBrowserChatSkillCatalog(browserChatApiUrl, t);
-  const { mode: themeMode, toggleMode } = useTheme();
+  const { mode: themeMode, setMode } = useTheme();
   const {
     closeFilePreview,
     filePreviewOpen,
@@ -8874,8 +8778,6 @@ export function BrowserChatWorkspace({
     loadingMore: loadingMoreSessions,
     page: sessionListPage,
   } = useBrowserChatSessionPagination(browserChatApiUrl, applySessionListPage, t);
-  const [mode, setMode] = useState<BrowserChatMode>('code');
-  const defaultModeRef = useRef<BrowserChatMode>('code');
   const [safetyMode, setSafetyMode] = useState<BrowserChatSafetyMode>('strict');
   const [modelProvider, setModelProvider] = useState<ModelProvider>(() => initialModelSelection.provider);
   const [modelId, setModelId] = useState(() => initialModelSelection.model);
@@ -8933,7 +8835,6 @@ export function BrowserChatWorkspace({
   const currentBusy = busy || selectedSessionRunning || interrupting;
   const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
   const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
-  const modeLocked = Boolean(session && session.status !== 'closed' && (session.messages.length || session.steps.length || selectedSessionRunning));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
@@ -9370,12 +9271,8 @@ export function BrowserChatWorkspace({
   const applyBrowserRuntimeSettings = useCallback((saved: Array<{ key?: string; value?: string }>) => {
     const embeddedSetting = saved.find((item) => item.key === 'ELECTRON_EMBEDDED_BROWSER');
     const reasoningSetting = saved.find((item) => item.key === 'BROWSER_CHAT_SHOW_REASONING');
-    const browserModeSetting = saved.find((item) => item.key === 'AI_BROWSER_MODE');
-    const savedMode = normalizeMode(browserModeSetting?.value);
     setEmbeddedBrowserEnabled(embeddedSetting?.value === 'true');
     setShowReasoning(reasoningSetting?.value === 'true');
-    defaultModeRef.current = savedMode;
-    setMode(savedMode);
   }, []);
 
   const applyModelConfig = useCallback((value: Partial<BrowserChatModelConfig> | undefined) => {
@@ -9486,7 +9383,6 @@ export function BrowserChatWorkspace({
     const shouldActivate = options.activateIf?.() ?? options.activate ?? activeSessionIdRef.current === sessionId;
     const loadedSession = upsertSession(data.session as BrowserChatSession, { activate: shouldActivate });
     if (shouldActivate) {
-      setMode(normalizeMode(loadedSession.mode));
       setSafetyMode(normalizeSafetyMode(loadedSession.safetyMode));
       const nextModel = resolveRuntimeModelSelection(modelConfig, {
         model: loadedSession.model,
@@ -9629,7 +9525,6 @@ export function BrowserChatWorkspace({
       setSessions((current) => current.filter((item) => item.id !== event.id));
       if (activeSessionIdRef.current === event.id) {
         activeSessionIdRef.current = null;
-        setMode(defaultModeRef.current);
       }
       setSession((current) => (current?.id === event.id ? null : current));
       setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
@@ -9961,7 +9856,6 @@ export function BrowserChatWorkspace({
     setLoadingSessionId(null);
     setSessionMinimumLoadingElapsed(true);
     setMessageViewportReady(true);
-    setMode(defaultModeRef.current);
     setSession(null);
     if (!mountedIdentityRef.current) {
       window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href));
@@ -10045,10 +9939,6 @@ export function BrowserChatWorkspace({
       setDeletingSelectedSessions(false);
       setRecentSelectionMode(false);
     }
-  }
-
-  function closeSidebarOverflowMenu() {
-    document.querySelectorAll<HTMLDetailsElement>('.browser-chat-overflow[open]').forEach((menu) => menu.removeAttribute('open'));
   }
 
   const openMessageGenerationDialog = useCallback((kind: BrowserChatMessageGenerationKind, messageId: string) => {
@@ -10150,7 +10040,6 @@ export function BrowserChatWorkspace({
     setAttachments([]);
     releaseSessionRuntime(activeSessionIdRef.current);
     activeSessionIdRef.current = null;
-    setMode(defaultModeRef.current);
     setSession(null);
     setMessageViewportReady(true);
     if (!mountedIdentityRef.current) {
@@ -10202,8 +10091,6 @@ export function BrowserChatWorkspace({
     if (loadingSessionRef.current === loadingSessionId) loadingSessionRef.current = null;
     setLoadingSessionId((current) => current === loadingSessionId ? null : current);
   }, [loadingSessionId, messageViewportReady, sessionMinimumLoadingElapsed]);
-
-  useEscapeDismiss(Boolean(messageGenerationDialog), closeMessageGenerationDialog);
 
   useEscapeDismiss(mobileHistoryOpen, () => setMobileHistoryOpen(false));
 
@@ -10306,7 +10193,6 @@ export function BrowserChatWorkspace({
                   {recentSessions.length ? (
                     <button
                       onClick={() => {
-                        closeSidebarOverflowMenu();
                         setRecentSelectionMode((current) => !current);
                         if (recentSelectionMode) setSelectedSessionIds([]);
                       }}
@@ -10319,7 +10205,6 @@ export function BrowserChatWorkspace({
                   {recentSelectionMode ? (
                     <button
                       onClick={() => {
-                        closeSidebarOverflowMenu();
                         toggleAllRecentSelections();
                       }}
                       type="button"
@@ -10411,7 +10296,6 @@ export function BrowserChatWorkspace({
                             className="danger"
                             disabled={item.busy || deletingSessionIds.has(item.id) || deletingSelectedSessions}
                             onClick={() => {
-                              closeSidebarOverflowMenu();
                               void deleteSessionHistory(item.id);
                             }}
                             type="button"
@@ -10431,14 +10315,17 @@ export function BrowserChatWorkspace({
                       }}
                       selecting={recentSelectionMode}
                       selectionControl={recentSelectionMode ? (
-                        <input
-                          aria-label={t('选择 {name}', { name: displayTitle })}
-                          checked={selectedSessionIdSet.has(item.id)}
-                          className="browser-chat-recent-check"
-                          disabled={item.busy || deletingSelectedSessions}
-                          onChange={(event) => toggleSessionSelection(item.id, event.currentTarget.checked)}
-                          type="checkbox"
-                        />
+                        <span className="browser-chat-recent-check">
+                          <Checkbox
+                            isDisabled={item.busy || deletingSelectedSessions}
+                            isSelected={selectedSessionIdSet.has(item.id)}
+                            onChange={(selected) => toggleSessionSelection(item.id, selected)}
+                          >
+                            <Checkbox.Content aria-label={t('选择 {name}', { name: displayTitle })}>
+                              <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                            </Checkbox.Content>
+                          </Checkbox>
+                        </span>
                       ) : undefined}
                       title={displayTitle}
                     />
@@ -10611,15 +10498,12 @@ export function BrowserChatWorkspace({
               </button>
             </div>
           )}
-          mode={mode}
-          modeLocked={modeLocked}
           modelSelection={modelSelection}
           modelSelectionTitle={modelSelectionDiagnostic}
           modelSelectionOptions={modelSelectionOptions}
           safetyMode={safetyMode}
           onInterrupt={interruptConversation}
           onModelSelectionChange={changeModelSelection}
-          onModeChange={setMode}
           onLoadMoreSkills={loadMoreSkills}
           onPreviewAttachment={previewAttachment}
           onRemoveAttachment={removeAttachment}
@@ -10644,7 +10528,7 @@ export function BrowserChatWorkspace({
         collapsed={sidebarCollapsed}
         collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
-        onToggleTheme={toggleMode}
+        onThemeChange={setMode}
         themeMode={themeMode}
         themeToggleLabel={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
         themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
@@ -10767,15 +10651,14 @@ export function BrowserChatWorkspace({
         />
       ) : null}
 
-      {messageGenerationDialog ? createPortal((
-        <div className="ui-modal-overlay browser-chat-message-generation-overlay" onMouseDown={closeMessageGenerationDialog}>
-          <section
-            aria-labelledby="browser-chat-message-generation-title"
-            aria-modal="true"
-            className="ui-modal browser-chat-message-generation-dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
+      {messageGenerationDialog ? (
+        <AppModal
+          ariaLabelledBy="browser-chat-message-generation-title"
+          dismissable={!messageGenerationSubmitting}
+          keyboardDismissable={!messageGenerationSubmitting}
+          onClose={closeMessageGenerationDialog}
+          size="lg"
+        >
             <header className="ui-modal-header browser-chat-message-generation-header">
               <div className="ui-modal-heading ui-modal-heading--with-icon browser-chat-message-generation-heading">
                 <span className="ui-modal-heading-icon browser-chat-message-generation-icon" aria-hidden="true">
@@ -10805,10 +10688,10 @@ export function BrowserChatWorkspace({
                     <strong>{t('总结方向')}</strong>
                     <small>{messageGenerationDialog.summaryDirection.length}/2000</small>
                   </span>
-                  <textarea
+                  <TextArea
                     autoFocus
-                    className="input"
                     disabled={messageGenerationSubmitting}
+                    fullWidth
                     maxLength={2_000}
                     onChange={(event) => {
                       const summaryDirection = event.currentTarget.value;
@@ -10847,21 +10730,24 @@ export function BrowserChatWorkspace({
               </div>
               <div className="browser-chat-message-generation-list">
                 {generatableMessageOptions.map((item) => (
-                  <label className="browser-chat-message-generation-item" key={item.id}>
-                    <input
-                      checked={selectedGenerationMessageIdSet.has(item.id)}
-                      disabled={messageGenerationSubmitting}
-                      onChange={(event) => toggleGeneratedMessageSelection(item.id, event.currentTarget.checked)}
-                      type="checkbox"
-                    />
-                    <div className="browser-chat-message-generation-content">
-                      <div className="browser-chat-message-generation-title" title={item.title}>{item.title}</div>
-                      {item.summary && item.summary !== item.title ? (
-                        <div className="browser-chat-message-generation-summary" title={item.summary}>{item.summary}</div>
-                      ) : null}
-                    </div>
-                    <em>{t('{count} 个步骤', { count: item.stepCount })}</em>
-                  </label>
+                  <div className="browser-chat-message-generation-item" key={item.id}>
+                    <Checkbox
+                      isDisabled={messageGenerationSubmitting}
+                      isSelected={selectedGenerationMessageIdSet.has(item.id)}
+                      onChange={(selected) => toggleGeneratedMessageSelection(item.id, selected)}
+                    >
+                      <Checkbox.Content>
+                        <Checkbox.Control><Checkbox.Indicator /></Checkbox.Control>
+                        <div className="browser-chat-message-generation-content">
+                          <div className="browser-chat-message-generation-title" title={item.title}>{item.title}</div>
+                          {item.summary && item.summary !== item.title ? (
+                            <div className="browser-chat-message-generation-summary" title={item.summary}>{item.summary}</div>
+                          ) : null}
+                        </div>
+                        <em>{t('{count} 个步骤', { count: item.stepCount })}</em>
+                      </Checkbox.Content>
+                    </Checkbox>
+                  </div>
                 ))}
               </div>
               {messageGenerationError ? <div className="error" role="alert">{messageGenerationError}</div> : null}
@@ -10889,9 +10775,8 @@ export function BrowserChatWorkspace({
                 </button>
               </div>
             </footer>
-          </section>
-        </div>
-      ), document.body) : null}
+        </AppModal>
+      ) : null}
 
     </section>
     </BrowserChatReasoningVisibilityContext.Provider>

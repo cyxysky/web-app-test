@@ -65,7 +65,6 @@ export async function POST(request: NextRequest) {
         sourceMessageIds: [],
         targetUrl: text(body.targetUrl ?? body.url) || 'about:blank',
         instruction,
-        mode: 'code',
         operations: [],
       });
       return apiJson(request, {

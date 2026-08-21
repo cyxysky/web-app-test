@@ -348,7 +348,6 @@ async function runRepairAgent(input: {
     targetUrl: input.automationCase.targetUrl,
     instruction: input.instruction,
     operationalContext: input.credentialContext.operationalContext || undefined,
-    mode: input.automationCase.mode,
     safetyMode: 'full',
     abortSignal: input.abortSignal,
     shouldContinue: () => !input.abortSignal?.aborted,
@@ -468,7 +467,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
     const credentialContext = credentialContextForCase(automationCase);
     throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     const browserProfileKey = `user_${automationCase.userId}`;
-    browser = new BrowserSession(automationCase.mode, {
+    browser = new BrowserSession({
       browserSurface: 'external',
       headless: true,
       browserProfileKey,
@@ -515,7 +514,6 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
         try {
           fixedResult = await executeRecordedBrowserOperation(browser, operation, {
             runId: run.id,
-            targetUrl: automationCase.targetUrl,
             abortSignal: options.abortSignal,
             credentialBindings: credentialContext.bindings,
           });

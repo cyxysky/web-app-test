@@ -2,24 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { browserToolApprovalRequest } from './browser-tool-approval';
 
-test('keeps read-only and preparatory browser tools approval-free', () => {
-  assert.equal(browserToolApprovalRequest({ toolName: 'takeSnapshot', toolInput: { reason: '读取页面' } }), undefined);
-  assert.equal(browserToolApprovalRequest({
-    toolName: 'interact',
-    toolInput: { action: 'type', reason: '填写名称', value: '示例' },
-    targetDescription: 'textbox "名称"',
-  }), undefined);
-});
-
-test('requires approval for committing DOM interactions using backend target evidence', () => {
-  const request = browserToolApprovalRequest({
-    toolName: 'interact',
-    toolInput: { action: 'click', reason: '继续操作' },
-    targetDescription: 'button "删除项目"',
-  });
-  assert.match(request?.prompt || '', /删除项目/);
-});
-
 test('requires approval for committing browser code', () => {
   const request = browserToolApprovalRequest({
     toolName: 'browserCode',

@@ -1,25 +1,15 @@
-.file-preview-overlay {
-  align-items: center;
-  background: var(--modal-overlay-bg);
+.file-preview-dialog {
   display: flex;
-  inset: 0;
-  justify-content: center;
-  padding: 24px;
-  position: fixed;
-  z-index: 1300;
+  flex-direction: column;
+  overflow: hidden;
+  width: calc(100vw - 40px);
 }
 
-.file-preview-dialog {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  box-shadow: var(--modal-shadow);
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  height: min(90vh, 920px);
-  max-width: 1480px;
+.file-preview-dialog > [data-slot="modal-body"] {
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
-  width: min(94vw, 1480px);
+  padding: 0;
 }
 
 .file-preview-header {
@@ -68,6 +58,8 @@
   min-height: 0;
   overflow: hidden;
   position: relative;
+  height: 100%;
+  width: 100%;
 }
 
 .file-preview-stage > .ofv-root,
@@ -78,7 +70,8 @@
 }
 
 .file-preview-stage .ofv-root {
-  border: 0;
+  border: 0 !important;
+  box-shadow: none !important;
   height: 100% !important;
 }
 
@@ -108,9 +101,7 @@
 }
 
 @media (max-width: 720px) {
-  .file-preview-overlay { padding: 0; }
   .file-preview-dialog {
-    border: 0;
     border-radius: 0;
     height: 100dvh;
     width: 100vw;

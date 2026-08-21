@@ -2,6 +2,7 @@
 
 import { ChevronDown, Globe2, History, Search, Star, Trash2, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { InputGroup } from '@heroui/react';
 import { useI18n } from '@/i18n/I18nProvider';
 import styles from './EmbeddedBrowserLibraryOverlay.module.css';
 
@@ -210,9 +211,9 @@ export function EmbeddedBrowserLibraryOverlay() {
         </header>
 
         {searchVisible ? (
-          <div className={styles.searchBar}>
-            <Search aria-hidden="true" size={16} />
-            <input
+          <InputGroup fullWidth>
+            <InputGroup.Prefix><Search aria-hidden="true" size={16} /></InputGroup.Prefix>
+            <InputGroup.Input
               aria-label={t('搜索收藏与历史记录')}
               onChange={(event) => setQuery(event.currentTarget.value)}
               placeholder={t('搜索收藏与历史记录')}
@@ -220,11 +221,13 @@ export function EmbeddedBrowserLibraryOverlay() {
               value={query}
             />
             {query ? (
-              <button aria-label={t('清除搜索')} onClick={() => setQuery('')} title={t('清除')} type="button">
-                <X size={14} />
-              </button>
+              <InputGroup.Suffix>
+                <button aria-label={t('清除搜索')} onClick={() => setQuery('')} title={t('清除')} type="button">
+                  <X size={14} />
+                </button>
+              </InputGroup.Suffix>
             ) : null}
-          </div>
+          </InputGroup>
         ) : null}
 
         <section className={`${styles.content} ${styles.combinedContent}`}>

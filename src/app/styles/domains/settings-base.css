@@ -155,19 +155,19 @@
   white-space: nowrap;
 }
 
-.settings-workspace .input {
+.settings-workspace .input:not([data-slot], [data-slot] *) {
   background: #ffffff;
   border-color: var(--border);
   color: var(--foreground);
 }
 
-.settings-workspace .input:disabled {
+.settings-workspace .input:not([data-slot], [data-slot] *):disabled {
   color: var(--muted);
   cursor: not-allowed;
   opacity: 0.74;
 }
 
-.settings-workspace .input::placeholder {
+.settings-workspace .input:not([data-slot], [data-slot] *)::placeholder {
   color: #8e8ea0;
 }
 
@@ -427,94 +427,7 @@
 }
 
 .domain-list-search {
-  align-items: center;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 10px;
-  color: var(--muted);
-  display: flex;
-  gap: 9px;
-  height: 42px;
   min-width: 0;
-  padding: 0 7px 0 12px;
-  position: relative;
-  transition:
-    background-color 150ms ease,
-    border-color 150ms ease,
-    box-shadow 150ms ease,
-    color 150ms ease;
-}
-
-.domain-list-search:hover {
-  background: transparent;
-  border-color: color-mix(in srgb, var(--border-strong) 70%, transparent);
-}
-
-.domain-list-search:focus-within {
-  background: transparent;
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 9%, transparent);
-  color: var(--foreground);
-}
-
-.domain-list-search > svg {
-  color: currentColor;
-  flex: 0 0 auto;
-  pointer-events: none;
-}
-
-.domain-list-search-input {
-  appearance: none;
-  background: transparent;
-  border: 0;
-  color: var(--foreground);
-  flex: 1 1 auto;
-  font: inherit;
-  font-size: 13px;
-  height: 100%;
-  min-width: 0;
-  outline: 0;
-  padding: 0;
-  width: 100%;
-}
-
-.domain-list-search-input:focus,
-.domain-list-search-input:focus-visible {
-  outline: 0;
-}
-
-.domain-list-search-input::placeholder {
-  color: color-mix(in srgb, var(--muted) 84%, transparent);
-  opacity: 1;
-}
-
-.domain-list-search-input::-webkit-search-cancel-button,
-.domain-list-search-input::-webkit-search-decoration {
-  appearance: none;
-  display: none;
-}
-
-.domain-list-search > button {
-  align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 7px;
-  color: var(--muted);
-  cursor: pointer;
-  display: inline-flex;
-  flex: 0 0 auto;
-  height: 28px;
-  justify-content: center;
-  padding: 0;
-  transition:
-    background-color 140ms ease,
-    color 140ms ease;
-  width: 28px;
-}
-
-.domain-list-search > button:hover {
-  background: color-mix(in srgb, var(--foreground) 7%, transparent);
-  color: var(--foreground);
 }
 
 .domain-list-count {
@@ -539,44 +452,6 @@
   min-width: 0;
 }
 
-.management-data-table .openstatus-data-table-scroll {
-  border-radius: 10px;
-}
-
-.management-data-table table {
-  min-width: 900px;
-  table-layout: fixed;
-  width: 100%;
-}
-
-.management-data-table th,
-.management-data-table td {
-  padding: 11px 13px;
-  text-align: left;
-  vertical-align: middle;
-}
-
-.management-data-table th {
-  background: var(--panel-soft);
-  color: var(--muted-strong);
-  font-size: 12px;
-  font-weight: 720;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
-}
-
-.management-data-table tbody tr:last-child > td,
-.management-data-table tbody tr:has(+ .openstatus-data-table-expanded-row) > td {
-  border-bottom: 0;
-}
-
-.management-data-table tbody tr:not(.openstatus-data-table-expanded-row):not(.openstatus-data-table-empty-row):hover > td {
-  background: color-mix(in srgb, var(--foreground) 2.8%, transparent);
-}
-
-.management-data-table tbody tr.is-disabled {
-  opacity: 0.66;
-}
 
 .management-table-primary-column {
   width: 27%;
@@ -666,22 +541,6 @@
 .management-data-table tr:hover :where(.skills-manager-item-actions, .personal-memory-actions, .login-account-item-actions),
 .management-data-table :where(.skills-manager-item-actions, .personal-memory-actions, .login-account-item-actions):focus-within {
   opacity: 1;
-}
-
-.management-data-table .openstatus-data-table-expanded-row > td {
-  background: color-mix(in srgb, var(--panel-soft) 62%, transparent);
-  border-bottom: 1px solid var(--border) !important;
-  padding: 0;
-}
-
-.management-data-table .openstatus-data-table-expanded-row .skills-manager-item-detail {
-  padding: 18px 22px 20px 38px;
-}
-
-.management-data-table .openstatus-data-table-empty-row td {
-  color: var(--muted);
-  padding: 34px 18px;
-  text-align: center;
 }
 
 .domain-accordion-group {
@@ -836,12 +695,6 @@
 
 .personal-memory-field .custom-select {
   z-index: 1;
-}
-
-.personal-memory-field textarea {
-  line-height: 1.5;
-  min-height: 92px;
-  resize: vertical;
 }
 
 .personal-memory-item {
@@ -1010,7 +863,7 @@
   font-weight: 560;
 }
 
-.login-account-form .input {
+.login-account-form .input:not([data-slot], [data-slot] *) {
   min-width: 0;
   width: 100%;
 }
@@ -1107,8 +960,8 @@
 }
 
 .settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) {
-  height: 100vh;
-  height: 100dvh;
+  height: 100%;
+  min-height: 0;
 }
 
 .settings-workspace:has(.skills-manager.is-loading, .personal-memory-settings.is-loading, .login-account-settings.is-loading) .settings-layout {
@@ -1127,7 +980,7 @@
 .login-account-settings.is-loading {
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
-  min-height: 100%;
+  min-height: 0;
 }
 
 .skills-manager.is-loading .skills-manager-layout,
@@ -1336,20 +1189,6 @@
   width: 100%;
 }
 
-.skills-manager-field textarea {
-  line-height: 1.5;
-  min-height: 74px;
-  resize: vertical;
-}
-
-.skills-manager-field textarea.compact {
-  min-height: 58px;
-}
-
-.skills-manager-field textarea.skill-details {
-  min-height: 300px;
-}
-
 .skills-manager-details {
   color: color-mix(in srgb, var(--foreground) 82%, var(--muted));
   font-size: 13.5px;
@@ -1517,7 +1356,7 @@
   z-index: 1;
 }
 
-.admin-settings-password-input .input {
+.admin-settings-password-input .input:not([data-slot], [data-slot] *) {
   padding-left: 40px;
   width: 100%;
 }
@@ -1640,9 +1479,8 @@
   justify-content: stretch;
 }
 
-.browser-chat-settings-pane .custom-select-button,
-.browser-chat-settings-pane .settings-workspace .input,
-.browser-chat-settings-pane .settings-workspace .textarea,
+.browser-chat-settings-pane .settings-workspace .input:not([data-slot], [data-slot] *),
+.browser-chat-settings-pane .settings-workspace .textarea:not([data-slot], [data-slot] *),
 .browser-chat-settings-pane .theme-color-picker {
   background: var(--panel-soft);
   border-color: var(--border);
@@ -1650,9 +1488,8 @@
   min-height: 40px;
 }
 
-.browser-chat-settings-pane .custom-select-button:hover,
-.browser-chat-settings-pane .settings-workspace .input:focus,
-.browser-chat-settings-pane .settings-workspace .textarea:focus,
+.browser-chat-settings-pane .settings-workspace .input:not([data-slot], [data-slot] *):focus,
+.browser-chat-settings-pane .settings-workspace .textarea:not([data-slot], [data-slot] *):focus,
 .browser-chat-settings-pane .theme-color-picker:hover {
   border-color: color-mix(in srgb, var(--accent) 56%, var(--border));
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 13%, transparent);
@@ -1716,9 +1553,8 @@
   background: color-mix(in srgb, var(--foreground) 2.5%, transparent);
 }
 
-:root[data-theme="dark"] .browser-chat-settings-pane .custom-select-button,
-:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .input,
-:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .textarea,
+:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .input:not([data-slot], [data-slot] *),
+:root[data-theme="dark"] .browser-chat-settings-pane .settings-workspace .textarea:not([data-slot], [data-slot] *),
 :root[data-theme="dark"] .browser-chat-settings-pane .theme-color-picker {
   background: color-mix(in srgb, var(--panel-soft) 88%, #000000);
 }

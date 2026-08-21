@@ -221,15 +221,14 @@ export function createAutomationCase(input: CreateAutomationCaseInput) {
   });
   getSqliteDatabase().prepare(`
     INSERT INTO automation_case (
-      id, user_id, source_session_id, title, target_url, mode, record_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, user_id, source_session_id, title, target_url, record_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id,
     record.userId,
     record.sourceSessionId,
     record.title,
     record.targetUrl,
-    record.mode,
     JSON.stringify(record),
     record.createdAt,
     record.updatedAt,
@@ -252,13 +251,12 @@ export function updateAutomationCase(id: string, patch: UpdateAutomationCaseInpu
     });
     database.prepare(`
       UPDATE automation_case SET
-        source_session_id = ?, title = ?, target_url = ?, mode = ?, record_json = ?, updated_at = ?
+        source_session_id = ?, title = ?, target_url = ?, record_json = ?, updated_at = ?
       WHERE id = ? AND user_id = ?
     `).run(
       record.sourceSessionId,
       record.title,
       record.targetUrl,
-      record.mode,
       JSON.stringify(record),
       record.updatedAt,
       record.id,

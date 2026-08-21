@@ -1,6 +1,7 @@
 'use client';
 
 import Link from 'next/link';
+import { TextArea } from '@heroui/react';
 import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   CalendarDays,
@@ -29,6 +30,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import {
@@ -39,7 +41,6 @@ import {
 } from '@/components/WorkspaceSidebarArchive';
 import { WorkspaceOverflowMenu } from '@/components/WorkspaceOverflowMenu';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import type { Language } from '@/i18n/language';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
@@ -52,6 +53,8 @@ import {
 } from '@/lib/sidebar-collapse';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
 
 type AutomationFrequency = 'daily' | 'weekly';
 type AutomationRunStatus = 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
@@ -571,7 +574,7 @@ export function AutomationWorkspace({
   initialSidebarCollapsed?: boolean;
 }) {
   const userId = defaultUserId.trim() || '1';
-  const { mode: themeMode, toggleMode } = useTheme();
+  const { mode: themeMode, setMode } = useTheme();
   const { language, t } = useI18n();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [cases, setCases] = useState<AutomationCase[]>([]);
@@ -790,8 +793,6 @@ export function AutomationWorkspace({
     setSchedulePendingDelete(null);
     setFormError('');
   }
-
-  useEscapeDismiss(Boolean(dialog), closeDialog);
 
   function openDeleteCaseDialog(automationCase: AutomationCase) {
     setCasePendingDelete(automationCase);
@@ -1015,7 +1016,7 @@ export function AutomationWorkspace({
         collapsed={sidebarCollapsed}
         collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
-        onToggleTheme={toggleMode}
+        onThemeChange={setMode}
         themeMode={themeMode}
         themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
         themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
@@ -1420,21 +1421,20 @@ export function AutomationWorkspace({
       </main>
 
       {dialog === 'case' ? (
-        <div className="ui-modal-overlay" onMouseDown={(event) => event.currentTarget === event.target && closeDialog()} role="presentation">
-          <form
-            aria-labelledby="automation-case-dialog-title"
-            aria-modal="true"
-            className="ui-modal automation-dialog"
-            onSubmit={createCase}
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
+        <AppModal
+          ariaLabelledBy="automation-case-dialog-title"
+          dismissable={!savingCase}
+          keyboardDismissable={!savingCase}
+          onClose={closeDialog}
+          size="lg"
+        >
+          <form className="webpilot-modal-form" onSubmit={createCase}>
             <header className="ui-modal-header">
-              <div>
-                <h2 id="automation-case-dialog-title">{t('新建自动化用例')}</h2>
-                <p>{t('描述浏览器需要完成的任务和验收目标。')}</p>
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title" id="automation-case-dialog-title">{t('新建自动化用例')}</h2>
+                <p className="ui-modal-subtitle">{t('描述浏览器需要完成的任务和验收目标。')}</p>
               </div>
-              <button aria-label={t('关闭')} className="ui-icon-button" disabled={savingCase} onClick={closeDialog} type="button">
+              <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={savingCase} onClick={closeDialog} type="button">
                 <X size={17} />
               </button>
             </header>
@@ -1442,9 +1442,8 @@ export function AutomationWorkspace({
               {formError ? <p className="error">{formError}</p> : null}
               <div className="field modal-field">
                 <label htmlFor="automation-case-name">{t('用例名称')}</label>
-                <input
+                <AppInput
                   autoFocus
-                  className="input"
                   id="automation-case-name"
                   maxLength={160}
                   onChange={(event) => setCaseDraft((current) => ({ ...current, name: event.target.value }))}
@@ -1454,8 +1453,7 @@ export function AutomationWorkspace({
               </div>
               <div className="field modal-field">
                 <label htmlFor="automation-case-description">{t('用例说明（可选）')}</label>
-                <input
-                  className="input"
+                <AppInput
                   id="automation-case-description"
                   maxLength={500}
                   onChange={(event) => setCaseDraft((current) => ({ ...current, description: event.target.value }))}
@@ -1465,8 +1463,7 @@ export function AutomationWorkspace({
               </div>
               <div className="field modal-field">
                 <label htmlFor="automation-case-url">{t('目标网址（可选）')}</label>
-                <input
-                  className="input"
+                <AppInput
                   id="automation-case-url"
                   maxLength={4_000}
                   onChange={(event) => setCaseDraft((current) => ({ ...current, targetUrl: event.target.value }))}
@@ -1477,8 +1474,8 @@ export function AutomationWorkspace({
               </div>
               <div className="field modal-field">
                 <label htmlFor="automation-case-prompt">{t('执行指令')}</label>
-                <textarea
-                  className="textarea"
+                <TextArea
+                  fullWidth
                   id="automation-case-prompt"
                   maxLength={100_000}
                   onChange={(event) => setCaseDraft((current) => ({ ...current, prompt: event.target.value }))}
@@ -1495,25 +1492,24 @@ export function AutomationWorkspace({
               </button>
             </footer>
           </form>
-        </div>
+        </AppModal>
       ) : null}
 
       {dialog === 'schedule' ? (
-        <div className="ui-modal-overlay" onMouseDown={(event) => event.currentTarget === event.target && closeDialog()} role="presentation">
-          <form
-            aria-labelledby="automation-schedule-dialog-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact automation-dialog"
-            onSubmit={createSchedule}
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
+        <AppModal
+          ariaLabelledBy="automation-schedule-dialog-title"
+          dismissable={!savingSchedule}
+          keyboardDismissable={!savingSchedule}
+          onClose={closeDialog}
+          size="md"
+        >
+          <form className="webpilot-modal-form" onSubmit={createSchedule}>
             <header className="ui-modal-header">
-              <div>
-                <h2 id="automation-schedule-dialog-title">{t('新建执行计划')}</h2>
-                <p>{t('按本地时区每日或每周自动执行用例。')}</p>
+              <div className="ui-modal-heading">
+                <h2 className="ui-modal-title" id="automation-schedule-dialog-title">{t('新建执行计划')}</h2>
+                <p className="ui-modal-subtitle">{t('按本地时区每日或每周自动执行用例。')}</p>
               </div>
-              <button aria-label={t('关闭')} className="ui-icon-button" disabled={savingSchedule} onClick={closeDialog} type="button">
+              <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={savingSchedule} onClick={closeDialog} type="button">
                 <X size={17} />
               </button>
             </header>
@@ -1534,8 +1530,7 @@ export function AutomationWorkspace({
               </div>
               <div className="field modal-field">
                 <label htmlFor="automation-schedule-name">{t('计划名称（可选）')}</label>
-                <input
-                  className="input"
+                <AppInput
                   id="automation-schedule-name"
                   maxLength={160}
                   onChange={(event) => setScheduleDraft((current) => ({ ...current, name: event.target.value }))}
@@ -1571,8 +1566,7 @@ export function AutomationWorkspace({
                 ) : null}
                 <div className="field modal-field">
                   <label htmlFor="automation-schedule-time">{t('运行时间')}</label>
-                  <input
-                    className="input"
+                  <AppInput
                     id="automation-schedule-time"
                     onChange={(event) => setScheduleDraft((current) => ({ ...current, time: event.target.value }))}
                     required
@@ -1583,8 +1577,7 @@ export function AutomationWorkspace({
               </div>
               <div className="field modal-field">
                 <label htmlFor="automation-schedule-timezone">{t('时区')}</label>
-                <input
-                  className="input"
+                <AppInput
                   id="automation-schedule-timezone"
                   maxLength={120}
                   onChange={(event) => setScheduleDraft((current) => ({ ...current, timezone: event.target.value }))}
@@ -1600,73 +1593,35 @@ export function AutomationWorkspace({
               </button>
             </footer>
           </form>
-        </div>
+        </AppModal>
       ) : null}
 
       {dialog === 'deleteCase' && casePendingDelete ? (
-        <div className="ui-modal-overlay" onMouseDown={(event) => event.currentTarget === event.target && closeDialog()} role="presentation">
-          <div
-            aria-labelledby="automation-delete-case-dialog-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact automation-dialog automation-confirm-dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <header className="ui-modal-header">
-              <div>
-                <h2 id="automation-delete-case-dialog-title">{t('删除自动化用例')}</h2>
-                <p>{t('此操作无法撤销。')}</p>
-              </div>
-              <button aria-label={t('关闭')} className="ui-icon-button" disabled={Boolean(deletingCaseId)} onClick={closeDialog} type="button">
-                <X size={17} />
-              </button>
-            </header>
-            <div className="ui-modal-body automation-confirm-copy">
-              {t('确认删除“{name}”？关联的 {schedules} 个执行计划和 {runs} 次运行历史也会一并删除。', {
-                name: casePendingDelete.name,
-                schedules: (schedulesByCase.get(casePendingDelete.id) || []).length,
-                runs: (runsByCase.get(casePendingDelete.id) || []).length,
-              })}
-            </div>
-            <footer className="ui-modal-footer">
-              <button className="ui-button ui-button--neutral" disabled={Boolean(deletingCaseId)} onClick={closeDialog} type="button">{t('取消')}</button>
-              <button className="ui-button ui-button--danger" disabled={Boolean(deletingCaseId)} onClick={() => void deleteCase()} type="button">
-                {t(deletingCaseId ? '删除中…' : '删除用例')}
-              </button>
-            </footer>
-          </div>
-        </div>
+        <ConfirmDeleteModal
+          deleting={Boolean(deletingCaseId)}
+          description={t('确认删除“{name}”？关联的 {schedules} 个执行计划和 {runs} 次运行历史也会一并删除。', {
+            name: casePendingDelete.name,
+            schedules: (schedulesByCase.get(casePendingDelete.id) || []).length,
+            runs: (runsByCase.get(casePendingDelete.id) || []).length,
+          })}
+          id="automation-delete-case-dialog-title"
+          itemTitle={casePendingDelete.name}
+          onClose={closeDialog}
+          onConfirm={deleteCase}
+          title={t('删除自动化用例')}
+        />
       ) : null}
 
       {dialog === 'deleteSchedule' && schedulePendingDelete ? (
-        <div className="ui-modal-overlay" onMouseDown={(event) => event.currentTarget === event.target && closeDialog()} role="presentation">
-          <div
-            aria-labelledby="automation-delete-schedule-dialog-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact automation-dialog automation-confirm-dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
-            <header className="ui-modal-header">
-              <div>
-                <h2 id="automation-delete-schedule-dialog-title">{t('删除执行计划')}</h2>
-                <p>{t('删除后，该计划将不再自动运行。')}</p>
-              </div>
-              <button aria-label={t('关闭')} className="ui-icon-button" disabled={Boolean(deletingScheduleId)} onClick={closeDialog} type="button">
-                <X size={17} />
-              </button>
-            </header>
-            <div className="ui-modal-body automation-confirm-copy">
-              {t('确认删除“{name}”？已产生的运行历史不会受到影响。', { name: schedulePendingDelete.name })}
-            </div>
-            <footer className="ui-modal-footer">
-              <button className="ui-button ui-button--neutral" disabled={Boolean(deletingScheduleId)} onClick={closeDialog} type="button">{t('取消')}</button>
-              <button className="ui-button ui-button--danger" disabled={Boolean(deletingScheduleId)} onClick={() => void deleteSchedule()} type="button">
-                {t(deletingScheduleId ? '删除中…' : '删除计划')}
-              </button>
-            </footer>
-          </div>
-        </div>
+        <ConfirmDeleteModal
+          deleting={Boolean(deletingScheduleId)}
+          description={t('确认删除“{name}”？已产生的运行历史不会受到影响。', { name: schedulePendingDelete.name })}
+          id="automation-delete-schedule-dialog-title"
+          itemTitle={schedulePendingDelete.name}
+          onClose={closeDialog}
+          onConfirm={deleteSchedule}
+          title={t('删除执行计划')}
+        />
       ) : null}
     </section>
   );

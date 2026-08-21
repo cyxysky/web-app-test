@@ -177,10 +177,6 @@ export function normalizeString(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
-export function normalizeMode(value: unknown) {
-  return value === 'dom' ? 'dom' : 'code';
-}
-
 export function normalizeSafetyMode(value: unknown) {
   return value === 'full' ? 'full' : 'strict';
 }

@@ -28,7 +28,7 @@ export function BeautifulLoadingState({
   className = '',
   detail,
   label,
-  showElapsed = true,
+  showElapsed = false,
   variant = 'grid',
 }: {
   className?: string;

@@ -10,7 +10,6 @@ function sessionFixture(): BrowserChatSessionSnapshot {
     userId: '1',
     browserGroupId: 'session:chat-1',
     targetUrl: 'https://example.com/requirements',
-    mode: 'code',
     safetyMode: 'strict',
     modelProvider: 'deepseek',
     model: 'deepseek-v4-flash',

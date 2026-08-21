@@ -1,12 +1,12 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { KeyRound, Loader2, Save, ShieldCheck, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
 
 export type LoginAccountMetadata = {
   id: string;
@@ -54,7 +54,6 @@ export function LoginAccountModal({
   open: boolean;
 }) {
   const { t } = useI18n();
-  const [portalReady, setPortalReady] = useState(false);
   const [domain, setDomain] = useState('');
   const [label, setLabel] = useState('');
   const [loginUrl, setLoginUrl] = useState('');
@@ -63,8 +62,6 @@ export function LoginAccountModal({
   const [shared, setShared] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
-
-  useEffect(() => setPortalReady(true), []);
 
   useEffect(() => {
     if (!open) return;
@@ -77,11 +74,7 @@ export function LoginAccountModal({
     setError('');
   }, [account, initialDomain, initialLabel, initialLoginUrl, initialUsername, open]);
 
-  useEscapeDismiss(open && portalReady, () => {
-    if (!saving) onClose();
-  });
-
-  if (!open || !portalReady) return null;
+  if (!open) return null;
   const editing = Boolean(account);
 
   async function save() {
@@ -120,15 +113,15 @@ export function LoginAccountModal({
     }
   }
 
-  return createPortal((
-    <div className="ui-modal-overlay login-account-modal-overlay" onMouseDown={() => !saving && onClose()}>
-      <section
-        aria-labelledby="login-account-modal-title"
-        aria-modal="true"
-        className="ui-modal login-account-modal"
-        onMouseDown={(event) => event.stopPropagation()}
-        role="dialog"
-      >
+  return (
+    <AppModal
+      ariaLabelledBy="login-account-modal-title"
+      dismissable={!saving}
+      keyboardDismissable={!saving}
+      onClose={onClose}
+      open={open}
+      size="wide"
+    >
         <header className="ui-modal-header login-account-modal-header">
           <div className="ui-modal-heading ui-modal-heading--with-icon">
             <span className="ui-modal-heading-icon login-account-modal-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
@@ -145,23 +138,23 @@ export function LoginAccountModal({
         <div className="ui-modal-body login-account-form">
           <label>
             <span>{t('名称')}</span>
-            <input className="input" disabled={saving} onChange={(event) => setLabel(event.target.value)} placeholder={t('例如：测试环境管理员')} value={label} />
+            <AppInput disabled={saving} onChange={(event) => setLabel(event.target.value)} placeholder={t('例如：测试环境管理员')} value={label} />
           </label>
           <label>
             <span>{t('域名')}</span>
-            <input className="input" disabled={saving} onChange={(event) => setDomain(event.target.value)} placeholder="app.example.com" value={domain} />
+            <AppInput disabled={saving} onChange={(event) => setDomain(event.target.value)} placeholder="app.example.com" value={domain} />
           </label>
           <label className="wide">
             <span>{t('登录地址')} <small>{t('可选')}</small></span>
-            <input className="input" disabled={saving} onBlur={() => !domain && setDomain(loginAccountDomain(loginUrl))} onChange={(event) => setLoginUrl(event.target.value)} placeholder="https://app.example.com/login" value={loginUrl} />
+            <AppInput disabled={saving} onBlur={() => !domain && setDomain(loginAccountDomain(loginUrl))} onChange={(event) => setLoginUrl(event.target.value)} placeholder="https://app.example.com/login" value={loginUrl} />
           </label>
           <label>
             <span>{t('用户名')}</span>
-            <input autoComplete="off" className="input" disabled={saving} onChange={(event) => setUsername(event.target.value)} placeholder="admin@example.com" value={username} />
+            <AppInput autoComplete="off" disabled={saving} onChange={(event) => setUsername(event.target.value)} placeholder="admin@example.com" value={username} />
           </label>
           <label>
             <span>{t('密码')} {editing ? <small>{t('留空则不修改')}</small> : null}</span>
-            <input autoComplete="new-password" className="input" disabled={saving} onChange={(event) => setPassword(event.target.value)} placeholder={t(editing ? '保持原密码' : '输入登录密码')} type="password" value={password} />
+            <AppInput autoComplete="new-password" disabled={saving} onChange={(event) => setPassword(event.target.value)} placeholder={t(editing ? '保持原密码' : '输入登录密码')} type="password" value={password} />
           </label>
           <div className="resource-sharing-field wide">
             <div>
@@ -186,7 +179,6 @@ export function LoginAccountModal({
             {t(saving ? '正在保存' : '保存账号')}
           </button>
         </footer>
-      </section>
-    </div>
-  ), document.body);
+    </AppModal>
+  );
 }

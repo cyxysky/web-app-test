@@ -57,10 +57,6 @@
   white-space: nowrap;
 }
 
-.automation-icon-action:hover {
-  color: var(--foreground);
-}
-
 .automation-icon-action:disabled {
   cursor: not-allowed;
   opacity: 0.42;
@@ -94,7 +90,7 @@
 .automation-notice {
   background: color-mix(in srgb, var(--accent) 7%, var(--panel));
   border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border));
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--accent-strong);
   font-size: 12px;
 }
@@ -470,16 +466,6 @@
   color: var(--muted-strong);
   font-size: 12px;
   font-weight: 600;
-}
-
-.automation-dialog-fields :is(input, select, textarea) {
-  width: 100%;
-}
-
-.automation-dialog-fields textarea {
-  line-height: 1.55;
-  min-height: 126px;
-  resize: vertical;
 }
 
 .automation-dialog-fields .error {
@@ -1073,7 +1059,7 @@
 
 .automation-schedule-row:hover,
 .automation-run-summary:hover {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
 }
 
 .automation-run-trace {

@@ -24,7 +24,7 @@ function readPngDimensions(buffer: Buffer) {
 }
 
 test('BrowserSession executes browserCode against the controlled Playwright page', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-session-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-session-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -233,7 +233,7 @@ test('BrowserSession executes browserCode against the controlled Playwright page
 });
 
 test('browserCode-created tabs are owned and group-marked before preview starts', async (context) => {
-  const session = new BrowserSession('code', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-code-tab-group-test',
@@ -301,7 +301,7 @@ test('browserCode-created tabs are owned and group-marked before preview starts'
 });
 
 test('live preview keeps a clicked popup in the background until the user switches tabs', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-live-preview-tab-test',
@@ -385,7 +385,7 @@ test('live preview keeps a clicked popup in the background until the user switch
 test('live preview repeats the latest native frame at the configured output rate', async (context) => {
   const previousFps = process.env.BROWSER_PREVIEW_FPS;
   process.env.BROWSER_PREVIEW_FPS = '30';
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-live-preview-cadence-test',
@@ -424,7 +424,7 @@ test('live preview repeats the latest native frame at the configured output rate
 });
 
 test('live preview supports drag and does not drive the AI cursor', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-live-preview-drag-test',
@@ -467,7 +467,7 @@ test('live preview supports drag and does not drive the AI cursor', async (conte
 });
 
 test('live preview mirrors native select options and applies the selected value', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-live-preview-native-select-test',
@@ -529,7 +529,7 @@ test('live preview bridges native pickers, datalist, file chooser, and JavaScrip
   const uploadPath = path.join(temporaryDirectory, 'employee-note.txt');
   await writeFile(uploadPath, 'live preview upload');
 
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-live-preview-native-controls-test',
@@ -663,7 +663,7 @@ test('browser viewport size and output pixel ratio are independent', async () =>
   process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT = 'png';
   process.env.BROWSER_PREVIEW_VIDEO_MAX_WIDTH = '1600';
   process.env.BROWSER_PREVIEW_VIDEO_MAX_HEIGHT = '1200';
-  const session = new BrowserSession('code', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-output-pixel-ratio-test',
@@ -760,7 +760,7 @@ test('browser viewport size and output pixel ratio are independent', async () =>
 });
 
 test('force close releases the browser', async () => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-force-close-test',
@@ -778,12 +778,12 @@ test('force close releases the browser', async () => {
 test('force close terminates an external Chromium process reached through CDP', async () => {
   const previousEndpoint = process.env.BROWSER_CDP_ENDPOINT;
   const previousSharedTabs = process.env.BROWSER_SHARED_TABS;
-  const owner = new BrowserSession('dom', {
+  const owner = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-cdp-process-owner-test',
   });
-  const connected = new BrowserSession('dom', {
+  const connected = new BrowserSession({
     headless: true,
     runId: 'browser-cdp-process-connection-test',
   });
@@ -811,22 +811,22 @@ test('force close terminates an external Chromium process reached through CDP', 
 });
 
 test('application shutdown closes every registered test browser', async () => {
-  const first = new BrowserSession('dom', {
+  const first = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-shutdown-first-test',
   });
-  const second = new BrowserSession('dom', {
+  const second = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'browser-shutdown-second-test',
   });
-  const sharedFirst = new BrowserSession('dom', {
+  const sharedFirst = new BrowserSession({
     headless: true,
     sharedBrowserRuntimeKey: 'browser-shutdown-shared-test',
     runId: 'browser-shutdown-shared-first-test',
   });
-  const sharedSecond = new BrowserSession('dom', {
+  const sharedSecond = new BrowserSession({
     headless: true,
     sharedBrowserRuntimeKey: 'browser-shutdown-shared-test',
     runId: 'browser-shutdown-shared-second-test',
@@ -857,7 +857,7 @@ test('application shutdown closes every registered test browser', async () => {
 });
 
 test('browserCode returns structured dependency failures from the current cell', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-dependency-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-dependency-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -898,7 +898,7 @@ test('browserCode returns structured dependency failures from the current cell',
 });
 
 test('browserCode reports a delayed 504 in the next result exactly once', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-delayed-dependency-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-delayed-dependency-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -953,7 +953,7 @@ test('browserCode reports a delayed 504 in the next result exactly once', async 
 });
 
 test('browserCode reports 408 and 429 but ignores ordinary 404 responses', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-http-status-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-http-status-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -981,7 +981,7 @@ test('browserCode reports 408 and 429 but ignores ordinary 404 responses', async
 });
 
 test('browserCode carries a transport timeout observed between cells into the next result', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'browser-code-network-timeout-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-network-timeout-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;

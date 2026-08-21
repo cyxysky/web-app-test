@@ -95,7 +95,7 @@
 .beautiful-loading-elapsed {
   color: var(--muted);
   flex: 0 0 auto;
-  font-family: var(--font-mono);
+  font-family: var(--app-font-mono);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }

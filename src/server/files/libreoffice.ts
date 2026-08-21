@@ -8,7 +8,6 @@ import { appDataRoot } from '@/server/storage/paths';
 import type { OfficeDocumentSpec } from './office-document-spec';
 
 const OFFICE_WORKER_TIMEOUT_MS = 120_000;
-const OFFICE_SPEC_MAX_BYTES = 8 * 1024 * 1024;
 let officeGenerationQueue = Promise.resolve();
 const pythonUnoProbeCache = new Map<string, Promise<boolean>>();
 
@@ -163,9 +162,6 @@ export async function generateOfficeDocument(spec: OfficeDocumentSpec) {
   }
   const extension = path.extname(spec.fileName).toLowerCase();
   const serialized = JSON.stringify(spec);
-  if (Buffer.byteLength(serialized, 'utf8') > OFFICE_SPEC_MAX_BYTES) {
-    throw new Error(`Office document specification exceeds ${OFFICE_SPEC_MAX_BYTES} bytes.`);
-  }
 
   return enqueueOfficeGeneration(async () => {
     const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-uno-'));
