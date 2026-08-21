@@ -27,7 +27,7 @@ describe('browser live-preview native controls', () => {
     const uploadPath = path.join(temporaryDirectory, 'employee-note.txt');
     await writeFile(uploadPath, 'live preview upload');
 
-    const session = new BrowserSession('dom', {
+    const session = new BrowserSession({
       headless: true,
       isolated: true,
       runId: 'browser-live-preview-native-controls-vitest',
@@ -134,7 +134,7 @@ describe('browser live-preview native controls', () => {
   }, 60_000);
 
   it('keeps a live-preview popup in the background until it is selected', async () => {
-    const session = new BrowserSession('dom', {
+    const session = new BrowserSession({
       headless: true,
       isolated: true,
       runId: 'browser-live-preview-background-popup-vitest',
@@ -180,7 +180,7 @@ describe('browser live-preview native controls', () => {
 
   it('cancels the controlled-browser download and relays its URL to the user browser', async () => {
     const runId = 'chat_browser_live_preview_download_vitest';
-    const session = new BrowserSession('dom', {
+    const session = new BrowserSession({
       headless: true,
       isolated: true,
       runId,
@@ -231,7 +231,7 @@ describe('browser live-preview native controls', () => {
   }, 60_000);
 
   it('intercepts a visible download link before the controlled browser requests it', async () => {
-    const session = new BrowserSession('dom', {
+    const session = new BrowserSession({
       headless: true,
       isolated: true,
       runId: 'chat_browser_live_preview_direct_download_vitest',

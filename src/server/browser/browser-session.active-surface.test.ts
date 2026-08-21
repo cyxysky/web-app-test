@@ -4,7 +4,7 @@ import type { Page } from 'playwright';
 import { BrowserSession } from './browser-session';
 
 test('initial high-z interface chrome stays metadata instead of becoming the active surface', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'initial-surface-baseline-test',
@@ -25,7 +25,7 @@ test('initial high-z interface chrome stays metadata instead of becoming the act
 });
 
 test('identical console errors are emitted once per document', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'console-error-dedupe-test',
@@ -46,7 +46,7 @@ test('identical console errors are emitted once per document', async (context) =
 });
 
 test('Playwright trial overrides a legacy supplemental occlusion diagnosis', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'playwright-trial-authority-test',
@@ -86,7 +86,7 @@ test('Playwright trial overrides a legacy supplemental occlusion diagnosis', asy
 });
 
 test('a rendered aria-hidden menu remains observable and actionable', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'rendered-aria-hidden-menu-test',
@@ -113,7 +113,7 @@ test('a rendered aria-hidden menu remains observable and actionable', async (con
 });
 
 test('actionability resolves eleven duplicate traps without surface-based target selection', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'modal-trigger-duplicate-traps-test',
@@ -156,7 +156,7 @@ test('actionability resolves eleven duplicate traps without surface-based target
 });
 
 test('DOM and Code expose active nested surfaces without restricting actions', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'active-surface-test',
@@ -293,7 +293,7 @@ test('DOM and Code expose active nested surfaces without restricting actions', a
 });
 
 test('a portal dialog opened from another surface forms a source-based stack', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'portal-surface-stack-test',
@@ -335,7 +335,7 @@ test('a portal dialog opened from another surface forms a source-based stack', a
 });
 
 test('a unique top modal scopes observations but does not disambiguate browser actions', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'modal-disambiguation-test',
@@ -403,7 +403,7 @@ test('a unique top modal scopes observations but does not disambiguate browser a
 });
 
 test('parallel same-level dialogs remain visible as separate surface metadata', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'parallel-surface-test',
@@ -469,7 +469,7 @@ test('parallel same-level dialogs remain visible as separate surface metadata', 
 });
 
 test('small CDK portal cascader remains actionable beside a same-level popup', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'cdk-cascader-surface-test',
@@ -535,7 +535,7 @@ test('small CDK portal cascader remains actionable beside a same-level popup', a
 });
 
 test('fixed edge affix does not block a small CDK tree-select portal', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'cdk-tree-select-affix-test',
@@ -596,7 +596,7 @@ test('fixed edge affix does not block a small CDK tree-select portal', async (co
 });
 
 test('failed post-action verification is a hard BrowserActionResult failure', async (context) => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'hard-verification-test',

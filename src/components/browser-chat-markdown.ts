@@ -104,6 +104,13 @@ function normalizeMarkdownSegment(value: string) {
     .replace(/\n{3,}/g, '\n\n');
 }
 
+function normalizeFencedCodeBoundaries(value: string) {
+  return value
+    .replace(/([^\n])[ \t]*(```(?:[a-z0-9_+-]+)?[ \t]*\n)/gi, '$1\n$2')
+    .replace(/([^\n])[ \t]*(```[ \t]*)(?=\n|$)/g, '$1\n$2')
+    .replace(/(^|\n)(```[ \t]*)(?=#{1,6}[ \t]+|---(?:[ \t]|$))/g, '$1$2\n\n');
+}
+
 type MarkdownAstNode = {
   children?: MarkdownAstNode[];
   type?: string;
@@ -148,7 +155,7 @@ export function remarkBrowserChatCjkStrong() {
 }
 
 export function normalizeBrowserChatMarkdown(markdown: string) {
-  return markdown
+  return normalizeFencedCodeBoundaries(markdown)
     .split(/(```[\s\S]*?```|`[^`\n]*`)/g)
     .map((part) => (part.startsWith('`') ? part : normalizeMarkdownSegment(part)))
     .join('')

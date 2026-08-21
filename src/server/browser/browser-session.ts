@@ -118,8 +118,6 @@ function browserOutputPixelRatioFromEnv() {
 }
 
 
-export type BrowserSessionMode = 'code' | 'dom';
-
 export type BrowserSessionOptions = {
   browserSurface?: BrowserSessionSurface;
   isMarked?: boolean;
@@ -153,14 +151,6 @@ export type AccessibilitySnapshotExportControlResult = {
   downloadUrl?: string;
   error?: string;
 };
-
-/**
- * 浏览器请求鉴定模式
- * @returns 鉴定模式
- */
-function browserSessionModeFromEnv(): BrowserSessionMode {
-  return process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code';
-}
 
 export type BrowserSnapshotView = 'actionable' | 'full' | 'text' | 'changes';
 
@@ -1752,10 +1742,7 @@ export class BrowserSession {
   private browserSurface: BrowserSessionSurface = 'external';
   private transportKind?: BrowserSessionTransportKind;
 
-  constructor(
-    private readonly mode: BrowserSessionMode = browserSessionModeFromEnv(),
-    private readonly options: BrowserSessionOptions = {},
-  ) {
+  constructor(private readonly options: BrowserSessionOptions = {}) {
     this.pageGroupId = normalizePageGroupId(options.runId);
     registerBrowserSession(this);
   }
@@ -4236,7 +4223,6 @@ export class BrowserSession {
 
     return [
       `phase=${details.phase}`,
-      `mode=${this.mode}`,
       `transport=${this.transportKind || 'not-started'}`,
       `capture=${details.capture}`,
       `timeoutMs=${details.timeoutMs}`,
@@ -4526,7 +4512,7 @@ export class BrowserSession {
     return this.lastOriginalScreenshotPath;
   }
 
-  // 返回当前可见交互候选元素，供 DOM 模式在无截图输入时定位控件。
+  // 返回当前可见交互候选元素，供语义快照与调试工具定位控件。
   async getInteractiveCandidates(): Promise<BrowserActionResult> {
     const candidates = await this.refreshInteractiveCandidates();
     return {
@@ -6961,19 +6947,6 @@ export class BrowserSession {
       return { error: `UID ${uid} is not present in the latest snapshot ${generation.id}. Take a new snapshot and choose a current UID.` };
     }
     return { reference };
-  }
-
-  describeElementTarget(target: BrowserElementTarget | undefined) {
-    const ref = String(target?.ref || '').trim();
-    if (!ref) return undefined;
-    if (ref.startsWith('dom-')) {
-      const reference = this.lastDomNodeReferences.get(ref);
-      if (!reference || reference.observationId !== this.domVisibleObservationId) return undefined;
-      return `${reference.tag} "${reference.label}" ${reference.contextText || reference.descriptor}`.replace(/\s+/g, ' ').trim();
-    }
-    const resolved = this.currentSnapshotReference(ref);
-    const reference = resolved.reference;
-    return reference ? `${reference.role} "${reference.name}"` : undefined;
   }
 
   private async snapshotReferenceLocator(reference: SnapshotReference) {

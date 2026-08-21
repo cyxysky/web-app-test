@@ -1,12 +1,12 @@
 'use client';
 
 import { useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
 import { Download, Loader2, ShieldCheck, Upload, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
 
 type DataTransferKind = 'credentials' | 'skills' | 'memory' | 'model';
 
@@ -150,8 +150,6 @@ export function DataTransferButtons({
     setPassphraseConfirmation('');
   }
 
-  useEscapeDismiss(Boolean(passphraseModal), closePassphraseModal);
-
   async function submitPassphrase() {
     if (!passphraseModal) return;
     if (passphrase.trim().length < 8) {
@@ -196,15 +194,14 @@ export function DataTransferButtons({
         ref={fileInputRef}
         type="file"
       />
-      {passphraseModal ? createPortal((
-        <div className="ui-modal-overlay" onMouseDown={closePassphraseModal}>
-          <section
-            aria-labelledby="data-transfer-passphrase-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact ui-modal--data-transfer"
-            onMouseDown={(event) => event.stopPropagation()}
-            role="dialog"
-          >
+      {passphraseModal ? (
+        <AppModal
+          ariaLabelledBy="data-transfer-passphrase-title"
+          dismissable={!busy}
+          keyboardDismissable={!busy}
+          onClose={closePassphraseModal}
+          size="sm"
+        >
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
                 <h2 className="ui-modal-title" id="data-transfer-passphrase-title">
@@ -223,12 +220,12 @@ export function DataTransferButtons({
               </div>
               <label>
                 <span>{t('导出文件密码')}</span>
-                <input autoComplete={passphraseModal.operation === 'export' ? 'new-password' : 'current-password'} autoFocus className="input" maxLength={1_024} onChange={(event) => setPassphrase(event.target.value)} type="password" value={passphrase} />
+                <AppInput autoComplete={passphraseModal.operation === 'export' ? 'new-password' : 'current-password'} autoFocus maxLength={1_024} onChange={(event) => setPassphrase(event.target.value)} type="password" value={passphrase} />
               </label>
               {passphraseModal.operation === 'export' ? (
                 <label>
                   <span>{t('再次输入密码')}</span>
-                  <input autoComplete="new-password" className="input" maxLength={1_024} onChange={(event) => setPassphraseConfirmation(event.target.value)} type="password" value={passphraseConfirmation} />
+                  <AppInput autoComplete="new-password" maxLength={1_024} onChange={(event) => setPassphraseConfirmation(event.target.value)} type="password" value={passphraseConfirmation} />
                 </label>
               ) : null}
             </div>
@@ -242,9 +239,8 @@ export function DataTransferButtons({
                 {t(passphraseModal.operation === 'export' ? '导出' : '导入')}
               </button>
             </footer>
-          </section>
-        </div>
-      ), document.body) : null}
+        </AppModal>
+      ) : null}
     </>
   );
 }

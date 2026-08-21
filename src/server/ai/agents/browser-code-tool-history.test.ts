@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { ModelMessage } from 'ai';
-import { compactOlderBrowserCodeToolResults, compactOlderBrowserToolResults } from './browser-code-tool-history';
+import { compactOlderBrowserCodeToolResults } from './browser-code-tool-history';
 
 function browserCodeToolMessage(id: string, actual: string): ModelMessage {
   return {
@@ -161,47 +161,4 @@ test('AX and domChanges retain their newest occurrences independently', () => {
   assert.doesNotMatch(operationOutput, /Operation tree/);
   assert.match(inspectionOutput, /Latest tree/);
   assert.doesNotMatch(inspectionOutput, /domChanges/);
-});
-
-function domToolMessage(id: string, text: string): ModelMessage {
-  return {
-    role: 'tool',
-    content: [{
-      type: 'tool-result',
-      toolCallId: id,
-      toolName: 'interact',
-      output: {
-        type: 'json',
-        value: {
-          ok: true,
-          actual: `clicked ${id}`,
-          domChanges: {
-            epoch: 1,
-            added: [`<div>${text}</div>`],
-            updated: [],
-            removed: [],
-            extra: { added: [], updated: [], errors: [], validationErrors: [] },
-            overflow: false,
-          },
-        },
-      },
-    }],
-  };
-}
-
-test('DOM mode retains only the latest full post-action DOM update', () => {
-  const source = [domToolMessage('old', 'old-update'), domToolMessage('latest', 'latest-update')];
-  const compacted = compactOlderBrowserToolResults(source, 'dom');
-  const oldValue = (compacted[0] as unknown as { content: Array<{ output: { value: Record<string, unknown> } }> }).content[0].output.value;
-  const latestValue = (compacted[1] as unknown as { content: Array<{ output: { value: Record<string, unknown> } }> }).content[0].output.value;
-
-  assert.equal(oldValue.actual, 'clicked old');
-  assert.equal(oldValue.domChanges, undefined);
-  assert.equal(oldValue.historicalDomUpdate, undefined);
-  assert.match(JSON.stringify(latestValue.domChanges), /latest-update/);
-});
-
-test('code mode does not rewrite DOM-tool updates', () => {
-  const source = [domToolMessage('old', 'old-update'), domToolMessage('latest', 'latest-update')];
-  assert.deepEqual(compactOlderBrowserToolResults(source, 'code'), source);
 });

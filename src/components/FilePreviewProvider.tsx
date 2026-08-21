@@ -9,16 +9,14 @@ import {
   useId,
   useMemo,
   useState,
-  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from 'react';
-import { createPortal } from 'react-dom';
 import { FileText, X } from 'lucide-react';
 import type { PreviewSource } from '@open-file-viewer/core';
 import { BeautifulLoadingState } from '@/components/BeautifulLoadingState';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useTheme } from '@/theme/ThemeProvider';
+import { AppModal } from '@/components/ui/app-modal';
 
 function FilePreviewModuleLoading() {
   const { t } = useI18n();
@@ -109,8 +107,6 @@ export function FilePreviewProvider({ children }: { children: ReactNode }) {
     setError('');
   }, []);
 
-  useEscapeDismiss(Boolean(request), closeFilePreview);
-
   useEffect(() => {
     if (!request || typeof request.source !== 'function') return undefined;
     let active = true;
@@ -138,6 +134,14 @@ export function FilePreviewProvider({ children }: { children: ReactNode }) {
       const anchor = target.closest<HTMLAnchorElement>('a[href]');
       if (!anchor || anchor.dataset.filePreview === 'false') return;
       const href = anchor.getAttribute('href') || '';
+      if (anchor.hasAttribute('download')) return;
+      try {
+        const url = new URL(href, window.location.href);
+        const download = url.searchParams.get('download');
+        if (download !== null && !/^(0|false|no)$/i.test(download)) return;
+      } catch {
+        // Invalid links are ignored by the preview check below.
+      }
       const fileName = anchor.dataset.fileName || fileNameFromPreviewUrl(href);
       if (!isFilePreviewHref(href, fileName)) return;
       event.preventDefault();
@@ -159,50 +163,45 @@ export function FilePreviewProvider({ children }: { children: ReactNode }) {
     openFilePreview,
   }), [closeFilePreview, openFilePreview, request]);
 
-  const dialog = request && typeof document !== 'undefined'
-    ? createPortal((
-      <div className="file-preview-overlay" onMouseDown={closeFilePreview}>
-        <section
-          aria-labelledby={titleId}
-          aria-modal="true"
-          className="file-preview-dialog"
-          onMouseDown={(event: ReactMouseEvent) => event.stopPropagation()}
-          role="dialog"
-        >
-          <header className="file-preview-header">
-            <span aria-hidden="true" className="file-preview-heading-icon"><FileText size={18} /></span>
-            <div className="file-preview-heading-copy">
-              <h2 id={titleId}>{request.fileName}</h2>
-              <p>{t('文件预览')}</p>
-            </div>
-            <button aria-label={t('关闭')} autoFocus className="ui-icon-button" onClick={closeFilePreview} type="button">
-              <X size={18} />
-            </button>
-          </header>
-          <div className="file-preview-stage">
-            {loadingSource ? <BeautifulLoadingState label={t('正在读取文件')} /> : null}
-            {!loadingSource && error ? (
-              <div className="file-preview-error" role="alert">
-                <FileText size={24} />
-                <strong>{t('无法预览此文件')}</strong>
-                <span>{error}</span>
-              </div>
-            ) : null}
-            {!loadingSource && !error && resolvedSource !== null ? (
-              <OpenFileViewerSurface
-                fileName={request.fileName}
-                locale={language === 'en' ? 'en-US' : 'zh-CN'}
-                mimeType={request.mimeType}
-                onError={(reason) => setError(reason.message)}
-                source={resolvedSource}
-                theme={mode}
-              />
-            ) : null}
+  const dialog = request ? (
+    <AppModal
+      ariaLabelledBy={titleId}
+      dialogClassName="file-preview-dialog"
+      onClose={closeFilePreview}
+      size="preview"
+    >
+      <header className="ui-modal-header file-preview-header">
+        <span aria-hidden="true" className="file-preview-heading-icon"><FileText size={18} /></span>
+        <div className="file-preview-heading-copy">
+          <h2 id={titleId}>{request.fileName}</h2>
+          <p>{t('文件预览')}</p>
+        </div>
+        <button aria-label={t('关闭')} autoFocus className="ui-icon-button ui-modal-close" onClick={closeFilePreview} type="button">
+          <X size={18} />
+        </button>
+      </header>
+      <div className="ui-modal-body file-preview-stage">
+        {loadingSource ? <BeautifulLoadingState label={t('正在读取文件')} /> : null}
+        {!loadingSource && error ? (
+          <div className="file-preview-error" role="alert">
+            <FileText size={24} />
+            <strong>{t('无法预览此文件')}</strong>
+            <span>{error}</span>
           </div>
-        </section>
+        ) : null}
+        {!loadingSource && !error && resolvedSource !== null ? (
+          <OpenFileViewerSurface
+            fileName={request.fileName}
+            locale={language === 'en' ? 'en-US' : 'zh-CN'}
+            mimeType={request.mimeType}
+            onError={(reason) => setError(reason.message)}
+            source={resolvedSource}
+            theme={mode}
+          />
+        ) : null}
       </div>
-    ), document.body)
-    : null;
+    </AppModal>
+  ) : null;
 
   return (
     <FilePreviewContext.Provider value={contextValue}>

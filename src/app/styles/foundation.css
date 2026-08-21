@@ -1,5 +1,7 @@
 @import "tailwindcss";
 
+@import "@heroui/styles";
+
 @import "./tokens.css";
 
 @import "./controls.css";
@@ -8,7 +10,6 @@
 
 @import "./file-preview.css";
 
-@import "./data-table.css";
 
 /*
  * Canonical visual refinement layer.
@@ -52,7 +53,7 @@ html {
   --warning: #fbbf24;
   --success: #34d399;
   --body-gradient: linear-gradient(transparent, transparent);
-  --overlay: rgba(0, 0, 0, 0.58);
+  --app-overlay: rgba(0, 0, 0, 0.58);
   --code-panel: #050505;
   --code-foreground: #f5f5f5;
   --inverse-panel: #ffffff;
@@ -79,18 +80,18 @@ body {
   text-rendering: optimizeLegibility;
   background: var(--body-gradient), var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans);
+  font-family: var(--app-font-sans);
   font-size: 14px;
   letter-spacing: -0.006em;
   line-height: 1.5;
 }
 
-*::-webkit-scrollbar {
+*:not([data-slot], [data-slot] *)::-webkit-scrollbar {
   height: 10px;
   width: 8px;
 }
 
-*::-webkit-scrollbar-thumb {
+*:not([data-slot], [data-slot] *)::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb);
   background-clip: padding-box;
   border: 2px dashed transparent;
@@ -98,24 +99,24 @@ body {
   padding: 2px;
 }
 
-:where(button, input, textarea, select) {
+:where(button, input, textarea, select):not([data-slot], [data-slot] *) {
   font-family: inherit;
   letter-spacing: inherit;
 }
 
-:where(h1, h2, h3, h4) {
+:where(h1, h2, h3, h4):not([data-slot], [data-slot] *) {
   color: var(--foreground);
   font-weight: 600;
   letter-spacing: -0.028em;
   text-wrap: balance;
 }
 
-:where(p, li, dd, figcaption) {
+:where(p, li, dd, figcaption):not([data-slot], [data-slot] *) {
   text-wrap: pretty;
 }
 
-:where(code, pre, kbd, samp) {
-  font-family: var(--font-mono);
+:where(code, pre, kbd, samp):not([data-slot], [data-slot] *) {
+  font-family: var(--app-font-mono);
 }
 
 ::selection {
@@ -123,7 +124,7 @@ body {
   color: var(--foreground);
 }
 
-:where(button, a, input, textarea, select, summary):focus-visible {
+:where(button, a, input, textarea, select, summary):not([data-slot], [data-slot] *):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
@@ -239,7 +240,7 @@ body {
   box-shadow: 0 1px 2px color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
-html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow > summary, .domain-list-search > button) {
+html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow-trigger, .domain-list-search > button):not([data-slot], [data-slot] *) {
   backdrop-filter: none !important;
   background: transparent !important;
   border: 0 !important;
@@ -287,11 +288,8 @@ html :is(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-ch
   .textarea,
   .file-input,
   .settings-workspace .input,
-  .settings-workspace .textarea,
-  .modal-field input,
-  .modal-field textarea,
-  .modal-field select
-) {
+  .settings-workspace .textarea
+):not([data-slot], [data-slot] *) {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--control-radius);
@@ -311,11 +309,8 @@ html :is(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-ch
   .textarea,
   .file-input,
   .settings-workspace .input,
-  .settings-workspace .textarea,
-  .modal-field input,
-  .modal-field textarea,
-  .modal-field select
-):hover:not(:disabled) {
+  .settings-workspace .textarea
+):not([data-slot], [data-slot] *):hover:not(:disabled) {
   border-color: var(--border-strong);
 }
 
@@ -324,27 +319,24 @@ html :is(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-ch
   .textarea,
   .file-input,
   .settings-workspace .input,
-  .settings-workspace .textarea,
-  .modal-field input,
-  .modal-field textarea,
-  .modal-field select
-):focus {
+  .settings-workspace .textarea
+):not([data-slot], [data-slot] *):focus {
   border-color: var(--focus-ring);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring) 15%, transparent);
   outline: 0;
 }
 
-:where(input, textarea)::placeholder {
+:where(input, textarea):not([data-slot], [data-slot] *)::placeholder {
   color: color-mix(in srgb, var(--muted) 82%, transparent);
   opacity: 1;
 }
 
-:where(input, textarea, select):disabled {
+:where(input, textarea, select):not([data-slot], [data-slot] *):disabled {
   cursor: not-allowed;
   opacity: 0.56;
 }
 
-input[type="checkbox"] {
+input[type="checkbox"]:not([data-slot], [data-slot] *) {
   appearance: none;
   -webkit-appearance: none;
   background-color: var(--panel);
@@ -366,18 +358,26 @@ input[type="checkbox"] {
   box-shadow: var(--shadow-xs);
 }
 
-input[type="checkbox"]:focus-visible {
+input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   outline: none;
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring) 18%, transparent);
 }
 
 .custom-select-button {
   align-items: center;
-  border: 1px solid var(--border);
+  background: var(--field-background, var(--default));
+  border: var(--field-border-width, 0) solid var(--field-border, var(--border));
+  border-radius: var(--field-radius, calc(var(--radius) * 1.5));
+  box-shadow: var(--field-shadow);
+  color: var(--field-foreground, var(--foreground));
   cursor: pointer;
   display: flex;
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 400;
   gap: 10px;
   justify-content: space-between;
+  min-height: 36px;
   outline: none;
   padding: 0 12px;
   text-align: left;
@@ -386,37 +386,26 @@ input[type="checkbox"]:focus-visible {
     border-color 0.16s ease,
     box-shadow 0.16s ease;
   width: 100%;
-  background: var(--panel);
-  border-color: var(--border);
-  border-radius: var(--control-radius);
-  box-shadow: var(--shadow-xs);
-  color: var(--foreground);
-  font-size: 13px;
-  font-weight: 500;
-  min-height: var(--control-height);
 }
 
 .custom-select-button:hover:not(:disabled) {
-  background: var(--panel);
-  border-color: var(--border-strong);
+  background: var(--field-hover, var(--field-background, var(--default)));
+  border-color: var(--field-border-hover, var(--field-border, var(--border)));
 }
 
 .custom-select-button:focus-visible {
-  border-color: var(--focus-ring);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus-ring) 15%, transparent);
+  background: var(--field-focus, var(--field-background, var(--default)));
+  border-color: var(--field-border-focus, var(--field-border, var(--border)));
+  box-shadow: var(--field-shadow), 0 0 0 2px var(--focus);
   outline: 0;
 }
 
 .custom-select-menu,
-.browser-chat-overflow-menu,
-.browser-chat-download-popover,
-.browser-chat-group-binding-popover,
-.browser-chat-mode-selector-menu,
 .browser-chat-skill-menu {
   background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
   backdrop-filter: blur(18px) saturate(1.08);
   border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
-  border-radius: var(--radius-md);
+  border-radius: var(--app-radius-md);
   box-shadow: var(--shadow-lg);
 }
 
@@ -450,7 +439,7 @@ input[type="checkbox"]:focus-visible {
     box-shadow 140ms ease-out;
   background: var(--panel-soft);
   border: 1px solid transparent;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--muted);
 }
 
@@ -476,6 +465,13 @@ input[type="checkbox"]:focus-visible {
   font-weight: 400;
 }
 
+.custom-select-search input:focus,
+.custom-select-search input:focus-visible {
+  border: 0;
+  box-shadow: none;
+  outline: 0;
+}
+
 .custom-select-option {
   -webkit-appearance: none;
   align-items: center;
@@ -498,7 +494,7 @@ input[type="checkbox"]:focus-visible {
   text-align: left;
   text-transform: none;
   width: 100%;
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--muted-strong);
   font-size: 13px;
   min-height: 38px;
@@ -506,7 +502,7 @@ input[type="checkbox"]:focus-visible {
 
 .custom-select-option:hover,
 .custom-select-option.active {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
   color: var(--foreground);
 }
 
@@ -525,7 +521,7 @@ input[type="checkbox"]:focus-visible {
 :where(.case-main-panel, .run-execution-panel) {
   background: var(--panel);
   border-color: var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--app-radius-lg);
   box-shadow: var(--shadow-sm);
 }
 
@@ -553,7 +549,7 @@ input[type="checkbox"]:focus-visible {
 .personal-memory-delete-error {
   background: color-mix(in srgb, var(--danger) 9%, var(--panel));
   border: 1px solid color-mix(in srgb, var(--danger) 22%, var(--border));
-  border-radius: var(--radius-sm);
+  border-radius: var(--app-radius-sm);
   color: var(--danger);
   font-size: 12px;
 }
@@ -764,6 +760,10 @@ input[type="checkbox"]:focus-visible {
   box-shadow: var(--modal-shadow);
 }
 
+.webpilot-modal-form {
+  display: contents;
+}
+
 .ui-modal.ui-modal--compact,
 .ui-modal.admin-settings-password-dialog {
   --ui-modal-inline-size: 520px;
@@ -776,93 +776,6 @@ input[type="checkbox"]:focus-visible {
 .ui-modal.ui-modal--skill {
   --ui-modal-inline-size: 1180px;
   height: min(calc(100dvh - 48px), 920px);
-}
-
-.ui-modal-header,
-.ui-modal > header,
-.ui-modal-footer {
-  background: color-mix(in srgb, var(--panel) 94%, var(--panel-soft));
-  border-color: var(--border);
-  position: relative;
-  z-index: 2;
-}
-
-.ui-modal-header,
-.ui-modal > header {
-  min-height: 58px;
-  padding: 8px 10px;
-}
-
-.ui-modal-title,
-.ui-modal > header h2 {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-}
-
-.ui-modal-subtitle,
-.ui-modal > header p {
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.55;
-}
-
-.ui-modal-body {
-  min-width: 0;
-  overflow: auto;
-  overscroll-behavior: contain;
-  padding: 18px;
-}
-
-.ui-modal-footer {
-  align-items: center;
-  border-top: 1px solid var(--border);
-  display: flex;
-  justify-content: flex-end;
-  background: color-mix(in srgb, var(--panel) 94%, var(--panel-soft));
-  border-color: var(--border);
-  gap: 8px;
-  min-height: 60px;
-  padding: 11px 18px;
-}
-
-.ui-modal-footer .ui-button {
-  border-radius: var(--control-radius);
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.ui-modal-footer .ui-button--primary {
-  background: var(--button-primary-bg) !important;
-  border: 1px solid var(--button-primary-bg) !important;
-  color: var(--button-primary-foreground) !important;
-}
-
-.ui-modal-footer .ui-button--neutral,
-.ui-modal-footer .ui-button--neutral:not(:disabled):hover,
-.ui-modal-footer .ui-button--neutral:not(:disabled):active {
-  background: transparent !important;
-  border: 0 !important;
-  box-shadow: none !important;
-  color: var(--foreground) !important;
-}
-
-.ui-modal-footer .ui-button--danger {
-  background: var(--button-danger-bg) !important;
-  border: 1px solid var(--button-danger-bg) !important;
-  color: #ffffff !important;
-}
-
-.ui-modal-footer .ui-button--primary:not(:disabled):hover {
-  background: var(--button-primary-hover-bg) !important;
-  border-color: var(--button-primary-hover-bg) !important;
-  opacity: 1;
-}
-
-.ui-modal-footer .ui-button--danger:not(:disabled):hover {
-  background: var(--button-danger-bg) !important;
-  border-color: var(--button-danger-bg) !important;
-  opacity: 1;
 }
 
 /* Compact form dialogs use one quiet, input-first card language. */
@@ -1000,7 +913,7 @@ input[type="checkbox"]:focus-visible {
   .admin-settings-password-form label > span
 ) {
   color: var(--form-dialog-label);
-  font-family: var(--font-mono);
+  font-family: var(--app-font-mono);
   font-size: 12px;
   font-weight: 600;
 }
@@ -1074,6 +987,36 @@ input[type="checkbox"]:focus-visible {
 }
 
 /* Magic UI registry primitives, wired through the local Shadcn component layer. */
+.magic-animated-shiny-text {
+  animation: magic-shiny-text 8s infinite;
+  background-image: linear-gradient(
+    110deg,
+    transparent 0,
+    transparent 38%,
+    color-mix(in srgb, currentColor 88%, white) 50%,
+    transparent 62%,
+    transparent 100%
+  );
+  background-position: calc(-100% - var(--shiny-width)) 0;
+  background-repeat: no-repeat;
+  background-size: var(--shiny-width) 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+
+@keyframes magic-shiny-text {
+  0%, 90%, 100% {
+    background-position: calc(-100% - var(--shiny-width)) 0;
+  }
+  30%, 60% {
+    background-position: calc(100% + var(--shiny-width)) 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .magic-animated-shiny-text { animation: none; }
+}
+
 .magic-rainbow-button {
   --magic-rainbow-surface: #17181a;
   --magic-rainbow-foreground: #ffffff;
@@ -1128,9 +1071,30 @@ input[type="checkbox"]:focus-visible {
   mix-blend-mode: normal;
 }
 
-::view-transition-new(root) { z-index: 9999; }
+:root[data-magicui-theme-vt="active"] {
+  view-transition-name: root;
+}
+
+::view-transition-group(root) {
+  animation-duration: var(--magicui-theme-toggle-vt-duration, 400ms);
+}
+
+::view-transition-new(root) {
+  clip-path: var(--magicui-theme-vt-clip-from);
+  z-index: 9999;
+}
 ::view-transition-old(root) { z-index: 1; }
+
+.magicui-theme-toggle-fallback {
+  backdrop-filter: invert(1) hue-rotate(180deg);
+  clip-path: circle(0% at 50% 50%);
+  inset: 0;
+  pointer-events: none;
+  position: fixed;
+  z-index: 2147483647;
+}
 
 @media (prefers-reduced-motion: reduce) {
   .magic-rainbow-button { animation: none; }
+  .magicui-theme-toggle-fallback { display: none; }
 }

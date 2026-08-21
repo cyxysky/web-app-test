@@ -217,7 +217,7 @@ export function AiOperationsWorkspace({
   initialSidebarCollapsed?: boolean;
 }) {
   const { t } = useI18n();
-  const { mode: themeMode, toggleMode } = useTheme();
+  const { mode: themeMode, setMode } = useTheme();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [data, setData] = useState(initialData);
   const [rangeDays, setRangeDays] = useState(initialData.rangeDays);
@@ -279,7 +279,7 @@ export function AiOperationsWorkspace({
         collapsed={sidebarCollapsed}
         collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
-        onToggleTheme={toggleMode}
+        onThemeChange={setMode}
         themeMode={themeMode}
         themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
         themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}

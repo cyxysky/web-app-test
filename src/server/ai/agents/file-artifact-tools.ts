@@ -9,8 +9,15 @@ import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 import {
   generateFileBuffer,
-  type GeneratedFileInput,
 } from './document-artifact-generators';
+import type {
+  OfficeBlock,
+  OfficeDocumentDraft,
+  OfficeDocumentEditOperation,
+  OfficeDocumentKind,
+  OfficeDocumentOutlineItem,
+  OfficeDocumentSettings,
+} from '@/server/files/office-document-spec';
 import {
   fillDocxTemplateBuffer,
   type DocxTemplateFillOperation,
@@ -30,9 +37,31 @@ type DownloadArtifactInput = {
   fileName?: string | null;
 };
 
-type GenerateArtifactInput = Omit<GeneratedFileInput, 'fileName'> & {
+type PlanArtifactInput = {
   runId?: string;
   fileName?: string | null;
+  documentType?: OfficeDocumentKind;
+  document?: OfficeDocumentSettings;
+  intent?: string;
+  outline?: OfficeDocumentOutlineItem[];
+};
+
+type GenerateArtifactBlocksInput = {
+  runId?: string;
+  documentId?: string;
+  blocks?: OfficeBlock[];
+  parentId?: string;
+  beforeId?: string;
+  afterId?: string;
+  render?: boolean;
+  includeVisualVerification?: boolean;
+};
+
+type EditArtifactInput = {
+  runId?: string;
+  documentId?: string;
+  operations?: OfficeDocumentEditOperation[];
+  render?: boolean;
   includeVisualVerification?: boolean;
 };
 
@@ -54,6 +83,8 @@ type ArtifactToolPayload = {
   downloadUrl?: string;
   bytes?: number;
   sourceUrl?: string;
+  documentId?: string;
+  blockCount?: number;
 };
 
 export type FileArtifactToolResult = {
@@ -81,7 +112,7 @@ function sanitizeFileName(value: string | undefined | null, fallback: string) {
   return cleaned || fallback;
 }
 
-function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'downloads' | 'generated') {
+function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'document-drafts' | 'downloads' | 'generated') {
   return artifactPath(sanitizeFileName(runId, 'adhoc'), kind);
 }
 
@@ -130,6 +161,12 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
   if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
+    if (payload.kind === 'document-plan') {
+      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; blocks=${payload.blockCount || 0}`;
+    }
+    if (payload.kind === 'document-draft') {
+      return `Document draft updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; blocks=${payload.blockCount || 0}`;
+    }
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
       ? 'File downloaded'
       : toolName === 'fillDocumentTemplate'
@@ -265,25 +302,98 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
   }
 }
 
-export async function generateFileArtifact(input: GenerateArtifactInput): Promise<BrowserActionResult> {
-  try {
-    if (!String(input.fileName || '').trim()) {
-      return { ok: false, actual: 'generateFile failed: fileName with a supported extension is required.' };
+function draftPath(runId: string | undefined, documentId: string) {
+  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.json`);
+}
+
+function nestedBlocks(block: OfficeBlock) {
+  return [
+    ...(Array.isArray(block.children) ? block.children : []),
+    ...(Array.isArray(block.columns) ? block.columns.flatMap((column) => Array.isArray(column.blocks) ? column.blocks : []) : []),
+  ];
+}
+
+function allBlocks(blocks: OfficeBlock[]): OfficeBlock[] {
+  return blocks.flatMap((block) => [block, ...allBlocks(nestedBlocks(block))]);
+}
+
+function validateUniqueBlockIds(blocks: OfficeBlock[], occupied = new Set<string>()) {
+  for (const block of allBlocks(blocks)) {
+    const id = String(block.id || '').trim();
+    if (!id) throw new Error('Every document block requires a stable id.');
+    if (occupied.has(id)) throw new Error(`Duplicate document block id: ${id}`);
+    occupied.add(id);
+  }
+}
+
+function findBlockList(blocks: OfficeBlock[], blockId: string): { list: OfficeBlock[]; index: number } | undefined {
+  const directIndex = blocks.findIndex((block) => block.id === blockId);
+  if (directIndex >= 0) return { list: blocks, index: directIndex };
+  for (const block of blocks) {
+    const candidates: OfficeBlock[][] = [];
+    if (Array.isArray(block.children)) candidates.push(block.children);
+    for (const column of block.columns || []) if (Array.isArray(column.blocks)) candidates.push(column.blocks);
+    for (const candidate of candidates) {
+      const found = findBlockList(candidate, blockId);
+      if (found) return found;
     }
-    const requestedName = sanitizeFileName(
-      input.fileName,
-      `document-${Date.now()}.md`,
-    );
-    const generated = await generateFileBuffer({
-      content: input.content,
-      documentType: input.documentType,
-      fileName: requestedName,
-      sheets: input.sheets,
-      slides: input.slides,
-      subtitle: input.subtitle,
-      theme: input.theme,
-      title: input.title,
-    });
+  }
+  return undefined;
+}
+
+function insertionList(draft: OfficeDocumentDraft, parentId?: string) {
+  if (!parentId) return draft.blocks;
+  const parent = findBlockList(draft.blocks, parentId);
+  if (!parent) throw new Error(`Parent block not found: ${parentId}`);
+  const block = parent.list[parent.index];
+  if (!Array.isArray(block.children)) block.children = [];
+  return block.children;
+}
+
+function insertBlocks(draft: OfficeDocumentDraft, blocks: OfficeBlock[], placement: { parentId?: string; beforeId?: string; afterId?: string }) {
+  validateUniqueBlockIds(blocks, new Set(allBlocks(draft.blocks).map((block) => block.id)));
+  let list = insertionList(draft, placement.parentId);
+  let index = list.length;
+  const anchorId = placement.beforeId || placement.afterId;
+  if (anchorId) {
+    const anchor = findBlockList(draft.blocks, anchorId);
+    if (!anchor) throw new Error(`Placement block not found: ${anchorId}`);
+    list = anchor.list;
+    index = anchor.index + (placement.afterId ? 1 : 0);
+  }
+  list.splice(index, 0, ...blocks);
+}
+
+function mergePlainObject(base: unknown, patch: unknown): unknown {
+  if (!base || !patch || typeof base !== 'object' || typeof patch !== 'object' || Array.isArray(base) || Array.isArray(patch)) return patch;
+  const result = { ...(base as Record<string, unknown>) };
+  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
+    result[key] = mergePlainObject(result[key], value);
+  }
+  return result;
+}
+
+async function loadDraft(runId: string | undefined, documentId: string) {
+  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft;
+  if (parsed.documentId !== documentId) throw new Error('Document draft identity does not match the requested documentId.');
+  return parsed;
+}
+
+async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
+  const dir = artifactDir(runId, 'document-drafts');
+  await mkdir(dir, { recursive: true });
+  draft.updatedAt = new Date().toISOString();
+  await writeFile(draftPath(runId, draft.documentId), JSON.stringify(draft, null, 2), 'utf8');
+}
+
+async function renderDraft(input: {
+  runId?: string;
+  draft: OfficeDocumentDraft;
+  includeVisualVerification?: boolean;
+}): Promise<BrowserActionResult> {
+  try {
+    const requestedName = sanitizeFileName(input.draft.fileName, `document-${Date.now()}.pdf`);
+    const generated = await generateFileBuffer(input.draft);
     const dir = artifactDir(input.runId, 'generated');
     await mkdir(dir, { recursive: true });
     const target = await uniqueArtifactPath(dir, requestedName);
@@ -310,6 +420,8 @@ export async function generateFileArtifact(input: GenerateArtifactInput): Promis
           filePath: target.filePath,
           bytes: generated.buffer.byteLength,
         }),
+        documentId: input.draft.documentId,
+        blockCount: allBlocks(input.draft.blocks).length,
         visualVerification: visualVerification ? {
           imageCount: visualVerification.imagePaths.length,
           pageCount: visualVerification.pageCount,
@@ -321,7 +433,91 @@ export async function generateFileArtifact(input: GenerateArtifactInput): Promis
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
   } catch (error) {
-    return { ok: false, actual: `generateFile failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function planFileArtifact(input: PlanArtifactInput): Promise<BrowserActionResult> {
+  try {
+    if (!String(input.fileName || '').trim()) return { ok: false, actual: 'file action=plan requires fileName.' };
+    if (!input.documentType) return { ok: false, actual: 'file action=plan requires documentType.' };
+    const now = new Date().toISOString();
+    const draft: OfficeDocumentDraft = {
+      blocks: [],
+      createdAt: now,
+      document: input.document || {},
+      documentId: randomUUID(),
+      documentType: input.documentType,
+      fileName: sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`),
+      intent: input.intent,
+      outline: input.outline,
+      updatedAt: now,
+    };
+    await saveDraft(input.runId, draft);
+    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, outline: draft.outline, blockCount: 0 }) };
+  } catch (error) {
+    return { ok: false, actual: `file planning failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function generateFileArtifactBlocks(input: GenerateArtifactBlocksInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
+    const blocks = Array.isArray(input.blocks) ? input.blocks : [];
+    if (!blocks.length) return { ok: false, actual: 'file action=generate requires at least one block.' };
+    const draft = await loadDraft(input.runId, documentId);
+    insertBlocks(draft, blocks, input);
+    await saveDraft(input.runId, draft);
+    if (input.render) return renderDraft({ ...input, draft });
+    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, acceptedBlockIds: blocks.map((block) => block.id), blockCount: allBlocks(draft.blocks).length }) };
+  } catch (error) {
+    return { ok: false, actual: `file block generation failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function editFileArtifact(input: EditArtifactInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) return { ok: false, actual: 'file action=edit requires documentId.' };
+    const operations = Array.isArray(input.operations) ? input.operations : [];
+    if (!operations.length) return { ok: false, actual: 'file action=edit requires at least one operation.' };
+    const draft = await loadDraft(input.runId, documentId);
+    for (const operation of operations) {
+      if (operation.op === 'setDocument') {
+        draft.document = mergePlainObject(draft.document, operation.patch || {}) as OfficeDocumentSettings;
+        continue;
+      }
+      if (operation.op === 'add') {
+        const blocks = operation.blocks || (operation.block ? [operation.block] : []);
+        insertBlocks(draft, blocks, operation);
+        continue;
+      }
+      const blockId = String(operation.blockId || '').trim();
+      const found = findBlockList(draft.blocks, blockId);
+      if (!found) throw new Error(`Block not found: ${blockId}`);
+      if (operation.op === 'remove') {
+        found.list.splice(found.index, 1);
+      } else if (operation.op === 'replace') {
+        if (!operation.block) throw new Error(`replace requires block for ${blockId}`);
+        const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => block.id !== blockId).map((block) => block.id));
+        validateUniqueBlockIds([operation.block], remainingIds);
+        found.list.splice(found.index, 1, operation.block);
+      } else if (operation.op === 'update') {
+        const updated = mergePlainObject(found.list[found.index], operation.patch || {}) as OfficeBlock;
+        updated.id = blockId;
+        found.list[found.index] = updated;
+      } else if (operation.op === 'move') {
+        const [block] = found.list.splice(found.index, 1);
+        insertBlocks(draft, [block], operation);
+      }
+    }
+    validateUniqueBlockIds(draft.blocks);
+    await saveDraft(input.runId, draft);
+    if (input.render !== false) return renderDraft({ ...input, draft });
+    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, blockCount: allBlocks(draft.blocks).length }) };
+  } catch (error) {
+    return { ok: false, actual: `file edit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -460,14 +656,10 @@ function repairArtifactDownloadLinks(reply: string, downloads: FileArtifactDownl
   });
 }
 
-export function appendMissingFileArtifactDownloadLinks(reply: string, tools: FileArtifactToolResult[]) {
+export function repairFileArtifactDownloadLinks(reply: string, tools: FileArtifactToolResult[]) {
   const downloads = tools
     .map(fileArtifactDownloadFromToolResult)
     .filter((item): item is FileArtifactDownload => Boolean(item));
   const unique = [...new Map(downloads.map((item) => [item.artifactId, item])).values()];
-  const repairedReply = repairArtifactDownloadLinks(reply, unique);
-  const missing = unique.filter((item) => !repairedReply.includes(item.downloadUrl));
-  if (!missing.length) return repairedReply;
-  const links = missing.map((item) => `- [${escapeMarkdownLinkLabel(item.fileName)}](${item.downloadUrl})`).join('\n');
-  return [repairedReply.trim(), `## 文件下载\n\n${links}`].filter(Boolean).join('\n\n');
+  return repairArtifactDownloadLinks(reply, unique);
 }

@@ -1,6 +1,6 @@
 'use client';
 
-import { Moon, PanelLeft, Sun } from 'lucide-react';
+import { PanelLeft } from 'lucide-react';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
@@ -13,7 +13,7 @@ type WorkspaceSidebarProps = {
   collapsed: boolean;
   collapseLabel: string;
   onToggleCollapse: () => void;
-  onToggleTheme: () => void;
+  onThemeChange: (theme: ThemeMode) => void;
   themeMode: ThemeMode;
   themeToggleLabel: string;
   themeToggleTitle: string;
@@ -54,7 +54,7 @@ export function WorkspaceSidebar({
   collapsed,
   collapseLabel,
   onToggleCollapse,
-  onToggleTheme,
+  onThemeChange,
   themeMode,
   themeToggleLabel,
   themeToggleTitle,
@@ -90,12 +90,11 @@ export function WorkspaceSidebar({
         <AnimatedThemeToggler
           aria-label={themeToggleLabel}
           className="browser-chat-theme-toggle"
-          onThemeChange={onToggleTheme}
+          duration={600}
+          onThemeChange={onThemeChange}
           theme={themeMode}
           title={themeToggleTitle}
-        >
-          {themeMode === 'dark' ? <Sun aria-hidden="true" size={17} /> : <Moon aria-hidden="true" size={17} />}
-        </AnimatedThemeToggler>
+        />
       </div>
     </aside>
   );

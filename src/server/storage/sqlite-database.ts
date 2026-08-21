@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 21;
+const currentSchemaVersion = 22;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -344,7 +344,6 @@ function applyVersionNineMigration(database: DatabaseSync) {
         source_session_id TEXT NOT NULL,
         title TEXT NOT NULL,
         target_url TEXT NOT NULL,
-        mode TEXT NOT NULL,
         record_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -667,6 +666,36 @@ function applyVersionTwentyOneMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionTwentyTwoMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 22').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      UPDATE automation_case
+      SET record_json = json_remove(record_json, '$.mode')
+      WHERE json_type(record_json, '$.mode') IS NOT NULL;
+      UPDATE browser_chat_session
+      SET snapshot_json = json_remove(snapshot_json, '$.mode'),
+          summary_json = json_remove(summary_json, '$.mode')
+      WHERE json_type(snapshot_json, '$.mode') IS NOT NULL
+         OR json_type(summary_json, '$.mode') IS NOT NULL;
+    `);
+    const columns = database.prepare('PRAGMA table_info(automation_case)').all() as Array<{ name?: string }>;
+    if (columns.some((column) => column.name === 'mode')) {
+      database.exec('ALTER TABLE automation_case DROP COLUMN mode');
+    }
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (22, 'remove-browser-operation-mode', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -868,6 +897,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionNineteenMigration(database);
   applyVersionTwentyMigration(database);
   applyVersionTwentyOneMigration(database);
+  applyVersionTwentyTwoMigration(database);
 }
 
 export function getSqliteDatabase() {

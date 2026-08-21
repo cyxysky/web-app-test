@@ -24,7 +24,7 @@ test('a headless user profile preserves login storage after the browser is recyc
     process.env.APP_DATA_DIR = dataRoot;
     for (const key of environmentKeys) delete process.env[key];
 
-    first = new BrowserSession('dom', {
+    first = new BrowserSession({
       browserProfileKey: profileKey,
       headless: true,
       runId: 'profile-first-conversation',
@@ -44,7 +44,7 @@ test('a headless user profile preserves login storage after the browser is recyc
     await first.close({ force: true });
     first = undefined;
 
-    second = new BrowserSession('dom', {
+    second = new BrowserSession({
       browserProfileKey: profileKey,
       headless: true,
       runId: 'profile-second-conversation',
@@ -83,7 +83,7 @@ test('a headless user profile preserves login storage after the browser is recyc
 });
 
 test('application tab snapshots restore URL order and the active tab in headless mode', async () => {
-  const session = new BrowserSession('dom', {
+  const session = new BrowserSession({
     headless: true,
     isolated: true,
     runId: 'headless-tab-restore-test',

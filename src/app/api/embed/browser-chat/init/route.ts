@@ -80,7 +80,6 @@ export async function POST(request: NextRequest) {
       userId,
       token: embedAuth?.token,
       expiresAt: embedAuth?.expiresAt,
-      mode: process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code',
       safetyMode: session?.safetyMode || normalizeSafetyMode(body.safetyMode),
       mountId: normalizeString(body.mountId) || normalizeString(body.containerId) || undefined,
     });

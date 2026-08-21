@@ -27,7 +27,7 @@ async function readWholeView(session: BrowserSession, mode: SnapshotMode, refres
 }
 
 test('DOMSnapshot covers offscreen content and iframes, paginates records, and powers unified input', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'ax-snapshot-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'ax-snapshot-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -158,7 +158,7 @@ test('DOMSnapshot covers offscreen content and iframes, paginates records, and p
 });
 
 test('DOM-observation takeSnapshot pages actionable, text, and full views with stable DOM UIDs', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-observation-pagination-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-observation-pagination-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -182,7 +182,7 @@ test('DOM-observation takeSnapshot pages actionable, text, and full views with s
 });
 
 test('frozen snapshot cursors survive search, waiting, and asynchronous DOM changes', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'frozen-dom-pagination-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'frozen-dom-pagination-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -224,7 +224,7 @@ test('frozen snapshot cursors survive search, waiting, and asynchronous DOM chan
 });
 
 test('inter-action changes retain all DOM mutations and request summaries until the next interaction', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'inter-action-changes-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'inter-action-changes-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -262,7 +262,7 @@ test('inter-action changes retain all DOM mutations and request summaries until 
 });
 
 test('snapshot lifecycle refreshes on page-state changes, ranks actionable matches, and rejects covered targets', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-lifecycle-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'snapshot-lifecycle-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -363,7 +363,7 @@ test('snapshot lifecycle refreshes on page-state changes, ranks actionable match
 });
 
 test('DOM page runtime refreshes a stale injected snapshot implementation', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-runtime-revision-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-runtime-revision-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -395,7 +395,7 @@ test('DOM page runtime refreshes a stale injected snapshot implementation', asyn
 });
 
 test('DOM actions use current backend-bound refs without semantic fingerprint validation', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-uid-target-text-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-uid-target-text-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -471,7 +471,7 @@ test('DOM actions use current backend-bound refs without semantic fingerprint va
 });
 
 test('DOM UID force click explicitly dismisses an overlay without activating the covered target', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-covered-target-dismiss-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-covered-target-dismiss-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -518,7 +518,7 @@ test('DOM UID force click explicitly dismisses an overlay without activating the
 });
 
 test('DOM baseline ranks modal duplicates and describes virtual lists', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-ranking-and-virtual-list-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-ranking-and-virtual-list-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -549,7 +549,7 @@ test('DOM baseline ranks modal duplicates and describes virtual lists', async (c
 });
 
 test('searchSnapshot is a pure frozen-baseline read and never scrolls virtual lists', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'virtual-list-progressive-search-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'virtual-list-progressive-search-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -575,7 +575,7 @@ test('searchSnapshot is a pure frozen-baseline read and never scrolls virtual li
 });
 
 test('selectOption scans a virtual list in the backend and clicks the exact mounted match', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'virtual-list-select-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'virtual-list-select-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -631,7 +631,7 @@ test('selectOption scans a virtual list in the backend and clicks the exact moun
 });
 
 test('searchSnapshot tag returns every matching element from the frozen full DOM', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-tag-search-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'snapshot-tag-search-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -651,7 +651,7 @@ test('searchSnapshot tag returns every matching element from the frozen full DOM
 });
 
 test('DOM mutation deltas coalesce repeated attributes and promote nested text changes to interactive roots', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mutation-coalescing-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-mutation-coalescing-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -677,7 +677,7 @@ test('DOM mutation deltas coalesce repeated attributes and promote nested text c
 });
 
 test('post-action domChanges includes every mounted rendered option even outside a scroll viewport', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mounted-scroll-options-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-mounted-scroll-options-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -725,7 +725,7 @@ test('post-action domChanges includes every mounted rendered option even outside
 });
 
 test('fresh DOM captures use a new UID epoch and reset the local sequence', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-uid-epoch-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-uid-epoch-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -756,7 +756,7 @@ test('fresh DOM captures use a new UID epoch and reset the local sequence', asyn
 });
 
 test('DOM mutation deltas expose non-actionable semantic context and page diagnostics under extra', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-mutation-extra-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-mutation-extra-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -775,7 +775,7 @@ test('DOM mutation deltas expose non-actionable semantic context and page diagno
 });
 
 test('post-action form validation errors are elevated instead of remaining only in extra context', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-validation-error-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-validation-error-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -792,7 +792,7 @@ test('post-action form validation errors are elevated instead of remaining only 
 });
 
 test('SVG parents and children with independent click boundaries remain separate actions', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'svg-action-boundary-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'svg-action-boundary-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -822,7 +822,7 @@ test('open waits for a bounded DOM quiet window before capturing the navigation 
   const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
   process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
   process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '800';
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-stability-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'navigation-dom-stability-test' });
   context.after(async () => {
     if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
     else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
@@ -871,7 +871,7 @@ test('open continues when continuous DOM mutations reach the navigation stabilit
   const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
   process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
   process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '250';
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-stability-cap-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'navigation-dom-stability-cap-test' });
   context.after(async () => {
     if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
     else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
@@ -899,7 +899,7 @@ test('navigation stability cap also bounds a stalled DOM sample', async (context
   const previousTimeoutMs = process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS;
   process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = '120';
   process.env.BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = '150';
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'navigation-dom-sample-cap-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'navigation-dom-sample-cap-test' });
   context.after(async () => {
     if (previousQuietMs === undefined) delete process.env.BROWSER_NAVIGATION_DOM_QUIET_MS;
     else process.env.BROWSER_NAVIGATION_DOM_QUIET_MS = previousQuietMs;
@@ -919,7 +919,7 @@ test('navigation stability cap also bounds a stalled DOM sample', async (context
 });
 
 test('unified mouse and keyboard actions emit real browser events', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'input-events-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'input-events-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -1070,7 +1070,7 @@ test('unified mouse and keyboard actions emit real browser events', async (conte
 });
 
 test('typing followed by Enter accepts navigation when the old document telemetry is replaced', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'keyboard-navigation-verification-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'keyboard-navigation-verification-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -1090,7 +1090,7 @@ test('typing followed by Enter accepts navigation when the old document telemetr
 });
 
 test('native select options and rich-text iframe entry use explicit DOM-baseline actions', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'select-and-rich-text-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'select-and-rich-text-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -1126,7 +1126,7 @@ test('native select options and rich-text iframe entry use explicit DOM-baseline
 });
 
 test('actionable view preserves flattened DOMSnapshot order across paginated slices', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'actionable-priority-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'actionable-priority-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;
@@ -1165,7 +1165,7 @@ test('actionable view preserves flattened DOMSnapshot order across paginated sli
 test('snapshot UID mappings evict identities outside the retention window', async (context) => {
   const previousRetention = process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
   process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = '2';
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'snapshot-uid-prune-test' });
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'snapshot-uid-prune-test' });
   context.after(async () => {
     if (previousRetention === undefined) delete process.env.SNAPSHOT_UID_RETENTION_GENERATIONS;
     else process.env.SNAPSHOT_UID_RETENTION_GENERATIONS = previousRetention;
@@ -1188,8 +1188,8 @@ test('snapshot UID mappings evict identities outside the retention window', asyn
   assert.equal([...mappings.values()].some((entry) => entry.uid === expiredUid), false);
 });
 
-test('DOM mode atomically inserts and replaces selected text in textareas and rich-text iframes', async (context) => {
-  const session = new BrowserSession('dom', { headless: true, isolated: true, runId: 'dom-insert-text-at-test' });
+test('semantic input atomically inserts and replaces selected text in textareas and rich-text iframes', async (context) => {
+  const session = new BrowserSession({ headless: true, isolated: true, runId: 'dom-insert-text-at-test' });
   context.after(async () => session.close());
   await session.start();
   const page = Reflect.get(session, 'activePage') as Page;

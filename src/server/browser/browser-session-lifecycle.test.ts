@@ -11,7 +11,7 @@ type MutableBrowserSession = {
 };
 
 function sharedSessionWithPage() {
-  const session = new BrowserSession('code', { runId: 'chat_lifecycle_test' });
+  const session = new BrowserSession({ runId: 'chat_lifecycle_test' });
   const state = session as unknown as MutableBrowserSession;
   let closedPages = 0;
   const page = {

@@ -27,11 +27,11 @@ test('compression never separates an assistant tool call from its tool result', 
     { role: 'user', content: '检查页面' },
     {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'tool-1', toolName: 'inspect', input: { action: 'capture' } }],
+      content: [{ type: 'tool-call', toolCallId: 'tool-1', toolName: 'browserCode', input: { code: 'nodeRepl.write(await page.title())' } }],
     },
     {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'tool-1', toolName: 'inspect', output: { type: 'text', value: 'done' } }],
+      content: [{ type: 'tool-result', toolCallId: 'tool-1', toolName: 'browserCode', output: { type: 'text', value: 'done' } }],
     },
     { role: 'assistant', content: '页面检查完成' },
   ];
@@ -87,8 +87,8 @@ test('compression keeps only complete recent blocks that fit the ten-percent raw
 
 test('an oversized atomic tool block is summarized instead of breaking the twenty-percent ceiling', () => {
   const toolBlock: ModelMessage[] = [
-    { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'huge', toolName: 'inspect', input: {} }] },
-    { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'huge', toolName: 'inspect', output: { type: 'text', value: 'x'.repeat(10_000) } }] },
+    { role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'huge', toolName: 'browserCode', input: { code: 'nodeRepl.write(1)' } }] },
+    { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'huge', toolName: 'browserCode', output: { type: 'text', value: 'x'.repeat(10_000) } }] },
   ];
   const selected = selectRecentRuntimeMessageBlocks([toolBlock], () => 2_500, 1_000);
   assert.deepEqual(selected.retainedBlocks, []);
@@ -98,7 +98,6 @@ test('an oversized atomic tool block is summarized instead of breaking the twent
 test('continuation compression explicitly merges a previous summary with only a delta', () => {
   const prompt = buildRuntimeContinuationSummaryPrompt({
     agentStep: 3,
-    browserMode: 'code',
     deltaModelMessages: { messages: [{ role: 'tool', content: 'new evidence' }] },
     estimatedTokens: 200000,
     goal: '完成任务',

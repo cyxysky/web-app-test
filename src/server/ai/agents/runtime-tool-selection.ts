@@ -1,5 +1,4 @@
 export const runtimeToolLoopStopToolNames = [
-  'reportState',
   'waitForHumanVerification',
   'subagent',
 ] as const;
@@ -15,8 +14,7 @@ export function runtimeAllowedToolTypes({
   nativeToolNames: string[];
   observationToolNames: ReadonlySet<string>;
 }) {
-  const nativeAllowedToolTypes = nativeToolNames.filter((name) => !(browserChatMode && name === 'reportState'));
-  void codexMode;
+  const nativeAllowedToolTypes = nativeToolNames;
   void observationToolNames;
   const baseAllowedToolTypes = nativeAllowedToolTypes;
 

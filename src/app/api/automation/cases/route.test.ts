@@ -25,7 +25,6 @@ test('automation case history defaults to stable pages of ten', async () => {
         sourceMessageIds: [],
         targetUrl: 'https://example.com',
         instruction: `Run case ${index}`,
-        mode: 'code',
         operations: [],
       });
     }

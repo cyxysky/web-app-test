@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createPortal } from 'react-dom';
+import { TextArea } from '@heroui/react';
 import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -9,12 +9,13 @@ import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { ManagementDataTable } from '@/components/ManagementDataTable';
 import { useI18n } from '@/i18n/I18nProvider';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { readApiJson } from '@/lib/api-client';
 import { startGlobalLoading, stopGlobalLoading } from '@/lib/global-loading';
 import { waitForMinimumLoading } from '@/lib/minimum-loading';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
 
 type SkillDraft = {
   shared: boolean;
@@ -92,7 +93,6 @@ export function SkillsManager({
   const skillsApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
   const [expandedSkillIds, setExpandedSkillIds] = useState<string[]>([]);
-  const [portalReady, setPortalReady] = useState(false);
   const [editorMode, setEditorMode] = useState<EditorMode>(null);
   const [editingSkillId, setEditingSkillId] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<SkillRecord | null>(null);
@@ -121,23 +121,6 @@ export function SkillsManager({
   useEffect(() => {
     void loadSkills();
   }, [loadSkills]);
-
-  useEffect(() => {
-    setPortalReady(true);
-  }, []);
-
-  useEffect(() => {
-    if (!editorMode && !deleteTarget) return undefined;
-    function closeOnEscape(event: KeyboardEvent) {
-      if (event.key !== 'Escape' || saving || deletingSkillId) return;
-      setEditorMode(null);
-      setEditingSkillId(null);
-      setDeleteTarget(null);
-      setDraft(emptyDraft);
-    }
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [deleteTarget, deletingSkillId, editorMode, saving]);
 
   function update(patch: Partial<SkillDraft>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -174,8 +157,6 @@ export function SkillsManager({
     setEditingSkillId(null);
     setDraft(emptyDraft);
   }
-
-  useEscapeDismiss(Boolean(editorMode), closeEditorModal);
 
   function requestDeleteSkill(skill: SkillRecord) {
     if (skill.userId !== normalizedUserId) return;
@@ -442,14 +423,14 @@ export function SkillsManager({
         </div>
       </div>
 
-      {editorMode && portalReady ? createPortal((
-        <div className="ui-modal-overlay">
-          <section
-            aria-labelledby="skills-manager-modal-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--skill"
-            role="dialog"
-          >
+      {editorMode ? (
+        <AppModal
+          ariaLabelledBy="skills-manager-modal-title"
+          dismissable={!saving}
+          keyboardDismissable={!saving}
+          onClose={closeEditorModal}
+          size="wide"
+        >
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
                 <h2 className="ui-modal-title" id="skills-manager-modal-title">{editorMode === 'edit' ? t('编辑 Skill') : t('新建 Skill')}</h2>
@@ -463,7 +444,7 @@ export function SkillsManager({
             <div className="ui-modal-body skills-manager-form">
               <label className={editorMode === 'create' ? 'skills-manager-field wide' : 'skills-manager-field'}>
                 <span>{t('标题')}</span>
-                <input className="input settings-control" value={draft.title} onChange={(event) => update({ title: event.target.value })} />
+                <AppInput value={draft.title} onChange={(event) => update({ title: event.target.value })} />
               </label>
               {editorMode === 'edit' ? <label className="skills-manager-field">
                 <span>{t('状态')}</span>
@@ -480,15 +461,15 @@ export function SkillsManager({
               </label> : null}
               <label className="skills-manager-field wide">
                 <span>{t('描述')}</span>
-                <textarea className="textarea settings-control" value={draft.description} onChange={(event) => update({ description: event.target.value })} placeholder={t('一句话说明能力和适用场景')} />
+                <TextArea fullWidth value={draft.description} onChange={(event) => update({ description: event.target.value })} placeholder={t('一句话说明能力和适用场景')} />
               </label>
               <label className="skills-manager-field wide">
                 <span>{t('触发词')}</span>
-                <textarea className="textarea settings-control compact" value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('每行一个精确的用户意图')} />
+                <TextArea fullWidth value={draft.triggerPhrases} onChange={(event) => update({ triggerPhrases: event.target.value })} placeholder={t('每行一个精确的用户意图')} />
               </label>
               <label className="skills-manager-field wide">
                 <span>{t('详细内容')}</span>
-                <textarea className="textarea settings-control skill-details" maxLength={30_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作说明，支持多段文本和 Markdown')} />
+                <TextArea fullWidth maxLength={30_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作说明，支持多段文本和 Markdown')} />
               </label>
               <div className="resource-sharing-field wide">
                 <div>
@@ -513,11 +494,10 @@ export function SkillsManager({
                 {t('保存')}
               </button>
             </footer>
-          </section>
-        </div>
-      ), document.body) : null}
+        </AppModal>
+      ) : null}
 
-      {deleteTarget && portalReady ? (
+      {deleteTarget ? (
         <ConfirmDeleteModal
           deleting={Boolean(deletingSkillId)}
           description={t('确定删除这个 Skill 吗？')}

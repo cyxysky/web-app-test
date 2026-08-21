@@ -28,15 +28,12 @@
   }
 }
 
-a {
+a:not([data-slot], [data-slot] *) {
   color: inherit;
   text-decoration: none;
 }
 
-button,
-input,
-textarea,
-select {
+:where(button, input, textarea, select):not([data-slot], [data-slot] *) {
   font: inherit;
 }
 
@@ -47,28 +44,28 @@ select {
   width: min(100%, 1400px);
 }
 
-.dashboard-v2 :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption),
-.case-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption),
-.settings-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption),
-.redesigned-run-shell :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption) {
+.dashboard-v2 :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
+.case-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
+.settings-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
+.redesigned-run-shell :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.dashboard-v2 :where(input, select),
-.case-workspace :where(input, select),
-.settings-workspace :where(input, select),
-.redesigned-run-shell :where(input, select) {
+.dashboard-v2 :where(input, select):not([data-slot], [data-slot] *),
+.case-workspace :where(input, select):not([data-slot], [data-slot] *),
+.settings-workspace :where(input, select):not([data-slot], [data-slot] *),
+.redesigned-run-shell :where(input, select):not([data-slot], [data-slot] *) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.case-workspace :where(textarea, pre),
-.settings-workspace :where(textarea, pre),
-.redesigned-run-shell :where(textarea, pre) {
+.case-workspace :where(textarea, pre):not([data-slot], [data-slot] *),
+.settings-workspace :where(textarea, pre):not([data-slot], [data-slot] *),
+.redesigned-run-shell :where(textarea, pre):not([data-slot], [data-slot] *) {
   overflow: auto;
   text-overflow: clip;
   white-space: pre-wrap;
@@ -180,9 +177,7 @@ select {
   gap: 6px;
 }
 
-.input,
-.textarea,
-.file-input {
+:where(.input, .textarea, .file-input):not([data-slot], [data-slot] *) {
   background: #ffffff;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -192,9 +187,7 @@ select {
   width: 100%;
 }
 
-.input:focus,
-.textarea:focus,
-.file-input:focus {
+:where(.input, .textarea, .file-input):not([data-slot], [data-slot] *):focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--focus);
 }
@@ -206,8 +199,8 @@ select {
 }
 
 .custom-select-button:hover {
-  background: var(--panel-soft);
-  border-color: var(--border-strong);
+  background: var(--field-hover, var(--field-background, var(--default)));
+  border-color: var(--field-border-hover, var(--field-border, var(--border)));
 }
 
 .custom-select-button:disabled {
@@ -405,7 +398,7 @@ select {
   }
 }
 
-.textarea {
+.textarea:not([data-slot], [data-slot] *) {
   line-height: 1.6;
   min-height: 168px;
   resize: vertical;
@@ -483,7 +476,7 @@ select {
   padding: 18px;
 }
 
-.textarea.compact {
+.textarea:not([data-slot], [data-slot] *).compact {
   min-height: 88px;
 }
 
@@ -1377,17 +1370,17 @@ body.is-dragging-embedded-tab * {
   color: var(--foreground);
 }
 
-:root[data-theme="dark"] :where(.input, .textarea, .file-input, .custom-select-button, .custom-select-menu, .settings-model-row-button, .settings-workspace .input, .browser-chat-compose textarea, .theme-color-picker) {
+:root[data-theme="dark"] :where(.input, .textarea, .file-input, .custom-select-menu, .settings-model-row-button, .settings-workspace .input, .browser-chat-compose textarea, .theme-color-picker):not([data-slot], [data-slot] *) {
   background-color: var(--panel-soft);
   border-color: var(--border);
   color: var(--foreground);
 }
 
-:root[data-theme="dark"] :where(.input, .textarea, .file-input, .settings-workspace .input, .browser-chat-compose textarea)::placeholder {
+:root[data-theme="dark"] :where(.input, .textarea, .file-input, .settings-workspace .input, .browser-chat-compose textarea):not([data-slot], [data-slot] *)::placeholder {
   color: color-mix(in srgb, var(--muted) 78%, transparent);
 }
 
-:root[data-theme="dark"] :where(.custom-select-button:hover, .custom-select-option.active, .custom-select-option:hover, .settings-model-row-button:hover:not(:disabled), .browser-chat-log-button:hover) {
+:root[data-theme="dark"] :where(.custom-select-option.active, .custom-select-option:hover, .settings-model-row-button:hover:not(:disabled), .browser-chat-log-button:hover) {
   background-color: var(--panel-warm);
 }
 
@@ -1456,7 +1449,7 @@ body.is-dragging-embedded-tab * {
 }
 
 :root[data-theme="dark"] :where(.ui-modal-overlay) {
-  background: var(--overlay);
+  background: var(--app-overlay);
 }
 
 :root[data-theme="dark"] .browser-chat-message.user :where(p, strong) {
@@ -1564,7 +1557,7 @@ body.is-dragging-embedded-tab * {
   width: 100%;
 }
 
-:where(button, a, input, textarea, select, summary) {
+:where(button, a, input, textarea, select, summary):not([data-slot], [data-slot] *) {
   -webkit-tap-highlight-color: transparent;
 }
 
@@ -1572,7 +1565,7 @@ body.is-dragging-embedded-tab * {
   letter-spacing: -0.025em;
 }
 
-:where(.input, .textarea, .file-input, .custom-select-button) {
+:where(.input, .textarea, .file-input):not([data-slot], [data-slot] *) {
   box-shadow: inset 0 1px 0 color-mix(in srgb, #ffffff 36%, transparent);
   transition:
     background var(--motion-fast) ease,
@@ -1580,16 +1573,15 @@ body.is-dragging-embedded-tab * {
     box-shadow var(--motion-fast) ease;
 }
 
-:where(.input, .textarea, .file-input, .custom-select-button):hover:not(:disabled) {
+:where(.input, .textarea, .file-input):not([data-slot], [data-slot] *):hover:not(:disabled) {
   border-color: var(--border-strong);
 }
 
-:where(.input, .textarea, .file-input):focus,
+:where(.input, .textarea, .file-input):not([data-slot], [data-slot] *):focus,
 .custom-select-button:focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 68%, var(--border));
-  box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent),
-    inset 0 1px 0 color-mix(in srgb, #ffffff 28%, transparent);
+  background: var(--field-focus, var(--field-background, var(--default)));
+  border-color: var(--field-border-focus, var(--field-border, var(--border)));
+  box-shadow: var(--field-shadow), 0 0 0 2px var(--focus);
 }
 
 :where(.ui-modal-header, .ui-modal-footer) {
@@ -1605,7 +1597,7 @@ body.is-dragging-embedded-tab * {
 @media (hover: hover) {
 
   :where(.browser-chat-nav-item, .browser-chat-subnav button, .browser-chat-recent-item):hover {
-    background: var(--surface-hover);
+    background: var(--app-surface-hover);
   }
 }
 
@@ -1671,7 +1663,7 @@ body.is-dragging-embedded-tab * {
   .browser-chat-subnav button.active,
   .browser-chat-subnav button.active:hover
 ) {
-  background: var(--surface-active);
+  background: var(--app-surface-active);
   box-shadow: none;
   color: var(--foreground);
 }
@@ -1824,7 +1816,7 @@ body.is-dragging-embedded-tab * {
   animation: ui-icon-settle var(--motion-slow) var(--ease-emphasized) both;
 }
 
-:where(input[type="checkbox"], input[type="radio"]):checked {
+:where(input[type="checkbox"], input[type="radio"]):not([data-slot], [data-slot] *):checked {
   animation: ui-check-in var(--motion-normal) var(--ease-spring) both;
 }
 

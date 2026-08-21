@@ -194,7 +194,7 @@ export async function openAccessibilitySnapshotTestBrowser(appOrigin?: string): 
 
   state.startPromise = (async () => {
     await state.session?.close().catch(() => undefined);
-    const session = new BrowserSession('dom', {
+    const session = new BrowserSession({
       headless: false,
       isolated: true,
       runId: 'dom-observation-test',

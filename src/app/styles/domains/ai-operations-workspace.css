@@ -157,7 +157,7 @@
 
 .ai-operations-range button:hover,
 .ai-operations-refresh:hover {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
   color: var(--foreground);
 }
 
@@ -546,7 +546,7 @@
 }
 
 .ai-operations-data-table tbody tr:hover td {
-  background: var(--surface-hover);
+  background: var(--app-surface-hover);
 }
 
 .ai-operations-data-table td:first-child {

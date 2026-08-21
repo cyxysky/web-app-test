@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserSessionMode, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserTabSnapshot } from '@/server/browser/browser-session';
 import type {
   BrowserCodeAttachmentBinding,
   BrowserCodeCredentialBinding,
@@ -223,7 +223,6 @@ export type BrowserChatSessionSnapshot = {
   browserGroupId: string;
   targetUrl: string;
   noVncUrl?: string;
-  mode: BrowserSessionMode;
   safetyMode: BrowserChatSafetyMode;
   modelProvider: ModelProvider;
   model: string;
@@ -1847,7 +1846,6 @@ function sessionSnapshotHeader(
   session: BrowserChatSessionRecord,
 ): Omit<BrowserChatSessionSnapshot, 'logs' | 'messages' | 'steps'> {
   finalizeIdleRunningAssistantMessages(session);
-  if (!session.busy && session.status !== 'running') session.mode = configuredBrowserChatMode();
   const firstUserMessage = session.messages.find((message) => message.role === 'user');
   const titleFileName = session.titleFileName
     || browserChatSessionTitleParts(session.title, firstUserMessage?.attachments).fileName;
@@ -1859,7 +1857,6 @@ function sessionSnapshotHeader(
     browserGroupId: session.browserGroupId,
     targetUrl: session.targetUrl,
     noVncUrl: browserChatNoVncUrl(session),
-    mode: session.mode,
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
     model: browserChatModelSettings(session.modelProvider, session.model).model,
@@ -2188,7 +2185,6 @@ function recordFromSnapshot(
   return {
     ...session,
     userId: normalizeUserId(session.userId),
-    mode: configuredBrowserChatMode(),
     tabs: session.tabs || [],
     targetUrl: exportableTargetUrl(session.targetUrl),
     safetyMode: normalizeSafetyMode(session.safetyMode),
@@ -2836,7 +2832,7 @@ async function ensureStarted(
 
 function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExistingPage = false) {
   const browserProfileKey = browserChatBrowserProfileKey(session);
-  return new BrowserSession(session.mode, {
+  return new BrowserSession({
     browserSurface: 'electron-embedded',
     browserProfileKey,
     ...(process.env.ELECTRON_EMBEDDED_BROWSER === 'true' ? {} : { sharedBrowserRuntimeKey: browserProfileKey }),
@@ -2845,10 +2841,6 @@ function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExist
     preferExistingPage,
     runId: session.id,
   });
-}
-
-function configuredBrowserChatMode(): BrowserSessionMode {
-  return process.env.AI_BROWSER_MODE?.trim().toLowerCase() === 'dom' ? 'dom' : 'code';
 }
 
 function restoreBrowserSessionPrototype(browser?: BrowserSession) {
@@ -2987,7 +2979,6 @@ export function createBrowserChatSession(input: {
     userId: normalizeUserId(input.userId),
     browserGroupId: '',
     targetUrl: exportableTargetUrl(input.targetUrl || ''),
-    mode: configuredBrowserChatMode(),
     safetyMode: normalizeSafetyMode(input.safetyMode),
     modelProvider: modelSettings.provider,
     model: modelSettings.model,
@@ -3461,7 +3452,6 @@ export async function generateBrowserChatMessagesSkill(
     : undefined;
   const titleSeed = firstPreviousUser?.content || firstSelected?.message.content || session.title || '浏览器对话 Skill';
   const generated = await generateSkillFromBrowserHistory({
-    browserMode: session.mode,
     consoleErrors: session.consoleErrors,
     constraints: `Skill 总结方向（必须优先遵循）：${compactText(summaryDirection, 2_000)}`,
     goal: turnDescriptions.join('\n\n') || titleSeed,
@@ -3520,7 +3510,6 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
   if (!queued || userMessageIndex < 0) return false;
 
   store.applyRuntimeEnv();
-  session.mode = configuredBrowserChatMode();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   transitionBrowserChatSession(session, { type: 'confirmationCleared' });
@@ -3669,10 +3658,7 @@ export async function sendBrowserChatMessage(
     });
     return clientSnapshot(session);
   }
-  // Operation mode is shared application configuration. A conversation or
-  // mounted user must never preserve or override an older mode value.
   store.applyRuntimeEnv();
-  session.mode = configuredBrowserChatMode();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   transitionBrowserChatSession(session, { type: 'confirmationCleared' });
@@ -4618,7 +4604,7 @@ async function executeBrowserChatSubagentBatch(input: {
     });
     persistAndNotify(session.id);
     const browserProfileKey = browserChatBrowserProfileKey(session);
-    const child = new BrowserSession(session.mode, {
+    const child = new BrowserSession({
       browserSurface: 'external',
       headless: true,
       browserProfileKey,
@@ -4669,9 +4655,7 @@ async function executeBrowserChatSubagentBatch(input: {
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
             : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
           '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          session.mode === 'code'
-            ? '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。'
-            : '浏览器检查与操作使用 inspect 获取当前结构化页面状态，再使用 browser/interact 完成动作；只操作 inspect 返回的可见、可交互节点。',
+          '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
           summaryGuidanceChars
@@ -4682,7 +4666,6 @@ async function executeBrowserChatSubagentBatch(input: {
         operationalContext: initialRuntimeContext.operationalContext,
         conversation: [],
         completedSteps: [],
-        mode: session.mode,
         safetyMode: session.safetyMode,
         useToolLoopAgent: true,
         credentialBindings: initialRuntimeContext.credentialBindings,
@@ -4891,7 +4874,6 @@ async function resumeBlockedBrowserChatSubagent(input: {
       operationalContext: initialRuntimeContext.operationalContext,
       conversation: [],
       completedSteps: binding.steps,
-      mode: session.mode,
       safetyMode: session.safetyMode,
       useToolLoopAgent: true,
       credentialBindings: initialRuntimeContext.credentialBindings,
@@ -5101,7 +5083,6 @@ async function runBrowserChatMessage(
         operationalContext: initialRuntimeContext.operationalContext,
         conversation: session.modelContext.activeMessages,
         completedSteps: session.steps,
-        mode: session.mode,
         safetyMode: session.safetyMode,
         memoryTools: createPersonalMemoryTools({
           userId: session.userId,

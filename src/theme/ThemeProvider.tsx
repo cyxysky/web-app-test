@@ -121,6 +121,7 @@ function deriveThemeColor(color: string, mode: ThemeMode): ThemeColor {
 function applyThemeMode(mode: ThemeMode) {
   const root = document.documentElement;
   root.dataset.theme = mode;
+  root.classList.toggle('dark', mode === 'dark');
   root.style.setProperty('color-scheme', mode);
 }
 
@@ -181,6 +182,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setMode = useCallback((nextMode: ThemeMode) => {
     const normalized = normalizeThemeMode(nextMode);
+    applyThemeMode(normalized);
     setModeState(normalized);
     window.localStorage.setItem(MODE_STORAGE_KEY, normalized);
   }, []);
@@ -188,6 +190,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const toggleMode = useCallback(() => {
     setModeState((current) => {
       const nextMode = current === 'dark' ? 'light' : 'dark';
+      applyThemeMode(nextMode);
       window.localStorage.setItem(MODE_STORAGE_KEY, nextMode);
       return nextMode;
     });

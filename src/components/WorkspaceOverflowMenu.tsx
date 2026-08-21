@@ -1,7 +1,7 @@
 'use client';
 
-import { useCallback, useId, useRef, useState, type ReactNode } from 'react';
-import { FloatingLayer } from '@/components/FloatingLayer';
+import { Button, Popover } from '@heroui/react';
+import { useId, useState, type ReactNode } from 'react';
 
 type WorkspaceOverflowMenuProps = {
   children: ReactNode;
@@ -19,30 +19,37 @@ export function WorkspaceOverflowMenu({
   title,
 }: WorkspaceOverflowMenuProps) {
   const menuId = useId();
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const triggerRef = useRef<HTMLElement | null>(null);
   const [open, setOpen] = useState(false);
-  const close = useCallback(() => detailsRef.current?.removeAttribute('open'), []);
 
   return (
-    <details
+    <div
       className={className ? `browser-chat-overflow ${className}` : 'browser-chat-overflow'}
-      onToggle={(event) => setOpen(event.currentTarget.open)}
-      ref={detailsRef}
+      data-open={open || undefined}
     >
-      <summary aria-controls={menuId} aria-expanded={open} aria-label={label} ref={triggerRef} title={title}>
-        {icon}
-      </summary>
-      <FloatingLayer
-        anchorRef={triggerRef}
-        className="browser-chat-overflow-menu"
-        id={menuId}
-        maxHeight={320}
-        onDismiss={close}
-        present={open}
-      >
-        {children}
-      </FloatingLayer>
-    </details>
+      <Popover isOpen={open} onOpenChange={setOpen}>
+        <Button
+          aria-controls={menuId}
+          aria-description={title}
+          aria-expanded={open}
+          aria-label={label}
+          className="browser-chat-overflow-trigger"
+          variant="ghost"
+        >
+          {icon}
+        </Button>
+        <Popover.Content containerPadding={8} offset={6} placement="bottom end">
+          <Popover.Dialog
+            aria-label={label}
+            className="browser-chat-popover-actions"
+            id={menuId}
+            onClickCapture={(event) => {
+              if (event.target instanceof Element && event.target.closest('button')) setOpen(false);
+            }}
+          >
+            {children}
+          </Popover.Dialog>
+        </Popover.Content>
+      </Popover>
+    </div>
   );
 }

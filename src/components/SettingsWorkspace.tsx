@@ -1,7 +1,6 @@
 'use client';
 
-import { createPortal } from 'react-dom';
-import { useCallback, useEffect, useLayoutEffect, useState, type FormEvent } from 'react';
+import { useCallback, useLayoutEffect, useState, type FormEvent } from 'react';
 import {
   Bot,
   Brain,
@@ -26,7 +25,6 @@ import {
 } from '@/components/environment-settings-model';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import type { SettingsTab } from '@/config/settings';
-import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import {
@@ -35,6 +33,8 @@ import {
 } from '@/lib/sidebar-collapse';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
+import { AppInput } from '@/components/ui/app-input';
+import { AppModal } from '@/components/ui/app-modal';
 
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'model') return <Bot size={15} />;
@@ -59,7 +59,7 @@ export function SettingsWorkspace({
   initialSidebarCollapsed?: boolean;
 }) {
   const { t } = useI18n();
-  const { mode: themeMode, toggleMode } = useTheme();
+  const { mode: themeMode, setMode } = useTheme();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [activeTab, setActiveTab] = useState<SettingsTab>('general');
   const [adminSettingsAccessToken, setAdminSettingsAccessToken] = useState('');
@@ -67,7 +67,6 @@ export function SettingsWorkspace({
   const [adminSettingsPassword, setAdminSettingsPassword] = useState('');
   const [adminSettingsPasswordError, setAdminSettingsPasswordError] = useState('');
   const [adminSettingsPasswordSubmitting, setAdminSettingsPasswordSubmitting] = useState(false);
-  const [portalReady, setPortalReady] = useState(false);
   const visibleSettingsTabs = environmentSettingsTabsForUser(defaultUserId, defaultUserId);
   const selectedTab = visibleSettingsTabs.some((tab) => tab.id === activeTab) ? activeTab : 'general';
   const adminSettingsLocked = adminSettingsPasswordRequired && !adminSettingsAccessToken;
@@ -86,16 +85,12 @@ export function SettingsWorkspace({
     writeSidebarCollapsedPreference(stored);
   }, [initialSidebarCollapsed]);
 
-  useEffect(() => setPortalReady(true), []);
-
   function closeAdminSettingsPasswordDialog() {
     if (adminSettingsPasswordSubmitting) return;
     setPendingAdminSettingsTab(null);
     setAdminSettingsPassword('');
     setAdminSettingsPasswordError('');
   }
-
-  useEscapeDismiss(Boolean(pendingAdminSettingsTab), closeAdminSettingsPasswordDialog);
 
   function selectSettingsTab(tab: SettingsTab) {
     if (!visibleSettingsTabs.some((item) => item.id === tab)) return;
@@ -139,7 +134,7 @@ export function SettingsWorkspace({
         collapsed={sidebarCollapsed}
         collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
-        onToggleTheme={toggleMode}
+        onThemeChange={setMode}
         themeMode={themeMode}
         themeToggleLabel={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
         themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
@@ -192,16 +187,15 @@ export function SettingsWorkspace({
         </div>
       </main>
 
-      {portalReady && pendingAdminSettingsTab ? createPortal((
-        <div className="ui-modal-overlay" onMouseDown={closeAdminSettingsPasswordDialog}>
-          <form
-            aria-labelledby="admin-settings-password-title"
-            aria-modal="true"
-            className="ui-modal ui-modal--compact admin-settings-password-dialog"
-            onMouseDown={(event) => event.stopPropagation()}
-            onSubmit={(event) => void submitAdminSettingsPassword(event)}
-            role="dialog"
-          >
+      {pendingAdminSettingsTab ? (
+        <AppModal
+          ariaLabelledBy="admin-settings-password-title"
+          dismissable={!adminSettingsPasswordSubmitting}
+          keyboardDismissable={!adminSettingsPasswordSubmitting}
+          onClose={closeAdminSettingsPasswordDialog}
+          size="sm"
+        >
+          <form className="webpilot-modal-form" onSubmit={(event) => void submitAdminSettingsPassword(event)}>
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
                 <h2 className="ui-modal-title" id="admin-settings-password-title">{t('管理员设置验证')}</h2>
@@ -220,19 +214,16 @@ export function SettingsWorkspace({
             <div className="ui-modal-body admin-settings-password-form">
               <label>
                 <span>{t('管理员密码')}</span>
-                <div className="admin-settings-password-input">
-                  <KeyRound aria-hidden="true" size={16} />
-                  <input
-                    autoComplete="current-password"
-                    autoFocus
-                    className="input"
-                    disabled={adminSettingsPasswordSubmitting}
-                    maxLength={1_024}
-                    onChange={(event) => setAdminSettingsPassword(event.target.value)}
-                    type="password"
-                    value={adminSettingsPassword}
-                  />
-                </div>
+                <AppInput
+                  autoComplete="current-password"
+                  autoFocus
+                  disabled={adminSettingsPasswordSubmitting}
+                  maxLength={1_024}
+                  onChange={(event) => setAdminSettingsPassword(event.target.value)}
+                  prefix={<KeyRound aria-hidden="true" size={16} />}
+                  type="password"
+                  value={adminSettingsPassword}
+                />
               </label>
               {adminSettingsPasswordError ? <div className="error" role="alert">{adminSettingsPasswordError}</div> : null}
             </div>
@@ -246,8 +237,8 @@ export function SettingsWorkspace({
               </button>
             </footer>
           </form>
-        </div>
-      ), document.body) : null}
+        </AppModal>
+      ) : null}
     </section>
   );
 }

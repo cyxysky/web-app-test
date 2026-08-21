@@ -119,7 +119,6 @@ function serializedMessageDelta(modelMessages: unknown) {
 
 export function buildRuntimeContinuationSummaryPrompt(input: {
   agentStep: number;
-  browserMode: string;
   deltaModelMessages: unknown;
   estimatedTokens: number;
   goal: string;
@@ -146,7 +145,6 @@ export function buildRuntimeContinuationSummaryPrompt(input: {
     `Goal: ${input.goal}`,
     `Executor step: ${input.stepIndex}`,
     `Agent step before compression: ${input.agentStep}`,
-    `Browser mode: ${input.browserMode}`,
     `Estimated model-context tokens: ${input.estimatedTokens}/${input.thresholdTokens}`,
     '',
     `Previous continuation summary JSON:\n${input.previousSummary || '[none]'}`,
@@ -159,7 +157,6 @@ export function buildRuntimeContinuationSummaryPrompt(input: {
 
 export function fallbackRuntimeContinuationSummary(input: {
   agentStep: number;
-  browserMode: string;
   goal: string;
   previousSummary?: string;
   recentToolAttempts: string;
@@ -168,7 +165,6 @@ export function fallbackRuntimeContinuationSummary(input: {
 }) {
   return JSON.stringify({
     goal: input.goal,
-    browserMode: input.browserMode,
     executorStep: input.stepIndex,
     agentStepBeforeCompression: input.agentStep,
     previousContinuationSummary: sanitizeRuntimeContinuationSummary(input.previousSummary || '') || undefined,

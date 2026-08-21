@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
 
     const session = reuse && debugState.session
       ? debugState.session
-      : new BrowserSession('dom', {
+      : new BrowserSession({
           isMarked: true,
           runId,
           debugDevtools: true,
