@@ -1553,6 +1553,19 @@ function sanitizeModelLogValue(
 ): unknown {
   if (value === null || value === undefined) return value;
   if (typeof value !== 'object') return value;
+  if (value instanceof Error) {
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    return {
+      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [
+        key,
+        sanitizeModelLogValue(item, imagePaths, state, seen),
+      ])),
+      name: value.name,
+      message: value.message,
+      cause: sanitizeModelLogValue(value.cause, imagePaths, state, seen),
+    };
+  }
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
     const imagePath = imagePaths[state.imageIndex++];
     return binaryLogDescriptor(value, imagePath);

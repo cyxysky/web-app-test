@@ -522,6 +522,67 @@ function browserChatMemoryDiagnostics() {
   };
 }
 
+export type BrowserChatRuntimeBrowser = {
+  id: string;
+  kind: 'session' | 'subagent';
+  sessionId: string;
+  userId: string;
+  title: string;
+  status: string;
+  busy: boolean;
+  tabCount: number;
+  currentUrl: string;
+  updatedAt: string;
+};
+
+export function readBrowserChatRuntimeStatus() {
+  const browsers: BrowserChatRuntimeBrowser[] = [];
+  for (const session of sessions.values()) {
+    const browser = restoreBrowserSessionPrototype(session.browser);
+    if (!browser?.isUsable()) continue;
+    browsers.push({
+      id: `session:${session.id}`,
+      kind: 'session',
+      sessionId: session.id,
+      userId: session.userId || '',
+      title: session.title || session.id,
+      status: session.status,
+      busy: session.busy || activeTurns.has(session.id),
+      tabCount: browser.getTabsSnapshot().length,
+      currentUrl: browser.currentUrl(),
+      updatedAt: session.updatedAt,
+    });
+  }
+  for (const binding of blockedSubagents.values()) {
+    const session = sessions.get(binding.sessionId);
+    const browser = restoreBrowserSessionPrototype(binding.browser);
+    if (!browser?.isUsable()) continue;
+    browsers.push({
+      id: `subagent:${binding.id}`,
+      kind: 'subagent',
+      sessionId: binding.sessionId,
+      userId: session?.userId || '',
+      title: binding.title,
+      status: 'blocked',
+      busy: false,
+      tabCount: browser.getTabsSnapshot().length,
+      currentUrl: browser.currentUrl(),
+      updatedAt: session?.updatedAt || now(),
+    });
+  }
+  return {
+    diagnostics: browserChatMemoryDiagnostics(),
+    activeConversations: new Set([
+      ...activeTurns.keys(),
+      ...[...sessions.values()]
+        .filter((session) => session.busy || session.queuedTurns.length > 0)
+        .map((session) => session.id),
+    ]).size,
+    browserCount: browsers.length,
+    browsers: browsers.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)),
+  };
+}
+
 const memoryDiagnosticProviders = ((globalThis as typeof globalThis & {
   __webpilotMemoryDiagnosticProviders?: Map<string, () => unknown>;
 }).__webpilotMemoryDiagnosticProviders ??= new Map());
@@ -3168,6 +3229,41 @@ export async function closeBrowserChatSession(sessionId: string, userId?: string
   session.updatedAt = session.closedAt;
   persistAndNotify(session.id);
   return clientSnapshot(session);
+}
+
+export async function closeBrowserChatRuntimeBrowser(browserId: string) {
+  const separator = browserId.indexOf(':');
+  const kind = separator > 0 ? browserId.slice(0, separator) : '';
+  const id = separator > 0 ? browserId.slice(separator + 1) : '';
+  if (!id) return false;
+
+  if (kind === 'subagent') {
+    const binding = blockedSubagents.get(id);
+    if (!binding) return false;
+    blockedSubagents.delete(id);
+    await binding.browser.close({ closePages: true, force: true }).catch(() => undefined);
+    updateBrowserChatStoredSubagent(binding.sessionId, id, {
+      status: 'failed',
+      error: '测试浏览器已由管理员手动关闭。',
+    });
+    return true;
+  }
+
+  if (kind !== 'session') return false;
+  const session = sessions.get(id);
+  if (!session?.browser) return false;
+  if (browserChatSessionHasActiveRuntimeWork(session)) {
+    await stopBrowserChatRuntime(session, new Error('Test browser closed by administrator.'), { forceBrowser: true });
+    transitionBrowserChatSession(session, { type: 'sessionRecovered', at: now() });
+  } else {
+    const browser = restoreBrowserSessionPrototype(session.browser);
+    session.browser = undefined;
+    session.started = false;
+    if (browser) await browser.close({ closePages: true, force: true }).catch(() => undefined);
+  }
+  session.updatedAt = now();
+  persistAndNotify(session.id);
+  return true;
 }
 
 export async function deleteBrowserChatSession(sessionId: string, userId?: string | number) {

@@ -5,6 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 const {
+  applyTrustedIdentityHeaders,
   applicationBasePath,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
@@ -18,6 +19,38 @@ const {
 } = require('./webpilot-server');
 
 const ticket = 'a'.repeat(43);
+
+test('replaces identity headers in both normalized and raw request views', () => {
+  const request = {
+    headers: {
+      host: 'localhost:3000',
+      'x-webpilot-identity-user-id': 'spoofed',
+      'x-webpilot-identity-proof': 'spoofed-proof',
+    },
+    rawHeaders: [
+      'Host', 'localhost:3000',
+      'X-WebPilot-Identity-User-Id', 'spoofed',
+      'X-WebPilot-Identity-Proof', 'spoofed-proof',
+    ],
+  };
+
+  applyTrustedIdentityHeaders(request, {
+    userId: '1',
+    username: 'admin',
+    roles: ['user'],
+  }, 'trusted-proof');
+
+  assert.equal(request.headers['x-webpilot-identity-user-id'], '1');
+  assert.equal(request.headers['x-webpilot-identity-username'], 'admin');
+  assert.equal(request.headers['x-webpilot-identity-proof'], 'trusted-proof');
+  assert.deepEqual(request.rawHeaders, [
+    'Host', 'localhost:3000',
+    'x-webpilot-identity-user-id', '1',
+    'x-webpilot-identity-username', 'admin',
+    'x-webpilot-identity-roles', 'user',
+    'x-webpilot-identity-proof', 'trusted-proof',
+  ]);
+});
 
 test('isolates API routes in the runtime process while keeping shutdown in the UI host', () => {
   assert.equal(runtimeApiRequest('/api/browser-chat/chat-1/message'), true);

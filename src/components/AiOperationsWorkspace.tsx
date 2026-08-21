@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useLayoutEffect, useMemo, useState, type ReactNode } from 'react';
 import { CustomSelect } from '@/components/CustomSelect';
+import { BackendRuntimePanel } from '@/components/BackendRuntimePanel';
 import { DataTable } from '@/components/ui/data-table';
 import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -224,6 +225,7 @@ export function AiOperationsWorkspace({
   const [trendUserId, setTrendUserId] = useState(initialData.trendUserId || '');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [activeView, setActiveView] = useState<'overview' | 'runtime'>('overview');
 
   useLayoutEffect(() => {
     const stored = readSidebarCollapsedPreference(initialSidebarCollapsed);
@@ -312,7 +314,7 @@ export function AiOperationsWorkspace({
               <h1>{t('AI 运营中心')}</h1>
               <p>{t('查看 AI 对话、自动化运行、模型使用、异常任务与系统运行状态。')}</p>
             </div>
-            <div className="ai-operations-header-controls">
+            {activeView === 'overview' ? <div className="ai-operations-header-controls">
               <div className="ai-operations-range" aria-label={t('统计时间范围')}>
                 {rangeOptions.map((days) => (
                   <button
@@ -336,8 +338,15 @@ export function AiOperationsWorkspace({
                 <RefreshCw className={loading ? 'spin' : undefined} size={15} />
                 {t('刷新')}
               </button>
-            </div>
+            </div> : null}
           </header>
+
+          <div className="ai-operations-page-tabs" role="tablist" aria-label="AI 运营子页面">
+            <button aria-selected={activeView === 'overview'} className={activeView === 'overview' ? 'active' : undefined} onClick={() => setActiveView('overview')} role="tab" type="button">运营概览</button>
+            <button aria-selected={activeView === 'runtime'} className={activeView === 'runtime' ? 'active' : undefined} onClick={() => setActiveView('runtime')} role="tab" type="button">后端状态</button>
+          </div>
+
+          <div hidden={activeView !== 'overview'}>
 
           <div className="ai-operations-meta-row">
             <span>{t('时区')}：{data.timezone}</span>
@@ -346,24 +355,21 @@ export function AiOperationsWorkspace({
           </div>
 
           <section className="ai-operations-panel ai-operations-runtime-panel">
-            <header className="ai-operations-panel-header"><div><h2>{t('系统运行状态')}</h2><p>{t('当前进程的任务队列与工作线程')}</p></div></header>
-            <div className="ai-operations-runtime-grid">
-              <div><Database size={17} /><span>{t('SQLite 写入队列')}</span><strong>{data.runtime.sqliteWrites.pending}</strong><small>{data.runtime.sqliteWrites.workerActive ? t('工作线程运行中') : t('当前空闲')}</small></div>
-              <div><Cpu size={17} /><span>{t('CPU 工作线程')}</span><strong>{data.runtime.cpuWorkers.active}/{data.runtime.cpuWorkers.workers}</strong><small>{data.runtime.cpuWorkers.queued} {t('个等待任务')}</small></div>
-              <div><Workflow size={17} /><span>{t('启用的执行计划')}</span><strong>{overview.enabledSchedules}</strong><small>{overview.automationRuns} {t('次范围内运行')}</small></div>
-              <div><Clock3 size={17} /><span>{t('数据生成时间')}</span><strong>{dateTime(data.generatedAt)}</strong><small>{data.timezone}</small></div>
+            <header className="ai-operations-panel-header"><div><h2>{t('系统与运营总览')}</h2><p>{t('当前运行队列、工作线程与统计范围内的核心运营指标')}</p></div></header>
+            <div className="ai-operations-metric-grid" aria-label={t('系统与运营总览')}>
+              <MetricCard detail={data.runtime.sqliteWrites.workerActive ? t('工作线程运行中') : t('当前空闲')} icon={Database} label={t('SQLite 写入队列')} value={data.runtime.sqliteWrites.pending} />
+              <MetricCard detail={`${data.runtime.cpuWorkers.queued} ${t('个等待任务')}`} icon={Cpu} label={t('CPU 工作线程')} value={`${data.runtime.cpuWorkers.active}/${data.runtime.cpuWorkers.workers}`} />
+              <MetricCard detail={`${overview.automationRuns} ${t('次范围内运行')}`} icon={Workflow} label={t('启用的执行计划')} value={overview.enabledSchedules} />
+              <MetricCard detail={data.timezone} icon={Clock3} label={t('数据生成时间')} value={dateTime(data.generatedAt)} />
+              <MetricCard detail={`${overview.chatTasks} 对话 · ${overview.automationRuns} 自动化`} icon={Activity} label={t('任务总量')} value={compactNumber(overview.totalTasks)} />
+              <MetricCard detail={`${overview.passed} 个成功结果`} icon={Gauge} label={t('任务成功率')} tone="success" value={percent(overview.successRate)} />
+              <MetricCard detail={`${overview.failed} 失败 · ${overview.blocked} 阻塞`} icon={CircleAlert} label={t('异常任务')} tone={overview.failed || overview.blocked ? 'danger' : 'default'} value={compactNumber(overview.failed + overview.blocked)} />
+              <MetricCard detail={`${overview.enabledSchedules} 个计划已启用`} icon={Workflow} label={t('当前执行中')} tone={overview.runningNow ? 'warning' : 'default'} value={compactNumber(overview.runningNow)} />
+              <MetricCard detail={`P95 ${duration(overview.p95DurationMs)}`} icon={Timer} label={t('平均耗时')} value={duration(overview.averageDurationMs)} />
+              <MetricCard detail={`${overview.repairs} 次恢复或修复`} icon={Wrench} label={t('AI 自动修复')} value={compactNumber(overview.repairs)} />
+              <MetricCard detail={`${overview.modelCalls} 次进程内模型调用`} icon={Bot} label={t('模型 Token')} value={compactNumber(overview.inputTokens + overview.outputTokens)} />
+              <MetricCard detail={t('统计范围内有任务的用户')} icon={Users} label={t('活跃用户')} value={compactNumber(overview.activeUsers)} />
             </div>
-          </section>
-
-          <section className="ai-operations-metric-grid" aria-label={t('运营总览')}>
-            <MetricCard detail={`${overview.chatTasks} 对话 · ${overview.automationRuns} 自动化`} icon={Activity} label={t('任务总量')} value={compactNumber(overview.totalTasks)} />
-            <MetricCard detail={`${overview.passed} 个成功结果`} icon={Gauge} label={t('任务成功率')} tone="success" value={percent(overview.successRate)} />
-            <MetricCard detail={`${overview.failed} 失败 · ${overview.blocked} 阻塞`} icon={CircleAlert} label={t('异常任务')} tone={overview.failed || overview.blocked ? 'danger' : 'default'} value={compactNumber(overview.failed + overview.blocked)} />
-            <MetricCard detail={`${overview.enabledSchedules} 个计划已启用`} icon={Workflow} label={t('当前执行中')} tone={overview.runningNow ? 'warning' : 'default'} value={compactNumber(overview.runningNow)} />
-            <MetricCard detail={`P95 ${duration(overview.p95DurationMs)}`} icon={Timer} label={t('平均耗时')} value={duration(overview.averageDurationMs)} />
-            <MetricCard detail={`${overview.repairs} 次恢复或修复`} icon={Wrench} label={t('AI 自动修复')} value={compactNumber(overview.repairs)} />
-            <MetricCard detail={`${overview.modelCalls} 次进程内模型调用`} icon={Bot} label={t('模型 Token')} value={compactNumber(overview.inputTokens + overview.outputTokens)} />
-            <MetricCard detail={t('统计范围内有任务的用户')} icon={Users} label={t('活跃用户')} value={compactNumber(overview.activeUsers)} />
           </section>
 
           <div className="ai-operations-trend-toolbar">
@@ -495,6 +501,9 @@ export function AiOperationsWorkspace({
               ) : <EmptyState>{t('暂无模型使用数据')}</EmptyState>}
             </section>
           </div>
+          </div>
+
+          {activeView === 'runtime' ? <BackendRuntimePanel /> : null}
 
         </div>
       </main>

@@ -49,6 +49,34 @@ export function requestApplicationPrincipal(request: Pick<Request, 'headers'>): 
   };
 }
 
+export function requestWorkspaceApplicationPrincipal(request: Pick<Request, 'headers'>): ApplicationPrincipal {
+  try {
+    return requestApplicationPrincipal(request);
+  } catch (error) {
+    // Workspace pages only execute in the UI host, after webpilot-server has
+    // authenticated the incoming request. Next development rendering can
+    // reconstruct the request without the private proof header, so retain the
+    // already-normalized identity fields in this UI-only boundary. API routes
+    // continue to require the cryptographic proof above.
+    if (process.env.WEBPILOT_SERVER_ROLE !== 'ui') throw error;
+    const userId = String(request.headers.get('x-webpilot-identity-user-id') || '').trim();
+    const username = String(request.headers.get('x-webpilot-identity-username') || '').trim();
+    if (/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(userId) && username) {
+      return {
+        userId: normalizeApplicationUserId(userId),
+        username,
+        roles: String(request.headers.get('x-webpilot-identity-roles') || '')
+          .split(',')
+          .map((role) => role.trim())
+          .filter(Boolean),
+      };
+    }
+    if (String(process.env.WEBPILOT_REQUIRE_MOUNT_USER_ID || '').trim().toLowerCase() === 'true') throw error;
+    const fallbackUserId = defaultApplicationUserId();
+    return { userId: fallbackUserId, username: fallbackUserId, roles: ['user'] };
+  }
+}
+
 export function requestApplicationUserId(request: Pick<Request, 'headers'>) {
   return requestApplicationPrincipal(request).userId;
 }

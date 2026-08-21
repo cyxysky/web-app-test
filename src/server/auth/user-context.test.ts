@@ -6,6 +6,7 @@ import {
   DEFAULT_APPLICATION_USER_ID,
   normalizeApplicationUserId,
   requestApplicationUserId,
+  requestWorkspaceApplicationPrincipal,
 } from './user-context';
 
 test('missing application user ids normalize to user 1', () => {
@@ -66,6 +67,43 @@ test('spoofed identity headers without the custom-server proof are rejected', ()
   } finally {
     if (previousSecret === undefined) delete process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
     else process.env.WEBPILOT_IDENTITY_HEADER_SECRET = previousSecret;
+  }
+});
+
+test('workspace rendering retains the UI-host identity when Next omits the private proof header', () => {
+  const previousRole = process.env.WEBPILOT_SERVER_ROLE;
+  const previousRequireMounted = process.env.WEBPILOT_REQUIRE_MOUNT_USER_ID;
+  process.env.WEBPILOT_SERVER_ROLE = 'ui';
+  delete process.env.WEBPILOT_REQUIRE_MOUNT_USER_ID;
+  try {
+    const principal = requestWorkspaceApplicationPrincipal(new Request('http://localhost/browser-chat', {
+      headers: {
+        'x-webpilot-identity-user-id': '1',
+        'x-webpilot-identity-username': '1',
+        'x-webpilot-identity-roles': 'user',
+      },
+    }));
+    assert.equal(principal.userId, '1');
+    assert.deepEqual(principal.roles, ['user']);
+  } finally {
+    if (previousRole === undefined) delete process.env.WEBPILOT_SERVER_ROLE;
+    else process.env.WEBPILOT_SERVER_ROLE = previousRole;
+    if (previousRequireMounted === undefined) delete process.env.WEBPILOT_REQUIRE_MOUNT_USER_ID;
+    else process.env.WEBPILOT_REQUIRE_MOUNT_USER_ID = previousRequireMounted;
+  }
+});
+
+test('workspace identity fallback stays unavailable outside the UI host', () => {
+  const previousRole = process.env.WEBPILOT_SERVER_ROLE;
+  process.env.WEBPILOT_SERVER_ROLE = 'runtime';
+  try {
+    assert.throws(
+      () => requestWorkspaceApplicationPrincipal(new Request('http://localhost/browser-chat')),
+      /Authentication required/,
+    );
+  } finally {
+    if (previousRole === undefined) delete process.env.WEBPILOT_SERVER_ROLE;
+    else process.env.WEBPILOT_SERVER_ROLE = previousRole;
   }
 });
 

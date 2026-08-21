@@ -67,7 +67,7 @@ test('matches persisted tool traces only by exact call ID', () => {
   assert.equal(details.get('cycle-2:0')?.tool.id, 'read-2');
 });
 
-test('shows unmatched provider calls without pairing them to unrelated persisted traces', () => {
+test('pairs legacy traces by step, tool name, and normalized input when provider call IDs changed', () => {
   const toolCycle = (id: string, sourceCycleId: string, fileName: string) => ({
     id,
     sourceCycleId,
@@ -97,9 +97,9 @@ test('shows unmatched provider calls without pairing them to unrelated persisted
     toolCycle('provider-call-5', 'provider-cycle-3', '陈劲帆.docx'),
   ], steps);
 
-  assert.equal(details.get('provider-call-1:0')?.tool.id, 'provider-call-1');
-  assert.equal(details.get('provider-call-ignored-2:0')?.tool.id, 'provider-call-ignored-2');
-  assert.equal(details.get('provider-call-ignored-3:0')?.tool.ok, false);
+  assert.equal(details.get('provider-call-1:0')?.tool.id, 'legacy-trace-1');
+  assert.equal(details.get('provider-call-ignored-2:0')?.tool.id, 'legacy-trace-2');
+  assert.equal(details.get('provider-call-ignored-3:0')?.tool.id, 'legacy-trace-3');
   assert.equal(details.get('provider-call-4:0')?.tool.id, 'provider-call-4');
   assert.equal(details.get('provider-call-5:0')?.step.status, 'failed');
 });
@@ -170,12 +170,23 @@ test('renders invalid tool calls even when argument parsing prevented execution'
       input: '{"code":',
       dynamic: true,
       invalid: true,
-      error: { message: 'Invalid tool input: JSON parsing failed' },
+      error: {
+        message: 'Invalid input for tool browserCode',
+        cause: {
+          message: 'Schema validation failed',
+          cause: {
+            issues: [{ path: ['code'], message: 'expected string, received undefined' }],
+          },
+        },
+      },
     }],
   });
 
   assert.equal(output.tools[0]?.invalid, true);
-  assert.equal(output.tools[0]?.error, 'Invalid tool input: JSON parsing failed');
+  assert.equal(
+    output.tools[0]?.error,
+    'Invalid input for tool browserCode；Schema validation failed；参数 code: expected string, received undefined',
+  );
 
   const details = buildAiCycleToolDetailMap([{
     id: 'invalid-cycle',
@@ -188,5 +199,5 @@ test('renders invalid tool calls even when argument parsing prevented execution'
   assert.equal(detail?.step.status, 'failed');
   assert.equal(detail?.tool.ok, false);
   assert.equal(detail?.tool.invalid, true);
-  assert.equal(detail?.tool.result, 'Invalid tool input: JSON parsing failed');
+  assert.equal(detail?.tool.result, 'Invalid input for tool browserCode；Schema validation failed；参数 code: expected string, received undefined');
 });

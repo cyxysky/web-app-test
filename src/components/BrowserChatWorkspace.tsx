@@ -865,11 +865,32 @@ function toolReasonFromInput(input: unknown) {
 }
 
 function toolErrorFromUnknown(value: unknown) {
-  const record = asRecord(value);
-  return stringFromUnknown(record?.message)
-    || stringFromUnknown(record?.cause)
-    || stringFromUnknown(record?.error)
-    || stringFromUnknown(value);
+  const details: string[] = [];
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown, depth = 0) => {
+    if (depth > 6 || current === null || current === undefined) return;
+    if (typeof current === 'string') {
+      const text = stripAnsiControlCodes(current).trim();
+      if (text && !details.includes(text)) details.push(text);
+      return;
+    }
+    const record = asRecord(current);
+    if (!record || seen.has(record)) return;
+    seen.add(record);
+    visit(record.message, depth + 1);
+    if (Array.isArray(record.issues)) {
+      for (const issue of record.issues) {
+        const item = asRecord(issue);
+        const path = Array.isArray(item?.path) ? item.path.map(String).join('.') : '';
+        const message = stringFromUnknown(item?.message);
+        if (message) details.push(`${path ? `参数 ${path}: ` : ''}${message}`);
+      }
+    }
+    visit(record.cause, depth + 1);
+    visit(record.error, depth + 1);
+  };
+  visit(value);
+  return [...new Set(details)].join('；') || '工具参数解析失败：运行时未返回可识别的错误详情';
 }
 
 function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
@@ -1003,26 +1024,42 @@ function toolInputSignature(value: unknown) {
 export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[], running = false) {
   const details = new Map<string, BrowserChatToolDetail>();
   const persistedToolsById = new Map<string, BrowserChatToolDetail>();
+  const persistedTools: BrowserChatToolDetail[] = [];
+  const consumedToolIds = new Set<string>();
 
   steps.forEach((step) => {
     (step.tools || []).forEach((tool, toolIndex) => {
       if (!tool.id) return;
-      persistedToolsById.set(tool.id, {
+      const detail = {
         stepIndex: step.index,
         step,
         toolIndex,
         tool,
-      });
+      };
+      persistedToolsById.set(tool.id, detail);
+      persistedTools.push(detail);
     });
   });
 
   cycles.forEach((cycle) => {
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
-      const detail = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
+      let detail = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
       if (detail && detail.tool.name === aiTool.name && (
         typeof cycle.stepIndex !== 'number' || detail.stepIndex === cycle.stepIndex
       )) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+        if (detail.tool.id) consumedToolIds.add(detail.tool.id);
+        return;
+      }
+      detail = persistedTools.find((candidate) => (
+        !consumedToolIds.has(candidate.tool.id || '')
+        && candidate.tool.name === aiTool.name
+        && (typeof cycle.stepIndex !== 'number' || candidate.stepIndex === cycle.stepIndex)
+        && toolInputSignature(candidate.tool.input) === toolInputSignature(aiTool.input)
+      ));
+      if (detail) {
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
+        if (detail.tool.id) consumedToolIds.add(detail.tool.id);
         return;
       }
       const stepIndex = typeof cycle.stepIndex === 'number' ? cycle.stepIndex : -1;
@@ -3347,7 +3384,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const executedTool = toolDetail.tool;
         const label = browserChatToolLabel(executedTool.name, t);
         const meta = executedTool.invalid
-          ? t('工具参数解析失败')
+          ? executedTool.error || String(executedTool.result || '') || t('工具参数解析失败：没有错误详情')
           : executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
         const presentation = browserChatToolPresentation(executedTool, toolDetail.step, running);
         const { isActive, stateClass } = presentation;
@@ -6026,6 +6063,7 @@ function BrowserChatManagementDialog({
   return (
     <AppModal
       ariaLabelledBy={titleId}
+      dialogClassName="browser-chat-management-dialog"
       onClose={onClose}
       size="management"
     >
@@ -9213,7 +9251,7 @@ export function BrowserChatWorkspace({
   const allSelectableRecentSessionsSelected = selectableRecentSessionIds.length > 0
     && selectableRecentSessionIds.every((id) => selectedSessionIdSet.has(id));
   const embeddedBrowserActive = embeddedBrowserEnabled;
-  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || filePreviewOpen || embeddedBrowserDialogOpen || messageGenerationDialog);
+  const embeddedBrowserCovered = Boolean(toolDialog || logDialogMessageId || filePreviewOpen || embeddedBrowserDialogOpen || managementTab || messageGenerationDialog);
   const embeddedBrowserViewActive = embeddedBrowserActive && !embeddedBrowserCovered;
   const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });

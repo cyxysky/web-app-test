@@ -39,11 +39,32 @@ function toolReasonFromInput(input: unknown) {
 }
 
 function toolErrorFromUnknown(value: unknown) {
-  const record = asRecord(value);
-  return stringFromUnknown(record?.message)
-    || stringFromUnknown(record?.cause)
-    || stringFromUnknown(record?.error)
-    || stringFromUnknown(value);
+  const details: string[] = [];
+  const seen = new WeakSet<object>();
+  const visit = (current: unknown, depth = 0) => {
+    if (depth > 6 || current === null || current === undefined) return;
+    if (typeof current === 'string') {
+      const text = stripAnsiControlCodes(current).trim();
+      if (text && !details.includes(text)) details.push(text);
+      return;
+    }
+    const record = asRecord(current);
+    if (!record || seen.has(record)) return;
+    seen.add(record);
+    visit(record.message, depth + 1);
+    if (Array.isArray(record.issues)) {
+      for (const issue of record.issues) {
+        const item = asRecord(issue);
+        const path = Array.isArray(item?.path) ? item.path.map(String).join('.') : '';
+        const message = stringFromUnknown(item?.message);
+        if (message) details.push(`${path ? `参数 ${path}: ` : ''}${message}`);
+      }
+    }
+    visit(record.cause, depth + 1);
+    visit(record.error, depth + 1);
+  };
+  visit(value);
+  return [...new Set(details)].join('；') || '工具参数解析失败：运行时未返回可识别的错误详情';
 }
 
 function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {

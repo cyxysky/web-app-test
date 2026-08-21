@@ -66,6 +66,7 @@ function startProcessMemoryMonitor() {
   const eventLoop = monitorEventLoopDelay({ resolution: 20 });
   eventLoop.enable();
   let previous;
+  const history = [];
 
   const writeSnapshot = (reason = 'interval') => {
     const usage = process.memoryUsage();
@@ -121,10 +122,17 @@ function startProcessMemoryMonitor() {
       diagnostics: providerSnapshots(),
     };
     previous = { heapUsed: usage.heapUsed, rss: usage.rss };
+    state.latest = payload;
+    history.push({
+      time: payload.time,
+      rssMb: payload.memoryMb.rss,
+      heapUsedMb: payload.memoryMb.heapUsed,
+      heapTotalMb: payload.memoryMb.heapTotal,
+      externalMb: payload.memoryMb.external,
+      arrayBuffersMb: payload.memoryMb.arrayBuffers,
+    });
+    if (history.length > 180) history.splice(0, history.length - 180);
     eventLoop.reset();
-    const line = JSON.stringify(payload);
-    if (pressure === 'normal') console.info(line);
-    else console.warn(line);
     return payload;
   };
 
@@ -139,7 +147,9 @@ function startProcessMemoryMonitor() {
   }, Math.min(intervalMs, 10_000));
   pressureTimer.unref?.();
   const state = {
+    history,
     intervalMs,
+    latest: undefined,
     pressureTimer,
     timer,
     writeSnapshot,

@@ -363,6 +363,7 @@
   --ui-modal-inline-size: 1120px;
   grid-template-rows: auto minmax(0, 1fr);
   height: min(88dvh, 860px);
+  width: min(1120px, calc(100vw - 40px));
 }
 
 .browser-chat-management-heading > span {
@@ -645,7 +646,6 @@
 .browser-chat-compose--reference .browser-chat-send:not(:disabled):hover {
   background: var(--accent-hover);
   color: #ffffff;
-  transform: translateY(-1px);
 }
 
 .browser-chat-compose--reference .browser-chat-stop {
@@ -2292,7 +2292,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-tool-chips > .browser-chat-executed-body {
   gap: 1px;
-  padding: 3px 2px 3px 4px;
+  padding: 3px 0;
 }
 
 .browser-chat-ai-cycle-tools {

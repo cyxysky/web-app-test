@@ -51,29 +51,7 @@ export function serializableBrowserChatModelMessages(messages: ModelMessage[]) {
 }
 
 export function compactBrowserChatModelTranscript(messages: ModelMessage[]) {
-  const maxMessagesValue = Number(process.env.BROWSER_CHAT_MODEL_TRANSCRIPT_MESSAGE_LIMIT || 160);
-  const maxCharactersValue = Number(process.env.BROWSER_CHAT_MODEL_TRANSCRIPT_CHARACTER_LIMIT || 2 * 1024 * 1024);
-  const maxMessages = Number.isFinite(maxMessagesValue)
-    ? Math.max(16, Math.min(1000, Math.floor(maxMessagesValue)))
-    : 160;
-  const maxCharacters = Number.isFinite(maxCharactersValue)
-    ? Math.max(128 * 1024, Math.min(32 * 1024 * 1024, Math.floor(maxCharactersValue)))
-    : 2 * 1024 * 1024;
-  const retained: ModelMessage[] = [];
-  let characters = 0;
-  for (let index = messages.length - 1; index >= 0 && retained.length < maxMessages; index -= 1) {
-    const message = messages[index];
-    let nextCharacters = 0;
-    try {
-      nextCharacters = JSON.stringify(message).length;
-    } catch {
-      nextCharacters = 1024;
-    }
-    if (retained.length && characters + nextCharacters > maxCharacters) break;
-    retained.push(message);
-    characters += nextCharacters;
-  }
-  return retained.reverse();
+  return [...messages];
 }
 
 function modelMessageText(message: ModelMessage) {

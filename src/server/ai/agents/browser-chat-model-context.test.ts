@@ -8,15 +8,15 @@ import {
   serializableBrowserChatModelMessages,
 } from './browser-chat-model-context';
 
-test('bounds the historical model transcript while retaining the newest messages', () => {
+test('retains the complete historical model transcript without a message-count limit', () => {
   const messages = Array.from({ length: 200 }, (_, index) => ({
     role: 'user' as const,
     content: `message-${index}`,
   }));
   const compacted = compactBrowserChatModelTranscript(messages);
 
-  assert.equal(compacted.length, 160);
-  assert.equal(compacted[0]?.content, 'message-40');
+  assert.equal(compacted.length, 200);
+  assert.equal(compacted[0]?.content, 'message-0');
   assert.equal(compacted.at(-1)?.content, 'message-199');
 });
 
@@ -67,15 +67,32 @@ test('falls back to the transcript when an active chain was not stored', () => {
   assert.deepEqual(context.activeMessages, context.transcript);
 });
 
-test('bounds the active model working set as well as the historical transcript', () => {
+test('retains the complete active model working set', () => {
   const activeMessages = Array.from({ length: 220 }, (_, index) => ({
     role: 'user' as const,
     content: `active-${index}`,
   }));
   const context = normalizeBrowserChatModelContext({ version: 1, transcript: [], activeMessages });
-  assert.equal(context.activeMessages.length, 160);
-  assert.equal(context.activeMessages[0]?.content, 'active-60');
+  assert.equal(context.activeMessages.length, 220);
+  assert.equal(context.activeMessages[0]?.content, 'active-0');
   assert.equal(context.activeMessages.at(-1)?.content, 'active-219');
+});
+
+test('does not separate a large tool result from its tool call', () => {
+  const messages: ModelMessage[] = [
+    { role: 'user', content: '读取大页面' },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', toolCallId: 'call-large', toolName: 'browserCode', input: { code: 'read page' } }],
+    },
+    {
+      role: 'tool',
+      content: [{ type: 'tool-result', toolCallId: 'call-large', toolName: 'browserCode', output: { type: 'text', value: 'x'.repeat(3 * 1024 * 1024) } }],
+    },
+  ];
+
+  const compacted = compactBrowserChatModelTranscript(messages);
+  assert.deepEqual(compacted, messages);
 });
 
 test('an interrupted turn keeps completed tool messages and the partial assistant response in the native chain', () => {

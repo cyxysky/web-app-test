@@ -1,5 +1,5 @@
 import { cookies, headers } from 'next/headers';
-import { requestApplicationPrincipal } from '@/server/auth/user-context';
+import { requestWorkspaceApplicationPrincipal } from '@/server/auth/user-context';
 import { store } from '@/server/db/store';
 import {
   SIDEBAR_COLLAPSED_COOKIE_NAME,
@@ -11,7 +11,7 @@ export async function readWorkspacePageContext() {
   const requestHeaders = await headers();
   const requestCookies = await cookies();
   return {
-    userId: requestApplicationPrincipal({ headers: requestHeaders }).userId,
+    userId: requestWorkspaceApplicationPrincipal({ headers: requestHeaders }).userId,
     sidebarCollapsed: sidebarCollapsedFromCookie(
       requestCookies.get(SIDEBAR_COLLAPSED_COOKIE_NAME)?.value,
     ),

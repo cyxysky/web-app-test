@@ -136,6 +136,37 @@ function internalPort(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 && parsed <= 65_535 ? Math.floor(parsed) : fallback;
 }
 
+const identityHeaderNames = new Set([
+  'x-webpilot-identity-user-id',
+  'x-webpilot-identity-username',
+  'x-webpilot-identity-roles',
+  'x-webpilot-identity-proof',
+]);
+
+function applyTrustedIdentityHeaders(request, principal, proof) {
+  for (const name of identityHeaderNames) delete request.headers[name];
+  if (Array.isArray(request.rawHeaders)) {
+    const retained = [];
+    for (let index = 0; index < request.rawHeaders.length; index += 2) {
+      const name = String(request.rawHeaders[index] || '');
+      if (identityHeaderNames.has(name.toLowerCase())) continue;
+      retained.push(name, request.rawHeaders[index + 1]);
+    }
+    request.rawHeaders.splice(0, request.rawHeaders.length, ...retained);
+  }
+  if (!principal) return;
+  const values = {
+    'x-webpilot-identity-user-id': principal.userId,
+    'x-webpilot-identity-username': principal.username,
+    'x-webpilot-identity-roles': principal.roles.join(','),
+    'x-webpilot-identity-proof': proof,
+  };
+  for (const [name, value] of Object.entries(values)) {
+    request.headers[name] = value;
+    if (Array.isArray(request.rawHeaders)) request.rawHeaders.push(name, value);
+  }
+}
+
 function runtimeApiRequest(pathname) {
   return pathname.startsWith('/api/') && pathname !== '/api/system/shutdown';
 }
@@ -415,17 +446,8 @@ async function main() {
 
       if (request.method === 'GET' && pathname === '/browser-chat' && initializeMountedIdentity(request, response, requestUrl)) return;
 
-      delete request.headers['x-webpilot-identity-user-id'];
-      delete request.headers['x-webpilot-identity-username'];
-      delete request.headers['x-webpilot-identity-roles'];
-      delete request.headers['x-webpilot-identity-proof'];
       const principal = internalPrincipal(request, pathname) || requestIdentity(request);
-      if (principal) {
-        request.headers['x-webpilot-identity-user-id'] = principal.userId;
-        request.headers['x-webpilot-identity-username'] = principal.username;
-        request.headers['x-webpilot-identity-roles'] = principal.roles.join(',');
-        request.headers['x-webpilot-identity-proof'] = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
-      }
+      applyTrustedIdentityHeaders(request, principal, process.env.WEBPILOT_IDENTITY_HEADER_SECRET);
 
       if (!principal && !publicPath(pathname) && !internalRequestAuthorized(request, pathname)) {
         rejectMissingIdentity(response);
@@ -490,6 +512,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  applyTrustedIdentityHeaders,
   applicationBasePath,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
