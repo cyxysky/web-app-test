@@ -22,16 +22,97 @@ export function aiReasoningEffort(): AiReasoningEffort | undefined {
   return reasoningEfforts.has(value) && value !== 'provider-default' ? value : undefined;
 }
 
-export function aiRequestTimeoutMs(fallback = 30_000) {
+export function aiRequestTimeoutMs(fallback = 120_000) {
   return positiveInteger(process.env.AI_REQUEST_TIMEOUT_MS, fallback);
+}
+
+/** Runtime chat requests have a product-level 120s minimum. This intentionally
+ * does not inherit a lower legacy AI_REQUEST_TIMEOUT_MS value used by short
+ * auxiliary model calls. */
+export function aiRuntimeRequestTimeoutMs() {
+  return Math.max(120_000, positiveInteger(process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS, 120_000));
+}
+
+/**
+ * Providers can leave a stalled connection open even after the SDK timeout.
+ * This watchdog has its own abort signal and a hard rejection deadline so the
+ * runtime can record a terminal failure and apply its normal retry policy.
+ */
+export class AiRequestWatchdogTimeoutError extends Error {
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`AI request watchdog timed out after ${timeoutMs}ms.`);
+    this.name = 'AiRequestWatchdogTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export function createAiRequestWatchdog(parentSignal?: AbortSignal, timeoutMs = aiRequestTimeoutMs()) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let paused = false;
+  let timeoutReject: ((reason: unknown) => void) | undefined;
+  const abortFromParent = () => controller.abort(parentSignal?.reason);
+  if (parentSignal) {
+    if (parentSignal.aborted) abortFromParent();
+    else parentSignal.addEventListener('abort', abortFromParent, { once: true });
+  }
+  const clear = () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  };
+  const arm = () => {
+    clear();
+    if (paused || controller.signal.aborted) return;
+    timer = setTimeout(() => {
+      const error = new AiRequestWatchdogTimeoutError(timeoutMs);
+      controller.abort(error);
+      timeoutReject?.(error);
+    }, timeoutMs);
+  };
+  return {
+    abortSignal: controller.signal,
+    touch: arm,
+    pause() {
+      paused = true;
+      clear();
+    },
+    resume() {
+      paused = false;
+      arm();
+    },
+    async run<T>(operation: Promise<T>) {
+      if (controller.signal.aborted) {
+        throw controller.signal.reason instanceof Error
+          ? controller.signal.reason
+          : new Error('AI request was aborted before it started.');
+      }
+      arm();
+      try {
+        return await Promise.race([
+          operation,
+          new Promise<never>((_resolve, reject) => { timeoutReject = reject; }),
+        ]);
+      } finally {
+        timeoutReject = undefined;
+        clear();
+      }
+    },
+    dispose() {
+      clear();
+      timeoutReject = undefined;
+      parentSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
 }
 
 export function aiMaxOutputTokens(fallback = 32_768) {
   return Math.min(131_072, positiveInteger(process.env.AI_MAX_OUTPUT_TOKENS, fallback));
 }
 
-export function aiStreamTimeouts() {
-  const requestMs = aiRequestTimeoutMs();
+export function aiStreamTimeouts(requestTimeoutMs = aiRequestTimeoutMs()) {
+  const requestMs = requestTimeoutMs;
   const toolMs = positiveInteger(process.env.AI_TOOL_TIMEOUT_MS, 120_000);
   const configuredChunkMs = positiveInteger(process.env.AI_STREAM_CHUNK_TIMEOUT_MS, requestMs);
   return {

@@ -38,13 +38,13 @@ test('repairs document page booleans and numbers without changing semantic strin
   });
 });
 
-test('wraps schema-shaped singleton outline, block, and edit operation objects', () => {
+test('does not guess that singleton objects were intended as plural arrays', () => {
   assert.deepEqual(coerceBrowserChatToolInput('file', {
     action: 'plan',
     outline: { id: 'cover', title: '封面', suggestedBlocks: '["text","shape"]' },
   }), {
     action: 'plan',
-    outline: [{ id: 'cover', title: '封面', suggestedBlocks: ['text', 'shape'] }],
+    outline: { id: 'cover', title: '封面', suggestedBlocks: '["text","shape"]' },
   });
   assert.deepEqual(coerceBrowserChatToolInput('file', {
     action: 'generate',
@@ -56,11 +56,11 @@ test('wraps schema-shaped singleton outline, block, and edit operation objects',
     render: 'true',
   }), {
     action: 'generate',
-    blocks: [{
+    blocks: {
       id: 'page-1',
       type: 'page',
-      children: [{ id: 'title', type: 'text', text: 'Hello' }],
-    }],
+      children: { id: 'title', type: 'text', text: 'Hello' },
+    },
     render: true,
   });
   assert.deepEqual(coerceBrowserChatToolInput('file', {
@@ -68,7 +68,7 @@ test('wraps schema-shaped singleton outline, block, and edit operation objects',
     operations: { op: 'remove', blockId: 'title' },
   }), {
     action: 'edit',
-    operations: [{ op: 'remove', blockId: 'title' }],
+    operations: { op: 'remove', blockId: 'title' },
   });
 });
 

@@ -96,6 +96,8 @@ import {
 } from '@/server/ai/personal-memory';
 import { createPersonalMemoryTools } from '@/server/ai/personal-memory-tools';
 import { withModelSettings } from '@/server/ai/model';
+import { modelCapabilities } from '@/lib/model-capabilities';
+import { ApiRequestError } from '@/server/http/api-request';
 import { compactBrowserChatLogsForClient } from '@/server/ai/agents/browser-chat-log-client';
 import {
   compactBrowserChatLogDetails,
@@ -1138,11 +1140,20 @@ function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown)
   if (!enabledModelProviders(config).length) {
     throw new Error('尚未启用模型服务商，请先在模型配置中开启至少一个服务商。');
   }
-  return resolveRuntimeModelSelection(config, {
+  const selection = resolveRuntimeModelSelection(config, {
     fallbackProvider: config?.provider,
     model: modelInput,
     provider: providerInput,
   });
+  const imageInputGloballyEnabled = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase() !== 'false';
+  return {
+    ...selection,
+    supportsImageInput: imageInputGloballyEnabled && modelCapabilities(
+      config?.providers?.[selection.provider],
+      selection.provider,
+      selection.model,
+    ).imageInput,
+  };
 }
 
 function normalizeToolConfirmation(value: unknown): BrowserChatToolConfirmation | undefined {
@@ -3738,6 +3749,12 @@ export async function sendBrowserChatMessage(
   }
   const requestedSafetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
   const requestedModelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
+  if (attachments.some(isBrowserChatImageAttachment) && !requestedModelSettings.supportsImageInput) {
+    throw new ApiRequestError(
+      `模型 ${requestedModelSettings.model} 未配置图片输入能力，请在“模型配置”中启用后再上传图片。`,
+      { code: 'model_image_input_unsupported', status: 400 },
+    );
+  }
   if (
     session.busy
     || activeTurns.has(session.id)
@@ -4057,6 +4074,8 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'perf:runtime-input') return '正在准备页面上下文';
   if (phase === 'ai:prepare') return '正在请求 AI 决策';
   if (phase === 'ai:runtime:attempt') return message;
+  if (phase === 'ai:context-compression:start') return '正在压缩上下文';
+  if (phase === 'ai:context-compression:complete' || phase === 'ai:context-segmented') return '上下文压缩完成，正在准备模型输入';
   if (phase === 'ai:runtime:request') return '正在请求 AI 模型';
   if (phase === 'ai:runtime:response') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:object') return 'AI 已返回，正在解析动作';
@@ -4065,7 +4084,7 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'ai:runtime:retry-skipped') return 'AI 请求失败，该错误不可重试';
   if (phase === 'ai:runtime:attempt-succeeded') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:partial') return '工具已执行，正在继续判断';
-  if (phase === 'ai:context-compressed') return '正在整理上下文';
+  if (phase === 'ai:context-compressed') return '正在压缩上下文';
   if (phase === 'ai:visual-context') return '正在更新视觉上下文';
   if (phase === 'ai:document-visual-qa:queued') return '文档预览已生成，正在交给模型检查';
   if (phase === 'ai:document-visual-qa:unavailable') return '文档预览已验证，当前模型未启用图片检查';
@@ -5313,6 +5332,8 @@ async function runBrowserChatMessage(
             || event.phase === 'ai:runtime:retry'
             || event.phase === 'ai:runtime:retry-exhausted'
             || event.phase === 'ai:runtime:retry-skipped'
+            || event.phase.startsWith('ai:context-compression:')
+            || event.phase === 'ai:context-segmented'
             || event.phase.startsWith('ai:document-visual-qa:');
           appendLog(session, event.phase, event.message, {
             stepIndex: event.stepIndex,

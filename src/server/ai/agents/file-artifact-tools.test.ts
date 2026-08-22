@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  editFileArtifact,
   repairFileArtifactDownloadLinks,
   generateFileArtifactBlocks,
   planFileArtifact,
+  renderFileArtifact,
 } from './file-artifact-tools';
 
 test('stores generated files in the session generated-artifact directory', async () => {
@@ -72,6 +74,175 @@ test('requires the model to choose a stable documentId during plan', async () =>
   });
   assert.equal(planned.ok, false);
   assert.match(planned.actual || '', /stable model-chosen documentId/);
+});
+
+test('rejects empty add edits instead of reporting a successful no-op', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-empty-edit-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'empty-edit', documentType: 'word', fileName: 'empty.docx', runId: 'chat_test' });
+    const result = await editFileArtifact({
+      documentId: 'empty-edit',
+      operations: [{ op: 'add' } as never],
+      render: false,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.actual || '', /add requires block or a non-empty blocks array/);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('atomically replaces page children and reports the changed revision', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-replace-children-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'replace-page', documentType: 'presentation', fileName: 'replace.pptx', runId: 'chat_test' });
+    await generateFileArtifactBlocks({
+      blocks: [{ id: 'page-1', type: 'page', children: [{ id: 'old-title', type: 'text', text: 'Old' }] }],
+      documentId: 'replace-page',
+      render: false,
+      runId: 'chat_test',
+    });
+    const result = await editFileArtifact({
+      documentId: 'replace-page',
+      operations: [{
+        op: 'replaceChildren',
+        parentId: 'page-1',
+        blocks: [{ id: 'new-title', type: 'text', style: { fontSize: 22, width: 600 }, text: 'New' }],
+      }],
+      render: false,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, true, result.actual);
+    const payload = JSON.parse(result.actual || '{}') as { changedBlockIds?: string[]; revision?: number };
+    assert.equal(payload.revision, 2);
+    assert.deepEqual(new Set(payload.changedBlockIds), new Set(['page-1', 'old-title', 'new-title']));
+    const draft = JSON.parse(await readFile(path.join(root, 'chat_test', 'document-drafts', 'replace-page.json'), 'utf8'));
+    assert.deepEqual(draft.blocks[0].children[0].style, { fontSize: 22, width: 600 });
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('rejects flattened update style fields without changing the persisted draft', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-canonical-update-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'canonical-update', documentType: 'word', fileName: 'canonical.docx', runId: 'chat_test' });
+    await generateFileArtifactBlocks({
+      blocks: [{ id: 'title', type: 'text', style: { fontSize: 18 }, text: 'Original' }],
+      documentId: 'canonical-update',
+      render: false,
+      runId: 'chat_test',
+    });
+    const result = await editFileArtifact({
+      documentId: 'canonical-update',
+      operations: [{ op: 'update', blockId: 'title', patch: { fontSize: 32 } }],
+      render: false,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.actual || '', /patch\.fontSize.*patch\.style\.fontSize/);
+    const draft = JSON.parse(await readFile(path.join(root, 'chat_test', 'document-drafts', 'canonical-update.json'), 'utf8'));
+    assert.equal(draft.revision, 1);
+    assert.deepEqual(draft.blocks[0].style, { fontSize: 18 });
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('invalid presentation structure is rejected before any draft commit', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-render-transaction-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'atomic-presentation', documentType: 'presentation', fileName: 'atomic.pptx', runId: 'chat_test' });
+    const result = await generateFileArtifactBlocks({
+      blocks: [{ id: 'orphan', type: 'text', text: 'Not inside a page' }],
+      documentId: 'atomic-presentation',
+      includeVisualVerification: false,
+      render: false,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.actual || '', /top-level page blocks/);
+    const draft = JSON.parse(await readFile(path.join(root, 'chat_test', 'document-drafts', 'atomic-presentation.json'), 'utf8'));
+    assert.equal(draft.revision, 0);
+    assert.deepEqual(draft.blocks, []);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('renderer failure does not commit the candidate blocks or revision', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-render-failure-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'failed-render', documentType: 'presentation', fileName: 'failed-render.pptx', runId: 'chat_test' });
+    const result = await generateFileArtifactBlocks({
+      blocks: [{
+        id: 'page-1',
+        type: 'page',
+        children: [{ id: 'missing-image', type: 'image', source: 'missing-image.png' }],
+      }],
+      documentId: 'failed-render',
+      includeVisualVerification: false,
+      render: true,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.actual || '', /file rendering failed/);
+    const draft = JSON.parse(await readFile(path.join(root, 'chat_test', 'document-drafts', 'failed-render.json'), 'utf8'));
+    assert.equal(draft.revision, 0);
+    assert.deepEqual(draft.blocks, []);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('renders an existing draft without adding a trigger block', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-explicit-render-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({ documentId: 'explicit-render', documentType: 'word', fileName: 'explicit.docx', runId: 'chat_test' });
+    await generateFileArtifactBlocks({
+      blocks: [{ id: 'body', type: 'text', text: 'Rendered without mutation' }],
+      documentId: 'explicit-render',
+      render: false,
+      runId: 'chat_test',
+    });
+    const result = await renderFileArtifact({
+      documentId: 'explicit-render',
+      expectedRevision: 1,
+      includeVisualVerification: false,
+      runId: 'chat_test',
+    });
+    assert.equal(result.ok, true, result.actual);
+    const payload = JSON.parse(result.actual || '{}') as { revision?: number; blockCount?: number };
+    assert.equal(payload.revision, 1);
+    assert.equal(payload.blockCount, 1);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
 });
 
 test('does not append a download section for files already exposed as message artifacts', () => {

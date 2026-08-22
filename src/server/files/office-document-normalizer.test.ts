@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   normalizeOfficeDocumentSpec,
+  validateCanonicalOfficeBlockInput,
   validateOfficeDocumentStructure,
 } from './office-document-normalizer';
 import type { OfficeDocumentSpec } from './office-document-spec';
 
-test('normalizes legacy visual fields without discarding the original free-form style', () => {
+test('preserves canonical visual fields without rewriting their meaning', () => {
   const input: OfficeDocumentSpec = {
     blocks: [{
       id: 'slide',
@@ -14,8 +15,9 @@ test('normalizes legacy visual fields without discarding the original free-form 
       children: [{
         id: 'visual',
         type: 'svg',
-        content: '<svg xmlns="http://www.w3.org/2000/svg"/>',
-        style: { fill: '#123456', text: 'Caption', textAlign: 'center', x: 10 },
+        svg: '<svg xmlns="http://www.w3.org/2000/svg"/>',
+        text: 'Caption',
+        style: { align: 'center', fill: '#123456', x: 10 },
       }],
     }],
     document: {},
@@ -26,9 +28,27 @@ test('normalizes legacy visual fields without discarding the original free-form 
   const visual = normalized.blocks[0].children?.[0];
   assert.equal(visual?.svg, '<svg xmlns="http://www.w3.org/2000/svg"/>');
   assert.equal(visual?.text, 'Caption');
-  assert.equal(visual?.style?.backgroundColor, '#123456');
+  assert.equal(visual?.style?.fill, '#123456');
   assert.equal(visual?.style?.align, 'center');
   assert.equal(visual?.style?.x, 10);
+});
+
+test('rejects flattened style fields instead of guessing which value the model intended', () => {
+  assert.throws(() => validateCanonicalOfficeBlockInput({
+    id: 'title',
+    type: 'text',
+    fontSize: 22,
+    style: { fontSize: 28 },
+    text: 'Title',
+  }), /block\.fontSize.*use block\.style\.fontSize/);
+});
+
+test('rejects semantic aliases instead of silently rewriting them', () => {
+  assert.throws(() => validateCanonicalOfficeBlockInput({
+    id: 'visual',
+    type: 'svg',
+    content: '<svg/>',
+  }), /block\.content.*use block\.svg/);
 });
 
 test('requires explicit presentation pages and spreadsheet sheets', () => {

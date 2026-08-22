@@ -31,6 +31,10 @@ import { AppModal } from '@/components/ui/app-modal';
 import { ColorPickerField } from '@/components/ui/color-picker-field';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import {
+  defaultModelCapabilities,
+  normalizedModelCapabilities,
+} from '@/lib/model-capabilities';
+import {
   environmentSettingsTabs,
   environmentSettingsTabsForUser,
 } from '@/components/environment-settings-model';
@@ -187,6 +191,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
       defaultModel: model,
       model,
       models,
+      modelCapabilities: normalizedModelCapabilities(definition.value, models, current?.modelCapabilities),
       apiKey: current?.apiKey || '',
       hasApiKey: Boolean(current?.hasApiKey || current?.apiKey),
       baseURL: current?.baseURL ?? definition.defaultBaseURL ?? '',
@@ -207,6 +212,7 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
     defaultModel: definition.defaultModel,
     model: definition.defaultModel,
     models: modelListForProvider(definition),
+    modelCapabilities: normalizedModelCapabilities(definition.value, modelListForProvider(definition)),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
   };
@@ -388,7 +394,11 @@ export function EnvironmentSettings({
     });
   }
 
-  function setActiveProviderModels(models: string[], defaultModel?: string) {
+  function setActiveProviderModels(
+    models: string[],
+    defaultModel?: string,
+    modelCapabilitiesInput?: ModelProviderSettings['modelCapabilities'],
+  ) {
     setModelDraft((current) => {
       const next = {
         ...current,
@@ -398,6 +408,7 @@ export function EnvironmentSettings({
       const definition = modelProviderDefinition(provider);
       const currentSettings = providerSettings(next, provider);
       const fallbackModel = defaultModel || currentSettings.defaultModel || currentSettings.model || definition.defaultModel;
+      const normalizedModels = models.map((item) => item.trim()).filter(Boolean);
       return {
         ...next,
         providers: {
@@ -407,6 +418,11 @@ export function EnvironmentSettings({
             defaultModel: fallbackModel,
             model: fallbackModel,
             models,
+            modelCapabilities: normalizedModelCapabilities(
+              provider,
+              normalizedModels,
+              modelCapabilitiesInput || currentSettings.modelCapabilities,
+            ),
           },
         },
       };
@@ -422,7 +438,12 @@ export function EnvironmentSettings({
     const nextDefault = previous === currentDefault || !trimmedRows.includes(currentDefault)
       ? value.trim() || trimmedRows[0] || activeProviderOption.defaultModel
       : currentDefault;
-    setActiveProviderModels(rows, nextDefault);
+    const nextCapabilities = { ...(activeProviderSettings.modelCapabilities || {}) };
+    const previousCapability = nextCapabilities[previous]
+      || defaultModelCapabilities(activeProvider, previous);
+    delete nextCapabilities[previous];
+    if (value.trim()) nextCapabilities[value.trim()] = previousCapability;
+    setActiveProviderModels(rows, nextDefault, nextCapabilities);
   }
 
   function addActiveProviderModel() {
@@ -439,7 +460,19 @@ export function EnvironmentSettings({
     const nextDefault = removed === currentDefault || !remaining.includes(currentDefault)
       ? remaining[0] || activeProviderOption.defaultModel
       : currentDefault;
-    setActiveProviderModels(nextRows, nextDefault);
+    const nextCapabilities = { ...(activeProviderSettings.modelCapabilities || {}) };
+    delete nextCapabilities[removed];
+    setActiveProviderModels(nextRows, nextDefault, nextCapabilities);
+  }
+
+  function setActiveModelImageInput(model: string, imageInput: boolean) {
+    if (!model.trim()) return;
+    updateActiveProviderSettings({
+      modelCapabilities: {
+        ...(activeProviderSettings.modelCapabilities || {}),
+        [model]: { imageInput },
+      },
+    });
   }
 
   async function saveModel() {
@@ -1414,6 +1447,17 @@ export function EnvironmentSettings({
                           onChange={(event) => updateActiveProviderModel(index, event.target.value)}
                           placeholder={activeProviderOption.defaultModel}
                         />
+                        <button
+                          aria-label={t('图片输入')}
+                          aria-pressed={activeProviderSettings.modelCapabilities?.[model]?.imageInput === true}
+                          className={`settings-model-capability-button${activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? ' on' : ''}`}
+                          disabled={!activeProviderEnabled || !model.trim()}
+                          onClick={() => setActiveModelImageInput(model, activeProviderSettings.modelCapabilities?.[model]?.imageInput !== true)}
+                          title={t(activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? '支持图片输入' : '不支持图片输入')}
+                          type="button"
+                        >
+                          {t('图片')}
+                        </button>
                         <button
                           aria-label={t('删除模型')}
                           className="settings-model-row-button danger"

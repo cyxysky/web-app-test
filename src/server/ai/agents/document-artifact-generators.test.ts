@@ -82,6 +82,29 @@ test('adds LibreOffice drawing-layer SVG to a spreadsheet without ExcelJS', asyn
   assert.ok(Object.keys(archive.files).some((name) => /^xl\/drawings\//.test(name)));
 });
 
+test('normalizes URL-encoded inline SVG paint references and text colors', async (context) => {
+  if (!await requireOfficeGeneration(context)) return;
+  const result = await generateFileBuffer({
+    blocks: [{ id: 'page', type: 'page', children: [
+      {
+        id: 'encoded-gradient',
+        type: 'svg',
+        svg: '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180"><defs><linearGradient id="accent"><stop stop-color="%232563eb"/><stop offset="1" stop-color="%238b5cf6"/></linearGradient></defs><rect width="640" height="180" fill="url(%23accent)"/></svg>',
+        style: { x: 20, y: 20, width: 640, height: 180 },
+      },
+      { id: 'encoded-white', type: 'text', text: 'Visible white text', style: { x: 36, y: 78, width: 400, height: 36, color: '%23FFFFFF', fontSize: 24 } },
+    ] }],
+    document: { page: { width: 720, height: 260, unit: 'px' } },
+    documentType: 'presentation',
+    fileName: 'encoded-svg.pptx',
+  });
+  const archive = await JSZip.loadAsync(result.buffer);
+  const slideXml = await archive.file('ppt/slides/slide1.xml')?.async('text');
+  assert.match(slideXml || '', /Visible white text/);
+  assert.match(slideXml || '', /FFFFFF/i);
+  assert.ok(Object.keys(archive.files).some((name) => /^ppt\/media\//.test(name)));
+});
+
 test('preserves explicit presentation structure and legacy inline SVG content', async (context) => {
   if (!await requireOfficeGeneration(context)) return;
   const result = await generateFileBuffer({

@@ -23,21 +23,8 @@ function providerArray(value: unknown) {
   return parseJsonContainer(value, 'array');
 }
 
-function singletonRecordArray(
-  value: unknown,
-  isValidItem: (item: JsonRecord) => boolean,
-) {
-  const parsedArray = providerArray(value);
-  if (Array.isArray(parsedArray)) return parsedArray;
-  const parsed = parseJsonContainer(parsedArray, 'object');
-  const item = recordFromUnknown(parsed);
-  return item && isValidItem(item) ? [item] : parsedArray;
-}
-
 function blockArray(value: unknown) {
-  return singletonRecordArray(value, (item) => (
-    typeof item.id === 'string' && typeof item.type === 'string'
-  ));
+  return providerArray(value);
 }
 
 function booleanFromString(value: unknown) {
@@ -96,9 +83,7 @@ function coerceBlock(value: unknown): unknown {
   if (Array.isArray(block.children)) block.children = block.children.map(coerceBlock);
   if (Array.isArray(block.rows)) block.rows = block.rows.map(providerArray);
   if ('columns' in block) {
-    block.columns = singletonRecordArray(block.columns, (item) => (
-      'blocks' in item || 'width' in item
-    ));
+    block.columns = providerArray(block.columns);
   }
   if (Array.isArray(block.columns)) {
     block.columns = block.columns.map((column) => {
@@ -152,9 +137,7 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
   if (source.action === 'plan') {
     if ('document' in input) input.document = coerceDocument(input.document);
     if ('outline' in input) {
-      input.outline = singletonRecordArray(input.outline, (item) => (
-        typeof item.id === 'string' && typeof item.title === 'string'
-      ));
+      input.outline = providerArray(input.outline);
     }
     if (Array.isArray(input.outline)) {
       input.outline = input.outline.map((item) => {
@@ -170,11 +153,16 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
     input.blocks = blockArray(input.blocks);
     if (Array.isArray(input.blocks)) input.blocks = input.blocks.map(coerceBlock);
     if ('render' in input) input.render = booleanFromString(input.render);
+    if ('expectedRevision' in input) input.expectedRevision = numberFromString(input.expectedRevision);
   }
   if (source.action === 'edit') {
-    input.operations = singletonRecordArray(input.operations, (item) => typeof item.op === 'string');
+    input.operations = providerArray(input.operations);
     if (Array.isArray(input.operations)) input.operations = input.operations.map(coerceEditOperation);
     if ('render' in input) input.render = booleanFromString(input.render);
+    if ('expectedRevision' in input) input.expectedRevision = numberFromString(input.expectedRevision);
+  }
+  if (source.action === 'render' && 'expectedRevision' in input) {
+    input.expectedRevision = numberFromString(input.expectedRevision);
   }
   if (source.action === 'read') {
     if ('includeVisuals' in input) input.includeVisuals = booleanFromString(input.includeVisuals);

@@ -194,7 +194,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_HTTP_REQUEST_TOOL_LIMIT', label: 'HTTP 请求工具返回条数', description: 'AI 调用 getHttpRequests 时最多返回当前标签页最近多少条请求。', tab: 'browser', defaultValue: '80', control: 'number' },
   { key: 'SCREENSHOT_TIMEOUT_MS', label: '截图超时', description: 'Playwright 截图等待上限，单位毫秒；默认 15000。', tab: 'browser', defaultValue: '15000', control: 'number' },
   { key: 'AI_SCREENSHOT_MAX_KB', label: 'AI 截图压缩上限', description: '发送给 AI 的截图大小上限，留空表示不压缩。', tab: 'browser', defaultValue: '', control: 'number' },
-  { key: 'SEND_SCREENSHOT_TO_AI', label: 'AI 图片输入', description: '控制是否向模型提供图片工具和图片内容；自动模式按模型能力判断，不会自动截取每一步。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动判断', value: '' }, { label: '启用', value: 'true' }, { label: '禁用', value: 'false' }] },
+  { key: 'SEND_SCREENSHOT_TO_AI', label: 'AI 图片输入', description: '图片输入总开关；自动或启用时仍以模型配置中的图片能力为准，禁用时对所有模型关闭。', tab: 'browser', defaultValue: '', control: 'select', options: [{ label: '自动判断', value: '' }, { label: '启用', value: 'true' }, { label: '禁用', value: 'false' }] },
 
   { key: 'SQLITE_AUTO_COMPACT_ENABLED', label: 'SQLite 自动压缩', description: '维护任务发现大量空闲页时执行 WAL checkpoint 和 VACUUM，减少数据库及备份体积。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'SQLITE_COMPACTION_FREE_RATIO', label: 'SQLite 压缩空闲比例', description: '空闲页达到该比例且超过最小页数时执行压缩；默认 0.3。', tab: 'runtime', defaultValue: '0.3', control: 'number', min: 0.1, max: 0.9, step: 0.05 },

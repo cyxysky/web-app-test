@@ -43,6 +43,7 @@ type SandboxMode = 'danger-full-access' | 'read-only' | 'workspace-write';
 export type ModelSettingsOverride = {
   provider?: string;
   model?: string;
+  supportsImageInput?: boolean;
 };
 
 const modelSettingsStorage = new AsyncLocalStorage<ModelSettingsOverride>();
@@ -298,6 +299,7 @@ export function getModelSettings() {
   return {
     provider,
     model: override?.model || process.env.AI_MODEL || defaults[provider],
+    supportsImageInput: override?.supportsImageInput === true,
   };
 }
 

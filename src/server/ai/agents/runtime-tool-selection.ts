@@ -33,8 +33,15 @@ export function browserToolBlockedBeforeBrowserState(
   toolName: string,
   preflightPending: boolean,
   browserToolNames: ReadonlySet<string>,
+  input?: unknown,
 ) {
+  // `subagent.read` only returns an already-persisted child result. It neither
+  // observes nor changes the live browser, so a browser preflight would turn a
+  // harmless result read into a stale-session failure.
+  const isSubagentResultRead = toolName === 'subagent'
+    && Boolean(input && typeof input === 'object' && 'action' in input && input.action === 'read');
   return preflightPending
     && toolName !== 'readBrowserState'
+    && !isSubagentResultRead
     && browserToolNames.has(toolName);
 }

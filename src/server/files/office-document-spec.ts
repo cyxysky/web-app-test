@@ -42,8 +42,6 @@ export type OfficeBlockStyle = {
   padding?: number | number[];
   rotation?: number;
   shadow?: boolean | Record<string, unknown>;
-  textAlign?: 'center' | 'justify' | 'left' | 'right';
-  text?: string;
   unit?: 'cm' | 'in' | 'mm' | 'pt' | 'px';
   width?: number | string;
   x?: number | string;
@@ -55,6 +53,8 @@ export type OfficeBlock = {
   id: string;
   type: OfficeBlockType | (string & {});
   alt?: string;
+  /** Semantic Writer pagination; do not emulate this through blank text or raw UNO properties. */
+  breakBefore?: 'page';
   caption?: string;
   children?: OfficeBlock[];
   columns?: Array<{ blocks?: OfficeBlock[]; width?: number | string }>;
@@ -119,18 +119,23 @@ export type OfficeDocumentDraft = OfficeDocumentSpec & {
   documentId: string;
   intent?: string;
   outline?: OfficeDocumentOutlineItem[];
+  revision?: number;
   renderedFileName?: string;
   updatedAt: string;
 };
 
-export type OfficeDocumentEditOperation = {
-  op: 'add' | 'move' | 'remove' | 'replace' | 'setDocument' | 'update';
+type OfficeBlockPlacement = {
   afterId?: string;
   beforeId?: string;
-  block?: OfficeBlock;
-  blockId?: string;
-  blockIds?: string[];
-  blocks?: OfficeBlock[];
   parentId?: string;
-  patch?: Record<string, unknown>;
 };
+
+export type OfficeDocumentEditOperation =
+  | ({ op: 'add'; block: OfficeBlock; blocks?: never } & OfficeBlockPlacement)
+  | ({ op: 'add'; block?: never; blocks: OfficeBlock[] } & OfficeBlockPlacement)
+  | ({ op: 'move'; blockId: string } & OfficeBlockPlacement)
+  | { op: 'remove'; blockId: string }
+  | { op: 'replace'; blockId: string; block: OfficeBlock }
+  | { op: 'replaceChildren'; parentId: string; blocks: OfficeBlock[] }
+  | { op: 'setDocument'; patch: Record<string, unknown> }
+  | { op: 'update'; blockId: string; patch: Record<string, unknown> };

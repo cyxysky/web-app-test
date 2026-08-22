@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote, unquote_to_bytes
 
 import uno
 
@@ -66,8 +66,20 @@ CSS_COLORS = {
 }
 
 
+def decode_percent_encoded_value(value):
+    """Decode one URL-encoding pass without interpreting SVG/XML entities.
+
+    Models occasionally copy fragments from a data SVG URL into an inline SVG
+    block. For example, ``url(%23accent)`` is not a valid SVG paint reference
+    after it is written to a standalone .svg file; it must become
+    ``url(#accent)``. Do not use html.unescape here: SVG entities must retain
+    their XML meaning until LibreOffice parses the file.
+    """
+    return unquote(str(value or ""))
+
+
 def parse_color(value):
-    cleaned = str(value or "").strip().lower()
+    cleaned = decode_percent_encoded_value(value).strip().lower()
     if not cleaned:
         return None
     if cleaned in CSS_COLORS:
@@ -146,12 +158,7 @@ def style_for(spec, block=None):
     document = spec.get("document") if isinstance(spec.get("document"), dict) else {}
     default = document.get("defaultStyle") if isinstance(document.get("defaultStyle"), dict) else {}
     own = block.get("style") if isinstance(block, dict) and isinstance(block.get("style"), dict) else {}
-    style = {**default, **own}
-    if "align" not in style and style.get("textAlign") is not None:
-        style["align"] = style["textAlign"]
-    if "backgroundColor" not in style and isinstance(style.get("fill"), str) and "gradient(" not in style["fill"].lower():
-        style["backgroundColor"] = style["fill"]
-    return style
+    return {**default, **own}
 
 
 def normalized_block(block):
@@ -161,12 +168,6 @@ def normalized_block(block):
     style = style_for({"document": {}}, result)
     if style:
         result["style"] = style
-    if result.get("text") is None and style.get("text") is not None:
-        result["text"] = style["text"]
-    if result.get("type") == "svg" and not result.get("svg") and isinstance(result.get("content"), str):
-        result["svg"] = result["content"]
-    if not result.get("source") and isinstance(result.get("url"), str):
-        result["source"] = result["url"]
     if isinstance(result.get("children"), list):
         result["children"] = [normalized_block(child) for child in result["children"]]
     if isinstance(result.get("columns"), list):
@@ -199,9 +200,29 @@ def safe_graphic_name(value):
     return cleaned[:96] or uuid.uuid4().hex
 
 
+def normalized_inline_svg(value):
+    raw_svg = str(value or "").strip()
+    if not raw_svg:
+        return ""
+    # Accept a complete data SVG URI defensively when a provider puts it in
+    # `svg` instead of `source`. Its payload is decoded exactly once.
+    if raw_svg.lower().startswith("data:"):
+        header, separator, payload = raw_svg.partition(",")
+        if separator and "svg" in header.lower():
+            try:
+                decoded = base64.b64decode(payload) if ";base64" in header.lower() else unquote_to_bytes(payload)
+                return decoded.decode("utf-8-sig")
+            except Exception as error:
+                DIAGNOSTICS["warnings"].append(f"inline SVG data URI could not be decoded: {type(error).__name__}: {error}")
+                return raw_svg
+    # Inline SVG is not a URL. Normalize one encoded pass so encoded fragment
+    # references (`%23id`) and copied CSS colors (`%23FFFFFF`) remain valid.
+    return decode_percent_encoded_value(raw_svg)
+
+
 def materialize_graphic(block, work_dir):
-    raw_svg = str(block.get("svg") or "").strip()
-    source = str(block.get("source") or block.get("url") or "").strip()
+    raw_svg = normalized_inline_svg(block.get("svg"))
+    source = str(block.get("source") or "").strip()
     if raw_svg:
         target = work_dir / f"{safe_graphic_name(block.get('id'))}.svg"
         target.write_text(raw_svg, encoding="utf-8")
@@ -299,7 +320,20 @@ def apply_uno_properties(target, block):
     properties = block.get("unoProperties") if isinstance(block, dict) else None
     if not isinstance(properties, dict):
         return
+    target_info = None
+    try:
+        target_info = target.getPropertySetInfo()
+    except Exception:
+        # Some UNO objects use direct attributes without a PropertySetInfo.
+        # setattr below remains the authoritative compatibility check for them.
+        target_info = None
     for name, value in properties.items():
+        if target_info is not None and not target_info.hasPropertyByName(str(name)):
+            context = str(block.get("id") or block.get("type") or "block")
+            raise ValueError(
+                f"UNO property {name} is not supported by the native object for {context}. "
+                "Use a documented property of that block's emitted UNO object, or use the document DSL for layout."
+            )
         set_property(target, str(name), decode_uno_value(value), required=True, context=str(block.get("id") or block.get("type") or "block"))
 
 
@@ -310,7 +344,10 @@ def parse_linear_gradient(value):
         colors = [item for item in colors if item]
         if len(colors) >= 2:
             return colors[0], colors[-1], number(value.get("angle"), 0)
-    if not isinstance(value, str) or not value.strip().lower().startswith("linear-gradient("):
+    if not isinstance(value, str):
+        return None
+    value = decode_percent_encoded_value(value)
+    if not value.strip().lower().startswith("linear-gradient("):
         return None
     angle_match = re.search(r"linear-gradient\(\s*(-?[\d.]+)deg", value, re.I)
     tokens = re.findall(r"#[0-9a-fA-F]{3,8}|rgba?\([^)]*\)|\b(?:black|white|red|green|blue|gray|grey|yellow|orange|purple|pink|transparent)\b", value, re.I)
@@ -405,7 +442,17 @@ def style_text(target, style, *, default_size=11, default_color=0x000000):
     set_property(target, "CharWeight", 150.0 if weight in ("bold", 600, 700, 800, 900) or number(weight) >= 600 else 100.0)
     set_property(target, "CharPosture", uno_constant("com.sun.star.awt.FontSlant.ITALIC", 2) if style.get("fontStyle") == "italic" else uno_constant("com.sun.star.awt.FontSlant.NONE", 0))
     if style.get("letterSpacing") is not None:
-        set_property(target, "CharKerning", int(number(style.get("letterSpacing")) * 100))
+        requested_spacing = number(style.get("letterSpacing"))
+        # CharKerning is a signed UNO short measured in 1/100 pt. Preserve the
+        # authored value exactly inside the actual storage range instead of
+        # imposing an arbitrary visual-design range.
+        kerning = round(requested_spacing * 100)
+        if kerning < -32768 or kerning > 32767:
+            raise ValueError(
+                f"letterSpacing {requested_spacing}pt exceeds LibreOffice CharKerning's "
+                "signed-short range (-327.68pt to 327.67pt)"
+            )
+        set_property(target, "CharKerning", kerning)
     alignments = {"left": 0, "right": 1, "center": 3, "justify": 2}
     set_property(target, "ParaAdjust", alignments.get(style.get("align"), 0))
     if style.get("lineHeight") is not None:
@@ -562,6 +609,9 @@ def render_writer_blocks(document, blocks, spec, work_dir, page_number=1):
             continue
         kind = str(block.get("type") or "text")
         style = style_for(spec, block)
+        # Pagination is document semantics, not a paragraph UNO escape hatch.
+        if block.get("breakBefore") == "page":
+            document.Text.insertControlCharacter(document.Text.End, uno_constant("com.sun.star.text.ControlCharacter.PAGE_BREAK", 1), False)
         if kind in ("image", "svg", "chart"):
             if positioned(style):
                 writer_draw_object(document, block, style, work_dir, page_number)
@@ -782,13 +832,15 @@ def slide_measure(value, total, fallback, unit="px"):
     return length_hmm(value, unit, fallback)
 
 
-def slide_box(style, page_width, page_height, default_y):
+def slide_box(style, page_width, page_height, default_y, origin_x=0, origin_y=0, default_x=60):
     unit = style.get("unit", "px")
-    x = slide_measure(style.get("x"), page_width, 60, unit)
-    y = default_y if style.get("y") is None else slide_measure(style.get("y"), page_height, 0, unit)
+    local_x = slide_measure(style.get("x"), page_width, default_x, unit)
+    local_y = default_y - origin_y if style.get("y") is None else slide_measure(style.get("y"), page_height, 0, unit)
+    x = origin_x + local_x
+    y = origin_y + local_y
     width = slide_measure(style.get("width"), page_width, 880, unit)
     height = slide_measure(style.get("height"), page_height, 96, unit)
-    return x, y, min(width, page_width - x), min(height, page_height - y)
+    return x, y, max(1, min(width, page_width - local_x)), max(1, min(height, page_height - local_y))
 
 
 def slide_text(document, page, value, style, box, default_size=18, block=None):
@@ -826,21 +878,44 @@ def slide_table(document, page, block, style, box):
         return
     columns = max(len(row) for row in rows)
     x, y, width, height = box
-    cell_w, cell_h = width / columns, height / len(rows)
+    column_specs = block.get("columns") if isinstance(block.get("columns"), list) else []
+    weights = []
+    for column_index in range(columns):
+        raw_width = column_specs[column_index].get("width") if column_index < len(column_specs) and isinstance(column_specs[column_index], dict) else 1
+        if isinstance(raw_width, str) and raw_width.strip().endswith("%"):
+            raw_width = number(raw_width.strip()[:-1], 1)
+        weights.append(max(0.01, number(raw_width, 1)))
+    weight_total = sum(weights) or columns
+    column_widths = [width * weight / weight_total for weight in weights]
+    explicit_height = style.get("height") is not None
+    minimum_cell_height = length_hmm(max(28, number(style.get("fontSize"), 10) * 1.8), "px")
+    cell_h = height / len(rows) if explicit_height else max(height / len(rows), minimum_cell_height)
+    cell_style = block.get("cellStyle") if isinstance(block.get("cellStyle"), dict) else {}
+    header_style = block.get("headerStyle") if isinstance(block.get("headerStyle"), dict) else {}
     for row_index, row in enumerate(rows):
+        current_x = x
         for column_index in range(columns):
             value = row[column_index] if column_index < len(row) else ""
-            slide_text(document, page, value, style, (x + column_index * cell_w, y + row_index * cell_h, cell_w, cell_h), default_size=10)
+            resolved_style = {**style, **cell_style, **(header_style if row_index == 0 else {})}
+            resolved_style.setdefault("borderColor", style.get("borderColor") or "#D1D5DB")
+            resolved_style.setdefault("borderWidth", 1)
+            resolved_style.setdefault("paddingLeft", 6)
+            resolved_style.setdefault("paddingRight", 6)
+            resolved_style.setdefault("paddingTop", 4)
+            resolved_style.setdefault("paddingBottom", 4)
+            cell_width = column_widths[column_index]
+            slide_text(document, page, value, resolved_style, (current_x, y + row_index * cell_h, cell_width, cell_h), default_size=10)
+            current_x += cell_width
 
 
-def render_slide_blocks(document, page, blocks, spec, work_dir, page_width, page_height):
-    cursor_y = length_hmm(48, "px")
+def render_slide_blocks(document, page, blocks, spec, work_dir, page_width, page_height, origin_x=0, origin_y=0, default_x=60):
+    cursor_y = origin_y + length_hmm(48, "px")
     for block in blocks:
         if not isinstance(block, dict):
             continue
         kind = str(block.get("type") or "text")
         style = style_for(spec, block)
-        box = slide_box(style, page_width, page_height, cursor_y)
+        box = slide_box(style, page_width, page_height, cursor_y, origin_x, origin_y, default_x)
         if kind in ("image", "svg", "chart"):
             slide_graphic(document, page, block, style, box, work_dir)
         elif kind == "table":
@@ -854,7 +929,23 @@ def render_slide_blocks(document, page, blocks, spec, work_dir, page_width, page
                 style_text(shape, style)
             apply_uno_properties(shape, block)
         elif kind == "group":
-            render_slide_blocks(document, page, block.get("children") or [], spec, work_dir, page_width, page_height)
+            has_local_frame = any(style.get(key) is not None for key in ("x", "y", "width", "height"))
+            if has_local_frame:
+                group_x, group_y, group_width, group_height = box
+                render_slide_blocks(
+                    document,
+                    page,
+                    block.get("children") or [],
+                    spec,
+                    work_dir,
+                    group_width,
+                    group_height,
+                    group_x,
+                    group_y,
+                    0,
+                )
+            else:
+                render_slide_blocks(document, page, block.get("children") or [], spec, work_dir, page_width, page_height, origin_x, origin_y, default_x)
         elif block.get("unoService"):
             service = custom_shape_service(block, "com.sun.star.drawing.RectangleShape")
             shape = draw_shape(document, page, service, *box)
@@ -871,7 +962,7 @@ def render_slide_blocks(document, page, blocks, spec, work_dir, page_width, page
             current_x = x
             for column in columns:
                 column_width = (width - gap * max(0, len(columns) - 1)) * number(column.get("width"), 1) / total
-                render_slide_blocks(document, page, [dict(child, style={**(child.get("style") or {}), "x": f"{current_x / 100}mm", "y": f"{y / 100}mm", "width": f"{column_width / 100}mm"}) for child in column.get("blocks") or []], spec, work_dir, page_width, page_height)
+                render_slide_blocks(document, page, [dict(child, style={**(child.get("style") or {}), "x": f"{(current_x - origin_x) / 100}mm", "y": f"{(y - origin_y) / 100}mm", "width": f"{column_width / 100}mm"}) for child in column.get("blocks") or []], spec, work_dir, page_width, page_height, origin_x, origin_y, default_x)
                 current_x += column_width + gap
         elif kind in ("card", "metric", "timeline"):
             items = block.get("items") if isinstance(block.get("items"), list) else []

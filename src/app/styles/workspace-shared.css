@@ -19,6 +19,65 @@
   grid-template-columns: var(--browser-chat-sidebar-collapsed-width) minmax(0, 1fr);
 }
 
+/* Keep desktop sidebar content mounted while its grid column changes.  The
+ * previous collapsed rules use display:none for labels, which makes expanding
+ * look like a snap even though the outer grid is transitioning. */
+@media (min-width: 1025px) and (prefers-reduced-motion: no-preference) {
+  .browser-chat-layout {
+    transition: grid-template-columns var(--motion-normal) var(--ease-standard);
+  }
+
+  .browser-chat-sidebar {
+    overflow: clip;
+  }
+
+  .browser-chat-nav-item,
+  .browser-chat-subnav button {
+    transition:
+      background 0.16s ease,
+      color 0.16s ease,
+      gap var(--motion-normal) var(--ease-standard),
+      justify-content var(--motion-normal) var(--ease-standard),
+      padding var(--motion-normal) var(--ease-standard);
+  }
+
+  .browser-chat-layout :is(
+    .browser-chat-nav-item > span,
+    .browser-chat-subnav button > span,
+    .browser-chat-theme-toggle > span,
+    .browser-chat-new-chat-button > span
+  ) {
+    display: inline-block;
+    max-width: 180px;
+    opacity: 1;
+    overflow: hidden;
+    transform: translateX(0);
+    transition:
+      max-width var(--motion-normal) var(--ease-standard),
+      opacity var(--motion-fast) ease,
+      transform var(--motion-normal) var(--ease-standard);
+    white-space: nowrap;
+  }
+
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-nav-item > span,
+    .browser-chat-subnav button > span,
+    .browser-chat-theme-toggle > span,
+    .browser-chat-new-chat-button > span
+  ) {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+
+  .browser-chat-layout.sidebar-collapsed :is(
+    .browser-chat-nav-item,
+    .browser-chat-subnav button
+  ) {
+    gap: 0;
+  }
+}
+
 .browser-chat-sidebar {
   background: color-mix(in srgb, var(--panel-soft) 92%, var(--panel));
   border-right: 1px solid color-mix(in srgb, var(--border) 62%, transparent);

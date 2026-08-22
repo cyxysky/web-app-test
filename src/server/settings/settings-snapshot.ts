@@ -6,6 +6,7 @@ import {
   runtimeEnvDefinitions,
 } from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
+import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import { store } from '@/server/db/store';
 
 function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
@@ -17,6 +18,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
     defaultModel: model,
     model,
     models,
+    modelCapabilities: normalizedModelCapabilities(provider, models),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
   };
@@ -35,6 +37,7 @@ function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSe
       defaultModel: model,
       model,
       models,
+      modelCapabilities: normalizedModelCapabilities(definition.value, models, current?.modelCapabilities),
     };
   }
   return result;

@@ -58,6 +58,8 @@ test('browser state gate blocks execution without hiding tool schemas', () => {
   assert.equal(browserToolBlockedBeforeBrowserState('readBrowserState', true, browserTools), false);
   assert.equal(browserToolBlockedBeforeBrowserState('browserCode', true, browserTools), true);
   assert.equal(browserToolBlockedBeforeBrowserState('subagent', true, browserTools), true);
+  assert.equal(browserToolBlockedBeforeBrowserState('subagent', true, browserTools, { action: 'read' }), false);
+  assert.equal(browserToolBlockedBeforeBrowserState('subagent', true, browserTools, { action: 'spawn' }), true);
   assert.equal(browserToolBlockedBeforeBrowserState('file', true, browserTools), false);
   assert.equal(browserToolBlockedBeforeBrowserState('subagent', false, browserTools), false);
 });

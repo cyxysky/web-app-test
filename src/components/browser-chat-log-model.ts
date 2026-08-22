@@ -99,7 +99,9 @@ export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
 }
 
 export function isBrowserChatContextCompressionLog(log: BrowserChatLogRecordLike) {
-  return phaseMatches(log, 'ai:context-segmented')
+  return phaseMatches(log, 'ai:context-compression:start')
+    || phaseMatches(log, 'ai:context-compression:complete')
+    || phaseMatches(log, 'ai:context-segmented')
     || phaseMatches(log, 'conversation:context:request')
     || phaseMatches(log, 'conversation:context:response')
     || phaseMatches(log, 'conversation:context:error');

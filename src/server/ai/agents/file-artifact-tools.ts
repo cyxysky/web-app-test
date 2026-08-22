@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { access, mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -18,7 +18,12 @@ import type {
   OfficeDocumentOutlineItem,
   OfficeDocumentSettings,
 } from '@/server/files/office-document-spec';
-import { normalizeOfficeBlock } from '@/server/files/office-document-normalizer';
+import {
+  normalizeOfficeBlock,
+  validateCanonicalOfficeBlockInput,
+  validateCanonicalOfficeBlockPatch,
+  validateOfficeDocumentStructure,
+} from '@/server/files/office-document-normalizer';
 import {
   fillDocxTemplateBuffer,
   type DocxTemplateFillOperation,
@@ -57,6 +62,7 @@ type GenerateArtifactBlocksInput = {
   afterId?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
+  expectedRevision?: number;
 };
 
 type EditArtifactInput = {
@@ -65,6 +71,14 @@ type EditArtifactInput = {
   operations?: OfficeDocumentEditOperation[];
   render?: boolean;
   includeVisualVerification?: boolean;
+  expectedRevision?: number;
+};
+
+type RenderArtifactInput = {
+  runId?: string;
+  documentId?: string;
+  includeVisualVerification?: boolean;
+  expectedRevision?: number;
 };
 
 type FillDocumentTemplateArtifactInput = {
@@ -266,13 +280,13 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
     const timer = setTimeout(() => abortController.abort(new Error(`Download timed out after ${FILE_DOWNLOAD_TIMEOUT_MS}ms`)), FILE_DOWNLOAD_TIMEOUT_MS);
 
     try {
-      const response = await fetch(url, { signal: abortController.signal });
+      const { response, resolvedUrl } = await fetchDownloadResponse(url, abortController.signal);
       if (!response.ok) {
-        return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${url}` };
+        return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${resolvedUrl}` };
       }
       const suggestedName = input.fileName
         || parseContentDispositionFileName(response.headers.get('content-disposition'))
-        || fileNameFromUrl(url)
+        || fileNameFromUrl(resolvedUrl)
         || `download-${Date.now()}.bin`;
       const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
       const dir = artifactDir(input.runId, 'downloads');
@@ -293,7 +307,7 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
           fileName: target.fileName,
           filePath: target.filePath,
           bytes,
-          sourceUrl: url,
+          sourceUrl: resolvedUrl,
         })),
       };
     } finally {
@@ -317,6 +331,50 @@ function nestedBlocks(block: OfficeBlock) {
 
 function allBlocks(blocks: OfficeBlock[]): OfficeBlock[] {
   return blocks.flatMap((block) => [block, ...allBlocks(nestedBlocks(block))]);
+}
+
+function canonicalWikimediaOriginalUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname !== 'upload.wikimedia.org') return undefined;
+    const match = parsed.pathname.match(/^(\/wikipedia\/commons)\/thumb\/(.+)\/\d+px-[^/]+$/i);
+    if (!match) return undefined;
+    const segments = match[2].split('/');
+    if (segments.length < 3) return undefined;
+    const originalPath = match[2].replace(/^(.*)\/\d+px-[^/]+$/, '$1');
+    return `${parsed.origin}${match[1]}/${originalPath}${parsed.search}`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function fetchDownloadResponse(url: string, signal: AbortSignal) {
+  const response = await fetch(url, { signal, redirect: 'follow' });
+  if (response.ok || response.status !== 400) return { response, resolvedUrl: url };
+  // Commons rejects made-up thumbnail widths. The original asset has the same
+  // stable hash/file path, independent of a guessed `Npx-` segment.
+  const canonical = canonicalWikimediaOriginalUrl(url);
+  if (!canonical || canonical === url) return { response, resolvedUrl: url };
+  await response.body?.cancel().catch(() => undefined);
+  return { response: await fetch(canonical, { signal, redirect: 'follow' }), resolvedUrl: canonical };
+}
+
+function blockSnapshots(blocks: OfficeBlock[]) {
+  return new Map(allBlocks(blocks).map((block) => [block.id, JSON.stringify(block)]));
+}
+
+function changedBlockIds(before: Map<string, string>, after: Map<string, string>) {
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .filter((id) => before.get(id) !== after.get(id));
+}
+
+function affectedTopLevelPages(draft: OfficeDocumentDraft, blockIds: string[] | undefined) {
+  if (!blockIds?.length || draft.documentType !== 'presentation') return undefined;
+  const changed = new Set(blockIds);
+  const pages = draft.blocks.flatMap((page, index) => (
+    allBlocks([page]).some((block) => changed.has(block.id)) ? [index + 1] : []
+  ));
+  return pages.length ? pages.slice(0, 6) : undefined;
 }
 
 function validateUniqueBlockIds(blocks: OfficeBlock[], occupied = new Set<string>()) {
@@ -353,6 +411,7 @@ function insertionList(draft: OfficeDocumentDraft, parentId?: string) {
 }
 
 function insertBlocks(draft: OfficeDocumentDraft, blocks: OfficeBlock[], placement: { parentId?: string; beforeId?: string; afterId?: string }) {
+  blocks.forEach((block, index) => validateCanonicalOfficeBlockInput(block, `blocks[${index}]`));
   blocks = blocks.map(normalizeOfficeBlock);
   validateUniqueBlockIds(blocks, new Set(allBlocks(draft.blocks).map((block) => block.id)));
   let list = insertionList(draft, placement.parentId);
@@ -386,14 +445,24 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   const dir = artifactDir(runId, 'document-drafts');
   await mkdir(dir, { recursive: true });
   draft.updatedAt = new Date().toISOString();
-  await writeFile(draftPath(runId, draft.documentId), JSON.stringify(draft, null, 2), 'utf8');
+  const target = draftPath(runId, draft.documentId);
+  const candidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.json`);
+  try {
+    await writeFile(candidate, JSON.stringify(draft, null, 2), { encoding: 'utf8', flag: 'wx' });
+    await rename(candidate, target);
+  } finally {
+    await unlink(candidate).catch(() => undefined);
+  }
 }
 
 async function renderDraft(input: {
   runId?: string;
   draft: OfficeDocumentDraft;
   includeVisualVerification?: boolean;
+  changedBlockIds?: string[];
+  documentChanged?: boolean;
 }): Promise<BrowserActionResult> {
+  let verificationPath: string | undefined;
   try {
     const requestedName = sanitizeFileName(input.draft.fileName, `document-${Date.now()}.pdf`);
     const generated = await generateFileBuffer(input.draft);
@@ -405,29 +474,35 @@ async function renderDraft(input: {
     const target = existingRenderedName
       ? { fileName: existingRenderedName, filePath: path.join(dir, existingRenderedName) }
       : await uniqueArtifactPath(dir, requestedName);
-    await writeFile(target.filePath, generated.buffer);
-
-    const visualVerification = input.includeVisualVerification && [
+    const needsOfficePreview = input.includeVisualVerification && [
       '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
-    ].includes(generated.extension)
+    ].includes(generated.extension);
+    verificationPath = path.join(dir, `.render-${randomUUID()}${generated.extension}`);
+    await writeFile(verificationPath, generated.buffer, { flag: 'wx' });
+
+    const visualVerification = needsOfficePreview
       ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: target.filePath,
+          absolutePath: verificationPath,
           buffer: generated.buffer,
           extension: generated.extension,
           name: target.fileName,
+          pages: affectedTopLevelPages(input.draft, input.changedBlockIds),
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
         })
       : undefined;
-    if (input.includeVisualVerification
-      && ['.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp'].includes(generated.extension)
+    if (needsOfficePreview
       && (!visualVerification?.imagePaths.length
         || !['libreoffice-pdf', 'pdf'].includes(visualVerification.renderer))) {
       throw new Error(`visual quality gate failed: ${visualVerification?.warning || 'LibreOffice produced no page previews'}`);
     }
-    if (input.draft.renderedFileName !== target.fileName) {
-      input.draft.renderedFileName = target.fileName;
-      await saveDraft(input.runId, input.draft);
-    }
+
+    // The candidate draft and candidate binary are invisible until every
+    // structural/render/preview gate has passed. A failed render therefore
+    // cannot mutate the persisted block tree or reserve duplicate block IDs.
+    await rename(verificationPath, target.filePath);
+    verificationPath = undefined;
+    input.draft.renderedFileName = target.fileName;
+    await saveDraft(input.runId, input.draft);
 
     return {
       ok: true,
@@ -439,11 +514,21 @@ async function renderDraft(input: {
           bytes: generated.buffer.byteLength,
         }),
         documentId: input.draft.documentId,
+        revision: input.draft.revision || 0,
+        changedBlockIds: input.changedBlockIds || [],
+        documentChanged: input.documentChanged || false,
         blockCount: allBlocks(input.draft.blocks).length,
         generationDiagnostics: generated.diagnostics,
         qualityGate: {
           structural: true,
-          visual: visualVerification ? visualVerification.imagePaths.length > 0 : 'not-applicable-to-current-model',
+          visual: visualVerification ? {
+            previewGenerated: visualVerification.imagePaths.length > 0,
+            modelReviewRequired: true,
+            reviewedPages: visualVerification.renderedPages,
+          } : {
+            status: 'not-performed',
+            reason: 'The selected model does not accept image input; this result is structurally verified only.',
+          },
         },
         visualVerification: visualVerification ? {
           imageCount: visualVerification.imagePaths.length,
@@ -451,12 +536,17 @@ async function renderDraft(input: {
           renderedPages: visualVerification.renderedPages,
           renderer: visualVerification.renderer,
           warning: visualVerification.warning,
-        } : { skipped: 'current model does not accept image input or the generated format has no page renderer' },
+        } : {
+          status: 'not-performed',
+          reason: 'The selected model does not accept image input or the generated format has no page renderer; no visual conclusion was made.',
+        },
       }),
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
   } catch (error) {
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    if (verificationPath) await unlink(verificationPath).catch(() => undefined);
   }
 }
 
@@ -496,6 +586,7 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
           documentType: existing.documentType,
           outline: existing.outline,
           blockCount: allBlocks(existing.blocks).length,
+          revision: existing.revision || 0,
           reused: true,
         }),
       };
@@ -515,10 +606,11 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
       fileName: requestedFileName,
       intent: input.intent,
       outline: input.outline,
+      revision: 0,
       updatedAt: now,
     };
     await saveDraft(input.runId, draft);
-    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, outline: draft.outline, blockCount: 0 }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, outline: draft.outline, blockCount: 0, revision: draft.revision }) };
   } catch (error) {
     return { ok: false, actual: `file planning failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -530,11 +622,22 @@ export async function generateFileArtifactBlocks(input: GenerateArtifactBlocksIn
     if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
     const blocks = Array.isArray(input.blocks) ? input.blocks : [];
     if (!blocks.length) return { ok: false, actual: 'file action=generate requires at least one block.' };
-    const draft = await loadDraft(input.runId, documentId);
+    const persistedDraft = await loadDraft(input.runId, documentId);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== (persistedDraft.revision || 0)) {
+      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${persistedDraft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
+    }
+    const draft = structuredClone(persistedDraft);
     insertBlocks(draft, blocks, input);
+    draft.revision = (draft.revision || 0) + 1;
+    validateOfficeDocumentStructure(draft, path.extname(draft.fileName).toLowerCase());
+    if (input.render) return renderDraft({
+      ...input,
+      draft,
+      changedBlockIds: blocks.flatMap((block) => allBlocks([block]).map((item) => item.id)),
+      documentChanged: true,
+    });
     await saveDraft(input.runId, draft);
-    if (input.render) return renderDraft({ ...input, draft });
-    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, acceptedBlockIds: blocks.map((block) => block.id), blockCount: allBlocks(draft.blocks).length }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, acceptedBlockIds: blocks.map((block) => block.id), changedBlockIds: blocks.flatMap((block) => allBlocks([block]).map((item) => item.id)), blockCount: allBlocks(draft.blocks).length, revision: draft.revision }) };
   } catch (error) {
     return { ok: false, actual: `file block generation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -546,30 +649,67 @@ export async function editFileArtifact(input: EditArtifactInput): Promise<Browse
     if (!documentId) return { ok: false, actual: 'file action=edit requires documentId.' };
     const operations = Array.isArray(input.operations) ? input.operations : [];
     if (!operations.length) return { ok: false, actual: 'file action=edit requires at least one operation.' };
-    const draft = await loadDraft(input.runId, documentId);
+    const persistedDraft = await loadDraft(input.runId, documentId);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== (persistedDraft.revision || 0)) {
+      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${persistedDraft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
+    }
+    // Apply the entire edit batch to a detached copy. A later invalid operation
+    // must not leave earlier mutations visible in memory or on disk.
+    const draft = structuredClone(persistedDraft);
+    const before = blockSnapshots(draft.blocks);
     for (const operation of operations) {
       if (operation.op === 'setDocument') {
-        draft.document = mergePlainObject(draft.document, operation.patch || {}) as OfficeDocumentSettings;
+        if (!operation.patch || typeof operation.patch !== 'object' || Array.isArray(operation.patch)) {
+          throw new Error('setDocument requires a patch object.');
+        }
+        if (operation.patch.defaultStyle && typeof operation.patch.defaultStyle === 'object' && !Array.isArray(operation.patch.defaultStyle)) {
+          validateCanonicalOfficeBlockPatch({ style: operation.patch.defaultStyle }, 'operations.setDocument.patch');
+        }
+        draft.document = mergePlainObject(draft.document, operation.patch) as OfficeDocumentSettings;
         continue;
       }
       if (operation.op === 'add') {
         const blocks = operation.blocks || (operation.block ? [operation.block] : []);
+        if (!blocks.length) throw new Error('add requires block or a non-empty blocks array; no changes were applied.');
         insertBlocks(draft, blocks, operation);
         continue;
       }
+      if (operation.op === 'replaceChildren') {
+        const parentId = String(operation.parentId || '').trim();
+        if (!parentId) throw new Error('replaceChildren requires parentId.');
+        if (!Array.isArray(operation.blocks)) throw new Error(`replaceChildren requires a blocks array for ${parentId}.`);
+        const parent = findBlockList(draft.blocks, parentId);
+        if (!parent) throw new Error(`Parent block not found: ${parentId}`);
+        const parentBlock = parent.list[parent.index];
+        const removedIds = new Set(allBlocks(parentBlock.children || []).map((block) => block.id));
+        const occupiedIds = new Set(allBlocks(draft.blocks)
+          .filter((block) => !removedIds.has(block.id))
+          .map((block) => block.id));
+        operation.blocks.forEach((block, index) => validateCanonicalOfficeBlockInput(block, `operations.replaceChildren.blocks[${index}]`));
+        const nextChildren = operation.blocks.map(normalizeOfficeBlock);
+        validateUniqueBlockIds(nextChildren, occupiedIds);
+        parentBlock.children = nextChildren;
+        continue;
+      }
       const blockId = String(operation.blockId || '').trim();
+      if (!blockId) throw new Error(`${operation.op} requires blockId.`);
       const found = findBlockList(draft.blocks, blockId);
       if (!found) throw new Error(`Block not found: ${blockId}`);
       if (operation.op === 'remove') {
         found.list.splice(found.index, 1);
       } else if (operation.op === 'replace') {
         if (!operation.block) throw new Error(`replace requires block for ${blockId}`);
+        validateCanonicalOfficeBlockInput(operation.block, `operations.replace.block`);
         const replacedIds = new Set(allBlocks([found.list[found.index]]).map((block) => block.id));
         const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => !replacedIds.has(block.id)).map((block) => block.id));
         validateUniqueBlockIds([operation.block], remainingIds);
         found.list.splice(found.index, 1, normalizeOfficeBlock(operation.block));
       } else if (operation.op === 'update') {
-        const updated = normalizeOfficeBlock(mergePlainObject(found.list[found.index], operation.patch || {}) as OfficeBlock);
+        if (!operation.patch || typeof operation.patch !== 'object' || Array.isArray(operation.patch)) {
+          throw new Error(`update requires a patch object for ${blockId}.`);
+        }
+        validateCanonicalOfficeBlockPatch(operation.patch, `operations.update.patch`);
+        const updated = normalizeOfficeBlock(mergePlainObject(found.list[found.index], operation.patch) as OfficeBlock);
         updated.id = blockId;
         found.list[found.index] = updated;
       } else if (operation.op === 'move') {
@@ -578,11 +718,33 @@ export async function editFileArtifact(input: EditArtifactInput): Promise<Browse
       }
     }
     validateUniqueBlockIds(draft.blocks);
+    const after = blockSnapshots(draft.blocks);
+    const changedIds = changedBlockIds(before, after);
+    const documentChanged = JSON.stringify(persistedDraft.document) !== JSON.stringify(draft.document);
+    if (!changedIds.length && !documentChanged) {
+      return { ok: false, actual: 'file edit produced no effective changes; verify blockId, patch.style, and add block/blocks before retrying.' };
+    }
+    draft.revision = (persistedDraft.revision || 0) + 1;
+    validateOfficeDocumentStructure(draft, path.extname(draft.fileName).toLowerCase());
+    if (input.render !== false) return renderDraft({ ...input, draft, changedBlockIds: changedIds, documentChanged });
     await saveDraft(input.runId, draft);
-    if (input.render !== false) return renderDraft({ ...input, draft });
-    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, blockCount: allBlocks(draft.blocks).length }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, changedBlockIds: changedIds, documentChanged, blockCount: allBlocks(draft.blocks).length, revision: draft.revision }) };
   } catch (error) {
     return { ok: false, actual: `file edit failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function renderFileArtifact(input: RenderArtifactInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) return { ok: false, actual: 'file action=render requires documentId.' };
+    const draft = await loadDraft(input.runId, documentId);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== (draft.revision || 0)) {
+      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${draft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
+    }
+    return renderDraft({ ...input, draft });
+  } catch (error) {
+    return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -645,7 +807,10 @@ export async function fillDocumentTemplateArtifact(input: FillDocumentTemplateAr
           renderedPages: visualVerification.renderedPages,
           renderer: visualVerification.renderer,
           warning: visualVerification.warning,
-        } : { skipped: 'current model does not accept image input' },
+        } : {
+          status: 'not-performed',
+          reason: 'The selected model does not accept image input; no visual conclusion was made.',
+        },
       }),
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };

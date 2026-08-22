@@ -10,6 +10,7 @@ import {
   type WebPilotOnboardingStep,
 } from '@/lib/onboarding';
 import { modelProviderDefinition } from '@/config/settings';
+import { modelCapabilities } from '@/lib/model-capabilities';
 import { enabledModelProviders } from '@/lib/model-selection';
 import { getSqliteDatabase } from '@/server/storage/sqlite-database';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
@@ -172,15 +173,9 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
     providerDefinition.localAuth || localProvider || customCompatibleReady || providerSettings.hasApiKey
   ));
   const screenshotSetting = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase();
-  const selectedModel = String(providerSettings?.model || '').toLowerCase();
-  const visionReady = screenshotSetting === 'true'
-    || (
-      screenshotSetting !== 'false'
-      && provider !== 'deepseek'
-      && provider !== 'minimax'
-      && !selectedModel.startsWith('deepseek')
-      && !selectedModel.startsWith('minimax')
-    );
+  const selectedModel = String(providerSettings?.model || '');
+  const visionReady = screenshotSetting !== 'false'
+    && modelCapabilities(providerSettings, provider, selectedModel).imageInput;
   const libreOfficeExecutable = await resolveLibreOfficeExecutable();
   const libreOfficePython = libreOfficeExecutable
     ? await resolveLibreOfficePythonExecutable(libreOfficeExecutable)

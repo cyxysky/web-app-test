@@ -17,6 +17,7 @@ import type {
   SkillContent,
   SkillRecord,
 } from '@/server/ai/schemas/runtime.schema';
+import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import {
   deleteSkillRecord,
   readConfigRecord,
@@ -104,6 +105,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
     defaultModel: model,
     model,
     models,
+    modelCapabilities: normalizedModelCapabilities(provider, models),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
   };
@@ -129,6 +131,7 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
       defaultModel: model,
       model,
       models,
+      modelCapabilities: normalizedModelCapabilities(definition.value, models, current?.modelCapabilities),
       baseURL: baseURL ?? definition.defaultBaseURL ?? '',
     };
   }
@@ -337,6 +340,7 @@ export const store = {
         defaultModel: model,
         model,
         models,
+        modelCapabilities: normalizedModelCapabilities(provider, models, merged.modelCapabilities),
         apiKey: current?.apiKey ?? previous?.apiKey ?? '',
         baseURL: provider === 'minimax'
           ? normalizeMiniMaxOpenAIBaseURL(baseURL) || ''

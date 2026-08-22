@@ -20,11 +20,27 @@ export function aiSdkToolResultRequiresContinuation(input: {
   toolCallCount?: number;
   toolResultCount?: number;
 }) {
+  const finishReason = normalizedFinishReason(input.finishReason);
   const toolCallCount = Math.max(0, input.toolCallCount || 0);
   const toolResultCount = Math.max(0, input.toolResultCount || 0);
-  return normalizedFinishReason(input.finishReason) === 'other'
-    && toolCallCount > 0
-    && toolResultCount >= toolCallCount;
+  const completedToolRound = toolCallCount > 0 && toolResultCount >= toolCallCount;
+  if (!completedToolRound) return false;
+  if (finishReason === 'other') return true;
+  // Some OpenAI-compatible providers emit `stop` after consuming a tool
+  // result even though the final assistant step contains reasoning only. A
+  // completed tool round is not a user-facing task result; keep the agent loop
+  // alive when no displayable text was returned.
+  return finishReason === 'stop' && !String(input.responseText || '').trim();
+}
+
+export function aiSdkEmptyStopRequiresRetry(input: {
+  finishReason: unknown;
+  responseText?: string;
+  toolCallCount?: number;
+}) {
+  return normalizedFinishReason(input.finishReason) === 'stop'
+    && !String(input.responseText || '').trim()
+    && Math.max(0, input.toolCallCount || 0) === 0;
 }
 
 export function aiSdkFinishState(value: unknown, options: { runtimeContinuationRequired?: boolean } = {}): AiSdkFinishState {

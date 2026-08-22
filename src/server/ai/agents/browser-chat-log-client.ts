@@ -29,7 +29,8 @@ export function compactBrowserChatLogForClient<TLog extends BrowserChatClientLog
   if (log.phase === 'ai:runtime:request') {
     try {
       const details = parsedDetails(log.details);
-      const aiInput = asRecord(details?.aiInput);
+      if (!details || details.aiInput === undefined) return log;
+      const aiInput = details.aiInput;
       const compactedDetails = JSON.stringify({
         aiInput,
         aiInputTokens: details?.aiInputTokens,

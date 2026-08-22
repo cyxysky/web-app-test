@@ -3,7 +3,7 @@ import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelM
 import { z } from 'zod';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { aiMaxOutputTokens, aiReasoningEffort, aiRequestTimeoutMs, aiStreamTimeouts, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiMaxOutputTokens, aiReasoningEffort, aiRuntimeRequestTimeoutMs, aiStreamTimeouts, aiTelemetry, createAiRequestWatchdog } from '@/server/ai/ai-sdk-runtime';
 import { structuredLog } from '@/server/observability/runtime-observability';
 import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import {
@@ -15,7 +15,12 @@ import {
   type BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
 import { richTextToPlainText } from '@/lib/rich-text';
-import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
+import {
+  aiSdkEmptyStopRequiresRetry,
+  aiSdkFinishMessage,
+  aiSdkFinishState,
+  aiSdkToolResultRequiresContinuation,
+} from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
@@ -30,6 +35,7 @@ import {
   formatFileArtifactResult,
   generateFileArtifactBlocks,
   planFileArtifact,
+  renderFileArtifact,
 } from './file-artifact-tools';
 import { browserChatCodeRules } from './runtime-prompt-rules';
 import { readScreenshotForAi } from './browser-chat-image-input';
@@ -61,6 +67,7 @@ import {
 } from './runtime-context-budget';
 import type { BrowserChatModelContextCompression } from './browser-chat-model-context';
 import type { OfficeBlock, OfficeDocumentEditOperation } from '@/server/files/office-document-spec';
+import { officeBlockStyleKeys } from '@/server/files/office-document-normalizer';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
@@ -85,6 +92,41 @@ import {
 
 export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
 
+function rejectCanonicalAliases(
+  value: Record<string, unknown>,
+  context: z.RefinementCtx,
+  options: { block?: boolean } = {},
+) {
+  if (options.block) {
+    for (const key of officeBlockStyleKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `style-only field; use style.${key}. The tool never guesses or moves fields.`,
+          path: [key],
+        });
+      }
+    }
+    for (const [alias, canonical] of [['content', 'svg'], ['url', 'source']] as const) {
+      if (Object.prototype.hasOwnProperty.call(value, alias)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `unsupported alias; use ${canonical}.`,
+          path: [alias],
+        });
+      }
+    }
+  }
+  if (!options.block) {
+    if (Object.prototype.hasOwnProperty.call(value, 'text')) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'text belongs at block.text, not inside style.', path: ['text'] });
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'textAlign')) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'use the canonical style.align field.', path: ['textAlign'] });
+    }
+  }
+}
+
 const generatedFileStyleSchema = z.object({
   align: z.enum(['center', 'justify', 'left', 'right']).optional(),
   backgroundColor: z.string().optional(),
@@ -99,7 +141,7 @@ const generatedFileStyleSchema = z.object({
   fontWeight: z.union([z.number(), z.string()]).optional(),
   gap: z.number().optional(),
   height: z.union([z.number(), z.string()]).optional(),
-  letterSpacing: z.number().optional(),
+  letterSpacing: z.number().optional().describe('Character spacing in points. The value is passed to LibreOffice without an artificial design range.'),
   lineHeight: z.number().optional(),
   opacity: z.number().min(0).max(1).optional(),
   padding: z.union([z.number(), z.array(z.number())]).optional(),
@@ -111,11 +153,12 @@ const generatedFileStyleSchema = z.object({
   width: z.union([z.number(), z.string()]).optional(),
   x: z.union([z.number(), z.string()]).optional(),
   y: z.union([z.number(), z.string()]).optional(),
-}).passthrough();
+}).passthrough().superRefine((style, context) => rejectCanonicalAliases(style, context));
 const generatedFileBlockSchema: z.ZodType<OfficeBlock> = z.lazy(() => z.object({
   id: z.string().min(1),
   type: z.string().min(1),
   alt: z.string().optional(),
+  breakBefore: z.literal('page').optional().describe('Semantic Writer page break before this block. Use this or a {type:"pageBreak"} block for pagination; never use blank text or raw UNO paragraph properties to create a page break.'),
   caption: z.string().optional(),
   chartType: z.string().optional(),
   children: z.array(generatedFileBlockSchema).optional(),
@@ -137,15 +180,15 @@ const generatedFileBlockSchema: z.ZodType<OfficeBlock> = z.lazy(() => z.object({
   svg: z.string().optional(),
   text: z.string().optional(),
   title: z.string().optional(),
-  unoProperties: z.record(z.string(), z.unknown()).optional().describe('Advanced escape hatch: exact LibreOffice UNO properties. Tagged values support {$uno:"constant"|"enum",name}, {$uno:"struct",name,fields}, {$uno:"sequence",items}, and {$uno:"propertyValues",fields}. A rejected property fails rendering.'),
-  unoService: z.string().optional().describe('Advanced drawing/presentation Shape service, for example com.sun.star.drawing.EllipseShape.'),
-}).passthrough());
+  unoProperties: z.record(z.string(), z.unknown()).optional().describe('Advanced native-object properties only. Each key must be an exact, writable UNO property supported by the object emitted for this block; unknown properties fail rendering instead of being guessed. Do not use UNO to emulate document layout: use {type:"spacer", style:{height:12,unit:"mm"}} for blank vertical space, {type:"pageBreak"} or breakBefore:"page" for Writer pagination, and style for typography/position. Tagged values: {$uno:"constant"|"enum",name}, {$uno:"struct",name,fields}, {$uno:"sequence",items}, {$uno:"propertyValues",fields}. Example native ellipse: {type:"shape",unoService:"com.sun.star.drawing.EllipseShape",unoProperties:{RotateAngle:1200},style:{x:20,y:20,width:30,height:30,unit:"mm"}}.'),
+  unoService: z.string().optional().describe('Native drawing/presentation shape service. Only com.sun.star.drawing.*Shape and com.sun.star.presentation.*Shape are accepted; example: com.sun.star.drawing.EllipseShape.'),
+}).passthrough().superRefine((block, context) => rejectCanonicalAliases(block, context, { block: true })));
 const generatedFileDocumentSchema = z.object({
   title: z.string().optional(),
   author: z.string().optional(),
   description: z.string().optional(),
   language: z.string().optional(),
-  defaultStyle: z.record(z.string(), z.unknown()).optional(),
+  defaultStyle: generatedFileStyleSchema.optional(),
   page: z.object({
     orientation: z.enum(['portrait', 'landscape']).optional(),
     width: z.number().optional(),
@@ -167,16 +210,46 @@ const generatedFileOutlineSchema = z.array(z.object({
   purpose: z.string().optional(),
   suggestedBlocks: z.array(z.string()).optional(),
 })).describe('Optional ordered JSON array of planned sections. Even one section must be sent as an array: [{"id":"cover","title":"Cover"}], never as one object.');
-const generatedFileEditOperationSchema: z.ZodType<OfficeDocumentEditOperation> = z.object({
-  op: z.enum(['add', 'move', 'remove', 'replace', 'setDocument', 'update']),
-  blockId: z.string().optional(),
-  parentId: z.string().optional(),
-  beforeId: z.string().optional(),
-  afterId: z.string().optional(),
+const generatedFilePlacementSchema = {
+  parentId: z.string().min(1).optional(),
+  beforeId: z.string().min(1).optional(),
+  afterId: z.string().min(1).optional(),
+};
+const generatedFileAddOperationSchema = z.object({
+  op: z.literal('add'),
+  ...generatedFilePlacementSchema,
   block: generatedFileBlockSchema.optional(),
-  blocks: z.array(generatedFileBlockSchema).optional(),
-  patch: z.record(z.string(), z.unknown()).optional(),
-}).passthrough();
+  blocks: z.array(generatedFileBlockSchema).min(1).optional(),
+}).strict().superRefine((operation, context) => {
+  if (Boolean(operation.block) === Boolean(operation.blocks)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'add requires exactly one of block or non-empty blocks.',
+      path: ['block'],
+    });
+  }
+});
+const generatedFileBlockPatchSchema = z.record(z.string(), z.unknown()).superRefine((patch, context) => {
+  rejectCanonicalAliases(patch, context, { block: true });
+  if (patch.style && typeof patch.style === 'object' && !Array.isArray(patch.style)) {
+    const style = patch.style as Record<string, unknown>;
+    if (Object.prototype.hasOwnProperty.call(style, 'text')) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'text belongs at patch.text, not inside patch.style.', path: ['style', 'text'] });
+    }
+    if (Object.prototype.hasOwnProperty.call(style, 'textAlign')) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'use the canonical style.align field.', path: ['style', 'textAlign'] });
+    }
+  }
+});
+const generatedFileEditOperationSchema = z.union([
+  generatedFileAddOperationSchema,
+  z.object({ op: z.literal('move'), blockId: z.string().min(1), ...generatedFilePlacementSchema }).strict(),
+  z.object({ op: z.literal('remove'), blockId: z.string().min(1) }).strict(),
+  z.object({ op: z.literal('replace'), blockId: z.string().min(1), block: generatedFileBlockSchema }).strict(),
+  z.object({ op: z.literal('replaceChildren'), parentId: z.string().min(1), blocks: z.array(generatedFileBlockSchema) }).strict(),
+  z.object({ op: z.literal('setDocument'), patch: generatedFileDocumentSchema }).strict(),
+  z.object({ op: z.literal('update'), blockId: z.string().min(1), patch: generatedFileBlockPatchSchema }).strict(),
+]) as unknown as z.ZodType<OfficeDocumentEditOperation>;
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -306,15 +379,8 @@ type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
 // 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
 function modelSupportsScreenshotInput() {
-  if (process.env.SEND_SCREENSHOT_TO_AI === 'true') return true;
   if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
-
-  const { provider, model: configuredModel } = getModelSettings();
-  const model = configuredModel.toLowerCase();
-  return provider !== 'deepseek'
-    && provider !== 'minimax'
-    && !model.startsWith('deepseek')
-    && !model.startsWith('minimax');
+  return getModelSettings().supportsImageInput;
 }
 
 function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
@@ -377,7 +443,7 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
 }
 
 function runtimeRequestConsecutiveFailureLimit() {
-  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, 3, 1, 10);
+  return boundedInteger(process.env.AI_RUNTIME_REQUEST_RETRY_ATTEMPTS, 3, 1, 3);
 }
 
 function upstreamApiDisconnectReason(value?: string) {
@@ -1235,6 +1301,7 @@ function makeBrowserTools(
           name,
           !referenceOptions.browserStatePreflightComplete(),
           browserSessionToolNames,
+          input,
         )
       ) {
         return {
@@ -1242,7 +1309,7 @@ function makeBrowserTools(
           actual: `Tool ${name} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
         } satisfies BrowserActionResult;
       }
-      if (toolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
+      if (toolRequiresBrowserSession(name, input)) await referenceOptions?.ensureBrowserStarted?.();
       return action(actionSignal, trace);
     };
     const traceVisualContext = referenceOptions?.visualContext;
@@ -1378,7 +1445,7 @@ function makeBrowserTools(
       }),
     } : {}),
     file: tool({
-      description: 'Read, download, or author files through the LibreOffice UNO document engine. New files use action=plan with a required stable model-chosen documentId, repeated bounded action=generate batches, then action=edit and render. Reuse exactly the same documentId for every retry, repeated plan, render, and visual correction of one logical document; a repeated plan resumes that draft without clearing it. Use another ID only for a genuinely distinct requested output. Every plural collection field (outline, blocks, children, columns, operations) is always a JSON array, including when it contains only one item; never collapse a one-item array into an object and never wrap an array in an {"item": ...} object. Presentation drafts MUST contain only top-level page blocks, one per slide; spreadsheet drafts MUST contain only top-level sheet blocks, one per worksheet. Put visible text in block.text, inline SVG markup in block.svg, and drawing style in block.style; never put text in style.text or SVG in content. Presentation and Calc drawing geometry defaults to px; Writer page geometry defaults to mm, and style.unit may override it. For advanced native shapes use unoService plus unoProperties; rejected explicit UNO properties fail rather than disappearing. Complex visuals may always be supplied as SVG. There are no presets or fixed templates. PDF is a first-class LibreOffice-backed output. This tool does not navigate the visible browser.',
+      description: 'Read, download, or author files through the LibreOffice UNO document engine. New files use action=plan with a required stable model-chosen documentId, repeated bounded action=generate batches, action=edit for changes, and action=render to render an unchanged draft. Never add an invisible or dummy block merely to trigger rendering. Reuse exactly the same documentId for every retry, repeated plan, render, and visual correction of one logical document; a repeated plan resumes that draft without clearing it. Use another ID only for a genuinely distinct requested output. Every plural collection field (outline, blocks, children, columns, operations) is always a JSON array, including when it contains only one item; never collapse a one-item array into an object and never wrap an array in an {"item": ...} object. Edit operations are strict: add requires exactly one complete block or non-empty blocks array; update requires blockId plus patch; replace requires blockId plus a complete block; replaceChildren atomically replaces one parent children array and avoids remove-then-add ordering bugs. The document AST is canonical and never guesses intent: geometry and typography belong only under block.style, visible text only in block.text, inline SVG only in block.svg, and image sources only in block.source. Invalid aliases are rejected with their exact field path instead of being moved. Presentation drafts MUST contain only top-level page blocks, one per slide; spreadsheet drafts MUST contain only top-level sheet blocks, one per worksheet. Presentation and Calc drawing geometry defaults to px; Writer page geometry defaults to mm, and style.unit may override it. For advanced native shapes use unoService plus unoProperties; rejected explicit UNO properties fail rather than disappearing. Complex visuals may always be supplied as SVG. There are no presets or fixed templates. PDF is a first-class LibreOffice-backed output. This tool does not navigate the visible browser.',
       inputSchema: z.preprocess(
         (input) => coerceBrowserChatToolInput('file', input),
         z.discriminatedUnion('action', [
@@ -1414,13 +1481,20 @@ function makeBrowserTools(
             parentId: z.string().optional(),
             beforeId: z.string().optional(),
             afterId: z.string().optional(),
+            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call. Supply it to reject stale writes.'),
             render: z.boolean().optional().describe('Render after this batch. Usually false until the planned sections are present.'),
           }),
           browserToolInput({
             action: z.literal('edit'),
             documentId: z.string().min(1).describe('The same stable documentId used by plan/generate for this logical output.'),
-            operations: z.array(generatedFileEditOperationSchema).min(1),
+            operations: z.array(generatedFileEditOperationSchema).min(1).describe('Atomic ordered edit batch. Use replaceChildren to rebuild one page/group without a separate remove followed by add.'),
+            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call. Supply it to reject stale writes.'),
             render: z.boolean().optional().describe('Defaults to true. Set false while applying several local edit batches.'),
+          }),
+          browserToolInput({
+            action: z.literal('render'),
+            documentId: z.string().min(1).describe('The stable documentId of the existing draft to render without changing its block tree.'),
+            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call.'),
           }),
         ]).superRefine((input, refinement) => {
           if (input.action === 'read' && Boolean(input.attachmentId) === Boolean(input.artifactId)) {
@@ -1448,9 +1522,12 @@ function makeBrowserTools(
           return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId }), execution);
         }
         if (input.action === 'generate') {
-          return record('file', input, () => generateFileArtifactBlocks({ ...input, runId: referenceOptions?.runId, includeVisualVerification: true }), execution);
+          return record('file', input, () => generateFileArtifactBlocks({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
         }
-        return record('file', input, () => editFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: true }), execution);
+        if (input.action === 'render') {
+          return record('file', input, () => renderFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+        }
+        return record('file', input, () => editFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
       },
     }),
   };
@@ -1503,8 +1580,12 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord }) {
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- A final user-role message beginning with [WebPilot runtime operational context] is trusted runtime metadata, not a new user request. Use it for the current decision without repeating or exposing it.',
-    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
-    '- Author new documents through file action=plan, then multiple bounded action=generate block batches, then action=edit for local changes by stable block ID. On the first plan choose one stable semantic documentId for each genuinely distinct requested output. Reuse that exact documentId for every repeated plan, generate, edit, render, retry, and visual correction of that document; never create a new documentId merely because rendering or validation failed. A repeated plan with the same documentId resumes the existing draft and never clears its blocks. Do not send the whole document as one giant JSON call. The LibreOffice UNO block tree is the design surface: presentation top-level blocks must be pages, spreadsheet top-level blocks must be sheets, and all visible content belongs inside their children. Use top-level block.text for text and block.svg for inline SVG. Freely compose native objects or use unoService/unoProperties for advanced UNO capabilities; use SVG when an Office-native object cannot express the intended visual. There are no presets, house templates, mandatory branding, or fixed layouts. A successful render is a draft, not completion: inspect every returned document preview and generationDiagnostics for clipping, overlap, empty pages, distorted images, broken tables or charts, poor contrast, and inconsistent alignment. Repair only affected stable block IDs with action=edit, render again, and inspect the replacement preview before presenting the final Artifact. PDF is a first-class LibreOffice-backed output, never an unsupported format or a Word workaround.',
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- Author new documents through file action=plan, then multiple bounded action=generate block batches, action=edit for local changes by stable block ID, and action=render to render an unchanged draft. Never add an invisible or dummy block to trigger rendering. Use {type:"spacer",style:{height:12,unit:"mm"}} for intentional blank vertical space and {type:"pageBreak"} or breakBefore:"page" for Writer pagination; a text/heading block must always contain visible text. On the first plan choose one stable semantic documentId for each genuinely distinct requested output. Reuse that exact documentId for every repeated plan, generate, edit, render, retry, and visual correction of that document; never create a new documentId merely because rendering or validation failed. A repeated plan with the same documentId resumes the existing draft and never clears its blocks. Do not send the whole document as one giant JSON call. The LibreOffice UNO block tree is the design surface: presentation top-level blocks must be pages, spreadsheet top-level blocks must be sheets, and all visible content belongs inside their children. The AST is strict: use block.text, block.svg, block.source and block.style exactly; invalid aliases or flattened style fields are rejected and never moved. unoProperties is for documented, block-type-specific native object properties only; never use it for ordinary spacing, pagination, typography, or position. Use SVG when an Office-native object cannot express the intended visual. There are no presets, house templates, mandatory branding, or fixed layouts.',
+    screenshotAvailable
+      ? '- A successful render is a draft, not completion: inspect every returned document preview and generationDiagnostics for clipping, overlap, empty pages, distorted images, broken tables or charts, poor contrast, and inconsistent alignment. Repair only affected stable block IDs with action=edit, call action=render again, and inspect the replacement preview before presenting the final Artifact.'
+      : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
+    '- PDF is a first-class LibreOffice-backed output, never an unsupported format or a Word workaround.',
     ...browserChatCodeRules(screenshotAvailable),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
@@ -1536,8 +1617,12 @@ const browserSessionToolNames = new Set([
   'subagent',
 ]);
 
-function toolRequiresBrowserSession(name: string) {
-  return browserSessionToolNames.has(name);
+function toolRequiresBrowserSession(name: string, input?: unknown) {
+  // Child result reads are served from this chat session's stored subagent
+  // record. Only spawning a child depends on the current browser session.
+  return browserSessionToolNames.has(name)
+    && !(name === 'subagent'
+      && Boolean(input && typeof input === 'object' && 'action' in input && input.action === 'read'));
 }
 
 function isCodexProvider() {
@@ -1720,8 +1805,59 @@ function fullLogDetails(value: unknown) {
   };
 }
 
+function truncateModelLogStrings(value: unknown, maxCharacters = 6_000): unknown {
+  if (typeof value === 'string') {
+    return value.length <= maxCharacters
+      ? value
+      : `${value.slice(0, maxCharacters)}\n[... ${value.length - maxCharacters} characters omitted from log ...]`;
+  }
+  if (Array.isArray(value)) return value.map((item) => truncateModelLogStrings(item, maxCharacters));
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .map(([key, item]) => [key, truncateModelLogStrings(item, maxCharacters)]));
+}
+
+function boundedModelMessagesForRequestLog(value: unknown) {
+  if (!Array.isArray(value)) return { messages: value };
+  const maxCharacters = 64 * 1024;
+  const serialized = JSON.stringify(value) || '';
+  if (serialized.length <= maxCharacters) return { messages: value };
+
+  const compacted = value.map((message) => truncateModelLogStrings(message));
+  const retained: unknown[] = [];
+  let retainedCharacters = 0;
+  for (let index = compacted.length - 1; index >= 0; index -= 1) {
+    const message = compacted[index];
+    const messageCharacters = (JSON.stringify(message) || '').length;
+    if (retained.length && retainedCharacters + messageCharacters > maxCharacters - 12_000) break;
+    retained.unshift(message);
+    retainedCharacters += messageCharacters;
+  }
+  const first = compacted[0];
+  if (first && retained[0] !== first) {
+    const boundedFirst = truncateModelLogStrings(first, 8_000);
+    retained.unshift(boundedFirst);
+  }
+  const omittedMessageCount = Math.max(0, compacted.length - retained.length);
+  if (omittedMessageCount) {
+    retained.splice(first && retained[0] === first ? 1 : 0, 0, {
+      role: 'system',
+      content: `[${omittedMessageCount} earlier model input messages omitted from this log view]`,
+    });
+  }
+  return {
+    messages: retained,
+    truncation: {
+      originalCharacters: serialized.length,
+      originalMessageCount: value.length,
+      retainedMessageCount: retained.length - (omittedMessageCount ? 1 : 0),
+    },
+  };
+}
+
 function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Record<string, unknown> = {}, modelMessages?: unknown) {
   const messages = modelMessages || aiRequest?.messages || [];
+  const loggedMessages = boundedModelMessagesForRequestLog(messages);
   const preparedModelContextStats = aiRequest?.options?.modelContextStats;
   return fullLogDetails({
     aiInput: {
@@ -1733,7 +1869,8 @@ function aiRequestLogDetails(aiRequest: AiRequestSnapshot | undefined, extra: Re
         ...extra,
       },
       system: aiRequest?.systemPrompt,
-      messages,
+      messages: loggedMessages.messages,
+      ...(loggedMessages.truncation ? { logTruncation: loggedMessages.truncation } : {}),
     },
     aiInputTokens: preparedModelContextStats && typeof preparedModelContextStats === 'object'
       ? { ...preparedModelContextStats }
@@ -1973,6 +2110,10 @@ async function executeRuntimeStep(input: {
     executionIdentity: RuntimeExecutionIdentity,
   ) {
     ensureActive();
+    // This watchdog is deliberately separate from the user/session abort
+    // signal: its timeout is retryable, while a user cancellation is terminal.
+    const runtimeRequestTimeoutMs = aiRuntimeRequestTimeoutMs();
+    const requestWatchdog = createAiRequestWatchdog(abortSignal, runtimeRequestTimeoutMs);
     const onAttemptDebug: ExecutionDebug | undefined = onDebug
       ? (event) => onDebug({
           ...event,
@@ -2016,8 +2157,8 @@ async function executeRuntimeStep(input: {
           void onAttemptDebug?.({
             phase: 'ai:document-visual-qa:unavailable',
             stepIndex,
-            message: 'Document preview rendered, but the selected model cannot inspect images; renderer quality checks still ran.',
-            details: { source },
+            message: 'Selected model has no image input: document output passed structural rendering checks only; no visual layout review was performed.',
+            details: { source, verification: 'structural-only' },
           });
         }
         return;
@@ -2201,7 +2342,7 @@ async function executeRuntimeStep(input: {
           maxOutputTokens,
           maxRetries: 0,
           abortSignal,
-          timeout: aiRequestTimeoutMs(),
+          timeout: runtimeRequestTimeoutMs,
           telemetry: aiTelemetry('browser-chat-continuation-summary'),
         });
         ensureActive();
@@ -2313,6 +2454,19 @@ async function executeRuntimeStep(input: {
           8_192,
           targetCeilingTokens - baseStats.estimatedTotalTokens - retainedTokens - 256,
         ));
+        await onAttemptDebug?.({
+          phase: 'ai:context-compression:start',
+          stepIndex,
+          message: `Context compression started before agent step ${agentStepIndex}.`,
+          details: {
+            agentStepIndex,
+            estimatedTokensBefore: messageStats.estimatedTotalTokens,
+            summaryInputEstimatedTokens: deltaStats.estimatedTotalTokens,
+            targetFloorTokens,
+            targetCeilingTokens,
+            thresholdTokens,
+          },
+        });
         const summaryResult = await summarizeContinuation(
           deltaInputForSummary,
           turnIndex,
@@ -2388,6 +2542,12 @@ async function executeRuntimeStep(input: {
           thresholdTokens,
         };
         await onAttemptDebug?.({
+          phase: 'ai:context-compression:complete',
+          stepIndex,
+          message: `Context compression completed for agent step ${agentStepIndex}.`,
+          details: modelContextSegmentation,
+        });
+        await onAttemptDebug?.({
           phase: 'ai:context-segmented',
           stepIndex,
           message: `Model message context exceeded threshold; inserted continuation summary segment ${contextSegmentationTurns}.`,
@@ -2429,7 +2589,7 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    if (codexMode) {
+      if (codexMode) {
       const aiStartedAt = Date.now();
       const { system, messages, modelMessagesForLog, allowedTypes: stepAllowedToolTypes } = await prepareStep(0);
       ensureActive();
@@ -2443,7 +2603,7 @@ async function executeRuntimeStep(input: {
           codexObjectMode: true,
         }, modelMessagesForLog),
       });
-      const result = await generateText({
+      const result = await requestWatchdog.run(generateText({
         model: getModel(),
         instructions: system,
         messages,
@@ -2451,10 +2611,10 @@ async function executeRuntimeStep(input: {
         reasoning: aiReasoningEffort(),
         maxOutputTokens: aiMaxOutputTokens(),
         maxRetries: 0,
-        abortSignal,
-        timeout: aiRequestTimeoutMs(),
+        abortSignal: requestWatchdog.abortSignal,
+        timeout: runtimeRequestTimeoutMs,
         telemetry: aiTelemetry('browser-chat-codex-runtime'),
-      });
+      })).finally(() => requestWatchdog.dispose());
       const aiElapsedMs = elapsedSince(aiStartedAt);
       ensureActive();
       const object = alignCodexRuntimeObjectTool(
@@ -2537,6 +2697,8 @@ async function executeRuntimeStep(input: {
     }
 
     const browserTools = makeBrowserTools(session, traces, aiRequest, async (trace) => {
+      if (!trace.result && !trace.completedAt) requestWatchdog.pause();
+      else requestWatchdog.resume();
       ensureActive();
       upsertToolTrace(durableTraces, trace);
       await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
@@ -2604,6 +2766,7 @@ async function executeRuntimeStep(input: {
         visualContext: visualContext.snapshot(),
       } satisfies BrowserAgentRuntimeContext;
       const prepareAgentStep = async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
+        requestWatchdog.touch();
         ensureActive();
         const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
         ensureActive();
@@ -2653,6 +2816,7 @@ async function executeRuntimeStep(input: {
       } : undefined;
       const onAgentToolExecutionStart = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown } }) => {
         if (!externalToolNames.has(event.toolCall.toolName)) return;
+        requestWatchdog.pause();
         const trace: ToolTrace = {
           id: event.toolCall.toolCallId,
           name: event.toolCall.toolName,
@@ -2666,6 +2830,7 @@ async function executeRuntimeStep(input: {
       };
       const onAgentToolExecutionEnd = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown }; toolExecutionMs: number; toolOutput: unknown }) => {
         if (!externalToolNames.has(event.toolCall.toolName)) return;
+        requestWatchdog.resume();
         const output = event.toolOutput as { type?: string; output?: unknown; error?: unknown };
         const resultValue = output.type === 'tool-result' ? output.output : output.error;
         const actual = typeof resultValue === 'string'
@@ -2691,6 +2856,7 @@ async function executeRuntimeStep(input: {
         await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       };
       const onAgentStepEnd = async (event: { text?: string; stepNumber?: number }) => {
+        requestWatchdog.touch();
         ensureActive();
         latestText = event.text || '';
         const turnIndex = typeof event.stepNumber === 'number' ? event.stepNumber : toolExecutionGate.stepNumber;
@@ -2728,7 +2894,7 @@ async function executeRuntimeStep(input: {
         });
       };
       const timeout = {
-        ...aiStreamTimeouts(),
+        ...aiStreamTimeouts(runtimeRequestTimeoutMs),
         tools: {
           spawnSubagentsMs: boundedInteger(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS, 600_000, 1_000, 3_600_000),
         },
@@ -2757,16 +2923,17 @@ async function executeRuntimeStep(input: {
       const result = input.useToolLoopAgent
         ? await new ToolLoopAgent(agentSettings).stream({
           messages: initialMessages,
-          abortSignal,
+          abortSignal: requestWatchdog.abortSignal,
           timeout,
         })
         : streamText({
           ...agentSettings,
           messages: initialMessages,
-          abortSignal,
+          abortSignal: requestWatchdog.abortSignal,
           timeout,
           onChunk: async ({ chunk }) => {
             if (chunk.type !== 'text-delta' || !chunk.text) return;
+            requestWatchdog.touch();
             ensureActive();
             streamedStepText += chunk.text;
             latestText = streamedStepText;
@@ -2783,12 +2950,13 @@ async function executeRuntimeStep(input: {
       let resultSteps: Awaited<typeof result.steps>;
       let responseMessages: Awaited<typeof result.responseMessages>;
       try {
-        [resultText, resultFinishReason, resultSteps, responseMessages] = await Promise.all([
+        [resultText, resultFinishReason, resultSteps, responseMessages] = await requestWatchdog.run(Promise.all([
           result.text,
           result.finishReason,
           result.steps,
           result.responseMessages,
-        ]);
+        ]));
+        requestWatchdog.dispose();
       } catch (error) {
         throw streamedRequestError || error;
       }
@@ -2811,6 +2979,15 @@ async function executeRuntimeStep(input: {
         responseToolResultCount,
         resultSteps.reduce((count, step) => count + step.toolResults.length, 0),
       );
+      if (aiSdkEmptyStopRequiresRetry({
+        finishReason: resultFinishReason,
+        responseText: resultText,
+        toolCallCount,
+      })) {
+        const error = new Error('No output generated: provider returned stop with reasoning only and no displayable text or tool call.');
+        error.name = 'AI_NoOutputGeneratedError';
+        throw error;
+      }
       const finishState = aiSdkFinishState(resultFinishReason, {
         runtimeContinuationRequired: aiSdkToolResultRequiresContinuation({
           finishReason: resultFinishReason,
@@ -2840,6 +3017,7 @@ async function executeRuntimeStep(input: {
         responseStatus: finishState.status,
       };
     } catch (error) {
+      requestWatchdog.dispose();
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
       throw error;
@@ -3577,6 +3755,7 @@ export async function executeRecordedBrowserOperation(
           parentId: typeof input.parentId === 'string' ? input.parentId : undefined,
           beforeId: typeof input.beforeId === 'string' ? input.beforeId : undefined,
           afterId: typeof input.afterId === 'string' ? input.afterId : undefined,
+          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
           render: input.render === true,
           includeVisualVerification: true,
         });
@@ -3586,7 +3765,16 @@ export async function executeRecordedBrowserOperation(
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
           operations: z.array(generatedFileEditOperationSchema).safeParse(input.operations).data,
+          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
           render: input.render !== false,
+          includeVisualVerification: true,
+        });
+      }
+      if (input.action === 'render') {
+        return renderFileArtifact({
+          runId,
+          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
+          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
           includeVisualVerification: true,
         });
       }
@@ -3736,6 +3924,7 @@ async function executeCodexRuntimeObject(input: {
         type,
         !Boolean(browserStatePreflightComplete),
         browserSessionToolNames,
+        normalizedParams,
       )) {
         return {
           ok: false,
@@ -3755,7 +3944,7 @@ async function executeCodexRuntimeObject(input: {
           actual: 'Skipped before execution because the user cancelled this server-approved tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
         } satisfies BrowserActionResult;
       }
-      if (toolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
+      if (toolRequiresBrowserSession(type, normalizedParams)) await ensureBrowserStarted?.();
       const result = await runTool(trace?.id);
       if (approval === 'approved') {
         return {

@@ -75,6 +75,14 @@
   height: 100% !important;
 }
 
+/* A presentation slide is a fixed canvas, not an independent scroll
+   container. The viewer viewport owns navigation/zoom scrolling; clipping at
+   the slide boundary matches PowerPoint/Impress and prevents native browser
+   scrollbars from being painted over slide content. */
+.file-preview-stage .ofv-pptx-viewer > div[data-slide-index] {
+  overflow: hidden !important;
+}
+
 .file-preview-stage > .beautiful-loading-state {
   padding: 24px;
 }

@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aiSdkFinishMessage, aiSdkFinishState, aiSdkToolResultRequiresContinuation } from './ai-sdk-finish-state';
+import {
+  aiSdkEmptyStopRequiresRetry,
+  aiSdkFinishMessage,
+  aiSdkFinishState,
+  aiSdkToolResultRequiresContinuation,
+} from './ai-sdk-finish-state';
 
 test('treats stop as a normally completed AI response', () => {
   assert.deepEqual(aiSdkFinishState('stop'), {
@@ -86,6 +91,48 @@ test('continues an incomplete stream after its final tool result completed', () 
     toolCallCount: 1,
     toolResultCount: 1,
   }), true);
+});
+
+test('continues when a provider stops with reasoning only after a completed tool round', () => {
+  assert.equal(aiSdkToolResultRequiresContinuation({
+    finishReason: 'stop',
+    responseText: '',
+    toolCallCount: 1,
+    toolResultCount: 1,
+  }), true);
+  assert.deepEqual(aiSdkFinishState('stop', { runtimeContinuationRequired: true }), {
+    finishReason: 'stop',
+    retryRequest: false,
+    terminatesTurn: false,
+    status: 'passed',
+  });
+});
+
+test('accepts stop after a completed tool round only when visible final text exists', () => {
+  assert.equal(aiSdkToolResultRequiresContinuation({
+    finishReason: 'stop',
+    responseText: '文档已经生成完成。',
+    toolCallCount: 1,
+    toolResultCount: 1,
+  }), false);
+});
+
+test('retries a reasoning-only stop when no tool round can continue it', () => {
+  assert.equal(aiSdkEmptyStopRequiresRetry({
+    finishReason: 'stop',
+    responseText: '',
+    toolCallCount: 0,
+  }), true);
+  assert.equal(aiSdkEmptyStopRequiresRetry({
+    finishReason: 'stop',
+    responseText: '已完成。',
+    toolCallCount: 0,
+  }), false);
+  assert.equal(aiSdkEmptyStopRequiresRetry({
+    finishReason: 'stop',
+    responseText: '',
+    toolCallCount: 1,
+  }), false);
 });
 
 test('does not continue other when a completed tool result is missing', () => {

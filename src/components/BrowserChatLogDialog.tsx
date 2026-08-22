@@ -43,7 +43,9 @@ function booleanValue(value: unknown) {
 }
 
 function aiLogRequestPayload(details?: Record<string, unknown>) {
-  return details?.aiInput !== undefined ? formatToolPayload(details.aiInput) : '';
+  if (!details) return '';
+  const value = details.aiInput !== undefined ? details.aiInput : details;
+  return value === undefined ? '' : formatToolPayload(value);
 }
 
 function aiLogResponsePayload(details?: Record<string, unknown>) {
@@ -284,6 +286,8 @@ function aiLogTimingPayload(details: Record<string, unknown> | undefined, t: Tra
 
 function contextCompressionLabel(log: BrowserChatLogDialogRecord) {
   if (!isBrowserChatContextCompressionLog(log)) return '';
+  if (log.phase.endsWith('ai:context-compression:start')) return '上下文开始压缩';
+  if (log.phase.endsWith('ai:context-compression:complete')) return '上下文压缩完成';
   if (log.phase.endsWith('ai:context-segmented')) return 'Agent Loop 上下文压缩';
   if (log.phase.endsWith('conversation:context:request')) return '历史对话上下文开始压缩';
   if (log.phase.endsWith('conversation:context:response')) return '历史对话上下文压缩完成';
@@ -428,7 +432,10 @@ function BrowserChatLogEntry({
   const inputTokens = aiLogInputTokenCount(payloadLog);
   const timingLabel = aiLogTimingInline(payloadLog, t);
   const tone = browserChatLogTone(log);
-  const canExpand = Boolean(payloadLog.details);
+  const canExpand = Boolean(payloadLog.details && (
+    aiLogRequestPayload(aiLogPayloadDetails(parseJsonObjectText(payloadLog.details)))
+    || !phaseMatches(payloadLog, 'ai:runtime:request')
+  ));
   const canCopy = phaseMatches(payloadLog, 'ai:runtime:response') || phaseMatches(payloadLog, 'ai:runtime:object');
   const copyEvent = async () => {
     if (!navigator.clipboard) return;
@@ -683,16 +690,18 @@ export function BrowserChatLogDialog({
                   </button>
                 ))}
               </div>
-              <InputGroup fullWidth>
-                <InputGroup.Prefix><Search aria-hidden="true" size={16} /></InputGroup.Prefix>
-                <InputGroup.Input
-                  aria-label={t('搜索日志')}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder={t('搜索日志')}
-                  type="search"
-                  value={query}
-                />
-              </InputGroup>
+              <div className="browser-chat-log-search">
+                <InputGroup fullWidth>
+                  <InputGroup.Prefix><Search aria-hidden="true" size={16} /></InputGroup.Prefix>
+                  <InputGroup.Input
+                    aria-label={t('搜索日志')}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder={t('搜索日志')}
+                    type="search"
+                    value={query}
+                  />
+                </InputGroup>
+              </div>
             </div>
           ) : null}
           {filteredRounds.length ? (

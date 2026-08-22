@@ -216,6 +216,7 @@ import {
   resolveRuntimeModelSelection,
   type RuntimeModelConfig,
 } from '@/lib/model-selection';
+import { modelCapabilities } from '@/lib/model-capabilities';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { useTheme } from '@/theme/ThemeProvider';
@@ -9277,6 +9278,11 @@ export function BrowserChatWorkspace({
   const modelSelection = modelSelectionValueForConfig(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionDiagnostic = modelSelectionDiagnosticLabel(modelConfig, { model: modelId, provider: modelProvider });
   const modelSelectionOptions = useMemo(() => modelSelectionOptionsForConfig(modelConfig), [modelConfig]);
+  const selectedModelSupportsImageInput = modelCapabilities(
+    modelConfig?.providers?.[modelProvider],
+    modelProvider,
+    modelId,
+  ).imageInput;
   const selectedModelLabel = modelSelectionOptions.find((option) => option.value === modelSelection)?.selectedLabel
     || modelSelectionOptions.find((option) => option.value === modelSelection)?.label
     || modelSelectionDiagnostic;
@@ -9666,13 +9672,20 @@ export function BrowserChatWorkspace({
 
   async function uploadChatFiles(files: FileList | File[]) {
     const selectedFiles = Array.from(files);
+    const rejectedImages = selectedFiles.filter((file) => file.type.startsWith('image/'));
+    const uploadableFiles = selectedModelSupportsImageInput
+      ? selectedFiles
+      : selectedFiles.filter((file) => !file.type.startsWith('image/'));
+    if (rejectedImages.length && !selectedModelSupportsImageInput) {
+      setError(t('当前模型不支持图片输入，请在模型配置中为该模型启用图片输入后再上传图片。'));
+    }
     const remainingSlots = Math.max(0, BROWSER_CHAT_MAX_REFERENCES - attachmentsRef.current.length);
-    if (!selectedFiles.length || !remainingSlots || uploadingImage || currentBusy) return [];
+    if (!uploadableFiles.length || !remainingSlots || uploadingImage || currentBusy) return [];
     setUploadingImage(true);
-    setError('');
+    if (!rejectedImages.length) setError('');
     try {
       const uploaded: BrowserChatAttachment[] = [];
-      for (const file of selectedFiles.slice(0, remainingSlots)) {
+      for (const file of uploadableFiles.slice(0, remainingSlots)) {
         const response = await fetch(withWebPilotBasePath('/api/uploads'), {
           method: 'POST',
           headers: {
@@ -9708,6 +9721,13 @@ export function BrowserChatWorkspace({
   async function sendMessage(content: string, skillIds: string[] = [], messageAttachments?: BrowserChatAttachment[]) {
     const trimmedContent = content.trim();
     const nextAttachments = messageAttachments ?? attachments;
+    if (
+      !selectedModelSupportsImageInput
+      && nextAttachments.some((attachment) => browserChatAttachmentKind(attachment) === 'image')
+    ) {
+      setError(t('当前模型不支持图片输入，请在模型配置中为该模型启用图片输入后再上传图片。'));
+      return false;
+    }
     if (
       (!trimmedContent && !nextAttachments.length && !skillIds.length)
       || loadingSessionId

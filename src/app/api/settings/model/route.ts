@@ -9,6 +9,7 @@ import {
   modelProviderValues,
 } from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
+import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { store } from '@/server/db/store';
 import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
@@ -56,11 +57,20 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
       defaultModel: typeof item.defaultModel === 'string' ? item.defaultModel : undefined,
       model: typeof item.model === 'string' ? item.model : undefined,
     });
+    const rawCapabilities = item.modelCapabilities && typeof item.modelCapabilities === 'object' && !Array.isArray(item.modelCapabilities)
+      ? item.modelCapabilities as Record<string, unknown>
+      : {};
+    const configuredCapabilities = Object.fromEntries(Object.entries(rawCapabilities).flatMap(([modelId, capability]) => {
+      if (!capability || typeof capability !== 'object' || Array.isArray(capability)) return [];
+      const imageInput = (capability as Record<string, unknown>).imageInput;
+      return typeof imageInput === 'boolean' ? [[modelId, { imageInput }]] : [];
+    }));
     result[definition.value] = {
       enabled: item.enabled === true,
       defaultModel: model,
       model,
       models,
+      modelCapabilities: normalizedModelCapabilities(definition.value, models, configuredCapabilities),
       ...(typeof item.apiKey === 'string' && item.apiKey ? { apiKey: item.apiKey } : {}),
       baseURL: typeof item.baseURL === 'string' ? item.baseURL : definition.defaultBaseURL || '',
     };
@@ -99,6 +109,7 @@ export async function POST(request: NextRequest) {
           defaultModel: model,
           model,
           models,
+          modelCapabilities: normalizedModelCapabilities(provider, models),
           ...(typeof body.apiKey === 'string' && body.apiKey.trim() ? { apiKey: body.apiKey } : {}),
           baseURL: typeof body.baseURL === 'string' ? body.baseURL : definition.defaultBaseURL || '',
         };

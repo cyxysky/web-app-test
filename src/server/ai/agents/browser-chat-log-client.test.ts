@@ -68,6 +68,19 @@ test('keeps renderable model output and removes raw provider payloads', () => {
   assert.equal(details.aiOutput.response.response, undefined);
 });
 
+test('preserves a structurally truncated AI request instead of replacing it with an empty input', () => {
+  const log = {
+    id: 'request-truncated',
+    phase: 'ai:runtime:request',
+    details: JSON.stringify({
+      truncated: true,
+      originalCharacters: 200_000,
+      preview: '{"aiInput":{"provider":"openai"',
+    }),
+  };
+  assert.equal(compactBrowserChatLogForClient(log), log);
+});
+
 test('does not alter details used by other timeline phases', () => {
   const log = { id: 'tool', phase: 'ai:tool', details: '{"tool":"browserCode"}' };
   assert.equal(compactBrowserChatLogForClient(log), log);

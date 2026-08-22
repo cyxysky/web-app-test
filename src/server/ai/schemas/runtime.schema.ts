@@ -225,6 +225,9 @@ export type ModelProviderSettings = {
   defaultModel?: string;
   model: string;
   models?: string[];
+  modelCapabilities?: Record<string, {
+    imageInput: boolean;
+  }>;
   apiKey?: string;
   hasApiKey?: boolean;
   baseURL?: string;
