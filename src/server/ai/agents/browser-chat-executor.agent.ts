@@ -2352,6 +2352,12 @@ async function executeRuntimeStep(input: {
             targetFloorTokens,
             targetCeilingTokens,
             thresholdTokens,
+            modelContextStats: {
+              ...messageStats,
+              thresholdRatio,
+              thresholdTokens,
+              windowTokens,
+            },
           },
         });
         const summaryResult = await summarizeContinuation(
@@ -2432,7 +2438,15 @@ async function executeRuntimeStep(input: {
           phase: 'ai:context-compression:complete',
           stepIndex,
           message: `Context compression completed for agent step ${agentStepIndex}.`,
-          details: modelContextSegmentation,
+          details: {
+            ...modelContextSegmentation,
+            modelContextStats: {
+              ...afterStats,
+              thresholdRatio,
+              thresholdTokens,
+              windowTokens,
+            },
+          },
         });
         await onAttemptDebug?.({
           phase: 'ai:context-segmented',

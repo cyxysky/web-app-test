@@ -381,7 +381,8 @@
 
 .browser-chat-management-body {
   background: var(--panel);
-  padding: 0;
+  box-sizing: border-box;
+  padding: 0px 24px 16px 24px;
 }
 
 .browser-chat-management-body .browser-chat-settings-pane {

@@ -142,6 +142,7 @@ test('settings omit unused automatic screenshot and context compression controls
     'AI_VISUAL_COMPRESSED_HISTORY_LIMIT',
     'AI_VISUAL_COMPRESSED_PINNED_LIMIT',
     'AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT',
+    'AI_CONTEXT_COMPRESSION_THRESHOLD',
   ]) {
     assert.equal(runtimeEnvDefinition(key), undefined, `${key} should not be exposed`);
   }

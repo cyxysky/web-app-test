@@ -52,6 +52,7 @@ import {
   estimateRuntimeMessageContext,
   runtimeContextWindowTokens,
 } from '@/server/ai/agents/runtime-context-budget';
+import { browserChatContextUsageFromDebugRecord } from '@/server/ai/agents/browser-chat-context-usage';
 import {
   alignBrowserChatMessageStepIndexes,
   attachBrowserChatStepOwners,
@@ -1989,22 +1990,10 @@ function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChat
 function browserChatContextUsageFromDebugDetails(details: unknown): BrowserChatContextUsage | undefined {
   const unwrapped = unwrapLogDetails(details).value;
   if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) return undefined;
-  const inputTokens = (unwrapped as Record<string, unknown>).aiInputTokens;
-  if (!inputTokens || typeof inputTokens !== 'object' || Array.isArray(inputTokens)) return undefined;
-  const stats = inputTokens as Record<string, unknown>;
-  const currentTokens = Number(stats.estimatedTotalTokens);
-  if (!Number.isFinite(currentTokens) || currentTokens < 0) return undefined;
-  const textTokens = Number(stats.estimatedTextTokens);
-  const imageTokens = Number(stats.estimatedImageTokens);
-  const toolTokens = Number(stats.estimatedToolSchemaTokens);
-  const maxTokens = Number(stats.windowTokens);
-  return {
-    currentTokens: Math.round(currentTokens),
-    imageTokens: Number.isFinite(imageTokens) && imageTokens > 0 ? Math.round(imageTokens) : 0,
-    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.round(maxTokens) : runtimeContextWindowTokens(),
-    textTokens: Number.isFinite(textTokens) && textTokens > 0 ? Math.round(textTokens) : 0,
-    toolTokens: Number.isFinite(toolTokens) && toolTokens > 0 ? Math.round(toolTokens) : 0,
-  };
+  return browserChatContextUsageFromDebugRecord(
+    unwrapped as Record<string, unknown>,
+    runtimeContextWindowTokens(),
+  );
 }
 
 function sessionSnapshotHeader(
@@ -5436,7 +5425,9 @@ async function runBrowserChatMessage(
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
-          if (event.phase === 'ai:runtime:request') {
+          if (event.phase === 'ai:runtime:request'
+            || event.phase === 'ai:context-compression:start'
+            || event.phase === 'ai:context-compression:complete') {
             session.contextUsage = browserChatContextUsageFromDebugDetails(event.details)
               || session.contextUsage;
           }

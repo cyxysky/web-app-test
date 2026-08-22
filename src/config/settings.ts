@@ -241,7 +241,6 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_CONCURRENCY', label: '记忆提取并发数', description: '不同用户可并发提取记忆的全局上限；同一用户始终串行，避免并发写入相互覆盖。', tab: 'runtime', defaultValue: '2', control: 'number', min: 1, max: 8, step: 1 },
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_QUEUE_LIMIT', label: '记忆提取队列上限', description: '等待提取的对话轮次上限；同一会话轮次会自动去重。', tab: 'runtime', defaultValue: '100', control: 'number', min: 10, max: 1000, step: 10 },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '256000', control: 'number' },
-  { key: 'AI_CONTEXT_COMPRESSION_THRESHOLD', label: '上下文压缩阈值', description: '超过上下文窗口多少比例后压缩历史。', tab: 'runtime', defaultValue: '0.7', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
   { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
 

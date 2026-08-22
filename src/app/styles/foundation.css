@@ -764,6 +764,12 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   display: contents;
 }
 
+.app-modal-header,
+.app-modal-body,
+.app-modal-footer {
+  padding: 16px 24px;
+}
+
 .ui-modal.ui-modal--compact,
 .ui-modal.admin-settings-password-dialog {
   --ui-modal-inline-size: 520px;
@@ -826,7 +832,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   background: var(--form-dialog-surface);
   border-bottom: 0;
   min-height: 0;
-  padding: 24px 24px 12px;
+  padding: 16px 24px;
 }
 
 .ui-modal:is(
@@ -837,7 +843,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   .browser-chat-message-generation-dialog
 ) > .ui-modal-body {
   background: var(--form-dialog-surface);
-  padding: 10px 24px 18px;
+  padding: 16px 24px;
 }
 
 .ui-modal:is(
@@ -850,7 +856,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   background: var(--form-dialog-surface);
   border-top: 0;
   min-height: 0;
-  padding: 10px 24px 24px;
+  padding: 16px 24px;
 }
 
 .ui-modal:is(

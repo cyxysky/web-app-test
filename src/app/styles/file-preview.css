@@ -84,7 +84,7 @@
 }
 
 .file-preview-stage > .beautiful-loading-state {
-  padding: 24px;
+  padding: 16px 24px;
 }
 
 .file-preview-error {

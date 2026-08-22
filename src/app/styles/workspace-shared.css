@@ -816,6 +816,11 @@
     justify-items: start;
     scrollbar-gutter: stable;
     transform: none;
+    width: 54px;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .browser-chat-conversation-history .browser-chat-history-stage {
+    overflow: visible;
   }
 
   /* Keep the collapsed history controls centered inside the sidebar. */

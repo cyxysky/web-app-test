@@ -62,7 +62,7 @@
   border: 0;
   border-bottom: 1px solid var(--border);
   border-radius: 0;
-  padding: 20px 24px;
+  padding: 16px 24px;
   width: 100%;
 }
 
@@ -185,7 +185,7 @@
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
-  padding: 20px 24px 24px;
+  padding: 16px 24px;
 }
 
 .browser-chat-tool-dialog-tab {
@@ -446,7 +446,7 @@
 
 .browser-chat-log-dialog .browser-chat-log-dialog-header {
   min-height: 96px;
-  padding: 18px 24px;
+  padding: 16px 24px;
 }
 
 .browser-chat-log-title-row,
@@ -566,7 +566,7 @@
   gap: 18px;
   grid-template-columns: max-content minmax(220px, 1fr);
   min-height: 68px;
-  padding: 12px 24px;
+  padding: 16px 24px;
 }
 
 .browser-chat-log-filters {
@@ -658,7 +658,7 @@
   gap: 10px;
   justify-content: space-between;
   min-height: 52px;
-  padding: 8px 24px;
+  padding: 16px 24px;
 }
 
 .browser-chat-log-round-title {
@@ -705,7 +705,7 @@
   display: grid;
   gap: 10px;
   grid-template-columns: 78px 14px minmax(0, 1fr);
-  padding: 12px 24px 10px;
+  padding: 16px 24px;
 }
 
 .browser-chat-log-entry.is-danger {

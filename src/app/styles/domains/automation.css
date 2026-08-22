@@ -33,9 +33,7 @@
   justify-content: flex-end;
 }
 
-.automation-icon-action,
-.automation-icon-action:hover,
-.automation-icon-action:active {
+.automation-icon-action {
   align-items: center;
   appearance: none;
   background: transparent !important;
@@ -45,16 +43,28 @@
   color: var(--muted-strong);
   cursor: pointer;
   display: inline-flex;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 600;
+  font-family: inherit;
+  font-size: 12px !important;
+  font-weight: 600 !important;
   gap: 7px;
   justify-content: center;
+  line-height: 18px;
   min-height: 34px;
   padding: 0 8px;
   text-decoration: none;
   transition: color var(--motion-fast) ease, opacity var(--motion-fast) ease;
   white-space: nowrap;
+}
+
+.automation-icon-action:hover,
+.automation-icon-action:active {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  color: var(--muted-strong);
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  line-height: 18px;
 }
 
 .automation-icon-action:disabled {

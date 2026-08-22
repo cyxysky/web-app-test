@@ -350,8 +350,6 @@ const en: Record<string, string> = {
   '每个浏览器对话最多保留多少条执行日志；前端日志弹窗使用虚拟滚动。': 'Maximum execution logs retained per browser chat. The frontend log dialog uses virtual scrolling.',
   '上下文窗口大小': 'Context window size',
   '估算模型上下文窗口大小。': 'Estimated model context window size.',
-  '上下文压缩阈值': 'Context compression threshold',
-  '超过上下文窗口多少比例后压缩历史。': 'Compress history after exceeding this share of the context window.',
   '单张图片估算 Token': 'Tokens estimated per image',
   '估算每张截图占用的上下文 token。': 'Estimated context tokens used by each screenshot.',
   '视觉历史上限': 'Visual history limit',

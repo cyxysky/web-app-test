@@ -35,6 +35,10 @@ function splitModalClasses(className?: string) {
   };
 }
 
+function joinModalSectionClasses(baseClassName: string, className?: string) {
+  return [baseClassName, className].filter(Boolean).join(' ');
+}
+
 function stripModalClasses(node: ReactNode): ReactNode {
   return Children.map(node, (child) => {
     if (!isValidElement<ModalContentProps>(child)) return child;
@@ -73,20 +77,20 @@ function renderModalSections(children: ReactNode): ReactNode {
       return cloneElement(child, { children: renderModalSections(child.props.children) });
     }
     if (child.type === 'header' || modalClasses.includes('ui-modal-header')) {
-      return <Modal.Header className={remainingClassName || undefined}>{stripModalClasses(child.props.children)}</Modal.Header>;
+      return <Modal.Header className={joinModalSectionClasses('app-modal-header', remainingClassName)}>{stripModalClasses(child.props.children)}</Modal.Header>;
     }
     if (child.type === 'footer' || modalClasses.includes('ui-modal-footer')) {
-      return <Modal.Footer className={remainingClassName || undefined}>{stripModalClasses(child.props.children)}</Modal.Footer>;
+      return <Modal.Footer className={joinModalSectionClasses('app-modal-footer', remainingClassName)}>{stripModalClasses(child.props.children)}</Modal.Footer>;
     }
     if (modalClasses.includes('ui-modal-body')) {
-      return <Modal.Body className={remainingClassName || undefined}>{stripModalClasses(child.props.children)}</Modal.Body>;
+      return <Modal.Body className={joinModalSectionClasses('app-modal-body', remainingClassName)}>{stripModalClasses(child.props.children)}</Modal.Body>;
     }
     return stripModalClasses(child);
   });
 }
 
 function modalDialogStyle(size: AppModalSize): CSSProperties | undefined {
-  const base: CSSProperties = { boxSizing: 'border-box' };
+  const base: CSSProperties = { boxSizing: 'border-box', padding: 0 };
   switch (size) {
     case 'wide':
       return { ...base, maxWidth: 'min(880px, calc(100vw - 32px))' };
@@ -119,7 +123,7 @@ function modalDialogStyle(size: AppModalSize): CSSProperties | undefined {
         padding: 0,
       };
     default:
-      return undefined;
+      return base;
   }
 }
 
