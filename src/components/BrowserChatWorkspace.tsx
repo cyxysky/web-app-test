@@ -122,6 +122,7 @@ import {
   parseBrowserChatRealtimePatch,
 } from '@/components/browser-chat-realtime-model';
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
+import { browserChatToolValidationSummary } from '@/components/browser-chat-tool-error';
 import {
   resolveEmbeddedBrowserTabLayout,
   resolveEmbeddedBrowserWheelScrollLeft,
@@ -157,6 +158,7 @@ import {
   browserChatArtifactFileName,
   browserChatArtifactIsImage,
   browserChatArtifactsFromSteps,
+  browserChatScreenshotIsInternalDocumentPreview,
   mergeBrowserChatArtifactSummaries,
   type BrowserChatArtifactSummary,
 } from '@/lib/browser-chat-artifacts';
@@ -428,6 +430,7 @@ const BrowserChatScreenshotPreviewContext = createContext<{
 function browserChatRenderableScreenshots(tool: BrowserChatToolCall) {
   const paths = new Set<string>();
   return (tool.screenshots || []).flatMap((screenshot): BrowserChatRenderableScreenshot[] => {
+    if (browserChatScreenshotIsInternalDocumentPreview(tool.name, screenshot)) return [];
     const path = screenshot.path?.trim();
     const url = artifactApiUrl(path);
     if (!path || !url || paths.has(path)) return [];
@@ -1025,43 +1028,56 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
   const details = new Map<string, BrowserChatToolDetail>();
   const persistedToolsById = new Map<string, BrowserChatToolDetail>();
   const persistedTools: BrowserChatToolDetail[] = [];
-  const consumedToolIds = new Set<string>();
+  const consumedPersistedTools = new Set<BrowserChatToolDetail>();
 
   steps.forEach((step) => {
     (step.tools || []).forEach((tool, toolIndex) => {
-      if (!tool.id) return;
       const detail = {
         stepIndex: step.index,
         step,
         toolIndex,
         tool,
       };
-      persistedToolsById.set(tool.id, detail);
+      if (tool.id) persistedToolsById.set(tool.id, detail);
       persistedTools.push(detail);
     });
   });
 
   cycles.forEach((cycle) => {
+    const unmatched: Array<{ aiTool: BrowserChatAiOutputTool; aiToolIndex: number }> = [];
+    let matchedInCycle = false;
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
       let detail = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
-      if (detail && detail.tool.name === aiTool.name && (
-        typeof cycle.stepIndex !== 'number' || detail.stepIndex === cycle.stepIndex
-      )) {
+      if (detail && consumedPersistedTools.has(detail)) return;
+      if (detail && detail.tool.name === aiTool.name) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-        if (detail.tool.id) consumedToolIds.add(detail.tool.id);
+        consumedPersistedTools.add(detail);
+        matchedInCycle = true;
         return;
       }
       detail = persistedTools.find((candidate) => (
-        !consumedToolIds.has(candidate.tool.id || '')
+        !consumedPersistedTools.has(candidate)
         && candidate.tool.name === aiTool.name
         && (typeof cycle.stepIndex !== 'number' || candidate.stepIndex === cycle.stepIndex)
         && toolInputSignature(candidate.tool.input) === toolInputSignature(aiTool.input)
       ));
       if (detail) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-        if (detail.tool.id) consumedToolIds.add(detail.tool.id);
+        consumedPersistedTools.add(detail);
+        matchedInCycle = true;
         return;
       }
+      unmatched.push({ aiTool, aiToolIndex });
+    });
+
+    let optimisticToolShown = false;
+    unmatched.forEach(({ aiTool, aiToolIndex }) => {
+      // A provider may emit several calls in one response while the runtime is
+      // intentionally limited to one executed tool per model step. Once one
+      // call from the cycle has a real trace, the remaining valid calls are
+      // proposals that were never executed, not additional running tools.
+      if (!aiTool.invalid && (matchedInCycle || !running || optimisticToolShown)) return;
+      if (!aiTool.invalid) optimisticToolShown = true;
       const stepIndex = typeof cycle.stepIndex === 'number' ? cycle.stepIndex : -1;
       const pendingExecution = running && !aiTool.invalid;
       const parseError = aiTool.invalid
@@ -2917,7 +2933,7 @@ function BrowserChatScreenshotPreviewDialog({
               <SquareArrowOutUpRight size={15} />
               {t('打开原图')}
             </a>
-            <button aria-label={t('关闭')} className="ui-modal-close" onClick={onClose} type="button"><X size={17} /></button>
+            <button aria-label={t('关闭')} className="browser-chat-tool-image-dialog-close" onClick={onClose} type="button"><X size={17} /></button>
           </div>
         </header>
         <div className="browser-chat-tool-image-stage">
@@ -3229,7 +3245,9 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     <>
       {toolCalls.map(({ tool, toolIndex }) => {
         const label = browserChatToolLabel(tool.name, t);
-        const meta = compactText(tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
+        const meta = tool.invalid
+          ? browserChatToolValidationSummary(tool.error || tool.result)
+          : compactText(tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
         const presentation = browserChatToolPresentation(tool, step, running);
         const { isActive: isActiveTool, stateClass, status } = presentation;
@@ -3242,6 +3260,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           toolOk: tool.ok,
         });
         if (onlyPendingConfirmation && !pendingConfirmation) return null;
+        const visibleMeta = [meta, pendingConfirmation ? t('等待用户确认') : translatedStatus].filter(Boolean).join(' · ');
         const userAction = pendingConfirmation
           ? undefined
           : toolUserActionForTool(logs, step.index, tool.name, tool.input);
@@ -3254,7 +3273,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
               <BrowserChatSubagentToolDisclosure
                 batchId={tool.id}
                 cardContent={(
-                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={meta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
                 )}
                 className={stateClass}
                 isActive={isActiveTool}
@@ -3280,7 +3299,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                   onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
                   type="button"
                 >
-                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={meta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
                   {isActiveTool ? <BrowserChatToolTailParticles /> : null}
                 </button>
                 <BrowserChatToolScreenshotButton tool={tool} />
@@ -3384,10 +3403,10 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const executedTool = toolDetail.tool;
         const label = browserChatToolLabel(executedTool.name, t);
         const meta = executedTool.invalid
-          ? executedTool.error || String(executedTool.result || '') || t('工具参数解析失败：没有错误详情')
+          ? browserChatToolValidationSummary(executedTool.error || executedTool.result)
           : executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
         const presentation = browserChatToolPresentation(executedTool, toolDetail.step, running);
-        const { isActive, stateClass } = presentation;
+        const { isActive, stateClass, status } = presentation;
         const pendingConfirmation = pendingConfirmationForTool({
           pending: pendingToolConfirmation,
           stepIndex: toolDetail.stepIndex,
@@ -3398,11 +3417,13 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const userAction = pendingConfirmation
           ? undefined
           : toolUserActionForTool(logs, toolDetail.stepIndex, executedTool.name, executedTool.input);
+        const compactMeta = executedTool.invalid ? meta : meta ? compactText(meta, 150) : undefined;
+        const visibleMeta = [compactMeta, pendingConfirmation ? t('等待用户确认') : t(status)].filter(Boolean).join(' · ');
         const card = (
           <BrowserChatToolCardContent
             active={isActive}
             label={label}
-            meta={meta ? compactText(meta, 150) : undefined}
+            meta={visibleMeta}
             name={executedTool.name}
             userAction={userAction}
           />

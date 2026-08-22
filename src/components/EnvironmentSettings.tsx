@@ -1453,7 +1453,9 @@ export function EnvironmentSettings({
                   <div className="settings-row">
                     <div>
                       <strong>{t(activeProviderOption.baseUrlLabel)}</strong>
-                      <span>{t('自定义兼容服务地址，留空使用默认地址。')}</span>
+                      <span>{t(activeProvider === 'openai-compatible'
+                        ? '填写服务商提供的 OpenAI 兼容 Base URL，通常以 /v1 结尾。'
+                        : '自定义兼容服务地址，留空使用默认地址。')}</span>
                     </div>
                     <AppInput value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || t('默认地址')} />
                   </div>

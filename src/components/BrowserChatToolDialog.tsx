@@ -5,6 +5,7 @@ import { Check, Copy, X } from 'lucide-react';
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { artifactApiUrl } from '@/lib/artifacts';
+import { browserChatScreenshotIsInternalDocumentPreview } from '@/lib/browser-chat-artifacts';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { AppModal } from '@/components/ui/app-modal';
 
@@ -109,6 +110,9 @@ export function BrowserChatToolDialog({
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
   const resultPayload = formatToolPayload(completeResult);
+  const visibleScreenshots = (detail.tool.screenshots || []).filter((screenshot) => (
+    !browserChatScreenshotIsInternalDocumentPreview(detail.tool.name, screenshot)
+  ));
 
   useEffect(() => () => {
     if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
@@ -178,12 +182,12 @@ export function BrowserChatToolDialog({
             </section>
           </div>
 
-          {detail.confirmationScreenshotUrl || detail.tool.screenshots?.length ? (
+          {detail.confirmationScreenshotUrl || visibleScreenshots.length ? (
             <section className="browser-chat-tool-detail-section browser-chat-tool-screenshots">
               <h3>{t('截图记录')}</h3>
               <div className="browser-chat-tool-shot-grid">
                 {detail.confirmationScreenshotUrl ? <a className="browser-chat-tool-shot-card" href={detail.confirmationScreenshotUrl} rel="noopener noreferrer" target="_blank"><img alt={t('用户确认时的页面截图')} src={detail.confirmationScreenshotUrl} /><span><strong>{t('操作前确认截图')}</strong><code>{detail.confirmationScreenshotUrl}</code></span></a> : null}
-                {detail.tool.screenshots?.map((shot, index) => {
+                {visibleScreenshots.map((shot, index) => {
                   const url = artifactApiUrl(shot.path);
                   return <a className="browser-chat-tool-shot-card" href={url || '#'} key={`${shot.path}-${index}-preview`} onClick={(event) => { if (!url) event.preventDefault(); }} rel="noopener noreferrer" target="_blank">{url ? <img alt={shot.title || t(screenshotKindLabel(shot.kind))} src={url} /> : null}<span><strong>{t(screenshotKindLabel(shot.kind))} · {shot.title || t('截图 {index}', { index: index + 1 })}</strong><code>{shot.path}</code></span></a>;
                 })}

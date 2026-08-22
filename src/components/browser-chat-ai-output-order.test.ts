@@ -67,7 +67,7 @@ test('matches persisted tool traces only by exact call ID', () => {
   assert.equal(details.get('cycle-2:0')?.tool.id, 'read-2');
 });
 
-test('pairs legacy traces by step, tool name, and normalized input when provider call IDs changed', () => {
+test('pairs each legacy trace once and hides later provider calls that were never executed', () => {
   const toolCycle = (id: string, sourceCycleId: string, fileName: string) => ({
     id,
     sourceCycleId,
@@ -100,11 +100,11 @@ test('pairs legacy traces by step, tool name, and normalized input when provider
   assert.equal(details.get('provider-call-1:0')?.tool.id, 'legacy-trace-1');
   assert.equal(details.get('provider-call-ignored-2:0')?.tool.id, 'legacy-trace-2');
   assert.equal(details.get('provider-call-ignored-3:0')?.tool.id, 'legacy-trace-3');
-  assert.equal(details.get('provider-call-4:0')?.tool.id, 'provider-call-4');
-  assert.equal(details.get('provider-call-5:0')?.step.status, 'failed');
+  assert.equal(details.get('provider-call-4:0'), undefined);
+  assert.equal(details.get('provider-call-5:0'), undefined);
 });
 
-test('shows unmatched requests while still matching later exact tool IDs', () => {
+test('hides unmatched provider proposals while still matching later exact tool IDs', () => {
   const steps: StepExecutionResult[] = [{
     index: 2,
     action: 'read attendance',
@@ -155,10 +155,70 @@ test('shows unmatched requests while still matching later exact tool IDs', () =>
     },
   ], steps);
 
-  assert.equal(details.get('phantom-cycle:0')?.tool.id, 'unexecuted-call');
-  assert.equal(details.get('phantom-cycle:0')?.tool.ok, false);
+  assert.equal(details.get('phantom-cycle:0'), undefined);
   assert.equal(details.get('hover-cycle:0')?.tool.id, 'executed-hover');
   assert.equal(details.get('read-cycle:0')?.tool.id, 'executed-read');
+});
+
+test('does not render extra calls from a provider response after one call has a real trace', () => {
+  const output = aiOutputViewFromResponse({
+    content: [
+      { type: 'tool-call', toolCallId: 'spawn-1', toolName: 'subagent', input: { action: 'spawn' } },
+      { type: 'tool-call', toolCallId: 'state-never-ran', toolName: 'readBrowserState', input: {} },
+    ],
+  });
+  const details = buildAiCycleToolDetailMap([{
+    id: 'multi-call-cycle',
+    output,
+    stepIndex: 1,
+  }], [{
+    index: 1,
+    action: 'spawn',
+    actual: 'blocked by prerequisite',
+    expected: '',
+    status: 'failed',
+    tools: [{ id: 'spawn-1', name: 'subagent', input: { action: 'spawn' }, ok: false }],
+  }], true);
+
+  assert.equal(details.get('multi-call-cycle:0')?.tool.id, 'spawn-1');
+  assert.equal(details.get('multi-call-cycle:1'), undefined);
+});
+
+test('shows at most one optimistic tool before its trace arrives', () => {
+  const output = aiOutputViewFromResponse({
+    content: [
+      { type: 'tool-call', toolCallId: 'first', toolName: 'readBrowserState', input: {} },
+      { type: 'tool-call', toolCallId: 'second', toolName: 'subagent', input: { action: 'spawn' } },
+    ],
+  });
+  const details = buildAiCycleToolDetailMap([{
+    id: 'pending-cycle',
+    output,
+    stepIndex: 2,
+  }], [], true);
+
+  assert.equal(details.get('pending-cycle:0')?.tool.id, 'first');
+  assert.equal(details.get('pending-cycle:1'), undefined);
+});
+
+test('does not consume one persisted tool trace in duplicate provider cycles', () => {
+  const output = aiOutputViewFromResponse({
+    content: [{ type: 'tool-call', toolCallId: 'same-call', toolName: 'readBrowserState', input: {} }],
+  });
+  const details = buildAiCycleToolDetailMap([
+    { id: 'first-cycle', output, stepIndex: 1 },
+    { id: 'duplicate-cycle', output, stepIndex: 1 },
+  ], [{
+    index: 1,
+    action: 'read state',
+    actual: 'done',
+    expected: '',
+    status: 'passed',
+    tools: [{ id: 'same-call', name: 'readBrowserState', input: {}, ok: true }],
+  }], true);
+
+  assert.equal(details.get('first-cycle:0')?.tool.id, 'same-call');
+  assert.equal(details.get('duplicate-cycle:0'), undefined);
 });
 
 test('renders invalid tool calls even when argument parsing prevented execution', () => {

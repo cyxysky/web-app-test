@@ -22,6 +22,7 @@ test('visibleBrowserChatExecutionLogs keeps ai, tool, context, and screenshot lo
     { phase: 'subagent:child-1:ai:tool', message: 'readFile -> started' },
     { phase: 'subagent:child-1:ai:tool', message: 'readFile -> ok' },
     { phase: 'conversation:context:response' },
+    { phase: 'ai:document-visual-qa:queued' },
     { phase: 'browser:screenshot:capture' },
     { phase: 'chat:message' },
   ];
@@ -39,6 +40,7 @@ test('visibleBrowserChatExecutionLogs keeps ai, tool, context, and screenshot lo
     'ai:tool',
     'subagent:child-1:ai:tool',
     'conversation:context:response',
+    'ai:document-visual-qa:queued',
     'browser:screenshot:capture',
   ]);
 });

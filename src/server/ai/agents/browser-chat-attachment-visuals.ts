@@ -31,7 +31,12 @@ const docxExtensions = new Set(['.docx']);
 const spreadsheetExtensions = readableFileExtensions('spreadsheet');
 
 function normalizedPages(value: unknown, pageCount?: number) {
-  const source = Array.isArray(value) && value.length ? value : defaultPreviewPages;
+  const representative = pageCount && pageCount > maxPreviewPagesPerRead
+    ? [1, 2, Math.max(3, Math.round(pageCount / 2)), Math.max(1, pageCount - 1), pageCount]
+    : pageCount
+      ? Array.from({ length: pageCount }, (_, index) => index + 1)
+      : defaultPreviewPages;
+  const source = Array.isArray(value) && value.length ? value : representative;
   const pages = Array.from(new Set(source
     .map((item) => Number(item))
     .filter((item) => Number.isSafeInteger(item) && item > 0 && (!pageCount || item <= pageCount))))

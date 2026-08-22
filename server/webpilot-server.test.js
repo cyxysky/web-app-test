@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -7,6 +8,7 @@ const test = require('node:test');
 const {
   applyTrustedIdentityHeaders,
   applicationBasePath,
+  createApiRuntimeSupervisor,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
   loadCompiledNextConfig,
@@ -57,6 +59,46 @@ test('isolates API routes in the runtime process while keeping shutdown in the U
   assert.equal(runtimeApiRequest('/api/artifacts/chat-1/image.png'), true);
   assert.equal(runtimeApiRequest('/api/system/shutdown'), false);
   assert.equal(runtimeApiRequest('/browser-chat'), false);
+});
+
+test('restarts the API runtime after the child process exits', async () => {
+  let starts = 0;
+  const runtimes = [];
+  const supervisor = createApiRuntimeSupervisor({
+    appDir: process.cwd(),
+    dev: true,
+    externalPort: 3000,
+    restartDelayMs: 1,
+    startRuntime: async () => {
+      starts += 1;
+      const child = new EventEmitter();
+      child.exitCode = null;
+      child.killed = false;
+      child.kill = () => {
+        child.killed = true;
+        child.exitCode = 0;
+      };
+      const runtime = {
+        child,
+        hostname: '127.0.0.1',
+        port: 41_000 + starts,
+        ready: Promise.resolve(),
+      };
+      runtimes.push(runtime);
+      return runtime;
+    },
+  });
+
+  const first = await supervisor.ensure();
+  first.child.exitCode = 1;
+  first.child.emit('exit', 1, null);
+  const second = await supervisor.ensure();
+
+  assert.equal(first.port, 41_001);
+  assert.equal(second.port, 41_002);
+  assert.equal(starts, 2);
+  supervisor.stop();
+  assert.equal(runtimes[1].child.killed, true);
 });
 
 test('routes realtime upgrades through the configured public base path', () => {

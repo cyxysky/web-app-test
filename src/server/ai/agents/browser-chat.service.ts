@@ -1865,6 +1865,9 @@ function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[
 
 function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChatContextUsage {
   const fallbackMax = runtimeContextWindowTokens();
+  if (session.contextUsage && session.contextUsage.currentTokens > 0) {
+    return session.contextUsage;
+  }
   for (let index = session.steps.length - 1; index >= 0; index -= 1) {
     const rawStats = session.steps[index]?.aiRequest?.options?.modelContextStats;
     if (!rawStats || typeof rawStats !== 'object' || Array.isArray(rawStats)) continue;
@@ -1900,6 +1903,27 @@ function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChat
     maxTokens: fallbackMax,
     textTokens: estimated.textTokens,
     toolTokens: 0,
+  };
+}
+
+function browserChatContextUsageFromDebugDetails(details: unknown): BrowserChatContextUsage | undefined {
+  const unwrapped = unwrapLogDetails(details).value;
+  if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) return undefined;
+  const inputTokens = (unwrapped as Record<string, unknown>).aiInputTokens;
+  if (!inputTokens || typeof inputTokens !== 'object' || Array.isArray(inputTokens)) return undefined;
+  const stats = inputTokens as Record<string, unknown>;
+  const currentTokens = Number(stats.estimatedTotalTokens);
+  if (!Number.isFinite(currentTokens) || currentTokens < 0) return undefined;
+  const textTokens = Number(stats.estimatedTextTokens);
+  const imageTokens = Number(stats.estimatedImageTokens);
+  const toolTokens = Number(stats.estimatedToolSchemaTokens);
+  const maxTokens = Number(stats.windowTokens);
+  return {
+    currentTokens: Math.round(currentTokens),
+    imageTokens: Number.isFinite(imageTokens) && imageTokens > 0 ? Math.round(imageTokens) : 0,
+    maxTokens: Number.isFinite(maxTokens) && maxTokens > 0 ? Math.round(maxTokens) : runtimeContextWindowTokens(),
+    textTokens: Number.isFinite(textTokens) && textTokens > 0 ? Math.round(textTokens) : 0,
+    toolTokens: Number.isFinite(toolTokens) && toolTokens > 0 ? Math.round(toolTokens) : 0,
   };
 }
 
@@ -4043,6 +4067,8 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'ai:runtime:partial') return '工具已执行，正在继续判断';
   if (phase === 'ai:context-compressed') return '正在整理上下文';
   if (phase === 'ai:visual-context') return '正在更新视觉上下文';
+  if (phase === 'ai:document-visual-qa:queued') return '文档预览已生成，正在交给模型检查';
+  if (phase === 'ai:document-visual-qa:unavailable') return '文档预览已验证，当前模型未启用图片检查';
   if (phase === 'tool:confirmation:pending') return '等待用户确认工具调用';
   if (phase === 'tool:confirmation:confirmed') return '用户已确认，正在继续执行工具';
   if (phase === 'tool:confirmation:cancelled') return '用户已取消工具调用，正在继续本轮对话';
@@ -5141,6 +5167,7 @@ async function runBrowserChatMessage(
 ) {
   const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
   return withModelSettings(modelSettings, async () => {
+    session.contextUsage = undefined;
     const assertTurnActive = () => {
       if (isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       throw abortController.signal.reason || new Error('Browser chat operation interrupted by user.');
@@ -5265,6 +5292,10 @@ async function runBrowserChatMessage(
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          if (event.phase === 'ai:runtime:request') {
+            session.contextUsage = browserChatContextUsageFromDebugDetails(event.details)
+              || session.contextUsage;
+          }
           const outputCycle = browserChatAiOutputCycleFromDebugEvent({
             details: event.details,
             id: id('cycle'),
@@ -5281,7 +5312,8 @@ async function runBrowserChatMessage(
             || event.phase === 'ai:runtime:attempt-succeeded'
             || event.phase === 'ai:runtime:retry'
             || event.phase === 'ai:runtime:retry-exhausted'
-            || event.phase === 'ai:runtime:retry-skipped';
+            || event.phase === 'ai:runtime:retry-skipped'
+            || event.phase.startsWith('ai:document-visual-qa:');
           appendLog(session, event.phase, event.message, {
             stepIndex: event.stepIndex,
             elapsedMs: elapsedFromDetails(event.details),

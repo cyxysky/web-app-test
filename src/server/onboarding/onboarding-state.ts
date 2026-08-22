@@ -167,7 +167,10 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const providerDefinition = modelProviderDefinition(provider);
   const providerSettings = modelState.config.providers?.[provider];
   const localProvider = ['codex', 'llama-cpp', 'lmstudio', 'ollama'].includes(provider);
-  const modelReady = Boolean(providerSettings?.enabled && providerSettings.model && (providerDefinition.localAuth || localProvider || providerSettings.hasApiKey));
+  const customCompatibleReady = provider === 'openai-compatible' && Boolean(providerSettings?.baseURL);
+  const modelReady = Boolean(providerSettings?.enabled && providerSettings.model && (
+    providerDefinition.localAuth || localProvider || customCompatibleReady || providerSettings.hasApiKey
+  ));
   const screenshotSetting = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase();
   const selectedModel = String(providerSettings?.model || '').toLowerCase();
   const visionReady = screenshotSetting === 'true'

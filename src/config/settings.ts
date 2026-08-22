@@ -34,8 +34,24 @@ export type RuntimeEnvDefinition = {
   secret?: boolean;
 };
 
+export function normalizeMiniMaxOpenAIBaseURL(baseURL: string | undefined) {
+  const officialAnthropicEndpoint = baseURL?.trim().match(
+    /^(https:\/\/api\.(?:minimax\.io|minimaxi\.com))\/anthropic(?:\/v1)?\/?$/i,
+  );
+  return officialAnthropicEndpoint
+    ? `${officialAnthropicEndpoint[1]}/v1`
+    : baseURL;
+}
+
 export const modelProviderDefinitions: ModelProviderDefinition[] = [
   { value: 'openai', label: 'OpenAI', defaultModel: 'gpt-5.5', keyLabel: 'OpenAI 访问密钥', baseUrlLabel: 'OpenAI 服务地址' },
+  {
+    value: 'openai-compatible',
+    label: 'OpenAI 兼容接口',
+    defaultModel: 'custom-model',
+    keyLabel: '兼容接口访问密钥',
+    baseUrlLabel: '兼容接口 Base URL',
+  },
   { value: 'openrouter', label: 'OpenRouter', defaultModel: 'qwen/qwen3.6-27b', keyLabel: 'OpenRouter 访问密钥' },
   { value: 'ollama', label: 'Ollama', defaultModel: 'llama3.1', keyLabel: 'Ollama 访问密钥（可选）', baseUrlLabel: 'Ollama 服务地址', defaultBaseURL: 'http://localhost:11434/v1' },
   { value: 'llama-cpp', label: 'llama.cpp', defaultModel: 'local-model', keyLabel: 'llama.cpp 访问密钥（可选）', baseUrlLabel: 'llama.cpp 服务地址', defaultBaseURL: 'http://localhost:8080/v1' },
@@ -66,7 +82,7 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
     ],
     keyLabel: 'MiniMax 访问密钥',
     baseUrlLabel: 'MiniMax 服务地址',
-    defaultBaseURL: 'https://api.minimax.io/anthropic/v1',
+    defaultBaseURL: 'https://api.minimax.io/v1',
   },
   {
     value: 'deepseek',

@@ -15,6 +15,7 @@ test('stores generated files in the session generated-artifact directory', async
   process.env.ARTIFACTS_DIR = root;
   try {
     const planned = await planFileArtifact({
+      documentId: 'result-spreadsheet',
       documentType: 'spreadsheet',
       fileName: 'result.csv',
       runId: 'chat_test',
@@ -33,11 +34,44 @@ test('stores generated files in the session generated-artifact directory', async
     assert.equal(payload.kind, 'generated');
     assert.equal(payload.artifactId, 'chat_test/generated/result.csv');
     assert.equal(await readFile(payload.path || '', 'utf8'), 'name,value\nstatus,passed\n');
+    const replanned = await planFileArtifact({
+      documentId: 'result-spreadsheet',
+      documentType: 'spreadsheet',
+      fileName: 'renamed-result.csv',
+      runId: 'chat_test',
+    });
+    assert.equal(replanned.ok, true, replanned.actual);
+    assert.deepEqual(
+      (({ documentId, fileName, blockCount, reused }) => ({ documentId, fileName, blockCount, reused }))(
+        JSON.parse(replanned.actual || '{}') as { documentId?: string; fileName?: string; blockCount?: number; reused?: boolean },
+      ),
+      { documentId: 'result-spreadsheet', fileName: 'result.csv', blockCount: 1, reused: true },
+    );
+    const second = await generateFileArtifactBlocks({
+      blocks: [{ id: 'more-data', type: 'table', rows: [['next', 'revision']] }],
+      documentId,
+      includeVisualVerification: false,
+      render: true,
+      runId: 'chat_test',
+    });
+    assert.equal(second.ok, true, second.actual);
+    const secondPayload = JSON.parse(second.actual || '{}') as { artifactId?: string };
+    assert.equal(secondPayload.artifactId, payload.artifactId);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
     await rm(root, { force: true, recursive: true });
   }
+});
+
+test('requires the model to choose a stable documentId during plan', async () => {
+  const planned = await planFileArtifact({
+    documentType: 'word',
+    fileName: 'report.docx',
+    runId: 'chat_test',
+  });
+  assert.equal(planned.ok, false);
+  assert.match(planned.actual || '', /stable model-chosen documentId/);
 });
 
 test('does not append a download section for files already exposed as message artifacts', () => {

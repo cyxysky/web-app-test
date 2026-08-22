@@ -52,3 +52,109 @@ function restoreEnvironmentValue(name: string, value: string | undefined) {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
 }
+
+test('MiniMax uses the OpenAI-compatible endpoint and tool schema', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousMiniMaxBaseURL = process.env.MINIMAX_BASE_URL;
+  const previousMiniMaxApiKey = process.env.MINIMAX_API_KEY;
+  let requestUrl = '';
+  let requestBody: Record<string, unknown> = {};
+
+  globalThis.fetch = async (input, init) => {
+    requestUrl = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input.url;
+    requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    throw new Error('openai-compatible-provider-called');
+  };
+  process.env.MINIMAX_BASE_URL = 'https://api.minimaxi.com/anthropic/v1';
+  process.env.MINIMAX_API_KEY = 'test-key';
+
+  try {
+    const model = withModelSettings(
+      { provider: 'minimax', model: 'minimax-m3' },
+      () => getModel(),
+    ) as LanguageModelV4;
+    const call = {
+      ...minimalCall,
+      tools: [{
+        type: 'function',
+        name: 'file',
+        description: 'Create a document',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            blocks: { type: 'array', items: { type: 'object' } },
+            render: { type: 'boolean' },
+          },
+          required: ['blocks'],
+        },
+      }],
+    } as LanguageModelV4CallOptions;
+
+    await assert.rejects(
+      async () => await model.doGenerate(call),
+      /openai-compatible-provider-called/,
+    );
+    assert.equal(requestUrl, 'https://api.minimaxi.com/v1/chat/completions');
+    assert.equal(requestBody.reasoning_split, true);
+    assert.deepEqual(requestBody.tools, [{
+      type: 'function',
+      function: {
+        name: 'file',
+        description: 'Create a document',
+        parameters: {
+          type: 'object',
+          properties: {
+            blocks: { type: 'array', items: { type: 'object' } },
+            render: { type: 'boolean' },
+          },
+          required: ['blocks'],
+        },
+      },
+    }]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnvironmentValue('MINIMAX_BASE_URL', previousMiniMaxBaseURL);
+    restoreEnvironmentValue('MINIMAX_API_KEY', previousMiniMaxApiKey);
+  }
+});
+
+test('custom OpenAI-compatible provider uses its independent Base URL and key', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousBaseURL = process.env.OPENAI_COMPATIBLE_BASE_URL;
+  const previousApiKey = process.env.OPENAI_COMPATIBLE_API_KEY;
+  let requestUrl = '';
+  let authorization = '';
+
+  globalThis.fetch = async (input, init) => {
+    requestUrl = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input.url;
+    authorization = new Headers(init?.headers).get('authorization') || '';
+    throw new Error('custom-openai-compatible-provider-called');
+  };
+  process.env.OPENAI_COMPATIBLE_BASE_URL = 'https://gateway.example/v1';
+  process.env.OPENAI_COMPATIBLE_API_KEY = 'custom-key';
+
+  try {
+    const model = withModelSettings(
+      { provider: 'openai-compatible', model: 'vendor-model' },
+      () => getModel(),
+    ) as LanguageModelV4;
+    await assert.rejects(
+      async () => await model.doGenerate(minimalCall),
+      /custom-openai-compatible-provider-called/,
+    );
+    assert.equal(requestUrl, 'https://gateway.example/v1/chat/completions');
+    assert.equal(authorization, 'Bearer custom-key');
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnvironmentValue('OPENAI_COMPATIBLE_BASE_URL', previousBaseURL);
+    restoreEnvironmentValue('OPENAI_COMPATIBLE_API_KEY', previousApiKey);
+  }
+});

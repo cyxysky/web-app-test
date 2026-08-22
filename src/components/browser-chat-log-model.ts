@@ -82,6 +82,11 @@ export function isBrowserChatAiAttemptLog(log: BrowserChatLogRecordLike) {
     || isBrowserChatAiFailureLog(log);
 }
 
+export function isBrowserChatDocumentVisualQaLog(log: BrowserChatLogRecordLike) {
+  return phaseMatches(log, 'ai:document-visual-qa:queued')
+    || phaseMatches(log, 'ai:document-visual-qa:unavailable');
+}
+
 export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
   return log.phase.startsWith('target:plan:') || log.phase.includes(':target:plan:');
 }
@@ -89,6 +94,7 @@ export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
 export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
   return isBrowserChatAiInputOutputLog(log)
     || isBrowserChatAiAttemptLog(log)
+    || isBrowserChatDocumentVisualQaLog(log)
     || isBrowserChatTargetPlanningLog(log);
 }
 

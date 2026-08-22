@@ -41,6 +41,10 @@ export type OfficeBlockStyle = {
   opacity?: number;
   padding?: number | number[];
   rotation?: number;
+  shadow?: boolean | Record<string, unknown>;
+  textAlign?: 'center' | 'justify' | 'left' | 'right';
+  text?: string;
+  unit?: 'cm' | 'in' | 'mm' | 'pt' | 'px';
   width?: number | string;
   x?: number | string;
   y?: number | string;
@@ -66,6 +70,8 @@ export type OfficeBlock = {
   svg?: string;
   text?: string;
   title?: string;
+  unoProperties?: Record<string, unknown>;
+  unoService?: string;
   [property: string]: unknown;
 };
 
@@ -86,6 +92,7 @@ export type OfficeDocumentSettings = {
     marginTop?: number;
     orientation?: 'landscape' | 'portrait';
     showPageNumber?: boolean;
+    unit?: 'cm' | 'in' | 'mm' | 'pt' | 'px';
     width?: number;
     [property: string]: unknown;
   };
@@ -112,6 +119,7 @@ export type OfficeDocumentDraft = OfficeDocumentSpec & {
   documentId: string;
   intent?: string;
   outline?: OfficeDocumentOutlineItem[];
+  renderedFileName?: string;
   updatedAt: string;
 };
 

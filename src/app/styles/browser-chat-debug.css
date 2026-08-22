@@ -726,7 +726,7 @@
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   line-height: 18px;
-  padding-top: 0;
+  padding-top: 3px;
   white-space: nowrap;
 }
 
@@ -746,7 +746,7 @@
   height: 12px;
   left: 1px;
   position: absolute;
-  top: 3px;
+  top: 7px;
   width: 12px;
   z-index: 1;
 }
@@ -757,7 +757,7 @@
   content: '';
   left: 6.5px;
   position: absolute;
-  top: 17px;
+  top: 21px;
   width: 1px;
 }
 
@@ -1124,6 +1124,14 @@
   .browser-chat-log-marker {
     grid-column: 1;
     grid-row: 1 / span 2;
+  }
+
+  .browser-chat-log-marker::before {
+    top: 3px;
+  }
+
+  .browser-chat-log-marker::after {
+    top: 17px;
   }
 
   .browser-chat-log-entry-content {

@@ -2,12 +2,17 @@ import path from 'node:path';
 import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '@/server/files/file-format-registry';
 import { generateOfficeDocument } from '@/server/files/libreoffice';
 import type { OfficeBlock, OfficeCellValue, OfficeDocumentSpec } from '@/server/files/office-document-spec';
+import {
+  normalizeOfficeDocumentSpec,
+  validateOfficeDocumentStructure,
+} from '@/server/files/office-document-normalizer';
 
 export type GeneratedFileCell = OfficeCellValue;
 export type GeneratedFileInput = OfficeDocumentSpec;
 
 export type GeneratedFileOutput = {
   buffer: Buffer;
+  diagnostics?: unknown;
   extension: string;
 };
 
@@ -100,9 +105,13 @@ export async function generateFileBuffer(input: GeneratedFileInput): Promise<Gen
     if (!content) throw new Error('Text file generation requires at least one textual block.');
     return { buffer: Buffer.from(`${content}\n`, 'utf8'), extension };
   }
-  validateOfficeSpec(input, extension);
+  const normalized = normalizeOfficeDocumentSpec(input);
+  validateOfficeSpec(normalized, extension);
+  validateOfficeDocumentStructure(normalized, extension);
+  const generated = await generateOfficeDocument({ ...normalized, fileName: path.basename(normalized.fileName) });
   return {
-    buffer: await generateOfficeDocument({ ...input, fileName: path.basename(input.fileName) }),
+    buffer: generated.buffer,
+    diagnostics: generated.report,
     extension,
   };
 }

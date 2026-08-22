@@ -2931,7 +2931,9 @@ button.browser-chat-message-artifact-card {
   text-decoration: none;
 }
 
-.browser-chat-tool-image-dialog-actions button {
+.browser-chat-tool-image-dialog-actions button,
+.browser-chat-tool-image-dialog-close {
+  flex: 0 0 34px;
   padding: 0;
   width: 34px;
 }

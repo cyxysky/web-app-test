@@ -258,7 +258,98 @@ async function startApiRuntimeChild({ appDir, dev, externalPort }) {
   return { child, hostname, port, ready: waitForInternalPort(port, hostname, child) };
 }
 
-function proxyHttpRequest(request, response, target) {
+function createApiRuntimeSupervisor({
+  appDir,
+  dev,
+  externalPort,
+  startRuntime = startApiRuntimeChild,
+  restartDelayMs = 250,
+}) {
+  let current;
+  let starting;
+  let restartTimer;
+  let stopped = false;
+
+  const clearRestartTimer = () => {
+    if (!restartTimer) return;
+    clearTimeout(restartTimer);
+    restartTimer = undefined;
+  };
+
+  const scheduleRestart = () => {
+    if (stopped || restartTimer) return;
+    restartTimer = setTimeout(() => {
+      restartTimer = undefined;
+      void ensure().catch((error) => {
+        console.error('[webpilot-server] API runtime restart failed; retrying.', error);
+        scheduleRestart();
+      });
+    }, restartDelayMs);
+    restartTimer.unref?.();
+  };
+
+  const start = async () => {
+    const runtime = await startRuntime({ appDir, dev, externalPort });
+    if (stopped) {
+      if (!runtime.child.killed) runtime.child.kill('SIGTERM');
+      throw new Error('API runtime supervisor is stopped.');
+    }
+    current = runtime;
+    runtime.child.once('exit', (code, signal) => {
+      if (current !== runtime) return;
+      current = undefined;
+      if (stopped) return;
+      console.error(`[webpilot-server] API runtime exited (${code ?? 'unknown'}${signal ? `, ${signal}` : ''}); restarting.`);
+      scheduleRestart();
+    });
+    try {
+      await runtime.ready;
+      if (current !== runtime) throw new Error('API runtime exited before it became available.');
+      return runtime;
+    } catch (error) {
+      if (current === runtime) current = undefined;
+      if (!runtime.child.killed) runtime.child.kill('SIGTERM');
+      scheduleRestart();
+      throw error;
+    }
+  };
+
+  const ensure = () => {
+    if (stopped) return Promise.reject(new Error('API runtime supervisor is stopped.'));
+    clearRestartTimer();
+    if (current && current.child.exitCode == null && !current.child.killed) {
+      const runtime = current;
+      return Promise.resolve(runtime.ready).then(() => {
+        if (current !== runtime) return ensure();
+        return runtime;
+      });
+    }
+    if (starting) return starting;
+    starting = start().finally(() => {
+      starting = undefined;
+    });
+    return starting;
+  };
+
+  const invalidate = (runtime) => {
+    if (current !== runtime || stopped) return;
+    current = undefined;
+    if (!runtime.child.killed) runtime.child.kill('SIGTERM');
+    scheduleRestart();
+  };
+
+  const stop = () => {
+    stopped = true;
+    clearRestartTimer();
+    const runtime = current;
+    current = undefined;
+    if (runtime?.child && !runtime.child.killed) runtime.child.kill('SIGTERM');
+  };
+
+  return { ensure, invalidate, stop };
+}
+
+function proxyHttpRequest(request, response, target, onUnavailable) {
   const headers = { ...request.headers };
   headers.host = request.headers.host || `${target.hostname}:${target.port}`;
   const upstream = http.request({
@@ -273,7 +364,13 @@ function proxyHttpRequest(request, response, target) {
   });
   upstream.once('error', (error) => {
     console.error('[webpilot-server] API runtime proxy failed.', error);
-    if (!response.headersSent) response.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+    onUnavailable?.(error);
+    if (!response.headersSent) {
+      response.writeHead(503, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Retry-After': '1',
+      });
+    }
     response.end('API Runtime Unavailable');
   });
   request.once('aborted', () => upstream.destroy());
@@ -390,8 +487,8 @@ async function main() {
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
-  const apiRuntime = !runtimeChildMode && process.env.WEBPILOT_SPLIT_RUNTIME !== 'false'
-    ? await startApiRuntimeChild({ appDir, dev, externalPort: port })
+  const apiRuntimeSupervisor = !runtimeChildMode && process.env.WEBPILOT_SPLIT_RUNTIME !== 'false'
+    ? createApiRuntimeSupervisor({ appDir, dev, externalPort: port })
     : undefined;
 
   // Load the complete build-time configuration before loading Next itself.
@@ -416,7 +513,7 @@ async function main() {
   const handle = application.getRequestHandler();
   await Promise.all([
     application.prepare(),
-    apiRuntime?.ready,
+    apiRuntimeSupervisor?.ensure(),
   ]);
   const handleNextUpgrade = dev ? application.getUpgradeHandler() : undefined;
 
@@ -453,8 +550,20 @@ async function main() {
         rejectMissingIdentity(response);
         return;
       }
-      if (apiRuntime && runtimeApiRequest(pathname)) {
-        proxyHttpRequest(request, response, apiRuntime);
+      if (apiRuntimeSupervisor && runtimeApiRequest(pathname)) {
+        try {
+          const apiRuntime = await apiRuntimeSupervisor.ensure();
+          proxyHttpRequest(request, response, apiRuntime, () => apiRuntimeSupervisor.invalidate(apiRuntime));
+        } catch (error) {
+          console.error('[webpilot-server] API runtime is unavailable.', error);
+          if (!response.headersSent) {
+            response.writeHead(503, {
+              'Content-Type': 'text/plain; charset=utf-8',
+              'Retry-After': '1',
+            });
+          }
+          response.end('API Runtime Unavailable');
+        }
         return;
       }
       await handle(request, response);
@@ -495,7 +604,7 @@ async function main() {
   const close = () => {
     memoryMonitor.stop();
     refreshHub.close();
-    if (apiRuntime?.child && !apiRuntime.child.killed) apiRuntime.child.kill('SIGTERM');
+    apiRuntimeSupervisor?.stop();
     server.close(() => {
       process.exit(0);
     });
@@ -514,6 +623,7 @@ if (require.main === module) {
 module.exports = {
   applyTrustedIdentityHeaders,
   applicationBasePath,
+  createApiRuntimeSupervisor,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
   loadCompiledNextConfig,

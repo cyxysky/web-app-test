@@ -4,6 +4,7 @@ import {
   modelListForProvider,
   modelProviderDefinition,
   modelProviderDefinitions,
+  normalizeMiniMaxOpenAIBaseURL,
   runtimeEnvDefinitions,
   runtimeEnvKeys,
 } from '@/config/settings';
@@ -57,6 +58,7 @@ const modelApiKeyEnv: Record<ModelProvider, string> = {
   mistral: 'MISTRAL_API_KEY',
   ollama: 'OLLAMA_API_KEY',
   openai: 'OPENAI_API_KEY',
+  'openai-compatible': 'OPENAI_COMPATIBLE_API_KEY',
   openrouter: 'OPENROUTER_API_KEY',
   perplexity: 'PERPLEXITY_API_KEY',
   togetherai: 'TOGETHERAI_API_KEY',
@@ -85,6 +87,7 @@ const modelBaseUrlEnv: Record<ModelProvider, string> = {
   mistral: 'MISTRAL_BASE_URL',
   ollama: 'OLLAMA_BASE_URL',
   openai: 'OPENAI_BASE_URL',
+  'openai-compatible': 'OPENAI_COMPATIBLE_BASE_URL',
   openrouter: '',
   perplexity: 'PERPLEXITY_BASE_URL',
   togetherai: 'TOGETHERAI_BASE_URL',
@@ -116,6 +119,9 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
     const current = input.providers?.[definition.value];
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, current);
+    const baseURL = definition.value === 'minimax'
+      ? normalizeMiniMaxOpenAIBaseURL(current?.baseURL)
+      : current?.baseURL;
     providers[definition.value] = {
       ...defaultProviderSettings(definition.value),
       ...current,
@@ -123,6 +129,7 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
       defaultModel: model,
       model,
       models,
+      baseURL: baseURL ?? definition.defaultBaseURL ?? '',
     };
   }
   return { provider, providers, updatedAt: input.updatedAt || now() };
@@ -322,6 +329,7 @@ export const store = {
       const merged = { ...previous, ...current };
       const models = modelListForProvider(definition, merged);
       const model = defaultModelForProvider(definition, { ...merged, models });
+      const baseURL = current?.baseURL ?? previous?.baseURL ?? definition.defaultBaseURL ?? '';
       providers[provider] = {
         ...defaultProviderSettings(provider),
         ...merged,
@@ -330,7 +338,9 @@ export const store = {
         model,
         models,
         apiKey: current?.apiKey ?? previous?.apiKey ?? '',
-        baseURL: current?.baseURL ?? previous?.baseURL ?? definition.defaultBaseURL ?? '',
+        baseURL: provider === 'minimax'
+          ? normalizeMiniMaxOpenAIBaseURL(baseURL) || ''
+          : baseURL,
         updatedAt: current ? timestamp : previous?.updatedAt,
       };
     }

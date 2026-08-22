@@ -30,6 +30,7 @@ export function normalizeModelProvider(value?: unknown, fallback: ModelProvider 
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
   if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
+  if (provider === 'openai-compatible-api' || provider === 'custom-openai') return 'openai-compatible';
   return modelProviderDefinitions.some((item) => item.value === provider) ? provider as ModelProvider : fallback;
 }
 

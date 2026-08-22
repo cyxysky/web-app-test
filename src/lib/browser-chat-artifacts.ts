@@ -2,6 +2,7 @@ import type { StepExecutionResult, StepToolCall } from '@/server/ai/schemas/runt
 
 export type BrowserChatArtifactSummary = {
   bytes?: number;
+  documentId?: string;
   downloadUrl?: string;
   fileName: string;
   id: string;
@@ -18,6 +19,16 @@ const browserChatFileToolNames = new Set([
   'generateFile',
   'fillDocumentTemplate',
 ]);
+
+export function browserChatScreenshotIsInternalDocumentPreview(
+  toolName: string,
+  screenshot: { path?: string; title?: string },
+) {
+  const path = String(screenshot.path || '').replace(/\\/g, '/');
+  if (/(?:^|\/)attachment-previews(?:\/|$)/i.test(path)) return true;
+  const legacyInternalTitle = /^\s*(?:file|readFile|generateFile|fillDocumentTemplate)\s+explicit image\s+\d+\s*$/i.test(String(screenshot.title || ''));
+  return legacyInternalTitle && (!toolName || browserChatFileToolNames.has(toolName));
+}
 
 function recordFromUnknown(value: unknown) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -65,6 +76,7 @@ function browserChatFileArtifact(tool: StepToolCall): BrowserChatArtifactSummary
   const path = typeof payload.path === 'string' ? payload.path.trim() : '';
   const url = typeof payload.url === 'string' ? payload.url.trim() : '';
   const downloadUrl = typeof payload.downloadUrl === 'string' ? payload.downloadUrl.trim() : '';
+  const documentId = typeof payload.documentId === 'string' ? payload.documentId.trim() : '';
   if (!artifactId && !path && !url && !downloadUrl) return undefined;
 
   const visualVerification = recordFromUnknown(payload.visualVerification);
@@ -82,9 +94,12 @@ function browserChatFileArtifact(tool: StepToolCall): BrowserChatArtifactSummary
     || 'artifact';
   return {
     bytes,
+    documentId: documentId || undefined,
     downloadUrl: downloadUrl || undefined,
     fileName,
-    id: `file:${artifactId || path || url || downloadUrl}`,
+    id: documentId
+      ? `file:document:${documentId}`
+      : `file:${artifactId || path || url || downloadUrl}`,
     kind: browserChatArtifactIsImage(fileName) ? 'image' : 'file',
     pageCount,
     path: path || undefined,
@@ -97,6 +112,7 @@ export function browserChatArtifactsFromTool(tool: StepToolCall) {
   const file = browserChatFileArtifact(tool);
   if (file) artifacts.push(file);
   for (const screenshot of tool.screenshots || []) {
+    if (browserChatScreenshotIsInternalDocumentPreview(tool.name, screenshot)) continue;
     const path = screenshot.path?.trim();
     if (!path) continue;
     artifacts.push({
@@ -115,6 +131,10 @@ export function mergeBrowserChatArtifactSummaries(
 ) {
   const byId = new Map<string, BrowserChatArtifactSummary>();
   for (const artifact of groups.flatMap((group) => group || [])) {
+    if (
+      artifact.kind === 'screenshot'
+      && browserChatScreenshotIsInternalDocumentPreview('', artifact)
+    ) continue;
     const previous = byId.get(artifact.id);
     byId.set(artifact.id, previous ? { ...previous, ...artifact } : artifact);
   }

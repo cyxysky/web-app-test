@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
+import { normalizeMiniMaxOpenAIBaseURL } from '@/config/settings';
 import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
 
 ensureAiSdkTelemetryRegistered();
@@ -31,6 +32,7 @@ type AiProvider =
   | 'mistral'
   | 'ollama'
   | 'openai'
+  | 'openai-compatible'
   | 'openrouter'
   | 'perplexity'
   | 'togetherai'
@@ -84,6 +86,12 @@ function optionalEnvironmentValue(name: string) {
   return undefined;
 }
 
+function miniMaxOpenAIBaseURL() {
+  return normalizeMiniMaxOpenAIBaseURL(
+    optionalEnvironmentValue('MINIMAX_BASE_URL'),
+  );
+}
+
 function lazyLanguageModel(
   provider: string,
   modelId: string,
@@ -102,7 +110,7 @@ function lazyLanguageModel(
 }
 
 function openAiCompatibleModel(
-  provider: 'llama-cpp' | 'lmstudio' | 'ollama',
+  provider: 'llama-cpp' | 'lmstudio' | 'ollama' | 'openai-compatible',
   modelId: string,
   baseUrlEnvironmentName: string,
   defaultBaseURL: string,
@@ -195,10 +203,25 @@ export function getModel(): GenerateTextModel {
   if (provider === 'lmstudio') return openAiCompatibleModel(provider, model, 'LMSTUDIO_BASE_URL', 'http://localhost:1234/v1', 'LMSTUDIO_API_KEY');
   if (provider === 'llama-cpp') return openAiCompatibleModel(provider, model, 'LLAMA_CPP_BASE_URL', 'http://localhost:8080/v1', 'LLAMA_CPP_API_KEY');
   if (provider === 'ollama') return openAiCompatibleModel(provider, model, 'OLLAMA_BASE_URL', 'http://localhost:11434/v1', 'OLLAMA_API_KEY');
+  if (provider === 'openai-compatible') return lazyLanguageModel(provider, model, async () => {
+    const baseURL = optionalEnvironmentValue('OPENAI_COMPATIBLE_BASE_URL');
+    if (!baseURL) {
+      throw new Error('OpenAI 兼容接口尚未配置 Base URL。请在“模型配置”中填写完整的 /v1 地址。');
+    }
+    const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
+    return createOpenAICompatible({
+      name: provider,
+      baseURL,
+      apiKey: optionalEnvironmentValue('OPENAI_COMPATIBLE_API_KEY'),
+    })(model) as unknown as LoadedLanguageModel;
+  });
   if (provider === 'minimax') return lazyLanguageModel(provider, model, async () => {
-    const baseURL = optionalEnvironmentValue('MINIMAX_BASE_URL');
-    const { createMiniMax } = await import('@ai-sdk/minimax');
-    return createMiniMax({ apiKey: process.env.MINIMAX_API_KEY || '', baseURL })(model) as unknown as LoadedLanguageModel;
+    const baseURL = miniMaxOpenAIBaseURL();
+    const { createMiniMaxOpenAIV4 } = await import('@/server/ai/providers/minimax-openai-v4-provider');
+    return createMiniMaxOpenAIV4({
+      apiKey: process.env.MINIMAX_API_KEY || '',
+      baseURL: baseURL || 'https://api.minimax.io/v1',
+    })(model);
   });
   if (provider === 'openai') return lazyLanguageModel(provider, model, async () => {
     const baseURL = optionalEnvironmentValue('OPENAI_BASE_URL');
@@ -265,6 +288,7 @@ export function getModelSettings() {
     mistral: 'mistral-large-latest',
     ollama: 'llama3.1',
     openai: 'gpt-5.5',
+    'openai-compatible': 'custom-model',
     openrouter: 'qwen/qwen3.6-27b',
     perplexity: 'sonar',
     togetherai: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
@@ -337,6 +361,7 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'mistral' || provider === 'mistral-ai') return 'mistral';
   if (provider === 'ollama') return 'ollama';
   if (provider === 'openai') return 'openai';
+  if (provider === 'openai-compatible' || provider === 'openai-compatible-api' || provider === 'custom-openai') return 'openai-compatible';
   if (provider === 'perplexity') return 'perplexity';
   if (provider === 'together' || provider === 'togetherai' || provider === 'together-ai') return 'togetherai';
   if (provider === 'vercel' || provider === 'v0') return 'vercel';

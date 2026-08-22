@@ -213,6 +213,7 @@ export type ModelProvider =
   | 'mistral'
   | 'ollama'
   | 'openai'
+  | 'openai-compatible'
   | 'openrouter'
   | 'perplexity'
   | 'togetherai'

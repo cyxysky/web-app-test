@@ -9,6 +9,7 @@ import {
   isBrowserChatAiFailureLog,
   isBrowserChatAiLog,
   isBrowserChatContextCompressionLog,
+  isBrowserChatDocumentVisualQaLog,
   isBrowserChatScreenshotPerformanceLog,
   isBrowserChatToolLifecycleLog,
   summarizeBrowserChatExecutionTotals,
@@ -191,6 +192,7 @@ function browserChatLogEventTitle(log: BrowserChatLogDialogRecord) {
   if (phaseMatches(log, 'ai:runtime:response') || phaseMatches(log, 'ai:runtime:object')) return '模型已返回';
   if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return '本轮正常结束';
   if (isBrowserChatAiFailureLog(log)) return 'AI 请求异常';
+  if (isBrowserChatDocumentVisualQaLog(log)) return '文档视觉质检';
   if (isBrowserChatToolLifecycleLog(log)) return '工具调用';
   if (isBrowserChatContextCompressionLog(log)) return contextCompressionLabel(log) || '上下文';
   if (isBrowserChatScreenshotPerformanceLog(log)) return '截图性能';

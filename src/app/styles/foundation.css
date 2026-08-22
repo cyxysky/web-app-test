@@ -1017,7 +1017,14 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   .magic-animated-shiny-text { animation: none; }
 }
 
+@property --magic-rainbow-angle {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
 .magic-rainbow-button {
+  --magic-rainbow-angle: 0deg;
   --magic-rainbow-surface: #17181a;
   --magic-rainbow-foreground: #ffffff;
   --magic-rainbow-1: #ff6b6b;
@@ -1025,16 +1032,20 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   --magic-rainbow-3: #55d6be;
   --magic-rainbow-4: #6c8cff;
   --magic-rainbow-5: #c874ff;
-  background:
-    linear-gradient(var(--magic-rainbow-surface), var(--magic-rainbow-surface)) padding-box,
-    linear-gradient(100deg, var(--magic-rainbow-1), var(--magic-rainbow-2), var(--magic-rainbow-3), var(--magic-rainbow-4), var(--magic-rainbow-5), var(--magic-rainbow-1)) border-box;
-  background-position: 0 0, 0 50%;
-  background-size: 100% 100%, 240% 100%;
+  background-color: transparent;
+  background-image:
+    linear-gradient(var(--magic-rainbow-surface), var(--magic-rainbow-surface)),
+    conic-gradient(from var(--magic-rainbow-angle), var(--magic-rainbow-1), var(--magic-rainbow-2), var(--magic-rainbow-3), var(--magic-rainbow-4), var(--magic-rainbow-5), var(--magic-rainbow-1));
+  background-clip: padding-box, border-box;
+  background-origin: padding-box, border-box;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  background-size: 100% 100%;
   border: 2px solid transparent;
   color: var(--magic-rainbow-foreground);
   isolation: isolate;
   overflow: hidden;
-  animation: magic-rainbow-shift 4s linear infinite;
+  animation: magic-rainbow-spin 4s linear infinite;
 }
 
 .magic-rainbow-button::after {
@@ -1061,8 +1072,8 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-strong) 28%, transparent);
 }
 
-@keyframes magic-rainbow-shift {
-  to { background-position: 0 0, 240% 50%; }
+@keyframes magic-rainbow-spin {
+  to { --magic-rainbow-angle: 360deg; }
 }
 
 ::view-transition-old(root),

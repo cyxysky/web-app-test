@@ -4,12 +4,53 @@ import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } fr
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { appDataRoot } from '@/server/storage/paths';
-import type { OfficeDocumentSpec } from './office-document-spec';
+import { appDataRoot, artifactsRoot } from '@/server/storage/paths';
+import type { OfficeBlock, OfficeDocumentSpec } from './office-document-spec';
 
 const OFFICE_WORKER_TIMEOUT_MS = 120_000;
 let officeGenerationQueue = Promise.resolve();
 const pythonUnoProbeCache = new Map<string, Promise<boolean>>();
+
+function isPathWithin(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function resolveGraphicArtifactSource(source: unknown) {
+  if (typeof source !== 'string' || !source.trim()) return source;
+  const value = source.trim();
+  if (/^(?:data:|file:|https?:)/i.test(value) || path.isAbsolute(value)) return value;
+  const root = artifactsRoot();
+  const candidate = path.resolve(root, value.replace(/\\/g, '/'));
+  if (!isPathWithin(root, candidate)) return value;
+  try {
+    await access(candidate, constants.R_OK);
+    return candidate;
+  } catch {
+    return value;
+  }
+}
+
+async function resolveGraphicArtifactBlocks(blocks: OfficeBlock[]): Promise<OfficeBlock[]> {
+  return Promise.all(blocks.map(async (block) => {
+    const normalized: OfficeBlock = { ...block };
+    if (typeof normalized.source === 'string') {
+      normalized.source = await resolveGraphicArtifactSource(normalized.source) as string;
+    } else if (typeof normalized.url === 'string') {
+      normalized.url = await resolveGraphicArtifactSource(normalized.url);
+    }
+    if (Array.isArray(normalized.children)) {
+      normalized.children = await resolveGraphicArtifactBlocks(normalized.children);
+    }
+    if (Array.isArray(normalized.columns)) {
+      normalized.columns = await Promise.all(normalized.columns.map(async (column) => ({
+        ...column,
+        blocks: Array.isArray(column.blocks) ? await resolveGraphicArtifactBlocks(column.blocks) : column.blocks,
+      })));
+    }
+    return normalized;
+  }));
+}
 
 function enqueueOfficeGeneration<T>(operation: () => Promise<T>) {
   const result = officeGenerationQueue.then(operation, operation);
@@ -123,7 +164,7 @@ function runOfficeWorker(input: {
   libreOfficeProgramDirectory: string;
   pythonExecutable: string;
 }) {
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<Record<string, unknown>>((resolve, reject) => {
     const existingPythonPath = String(process.env.PYTHONPATH || '').trim();
     const pythonPath = [input.libreOfficeProgramDirectory, existingPythonPath].filter(Boolean).join(path.delimiter);
     execFile(input.pythonExecutable, input.args, {
@@ -136,9 +177,18 @@ function runOfficeWorker(input: {
       maxBuffer: 2 * 1024 * 1024,
       timeout: OFFICE_WORKER_TIMEOUT_MS,
       windowsHide: true,
-    }, (error, _stdout, stderr) => {
+    }, (error, stdout, stderr) => {
       if (!error) {
-        resolve();
+        try {
+          const report = JSON.parse(String(stdout || '').trim()) as Record<string, unknown>;
+          if (!report || typeof report !== 'object' || !Number.isFinite(Number(report.bytes))) {
+            reject(new Error('LibreOffice UNO worker returned an invalid generation report.'));
+            return;
+          }
+          resolve(report);
+        } catch (parseError) {
+          reject(new Error(`LibreOffice UNO worker returned unreadable diagnostics: ${parseError instanceof Error ? parseError.message : String(parseError)}`));
+        }
         return;
       }
       const detail = String(stderr || '').trim();
@@ -161,7 +211,10 @@ export async function generateOfficeDocument(spec: OfficeDocumentSpec) {
     throw new Error('LibreOffice UNO worker is missing from the application runtime.');
   }
   const extension = path.extname(spec.fileName).toLowerCase();
-  const serialized = JSON.stringify(spec);
+  const serialized = JSON.stringify({
+    ...spec,
+    blocks: await resolveGraphicArtifactBlocks(spec.blocks),
+  });
 
   return enqueueOfficeGeneration(async () => {
     const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-uno-'));
@@ -170,7 +223,7 @@ export async function generateOfficeDocument(spec: OfficeDocumentSpec) {
       const outputPath = path.join(temporaryDirectory, `output${extension}`);
       const profilePath = path.join(appDataRoot(), 'libreoffice', 'uno-profile');
       await writeFile(inputPath, serialized, 'utf8');
-      await runOfficeWorker({
+      const report = await runOfficeWorker({
         args: [
           worker,
           '--input', inputPath,
@@ -181,7 +234,7 @@ export async function generateOfficeDocument(spec: OfficeDocumentSpec) {
         libreOfficeProgramDirectory: path.dirname(libreOfficeExecutable),
         pythonExecutable,
       });
-      return await readFile(outputPath);
+      return { buffer: await readFile(outputPath), report };
     } finally {
       await rm(temporaryDirectory, { force: true, recursive: true });
     }

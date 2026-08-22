@@ -18,6 +18,7 @@ import type {
   OfficeDocumentOutlineItem,
   OfficeDocumentSettings,
 } from '@/server/files/office-document-spec';
+import { normalizeOfficeBlock } from '@/server/files/office-document-normalizer';
 import {
   fillDocxTemplateBuffer,
   type DocxTemplateFillOperation,
@@ -39,6 +40,7 @@ type DownloadArtifactInput = {
 
 type PlanArtifactInput = {
   runId?: string;
+  documentId?: string;
   fileName?: string | null;
   documentType?: OfficeDocumentKind;
   document?: OfficeDocumentSettings;
@@ -351,6 +353,7 @@ function insertionList(draft: OfficeDocumentDraft, parentId?: string) {
 }
 
 function insertBlocks(draft: OfficeDocumentDraft, blocks: OfficeBlock[], placement: { parentId?: string; beforeId?: string; afterId?: string }) {
+  blocks = blocks.map(normalizeOfficeBlock);
   validateUniqueBlockIds(blocks, new Set(allBlocks(draft.blocks).map((block) => block.id)));
   let list = insertionList(draft, placement.parentId);
   let index = list.length;
@@ -396,7 +399,12 @@ async function renderDraft(input: {
     const generated = await generateFileBuffer(input.draft);
     const dir = artifactDir(input.runId, 'generated');
     await mkdir(dir, { recursive: true });
-    const target = await uniqueArtifactPath(dir, requestedName);
+    const existingRenderedName = input.draft.renderedFileName
+      ? sanitizeFileName(input.draft.renderedFileName, requestedName)
+      : undefined;
+    const target = existingRenderedName
+      ? { fileName: existingRenderedName, filePath: path.join(dir, existingRenderedName) }
+      : await uniqueArtifactPath(dir, requestedName);
     await writeFile(target.filePath, generated.buffer);
 
     const visualVerification = input.includeVisualVerification && [
@@ -410,6 +418,16 @@ async function renderDraft(input: {
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
         })
       : undefined;
+    if (input.includeVisualVerification
+      && ['.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp'].includes(generated.extension)
+      && (!visualVerification?.imagePaths.length
+        || !['libreoffice-pdf', 'pdf'].includes(visualVerification.renderer))) {
+      throw new Error(`visual quality gate failed: ${visualVerification?.warning || 'LibreOffice produced no page previews'}`);
+    }
+    if (input.draft.renderedFileName !== target.fileName) {
+      input.draft.renderedFileName = target.fileName;
+      await saveDraft(input.runId, input.draft);
+    }
 
     return {
       ok: true,
@@ -422,6 +440,11 @@ async function renderDraft(input: {
         }),
         documentId: input.draft.documentId,
         blockCount: allBlocks(input.draft.blocks).length,
+        generationDiagnostics: generated.diagnostics,
+        qualityGate: {
+          structural: true,
+          visual: visualVerification ? visualVerification.imagePaths.length > 0 : 'not-applicable-to-current-model',
+        },
         visualVerification: visualVerification ? {
           imageCount: visualVerification.imagePaths.length,
           pageCount: visualVerification.pageCount,
@@ -439,16 +462,57 @@ async function renderDraft(input: {
 
 export async function planFileArtifact(input: PlanArtifactInput): Promise<BrowserActionResult> {
   try {
+    const documentId = String(input.documentId || '').trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(documentId)) {
+      return {
+        ok: false,
+        actual: 'file action=plan requires a stable model-chosen documentId (1-96 ASCII letters, numbers, dot, underscore, or hyphen). Reuse exactly the same documentId for every re-plan, generate, edit, render, and visual correction of this logical document.',
+      };
+    }
     if (!String(input.fileName || '').trim()) return { ok: false, actual: 'file action=plan requires fileName.' };
     if (!input.documentType) return { ok: false, actual: 'file action=plan requires documentType.' };
+    const requestedFileName = sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`);
+    try {
+      const existing = await loadDraft(input.runId, documentId);
+      if (existing.documentType !== input.documentType) {
+        return {
+          ok: false,
+          actual: `documentId ${documentId} already belongs to a ${existing.documentType} document. Reuse it only for that logical document or choose a different stable documentId for a genuinely different output.`,
+        };
+      }
+      if (!existing.blocks.length && !existing.renderedFileName) {
+        existing.fileName = requestedFileName;
+        existing.document = input.document || existing.document;
+        existing.intent = input.intent ?? existing.intent;
+        existing.outline = input.outline ?? existing.outline;
+        await saveDraft(input.runId, existing);
+      }
+      return {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'document-plan',
+          documentId: existing.documentId,
+          fileName: existing.fileName,
+          documentType: existing.documentType,
+          outline: existing.outline,
+          blockCount: allBlocks(existing.blocks).length,
+          reused: true,
+        }),
+      };
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code || '')
+        : '';
+      if (code !== 'ENOENT') throw error;
+    }
     const now = new Date().toISOString();
     const draft: OfficeDocumentDraft = {
       blocks: [],
       createdAt: now,
       document: input.document || {},
-      documentId: randomUUID(),
+      documentId,
       documentType: input.documentType,
-      fileName: sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`),
+      fileName: requestedFileName,
       intent: input.intent,
       outline: input.outline,
       updatedAt: now,
@@ -503,9 +567,9 @@ export async function editFileArtifact(input: EditArtifactInput): Promise<Browse
         const replacedIds = new Set(allBlocks([found.list[found.index]]).map((block) => block.id));
         const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => !replacedIds.has(block.id)).map((block) => block.id));
         validateUniqueBlockIds([operation.block], remainingIds);
-        found.list.splice(found.index, 1, operation.block);
+        found.list.splice(found.index, 1, normalizeOfficeBlock(operation.block));
       } else if (operation.op === 'update') {
-        const updated = mergePlainObject(found.list[found.index], operation.patch || {}) as OfficeBlock;
+        const updated = normalizeOfficeBlock(mergePlainObject(found.list[found.index], operation.patch || {}) as OfficeBlock);
         updated.id = blockId;
         found.list[found.index] = updated;
       } else if (operation.op === 'move') {

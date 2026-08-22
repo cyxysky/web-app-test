@@ -97,16 +97,16 @@ function resolvedContextUsage(
 }
 
 function withBrowserChatMessageArtifacts(sessionId: string, messages: BrowserChatMessage[]) {
-  const messagesWithoutArtifactIndex = messages.filter((message) => (
-    message.role === 'assistant' && message.artifacts === undefined
+  const assistantMessagesWithSteps = messages.filter((message) => (
+    message.role === 'assistant' && Boolean(message.stepIndexes?.length)
   ));
   const stepIndexes = Array.from(new Set(
-    messagesWithoutArtifactIndex.flatMap((message) => message.stepIndexes || []),
+    assistantMessagesWithSteps.flatMap((message) => message.stepIndexes || []),
   ));
   if (!stepIndexes.length) return messages;
   const steps = readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, stepIndexes);
   return messages.map((message) => {
-    if (message.role !== 'assistant' || message.artifacts !== undefined) return message;
+    if (message.role !== 'assistant' || !message.stepIndexes?.length) return message;
     const ownedIndexes = new Set(message.stepIndexes || []);
     const artifacts = mergeBrowserChatArtifactSummaries(
       message.artifacts,
