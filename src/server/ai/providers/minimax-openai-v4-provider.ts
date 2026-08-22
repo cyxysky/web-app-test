@@ -24,6 +24,7 @@ type MiniMaxOpenAIV4Options = {
   baseURL?: string;
   fetch?: typeof globalThis.fetch;
   headers?: Record<string, string>;
+  extraRequestParameters?: Record<string, unknown>;
 };
 
 export type MiniMaxOpenAIV4Provider = {
@@ -200,6 +201,7 @@ function reasoningDetailsFromPrompt(options: LanguageModelV4CallOptions) {
 function transformMiniMaxRequestBody(
   body: Record<string, unknown>,
   promptReasoningDetails: MiniMaxReasoningDetail[][],
+  extraRequestParameters: Record<string, unknown>,
 ) {
   let assistantIndex = 0;
   const messages = Array.isArray(body.messages) ? body.messages.map((messageValue) => {
@@ -218,7 +220,7 @@ function transformMiniMaxRequestBody(
     }
     return message;
   }) : body.messages;
-  return { ...body, messages, reasoning_split: true };
+  return { ...body, messages, ...extraRequestParameters, reasoning_split: true };
 }
 
 function detailsFromMetadata(metadata: SharedV4ProviderMetadata | undefined) {
@@ -293,7 +295,7 @@ class MiniMaxOpenAIV4LanguageModel implements LanguageModelV4 {
       includeUsage: true,
       metadataExtractor: metadataExtractor(),
       supportedUrls: () => ({}),
-      transformRequestBody: (body) => transformMiniMaxRequestBody(body, promptDetails),
+      transformRequestBody: (body) => transformMiniMaxRequestBody(body, promptDetails, this.options.extraRequestParameters || {}),
     });
     return provider(this.modelId);
   }

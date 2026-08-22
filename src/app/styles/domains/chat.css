@@ -2215,6 +2215,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-process-body-content > :is(
   .browser-chat-executed-collapse,
+  .browser-chat-single-tool-group,
   .browser-chat-current-tool-stack
 )::before {
   background: color-mix(in srgb, var(--muted) 46%, transparent);
@@ -2604,6 +2605,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
   .browser-chat-process-body-content > :is(
     .browser-chat-executed-collapse,
+    .browser-chat-single-tool-group,
     .browser-chat-current-tool-stack
   )::before {
     left: -24px;

@@ -88,6 +88,14 @@ function ToolOutputViewer({ payload, wrap }: { payload: string; wrap: boolean })
   );
 }
 
+function toolResultPayload(value: unknown) {
+  if (value && typeof value === 'object' && !Array.isArray(value) && 'actual' in value) {
+    const actual = (value as { actual?: unknown }).actual;
+    if (typeof actual === 'string') return actual;
+  }
+  return formatToolPayload(value);
+}
+
 export function BrowserChatToolDialog({
   detail,
   onClose,
@@ -109,7 +117,10 @@ export function BrowserChatToolDialog({
   const displayedInputPayload = inputPayload || emptyPayloadLabel;
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
-  const resultPayload = formatToolPayload(completeResult);
+  // The trace retains the structured BrowserActionResult. Show its actual
+  // payload directly so reflection/read output is visible, rather than making
+  // the user hunt through a wrapper object's `actual` field.
+  const resultPayload = toolResultPayload(completeResult);
   const visibleScreenshots = (detail.tool.screenshots || []).filter((screenshot) => (
     !browserChatScreenshotIsInternalDocumentPreview(detail.tool.name, screenshot)
   ));

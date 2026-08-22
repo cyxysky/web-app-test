@@ -31,10 +31,12 @@ import {
 import {
   repairFileArtifactDownloadLinks,
   downloadFileArtifact,
-  editFileArtifact,
+  editUnoFileArtifact,
   formatFileArtifactResult,
-  generateFileArtifactBlocks,
+  generateUnoFileArtifact,
+  getUnoApi,
   planFileArtifact,
+  readUnoDraft,
   renderFileArtifact,
 } from './file-artifact-tools';
 import { browserChatCodeRules } from './runtime-prompt-rules';
@@ -66,8 +68,6 @@ import {
   runtimeContextWindowTokens,
 } from './runtime-context-budget';
 import type { BrowserChatModelContextCompression } from './browser-chat-model-context';
-import type { OfficeBlock, OfficeDocumentEditOperation } from '@/server/files/office-document-spec';
-import { officeBlockStyleKeys } from '@/server/files/office-document-normalizer';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
@@ -89,167 +89,10 @@ import {
   coerceBrowserChatToolInput,
   repairBrowserChatToolCallInput,
 } from './browser-chat-tool-input-coercion';
+import { racePromiseWithAbort } from './browser-chat-interrupt-state';
+import type { BrowserChatFileVisualInput } from './browser-chat-attachment-reader';
 
 export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
-
-function rejectCanonicalAliases(
-  value: Record<string, unknown>,
-  context: z.RefinementCtx,
-  options: { block?: boolean } = {},
-) {
-  if (options.block) {
-    for (const key of officeBlockStyleKeys) {
-      if (Object.prototype.hasOwnProperty.call(value, key)) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `style-only field; use style.${key}. The tool never guesses or moves fields.`,
-          path: [key],
-        });
-      }
-    }
-    for (const [alias, canonical] of [['content', 'svg'], ['url', 'source']] as const) {
-      if (Object.prototype.hasOwnProperty.call(value, alias)) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `unsupported alias; use ${canonical}.`,
-          path: [alias],
-        });
-      }
-    }
-  }
-  if (!options.block) {
-    if (Object.prototype.hasOwnProperty.call(value, 'text')) {
-      context.addIssue({ code: z.ZodIssueCode.custom, message: 'text belongs at block.text, not inside style.', path: ['text'] });
-    }
-    if (Object.prototype.hasOwnProperty.call(value, 'textAlign')) {
-      context.addIssue({ code: z.ZodIssueCode.custom, message: 'use the canonical style.align field.', path: ['textAlign'] });
-    }
-  }
-}
-
-const generatedFileStyleSchema = z.object({
-  align: z.enum(['center', 'justify', 'left', 'right']).optional(),
-  backgroundColor: z.string().optional(),
-  borderColor: z.string().optional(),
-  borderRadius: z.number().optional(),
-  borderWidth: z.number().optional(),
-  color: z.string().optional(),
-  fill: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
-  fontFamily: z.string().optional(),
-  fontSize: z.number().optional(),
-  fontStyle: z.enum(['italic', 'normal']).optional(),
-  fontWeight: z.union([z.number(), z.string()]).optional(),
-  gap: z.number().optional(),
-  height: z.union([z.number(), z.string()]).optional(),
-  letterSpacing: z.number().optional().describe('Character spacing in points. The value is passed to LibreOffice without an artificial design range.'),
-  lineHeight: z.number().optional(),
-  opacity: z.number().min(0).max(1).optional(),
-  padding: z.union([z.number(), z.array(z.number())]).optional(),
-  position: z.enum(['absolute', 'flow']).optional(),
-  rotation: z.number().optional(),
-  shadow: z.union([z.boolean(), z.record(z.string(), z.unknown())]).optional(),
-  unit: z.enum(['cm', 'in', 'mm', 'pt', 'px']).optional(),
-  verticalAlign: z.enum(['bottom', 'center', 'middle', 'top']).optional(),
-  width: z.union([z.number(), z.string()]).optional(),
-  x: z.union([z.number(), z.string()]).optional(),
-  y: z.union([z.number(), z.string()]).optional(),
-}).passthrough().superRefine((style, context) => rejectCanonicalAliases(style, context));
-const generatedFileBlockSchema: z.ZodType<OfficeBlock> = z.lazy(() => z.object({
-  id: z.string().min(1),
-  type: z.string().min(1),
-  alt: z.string().optional(),
-  breakBefore: z.literal('page').optional().describe('Semantic Writer page break before this block. Use this or a {type:"pageBreak"} block for pagination; never use blank text or raw UNO paragraph properties to create a page break.'),
-  caption: z.string().optional(),
-  chartType: z.string().optional(),
-  children: z.array(generatedFileBlockSchema).optional(),
-  columns: z.array(z.object({
-    width: z.union([z.number(), z.string()]).optional(),
-    blocks: z.array(generatedFileBlockSchema).optional(),
-  }).passthrough()).optional(),
-  data: z.unknown().optional(),
-  items: z.array(z.unknown()).optional(),
-  level: z.number().optional(),
-  markdown: z.string().optional(),
-  name: z.string().optional(),
-  ordered: z.boolean().optional(),
-  range: z.string().optional(),
-  rows: z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()]))).optional(),
-  shape: z.string().optional(),
-  source: z.string().optional().describe('Graphic source for image/svg/chart blocks. Prefer the Artifact ID returned by file action=download; data URLs and absolute HTTP(S) URLs are also accepted.'),
-  style: generatedFileStyleSchema.optional(),
-  svg: z.string().optional(),
-  text: z.string().optional(),
-  title: z.string().optional(),
-  unoProperties: z.record(z.string(), z.unknown()).optional().describe('Advanced native-object properties only. Each key must be an exact, writable UNO property supported by the object emitted for this block; unknown properties fail rendering instead of being guessed. Do not use UNO to emulate document layout: use {type:"spacer", style:{height:12,unit:"mm"}} for blank vertical space, {type:"pageBreak"} or breakBefore:"page" for Writer pagination, and style for typography/position. Tagged values: {$uno:"constant"|"enum",name}, {$uno:"struct",name,fields}, {$uno:"sequence",items}, {$uno:"propertyValues",fields}. Example native ellipse: {type:"shape",unoService:"com.sun.star.drawing.EllipseShape",unoProperties:{RotateAngle:1200},style:{x:20,y:20,width:30,height:30,unit:"mm"}}.'),
-  unoService: z.string().optional().describe('Native drawing/presentation shape service. Only com.sun.star.drawing.*Shape and com.sun.star.presentation.*Shape are accepted; example: com.sun.star.drawing.EllipseShape.'),
-}).passthrough().superRefine((block, context) => rejectCanonicalAliases(block, context, { block: true })));
-const generatedFileDocumentSchema = z.object({
-  title: z.string().optional(),
-  author: z.string().optional(),
-  description: z.string().optional(),
-  language: z.string().optional(),
-  defaultStyle: generatedFileStyleSchema.optional(),
-  page: z.object({
-    orientation: z.enum(['portrait', 'landscape']).optional(),
-    width: z.number().optional(),
-    height: z.number().optional(),
-    marginTop: z.number().optional(),
-    marginRight: z.number().optional(),
-    marginBottom: z.number().optional(),
-    marginLeft: z.number().optional(),
-    backgroundColor: z.string().optional(),
-    header: z.string().optional(),
-    footer: z.string().optional(),
-    showPageNumber: z.boolean().optional(),
-    unit: z.enum(['cm', 'in', 'mm', 'pt', 'px']).optional(),
-  }).passthrough().optional(),
-}).passthrough();
-const generatedFileOutlineSchema = z.array(z.object({
-  id: z.string().min(1),
-  title: z.string().min(1),
-  purpose: z.string().optional(),
-  suggestedBlocks: z.array(z.string()).optional(),
-})).describe('Optional ordered JSON array of planned sections. Even one section must be sent as an array: [{"id":"cover","title":"Cover"}], never as one object.');
-const generatedFilePlacementSchema = {
-  parentId: z.string().min(1).optional(),
-  beforeId: z.string().min(1).optional(),
-  afterId: z.string().min(1).optional(),
-};
-const generatedFileAddOperationSchema = z.object({
-  op: z.literal('add'),
-  ...generatedFilePlacementSchema,
-  block: generatedFileBlockSchema.optional(),
-  blocks: z.array(generatedFileBlockSchema).min(1).optional(),
-}).strict().superRefine((operation, context) => {
-  if (Boolean(operation.block) === Boolean(operation.blocks)) {
-    context.addIssue({
-      code: 'custom',
-      message: 'add requires exactly one of block or non-empty blocks.',
-      path: ['block'],
-    });
-  }
-});
-const generatedFileBlockPatchSchema = z.record(z.string(), z.unknown()).superRefine((patch, context) => {
-  rejectCanonicalAliases(patch, context, { block: true });
-  if (patch.style && typeof patch.style === 'object' && !Array.isArray(patch.style)) {
-    const style = patch.style as Record<string, unknown>;
-    if (Object.prototype.hasOwnProperty.call(style, 'text')) {
-      context.addIssue({ code: z.ZodIssueCode.custom, message: 'text belongs at patch.text, not inside patch.style.', path: ['style', 'text'] });
-    }
-    if (Object.prototype.hasOwnProperty.call(style, 'textAlign')) {
-      context.addIssue({ code: z.ZodIssueCode.custom, message: 'use the canonical style.align field.', path: ['style', 'textAlign'] });
-    }
-  }
-});
-const generatedFileEditOperationSchema = z.union([
-  generatedFileAddOperationSchema,
-  z.object({ op: z.literal('move'), blockId: z.string().min(1), ...generatedFilePlacementSchema }).strict(),
-  z.object({ op: z.literal('remove'), blockId: z.string().min(1) }).strict(),
-  z.object({ op: z.literal('replace'), blockId: z.string().min(1), block: generatedFileBlockSchema }).strict(),
-  z.object({ op: z.literal('replaceChildren'), parentId: z.string().min(1), blocks: z.array(generatedFileBlockSchema) }).strict(),
-  z.object({ op: z.literal('setDocument'), patch: generatedFileDocumentSchema }).strict(),
-  z.object({ op: z.literal('update'), blockId: z.string().min(1), patch: generatedFileBlockPatchSchema }).strict(),
-]) as unknown as z.ZodType<OfficeDocumentEditOperation>;
 
 type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: number; details?: unknown }) => void | Promise<void>;
 type RuntimeModelMessage = ModelMessage;
@@ -355,6 +198,8 @@ const codexRuntimeObjectSchema = z.object({
     content: z.string().nullable().optional(),
     instruction: z.string().nullable().optional(),
     documentId: z.string().nullable().optional(),
+    artifactId: z.string().nullable().optional(),
+    screenshotIds: z.array(z.string()).nullable().optional(),
     fileName: z.string().nullable().optional(),
     title: z.string().nullable().optional(),
     path: z.string().nullable().optional(),
@@ -367,6 +212,7 @@ const codexRuntimeObjectSchema = z.object({
     })).min(1).nullable().optional(),
     uuid: z.string().uuid().nullable().optional(),
     limit: z.number().nullable().optional(),
+    offset: z.number().nullable().optional(),
     ids: z.array(z.string()).nullable().optional(),
     selectionReason: z.string().nullable().optional(),
     sameInterfaceGroup: z.string().nullable().optional(),
@@ -1067,6 +913,7 @@ function pushFailureFrameScreenshots(screenshots: ToolTrace['screenshots'], name
 
 const internalReferenceImageToolNames = new Set([
   'file',
+  'fileVisual',
   'readFile',
   'generateFile',
   'fillDocumentTemplate',
@@ -1182,7 +1029,7 @@ async function executeTracedBrowserAction(input: {
   let result: BrowserActionResult;
   const actionStartedAt = Date.now();
   try {
-    result = await action(abortSignal, trace);
+    result = await racePromiseWithAbort(action(abortSignal, trace), abortSignal);
     throwIfStopped(abortSignal, shouldContinue);
   } catch (error) {
     if (abortSignal?.aborted || (shouldContinue && !shouldContinue())) throw browserChatAbortError(abortSignal);
@@ -1257,6 +1104,7 @@ function makeBrowserTools(
     readSubagent?: BrowserChatSubagentReader;
     requiredSubagentUuid?: string;
     readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+    readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
     readSkill?: BrowserChatReadSkill;
     onReferenceImage?: (input: { path: string; source: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
@@ -1278,6 +1126,15 @@ function makeBrowserTools(
     reason: toolReasonInput,
   };
   const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
+  const repeatedDeterministicFileFailure = (input: unknown) => {
+    const normalized = JSON.stringify(splitToolInputAndReason(input).input);
+    return traces.some((trace) => {
+      if (trace.name !== 'file' || trace.result?.ok !== false) return false;
+      const previous = JSON.stringify(splitToolInputAndReason(trace.input).input);
+      if (previous !== normalized) return false;
+      return /requires one action|requires (?:a stable|documentId|exactly one|at least one|a complete)|already (?:has source|produced a rendered artifact)|does not accept a complete program replacement|not valid for documentType|could not find oldText|matched \d+ locations|made no changes|UNO program worker timed out/i.test(trace.result.actual || '');
+    });
+  };
   async function record(
     name: string,
     input: unknown,
@@ -1291,6 +1148,12 @@ function makeBrowserTools(
       return {
         ok: false,
         actual: `Ignored: only one browser tool can execute in model step ${toolExecutionGate.stepNumber + 1}. Continue from the executed tool result in the next model step.`,
+      } satisfies BrowserActionResult;
+    }
+    if (name === 'file' && repeatedDeterministicFileFailure(input)) {
+      return {
+        ok: false,
+        actual: 'This exact file call already failed for a deterministic reason in this turn and was not executed again. Read the returned current draft or change the required action fields; do not retry the same JSON shape.',
       } satisfies BrowserActionResult;
     }
     toolExecutionGate.executed = true;
@@ -1331,10 +1194,18 @@ function makeBrowserTools(
       const imagePaths = result.referenceImagePaths?.length
         ? result.referenceImagePaths
         : result.referenceImagePath ? [result.referenceImagePath] : [];
-      const source = name === 'file' && input && typeof input === 'object' && 'action' in input
-        ? `file:${String((input as { action?: unknown }).action || 'unknown')}`
+      const source = (name === 'file' || name === 'fileVisual') && input && typeof input === 'object' && 'action' in input
+        ? `${name}:${String((input as { action?: unknown }).action || 'unknown')}`
         : name;
-      for (const path of new Set(imagePaths)) referenceOptions?.onReferenceImage?.({ path, source });
+      const screenshotIds = name === 'fileVisual' && input && typeof input === 'object' && 'screenshotIds' in input
+        ? (input as { screenshotIds?: unknown }).screenshotIds
+        : undefined;
+      for (const [index, path] of [...new Set(imagePaths)].entries()) {
+        const screenshotId = Array.isArray(screenshotIds) && typeof screenshotIds[index] === 'string'
+          ? screenshotIds[index]
+          : undefined;
+        referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
+      }
       return compactToolResultForModel(name, result);
     });
   }
@@ -1445,65 +1316,45 @@ function makeBrowserTools(
       }),
     } : {}),
     file: tool({
-      description: 'Read, download, or author files through the LibreOffice UNO document engine. New files use action=plan with a required stable model-chosen documentId, repeated bounded action=generate batches, action=edit for changes, and action=render to render an unchanged draft. Never add an invisible or dummy block merely to trigger rendering. Reuse exactly the same documentId for every retry, repeated plan, render, and visual correction of one logical document; a repeated plan resumes that draft without clearing it. Use another ID only for a genuinely distinct requested output. Every plural collection field (outline, blocks, children, columns, operations) is always a JSON array, including when it contains only one item; never collapse a one-item array into an object and never wrap an array in an {"item": ...} object. Edit operations are strict: add requires exactly one complete block or non-empty blocks array; update requires blockId plus patch; replace requires blockId plus a complete block; replaceChildren atomically replaces one parent children array and avoids remove-then-add ordering bugs. The document AST is canonical and never guesses intent: geometry and typography belong only under block.style, visible text only in block.text, inline SVG only in block.svg, and image sources only in block.source. Invalid aliases are rejected with their exact field path instead of being moved. Presentation drafts MUST contain only top-level page blocks, one per slide; spreadsheet drafts MUST contain only top-level sheet blocks, one per worksheet. Presentation and Calc drawing geometry defaults to px; Writer page geometry defaults to mm, and style.unit may override it. For advanced native shapes use unoService plus unoProperties; rejected explicit UNO properties fail rather than disappearing. Complex visuals may always be supplied as SVG. There are no presets or fixed templates. PDF is a first-class LibreOffice-backed output. This tool does not navigate the visible browser.',
+      description: 'Read, download, or author files through an independent workspace draft.py per documentId and a dedicated LibreOffice worker. Different documentIds may coexist, including DOCX and PDF outputs in the same run. New documents use plan → one initial generate → render. generate={action,documentId,program} may initialize draft.py exactly once. After source exists, including after a failed first render, never send another complete program. Fix the saved source with edit={action,documentId,edits:[{oldText,newText,replaceAll?}]}, then render the same documentId. action=edit accepts targeted edits only and saves them to draft.py before execution; complete program replacement is unsupported. Copy oldText from the latest known source and call read first only when that source is unknown. Reuse the same documentId only for reads, edits, renders, and retries of that logical document. render={action,documentId}. documentType is word|spreadsheet|presentation. The source defines def create_document(job): and saves exactly one artifact at job.output_path/job.output_url. Before authoring call action=unoApi with target=all, then copy the returned cookbook.completeDocument and cookbook.operations patterns for every API category used. Treat the cookbook and installed reflection as authoritative: never invent enum members, constant names, numeric substitutes, object methods, bounds keys, or export filters. For every Impress TextShape, set Position/Size, call page.add(shape), and only then assign String/Text and text formatting; text assigned while detached is lost. Assets are available only through exact names returned by plan and job.asset_path(name); draft.py must not fetch remote URLs. A successful render reopens the result in a fresh LibreOffice process and produces a PDF preview. This tool does not navigate the visible browser.',
+      // Keep the provider-facing schema flat. Several OpenAI-compatible
+      // gateways mishandle a discriminated union/oneOf and reject a perfectly
+      // usable file call before the action-specific implementation can return
+      // a helpful correction. Each action validates its required fields below.
       inputSchema: z.preprocess(
         (input) => coerceBrowserChatToolInput('file', input),
-        z.discriminatedUnion('action', [
-          browserToolInput({
-            action: z.literal('read'),
-            attachmentId: z.string().min(1).max(160).optional().describe('One uploaded-file ID listed in conversation metadata.'),
-            artifactId: z.string().min(1).max(4_000).optional().describe('One Artifact ID returned by action=download or a rendered document draft.'),
-            includeVisuals: z.boolean().optional(),
-            offset: z.number().int().min(0).optional(),
-            limit: z.number().int().min(BROWSER_CHAT_FILE_READ_MIN_CHARS).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
-            pages: z.array(z.number().int().min(1)).min(1).max(6).optional(),
-          }),
-          browserToolInput({
-            action: z.literal('download'),
-            url: z.string().optional().describe('Absolute download URL. If omitted, path or urlOrPath is used.'),
-            path: z.string().optional().describe('Origin-relative or page-relative download path.'),
-            urlOrPath: z.string().optional().describe('Absolute URL, origin-relative path, or page-relative path.'),
-            fileName: z.string().optional().describe('Optional saved file name, including extension.'),
-          }),
-          browserToolInput({
-            action: z.literal('plan'),
-            documentId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/).describe('Required stable ID chosen by you for this logical output, for example solar-system-presentation. Reuse it exactly on every repeated plan, generate, edit, render, and visual-correction call for the same document. Use a different ID only for a genuinely different requested output.'),
-            fileName: z.string().min(1).describe('Required file name with a supported output extension.'),
-            documentType: z.enum(['word', 'spreadsheet', 'presentation']),
-            intent: z.string().optional().describe('Creative direction and functional goal. This is not a template name.'),
-            document: generatedFileDocumentSchema.optional(),
-            outline: generatedFileOutlineSchema.optional(),
-          }),
-          browserToolInput({
-            action: z.literal('generate'),
-            documentId: z.string().min(1).describe('The same stable documentId you chose for this logical output in action=plan.'),
-            blocks: z.array(generatedFileBlockSchema).min(1).describe('JSON array containing one coherent batch of blocks. Even one block must remain inside an array. Use stable unique IDs and multiple calls instead of one huge payload.'),
-            parentId: z.string().optional(),
-            beforeId: z.string().optional(),
-            afterId: z.string().optional(),
-            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call. Supply it to reject stale writes.'),
-            render: z.boolean().optional().describe('Render after this batch. Usually false until the planned sections are present.'),
-          }),
-          browserToolInput({
-            action: z.literal('edit'),
-            documentId: z.string().min(1).describe('The same stable documentId used by plan/generate for this logical output.'),
-            operations: z.array(generatedFileEditOperationSchema).min(1).describe('Atomic ordered edit batch. Use replaceChildren to rebuild one page/group without a separate remove followed by add.'),
-            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call. Supply it to reject stale writes.'),
-            render: z.boolean().optional().describe('Defaults to true. Set false while applying several local edit batches.'),
-          }),
-          browserToolInput({
-            action: z.literal('render'),
-            documentId: z.string().min(1).describe('The stable documentId of the existing draft to render without changing its block tree.'),
-            expectedRevision: z.number().int().min(0).optional().describe('Revision returned by the previous plan/generate/edit call.'),
-          }),
-        ]).superRefine((input, refinement) => {
-          if (input.action === 'read' && Boolean(input.attachmentId) === Boolean(input.artifactId)) {
-            refinement.addIssue({ code: z.ZodIssueCode.custom, message: 'action=read requires exactly one attachmentId or artifactId.' });
-          }
-        }),
+        z.object({
+          reason: z.string().min(1).max(300).optional().describe('Optional concise reason; it never changes file behavior.'),
+          action: z.string().max(32).optional().describe('Exactly one action: read, download, plan, generate, edit, unoApi, or render. plan={action,documentId,fileName,documentType}; generate={action,documentId,program} initializes source once; edit={action,documentId,edits:[{oldText,newText,replaceAll?}]} modifies existing draft.py and never accepts program; render={action,documentId}; download={action,url}; unoApi={action,documentType,target}; read={action, exactly one of attachmentId/artifactId/documentId}. Missing/unknown actions receive a corrective tool result instead of a schema failure.'),
+          attachmentId: z.string().max(160).optional(),
+          artifactId: z.string().max(4_000).optional(),
+          documentId: z.string().max(96).optional(),
+          fileName: z.string().max(180).optional(),
+          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('For plan/unoApi only: word, spreadsheet, or presentation. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
+          intent: z.string().max(8_000).optional(),
+          url: z.string().max(8_000).optional(),
+          path: z.string().max(8_000).optional(),
+          urlOrPath: z.string().max(8_000).optional(),
+          program: z.string().max(180_000).optional(),
+          edits: z.array(z.object({
+            oldText: z.string().min(1).max(100_000).describe('Exact source copied from the latest draft.py. Include enough surrounding lines to identify one location.'),
+            newText: z.string().max(100_000).describe('Replacement source. Use an empty string to delete oldText.'),
+            replaceAll: z.boolean().optional().describe('Replace every match intentionally. Omit for the safe unique-match default.'),
+          })).min(1).max(50).optional(),
+          render: z.boolean().optional(),
+          includeVisuals: z.boolean().optional(),
+          offset: z.number().int().min(0).optional(),
+          limit: z.number().int().min(1).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
+          pages: z.array(z.number().int().min(1)).max(6).optional(),
+          target: z.enum(['all', 'document', 'page', 'text', 'sheet', 'cell', 'shape']).optional(),
+          query: z.string().max(120).optional(),
+        }).passthrough(),
       ),
       execute: (input, execution) => {
         if (input.action === 'read') {
+          if (input.documentId) {
+            return record('file', input, () => readUnoDraft({ documentId: input.documentId, runId: referenceOptions?.runId }), execution);
+          }
           const includeVisuals = modelSupportsScreenshotInput()
             && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
           const normalizedInput = {
@@ -1519,17 +1370,48 @@ function makeBrowserTools(
           return record('file', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution);
         }
         if (input.action === 'plan') {
-          return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId }), execution);
+          return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings }), execution);
+        }
+        if (input.action === 'unoApi') {
+          return record('file', input, () => getUnoApi(input), execution);
         }
         if (input.action === 'generate') {
-          return record('file', input, () => generateFileArtifactBlocks({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+          return record('file', input, (abortSignal) => generateUnoFileArtifact({ ...input, abortSignal, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
         }
         if (input.action === 'render') {
-          return record('file', input, () => renderFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+          return record('file', input, (abortSignal) => renderFileArtifact({ ...input, abortSignal, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
         }
-        return record('file', input, () => editFileArtifact({ ...input, runId: referenceOptions?.runId, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+        if (input.action === 'edit') {
+          return record('file', input, (abortSignal) => editUnoFileArtifact({ ...input, abortSignal, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+        }
+        return record('file', input, () => Promise.resolve({
+          ok: false,
+          actual: 'file requires one action: read | download | plan | generate | edit | unoApi | render. Do not retry an empty object. Minimal valid plan: {"action":"plan","documentId":"solar-system","fileName":"solar-system.pptx","documentType":"presentation"}. Do not include outline, blocks, XML, or a nested params object.',
+        }), execution);
       },
     }),
+    ...(modelSupportsScreenshotInput() && referenceOptions?.readFileVisuals ? {
+      fileVisual: tool({
+        description: 'Inspect a generated PDF or Office artifact visually by stable screenshot id. First call action=index with the exact Artifact ID returned by file to get screenshotCount and screenshot ids. Then call action=read with one to six exact screenshotIds; those page images are attached to the next model request. Read every page in ordered batches before declaring a generated artifact visually verified. If a defect is visible, use file action=read/edit/render on the document draft and inspect the corrected artifact again.',
+        inputSchema: z.preprocess(
+          (input) => coerceBrowserChatToolInput('fileVisual', input),
+          browserToolInput({
+            action: z.enum(['index', 'read']),
+            artifactId: z.string().min(1).max(4_000).describe('Exact current-conversation Artifact ID returned by a successful file generation or download.'),
+            screenshotIds: z.array(z.string().min(1).max(40)).min(1).max(6).optional().describe('For action=read only: one to six exact screenshot-NNNN ids returned by action=index.'),
+            offset: z.number().int().min(0).optional().describe('For action=index only: zero-based screenshot-list offset. Defaults to 0.'),
+            limit: z.number().int().min(1).max(200).optional().describe('For action=index only: number of screenshot ids to list. Defaults to 100.'),
+          }).superRefine((input, context) => {
+            if (input.action === 'read' && !input.screenshotIds?.length) {
+              context.addIssue({ code: z.ZodIssueCode.custom, message: 'read requires screenshotIds.', path: ['screenshotIds'] });
+            }
+          }),
+        ),
+        execute: (input, execution) => record('fileVisual', input, () => referenceOptions?.readFileVisuals
+          ? referenceOptions.readFileVisuals(input)
+          : Promise.resolve({ ok: false, actual: 'fileVisual is unavailable in this runtime.' }), execution),
+      }),
+    } : {}),
   };
 
   const tools = sharedTools;
@@ -1565,12 +1447,13 @@ function toolSchemaEstimateInput(tools?: RuntimeToolDefinitions) {
   });
 }
 
-function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord }) {
+function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVisualAvailable?: boolean }) {
   const { runtimeRecord } = input;
   const rawCaseSystemPrompt = systemPromptOf(runtimeRecord);
   const caseSystemPrompt = browserChatSystemPromptForRuntime(rawCaseSystemPrompt);
   const customPrompt = customRuntimePromptFromEnv();
   const screenshotAvailable = modelSupportsScreenshotInput();
+  const documentAuthoringRule = '- Author a new Office/PDF document with file action=plan, then exactly one complete initial Python UNO draft in action=generate, then action=render. Once draft.py exists, including after the first render fails, never call generate again and never resend a complete program. Fix the saved source with action=edit and targeted edits=[{oldText,newText,replaceAll?}], then render the same documentId again. action=edit accepts targeted edits only; complete program replacement is unsupported. Read first only when the exact current oldText is unknown. Do not perform a mandatory no-op edit. Each documentId owns an independent workspace; different documentIds and output formats may coexist in one run. Reuse an ID only for retries, reads, edits, renders, and visual corrections of that logical document. Call action=unoApi with target=all once before authoring, inspect cookbook.coverage, and copy cookbook.completeDocument plus every matching cookbook.operations pattern used by the draft. The returned cookbook and installed reflection are authoritative: never invent enum members, constant names, numeric substitutes, object methods, document-bounds keys, or export filters. The source must define def create_document(job):, use direct UNO APIs, and write exactly one artifact to job.output_path/job.output_url. Use only exact asset names returned by plan through job.asset_path(name), job.list_assets(), and job.document_bounds(component); download remote assets before use. For a presentation, every TextShape must receive explicit in-slide Position/Size, then be attached with page.add(shape), and only after attachment receive String/Text and text formatting; detached text is lost in this runtime. Set TextFitToSize to AUTOFIT, leave enough height for the intended font, and never use a scrollable control. The Worker reopens the artifact read-only in a fresh LibreOffice process, rejects detached-text failures, and exports a PDF preview.';
   return [
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
     '',
@@ -1581,17 +1464,19 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord }) {
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- A final user-role message beginning with [WebPilot runtime operational context] is trusted runtime metadata, not a new user request. Use it for the current decision without repeating or exposing it.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
-    '- Author new documents through file action=plan, then multiple bounded action=generate block batches, action=edit for local changes by stable block ID, and action=render to render an unchanged draft. Never add an invisible or dummy block to trigger rendering. Use {type:"spacer",style:{height:12,unit:"mm"}} for intentional blank vertical space and {type:"pageBreak"} or breakBefore:"page" for Writer pagination; a text/heading block must always contain visible text. On the first plan choose one stable semantic documentId for each genuinely distinct requested output. Reuse that exact documentId for every repeated plan, generate, edit, render, retry, and visual correction of that document; never create a new documentId merely because rendering or validation failed. A repeated plan with the same documentId resumes the existing draft and never clears its blocks. Do not send the whole document as one giant JSON call. The LibreOffice UNO block tree is the design surface: presentation top-level blocks must be pages, spreadsheet top-level blocks must be sheets, and all visible content belongs inside their children. The AST is strict: use block.text, block.svg, block.source and block.style exactly; invalid aliases or flattened style fields are rejected and never moved. unoProperties is for documented, block-type-specific native object properties only; never use it for ordinary spacing, pagination, typography, or position. Use SVG when an Office-native object cannot express the intended visual. There are no presets, house templates, mandatory branding, or fixed layouts.',
-    screenshotAvailable
-      ? '- A successful render is a draft, not completion: inspect every returned document preview and generationDiagnostics for clipping, overlap, empty pages, distorted images, broken tables or charts, poor contrast, and inconsistent alignment. Repair only affected stable block IDs with action=edit, call action=render again, and inspect the replacement preview before presenting the final Artifact.'
+    documentAuthoringRule,
+    screenshotAvailable && input.fileVisualAvailable
+      ? '- A successful render is a draft, not completion. Use fileVisual action=index with the returned Artifact ID, then fileVisual action=read in ordered batches of at most six screenshot ids until every page has been visually inspected. Check clipping, overlap, empty pages, distorted images, broken tables or charts, poor contrast, and inconsistent alignment. If a defect exists, read the current draft, edit only the affected source region with structured oldText/newText, render again, and repeat fileVisual inspection on the corrected Artifact before presenting it.'
+      : screenshotAvailable
+        ? '- A successful render is a draft, not completion: inspect every returned document preview and generationDiagnostics for clipping, overlap, empty pages, distorted images, broken tables or charts, poor contrast, and inconsistent alignment. If a defect exists, read the current draft, edit only the affected source region with structured oldText/newText, render again, and inspect the replacement preview before presenting the final Artifact.'
       : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
-    '- PDF is a first-class LibreOffice-backed output, never an unsupported format or a Word workaround.',
+    '- PDF is a first-class LibreOffice UNO output, never an unsupported format or a Word workaround.',
     ...browserChatCodeRules(screenshotAvailable),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. For exactly one child, omit tasks and send title, url, and instruction as flat fields. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. If spawn is rejected for its input shape, do not retry that shape: use the flat single-task form once or continue in the main Agent. Never produce a chain of schema-debug retries. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
-    '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → edit document flow.',
+    '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
@@ -1599,13 +1484,14 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord }) {
   ].filter(Boolean).join('\n');
 }
 
-function runtimeToolNames() {
+function runtimeToolNames(includeVisualTools = true) {
   return [
     'readBrowserState',
     'browserCode',
     'waitForHumanVerification',
     'subagent',
     'file',
+    ...(includeVisualTools ? ['fileVisual'] : []),
     'skill',
   ];
 }
@@ -2025,6 +1911,7 @@ async function executeRuntimeStep(input: {
   readSubagent?: BrowserChatSubagentReader;
   requiredSubagentUuid?: string;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
@@ -2076,7 +1963,7 @@ async function executeRuntimeStep(input: {
         'Use these reference images as user-provided visual context. Do not confuse them with the live browser screenshot.',
       ].join('\n')
     : '';
-  const prompt = runtimePrompt({ runtimeRecord });
+  const prompt = runtimePrompt({ runtimeRecord, fileVisualAvailable: Boolean(input.readFileVisuals) });
   let activeOperationalContext = input.operationalContext || '';
   let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
@@ -2125,7 +2012,7 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const externalTools = codexMode ? {} : (input.memoryTools || {});
     const externalToolNames = new Set(Object.keys(externalTools));
-    const availableRuntimeToolNames = [...runtimeToolNames(), ...externalToolNames].filter((name) => (
+    const availableRuntimeToolNames = [...runtimeToolNames(imageInputAvailable && Boolean(input.readFileVisuals)), ...externalToolNames].filter((name) => (
       (name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent))
       && (name !== 'skill' || Boolean(input.readSkill))
     ));
@@ -2151,7 +2038,7 @@ async function executeRuntimeStep(input: {
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
     const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
-      const documentVisualQa = source === 'file:generate' || source === 'file:edit';
+      const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('fileVisual:read');
       if (!modelSupportsScreenshotInput()) {
         if (documentVisualQa) {
           void onAttemptDebug?.({
@@ -2165,7 +2052,7 @@ async function executeRuntimeStep(input: {
       }
       pendingObservationMessages.push({
         text: documentVisualQa
-          ? '[Document visual QA]\nThis image is a freshly rendered page from the current generated document. Inspect it before finalizing. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, and content outside the page. If a defect exists, use file action=edit on only the affected stable block IDs, render again, and inspect the replacement preview. Do not present this preview image as the final downloadable document.'
+          ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect it before finalizing. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, and content outside the page. Continue calling fileVisual action=read until every indexed screenshot has been inspected. If a defect exists, read the draft and use file action=edit with focused oldText/newText edits, render again, and inspect the corrected artifact. Do not present this preview image as the final downloadable document.`
           : source === 'file:read'
             ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
             : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.',
@@ -2643,6 +2530,7 @@ async function executeRuntimeStep(input: {
           traces,
         ),
         readFile: input.readFile,
+        readFileVisuals: input.readFileVisuals,
         readSkill: input.readSkill,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: activeCredentialBindings,
@@ -2725,6 +2613,7 @@ async function executeRuntimeStep(input: {
       readSubagent: input.readSubagent,
       requiredSubagentUuid: input.requiredSubagentUuid,
       readFile: input.readFile,
+      readFileVisuals: input.readFileVisuals,
       readSkill: input.readSkill,
       attachmentBindings: input.attachmentBindings,
       credentialBindings: input.credentialBindings,
@@ -2855,7 +2744,7 @@ async function executeRuntimeStep(input: {
         upsertToolTrace(durableTraces, trace);
         await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       };
-      const onAgentStepEnd = async (event: { text?: string; stepNumber?: number }) => {
+      const onAgentStepEnd = async (event: { text?: string; stepNumber?: number; toolCalls?: unknown[]; toolResults?: unknown[] }) => {
         requestWatchdog.touch();
         ensureActive();
         latestText = event.text || '';
@@ -2878,7 +2767,23 @@ async function executeRuntimeStep(input: {
           details: aiResponseLogDetails({
             aiRequest,
             modelMessages: stepModelMessagesForLog.get(turnIndex),
-            response: event,
+            // Preserve the SDK's ordered step transcript. The client can now
+            // render text/calls/results directly, rather than guessing which
+            // later execution trace belongs under a model sentence.
+            response: {
+              content: [
+                ...(latestText ? [{ type: 'text', text: latestText }] : []),
+                ...(Array.isArray(event.toolCalls) ? event.toolCalls.map((toolCall) => ({
+                  ...(typeof toolCall === 'object' && toolCall ? toolCall : {}),
+                  type: 'tool-call',
+                })) : []),
+                ...(Array.isArray(event.toolResults) ? event.toolResults.map((toolResult) => ({
+                  ...(typeof toolResult === 'object' && toolResult ? toolResult : {}),
+                  type: 'tool-result',
+                })) : []),
+              ],
+              text: latestText,
+            },
             elapsedMs: elapsedSince(startedAt),
             stepStartedAt: startedAt,
             traces: newTraces,
@@ -3303,6 +3208,7 @@ export async function executeInteractiveBrowserTurn(input: {
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
@@ -3369,6 +3275,7 @@ export async function executeInteractiveBrowserTurn(input: {
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
         readFile: input.readFile,
+        readFileVisuals: input.readFileVisuals,
         readSkill: input.readSkill,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: input.credentialBindings,
@@ -3725,6 +3632,9 @@ export async function executeRecordedBrowserOperation(
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'file':
+      if (input.action === 'read' && typeof input.documentId === 'string') {
+        return readUnoDraft({ runId, documentId: input.documentId });
+      }
       if (input.action === 'download') {
         return downloadFileArtifact({
           runId,
@@ -3743,29 +3653,41 @@ export async function executeRecordedBrowserOperation(
           fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
           documentType,
           intent: typeof input.intent === 'string' ? input.intent : undefined,
-          document: generatedFileDocumentSchema.safeParse(input.document).data,
-          outline: generatedFileOutlineSchema.safeParse(input.outline).data,
         });
       }
       if (input.action === 'generate') {
-        return generateFileArtifactBlocks({
+        return generateUnoFileArtifact({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          blocks: z.array(generatedFileBlockSchema).safeParse(input.blocks).data,
-          parentId: typeof input.parentId === 'string' ? input.parentId : undefined,
-          beforeId: typeof input.beforeId === 'string' ? input.beforeId : undefined,
-          afterId: typeof input.afterId === 'string' ? input.afterId : undefined,
-          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
-          render: input.render === true,
+          program: typeof input.program === 'string' ? input.program : undefined,
+          render: input.render !== false,
           includeVisualVerification: true,
         });
       }
+      if (input.action === 'unoApi') {
+        const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
+        const target = input.target === 'all' || input.target === 'document' || input.target === 'page' || input.target === 'text' || input.target === 'sheet' || input.target === 'cell' || input.target === 'shape' ? input.target : undefined;
+        return getUnoApi({
+          documentType,
+          target,
+          query: typeof input.query === 'string' ? input.query : undefined,
+          offset: typeof input.offset === 'number' ? input.offset : undefined,
+          limit: typeof input.limit === 'number' ? input.limit : undefined,
+        });
+      }
       if (input.action === 'edit') {
-        return editFileArtifact({
+        return editUnoFileArtifact({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          operations: z.array(generatedFileEditOperationSchema).safeParse(input.operations).data,
-          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
+          program: typeof input.program === 'string' ? input.program : undefined,
+          edits: Array.isArray(input.edits)
+            ? input.edits.flatMap((edit) => {
+              if (!edit || typeof edit !== 'object' || Array.isArray(edit)) return [];
+              const value = edit as Record<string, unknown>;
+              if (typeof value.oldText !== 'string' || typeof value.newText !== 'string') return [];
+              return [{ oldText: value.oldText, newText: value.newText, replaceAll: value.replaceAll === true }];
+            })
+            : undefined,
           render: input.render !== false,
           includeVisualVerification: true,
         });
@@ -3774,7 +3696,6 @@ export async function executeRecordedBrowserOperation(
         return renderFileArtifact({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          expectedRevision: typeof input.expectedRevision === 'number' ? input.expectedRevision : undefined,
           includeVisualVerification: true,
         });
       }
@@ -3812,6 +3733,7 @@ async function executeCodexRuntimeObject(input: {
   requiredSubagentUuid?: string;
   browserStatePreflightComplete?: boolean;
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
@@ -3820,7 +3742,7 @@ async function executeCodexRuntimeObject(input: {
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onReferenceImage?: (input: { path: string; source: string }) => void;
 }) {
-  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
+  const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readFileVisuals, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -3880,6 +3802,8 @@ async function executeCodexRuntimeObject(input: {
       return readSubagent(uuid);
     }
     if (type === 'file' && normalizedParams.action === 'read') {
+      const documentId = typeof normalizedParams.documentId === 'string' ? normalizedParams.documentId.trim() : undefined;
+      if (documentId) return readUnoDraft({ runId, documentId });
       if (!readFile) return { ok: false, actual: 'file action=read is unavailable in this runtime.' };
       const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : undefined;
       const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : undefined;
@@ -3891,6 +3815,32 @@ async function executeCodexRuntimeObject(input: {
         limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
         pages: Array.isArray(normalizedParams.pages) ? normalizedParams.pages as number[] : undefined,
+      });
+    }
+    if (type === 'fileVisual') {
+      if (!readFileVisuals) return { ok: false, actual: 'fileVisual is unavailable in this runtime.' };
+      const action = normalizedParams.action === 'index' || normalizedParams.action === 'read'
+        ? normalizedParams.action
+        : undefined;
+      const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : '';
+      const screenshotIds = Array.isArray(normalizedParams.screenshotIds)
+        ? Array.from(new Set(normalizedParams.screenshotIds
+            .filter((value): value is string => typeof value === 'string')
+            .map((value) => value.trim())
+            .filter(Boolean))).slice(0, 6)
+        : undefined;
+      if (!action || !artifactId) {
+        return { ok: false, actual: 'fileVisual requires action=index|read and the exact Artifact ID returned by file.' };
+      }
+      if (action === 'read' && !screenshotIds?.length) {
+        return { ok: false, actual: 'fileVisual action=read requires screenshotIds returned by action=index.' };
+      }
+      return readFileVisuals({
+        action,
+        artifactId,
+        screenshotIds,
+        offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
+        limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
       });
     }
     if (type === 'skill' && normalizedParams.action === 'read') {
@@ -3958,10 +3908,16 @@ async function executeCodexRuntimeObject(input: {
   const imagePaths = result.referenceImagePaths?.length
     ? result.referenceImagePaths
     : result.referenceImagePath ? [result.referenceImagePath] : [];
-  const imageSource = type === 'file'
-    ? `file:${String(normalizedParams.action || 'unknown')}`
+  const imageSource = type === 'file' || type === 'fileVisual'
+    ? `${type}:${String(normalizedParams.action || 'unknown')}`
     : type;
-  for (const imagePath of new Set(imagePaths)) onReferenceImage?.({ path: imagePath, source: imageSource });
+  const screenshotIds = type === 'fileVisual' && Array.isArray(normalizedParams.screenshotIds)
+    ? normalizedParams.screenshotIds
+    : undefined;
+  for (const [index, imagePath] of [...new Set(imagePaths)].entries()) {
+    const screenshotId = typeof screenshotIds?.[index] === 'string' ? screenshotIds[index] : undefined;
+    onReferenceImage?.({ path: imagePath, source: screenshotId ? `${imageSource}:${screenshotId}` : imageSource });
+  }
   const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
   return { text: fileResult || toolConsistentAssistantText(message, type), executed: true };
 }

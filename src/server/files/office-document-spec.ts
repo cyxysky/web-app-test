@@ -107,35 +107,17 @@ export type OfficeDocumentSpec = {
   fileName: string;
 };
 
-export type OfficeDocumentOutlineItem = {
-  id: string;
-  title: string;
-  purpose?: string;
-  suggestedBlocks?: string[];
-};
-
-export type OfficeDocumentDraft = OfficeDocumentSpec & {
+/** A semantic plan plus the model-owned, executable UNO draft. No block tree is rendered from this type. */
+export type OfficeDocumentDraft = {
   createdAt: string;
   documentId: string;
+  documentType: OfficeDocumentKind;
+  fileName: string;
   intent?: string;
-  outline?: OfficeDocumentOutlineItem[];
-  revision?: number;
+  /** Complete Python source run verbatim by the LibreOffice UNO worker. */
+  program?: string;
+  /** SHA-256 of the workspace draft.py content, used to detect split-brain metadata. */
+  sourceDigest?: string;
   renderedFileName?: string;
   updatedAt: string;
 };
-
-type OfficeBlockPlacement = {
-  afterId?: string;
-  beforeId?: string;
-  parentId?: string;
-};
-
-export type OfficeDocumentEditOperation =
-  | ({ op: 'add'; block: OfficeBlock; blocks?: never } & OfficeBlockPlacement)
-  | ({ op: 'add'; block?: never; blocks: OfficeBlock[] } & OfficeBlockPlacement)
-  | ({ op: 'move'; blockId: string } & OfficeBlockPlacement)
-  | { op: 'remove'; blockId: string }
-  | { op: 'replace'; blockId: string; block: OfficeBlock }
-  | { op: 'replaceChildren'; parentId: string; blocks: OfficeBlock[] }
-  | { op: 'setDocument'; patch: Record<string, unknown> }
-  | { op: 'update'; blockId: string; patch: Record<string, unknown> };

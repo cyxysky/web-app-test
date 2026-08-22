@@ -17,7 +17,7 @@ test('does not let stream timeouts expire while a tool is still allowed to run',
 
   try {
     assert.deepEqual(aiStreamTimeouts(), {
-      firstChunkMs: 20000,
+      firstChunkMs: 30000,
       chunkMs: 150000,
       toolMs: 120000,
     });

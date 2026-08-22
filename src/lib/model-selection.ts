@@ -30,7 +30,9 @@ export function normalizeModelProvider(value?: unknown, fallback: ModelProvider 
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
   if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
-  if (provider === 'openai-compatible-api' || provider === 'custom-openai') return 'openai-compatible';
+  if (provider === 'openai-compatible-1' || provider === 'openai-compatible-api' || provider === 'custom-openai' || provider === 'custom-openai-1') return 'openai-compatible';
+  if (provider === 'custom-openai-2') return 'openai-compatible-2';
+  if (provider === 'custom-openai-3') return 'openai-compatible-3';
   return modelProviderDefinitions.some((item) => item.value === provider) ? provider as ModelProvider : fallback;
 }
 

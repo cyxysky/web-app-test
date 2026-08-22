@@ -16,9 +16,9 @@ import { getSqliteDatabase } from '@/server/storage/sqlite-database';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 import {
   resolveLibreOfficeExecutable,
-  resolveLibreOfficeOfficeWorker,
   resolveLibreOfficePythonExecutable,
 } from '@/server/files/libreoffice';
+import { resolveUnoProgramWorker } from '@/server/files/uno-program';
 import { store } from '@/server/db/store';
 
 type OnboardingRow = {
@@ -168,7 +168,7 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const providerDefinition = modelProviderDefinition(provider);
   const providerSettings = modelState.config.providers?.[provider];
   const localProvider = ['codex', 'llama-cpp', 'lmstudio', 'ollama'].includes(provider);
-  const customCompatibleReady = provider === 'openai-compatible' && Boolean(providerSettings?.baseURL);
+  const customCompatibleReady = provider.startsWith('openai-compatible') && Boolean(providerSettings?.baseURL);
   const modelReady = Boolean(providerSettings?.enabled && providerSettings.model && (
     providerDefinition.localAuth || localProvider || customCompatibleReady || providerSettings.hasApiKey
   ));
@@ -180,7 +180,7 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const libreOfficePython = libreOfficeExecutable
     ? await resolveLibreOfficePythonExecutable(libreOfficeExecutable)
     : undefined;
-  const libreOfficeWorker = await resolveLibreOfficeOfficeWorker();
+  const libreOfficeWorker = await resolveUnoProgramWorker();
   const libreOfficeReady = Boolean(libreOfficeExecutable && libreOfficePython && libreOfficeWorker);
   let browserReady = false;
   try {

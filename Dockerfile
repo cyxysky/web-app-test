@@ -26,6 +26,7 @@ ENV HOSTNAME=0.0.0.0
 ENV HEADLESS_BROWSER=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV LIBREOFFICE_PATH=/usr/bin/libreoffice
+ENV LIBREOFFICE_UNO_PROGRAM_WORKER_PATH=/app/src/server/files/libreoffice-program-worker.py
 ENV APP_DATA_DIR=/app
 ENV ARTIFACTS_DIR=/app/artifacts
 
@@ -35,6 +36,7 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/.env ./.env
 COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=build /app/server/webpilot-server.js /app/server/webpilot-identity.js /app/server/realtime-refresh-hub.js ./server/
+COPY src/server/files/libreoffice-program-worker.py ./src/server/files/libreoffice-program-worker.py
 
 RUN mkdir -p .data artifacts
 

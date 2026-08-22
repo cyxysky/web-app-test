@@ -114,13 +114,17 @@ export function aiMaxOutputTokens(fallback = 32_768) {
 export function aiStreamTimeouts(requestTimeoutMs = aiRequestTimeoutMs()) {
   const requestMs = requestTimeoutMs;
   const toolMs = positiveInteger(process.env.AI_TOOL_TIMEOUT_MS, 120_000);
+  // A stale per-stream 30s setting must never undercut the runtime's 120s
+  // request deadline. The first chunk has its own SDK timer, so enforce the
+  // same lower bound here rather than only on the outer watchdog.
+  const configuredFirstChunkMs = positiveInteger(process.env.AI_STREAM_FIRST_CHUNK_TIMEOUT_MS, requestMs);
   const configuredChunkMs = positiveInteger(process.env.AI_STREAM_CHUNK_TIMEOUT_MS, requestMs);
   return {
-    firstChunkMs: positiveInteger(process.env.AI_STREAM_FIRST_CHUNK_TIMEOUT_MS, requestMs),
+    firstChunkMs: Math.max(requestMs, configuredFirstChunkMs),
     // AI SDK keeps the inter-chunk timer running while a tool executes. Keep
     // it above the complete tool window so a successful long-running tool does
     // not abort the stream before the following model step can begin.
-    chunkMs: Math.max(configuredChunkMs, toolMs + requestMs),
+    chunkMs: Math.max(requestMs, configuredChunkMs, toolMs + requestMs),
     toolMs,
   };
 }

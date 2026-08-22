@@ -114,6 +114,20 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
   { value: 'huggingface', label: 'Hugging Face', defaultModel: 'meta-llama/Llama-3.1-8B-Instruct', keyLabel: 'Hugging Face 访问密钥', baseUrlLabel: 'Hugging Face 服务地址' },
   { value: 'bedrock', label: 'Amazon Bedrock', defaultModel: 'anthropic.claude-3-5-sonnet-20241022-v2:0', keyLabel: 'AWS Bedrock Bearer Token（可选）', baseUrlLabel: 'AWS 区域', defaultBaseURL: 'us-east-1' },
   { value: 'vercel', label: 'Vercel v0', defaultModel: 'v0-1.5-md', keyLabel: 'Vercel 访问密钥', baseUrlLabel: 'Vercel 服务地址' },
+  {
+    value: 'openai-compatible-2',
+    label: 'OpenAI Compatible 2',
+    defaultModel: 'custom-model',
+    keyLabel: 'Compatible API 2 Key',
+    baseUrlLabel: 'Compatible API 2 Base URL',
+  },
+  {
+    value: 'openai-compatible-3',
+    label: 'OpenAI Compatible 3',
+    defaultModel: 'custom-model',
+    keyLabel: 'Compatible API 3 Key',
+    baseUrlLabel: 'Compatible API 3 Base URL',
+  },
 ];
 
 export const modelProviderValues = modelProviderDefinitions.map((item) => item.value);
@@ -203,10 +217,10 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'LIBREOFFICE_PYTHON_PATH', label: 'LibreOffice Python 路径', description: '可选的 PyUNO Python 可执行文件绝对路径。Windows 默认使用 LibreOffice 自带的 python.exe；仅在自动搜索失败时配置。', tab: 'runtime', defaultValue: '', control: 'text' },
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
-  { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求首个响应及普通非流式调用的最长等待时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
+  { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求首个响应及普通非流式调用的最长等待时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_MAX_OUTPUT_TOKENS', label: 'AI 最大输出 Token', description: '显式传给模型的单次最大输出 token，避免未知模型被兼容层自动限制为 4096。', tab: 'runtime', defaultValue: '32768', control: 'number', min: 256, max: 131072, step: 256 },
-  { key: 'AI_STREAM_FIRST_CHUNK_TIMEOUT_MS', label: 'AI 首块响应超时', description: '流式模型请求等待首个内容块的最长时间；留空时跟随 AI 请求超时。', tab: 'runtime', defaultValue: '30000', control: 'number' },
-  { key: 'AI_STREAM_CHUNK_TIMEOUT_MS', label: 'AI 流式分块超时', description: '流式响应相邻内容块之间允许的最长等待时间；Agent 工具循环会自动为工具执行预留完整时间。', tab: 'runtime', defaultValue: '30000', control: 'number' },
+  { key: 'AI_STREAM_FIRST_CHUNK_TIMEOUT_MS', label: 'AI 首块响应超时', description: '流式模型请求等待首个内容块的最长时间；留空时跟随 AI 请求超时。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_STREAM_CHUNK_TIMEOUT_MS', label: 'AI 流式分块超时', description: '流式响应相邻内容块之间允许的最长等待时间；Agent 工具循环会自动为工具执行预留完整时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_TOOL_TIMEOUT_MS', label: 'AI 工具执行超时', description: '单次 AI 工具执行的默认最长时间；模型请求与工具执行分别计时。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_REASONING_EFFORT', label: 'AI 推理强度', description: '统一控制支持该能力的模型推理强度；默认由提供商决定。', tab: 'runtime', defaultValue: 'provider-default', control: 'select', options: [{ label: '提供商默认', value: 'provider-default' }, { label: '无', value: 'none' }, { label: '极低', value: 'minimal' }, { label: '低', value: 'low' }, { label: '中', value: 'medium' }, { label: '高', value: 'high' }, { label: '极高', value: 'xhigh' }] },
   { key: 'AI_TELEMETRY_ENABLED', label: 'AI 运行指标', description: '记录模型耗时、首块延迟、Token 用量和工具耗时；不会记录提示词、输出或工具参数。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },

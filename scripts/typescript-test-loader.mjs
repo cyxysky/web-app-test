@@ -16,7 +16,7 @@ function typescriptCandidate(filePath) {
 }
 
 export async function resolve(specifier, context, nextResolve) {
-  if (specifier === 'next/server') return nextResolve('next/server.js', context);
+  if (specifier.startsWith('next/') && !specifier.endsWith('.js')) return nextResolve(`${specifier}.js`, context);
   if (specifier.startsWith('@/')) {
     const candidate = typescriptCandidate(path.join(projectRoot, 'src', specifier.slice(2)));
     if (candidate) return { shortCircuit: true, url: pathToFileURL(candidate).href };

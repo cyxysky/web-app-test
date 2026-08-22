@@ -3,13 +3,15 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { resolveLibreOfficeExecutable, resolveLibreOfficeOfficeWorker, resolveLibreOfficePythonExecutable } from '@/server/files/libreoffice';
+import { resolveLibreOfficeExecutable, resolveLibreOfficePythonExecutable } from '@/server/files/libreoffice';
+import { resolveUnoProgramWorker } from '@/server/files/uno-program';
 import { generateFileBuffer } from './document-artifact-generators';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
+import { readBrowserChatFileVisuals } from './browser-chat-attachment-reader';
 
 async function officeGenerationAvailable() {
   const executable = await resolveLibreOfficeExecutable();
-  return Boolean(executable && await resolveLibreOfficePythonExecutable(executable) && await resolveLibreOfficeOfficeWorker());
+  return Boolean(executable && await resolveLibreOfficePythonExecutable(executable) && await resolveUnoProgramWorker());
 }
 
 test('renders selected PDF pages into model-ready PNG files', async (context) => {
@@ -17,8 +19,16 @@ test('renders selected PDF pages into model-ready PNG files', async (context) =>
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-attachment-visual-'));
   const sourcePath = path.join(root, 'source.pdf');
   const generated = await generateFileBuffer({
-    blocks: Array.from({ length: 140 }, (_, index) => ({ id: `paragraph-${index}`, type: 'text', text: `Paragraph ${index + 1}: enough content to verify exact PDF page selection.` })),
     document: { title: 'Attachment visual pages' }, documentType: 'word', fileName: 'source.pdf',
+    program: `
+def create_document(job):
+    document = job.new_document('word')
+    cursor = document.Text.createTextCursor()
+    for index in range(140):
+        document.Text.insertString(cursor, f'Paragraph {index + 1}: enough content to verify exact PDF page selection.\\n', False)
+    document.storeToURL(job.output_url, (job.property('FilterName', 'writer_pdf_Export'),))
+    job.close(document)
+`,
   });
   await writeFile(sourcePath, generated.buffer);
   try {
@@ -27,6 +37,43 @@ test('renders selected PDF pages into model-ready PNG files', async (context) =>
     assert.ok((result.pageCount ?? 0) >= 2);
     assert.deepEqual(result.renderedPages, [2]);
     assert.equal((await readFile(result.imagePaths[0])).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+
+    const attachment = {
+      id: 'artifact-1',
+      kind: 'file' as const,
+      name: 'source.pdf',
+      path: 'generated/source.pdf',
+      type: 'application/pdf',
+      url: '/artifacts/generated/source.pdf',
+    };
+    const indexResult = await readBrowserChatFileVisuals({
+      attachment,
+      absolutePath: sourcePath,
+      request: { action: 'index', artifactId: 'generated/source.pdf', limit: 2 },
+      previewRoot: path.join(root, 'previews'),
+    });
+    assert.equal(indexResult.ok, true, indexResult.actual);
+    const index = JSON.parse(indexResult.actual) as {
+      screenshotCount: number;
+      screenshots: Array<{ screenshotId: string; pageNumber: number }>;
+    };
+    assert.ok(index.screenshotCount >= 2);
+    assert.deepEqual(index.screenshots.slice(0, 2), [
+      { screenshotId: 'screenshot-0001', pageNumber: 1 },
+      { screenshotId: 'screenshot-0002', pageNumber: 2 },
+    ]);
+    assert.equal(indexResult.referenceImagePaths, undefined);
+
+    const readResult = await readBrowserChatFileVisuals({
+      attachment,
+      absolutePath: sourcePath,
+      request: { action: 'read', artifactId: 'generated/source.pdf', screenshotIds: ['screenshot-0002', 'screenshot-0001'] },
+      previewRoot: path.join(root, 'previews'),
+    });
+    assert.equal(readResult.ok, true, readResult.actual);
+    assert.equal(readResult.referenceImagePaths?.length, 2);
+    assert.match(readResult.referenceImagePaths?.[0] || '', /page-0002\.png$/);
+    assert.match(readResult.referenceImagePaths?.[1] || '', /page-0001\.png$/);
   } finally {
     await rm(root, { force: true, recursive: true });
   }
@@ -37,8 +84,15 @@ test('renders a LibreOffice-generated DOCX into visual pages without detaching t
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-docx-visual-'));
   const sourcePath = path.join(root, 'template.docx');
   const generated = await generateFileBuffer({
-    blocks: [{ id: 'overview', type: 'heading', text: '工作概览' }, { id: 'body', type: 'text', text: '本年度研发工作按计划推进。' }],
     document: { title: '研发部员工年中工作总结报告' }, documentType: 'word', fileName: 'template.docx',
+    program: `
+def create_document(job):
+    document = job.new_document('word')
+    cursor = document.Text.createTextCursor()
+    document.Text.insertString(cursor, '研发部员工年中工作总结报告\\n\\n本年度研发工作按计划推进。', False)
+    document.storeAsURL(job.output_url, (job.property('FilterName', 'Office Open XML Text'),))
+    job.close(document)
+`,
   });
   await writeFile(sourcePath, generated.buffer);
   try {
@@ -46,6 +100,12 @@ test('renders a LibreOffice-generated DOCX into visual pages without detaching t
     assert.ok(result.renderer === 'html-preview' || result.renderer === 'libreoffice-pdf', result.warning);
     assert.deepEqual(result.renderedPages, [1]);
     assert.equal((await readFile(result.imagePaths[0])).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+    if (result.renderer === 'libreoffice-pdf') {
+      await rm(sourcePath, { force: true });
+      const cached = await renderBrowserChatAttachmentVisuals({ absolutePath: sourcePath, buffer: generated.buffer, extension: '.docx', name: 'template.docx', pages: [1], previewRoot: path.join(root, 'previews') });
+      assert.equal(cached.renderer, 'libreoffice-pdf');
+      assert.deepEqual(cached.renderedPages, [1]);
+    }
   } finally {
     await rm(root, { force: true, recursive: true });
   }

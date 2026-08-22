@@ -158,3 +158,60 @@ test('custom OpenAI-compatible provider uses its independent Base URL and key', 
     restoreEnvironmentValue('OPENAI_COMPATIBLE_API_KEY', previousApiKey);
   }
 });
+
+test('the second and third OpenAI-compatible providers use isolated endpoints and keys', async () => {
+  const previousFetch = globalThis.fetch;
+  const environments = [
+    {
+      provider: 'openai-compatible-2',
+      baseName: 'OPENAI_COMPATIBLE_2_BASE_URL',
+      keyName: 'OPENAI_COMPATIBLE_2_API_KEY',
+      baseURL: 'https://second.example/v1',
+      apiKey: 'second-key',
+    },
+    {
+      provider: 'openai-compatible-3',
+      baseName: 'OPENAI_COMPATIBLE_3_BASE_URL',
+      keyName: 'OPENAI_COMPATIBLE_3_API_KEY',
+      baseURL: 'https://third.example/v1',
+      apiKey: 'third-key',
+    },
+  ] as const;
+  const previous = environments.map((item) => ({
+    baseURL: process.env[item.baseName],
+    apiKey: process.env[item.keyName],
+  }));
+  let requestUrl = '';
+  let authorization = '';
+  globalThis.fetch = async (input, init) => {
+    requestUrl = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.href
+        : input.url;
+    authorization = new Headers(init?.headers).get('authorization') || '';
+    throw new Error('isolated-compatible-provider-called');
+  };
+  try {
+    for (const item of environments) {
+      process.env[item.baseName] = item.baseURL;
+      process.env[item.keyName] = item.apiKey;
+      const model = withModelSettings(
+        { provider: item.provider, model: 'vendor-model' },
+        () => getModel(),
+      ) as LanguageModelV4;
+      await assert.rejects(
+        async () => await model.doGenerate(minimalCall),
+        /isolated-compatible-provider-called/,
+      );
+      assert.equal(requestUrl, `${item.baseURL}/chat/completions`);
+      assert.equal(authorization, `Bearer ${item.apiKey}`);
+    }
+  } finally {
+    globalThis.fetch = previousFetch;
+    environments.forEach((item, index) => {
+      restoreEnvironmentValue(item.baseName, previous[index].baseURL);
+      restoreEnvironmentValue(item.keyName, previous[index].apiKey);
+    });
+  }
+});

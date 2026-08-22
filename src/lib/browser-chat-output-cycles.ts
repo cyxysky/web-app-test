@@ -13,7 +13,7 @@ function stringFromUnknown(value: unknown): string {
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) return value.map(stringFromUnknown).filter(Boolean).join('\n').trim();
   const record = asRecord(value);
-  return record ? stringFromUnknown(record.text ?? record.content ?? record.reasoning) : '';
+  return record ? stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value) : '';
 }
 
 function parseJsonObjectText(value?: string) {
@@ -101,6 +101,28 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   return { parts: [], reasoning: [], texts: [], tools: [] };
 }
 
+function applyToolResultToOutput(output: BrowserChatAiOutputView, part: unknown) {
+  const record = asRecord(part);
+  if (!record) return false;
+  const type = String(record.type || '').toLowerCase();
+  if (type !== 'tool-result' && type !== 'tool_result' && type !== 'tool-error' && type !== 'tool_error') return false;
+  const id = stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id);
+  if (!id) return true;
+  const rawResult = type === 'tool-result' || type === 'tool_result'
+    ? (record.output ?? record.result)
+    : (record.error ?? record.output ?? record.result);
+  const result = stringFromUnknown(rawResult) || (type === 'tool-result' || type === 'tool_result'
+    ? 'Tool completed.'
+    : toolErrorFromUnknown(rawResult));
+  const tool = [...output.tools].reverse().find((item) => item.id === id);
+  if (!tool) return true;
+  tool.ok = type === 'tool-result' || type === 'tool_result';
+  tool.result = result;
+  tool.rawResult = rawResult;
+  if (tool.ok === false) tool.error = result;
+  return true;
+}
+
 function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatAiOutputView) {
   const offsets = {
     reasoning: target.reasoning.length,
@@ -118,7 +140,9 @@ function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatA
 
 function aiOutputViewFromContentParts(parts: unknown[]) {
   const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
-  for (const part of parts) mergeAiOutputView(output, normalizeAiContentPart(part));
+  for (const part of parts) {
+    if (!applyToolResultToOutput(output, part)) mergeAiOutputView(output, normalizeAiContentPart(part));
+  }
   return output;
 }
 
@@ -133,8 +157,12 @@ export function browserChatAiOutputViewFromResponse(response: unknown): BrowserC
     const text = stringFromUnknown(record.text);
     if (text) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text }));
   }
-  for (const toolCall of Array.isArray(record.toolCalls) ? record.toolCalls : []) {
-    mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
+  // `content` is the canonical, ordered provider transcript. `toolCalls` is
+  // an SDK convenience mirror; only use it when the provider omitted content.
+  if (!output.tools.length) {
+    for (const toolCall of Array.isArray(record.toolCalls) ? record.toolCalls : []) {
+      mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
+    }
   }
   const steps = Array.isArray(record.steps) ? record.steps : [];
   if (steps.length && !output.reasoning.length && !output.tools.length) {
@@ -161,7 +189,7 @@ export function compactBrowserChatAiOutputView(output: BrowserChatAiOutputView):
   const compacted: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
   const seenReasoning = new Set<string>();
   const seenTexts = new Set<string>();
-  const seenTools = new Set<string>();
+  const seenToolIds = new Set<string>();
   for (const part of output.parts) {
     if (part.kind === 'reasoning') {
       const value = output.reasoning[part.index];
@@ -181,9 +209,11 @@ export function compactBrowserChatAiOutputView(output: BrowserChatAiOutputView):
     }
     const tool = output.tools[part.index];
     if (!tool) continue;
-    const key = `${tool.name}:${formatToolPayload(tool.input)}`;
-    if (seenTools.has(key)) continue;
-    seenTools.add(key);
+    // Retries may intentionally have the same name and arguments. Only remove
+    // the SDK's duplicate representation of the exact same provider call.
+    const key = tool.id || `${tool.name}:${formatToolPayload(tool.input)}`;
+    if (seenToolIds.has(key)) continue;
+    seenToolIds.add(key);
     compacted.parts.push({ index: compacted.tools.length, kind: 'tool' });
     compacted.tools.push(tool);
   }

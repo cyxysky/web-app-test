@@ -186,8 +186,18 @@ async function renderHtmlPages(input: {
   }
 }
 
-async function convertOfficeToPdf(absolutePath: string, extension: string) {
-  return convertOfficeFile({ absolutePath, sourceExtension: extension, targetExtension: '.pdf' });
+async function convertOfficeToPdf(absolutePath: string, extension: string, directory: string) {
+  const cachedPdfPath = path.join(directory, 'office-preview.pdf');
+  try {
+    return await readFile(cachedPdfPath);
+  } catch {
+    const pdf = await convertOfficeFile({ absolutePath, sourceExtension: extension, targetExtension: '.pdf' });
+    if (pdf) {
+      await mkdir(directory, { recursive: true });
+      await writeFile(cachedPdfPath, pdf);
+    }
+    return pdf;
+  }
 }
 
 async function renderDocxFallback(buffer: Buffer, directory: string, requestedPages: unknown, title: string) {
@@ -255,7 +265,7 @@ export async function renderBrowserChatAttachmentVisuals(input: {
   try {
     if (extension === '.pdf') return await renderPdfPages(input.buffer, directory, input.pages, 'pdf');
     if (officeExtensions.has(extension)) {
-      const pdf = await convertOfficeToPdf(input.absolutePath, extension);
+      const pdf = await convertOfficeToPdf(input.absolutePath, extension, directory);
       if (pdf) return await renderPdfPages(pdf, directory, input.pages, 'libreoffice-pdf');
       if (docxExtensions.has(extension)) {
         return await renderDocxFallback(input.buffer, directory, input.pages, input.name);

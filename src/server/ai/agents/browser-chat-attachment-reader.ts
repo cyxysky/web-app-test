@@ -22,6 +22,14 @@ export type BrowserChatAttachmentReadResult = {
   referenceImagePaths?: string[];
 };
 
+export type BrowserChatFileVisualInput = {
+  action: 'index' | 'read';
+  artifactId: string;
+  screenshotIds?: string[];
+  offset?: number;
+  limit?: number;
+};
+
 type AttachmentKind = 'archive' | 'image' | 'pdf' | 'presentation' | 'spreadsheet' | 'tab' | 'text' | 'unknown' | 'word';
 
 const maxSourceBytes = 64 * 1024 * 1024;
@@ -153,5 +161,128 @@ export async function readBrowserChatAttachment(input: {
   } catch (error) {
     const message = error instanceof Error ? error.message : '无法读取文件内容。';
     return { ok: false, actual: `读取文件 ${attachment.name} 失败：${message}` };
+  }
+}
+
+function screenshotId(pageNumber: number) {
+  return `screenshot-${String(pageNumber).padStart(4, '0')}`;
+}
+
+function screenshotPage(value: string) {
+  const match = /^screenshot-(\d{1,8})$/i.exec(value.trim());
+  if (!match) return undefined;
+  const pageNumber = Number(match[1]);
+  return Number.isSafeInteger(pageNumber) && pageNumber > 0 ? pageNumber : undefined;
+}
+
+/**
+ * Lazily indexes or reads rendered pages for one conversation artifact.
+ * Indexing returns stable screenshot ids without attaching images. Reading a
+ * bounded id batch returns image paths that the executor adds to the next
+ * model request.
+ */
+export async function readBrowserChatFileVisuals(input: {
+  attachment: BrowserChatReadableAttachment;
+  absolutePath?: string;
+  request: BrowserChatFileVisualInput;
+  previewRoot?: string;
+}): Promise<BrowserChatAttachmentReadResult> {
+  const { attachment, request } = input;
+  if (!input.absolutePath) {
+    return { ok: false, actual: `fileVisual could not locate artifact ${request.artifactId}.` };
+  }
+  if (attachmentKind(attachment) === 'image' || attachmentKind(attachment) === 'tab') {
+    return { ok: false, actual: 'fileVisual supports paged PDF and Office artifacts, not standalone images or tab references.' };
+  }
+
+  try {
+    const metadata = await stat(input.absolutePath);
+    if (!metadata.size) throw new Error('artifact is empty');
+    if (metadata.size > maxSourceBytes) throw new Error(`artifact exceeds ${formatSize(maxSourceBytes)}`);
+    const buffer = await readFile(input.absolutePath);
+    const requestedScreenshotIds = Array.from(new Set((request.screenshotIds || []).map((value) => value.trim()).filter(Boolean)));
+    if (request.action === 'read' && !requestedScreenshotIds.length) {
+      return { ok: false, actual: 'fileVisual action=read requires at least one screenshotId returned by action=index.' };
+    }
+    if (requestedScreenshotIds.length > 6) {
+      return { ok: false, actual: 'fileVisual action=read accepts at most 6 screenshotIds per call. Read larger documents in ordered batches.' };
+    }
+    const requestedPages = requestedScreenshotIds.map(screenshotPage);
+    if (request.action === 'read' && requestedPages.some((page) => page === undefined)) {
+      return { ok: false, actual: 'fileVisual received an invalid screenshotId. Use the exact screenshot-NNNN ids returned by action=index.' };
+    }
+
+    const visuals = await renderBrowserChatAttachmentVisuals({
+      absolutePath: input.absolutePath,
+      buffer,
+      extension: extensionOf(attachment),
+      name: attachment.name,
+      pages: request.action === 'read' ? requestedPages : [1],
+      previewRoot: input.previewRoot,
+    });
+    const screenshotCount = visuals.pageCount;
+    if (typeof screenshotCount !== 'number' || !Number.isSafeInteger(screenshotCount) || screenshotCount < 1) {
+      return {
+        ok: false,
+        actual: `fileVisual could not create a paged preview for ${attachment.name}.${visuals.warning ? ` ${visuals.warning}` : ''}`,
+      };
+    }
+
+    if (request.action === 'index') {
+      const offset = Math.min(Math.max(0, Math.floor(request.offset || 0)), screenshotCount);
+      const limit = Math.min(Math.max(1, Math.floor(request.limit || 100)), 200);
+      const end = Math.min(screenshotCount, offset + limit);
+      const screenshots = Array.from({ length: end - offset }, (_, index) => {
+        const pageNumber = offset + index + 1;
+        return { screenshotId: screenshotId(pageNumber), pageNumber };
+      });
+      return {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'file-visual-index',
+          artifactId: request.artifactId,
+          fileName: attachment.name,
+          screenshotCount,
+          screenshots,
+          offset,
+          nextOffset: end < screenshotCount ? end : null,
+          renderer: visuals.renderer,
+          warning: visuals.warning,
+          instruction: 'Call fileVisual action=read with one to six exact screenshotIds. Continue in ordered batches until every required page has been inspected.',
+        }),
+      };
+    }
+
+    const imagePathByPage = new Map(visuals.renderedPages.map((pageNumber, index) => [pageNumber, visuals.imagePaths[index]]));
+    const missing = (requestedPages as number[]).filter((pageNumber) => !imagePathByPage.get(pageNumber));
+    const orderedImagePaths = (requestedPages as number[]).map((pageNumber) => imagePathByPage.get(pageNumber)).filter((value): value is string => Boolean(value));
+    if (missing.length || orderedImagePaths.length !== requestedPages.length) {
+      return {
+        ok: false,
+        actual: `fileVisual could not render requested screenshot pages: ${missing.length ? missing.join(', ') : 'renderer returned an incomplete image set'}.`,
+      };
+    }
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        kind: 'file-visual-read',
+        artifactId: request.artifactId,
+        fileName: attachment.name,
+        screenshotCount,
+        screenshots: (requestedPages as number[]).map((pageNumber) => ({
+          screenshotId: screenshotId(pageNumber),
+          pageNumber,
+        })),
+        renderer: visuals.renderer,
+        warning: visuals.warning,
+        instruction: 'The requested screenshots are attached to the next model request. Inspect their visible layout before deciding whether the artifact passes or needs a targeted edit.',
+      }),
+      referenceImagePaths: orderedImagePaths,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      actual: `fileVisual failed for ${attachment.name}: ${error instanceof Error ? error.message : String(error)}`,
+    };
   }
 }

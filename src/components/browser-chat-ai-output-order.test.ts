@@ -67,7 +67,7 @@ test('matches persisted tool traces only by exact call ID', () => {
   assert.equal(details.get('cycle-2:0')?.tool.id, 'read-2');
 });
 
-test('pairs each legacy trace once and hides later provider calls that were never executed', () => {
+test('does not attach persisted traces to provider calls with different IDs', () => {
   const toolCycle = (id: string, sourceCycleId: string, fileName: string) => ({
     id,
     sourceCycleId,
@@ -97,11 +97,102 @@ test('pairs each legacy trace once and hides later provider calls that were neve
     toolCycle('provider-call-5', 'provider-cycle-3', '陈劲帆.docx'),
   ], steps);
 
-  assert.equal(details.get('provider-call-1:0')?.tool.id, 'legacy-trace-1');
-  assert.equal(details.get('provider-call-ignored-2:0')?.tool.id, 'legacy-trace-2');
-  assert.equal(details.get('provider-call-ignored-3:0')?.tool.id, 'legacy-trace-3');
+  assert.equal(details.get('provider-call-1:0'), undefined);
+  assert.equal(details.get('provider-call-ignored-2:0'), undefined);
+  assert.equal(details.get('provider-call-ignored-3:0'), undefined);
   assert.equal(details.get('provider-call-4:0'), undefined);
   assert.equal(details.get('provider-call-5:0'), undefined);
+});
+
+test('uses the provider tool-result directly and keeps identical retries distinct', () => {
+  const output = aiOutputViewFromResponse({
+    content: [
+      { type: 'text', text: 'Downloading the first image.' },
+      { type: 'tool-call', toolCallId: 'download-1', toolName: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' } },
+      { type: 'tool-result', toolCallId: 'download-1', toolName: 'file', output: { type: 'text', value: 'saved first image' } },
+      { type: 'text', text: 'Retrying the same image.' },
+      { type: 'tool-call', toolCallId: 'download-2', toolName: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' } },
+      { type: 'tool-result', toolCallId: 'download-2', toolName: 'file', output: { type: 'text', value: 'saved retry' } },
+    ],
+  });
+
+  assert.deepEqual(output.parts.map((part) => part.kind), ['text', 'tool', 'text', 'tool']);
+  assert.deepEqual(output.tools.map((tool) => [tool.id, tool.ok, tool.result]), [
+    ['download-1', true, 'saved first image'],
+    ['download-2', true, 'saved retry'],
+  ]);
+  const details = buildAiCycleToolDetailMap([{ id: 'cycle', output, stepIndex: 1 }], []);
+  assert.equal(details.get('cycle:0')?.tool.result, 'saved first image');
+  assert.equal(details.get('cycle:1')?.tool.result, 'saved retry');
+});
+
+test('provider results retain their exact persisted indexes without creating bottom fallback duplicates', () => {
+  const output = aiOutputViewFromResponse({
+    content: [
+      { type: 'text', text: 'Open the source.' },
+      { type: 'tool-call', toolCallId: 'browse-1', toolName: 'browserCode', input: { code: 'open()' } },
+      { type: 'tool-result', toolCallId: 'browse-1', toolName: 'browserCode', output: { type: 'text', value: 'opened' } },
+      { type: 'text', text: 'Extract the summary.' },
+      { type: 'tool-call', toolCallId: 'browse-2', toolName: 'browserCode', input: { code: 'extractSummary()' } },
+      { type: 'tool-result', toolCallId: 'browse-2', toolName: 'browserCode', output: { type: 'text', value: 'summary' } },
+      { type: 'text', text: 'Extract the details.' },
+      { type: 'tool-call', toolCallId: 'browse-3', toolName: 'browserCode', input: { code: 'extractDetails()' } },
+      { type: 'tool-result', toolCallId: 'browse-3', toolName: 'browserCode', output: { type: 'text', value: 'details' } },
+    ],
+  });
+  const steps: StepExecutionResult[] = [{
+    index: 1,
+    action: 'browse source',
+    actual: 'done',
+    expected: 'source content',
+    status: 'passed',
+    tools: [
+      { id: 'browse-1', name: 'browserCode', input: { code: 'open()' }, ok: true, result: 'opened' },
+      { id: 'browse-2', name: 'browserCode', input: { code: 'extractSummary()' }, ok: true, result: 'summary' },
+      { id: 'browse-3', name: 'browserCode', input: { code: 'extractDetails()' }, ok: true, result: 'details' },
+    ],
+  }];
+
+  const details = buildAiCycleToolDetailMap([{ id: 'cycle', output, stepIndex: 1 }], steps);
+
+  assert.deepEqual(
+    [0, 1, 2].map((index) => details.get(`cycle:${index}`)?.toolIndex),
+    [0, 1, 2],
+  );
+  assert.equal(new Set([...details.values()].map((detail) => `${detail.stepIndex}:${detail.toolIndex}`)).size, 3);
+});
+
+test('keeps a retried identical tool on the later model cycle that executed it', () => {
+  const input = { action: 'download', url: 'https://example.test/image.jpg' };
+  const firstCycle = aiOutputViewFromResponse({
+    content: [
+      { type: 'tool-call', toolCallId: 'executed-first', toolName: 'file', input: { action: 'download', url: 'https://example.test/first.jpg' } },
+      { type: 'tool-call', toolCallId: 'proposed-but-not-run', toolName: 'file', input },
+    ],
+  });
+  const retryCycle = aiOutputViewFromResponse({
+    content: [{ type: 'tool-call', toolCallId: 'executed-retry', toolName: 'file', input }],
+  });
+  const steps: StepExecutionResult[] = [{
+    index: 1,
+    action: 'download images',
+    actual: 'done',
+    expected: 'images',
+    status: 'passed',
+    tools: [
+      { id: 'executed-first', name: 'file', input: { action: 'download', url: 'https://example.test/first.jpg' }, ok: true },
+      { id: 'executed-retry', name: 'file', input, ok: true },
+    ],
+  }];
+
+  const details = buildAiCycleToolDetailMap([
+    { id: 'first-cycle', output: firstCycle, stepIndex: 1 },
+    { id: 'retry-cycle', output: retryCycle, stepIndex: 1 },
+  ], steps);
+
+  assert.equal(details.get('first-cycle:0')?.tool.id, 'executed-first');
+  assert.equal(details.get('first-cycle:1'), undefined);
+  assert.equal(details.get('retry-cycle:0')?.tool.id, 'executed-retry');
 });
 
 test('hides unmatched provider proposals while still matching later exact tool IDs', () => {
@@ -219,6 +310,56 @@ test('does not consume one persisted tool trace in duplicate provider cycles', (
 
   assert.equal(details.get('first-cycle:0')?.tool.id, 'same-call');
   assert.equal(details.get('duplicate-cycle:0'), undefined);
+});
+
+test('keeps repeated tool-call IDs and retry results on their own execution steps', () => {
+  const output = (id: string) => aiOutputViewFromResponse({
+    content: [{ type: 'tool-call', toolCallId: id, toolName: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' } }],
+  });
+  const steps: StepExecutionResult[] = [
+    {
+      index: 6,
+      action: 'download image',
+      actual: 'network failure',
+      expected: 'image',
+      status: 'failed',
+      tools: [{ id: 'provider-reused-id', name: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' }, ok: false }],
+    },
+    {
+      index: 7,
+      action: 'retry download image',
+      actual: 'done',
+      expected: 'image',
+      status: 'passed',
+      tools: [{ id: 'provider-reused-id', name: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' }, ok: true }],
+    },
+  ];
+  const details = buildAiCycleToolDetailMap([
+    { id: 'failed-cycle', output: output('provider-reused-id'), stepIndex: 6 },
+    { id: 'retry-cycle', output: output('provider-reused-id'), stepIndex: 7 },
+  ], steps);
+
+  assert.equal(details.get('failed-cycle:0')?.tool.ok, false);
+  assert.equal(details.get('retry-cycle:0')?.tool.ok, true);
+});
+
+test('does not guess a retry association when legacy provider data has no step identity', () => {
+  const output = aiOutputViewFromResponse({
+    content: [{ type: 'tool-call', toolName: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' } }],
+  });
+  const details = buildAiCycleToolDetailMap([{
+    id: 'legacy-cycle',
+    output,
+  }], [{
+    index: 3,
+    action: 'download image',
+    actual: 'failed',
+    expected: 'image',
+    status: 'failed',
+    tools: [{ name: 'file', input: { action: 'download', url: 'https://example.test/image.jpg' }, ok: false }],
+  }]);
+
+  assert.equal(details.get('legacy-cycle:0'), undefined);
 });
 
 test('renders invalid tool calls even when argument parsing prevented execution', () => {

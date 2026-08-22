@@ -1,110 +1,54 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import {
-  coerceBrowserChatToolInput,
-  repairBrowserChatToolCallInput,
-} from './browser-chat-tool-input-coercion';
+import { coerceBrowserChatToolInput, repairBrowserChatToolCallInput } from './browser-chat-tool-input-coercion';
 
-test('repairs JSON container strings and scalar strings for file generation', () => {
-  const raw = JSON.stringify({
-    action: 'generate',
-    documentId: 'document-1',
-    blocks: '[{"id":"page-1","type":"page","children":[{"id":"title","type":"text","style":{"x":"12","opacity":"0.8"},"text":"Hello"}]}]',
-    render: 'false',
+test('deterministically converts supported scalar transport values', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', {
+    action: 'generate', documentId: 'document-1', program: 'def create_document(job):\n    pass', render: 'false', expectedRevision: '2',
+  }), {
+    action: 'generate', documentId: 'document-1', program: 'def create_document(job):\n    pass', render: false,
   });
-  const repaired = repairBrowserChatToolCallInput('file', raw);
-  assert.ok(repaired);
-  assert.deepEqual(JSON.parse(repaired), {
-    action: 'generate',
-    documentId: 'document-1',
-    blocks: [{
-      id: 'page-1',
-      type: 'page',
-      children: [{ id: 'title', type: 'text', style: { x: 12, opacity: 0.8 }, text: 'Hello' }],
-    }],
-    render: false,
+  assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'read', pages: '["1",2]', limit: '40' }), {
+    action: 'read', pages: [1, 2], limit: 40,
   });
 });
 
-test('repairs document page booleans and numbers without changing semantic strings', () => {
+test('does not reshape model-authored document values', () => {
+  const outline = { item: [{ id: 'cover', title: 'Cover' }] };
+  const input = { action: 'plan', outline };
+  assert.deepEqual(coerceBrowserChatToolInput('file', input), input);
+});
+
+test('accepts standard OpenAI-compatible transport envelopes without unwrapping document content', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', '{"arguments":"{\\"action\\":\\"plan\\",\\"documentId\\":\\"solar-system\\",\\"fileName\\":\\"solar-system.pptx\\",\\"documentType\\":\\"pptx\\"}"}'), {
+    action: 'plan', documentId: 'solar-system', fileName: 'solar-system.pptx', documentType: 'presentation',
+  });
   assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'plan',
-    document: '{"page":{"width":"1280","height":"720","showPageNumber":"true","header":"2026"}}',
-    outline: '[{"id":"cover","title":"封面","suggestedBlocks":"[\\"text\\",\\"shape\\"]"}]',
+    action: 'plan', params: { documentId: 'solar-system', fileName: 'solar-system.pptx' }, outline: { item: [{ id: 'cover' }] },
   }), {
-    action: 'plan',
-    document: { page: { width: 1280, height: 720, showPageNumber: true, header: '2026' } },
-    outline: [{ id: 'cover', title: '封面', suggestedBlocks: ['text', 'shape'] }],
+    action: 'plan', documentId: 'solar-system', fileName: 'solar-system.pptx', documentType: 'presentation', outline: { item: [{ id: 'cover' }] },
   });
 });
 
-test('does not guess that singleton objects were intended as plural arrays', () => {
-  assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'plan',
-    outline: { id: 'cover', title: '封面', suggestedBlocks: '["text","shape"]' },
-  }), {
-    action: 'plan',
-    outline: { id: 'cover', title: '封面', suggestedBlocks: '["text","shape"]' },
-  });
-  assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'generate',
-    blocks: {
-      id: 'page-1',
-      type: 'page',
-      children: { id: 'title', type: 'text', text: 'Hello' },
+test('normalizes fileVisual transport envelopes and screenshot id arrays', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('fileVisual', {
+    params: {
+      action: 'READ',
+      artifactId: 'chat/generated/deck.pptx',
+      screenshotIds: '["screenshot-0001","screenshot-0003"]',
+      offset: '2',
+      limit: '6',
     },
-    render: 'true',
   }), {
-    action: 'generate',
-    blocks: {
-      id: 'page-1',
-      type: 'page',
-      children: { id: 'title', type: 'text', text: 'Hello' },
-    },
-    render: true,
-  });
-  assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'edit',
-    operations: { op: 'remove', blockId: 'title' },
-  }), {
-    action: 'edit',
-    operations: { op: 'remove', blockId: 'title' },
+    action: 'read',
+    artifactId: 'chat/generated/deck.pptx',
+    screenshotIds: ['screenshot-0001', 'screenshot-0003'],
+    offset: 2,
+    limit: 6,
   });
 });
 
-test('does not specially unwrap item containers', () => {
-  const uniqueItemContainer = {
-    item: { id: 'title', type: 'text', text: 'Hello' },
-  };
-  const blocks = {
-    item: { id: 'title', type: 'text', text: 'Hello' },
-    text: 'ambiguous sibling',
-  };
-  assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'generate',
-    blocks: uniqueItemContainer,
-  }), {
-    action: 'generate',
-    blocks: uniqueItemContainer,
-  });
-  assert.deepEqual(coerceBrowserChatToolInput('file', {
-    action: 'generate',
-    blocks,
-  }), {
-    action: 'generate',
-    blocks,
-  });
-});
-
-test('does not infer a missing block array from flattened top-level fields', () => {
-  const input = { action: 'generate', blocks: '', id: 'title', type: 'text', render: 'true' };
-  assert.deepEqual(coerceBrowserChatToolInput('file', input), {
-    ...input,
-    render: true,
-  });
-});
-
-test('does not coerce inputs for unrelated tools', () => {
-  const input = { render: 'true', limit: '20' };
-  assert.equal(coerceBrowserChatToolInput('browserCode', input), input);
+test('drops fields from the retired optimistic revision protocol', () => {
+  assert.equal(repairBrowserChatToolCallInput('file', '{"action":"render","expectedRevision":"3"}'), '{"action":"render"}');
+  assert.equal(repairBrowserChatToolCallInput('file', '{"action":"plan","outline":{"item":[]}}'), undefined);
 });

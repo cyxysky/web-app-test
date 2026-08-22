@@ -21,7 +21,13 @@ import {
   type InteractiveBrowserTurnResult,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-generator.agent';
-import { browserChatAttachmentMetadata, isBrowserChatImageAttachment, readBrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachment-reader';
+import {
+  browserChatAttachmentMetadata,
+  isBrowserChatImageAttachment,
+  readBrowserChatAttachment,
+  readBrowserChatFileVisuals,
+  type BrowserChatFileVisualInput,
+} from '@/server/ai/agents/browser-chat-attachment-reader';
 import {
   normalizeBrowserChatAttachments,
   normalizeBrowserChatUploadPath,
@@ -881,9 +887,16 @@ function markStepDirty(session: BrowserChatSessionRecord, step: StepExecutionRes
 function replaceSessionSteps(session: BrowserChatSessionRecord, nextSteps: StepExecutionResult[]) {
   const boundedSteps = compactBrowserChatStepsForRuntime(nextSteps);
   const previousByIndex = new Map(session.steps.map((step) => [step.index, step]));
-  const nextIndexes = new Set(boundedSteps.map((step) => step.index));
-  session.steps = boundedSteps;
-  for (const step of boundedSteps) {
+  // Tool execution publishes a start edge and a completion edge. Fold those
+  // edges together so a late status update can never discard a result that
+  // the detail dialog needs to inspect.
+  const mergedSteps = boundedSteps.map((step) => {
+    const previous = previousByIndex.get(step.index);
+    return previous ? mergePersistedStep(previous, step) : step;
+  });
+  const nextIndexes = new Set(mergedSteps.map((step) => step.index));
+  session.steps = mergedSteps;
+  for (const step of mergedSteps) {
     if (previousByIndex.get(step.index) !== step) markStepDirty(session, step);
   }
   const dirty = dirtyRecordsFor(session.id);
@@ -1658,6 +1671,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
         formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
+        conversationFileRegistry(input.session),
         browserChatCredentialPrompt(credentials.credentials),
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
@@ -1723,6 +1737,58 @@ function attachmentSummary(attachments?: BrowserChatAttachment[], options: { exc
   return [
     '用户提供的引用：',
     ...visibleAttachments.map((attachment, index) => attachmentPromptText(attachment, index + 1)),
+  ].join('\n');
+}
+
+async function readFileVisualsForSession(
+  session: BrowserChatSessionRecord,
+  input: BrowserChatFileVisualInput,
+) {
+  const attachment = artifactAttachmentForSession(session, input.artifactId);
+  if (!attachment) {
+    return {
+      ok: false,
+      actual: 'fileVisual could not find this artifact in the current conversation. Use the exact Artifact ID returned by a successful file generation or download.',
+    };
+  }
+  return readBrowserChatFileVisuals({
+    attachment,
+    absolutePath: uploadedBrowserChatAttachmentPath(attachment, session.userId),
+    request: input,
+    previewRoot: artifactPath(session.id, 'attachment-previews'),
+  });
+}
+
+/** Persistent file inventory survives model-context compression. */
+function conversationFileRegistry(session: BrowserChatSessionRecord) {
+  const uploads = new Map<string, BrowserChatAttachment>();
+  for (const message of session.messages) {
+    for (const attachment of message.attachments || []) {
+      if (attachment.kind !== 'tab' && !uploads.has(attachment.id)) uploads.set(attachment.id, attachment);
+    }
+  }
+  const artifacts = mergeBrowserChatArtifactSummaries(
+    ...session.messages.map((message) => message.artifacts),
+    browserChatArtifactsFromSteps(session.steps),
+  );
+  const lines = [
+    ...[...uploads.values()].map((attachment) => (
+      `- upload | name=${JSON.stringify(attachment.name)} | attachmentId=${attachment.id} | read=file(action=read, attachmentId=${JSON.stringify(attachment.id)})`
+    )),
+    ...artifacts.flatMap((artifact) => {
+      const relative = artifact.path
+        ? path.relative(artifactsRoot(), artifact.path).replace(/\\/g, '/')
+        : '';
+      const artifactId = relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : '';
+      if (!artifactId) return [];
+      return [`- artifact | name=${JSON.stringify(artifact.fileName)} | artifactId=${artifactId} | documentId=${artifact.documentId || '-'} | read=file(action=read, artifactId=${JSON.stringify(artifactId)})`];
+    }),
+  ];
+  if (!lines.length) return '';
+  return [
+    '[Conversation file registry — persistent runtime metadata]',
+    'Every listed file is shared by this conversation. Use its listed ID with file action=read; never guess a host path. Before Office generation, file action=plan returns the exact mounted asset names for job.asset_path(name).',
+    ...lines.slice(0, 200),
   ].join('\n');
 }
 
@@ -1839,7 +1905,10 @@ function compactStepForRealtime(step: StepExecutionResult): StepExecutionResult 
     ...clientStep,
     tools: clientStep.tools.map((tool) => {
       const realtimeTool = { ...tool };
-      delete realtimeTool.rawResult;
+      // `file action=unoApi target=all` is an inspection result. Its full
+      // runtime reflection must reach the client-side result dialog rather
+      // than being reduced to a status-only tool card.
+      if (realtimeTool.name !== 'file') delete realtimeTool.rawResult;
       return realtimeTool;
     }),
   };
@@ -2622,12 +2691,67 @@ function stepCompletenessScore(step: StepExecutionResult) {
   return score;
 }
 
+function toolCompletenessScore(tool: NonNullable<StepExecutionResult['tools']>[number]) {
+  let score = 0;
+  if (tool.rawResult !== undefined) score += 8;
+  if (tool.result !== undefined) score += 4;
+  if (tool.ok !== undefined) score += 2;
+  if (tool.error !== undefined) score += 1;
+  return score;
+}
+
+function toolMergeKey(tool: NonNullable<StepExecutionResult['tools']>[number], index: number) {
+  return tool.id ? `id:${tool.id}` : `position:${index}:${tool.name}`;
+}
+
+function mergePersistedTools(existing: StepExecutionResult['tools'], incoming: StepExecutionResult['tools']) {
+  if (!existing?.length) return incoming;
+  if (!incoming?.length) return existing;
+  const existingByKey = new Map(existing.map((tool, index) => [toolMergeKey(tool, index), tool]));
+  const consumed = new Set<string>();
+  const merged = incoming.map((tool, index) => {
+    const key = toolMergeKey(tool, index);
+    const previous = existingByKey.get(key);
+    consumed.add(key);
+    if (!previous) return tool;
+    const preferred = toolCompletenessScore(tool) >= toolCompletenessScore(previous) ? tool : previous;
+    const fallback = preferred === tool ? previous : tool;
+    return {
+      ...fallback,
+      ...preferred,
+      input: preferred.input ?? fallback.input,
+      reason: preferred.reason ?? fallback.reason,
+      result: preferred.result ?? fallback.result,
+      rawResult: preferred.rawResult ?? fallback.rawResult,
+      ok: preferred.ok ?? fallback.ok,
+      error: preferred.error ?? fallback.error,
+      contextBefore: preferred.contextBefore ?? fallback.contextBefore,
+      contextAfter: preferred.contextAfter ?? fallback.contextAfter,
+      screenshots: preferred.screenshots ?? fallback.screenshots,
+    };
+  });
+  existing.forEach((tool, index) => {
+    if (!consumed.has(toolMergeKey(tool, index))) merged.push(tool);
+  });
+  return merged;
+}
+
 function mergePersistedStep(existing: StepExecutionResult, incoming: StepExecutionResult) {
-  if (existing.status !== 'running' && incoming.status === 'running') return existing;
-  if (incoming.status !== 'running' && existing.status === 'running') return incoming;
-  return stepCompletenessScore(incoming) >= stepCompletenessScore(existing)
-    ? { ...existing, ...incoming }
-    : { ...incoming, ...existing };
+  const preferred = existing.status !== 'running' && incoming.status === 'running'
+    ? existing
+    : incoming.status !== 'running' && existing.status === 'running'
+      ? incoming
+      : stepCompletenessScore(incoming) >= stepCompletenessScore(existing)
+        ? incoming
+        : existing;
+  const fallback = preferred === incoming ? existing : incoming;
+  return {
+    ...fallback,
+    ...preferred,
+    tools: mergePersistedTools(existing.tools, incoming.tools),
+    aiRequest: preferred.aiRequest ?? fallback.aiRequest,
+    visualContext: preferred.visualContext ?? fallback.visualContext,
+  };
 }
 
 function mergePersistedSteps(existing: StepExecutionResult[] = [], incoming: StepExecutionResult[] = []) {
@@ -5253,6 +5377,7 @@ async function runBrowserChatMessage(
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
         readFile: (input) => readFileForSession(session, input),
+        readFileVisuals: (input) => readFileVisualsForSession(session, input),
         attachmentBindings: browserCodeAttachmentBindingsForSession(session),
         onTextStream: ({ text: streamedText }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;

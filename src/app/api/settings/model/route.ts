@@ -20,6 +20,23 @@ import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 const providers = new Set<ModelProvider>(modelProviderValues);
 const modelBodySchema = z.record(z.string(), z.unknown());
 
+function normalizeExtraRequestParameters(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  if (value.length > 16_000) {
+    throw new ApiRequestError('Extra request parameters must be at most 16 KB.', { status: 400 });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new ApiRequestError('Extra request parameters must be valid JSON.', { status: 400 });
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ApiRequestError('Extra request parameters must be a JSON object.', { status: 400 });
+  }
+  return JSON.stringify(parsed);
+}
+
 function requireAdmin(request: NextRequest) {
   if (!requestHasAdminSettingsAccess(request)) {
     throw new ApiRequestError('请先输入管理员设置密码。', { code: 'admin_access_required', status: 401 });
@@ -32,7 +49,9 @@ function normalizeProvider(value: unknown): ModelProvider {
   if (provider === 'codex' || provider === 'codex-cli') return 'codex';
   if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
   if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
-  if (provider === 'openai-compatible-api' || provider === 'custom-openai') return 'openai-compatible';
+  if (provider === 'openai-compatible-1' || provider === 'openai-compatible-api' || provider === 'custom-openai' || provider === 'custom-openai-1') return 'openai-compatible';
+  if (provider === 'custom-openai-2') return 'openai-compatible-2';
+  if (provider === 'custom-openai-3') return 'openai-compatible-3';
   return providers.has(provider as ModelProvider) ? provider as ModelProvider : 'openrouter';
 }
 
@@ -73,6 +92,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
       modelCapabilities: normalizedModelCapabilities(definition.value, models, configuredCapabilities),
       ...(typeof item.apiKey === 'string' && item.apiKey ? { apiKey: item.apiKey } : {}),
       baseURL: typeof item.baseURL === 'string' ? item.baseURL : definition.defaultBaseURL || '',
+      extraRequestParameters: normalizeExtraRequestParameters(item.extraRequestParameters),
     };
   }
   return result;
@@ -112,6 +132,7 @@ export async function POST(request: NextRequest) {
           modelCapabilities: normalizedModelCapabilities(provider, models),
           ...(typeof body.apiKey === 'string' && body.apiKey.trim() ? { apiKey: body.apiKey } : {}),
           baseURL: typeof body.baseURL === 'string' ? body.baseURL : definition.defaultBaseURL || '',
+          extraRequestParameters: normalizeExtraRequestParameters(body.extraRequestParameters),
         };
       }
       store.saveModelConfig({ provider, providers: providersInput });

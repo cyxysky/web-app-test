@@ -551,11 +551,13 @@ type BrowserChatMessageRecordLoader = (
 ) => Promise<BrowserChatMessageRecordPage>;
 
 function BrowserChatTransientLogDialog({
+  liveEntries,
   loadRecords,
   messageContent,
   messageId,
   onClose,
 }: {
+  liveEntries: BrowserChatLogRecord[];
   loadRecords: BrowserChatMessageRecordLoader;
   messageContent?: string;
   messageId: string;
@@ -579,7 +581,7 @@ function BrowserChatTransientLogDialog({
       if (controller.signal.aborted) return;
       setEntries((current) => {
         const records = new Map<string, BrowserChatLogRecord>();
-        for (const record of nextCursor ? [...page.logs, ...current] : page.logs) records.set(record.id, record);
+        for (const record of [...page.logs, ...current]) records.set(record.id, record);
         return [...records.values()].sort((left, right) => left.time.localeCompare(right.time));
       });
       setCursor(page.history.cursor);
@@ -607,6 +609,15 @@ function BrowserChatTransientLogDialog({
       requestRef.current = null;
     };
   }, [loadPage]);
+
+  useEffect(() => {
+    if (!liveEntries.length) return;
+    setEntries((current) => {
+      const records = new Map<string, BrowserChatLogRecord>();
+      for (const record of [...current, ...liveEntries]) records.set(record.id, record);
+      return [...records.values()].sort((left, right) => left.time.localeCompare(right.time));
+    });
+  }, [liveEntries]);
 
   return (
     <BrowserChatLogDialog
@@ -844,7 +855,7 @@ function stringFromUnknown(value: unknown): string {
   }
   if (value && typeof value === 'object') {
     const record = value as Record<string, unknown>;
-    return stringFromUnknown(record.text ?? record.content ?? record.reasoning);
+    return stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
   }
   return '';
 }
@@ -856,7 +867,8 @@ function arrayFromUnknown(value: unknown) {
 function textFromAiContentPart(part: Record<string, unknown>) {
   return stringFromUnknown(part.text)
     || stringFromUnknown(part.content)
-    || stringFromUnknown(part.reasoning);
+    || stringFromUnknown(part.reasoning)
+    || stringFromUnknown(part.value);
 }
 
 function toolReasonFromInput(input: unknown) {
@@ -931,6 +943,26 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   return { parts: [], reasoning: [], texts: [], tools: [] };
 }
 
+function applyToolResultToAiOutput(output: BrowserChatAiOutputView, part: unknown) {
+  const record = asRecord(part);
+  if (!record) return false;
+  const type = String(record.type || '').toLowerCase();
+  if (type !== 'tool-result' && type !== 'tool_result' && type !== 'tool-error' && type !== 'tool_error') return false;
+  const id = stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id);
+  if (!id) return true;
+  const succeeded = type === 'tool-result' || type === 'tool_result';
+  const rawResult = succeeded ? (record.output ?? record.result) : (record.error ?? record.output ?? record.result);
+  const result = textFromAiContentPart(asRecord(rawResult) || { value: rawResult })
+    || (succeeded ? 'Tool completed.' : toolErrorFromUnknown(rawResult));
+  const tool = [...output.tools].reverse().find((item) => item.id === id);
+  if (!tool) return true;
+  tool.ok = succeeded;
+  tool.result = result;
+  tool.rawResult = rawResult;
+  if (!succeeded) tool.error = result;
+  return true;
+}
+
 function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatAiOutputView) {
   const offsets = {
     reasoning: target.reasoning.length,
@@ -949,7 +981,7 @@ function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatA
 function aiOutputViewFromContentParts(parts: unknown[]) {
   const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
   for (const part of parts) {
-    mergeAiOutputView(output, normalizeAiContentPart(part));
+    if (!applyToolResultToAiOutput(output, part)) mergeAiOutputView(output, normalizeAiContentPart(part));
   }
   return output;
 }
@@ -965,8 +997,10 @@ export function aiOutputViewFromResponse(response: unknown) {
     const text = stringFromUnknown(record.text);
     if (text) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text }));
   }
-  for (const toolCall of arrayFromUnknown(record.toolCalls)) {
-    mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
+  if (!output.tools.length) {
+    for (const toolCall of arrayFromUnknown(record.toolCalls)) {
+      mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
+    }
   }
   const steps = arrayFromUnknown(record.steps);
   if (steps.length && !output.reasoning.length && !output.tools.length) {
@@ -1027,9 +1061,10 @@ function toolInputSignature(value: unknown) {
 
 export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[], running = false) {
   const details = new Map<string, BrowserChatToolDetail>();
-  const persistedToolsById = new Map<string, BrowserChatToolDetail>();
+  const persistedToolsById = new Map<string, BrowserChatToolDetail[]>();
   const persistedTools: BrowserChatToolDetail[] = [];
   const consumedPersistedTools = new Set<BrowserChatToolDetail>();
+  const consumedProviderResultIds = new Set<string>();
 
   steps.forEach((step) => {
     (step.tools || []).forEach((tool, toolIndex) => {
@@ -1039,7 +1074,11 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
         toolIndex,
         tool,
       };
-      if (tool.id) persistedToolsById.set(tool.id, detail);
+      if (tool.id) {
+        const matches = persistedToolsById.get(tool.id) || [];
+        matches.push(detail);
+        persistedToolsById.set(tool.id, matches);
+      }
       persistedTools.push(detail);
     });
   });
@@ -1048,26 +1087,71 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
     const unmatched: Array<{ aiTool: BrowserChatAiOutputTool; aiToolIndex: number }> = [];
     let matchedInCycle = false;
     cycle.output.tools.forEach((aiTool, aiToolIndex) => {
-      let detail = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
-      if (detail && consumedPersistedTools.has(detail)) return;
-      if (detail && detail.tool.name === aiTool.name) {
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-        consumedPersistedTools.add(detail);
-        matchedInCycle = true;
-        return;
-      }
-      detail = persistedTools.find((candidate) => (
-        !consumedPersistedTools.has(candidate)
-        && candidate.tool.name === aiTool.name
+      const belongsToCycle = (candidate: BrowserChatToolDetail) => (
+        candidate.tool.name === aiTool.name
         && (typeof cycle.stepIndex !== 'number' || candidate.stepIndex === cycle.stepIndex)
-        && toolInputSignature(candidate.tool.input) === toolInputSignature(aiTool.input)
-      ));
+      );
+      const idMatches = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
+      let detail = idMatches
+        ? [...idMatches].sort((left, right) => {
+          const score = (candidate: BrowserChatToolDetail) => (
+            (candidate.tool.rawResult !== undefined ? 8 : 0)
+            + (candidate.tool.result !== undefined ? 4 : 0)
+            + (candidate.tool.ok !== undefined ? 2 : 0)
+          );
+          return score(right) - score(left);
+        }).find((candidate) => (
+          !consumedPersistedTools.has(candidate) && belongsToCycle(candidate)
+        ))
+        : undefined;
       if (detail) {
         details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
         consumedPersistedTools.add(detail);
         matchedInCycle = true;
         return;
       }
+      // The same provider call can be present in a duplicated response cycle.
+      // Once its persisted trace was consumed, do not render a fictional second
+      // running tool in a later duplicate cycle.
+      if (idMatches?.length) return;
+      // If persistence has not caught up yet, the provider result is still an
+      // exact association. Synthesize a temporary card at the call's original
+      // position, but do not pretend it is persisted tool #0. That false index
+      // caused tools #1/#2 to be rendered again by the fallback timeline.
+      if (aiTool.ok !== undefined) {
+        const providerResultId = `${cycle.stepIndex ?? 'unknown'}:${aiTool.id || `${cycle.id}:${aiToolIndex}`}`;
+        if (consumedProviderResultIds.has(providerResultId)) return;
+        consumedProviderResultIds.add(providerResultId);
+        const tool: BrowserChatToolCall = {
+          id: aiTool.id || `${cycle.id}:${aiToolIndex}`,
+          input: aiTool.input,
+          name: aiTool.name,
+          reason: aiTool.reason,
+          ok: aiTool.ok,
+          result: aiTool.result,
+          rawResult: aiTool.rawResult,
+          ...(aiTool.ok ? {} : { error: aiTool.error || aiTool.result }),
+        };
+        const stepIndex = typeof cycle.stepIndex === 'number' ? cycle.stepIndex : -1;
+        const step: StepExecutionResult = {
+          index: stepIndex,
+          messageId: cycle.messageId,
+          action: aiTool.name,
+          expected: 'Tool execution result',
+          actual: aiTool.result || (aiTool.ok ? 'Tool completed.' : 'Tool failed.'),
+          status: aiTool.ok ? 'passed' : 'failed',
+          tools: [tool],
+        };
+        details.set(aiCycleToolKey(cycle.id, aiToolIndex), { stepIndex, step, toolIndex: -1, tool });
+        matchedInCycle = true;
+        return;
+      }
+      // Never infer ownership from matching tool names and arguments. One model
+      // cycle may propose several calls while the runtime executes only one,
+      // then retry an identical call in a later cycle. Argument matching moves
+      // that later execution card above the text that actually triggered it.
+      // Persisted traces without an exact call ID are rendered by the fallback
+      // step timeline instead of being attached to a guessed provider cycle.
       unmatched.push({ aiTool, aiToolIndex });
     });
 
@@ -1174,6 +1258,7 @@ function browserChatToolLabel(name: string, t: (value: string) => string) {
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
     file: '文件操作',
+    fileVisual: '视觉检查',
     memory: '记忆管理',
     skill: '读取 Skill',
     subagent: '子 Agent',
@@ -1213,6 +1298,14 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
     const actionLabel = action === 'read' ? t('读取') : action === 'download' ? t('下载') : action === 'generate' ? t('生成') : action;
     return [actionLabel, toolInputValue(record, ['fileName', 'attachmentId', 'artifactId', 'url', 'path'])].filter(Boolean).join(' · ');
   }
+  if (name === 'fileVisual') {
+    const action = toolInputValue(record, ['action']);
+    const screenshotCount = Array.isArray(record.screenshotIds) ? record.screenshotIds.length : 0;
+    if (action === 'index') return t('索引全部页面截图');
+    if (action === 'read') return screenshotCount
+      ? t('读取 {count} 张页面截图', { count: screenshotCount })
+      : t('读取页面截图');
+  }
   if (name === 'subagent') {
     return record.action === 'spawn' && Array.isArray(record.tasks)
       ? t('{count} 个任务', { count: record.tasks.length })
@@ -1240,6 +1333,7 @@ function isSubagentSpawnTool(name: string, input: unknown) {
 function BrowserChatToolIcon({ name }: { name: string }) {
   const lower = name.toLowerCase();
   if (name === 'browserCode') return <Braces size={13} />;
+  if (name === 'fileVisual') return <ImageIcon size={13} />;
   if (lower === 'file' || lower.includes('fileoperation')) return <FileText size={13} />;
   if (lower.includes('subagent')) return <Waypoints size={13} />;
   if (lower.includes('screenshot') || lower.includes('capture')) return <ImageIcon size={13} />;
@@ -4173,8 +4267,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     buildAiCycleToolDetailMap(pairedAiOutputCycles, steps, running)
   ), [pairedAiOutputCycles, running, steps]);
   const aiCycleRepresentedToolKeys = new Set([...matchedAiCycleToolDetails.values()].map((detail) => (
-    `${detail.stepIndex}:${detail.toolIndex}`
-  )));
+    detail.toolIndex >= 0 ? `${detail.stepIndex}:${detail.toolIndex}` : ''
+  )).filter(Boolean));
   const waitingForTool = running && steps.some((step) => step.status === 'running' && !(step.tools || []).length);
   const timelineSteps = steps.filter((step) => (step.tools || []).length || (running && step.status === 'running'));
   // Persisted step traces are the source of truth. Keep every trace that could not
@@ -4405,6 +4499,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               className={`browser-chat-agent-thinking${hasHistoricalAiOutput || shouldShowStepTimeline ? ' is-continuation' : ''}`}
               detail={runningActivityLabel}
               label={t('AI 正在处理当前请求')}
+              showElapsed
+              startedAt={message.activity?.updatedAt}
             />
           ) : null}
         </BrowserChatProcessDisclosure>
@@ -9076,6 +9172,10 @@ export function BrowserChatWorkspace({
     () => messages.find((item) => item.id === logDialogMessageId),
     [logDialogMessageId, messages],
   );
+  const logDialogLiveEntries = useMemo(
+    () => logDialogMessage ? browserChatLogsForMessage(logDialogMessage, logIndex) : [],
+    [logDialogMessage, logIndex],
+  );
   const previewAttachment = useCallback((attachment: BrowserChatAttachment) => {
     const source = attachment.url || (attachment.path
       ? withWebPilotBasePath(`/api/artifacts/${attachment.path.split('/').map(encodeURIComponent).join('/')}`)
@@ -10712,6 +10812,7 @@ export function BrowserChatWorkspace({
       {logDialogMessageId ? (
         <BrowserChatTransientLogDialog
           key={`${session?.id || 'session'}:${logDialogMessageId}`}
+          liveEntries={logDialogLiveEntries}
           loadRecords={loadMessageRecords}
           messageContent={logDialogMessage ? compactText(logDialogMessage.content, 80) : undefined}
           messageId={logDialogMessageId}

@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { access, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -10,29 +10,25 @@ import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 import {
   generateFileBuffer,
 } from './document-artifact-generators';
+import { assertControlledUnoProgram, inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
 import type {
-  OfficeBlock,
   OfficeDocumentDraft,
-  OfficeDocumentEditOperation,
   OfficeDocumentKind,
-  OfficeDocumentOutlineItem,
-  OfficeDocumentSettings,
 } from '@/server/files/office-document-spec';
-import {
-  normalizeOfficeBlock,
-  validateCanonicalOfficeBlockInput,
-  validateCanonicalOfficeBlockPatch,
-  validateOfficeDocumentStructure,
-} from '@/server/files/office-document-normalizer';
 import {
   fillDocxTemplateBuffer,
   type DocxTemplateFillOperation,
 } from './docx-template-filler';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import type { BrowserCodeAttachmentBinding } from '@/server/browser/browser-code-runner';
+import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 
-const FILE_DOWNLOAD_TIMEOUT_MS = 30000;
+const FILE_DOWNLOAD_TIMEOUT_MS = 120_000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const DOCUMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+const draftLocks = new Map<string, Promise<void>>();
+const DRAFT_LOCK_WAIT_MS = 120_000;
+const STALE_DRAFT_LOCK_MS = 10 * 60_000;
 
 type DownloadArtifactInput = {
   runId?: string;
@@ -48,37 +44,56 @@ type PlanArtifactInput = {
   documentId?: string;
   fileName?: string | null;
   documentType?: OfficeDocumentKind;
-  document?: OfficeDocumentSettings;
   intent?: string;
-  outline?: OfficeDocumentOutlineItem[];
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
 };
 
-type GenerateArtifactBlocksInput = {
+type GenerateUnoProgramInput = {
   runId?: string;
   documentId?: string;
-  blocks?: OfficeBlock[];
-  parentId?: string;
-  beforeId?: string;
-  afterId?: string;
+  program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
-  expectedRevision?: number;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
 };
 
-type EditArtifactInput = {
+export type UnoDraftTextEdit = {
+  oldText: string;
+  newText: string;
+  replaceAll?: boolean;
+};
+
+type EditUnoProgramInput = {
   runId?: string;
   documentId?: string;
-  operations?: OfficeDocumentEditOperation[];
+  edits?: UnoDraftTextEdit[];
+  program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
-  expectedRevision?: number;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
+};
+
+type UnoApiInput = {
+  documentType?: OfficeDocumentKind;
+  target?: UnoApiTarget;
+  query?: string;
+  offset?: number;
+  limit?: number;
+};
+
+type ReadUnoDraftInput = {
+  runId?: string;
+  documentId?: string;
 };
 
 type RenderArtifactInput = {
   runId?: string;
   documentId?: string;
   includeVisualVerification?: boolean;
-  expectedRevision?: number;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
 };
 
 type FillDocumentTemplateArtifactInput = {
@@ -100,7 +115,7 @@ type ArtifactToolPayload = {
   bytes?: number;
   sourceUrl?: string;
   documentId?: string;
-  blockCount?: number;
+  sourceCharacters?: number;
 };
 
 export type FileArtifactToolResult = {
@@ -128,8 +143,80 @@ function sanitizeFileName(value: string | undefined | null, fallback: string) {
   return cleaned || fallback;
 }
 
-function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'document-drafts' | 'downloads' | 'generated') {
+function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'document-assets' | 'document-drafts' | 'downloads' | 'generated') {
   return artifactPath(sanitizeFileName(runId, 'adhoc'), kind);
+}
+
+type DocumentAsset = {
+  assetName: string;
+  bytes: number;
+  origin: 'attachment' | 'download' | 'generated';
+  ref?: string;
+};
+
+function assetFileName(name: string, namespace: string, claimed: Set<string>) {
+  const direct = sanitizeFileName(name, 'asset.bin');
+  const normalizedNamespace = sanitizeFileName(namespace, 'asset').slice(0, 48);
+  const parsed = path.parse(direct);
+  const base = `${normalizedNamespace}-${parsed.name}${parsed.ext}`;
+  if (!claimed.has(base.toLowerCase())) {
+    claimed.add(base.toLowerCase());
+    return base;
+  }
+  const alternate = `${normalizedNamespace}-${randomUUID().slice(0, 8)}-${parsed.name}${parsed.ext}`;
+  claimed.add(alternate.toLowerCase());
+  return alternate;
+}
+
+async function visibleFiles(directory: string) {
+  try {
+    const entries = await readdir(directory, { withFileTypes: true });
+    return entries.filter((entry) => entry.isFile() && !entry.name.startsWith('.'));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Materialize the only local filesystem visible to an Office draft.  This is
+ * a per-run, copied asset workspace: uploads, downloads, and final generated
+ * artifacts are available by deterministic names, never by host paths.
+ */
+export async function syncDocumentAssets(
+  runId: string | undefined,
+  attachmentBindings: BrowserCodeAttachmentBinding[] = [],
+): Promise<DocumentAsset[]> {
+  const destination = artifactDir(runId, 'document-assets');
+  await mkdir(destination, { recursive: true });
+  const sources: Array<{ name: string; path: string; origin: DocumentAsset['origin']; ref?: string }> = [];
+  for (const binding of attachmentBindings) {
+    if (!binding.name || !binding.path) continue;
+    sources.push({ name: binding.name, path: binding.path, origin: 'attachment', ref: binding.ref });
+  }
+  for (const origin of ['downloads', 'generated'] as const) {
+    const directory = artifactDir(runId, origin);
+    for (const entry of await visibleFiles(directory)) {
+      sources.push({ name: entry.name, path: path.join(directory, entry.name), origin: origin === 'downloads' ? 'download' : 'generated' });
+    }
+  }
+  const claimed = new Set<string>();
+  const result: DocumentAsset[] = [];
+  for (const source of sources) {
+    try {
+      const metadata = await stat(source.path);
+      if (!metadata.isFile() || metadata.size > FILE_DOWNLOAD_MAX_BYTES) continue;
+      const assetName = assetFileName(
+        source.name,
+        source.origin === 'attachment' ? `attachment-${source.ref || 'file'}` : source.origin,
+        claimed,
+      );
+      await copyFile(source.path, path.join(destination, assetName));
+      result.push({ assetName, bytes: metadata.size, origin: source.origin, ref: source.ref });
+    } catch {
+      // A stale upload or artifact must not make unrelated document authoring fail.
+    }
+  }
+  return result;
 }
 
 async function uniqueArtifactPath(dir: string, requestedFileName: string) {
@@ -178,11 +265,17 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
     if (payload.kind === 'document-plan') {
-      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; blocks=${payload.blockCount || 0}`;
+      const assets = Array.isArray((payload as Record<string, unknown>).availableAssets)
+        ? ((payload as Record<string, unknown>).availableAssets as Array<Record<string, unknown>>)
+          .map((asset) => typeof asset.assetName === 'string' ? asset.assetName : '')
+          .filter(Boolean)
+        : [];
+      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with job.asset_path(name).`;
     }
-    if (payload.kind === 'document-draft') {
-      return `Document draft updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; blocks=${payload.blockCount || 0}`;
+    if (payload.kind === 'uno-program') {
+      return `UNO draft updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}`;
     }
+    if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
       ? 'File downloaded'
       : toolName === 'fillDocumentTemplate'
@@ -322,15 +415,73 @@ function draftPath(runId: string | undefined, documentId: string) {
   return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.json`);
 }
 
-function nestedBlocks(block: OfficeBlock) {
-  return [
-    ...(Array.isArray(block.children) ? block.children : []),
-    ...(Array.isArray(block.columns) ? block.columns.flatMap((column) => Array.isArray(column.blocks) ? column.blocks : []) : []),
-  ];
+function draftProgramPath(runId: string | undefined, documentId: string) {
+  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.py`);
 }
 
-function allBlocks(blocks: OfficeBlock[]): OfficeBlock[] {
-  return blocks.flatMap((block) => [block, ...allBlocks(nestedBlocks(block))]);
+function draftTransactionPath(runId: string | undefined, documentId: string) {
+  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.transaction.json`);
+}
+
+function draftLockPath(runId: string | undefined, documentId: string) {
+  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.lock`);
+}
+
+function requireDocumentId(value: string | undefined, action: 'read' | 'generate' | 'edit' | 'render') {
+  const documentId = String(value || '').trim();
+  if (!DOCUMENT_ID_PATTERN.test(documentId)) {
+    throw new Error(`file action=${action} requires the stable documentId returned by action=plan.`);
+  }
+  return documentId;
+}
+
+async function acquireFilesystemDraftLock(runId: string | undefined, documentId: string, abortSignal?: AbortSignal) {
+  const lockPath = draftLockPath(runId, documentId);
+  await mkdir(path.dirname(lockPath), { recursive: true });
+  const deadline = Date.now() + DRAFT_LOCK_WAIT_MS;
+  while (true) {
+    if (abortSignal?.aborted) throw abortSignal.reason instanceof Error ? abortSignal.reason : new Error('Draft operation aborted.');
+    try {
+      const handle = await open(lockPath, 'wx');
+      await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }), 'utf8');
+      return async () => {
+        await handle.close().catch(() => undefined);
+        await unlink(lockPath).catch(() => undefined);
+      };
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+      if (code !== 'EEXIST') throw error;
+      try {
+        const metadata = await stat(lockPath);
+        if (Date.now() - metadata.mtimeMs > STALE_DRAFT_LOCK_MS) await unlink(lockPath).catch(() => undefined);
+      } catch (lockError) {
+        const lockCode = lockError && typeof lockError === 'object' && 'code' in lockError ? String((lockError as { code?: unknown }).code || '') : '';
+        if (lockCode !== 'ENOENT') throw lockError;
+      }
+      if (Date.now() >= deadline) throw new Error(`Timed out waiting for the workspace draft lock for ${documentId}.`);
+      await racePromiseWithAbort(new Promise((resolve) => setTimeout(resolve, 50)), abortSignal);
+    }
+  }
+}
+
+/** Serializes a draft's lifecycle both locally and across server processes. */
+async function withDraftLock<T>(runId: string | undefined, documentId: string, operation: () => Promise<T>, abortSignal?: AbortSignal) {
+  const key = `${sanitizeFileName(runId, 'adhoc')}::${documentId}`;
+  const previous = draftLocks.get(key) || Promise.resolve();
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.then(() => gate);
+  draftLocks.set(key, tail);
+  let releaseFilesystemLock: (() => Promise<void>) | undefined;
+  try {
+    await racePromiseWithAbort(previous, abortSignal);
+    releaseFilesystemLock = await acquireFilesystemDraftLock(runId, documentId, abortSignal);
+    return await operation();
+  } finally {
+    await releaseFilesystemLock?.();
+    release?.();
+    if (draftLocks.get(key) === tail) draftLocks.delete(key);
+  }
 }
 
 function canonicalWikimediaOriginalUrl(url: string) {
@@ -359,94 +510,8 @@ async function fetchDownloadResponse(url: string, signal: AbortSignal) {
   return { response: await fetch(canonical, { signal, redirect: 'follow' }), resolvedUrl: canonical };
 }
 
-function blockSnapshots(blocks: OfficeBlock[]) {
-  return new Map(allBlocks(blocks).map((block) => [block.id, JSON.stringify(block)]));
-}
-
-function changedBlockIds(before: Map<string, string>, after: Map<string, string>) {
-  return [...new Set([...before.keys(), ...after.keys()])]
-    .filter((id) => before.get(id) !== after.get(id));
-}
-
-function affectedTopLevelPages(draft: OfficeDocumentDraft, blockIds: string[] | undefined) {
-  if (!blockIds?.length || draft.documentType !== 'presentation') return undefined;
-  const changed = new Set(blockIds);
-  const pages = draft.blocks.flatMap((page, index) => (
-    allBlocks([page]).some((block) => changed.has(block.id)) ? [index + 1] : []
-  ));
-  return pages.length ? pages.slice(0, 6) : undefined;
-}
-
-function validateUniqueBlockIds(blocks: OfficeBlock[], occupied = new Set<string>()) {
-  for (const block of allBlocks(blocks)) {
-    const id = String(block.id || '').trim();
-    if (!id) throw new Error('Every document block requires a stable id.');
-    if (occupied.has(id)) throw new Error(`Duplicate document block id: ${id}`);
-    occupied.add(id);
-  }
-}
-
-function findBlockList(blocks: OfficeBlock[], blockId: string): { list: OfficeBlock[]; index: number } | undefined {
-  const directIndex = blocks.findIndex((block) => block.id === blockId);
-  if (directIndex >= 0) return { list: blocks, index: directIndex };
-  for (const block of blocks) {
-    const candidates: OfficeBlock[][] = [];
-    if (Array.isArray(block.children)) candidates.push(block.children);
-    for (const column of block.columns || []) if (Array.isArray(column.blocks)) candidates.push(column.blocks);
-    for (const candidate of candidates) {
-      const found = findBlockList(candidate, blockId);
-      if (found) return found;
-    }
-  }
-  return undefined;
-}
-
-function insertionList(draft: OfficeDocumentDraft, parentId?: string) {
-  if (!parentId) return draft.blocks;
-  const parent = findBlockList(draft.blocks, parentId);
-  if (!parent) throw new Error(`Parent block not found: ${parentId}`);
-  const block = parent.list[parent.index];
-  if (!Array.isArray(block.children)) block.children = [];
-  return block.children;
-}
-
-function insertBlocks(draft: OfficeDocumentDraft, blocks: OfficeBlock[], placement: { parentId?: string; beforeId?: string; afterId?: string }) {
-  blocks.forEach((block, index) => validateCanonicalOfficeBlockInput(block, `blocks[${index}]`));
-  blocks = blocks.map(normalizeOfficeBlock);
-  validateUniqueBlockIds(blocks, new Set(allBlocks(draft.blocks).map((block) => block.id)));
-  let list = insertionList(draft, placement.parentId);
-  let index = list.length;
-  const anchorId = placement.beforeId || placement.afterId;
-  if (anchorId) {
-    const anchor = findBlockList(draft.blocks, anchorId);
-    if (!anchor) throw new Error(`Placement block not found: ${anchorId}`);
-    list = anchor.list;
-    index = anchor.index + (placement.afterId ? 1 : 0);
-  }
-  list.splice(index, 0, ...blocks);
-}
-
-function mergePlainObject(base: unknown, patch: unknown): unknown {
-  if (!base || !patch || typeof base !== 'object' || typeof patch !== 'object' || Array.isArray(base) || Array.isArray(patch)) return patch;
-  const result = { ...(base as Record<string, unknown>) };
-  for (const [key, value] of Object.entries(patch as Record<string, unknown>)) {
-    result[key] = mergePlainObject(result[key], value);
-  }
-  return result;
-}
-
-async function loadDraft(runId: string | undefined, documentId: string) {
-  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft;
-  if (parsed.documentId !== documentId) throw new Error('Document draft identity does not match the requested documentId.');
-  return parsed;
-}
-
-async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
-  const dir = artifactDir(runId, 'document-drafts');
-  await mkdir(dir, { recursive: true });
-  draft.updatedAt = new Date().toISOString();
-  const target = draftPath(runId, draft.documentId);
-  const candidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.json`);
+async function writeDraftJsonAtomically(target: string, draft: OfficeDocumentDraft) {
+  const candidate = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.tmp`);
   try {
     await writeFile(candidate, JSON.stringify(draft, null, 2), { encoding: 'utf8', flag: 'wx' });
     await rename(candidate, target);
@@ -455,17 +520,216 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   }
 }
 
+/** Complete or discard a crash-interrupted two-file workspace save deterministically. */
+async function recoverDraftTransaction(runId: string | undefined, documentId: string) {
+  const transactionPath = draftTransactionPath(runId, documentId);
+  let pending: OfficeDocumentDraft;
+  try {
+    pending = JSON.parse(await readFile(transactionPath, 'utf8')) as OfficeDocumentDraft;
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+    if (code === 'ENOENT') return;
+    throw error;
+  }
+  if (pending.documentId !== documentId) {
+    throw new Error('Draft transaction identity does not match the requested documentId.');
+  }
+  let sourceMatches = false;
+  if (pending.program) {
+    try {
+      sourceMatches = sourceDigest(await readFile(draftProgramPath(runId, documentId), 'utf8')) === pending.sourceDigest;
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+      if (code !== 'ENOENT') throw error;
+    }
+  } else {
+    try {
+      await access(draftProgramPath(runId, documentId));
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
+      if (code === 'ENOENT') sourceMatches = true;
+      else throw error;
+    }
+  }
+  if (sourceMatches) {
+    await writeDraftJsonAtomically(draftPath(runId, documentId), pending);
+  }
+  await unlink(transactionPath).catch(() => undefined);
+}
+
+async function loadDraft(runId: string | undefined, documentId: string) {
+  await recoverDraftTransaction(runId, documentId);
+  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft & { revision?: unknown };
+  // Migrate metadata written by the retired caller-visible revision protocol.
+  delete parsed.revision;
+  if (parsed.documentId !== documentId) throw new Error('Document draft identity does not match the requested documentId.');
+  if (parsed.program) {
+    try {
+      const workspaceProgram = await readFile(draftProgramPath(runId, documentId), 'utf8');
+      const workspaceDigest = sourceDigest(workspaceProgram);
+      if (parsed.sourceDigest && parsed.sourceDigest !== workspaceDigest) {
+        throw new Error('Workspace draft.py does not match its saved source metadata. Read the draft again or restore it before editing.');
+      }
+      // The file is the executable source of truth; JSON contains metadata only.
+      parsed.program = workspaceProgram;
+      parsed.sourceDigest = workspaceDigest;
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code || '')
+        : '';
+      if (code !== 'ENOENT') throw error;
+      // A pre-workspace draft remains readable and is migrated on its next save.
+    }
+  }
+  return parsed;
+}
+
+async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
+  const dir = artifactDir(runId, 'document-drafts');
+  await mkdir(dir, { recursive: true });
+  draft.updatedAt = new Date().toISOString();
+  draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
+  const target = draftPath(runId, draft.documentId);
+  const programTarget = draftProgramPath(runId, draft.documentId);
+  const transactionTarget = draftTransactionPath(runId, draft.documentId);
+  const transactionCandidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.transaction.json`);
+  const programCandidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.py`);
+  try {
+    // The journal makes a .py/JSON replacement recoverable across a crash or
+    // an interrupted Windows rename. It is deliberately kept on failure.
+    await writeFile(transactionCandidate, JSON.stringify(draft, null, 2), { encoding: 'utf8', flag: 'wx' });
+    await rename(transactionCandidate, transactionTarget);
+    if (draft.program) {
+      await writeFile(programCandidate, draft.program, { encoding: 'utf8', flag: 'wx' });
+      await rename(programCandidate, programTarget);
+    } else {
+      await unlink(programTarget).catch(() => undefined);
+    }
+    // Publish metadata only after the matching workspace source exists.
+    await writeDraftJsonAtomically(target, draft);
+    await unlink(transactionTarget).catch(() => undefined);
+  } finally {
+    await unlink(transactionCandidate).catch(() => undefined);
+    await unlink(programCandidate).catch(() => undefined);
+  }
+}
+
+function sourceDigest(source: string) {
+  return createHash('sha256').update(source, 'utf8').digest('hex');
+}
+
+function normalizedDraftSource(source: string) {
+  return source.replace(/\r\n?/g, '\n');
+}
+
+function textOccurrenceCount(source: string, search: string) {
+  let count = 0;
+  let offset = 0;
+  while (offset <= source.length - search.length) {
+    const foundAt = source.indexOf(search, offset);
+    if (foundAt < 0) break;
+    count += 1;
+    offset = foundAt + search.length;
+  }
+  return count;
+}
+
+/**
+ * Apply editor-style, ordered search/replace operations to the one virtual
+ * draft.py. A single replacement must be unambiguous; callers can explicitly
+ * opt into replacing every occurrence.
+ */
+export function applyUnoDraftTextEdits(source: string, edits: UnoDraftTextEdit[]) {
+  if (!Array.isArray(edits) || !edits.length) {
+    throw new Error('file action=edit requires at least one text edit.');
+  }
+  let output = normalizedDraftSource(source);
+  edits.forEach((edit, editIndex) => {
+    const oldText = normalizedDraftSource(typeof edit?.oldText === 'string' ? edit.oldText : '');
+    const newText = normalizedDraftSource(typeof edit?.newText === 'string' ? edit.newText : '');
+    if (!oldText) throw new Error(`draft.py edit ${editIndex + 1} requires non-empty oldText.`);
+    const occurrences = textOccurrenceCount(output, oldText);
+    if (!occurrences) {
+      throw new Error(`draft.py edit ${editIndex + 1} could not find oldText in the current source. Read draft.py again and copy a larger exact source region.`);
+    }
+    if (occurrences > 1 && edit.replaceAll !== true) {
+      throw new Error(`draft.py edit ${editIndex + 1} matched ${occurrences} locations. Include more surrounding context or set replaceAll=true intentionally.`);
+    }
+    if (edit.replaceAll === true) output = output.split(oldText).join(newText);
+    else {
+      const foundAt = output.indexOf(oldText);
+      output = `${output.slice(0, foundAt)}${newText}${output.slice(foundAt + oldText.length)}`;
+    }
+  });
+  return output;
+}
+
+async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading a UNO draft.' };
+    const draft = await loadDraft(input.runId, documentId);
+    if (!draft.program) return { ok: false, actual: `UNO draft ${documentId} has no program yet; call action=generate first.` };
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        kind: 'uno-draft',
+        documentId: draft.documentId,
+        documentType: draft.documentType,
+        fileName: draft.fileName,
+        sourceDigest: sourceDigest(draft.program),
+        program: draft.program,
+      }),
+    };
+  } catch (error) {
+    return { ok: false, actual: `UNO draft read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult> {
+  try {
+    if (!input.documentType || !input.target) return { ok: false, actual: 'file action=unoApi requires documentType and target.' };
+    return {
+      ok: true,
+      actual: JSON.stringify({ kind: 'uno-api', ...(await inspectUnoApi({
+        documentType: input.documentType,
+        target: input.target,
+        query: input.query,
+        offset: input.offset,
+        limit: input.limit,
+      })) }),
+    };
+  } catch (error) {
+    return { ok: false, actual: `UNO API inspection failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 async function renderDraft(input: {
   runId?: string;
   draft: OfficeDocumentDraft;
   includeVisualVerification?: boolean;
-  changedBlockIds?: string[];
   documentChanged?: boolean;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
 }): Promise<BrowserActionResult> {
   let verificationPath: string | undefined;
+  let previewPath: string | undefined;
   try {
+    if (!input.draft.program) throw new Error(`UNO draft ${input.draft.documentId} has no program yet; call action=generate first.`);
+    // Also migrates legacy JSON-only drafts before the worker is given its real
+    // workspace path. This never changes the source.
+    await saveDraft(input.runId, input.draft);
     const requestedName = sanitizeFileName(input.draft.fileName, `document-${Date.now()}.pdf`);
-    const generated = await generateFileBuffer(input.draft);
+    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+    const generated = await generateFileBuffer({
+      ...input.draft,
+      programPath: draftProgramPath(input.runId, input.draft.documentId),
+      // The worker sees only the materialized per-run asset workspace. This
+      // includes every registered upload plus previous downloads and final
+      // generated artifacts, never an arbitrary host path.
+      assetsPath: artifactDir(input.runId, 'document-assets'),
+      abortSignal: input.abortSignal,
+    });
     const dir = artifactDir(input.runId, 'generated');
     await mkdir(dir, { recursive: true });
     const existingRenderedName = input.draft.renderedFileName
@@ -480,25 +744,28 @@ async function renderDraft(input: {
     verificationPath = path.join(dir, `.render-${randomUUID()}${generated.extension}`);
     await writeFile(verificationPath, generated.buffer, { flag: 'wx' });
 
+    previewPath = path.join(dir, `.preview-${randomUUID()}.pdf`);
+    if (needsOfficePreview && !generated.previewPdf) {
+      throw new Error('LibreOffice UNO worker did not produce a PDF preview for visual verification.');
+    }
+    if (generated.previewPdf) await writeFile(previewPath, generated.previewPdf, { flag: 'wx' });
     const visualVerification = needsOfficePreview
       ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: verificationPath,
-          buffer: generated.buffer,
-          extension: generated.extension,
+          absolutePath: previewPath,
+          buffer: generated.previewPdf!,
+          extension: '.pdf',
           name: target.fileName,
-          pages: affectedTopLevelPages(input.draft, input.changedBlockIds),
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
         })
       : undefined;
     if (needsOfficePreview
       && (!visualVerification?.imagePaths.length
-        || !['libreoffice-pdf', 'pdf'].includes(visualVerification.renderer))) {
+        || visualVerification.renderer !== 'pdf')) {
       throw new Error(`visual quality gate failed: ${visualVerification?.warning || 'LibreOffice produced no page previews'}`);
     }
 
-    // The candidate draft and candidate binary are invisible until every
-    // structural/render/preview gate has passed. A failed render therefore
-    // cannot mutate the persisted block tree or reserve duplicate block IDs.
+    // The candidate program and binary stay invisible until every generation,
+    // reload, and optional preview gate has passed.
     await rename(verificationPath, target.filePath);
     verificationPath = undefined;
     input.draft.renderedFileName = target.fileName;
@@ -514,10 +781,13 @@ async function renderDraft(input: {
           bytes: generated.buffer.byteLength,
         }),
         documentId: input.draft.documentId,
-        revision: input.draft.revision || 0,
-        changedBlockIds: input.changedBlockIds || [],
         documentChanged: input.documentChanged || false,
-        blockCount: allBlocks(input.draft.blocks).length,
+        availableAssets: assets.map((asset) => ({
+          assetName: asset.assetName,
+          bytes: asset.bytes,
+          origin: asset.origin,
+          ref: asset.ref,
+        })),
         generationDiagnostics: generated.diagnostics,
         qualityGate: {
           structural: true,
@@ -547,10 +817,11 @@ async function renderDraft(input: {
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
     if (verificationPath) await unlink(verificationPath).catch(() => undefined);
+    if (previewPath) await unlink(previewPath).catch(() => undefined);
   }
 }
 
-export async function planFileArtifact(input: PlanArtifactInput): Promise<BrowserActionResult> {
+async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<BrowserActionResult> {
   try {
     const documentId = String(input.documentId || '').trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(documentId)) {
@@ -570,11 +841,9 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
           actual: `documentId ${documentId} already belongs to a ${existing.documentType} document. Reuse it only for that logical document or choose a different stable documentId for a genuinely different output.`,
         };
       }
-      if (!existing.blocks.length && !existing.renderedFileName) {
+      if (!existing.program && !existing.renderedFileName) {
         existing.fileName = requestedFileName;
-        existing.document = input.document || existing.document;
         existing.intent = input.intent ?? existing.intent;
-        existing.outline = input.outline ?? existing.outline;
         await saveDraft(input.runId, existing);
       }
       return {
@@ -584,9 +853,7 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
           documentId: existing.documentId,
           fileName: existing.fileName,
           documentType: existing.documentType,
-          outline: existing.outline,
-          blockCount: allBlocks(existing.blocks).length,
-          revision: existing.revision || 0,
+          sourceCharacters: existing.program?.length || 0,
           reused: true,
         }),
       };
@@ -598,151 +865,137 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
     }
     const now = new Date().toISOString();
     const draft: OfficeDocumentDraft = {
-      blocks: [],
       createdAt: now,
-      document: input.document || {},
       documentId,
       documentType: input.documentType,
       fileName: requestedFileName,
       intent: input.intent,
-      outline: input.outline,
-      revision: 0,
       updatedAt: now,
     };
     await saveDraft(input.runId, draft);
-    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, outline: draft.outline, blockCount: 0, revision: draft.revision }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, sourceCharacters: 0 }) };
   } catch (error) {
     return { ok: false, actual: `file planning failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
-export async function generateFileArtifactBlocks(input: GenerateArtifactBlocksInput): Promise<BrowserActionResult> {
+async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): Promise<BrowserActionResult> {
   try {
     const documentId = String(input.documentId || '').trim();
     if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
-    const blocks = Array.isArray(input.blocks) ? input.blocks : [];
-    if (!blocks.length) return { ok: false, actual: 'file action=generate requires at least one block.' };
+    const program = String(input.program || '').trim();
+    if (!program) return { ok: false, actual: 'file action=generate requires a complete Python UNO draft in program.' };
+    assertControlledUnoProgram(program);
     const persistedDraft = await loadDraft(input.runId, documentId);
-    if (input.expectedRevision !== undefined && input.expectedRevision !== (persistedDraft.revision || 0)) {
-      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${persistedDraft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
+    if (persistedDraft.program) {
+      return {
+        ok: false,
+        actual: `UNO draft ${documentId} already has source. Do not send another complete program. Use action=read only when the current source is unknown, then action=edit with targeted edits=[{oldText,newText,replaceAll?}]. The edit is saved to draft.py before it is rendered.`,
+      };
     }
     const draft = structuredClone(persistedDraft);
-    insertBlocks(draft, blocks, input);
-    draft.revision = (draft.revision || 0) + 1;
-    validateOfficeDocumentStructure(draft, path.extname(draft.fileName).toLowerCase());
-    if (input.render) return renderDraft({
-      ...input,
-      draft,
-      changedBlockIds: blocks.flatMap((block) => allBlocks([block]).map((item) => item.id)),
-      documentChanged: true,
-    });
+    draft.program = program;
     await saveDraft(input.runId, draft);
-    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, acceptedBlockIds: blocks.map((block) => block.id), changedBlockIds: blocks.flatMap((block) => allBlocks([block]).map((item) => item.id)), blockCount: allBlocks(draft.blocks).length, revision: draft.revision }) };
+    if (input.render !== false) return renderDraft({ ...input, draft, documentChanged: true });
+    return { ok: true, actual: JSON.stringify({ kind: 'uno-program', documentId, fileName: draft.fileName, sourceCharacters: program.length }) };
   } catch (error) {
-    return { ok: false, actual: `file block generation failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `UNO program generation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
-export async function editFileArtifact(input: EditArtifactInput): Promise<BrowserActionResult> {
+async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<BrowserActionResult> {
   try {
     const documentId = String(input.documentId || '').trim();
     if (!documentId) return { ok: false, actual: 'file action=edit requires documentId.' };
-    const operations = Array.isArray(input.operations) ? input.operations : [];
-    if (!operations.length) return { ok: false, actual: 'file action=edit requires at least one operation.' };
+    if (typeof input.program === 'string' && input.program.trim()) {
+      return {
+        ok: false,
+        actual: 'file action=edit does not accept a complete program replacement. Read the current draft.py when needed and send only targeted edits=[{oldText,newText,replaceAll?}].',
+      };
+    }
+    if (!Array.isArray(input.edits) || !input.edits.length) {
+      return { ok: false, actual: 'file action=edit requires targeted edits=[{oldText,newText,replaceAll?}].' };
+    }
     const persistedDraft = await loadDraft(input.runId, documentId);
-    if (input.expectedRevision !== undefined && input.expectedRevision !== (persistedDraft.revision || 0)) {
-      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${persistedDraft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
-    }
-    // Apply the entire edit batch to a detached copy. A later invalid operation
-    // must not leave earlier mutations visible in memory or on disk.
+    if (!persistedDraft.program) return { ok: false, actual: `UNO draft ${documentId} has no program yet; call action=generate first.` };
     const draft = structuredClone(persistedDraft);
-    const before = blockSnapshots(draft.blocks);
-    for (const operation of operations) {
-      if (operation.op === 'setDocument') {
-        if (!operation.patch || typeof operation.patch !== 'object' || Array.isArray(operation.patch)) {
-          throw new Error('setDocument requires a patch object.');
-        }
-        if (operation.patch.defaultStyle && typeof operation.patch.defaultStyle === 'object' && !Array.isArray(operation.patch.defaultStyle)) {
-          validateCanonicalOfficeBlockPatch({ style: operation.patch.defaultStyle }, 'operations.setDocument.patch');
-        }
-        draft.document = mergePlainObject(draft.document, operation.patch) as OfficeDocumentSettings;
-        continue;
-      }
-      if (operation.op === 'add') {
-        const blocks = operation.blocks || (operation.block ? [operation.block] : []);
-        if (!blocks.length) throw new Error('add requires block or a non-empty blocks array; no changes were applied.');
-        insertBlocks(draft, blocks, operation);
-        continue;
-      }
-      if (operation.op === 'replaceChildren') {
-        const parentId = String(operation.parentId || '').trim();
-        if (!parentId) throw new Error('replaceChildren requires parentId.');
-        if (!Array.isArray(operation.blocks)) throw new Error(`replaceChildren requires a blocks array for ${parentId}.`);
-        const parent = findBlockList(draft.blocks, parentId);
-        if (!parent) throw new Error(`Parent block not found: ${parentId}`);
-        const parentBlock = parent.list[parent.index];
-        const removedIds = new Set(allBlocks(parentBlock.children || []).map((block) => block.id));
-        const occupiedIds = new Set(allBlocks(draft.blocks)
-          .filter((block) => !removedIds.has(block.id))
-          .map((block) => block.id));
-        operation.blocks.forEach((block, index) => validateCanonicalOfficeBlockInput(block, `operations.replaceChildren.blocks[${index}]`));
-        const nextChildren = operation.blocks.map(normalizeOfficeBlock);
-        validateUniqueBlockIds(nextChildren, occupiedIds);
-        parentBlock.children = nextChildren;
-        continue;
-      }
-      const blockId = String(operation.blockId || '').trim();
-      if (!blockId) throw new Error(`${operation.op} requires blockId.`);
-      const found = findBlockList(draft.blocks, blockId);
-      if (!found) throw new Error(`Block not found: ${blockId}`);
-      if (operation.op === 'remove') {
-        found.list.splice(found.index, 1);
-      } else if (operation.op === 'replace') {
-        if (!operation.block) throw new Error(`replace requires block for ${blockId}`);
-        validateCanonicalOfficeBlockInput(operation.block, `operations.replace.block`);
-        const replacedIds = new Set(allBlocks([found.list[found.index]]).map((block) => block.id));
-        const remainingIds = new Set(allBlocks(draft.blocks).filter((block) => !replacedIds.has(block.id)).map((block) => block.id));
-        validateUniqueBlockIds([operation.block], remainingIds);
-        found.list.splice(found.index, 1, normalizeOfficeBlock(operation.block));
-      } else if (operation.op === 'update') {
-        if (!operation.patch || typeof operation.patch !== 'object' || Array.isArray(operation.patch)) {
-          throw new Error(`update requires a patch object for ${blockId}.`);
-        }
-        validateCanonicalOfficeBlockPatch(operation.patch, `operations.update.patch`);
-        const updated = normalizeOfficeBlock(mergePlainObject(found.list[found.index], operation.patch) as OfficeBlock);
-        updated.id = blockId;
-        found.list[found.index] = updated;
-      } else if (operation.op === 'move') {
-        const [block] = found.list.splice(found.index, 1);
-        insertBlocks(draft, [block], operation);
-      }
+    draft.program = applyUnoDraftTextEdits(persistedDraft.program, input.edits);
+    if (draft.program === normalizedDraftSource(persistedDraft.program)) {
+      return { ok: false, actual: 'file action=edit made no changes to draft.py.' };
     }
-    validateUniqueBlockIds(draft.blocks);
-    const after = blockSnapshots(draft.blocks);
-    const changedIds = changedBlockIds(before, after);
-    const documentChanged = JSON.stringify(persistedDraft.document) !== JSON.stringify(draft.document);
-    if (!changedIds.length && !documentChanged) {
-      return { ok: false, actual: 'file edit produced no effective changes; verify blockId, patch.style, and add block/blocks before retrying.' };
-    }
-    draft.revision = (persistedDraft.revision || 0) + 1;
-    validateOfficeDocumentStructure(draft, path.extname(draft.fileName).toLowerCase());
-    if (input.render !== false) return renderDraft({ ...input, draft, changedBlockIds: changedIds, documentChanged });
+    assertControlledUnoProgram(draft.program);
     await saveDraft(input.runId, draft);
-    return { ok: true, actual: JSON.stringify({ kind: 'document-draft', documentId, fileName: draft.fileName, changedBlockIds: changedIds, documentChanged, blockCount: allBlocks(draft.blocks).length, revision: draft.revision }) };
+    if (input.render !== false) return renderDraft({ ...input, draft, documentChanged: true });
+    return { ok: true, actual: JSON.stringify({ kind: 'uno-program', documentId, fileName: draft.fileName, sourceCharacters: draft.program.length, sourceDigest: sourceDigest(draft.program) }) };
   } catch (error) {
-    return { ok: false, actual: `file edit failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `UNO draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+async function renderFileArtifactUnlocked(input: RenderArtifactInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) return { ok: false, actual: 'file action=render requires documentId.' };
+    const draft = await loadDraft(input.runId, documentId);
+    return renderDraft({ ...input, draft });
+  } catch (error) {
+    return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function readUnoDraft(input: ReadUnoDraftInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = requireDocumentId(input.documentId, 'read');
+    return await withDraftLock(input.runId, documentId, () => readUnoDraftUnlocked({ ...input, documentId }));
+  } catch (error) {
+    return { ok: false, actual: `UNO draft read failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function planFileArtifact(input: PlanArtifactInput): Promise<BrowserActionResult> {
+  const documentId = String(input.documentId || '').trim();
+  if (!DOCUMENT_ID_PATTERN.test(documentId)) {
+    return { ok: false, actual: 'file action=plan requires a stable model-chosen documentId (1-96 ASCII letters, numbers, dot, underscore, or hyphen).' };
+  }
+  const result = await withDraftLock(input.runId, documentId, () => planFileArtifactUnlocked({ ...input, documentId }));
+  if (!result.ok) return result;
+  try {
+    const payload = JSON.parse(result.actual) as Record<string, unknown>;
+    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+    return {
+      ...result,
+      actual: JSON.stringify({
+        ...payload,
+        availableAssets: assets.map((asset) => ({ assetName: asset.assetName, bytes: asset.bytes, origin: asset.origin, ref: asset.ref })),
+      }),
+    };
+  } catch {
+    return result;
+  }
+}
+
+export async function generateUnoFileArtifact(input: GenerateUnoProgramInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = requireDocumentId(input.documentId, 'generate');
+    return await withDraftLock(input.runId, documentId, () => generateUnoFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
+  } catch (error) {
+    return { ok: false, actual: `UNO program generation failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function editUnoFileArtifact(input: EditUnoProgramInput): Promise<BrowserActionResult> {
+  try {
+    const documentId = requireDocumentId(input.documentId, 'edit');
+    return await withDraftLock(input.runId, documentId, () => editUnoFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
+  } catch (error) {
+    return { ok: false, actual: `UNO draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
 export async function renderFileArtifact(input: RenderArtifactInput): Promise<BrowserActionResult> {
   try {
-    const documentId = String(input.documentId || '').trim();
-    if (!documentId) return { ok: false, actual: 'file action=render requires documentId.' };
-    const draft = await loadDraft(input.runId, documentId);
-    if (input.expectedRevision !== undefined && input.expectedRevision !== (draft.revision || 0)) {
-      return { ok: false, actual: `document revision conflict: expected ${input.expectedRevision}, current revision is ${draft.revision || 0}. Read the latest tool result and retry against the same documentId.` };
-    }
-    return renderDraft({ ...input, draft });
+    const documentId = requireDocumentId(input.documentId, 'render');
+    return await withDraftLock(input.runId, documentId, () => renderFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
   } catch (error) {
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
   }

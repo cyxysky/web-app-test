@@ -1,11 +1,7 @@
 import path from 'node:path';
 import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '@/server/files/file-format-registry';
-import { generateOfficeDocument } from '@/server/files/libreoffice';
+import { generateUnoProgramDocument } from '@/server/files/uno-program';
 import type { OfficeBlock, OfficeCellValue, OfficeDocumentSpec } from '@/server/files/office-document-spec';
-import {
-  normalizeOfficeDocumentSpec,
-  validateOfficeDocumentStructure,
-} from '@/server/files/office-document-normalizer';
 
 export type GeneratedFileCell = OfficeCellValue;
 export type GeneratedFileInput = OfficeDocumentSpec;
@@ -14,6 +10,7 @@ export type GeneratedFileOutput = {
   buffer: Buffer;
   diagnostics?: unknown;
   extension: string;
+  previewPdf?: Buffer;
 };
 
 export const generatedTextExtensions = generatedFileExtensions('text');
@@ -82,12 +79,10 @@ function validateXlsLimits(input: GeneratedFileInput) {
   }
 }
 
-function validateOfficeSpec(input: GeneratedFileInput, extension: string) {
-  if (!Array.isArray(input.blocks) || !input.blocks.length) throw new Error('Document generation requires at least one block.');
+function validateOfficeTarget(input: Pick<OfficeDocumentSpec, 'documentType'>, extension: string) {
   if (wordExtensions.has(extension) && input.documentType !== 'word') throw new Error(`${extension} requires documentType=word.`);
   if (spreadsheetExtensions.has(extension) && input.documentType !== 'spreadsheet') throw new Error(`${extension} requires documentType=spreadsheet.`);
   if (presentationExtensions.has(extension) && input.documentType !== 'presentation') throw new Error(`${extension} requires documentType=presentation.`);
-  if (extension === '.xls') validateXlsLimits(input);
 }
 
 export function supportedGeneratedFileExtension(fileName: string) {
@@ -96,22 +91,29 @@ export function supportedGeneratedFileExtension(fileName: string) {
   return format?.canGenerate ? format.extension : undefined;
 }
 
-export async function generateFileBuffer(input: GeneratedFileInput): Promise<GeneratedFileOutput> {
+export async function generateFileBuffer(input: (GeneratedFileInput | Pick<OfficeDocumentSpec, 'documentType' | 'fileName'>) & { program?: string; programPath?: string; assetsPath?: string; abortSignal?: AbortSignal }): Promise<GeneratedFileOutput> {
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension) throw new Error('Unsupported output extension. Use a supported text/data format, PDF, Word, Excel, PowerPoint, or OpenDocument extension.');
   if (generatedTextExtensions.has(extension)) {
+    if (!('blocks' in input)) throw new Error('Text file generation requires semantic text blocks.');
     if (extension === '.csv' || extension === '.tsv') return { buffer: generateDelimitedText(input, extension), extension };
     const content = documentText(input);
     if (!content) throw new Error('Text file generation requires at least one textual block.');
     return { buffer: Buffer.from(`${content}\n`, 'utf8'), extension };
   }
-  const normalized = normalizeOfficeDocumentSpec(input);
-  validateOfficeSpec(normalized, extension);
-  validateOfficeDocumentStructure(normalized, extension);
-  const generated = await generateOfficeDocument({ ...normalized, fileName: path.basename(normalized.fileName) });
+  if (!input.program?.trim() && !input.programPath) throw new Error('Office document generation requires a Python UNO draft from file action=generate or action=edit.');
+  validateOfficeTarget(input, extension);
+  const generated = await generateUnoProgramDocument({
+    ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
+    fileName: path.basename(input.fileName),
+    documentType: input.documentType,
+    assetsPath: input.assetsPath,
+    abortSignal: input.abortSignal,
+  });
   return {
     buffer: generated.buffer,
     diagnostics: generated.report,
     extension,
+    previewPdf: generated.previewPdf,
   };
 }

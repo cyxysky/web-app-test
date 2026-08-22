@@ -38,6 +38,18 @@ type ConfigStoreData = {
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
 
+function normalizeExtraRequestParameters(value: unknown) {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? JSON.stringify(parsed)
+      : '';
+  } catch {
+    return '';
+  }
+}
+
 const modelApiKeyEnv: Record<ModelProvider, string> = {
   'ai-gateway': 'AI_GATEWAY_API_KEY',
   alibaba: 'ALIBABA_API_KEY',
@@ -60,6 +72,8 @@ const modelApiKeyEnv: Record<ModelProvider, string> = {
   ollama: 'OLLAMA_API_KEY',
   openai: 'OPENAI_API_KEY',
   'openai-compatible': 'OPENAI_COMPATIBLE_API_KEY',
+  'openai-compatible-2': 'OPENAI_COMPATIBLE_2_API_KEY',
+  'openai-compatible-3': 'OPENAI_COMPATIBLE_3_API_KEY',
   openrouter: 'OPENROUTER_API_KEY',
   perplexity: 'PERPLEXITY_API_KEY',
   togetherai: 'TOGETHERAI_API_KEY',
@@ -89,11 +103,20 @@ const modelBaseUrlEnv: Record<ModelProvider, string> = {
   ollama: 'OLLAMA_BASE_URL',
   openai: 'OPENAI_BASE_URL',
   'openai-compatible': 'OPENAI_COMPATIBLE_BASE_URL',
+  'openai-compatible-2': 'OPENAI_COMPATIBLE_2_BASE_URL',
+  'openai-compatible-3': 'OPENAI_COMPATIBLE_3_BASE_URL',
   openrouter: '',
   perplexity: 'PERPLEXITY_BASE_URL',
   togetherai: 'TOGETHERAI_BASE_URL',
   vercel: 'VERCEL_BASE_URL',
   xai: 'XAI_BASE_URL',
+};
+
+const modelExtraRequestParametersEnv: Partial<Record<ModelProvider, string>> = {
+  minimax: 'MINIMAX_EXTRA_REQUEST_PARAMETERS',
+  'openai-compatible': 'OPENAI_COMPATIBLE_EXTRA_REQUEST_PARAMETERS',
+  'openai-compatible-2': 'OPENAI_COMPATIBLE_2_EXTRA_REQUEST_PARAMETERS',
+  'openai-compatible-3': 'OPENAI_COMPATIBLE_3_EXTRA_REQUEST_PARAMETERS',
 };
 
 function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
@@ -108,6 +131,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
     modelCapabilities: normalizedModelCapabilities(provider, models),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
+    extraRequestParameters: '',
   };
 }
 
@@ -133,6 +157,7 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
       models,
       modelCapabilities: normalizedModelCapabilities(definition.value, models, current?.modelCapabilities),
       baseURL: baseURL ?? definition.defaultBaseURL ?? '',
+      extraRequestParameters: normalizeExtraRequestParameters(current?.extraRequestParameters),
     };
   }
   return { provider, providers, updatedAt: input.updatedAt || now() };
@@ -152,6 +177,8 @@ function applyModelConfig(config?: ModelConfigRecord) {
     if (keyEnv) process.env[keyEnv] = settings.apiKey || '';
     const baseUrlEnv = modelBaseUrlEnv[definition.value];
     if (baseUrlEnv) process.env[baseUrlEnv] = settings.baseURL || definition.defaultBaseURL || '';
+    const extraRequestParametersEnv = modelExtraRequestParametersEnv[definition.value];
+    if (extraRequestParametersEnv) process.env[extraRequestParametersEnv] = settings.extraRequestParameters || '';
   }
   const activeProvider = normalized.providers[normalized.provider]?.enabled
     ? normalized.provider
@@ -345,6 +372,7 @@ export const store = {
         baseURL: provider === 'minimax'
           ? normalizeMiniMaxOpenAIBaseURL(baseURL) || ''
           : baseURL,
+        extraRequestParameters: normalizeExtraRequestParameters(current?.extraRequestParameters ?? previous?.extraRequestParameters),
         updatedAt: current ? timestamp : previous?.updatedAt,
       };
     }

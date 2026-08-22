@@ -20,8 +20,8 @@ copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverOutput
 copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverOutput, 'webpilot-identity.js'));
 copyInto(path.join(root, 'server', 'realtime-refresh-hub.js'), path.join(serverOutput, 'realtime-refresh-hub.js'));
 copyInto(
-  path.join(root, 'src', 'server', 'files', 'libreoffice-office-worker.py'),
-  path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-office-worker.py'),
+  path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
+  path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
 );
 copyInto(
   path.join(root, 'src', 'server', 'browser', 'session-tab-grouper-extension'),

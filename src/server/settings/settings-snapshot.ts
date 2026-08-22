@@ -21,6 +21,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
     modelCapabilities: normalizedModelCapabilities(provider, models),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
+    extraRequestParameters: '',
   };
 }
 

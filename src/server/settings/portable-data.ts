@@ -70,6 +70,7 @@ const modelProviderSettingsSchema = z.object({
   }).strict()).optional(),
   apiKey: z.string().max(10_000).optional(),
   baseURL: z.string().trim().max(4_000).optional(),
+  extraRequestParameters: z.string().max(16_000).optional(),
 }).strict();
 
 const rawModelConfigSchema = z.object({
@@ -244,6 +245,7 @@ export async function exportPortableData(input: {
         modelCapabilities: current.modelCapabilities,
         apiKey: current.apiKey,
         baseURL: current.baseURL,
+        extraRequestParameters: current.extraRequestParameters,
       }];
     }).filter((entry) => entry[1] !== undefined));
     const config = parseModelConfig({ provider: saved.provider, providers });

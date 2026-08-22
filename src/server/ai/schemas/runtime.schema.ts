@@ -130,6 +130,10 @@ export type BrowserChatAiOutputTool = {
   reason?: string;
   invalid?: boolean;
   error?: string;
+  /** The provider's own tool-result, paired to this call by toolCallId. */
+  ok?: boolean;
+  result?: string;
+  rawResult?: unknown;
 };
 
 export type BrowserChatAiOutputPart =
@@ -214,6 +218,8 @@ export type ModelProvider =
   | 'ollama'
   | 'openai'
   | 'openai-compatible'
+  | 'openai-compatible-2'
+  | 'openai-compatible-3'
   | 'openrouter'
   | 'perplexity'
   | 'togetherai'
@@ -231,6 +237,8 @@ export type ModelProviderSettings = {
   apiKey?: string;
   hasApiKey?: boolean;
   baseURL?: string;
+  /** JSON object merged into OpenAI-compatible chat-completion request bodies. */
+  extraRequestParameters?: string;
   updatedAt?: string;
 };
 

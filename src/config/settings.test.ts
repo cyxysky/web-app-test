@@ -32,6 +32,21 @@ test('custom OpenAI-compatible APIs have a dedicated provider entry', () => {
   assert.equal(definition.defaultBaseURL, undefined);
 });
 
+test('exposes three independently configurable OpenAI-compatible providers', () => {
+  const providers = [
+    modelProviderDefinition('openai-compatible'),
+    modelProviderDefinition('openai-compatible-2'),
+    modelProviderDefinition('openai-compatible-3'),
+  ];
+  assert.deepEqual(providers.map((provider) => provider.value), [
+    'openai-compatible',
+    'openai-compatible-2',
+    'openai-compatible-3',
+  ]);
+  assert.ok(providers.every((provider) => provider.defaultModel === 'custom-model'));
+  assert.ok(providers.every((provider) => provider.baseUrlLabel));
+});
+
 test('MiniMax migrates saved official Anthropic endpoints to OpenAI endpoints', () => {
   assert.equal(
     normalizeMiniMaxOpenAIBaseURL('https://api.minimax.io/anthropic/v1'),

@@ -8,18 +8,22 @@ const DRIVE_DELAYS = Array.from({ length: 9 }, (_, index) => {
   return (column + Math.abs(row - 1)) * 90;
 });
 
-function useElapsedTime(enabled = true) {
-  const [deciseconds, setDeciseconds] = useState(0);
+function useElapsedTime(enabled = true, startedAt?: number | string) {
+  const [elapsedMs, setElapsedMs] = useState(0);
 
   useEffect(() => {
     if (!enabled) return undefined;
-    const timer = window.setInterval(() => setDeciseconds((current) => current + 1), 100);
+    const parsedStartedAt = typeof startedAt === 'number' ? startedAt : Date.parse(startedAt || '');
+    const startedAtMs = Number.isFinite(parsedStartedAt) ? parsedStartedAt : Date.now();
+    const update = () => setElapsedMs(Math.max(0, Date.now() - startedAtMs));
+    update();
+    const timer = window.setInterval(update, 100);
     return () => window.clearInterval(timer);
-  }, [enabled]);
+  }, [enabled, startedAt]);
 
   if (!enabled) return '';
 
-  const seconds = deciseconds / 10;
+  const seconds = elapsedMs / 1_000;
   if (seconds < 60) return `${seconds.toFixed(1)}s`;
   return `${Math.floor(seconds / 60)}m ${(seconds % 60).toFixed(1)}s`;
 }
@@ -29,15 +33,17 @@ export function BeautifulLoadingState({
   detail,
   label,
   showElapsed = false,
+  startedAt,
   variant = 'grid',
 }: {
   className?: string;
   detail?: string;
   label: string;
   showElapsed?: boolean;
+  startedAt?: number | string;
   variant?: 'grid' | 'orbit';
 }) {
-  const elapsed = useElapsedTime(showElapsed);
+  const elapsed = useElapsedTime(showElapsed, startedAt);
 
   return (
     <div className={`beautiful-loading-state${className ? ` ${className}` : ''}`} role="status">

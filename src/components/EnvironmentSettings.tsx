@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { TextArea } from '@heroui/react';
 import Link from 'next/link';
-import { ArrowLeft, FolderOpen, KeyRound, Loader2, PencilLine, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { ArrowLeft, FolderOpen, ImageIcon, KeyRound, Loader2, PencilLine, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
@@ -195,6 +195,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
       apiKey: current?.apiKey || '',
       hasApiKey: Boolean(current?.hasApiKey || current?.apiKey),
       baseURL: current?.baseURL ?? definition.defaultBaseURL ?? '',
+      extraRequestParameters: current?.extraRequestParameters || '',
       updatedAt: current?.updatedAt,
     };
   }
@@ -215,6 +216,7 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
     modelCapabilities: normalizedModelCapabilities(definition.value, modelListForProvider(definition)),
     apiKey: '',
     baseURL: definition.defaultBaseURL || '',
+    extraRequestParameters: '',
   };
 }
 
@@ -1268,6 +1270,7 @@ export function EnvironmentSettings({
   const activeProviderModels = draftModelRows(activeProviderOption, activeProviderSettings);
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const activeProviderEnabled = activeProviderSettings.enabled === true;
+  const activeProviderSupportsExtraRequestParameters = activeProvider === 'minimax' || activeProvider.startsWith('openai-compatible');
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
     .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
@@ -1446,18 +1449,20 @@ export function EnvironmentSettings({
                           value={model}
                           onChange={(event) => updateActiveProviderModel(index, event.target.value)}
                           placeholder={activeProviderOption.defaultModel}
+                          suffix={(
+                            <button
+                              aria-label={t('图片输入')}
+                              aria-pressed={activeProviderSettings.modelCapabilities?.[model]?.imageInput === true}
+                              className={`settings-model-capability-button${activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? ' on' : ''}`}
+                              disabled={!activeProviderEnabled || !model.trim()}
+                              onClick={() => setActiveModelImageInput(model, activeProviderSettings.modelCapabilities?.[model]?.imageInput !== true)}
+                              title={t(activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? '支持图片输入' : '不支持图片输入')}
+                              type="button"
+                            >
+                              <ImageIcon aria-hidden="true" size={16} strokeWidth={1.9} />
+                            </button>
+                          )}
                         />
-                        <button
-                          aria-label={t('图片输入')}
-                          aria-pressed={activeProviderSettings.modelCapabilities?.[model]?.imageInput === true}
-                          className={`settings-model-capability-button${activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? ' on' : ''}`}
-                          disabled={!activeProviderEnabled || !model.trim()}
-                          onClick={() => setActiveModelImageInput(model, activeProviderSettings.modelCapabilities?.[model]?.imageInput !== true)}
-                          title={t(activeProviderSettings.modelCapabilities?.[model]?.imageInput === true ? '支持图片输入' : '不支持图片输入')}
-                          type="button"
-                        >
-                          {t('图片')}
-                        </button>
                         <button
                           aria-label={t('删除模型')}
                           className="settings-model-row-button danger"
@@ -1497,11 +1502,26 @@ export function EnvironmentSettings({
                   <div className="settings-row">
                     <div>
                       <strong>{t(activeProviderOption.baseUrlLabel)}</strong>
-                      <span>{t(activeProvider === 'openai-compatible'
+                      <span>{t(activeProvider.startsWith('openai-compatible')
                         ? '填写服务商提供的 OpenAI 兼容 Base URL，通常以 /v1 结尾。'
                         : '自定义兼容服务地址，留空使用默认地址。')}</span>
                     </div>
                     <AppInput value={activeProviderSettings.baseURL || ''} onChange={(event) => updateActiveProviderSettings({ baseURL: event.target.value })} placeholder={activeProviderOption.defaultBaseURL || t('默认地址')} />
+                  </div>
+                ) : null}
+                {activeProviderSupportsExtraRequestParameters ? (
+                  <div className="settings-row">
+                    <div>
+                      <strong>Extra request parameters (JSON)</strong>
+                      <span>Added to every Chat Completions request. Example: {`{"thinking":{"type":"adaptive"},"service_tier":"priority"}`}. The app keeps model, messages, stream, and tools under its own control.</span>
+                    </div>
+                    <TextArea
+                      className="settings-textarea-control"
+                      fullWidth
+                      placeholder={'{\n  "thinking": { "type": "adaptive" },\n  "temperature": 1,\n  "top_p": 0.95,\n  "max_completion_tokens": 4096,\n  "service_tier": "priority"\n}'}
+                      value={activeProviderSettings.extraRequestParameters || ''}
+                      onChange={(event) => updateActiveProviderSettings({ extraRequestParameters: event.target.value })}
+                    />
                   </div>
                 ) : null}
               </div>
