@@ -4,7 +4,9 @@ import type { ModelMessage } from 'ai';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
+  fallbackRuntimeContinuationSummary,
   mergeRuntimeModelMessageChain,
+  normalizeRuntimeContinuationSummary,
   sanitizeRuntimeContinuationSummary,
   selectRecentRuntimeMessageBlocks,
 } from './runtime-context-compression';
@@ -17,7 +19,9 @@ import {
 
 test('runtime context uses an eighty-five percent trigger and a ten-to-twenty percent compression target', () => {
   assert.equal(runtimeContextWindowTokens(), 256000);
+  assert.equal(runtimeContextWindowTokens({ provider: 'openai-compatible', model: 'glm-5.3' }), 1_000_000);
   assert.equal(runtimeContextCompressionThresholdRatio(), 0.85);
+  assert.equal(runtimeContextCompressionThresholdRatio({ provider: 'openai-compatible', model: 'glm-5.3' }), 0.85);
   assert.equal(runtimeContextCompressionTargetFloorRatio(), 0.1);
   assert.equal(runtimeContextCompressionTargetCeilingRatio(), 0.2);
 });
@@ -126,4 +130,81 @@ test('continuation summaries discard raw AX and DOM-change payloads', () => {
   assert.match(sanitized, /login/);
   assert.match(sanitized, /The login succeeded/);
   assert.doesNotMatch(sanitized, /axTree|\[ax-tree\]|domChanges|button \\"Old\\"|dialog \\"Old\\"/);
+});
+
+test('a prose response cannot replace a structured continuation checkpoint', () => {
+  assert.equal(normalizeRuntimeContinuationSummary({
+    candidate: 'The document is complete, so start the original task again.',
+    goal: 'Create three documents.',
+    previousSummary: JSON.stringify({ completed: ['PPT rendered'], nextStep: 'Inspect page 2.' }),
+    runtimeState: {},
+  }), '');
+});
+
+test('continuation normalization keeps durable completion facts across segments', () => {
+  const normalized = JSON.parse(normalizeRuntimeContinuationSummary({
+    candidate: JSON.stringify({
+      completed: ['DOC QA 22/22'],
+      currentPage: 'PPT preview',
+      confirmedFacts: ['PPT is 94MB'],
+      negativeResults: [],
+      failedAttempts: [],
+      importantEvidence: [],
+      openObservations: [],
+      remaining: ['Inspect PPT pages'],
+      nextStep: 'Inspect the current PPT artifact.',
+    }),
+    goal: 'Create PPT, DOCX, and PDF.',
+    previousSummary: JSON.stringify({
+      completed: ['Wiki research complete'],
+      confirmedFacts: ['Assets downloaded'],
+      nextStep: 'Continue QA.',
+    }),
+    runtimeState: { completed: ['Latest render complete'] },
+  }));
+  assert.deepEqual(normalized.completed, ['Wiki research complete', 'DOC QA 22/22', 'Latest render complete']);
+  assert.deepEqual(normalized.confirmedFacts, ['Assets downloaded', 'PPT is 94MB']);
+  assert.equal(normalized.nextStep, 'Inspect the current PPT artifact.');
+});
+
+test('fallback compression preserves previous progress instead of reducing to the original goal', () => {
+  const fallback = JSON.parse(fallbackRuntimeContinuationSummary({
+    agentStep: 8,
+    goal: 'Create PPT, DOCX, and PDF.',
+    previousSummary: JSON.stringify({
+      completed: ['Wiki research complete', 'DOC rendered'],
+      confirmedFacts: ['DOC QA 22/22'],
+      remaining: ['PPT QA'],
+      nextStep: 'Read the remaining PPT screenshots.',
+    }),
+    recentToolAttempts: '[none]',
+    runtimeState: {},
+    stepIndex: 3,
+  }));
+  assert.deepEqual(fallback.completed, ['Wiki research complete', 'DOC rendered']);
+  assert.deepEqual(fallback.confirmedFacts, ['DOC QA 22/22']);
+  assert.deepEqual(fallback.remaining, ['PPT QA']);
+  assert.equal(fallback.nextStep, 'Read the remaining PPT screenshots.');
+});
+
+test('a runtime continuation gate overrides a model attempt to restart the goal', () => {
+  const normalized = JSON.parse(normalizeRuntimeContinuationSummary({
+    candidate: JSON.stringify({
+      completed: [],
+      currentPage: '',
+      confirmedFacts: [],
+      negativeResults: [],
+      failedAttempts: [],
+      importantEvidence: [],
+      openObservations: [],
+      remaining: ['Research the wiki again'],
+      nextStep: 'Research the wiki again.',
+    }),
+    goal: 'Create PPT, DOCX, and PDF.',
+    previousSummary: JSON.stringify({ completed: ['Wiki research complete'], nextStep: 'Continue QA.' }),
+    runtimeState: { userConstraints: ['Read pages 19-22 of the current DOC artifact.'] },
+  }));
+  assert.equal(normalized.nextStep, 'Read pages 19-22 of the current DOC artifact.');
+  assert.deepEqual(normalized.remaining, ['Read pages 19-22 of the current DOC artifact.']);
+  assert.deepEqual(normalized.completed, ['Wiki research complete']);
 });

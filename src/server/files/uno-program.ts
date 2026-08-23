@@ -206,6 +206,7 @@ export async function generateUnoProgramDocument(input: {
   fileName: string;
   documentType: OfficeDocumentKind;
   assetsPath?: string;
+  requiredSourceAssetName?: string;
   abortSignal?: AbortSignal;
 }): Promise<UnoGeneratedDocument> {
   if (input.abortSignal?.aborted) throw abortReason(input.abortSignal);
@@ -231,7 +232,18 @@ export async function generateUnoProgramDocument(input: {
     if (!input.sourcePath) await writeFile(programPath, sourceCode, 'utf8');
     const report = await runWorker({
       executable: python,
-      args: [worker, '--program', programPath, '--output', outputPath, '--preview', previewPath, '--assets', input.assetsPath || directory, '--document-type', input.documentType, '--profile', profilePath, '--soffice', soffice, '--expected-source-digest', expectedSourceDigest],
+      args: [
+        worker,
+        '--program', programPath,
+        '--output', outputPath,
+        '--preview', previewPath,
+        '--assets', input.assetsPath || directory,
+        '--document-type', input.documentType,
+        '--profile', profilePath,
+        '--soffice', soffice,
+        '--expected-source-digest', expectedSourceDigest,
+        ...(input.requiredSourceAssetName ? ['--required-source-asset', input.requiredSourceAssetName] : []),
+      ],
       libreOfficeProgramDirectory: path.dirname(soffice),
       abortSignal: input.abortSignal,
     });

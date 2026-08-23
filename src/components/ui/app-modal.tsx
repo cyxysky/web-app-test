@@ -90,7 +90,7 @@ function renderModalSections(children: ReactNode): ReactNode {
 }
 
 function modalDialogStyle(size: AppModalSize): CSSProperties | undefined {
-  const base: CSSProperties = { boxSizing: 'border-box', padding: 0 };
+  const base: CSSProperties = { boxSizing: 'border-box', padding: 0, position: 'relative' };
   switch (size) {
     case 'wide':
       return { ...base, maxWidth: 'min(880px, calc(100vw - 32px))' };

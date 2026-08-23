@@ -45,13 +45,19 @@ function normalizedPages(value: unknown, pageCount?: number) {
   return pageCount ? [1] : defaultPreviewPages;
 }
 
-function previewDirectory(buffer: Buffer, extension: string, root = path.join(artifactsRoot(), 'attachment-previews')) {
+function previewDirectory(input: {
+  buffer?: Buffer;
+  cacheKey?: string;
+  extension: string;
+  root?: string;
+}) {
+  if (!input.buffer && !input.cacheKey) throw new Error('Attachment preview requires a source buffer or stable cache key.');
   const digest = createHash('sha256')
-    .update('attachment-visual-v1\0')
-    .update(extension)
-    .update(buffer)
+    .update('attachment-visual-v2\0')
+    .update(input.extension)
+    .update(input.cacheKey || input.buffer!)
     .digest('hex');
-  return path.join(root, digest);
+  return path.join(input.root || path.join(artifactsRoot(), 'attachment-previews'), digest);
 }
 
 function pageImagePath(directory: string, pageNumber: number) {
@@ -254,26 +260,43 @@ async function extractEmbeddedMedia(buffer: Buffer, extension: string, directory
 
 export async function renderBrowserChatAttachmentVisuals(input: {
   absolutePath: string;
-  buffer: Buffer;
+  buffer?: Buffer;
+  cacheKey?: string;
   extension: string;
   name: string;
   pages?: unknown;
   previewRoot?: string;
 }): Promise<BrowserChatAttachmentVisualResult> {
   const extension = input.extension.toLowerCase();
-  const directory = previewDirectory(input.buffer, extension, input.previewRoot);
+  const directory = previewDirectory({
+    buffer: input.buffer,
+    cacheKey: input.cacheKey,
+    extension,
+    root: input.previewRoot,
+  });
+  let sourceBuffer = input.buffer;
+  const getSourceBuffer = async () => {
+    sourceBuffer ||= await readFile(input.absolutePath);
+    return sourceBuffer;
+  };
   try {
-    if (extension === '.pdf') return await renderPdfPages(input.buffer, directory, input.pages, 'pdf');
+    if (extension === '.pdf') {
+      const cached = await existingCache(directory, input.pages);
+      if (cached && cached.renderer === 'pdf') return cached;
+      return await renderPdfPages(await getSourceBuffer(), directory, input.pages, 'pdf');
+    }
     if (officeExtensions.has(extension)) {
+      const cached = await existingCache(directory, input.pages);
+      if (cached && cached.renderer === 'libreoffice-pdf') return cached;
       const pdf = await convertOfficeToPdf(input.absolutePath, extension, directory);
       if (pdf) return await renderPdfPages(pdf, directory, input.pages, 'libreoffice-pdf');
       if (docxExtensions.has(extension)) {
-        return await renderDocxFallback(input.buffer, directory, input.pages, input.name);
+        return await renderDocxFallback(await getSourceBuffer(), directory, input.pages, input.name);
       }
       if (spreadsheetExtensions.has(extension)) {
-        return await renderSpreadsheetFallback(input.buffer, directory, input.pages, input.name);
+        return await renderSpreadsheetFallback(await getSourceBuffer(), directory, input.pages, input.name);
       }
-      const media = await extractEmbeddedMedia(input.buffer, extension, directory);
+      const media = await extractEmbeddedMedia(await getSourceBuffer(), extension, directory);
       return {
         imagePaths: media.imagePaths,
         renderedPages: [],
@@ -285,7 +308,9 @@ export async function renderBrowserChatAttachmentVisuals(input: {
     }
     return { imagePaths: [], renderedPages: [], renderer: 'unavailable' };
   } catch (error) {
-    const media = await extractEmbeddedMedia(input.buffer, extension, directory).catch(() => ({ imagePaths: [], mediaCount: 0 }));
+    const media = await getSourceBuffer()
+      .then((buffer) => extractEmbeddedMedia(buffer, extension, directory))
+      .catch(() => ({ imagePaths: [], mediaCount: 0 }));
     const reason = error instanceof Error ? error.message : String(error);
     return {
       imagePaths: media.imagePaths,

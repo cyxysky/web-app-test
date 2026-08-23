@@ -12,6 +12,19 @@ type RuntimeContinuationState = {
   userConstraints?: unknown;
 };
 
+type RuntimeContinuationSummary = {
+  goal?: unknown;
+  completed?: unknown;
+  currentPage?: unknown;
+  confirmedFacts?: unknown;
+  negativeResults?: unknown;
+  failedAttempts?: unknown;
+  importantEvidence?: unknown;
+  openObservations?: unknown;
+  remaining?: unknown;
+  nextStep?: unknown;
+};
+
 const TRANSIENT_BROWSER_EVIDENCE_KEYS = new Set(['axTree', 'domChanges', 'domSnapshot']);
 
 function modelMessageContainsToolCall(message: ModelMessage) {
@@ -109,6 +122,79 @@ export function sanitizeRuntimeContinuationSummary(value: string) {
   }
 }
 
+function parsedRuntimeContinuationSummary(value: string | undefined) {
+  const sanitized = sanitizeRuntimeContinuationSummary(value || '');
+  if (!sanitized) return undefined;
+  try {
+    const parsed = JSON.parse(sanitized);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as RuntimeContinuationSummary
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function continuationStrings(value: unknown) {
+  return (Array.isArray(value) ? value : [])
+    .map((item) => typeof item === 'string' ? item.trim() : '')
+    .filter(Boolean);
+}
+
+function uniqueContinuationStrings(...values: unknown[]) {
+  return [...new Set(values.flatMap(continuationStrings))];
+}
+
+function continuationText(...values: unknown[]) {
+  return values.find((value): value is string => typeof value === 'string' && Boolean(value.trim()))?.trim() || '';
+}
+
+/**
+ * Canonicalize a model-authored continuation summary and merge durable fields
+ * with the previous segment. A prose answer or malformed JSON is rejected so
+ * it cannot silently replace a useful task-state checkpoint.
+ */
+export function normalizeRuntimeContinuationSummary(input: {
+  candidate: string;
+  goal: string;
+  previousSummary?: string;
+  runtimeState: RuntimeContinuationState;
+}) {
+  const candidate = parsedRuntimeContinuationSummary(input.candidate);
+  if (!candidate || !continuationText(candidate.nextStep)) return '';
+  const previous = parsedRuntimeContinuationSummary(input.previousSummary) || {};
+  const authoritativeDirective = continuationText(...continuationStrings(input.runtimeState.userConstraints));
+  const currentPage = continuationText(
+    input.runtimeState.currentState,
+    input.runtimeState.pageUnderstanding,
+    candidate.currentPage,
+    previous.currentPage,
+  );
+  const nextStep = continuationText(
+    authoritativeDirective,
+    candidate.nextStep,
+    previous.nextStep,
+    input.runtimeState.nextStep,
+    'Continue only the unfinished work recorded in this summary.',
+  );
+  return JSON.stringify({
+    goal: input.goal,
+    completed: uniqueContinuationStrings(previous.completed, candidate.completed, input.runtimeState.completed),
+    currentPage,
+    confirmedFacts: uniqueContinuationStrings(previous.confirmedFacts, candidate.confirmedFacts, input.runtimeState.findings),
+    negativeResults: uniqueContinuationStrings(previous.negativeResults, candidate.negativeResults),
+    failedAttempts: uniqueContinuationStrings(previous.failedAttempts, candidate.failedAttempts, input.runtimeState.blockers),
+    importantEvidence: uniqueContinuationStrings(previous.importantEvidence, candidate.importantEvidence, input.runtimeState.findings),
+    openObservations: uniqueContinuationStrings(previous.openObservations, candidate.openObservations),
+    remaining: authoritativeDirective
+      ? [authoritativeDirective]
+      : continuationStrings(candidate.remaining).length
+        ? continuationStrings(candidate.remaining)
+        : continuationStrings(previous.remaining),
+    nextStep,
+  });
+}
+
 function serializedMessageDelta(modelMessages: unknown) {
   const record = modelMessages && typeof modelMessages === 'object' && !Array.isArray(modelMessages)
     ? modelMessages as Record<string, unknown>
@@ -139,6 +225,8 @@ export function buildRuntimeContinuationSummaryPrompt(input: {
     '- Preserve stable Playwright locator intent and exact structured evidence when it materially affects the next action.',
     '- Preserve current URL/page state, blockers, manual verification state, user constraints, completed searches, empty results, and failed attempts.',
     '- The authoritative runtime state was produced after the latest completed tool call and wins on conflict.',
+    '- Goal is the success criterion, not an instruction to restart. Never repeat completed research, downloads, generation, rendering, or QA. Continue only remaining and nextStep.',
+    '- A later continuation/gate directive is authoritative for the immediate next action and must not be replaced by the original goal.',
     '- Never copy raw screenshots, AX trees, page.domSnapshot() output, domChanges payloads, candidate coordinates, full DOM dumps, long logs, or old tool parameter JSON into the summary. Preserve only the durable fact learned from that transient evidence.',
     '- Write Chinese for user-facing summaries when possible.',
     '',
@@ -163,20 +251,25 @@ export function fallbackRuntimeContinuationSummary(input: {
   runtimeState: RuntimeContinuationState;
   stepIndex: number;
 }) {
+  const previous = parsedRuntimeContinuationSummary(input.previousSummary) || {};
+  const runtimeNextStep = continuationText(input.runtimeState.nextStep);
+  const authoritativeDirective = continuationText(...continuationStrings(input.runtimeState.userConstraints));
+  const previousRemaining = continuationStrings(previous.remaining);
   return JSON.stringify({
     goal: input.goal,
     executorStep: input.stepIndex,
     agentStepBeforeCompression: input.agentStep,
-    previousContinuationSummary: sanitizeRuntimeContinuationSummary(input.previousSummary || '') || undefined,
-    completed: input.runtimeState.completed || [],
-    currentPage: input.runtimeState.currentState || input.runtimeState.pageUnderstanding || '',
-    importantEvidence: input.runtimeState.findings || [],
-    confirmedFacts: input.runtimeState.findings || [],
-    negativeResults: [],
-    failedAttempts: [],
-    openObservations: [],
-    remaining: input.runtimeState.nextStep ? [input.runtimeState.nextStep] : [],
-    nextStep: input.runtimeState.nextStep || 'Continue from the latest live browser state.',
+    completed: uniqueContinuationStrings(previous.completed, input.runtimeState.completed),
+    currentPage: continuationText(input.runtimeState.currentState, input.runtimeState.pageUnderstanding, previous.currentPage),
+    importantEvidence: uniqueContinuationStrings(previous.importantEvidence, input.runtimeState.findings),
+    confirmedFacts: uniqueContinuationStrings(previous.confirmedFacts, input.runtimeState.findings),
+    negativeResults: uniqueContinuationStrings(previous.negativeResults),
+    failedAttempts: uniqueContinuationStrings(previous.failedAttempts, input.runtimeState.blockers),
+    openObservations: uniqueContinuationStrings(previous.openObservations),
+    remaining: authoritativeDirective
+      ? [authoritativeDirective]
+      : previousRemaining.length ? previousRemaining : runtimeNextStep ? [runtimeNextStep] : [],
+    nextStep: continuationText(authoritativeDirective, previous.nextStep, runtimeNextStep, 'Continue only the unfinished work recorded in this summary.'),
     recentToolAttempts: input.recentToolAttempts,
   }, null, 2);
 }

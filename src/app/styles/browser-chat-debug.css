@@ -445,7 +445,7 @@
 }
 
 .browser-chat-log-dialog .browser-chat-log-dialog-header {
-  min-height: 96px;
+  min-height: 72px;
   padding: 16px 24px;
 }
 
@@ -538,6 +538,33 @@
   color: var(--foreground);
 }
 
+.browser-chat-log-load-more {
+  align-items: center;
+  background: var(--panel);
+  border: 0;
+  border-top: 1px solid var(--border);
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12.5px;
+  font-weight: 600;
+  justify-content: center;
+  min-height: 44px;
+  padding: 10px 24px;
+  transition: background 140ms ease, color 140ms ease;
+  width: 100%;
+}
+
+.browser-chat-log-load-more:not(:disabled):hover {
+  background: var(--panel-soft);
+  color: var(--foreground);
+}
+
+.browser-chat-log-load-more:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .browser-chat-log-dialog .ui-modal-close {
   height: 32px;
   min-height: 32px;
@@ -546,7 +573,7 @@
 
 .browser-chat-log-modal-body {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100%;
   min-height: 0;
   overflow: hidden;
@@ -565,8 +592,8 @@
   display: grid;
   gap: 18px;
   grid-template-columns: max-content minmax(220px, 1fr);
-  min-height: 68px;
-  padding: 16px 24px;
+  min-height: 56px;
+  padding: 12px 24px;
 }
 
 .browser-chat-log-filters {
@@ -994,7 +1021,7 @@
   }
 
   .browser-chat-log-dialog .browser-chat-log-dialog-header {
-    min-height: 84px;
+    min-height: 72px;
     padding: 14px 18px;
   }
 

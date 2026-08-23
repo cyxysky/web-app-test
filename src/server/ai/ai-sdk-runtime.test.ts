@@ -1,6 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { aiStreamTimeouts } from './ai-sdk-runtime';
+import { aiRuntimeRequestTimeoutMs, aiStreamTimeouts } from './ai-sdk-runtime';
+
+test('gives Agent Loop model requests a configurable long deadline', () => {
+  const original = process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS;
+  delete process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS;
+  try {
+    assert.equal(aiRuntimeRequestTimeoutMs(), 600_000);
+    process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS = '900000';
+    assert.equal(aiRuntimeRequestTimeoutMs(), 900_000);
+  } finally {
+    if (original === undefined) delete process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS;
+    else process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS = original;
+  }
+});
 
 test('does not let stream timeouts expire while a tool is still allowed to run', () => {
   const original = {

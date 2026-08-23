@@ -114,10 +114,32 @@ export type OfficeDocumentDraft = {
   documentType: OfficeDocumentKind;
   fileName: string;
   intent?: string;
+  /** Create a new file or modify a user-supplied Office document in place. */
+  operation?: 'create' | 'modify';
+  /** Program runtime selected when the workspace is planned. Existing-file modification always uses UNO. */
+  generator?: 'javascript' | 'uno';
+  /** Bound source file for a real existing-document modification workspace. */
+  sourceDocument?: {
+    assetName: string;
+    attachmentId: string;
+    bytes: number;
+    fileName: string;
+    sha256: string;
+  };
   /** Complete Python source run verbatim by the LibreOffice UNO worker. */
   program?: string;
   /** SHA-256 of the workspace draft.py content, used to detect split-brain metadata. */
   sourceDigest?: string;
+  /** Artifact identity of the last published source. A later edit makes this stale. */
+  renderedArtifactId?: string;
+  /** Current published source digest. Kept alongside renderedSourceDigest for legacy metadata compatibility. */
+  renderedDigest?: string;
   renderedFileName?: string;
+  renderedSourceDigest?: string;
+  /** Version-bound, server-recorded complete visual inspection state. */
+  visualQaArtifactId?: string;
+  visualQaDigest?: string;
+  visualQaPageCount?: number;
+  visualQaSeenPages?: number[];
   updatedAt: string;
 };

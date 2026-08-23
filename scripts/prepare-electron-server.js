@@ -24,6 +24,10 @@ copyInto(
   path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
 );
 copyInto(
+  path.join(root, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
+  path.join(serverOutput, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
+);
+copyInto(
   path.join(root, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
   path.join(serverOutput, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
 );

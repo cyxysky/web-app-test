@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '@/server/files/file-format-registry';
 import { generateUnoProgramDocument } from '@/server/files/uno-program';
+import { generateOfficeJsProgramDocument } from '@/server/files/office-js-program';
 import type { OfficeBlock, OfficeCellValue, OfficeDocumentSpec } from '@/server/files/office-document-spec';
 
 export type GeneratedFileCell = OfficeCellValue;
@@ -91,7 +92,14 @@ export function supportedGeneratedFileExtension(fileName: string) {
   return format?.canGenerate ? format.extension : undefined;
 }
 
-export async function generateFileBuffer(input: (GeneratedFileInput | Pick<OfficeDocumentSpec, 'documentType' | 'fileName'>) & { program?: string; programPath?: string; assetsPath?: string; abortSignal?: AbortSignal }): Promise<GeneratedFileOutput> {
+export async function generateFileBuffer(input: (GeneratedFileInput | Pick<OfficeDocumentSpec, 'documentType' | 'fileName'>) & {
+  program?: string;
+  programPath?: string;
+  assetsPath?: string;
+  generator?: 'javascript' | 'uno';
+  requiredSourceAssetName?: string;
+  abortSignal?: AbortSignal;
+}): Promise<GeneratedFileOutput> {
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension) throw new Error('Unsupported output extension. Use a supported text/data format, PDF, Word, Excel, PowerPoint, or OpenDocument extension.');
   if (generatedTextExtensions.has(extension)) {
@@ -101,13 +109,21 @@ export async function generateFileBuffer(input: (GeneratedFileInput | Pick<Offic
     if (!content) throw new Error('Text file generation requires at least one textual block.');
     return { buffer: Buffer.from(`${content}\n`, 'utf8'), extension };
   }
-  if (!input.program?.trim() && !input.programPath) throw new Error('Office document generation requires a Python UNO draft from file action=generate or action=edit.');
+  if (!input.program?.trim() && !input.programPath) throw new Error('Office document generation requires a saved source draft from file action=generate or action=edit.');
   validateOfficeTarget(input, extension);
-  const generated = await generateUnoProgramDocument({
+  const generator = input.generator || 'uno';
+  const generated = generator === 'javascript' ? await generateOfficeJsProgramDocument({
     ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
     fileName: path.basename(input.fileName),
     documentType: input.documentType,
     assetsPath: input.assetsPath,
+    abortSignal: input.abortSignal,
+  }) : await generateUnoProgramDocument({
+    ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
+    fileName: path.basename(input.fileName),
+    documentType: input.documentType,
+    assetsPath: input.assetsPath,
+    requiredSourceAssetName: input.requiredSourceAssetName,
     abortSignal: input.abortSignal,
   });
   return {

@@ -9,8 +9,10 @@ import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 import {
   generateFileBuffer,
+  type GeneratedFileOutput,
 } from './document-artifact-generators';
 import { assertControlledUnoProgram, inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
+import { assertControlledOfficeJsProgram } from '@/server/files/office-js-program';
 import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
@@ -45,6 +47,8 @@ type PlanArtifactInput = {
   fileName?: string | null;
   documentType?: OfficeDocumentKind;
   intent?: string;
+  operation?: 'create' | 'modify';
+  sourceAttachmentId?: string;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
 };
 
@@ -58,16 +62,19 @@ type GenerateUnoProgramInput = {
   abortSignal?: AbortSignal;
 };
 
-export type UnoDraftTextEdit = {
-  oldText: string;
+export type UnoDraftLineEdit = {
+  /** One-based, inclusive source line range from action=read. */
+  startLine: number;
+  endLine: number;
   newText: string;
-  replaceAll?: boolean;
 };
 
 type EditUnoProgramInput = {
   runId?: string;
   documentId?: string;
-  edits?: UnoDraftTextEdit[];
+  /** Optional legacy digest. A single chat owns its draft, so edits use the current source. */
+  baseDigest?: string;
+  edits?: UnoDraftLineEdit[];
   program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
@@ -76,6 +83,8 @@ type EditUnoProgramInput = {
 };
 
 type UnoApiInput = {
+  runId?: string;
+  documentId?: string;
   documentType?: OfficeDocumentKind;
   target?: UnoApiTarget;
   query?: string;
@@ -115,7 +124,10 @@ type ArtifactToolPayload = {
   bytes?: number;
   sourceUrl?: string;
   documentId?: string;
+  generator?: string;
+  operation?: string;
   sourceCharacters?: number;
+  cacheHit?: boolean;
 };
 
 export type FileArtifactToolResult = {
@@ -154,6 +166,69 @@ type DocumentAsset = {
   ref?: string;
 };
 
+const documentExtensions: Record<OfficeDocumentKind, Set<string>> = {
+  presentation: new Set(['.ppt', '.pptx', '.odp']),
+  spreadsheet: new Set(['.xls', '.xlsx', '.ods']),
+  word: new Set(['.doc', '.docx', '.odt']),
+};
+const javascriptOfficeExtensions = new Set(['.docx', '.pptx', '.xlsx', '.pdf']);
+
+function configuredOfficeGenerator(fileName: string, operation: 'create' | 'modify'):
+  OfficeDocumentDraft['generator'] {
+  if (operation === 'modify') return 'uno';
+  const configured = String(process.env.OFFICE_GENERATION_MODE || 'uno').trim().toLowerCase();
+  const extension = path.extname(fileName).toLowerCase();
+  if (configured === 'javascript') {
+    if (!javascriptOfficeExtensions.has(extension)) {
+      throw new Error('JavaScript Office generation supports .pptx, .docx, .xlsx, and PDF converted from the matching Office source. Select UNO mode for legacy Office or OpenDocument output.');
+    }
+    return 'javascript';
+  }
+  if (configured === 'auto' && javascriptOfficeExtensions.has(extension)) return 'javascript';
+  return 'uno';
+}
+
+async function plannedSourceDocument(input: PlanArtifactInput, assets: DocumentAsset[]) {
+  const matchingBindings = (input.attachmentBindings || []).filter((binding) => (
+    input.documentType && documentExtensions[input.documentType].has(path.extname(binding.name).toLowerCase())
+  ));
+  // Never infer an existing-file edit from natural-language intent. A request
+  // can mention "fix" or "revise" while it is still creating a new document.
+  // Modification is an explicit API contract: operation=modify or a selected
+  // sourceAttachmentId.
+  const inferredModify = input.operation === 'modify' || Boolean(input.sourceAttachmentId);
+  if (!inferredModify) return { operation: 'create' as const, sourceDocument: undefined };
+  const binding = input.sourceAttachmentId
+    ? matchingBindings.find((item) => item.ref === input.sourceAttachmentId)
+    : matchingBindings.length === 1 ? matchingBindings[0] : undefined;
+  if (!binding) {
+    const reason = input.sourceAttachmentId
+      ? 'sourceAttachmentId is not a registered Office attachment matching documentType'
+      : matchingBindings.length > 1
+        ? 'multiple matching Office attachments are available; sourceAttachmentId is required'
+        : 'no matching Office attachment is available';
+    throw new Error(`Existing-file modification requires a source Office attachment: ${reason}.`);
+  }
+  const requestedExtension = path.extname(String(input.fileName || '')).toLowerCase();
+  const sourceExtension = path.extname(binding.name).toLowerCase();
+  if (requestedExtension !== sourceExtension) {
+    throw new Error(`Existing-file modification must preserve the source format (${sourceExtension}); requested output uses ${requestedExtension || 'no extension'}. Create a separate documentId for format conversion.`);
+  }
+  const asset = assets.find((item) => item.origin === 'attachment' && item.ref === binding.ref);
+  if (!asset) throw new Error('The selected source attachment could not be mounted into the document workspace.');
+  const buffer = await readFile(binding.path);
+  return {
+    operation: 'modify' as const,
+    sourceDocument: {
+      assetName: asset.assetName,
+      attachmentId: binding.ref,
+      bytes: buffer.byteLength,
+      fileName: binding.name,
+      sha256: createHash('sha256').update(buffer).digest('hex'),
+    },
+  };
+}
+
 function assetFileName(name: string, namespace: string, claimed: Set<string>) {
   const direct = sanitizeFileName(name, 'asset.bin');
   const normalizedNamespace = sanitizeFileName(namespace, 'asset').slice(0, 48);
@@ -177,6 +252,25 @@ async function visibleFiles(directory: string) {
   }
 }
 
+async function visibleFilesRecursive(directory: string, relative = ''): Promise<Array<{ name: string; path: string }>> {
+  try {
+    const entries = await readdir(path.join(directory, relative), { withFileTypes: true });
+    const files: Array<{ name: string; path: string }> = [];
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const childRelative = path.join(relative, entry.name);
+      if (entry.isDirectory()) files.push(...await visibleFilesRecursive(directory, childRelative));
+      else if (entry.isFile()) files.push({
+        name: childRelative.replace(/[\\/]+/g, '-'),
+        path: path.join(directory, childRelative),
+      });
+    }
+    return files;
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Materialize the only local filesystem visible to an Office draft.  This is
  * a per-run, copied asset workspace: uploads, downloads, and final generated
@@ -195,8 +289,11 @@ export async function syncDocumentAssets(
   }
   for (const origin of ['downloads', 'generated'] as const) {
     const directory = artifactDir(runId, origin);
-    for (const entry of await visibleFiles(directory)) {
-      sources.push({ name: entry.name, path: path.join(directory, entry.name), origin: origin === 'downloads' ? 'download' : 'generated' });
+    const files = origin === 'generated'
+      ? await visibleFilesRecursive(directory)
+      : (await visibleFiles(directory)).map((entry) => ({ name: entry.name, path: path.join(directory, entry.name) }));
+    for (const entry of files) {
+      sources.push({ name: entry.name, path: entry.path, origin: origin === 'downloads' ? 'download' : 'generated' });
     }
   }
   const claimed = new Set<string>();
@@ -270,10 +367,13 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
           .map((asset) => typeof asset.assetName === 'string' ? asset.assetName : '')
           .filter(Boolean)
         : [];
-      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with job.asset_path(name).`;
+      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; operation=${payload.operation || 'create'}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with the returned cookbook asset API.`;
     }
-    if (payload.kind === 'uno-program') {
-      return `UNO draft updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}`;
+    if (payload.kind === 'uno-program' || payload.kind === 'office-program') {
+      return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}`;
+    }
+    if (payload.kind === 'uno-draft-validation') {
+      return `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`;
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
@@ -415,8 +515,11 @@ function draftPath(runId: string | undefined, documentId: string) {
   return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.json`);
 }
 
-function draftProgramPath(runId: string | undefined, documentId: string) {
-  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.py`);
+function draftProgramPath(runId: string | undefined, documentId: string, generator: OfficeDocumentDraft['generator'] = 'uno') {
+  return path.join(
+    artifactDir(runId, 'document-drafts'),
+    `${sanitizeFileName(documentId, 'document')}${generator === 'javascript' ? '.mjs' : '.py'}`,
+  );
 }
 
 function draftTransactionPath(runId: string | undefined, documentId: string) {
@@ -537,14 +640,14 @@ async function recoverDraftTransaction(runId: string | undefined, documentId: st
   let sourceMatches = false;
   if (pending.program) {
     try {
-      sourceMatches = sourceDigest(await readFile(draftProgramPath(runId, documentId), 'utf8')) === pending.sourceDigest;
+      sourceMatches = sourceDigest(await readFile(draftProgramPath(runId, documentId, pending.generator), 'utf8')) === pending.sourceDigest;
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
       if (code !== 'ENOENT') throw error;
     }
   } else {
     try {
-      await access(draftProgramPath(runId, documentId));
+      await access(draftProgramPath(runId, documentId, pending.generator));
     } catch (error) {
       const code = error && typeof error === 'object' && 'code' in error ? String((error as { code?: unknown }).code || '') : '';
       if (code === 'ENOENT') sourceMatches = true;
@@ -562,13 +665,16 @@ async function loadDraft(runId: string | undefined, documentId: string) {
   const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft & { revision?: unknown };
   // Migrate metadata written by the retired caller-visible revision protocol.
   delete parsed.revision;
+  parsed.generator ||= 'uno';
+  parsed.operation ||= parsed.sourceDocument ? 'modify' : 'create';
+  parsed.renderedDigest ||= parsed.renderedSourceDigest;
   if (parsed.documentId !== documentId) throw new Error('Document draft identity does not match the requested documentId.');
   if (parsed.program) {
     try {
-      const workspaceProgram = await readFile(draftProgramPath(runId, documentId), 'utf8');
+      const workspaceProgram = await readFile(draftProgramPath(runId, documentId, parsed.generator), 'utf8');
       const workspaceDigest = sourceDigest(workspaceProgram);
       if (parsed.sourceDigest && parsed.sourceDigest !== workspaceDigest) {
-        throw new Error('Workspace draft.py does not match its saved source metadata. Read the draft again or restore it before editing.');
+        throw new Error('Workspace source file does not match its saved source metadata. Read the draft again or restore it before editing.');
       }
       // The file is the executable source of truth; JSON contains metadata only.
       parsed.program = workspaceProgram;
@@ -590,7 +696,7 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   draft.updatedAt = new Date().toISOString();
   draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
   const target = draftPath(runId, draft.documentId);
-  const programTarget = draftProgramPath(runId, draft.documentId);
+  const programTarget = draftProgramPath(runId, draft.documentId, draft.generator);
   const transactionTarget = draftTransactionPath(runId, draft.documentId);
   const transactionCandidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.transaction.json`);
   const programCandidate = path.join(dir, `.${sanitizeFileName(draft.documentId, 'document')}.${randomUUID()}.py`);
@@ -622,54 +728,68 @@ function normalizedDraftSource(source: string) {
   return source.replace(/\r\n?/g, '\n');
 }
 
-function textOccurrenceCount(source: string, search: string) {
-  let count = 0;
-  let offset = 0;
-  while (offset <= source.length - search.length) {
-    const foundAt = source.indexOf(search, offset);
-    if (foundAt < 0) break;
-    count += 1;
-    offset = foundAt + search.length;
-  }
-  return count;
+function draftSourceLineCount(source: string) {
+  const normalized = normalizedDraftSource(source);
+  return (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized).split('\n').length;
 }
 
 /**
- * Apply editor-style, ordered search/replace operations to the one virtual
- * draft.py. A single replacement must be unambiguous; callers can explicitly
- * opt into replacing every occurrence.
+ * Apply Code-Editor-style line replacements. Ranges are one-based and always
+ * refer to the same source returned by action=read, so a batch cannot shift
+ * the location of a later edit. Replacing from the last line upward keeps
+ * those original coordinates stable.
  */
-export function applyUnoDraftTextEdits(source: string, edits: UnoDraftTextEdit[]) {
+export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]) {
   if (!Array.isArray(edits) || !edits.length) {
-    throw new Error('file action=edit requires at least one text edit.');
+    throw new Error('file action=edit requires at least one line edit.');
   }
-  let output = normalizedDraftSource(source);
-  edits.forEach((edit, editIndex) => {
-    const oldText = normalizedDraftSource(typeof edit?.oldText === 'string' ? edit.oldText : '');
-    const newText = normalizedDraftSource(typeof edit?.newText === 'string' ? edit.newText : '');
-    if (!oldText) throw new Error(`draft.py edit ${editIndex + 1} requires non-empty oldText.`);
-    const occurrences = textOccurrenceCount(output, oldText);
-    if (!occurrences) {
-      throw new Error(`draft.py edit ${editIndex + 1} could not find oldText in the current source. Read draft.py again and copy a larger exact source region.`);
+  const normalized = normalizedDraftSource(source);
+  const hasFinalNewline = normalized.endsWith('\n');
+  const lines = hasFinalNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
+  const lineCount = lines.length;
+  const ordered = edits.map((edit, editIndex) => {
+    const startLine = Number(edit?.startLine);
+    const endLine = Number(edit?.endLine);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
+      throw new Error(`source edit ${editIndex + 1} requires integer startLine and endLine from action=read.`);
     }
-    if (occurrences > 1 && edit.replaceAll !== true) {
-      throw new Error(`draft.py edit ${editIndex + 1} matched ${occurrences} locations. Include more surrounding context or set replaceAll=true intentionally.`);
+    if (startLine < 1 || endLine < startLine || endLine > lineCount) {
+      throw new Error(`source edit ${editIndex + 1} range ${startLine}-${endLine} is outside the current 1-${lineCount} source lines. Read the draft again.`);
     }
-    if (edit.replaceAll === true) output = output.split(oldText).join(newText);
-    else {
-      const foundAt = output.indexOf(oldText);
-      output = `${output.slice(0, foundAt)}${newText}${output.slice(foundAt + oldText.length)}`;
+    if (typeof edit.newText !== 'string') {
+      throw new Error(`source edit ${editIndex + 1} requires string newText.`);
     }
+    return { ...edit, startLine, endLine, editIndex };
   });
-  return output;
+  const ascending = [...ordered].sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine);
+  for (let index = 1; index < ascending.length; index += 1) {
+    if (ascending[index].startLine <= ascending[index - 1].endLine) {
+      throw new Error(`source edits ${ascending[index - 1].editIndex + 1} and ${ascending[index].editIndex + 1} overlap. Combine them into one line range.`);
+    }
+  }
+  for (const edit of ordered.sort((left, right) => right.startLine - left.startLine)) {
+    const replacement = normalizedDraftSource(edit.newText);
+    const replacementLines = replacement === '' ? [] : replacement.split('\n');
+    lines.splice(edit.startLine - 1, edit.endLine - edit.startLine + 1, ...replacementLines);
+  }
+  return `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`;
+}
+
+function numberedDraftSource(source: string) {
+  const normalized = normalizedDraftSource(source);
+  const lines = (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized)
+    .split('\n');
+  return lines
+    .map((line, index) => `${String(index + 1).padStart(5, ' ')} | ${line}`)
+    .join('\n');
 }
 
 async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserActionResult> {
   try {
     const documentId = String(input.documentId || '').trim();
-    if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading a UNO draft.' };
+    if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading an Office source draft.' };
     const draft = await loadDraft(input.runId, documentId);
-    if (!draft.program) return { ok: false, actual: `UNO draft ${documentId} has no program yet; call action=generate first.` };
+    if (!draft.program) return { ok: false, actual: `Office draft ${documentId} has no source yet; call action=generate first.` };
     return {
       ok: true,
       actual: JSON.stringify({
@@ -677,17 +797,37 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
         documentId: draft.documentId,
         documentType: draft.documentType,
         fileName: draft.fileName,
+        operation: draft.operation || 'create',
+        generator: draft.generator || 'uno',
+        sourceFileName: path.basename(draftProgramPath(input.runId, documentId, draft.generator)),
+        sourceDocument: draft.sourceDocument ? {
+          attachmentId: draft.sourceDocument.attachmentId,
+          assetName: draft.sourceDocument.assetName,
+          fileName: draft.sourceDocument.fileName,
+        } : undefined,
         sourceDigest: sourceDigest(draft.program),
-        program: draft.program,
+        lineCount: draftSourceLineCount(draft.program),
+        program: numberedDraftSource(draft.program),
       }),
     };
   } catch (error) {
-    return { ok: false, actual: `UNO draft read failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office draft read failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
 export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult> {
   try {
+    const documentId = String(input.documentId || '').trim();
+    if (!documentId) {
+      return { ok: false, actual: 'file action=unoApi requires the documentId returned by action=plan, so the selected generator can be verified.' };
+    }
+    const draft = await loadDraft(input.runId, documentId);
+    if ((draft.generator || 'uno') === 'javascript') {
+      return {
+        ok: false,
+        actual: `Document ${documentId} uses JavaScript generation. UNO API guidance is unavailable for this draft; call action=jsApi for ${draft.documentType} instead.`,
+      };
+    }
     if (!input.documentType || !input.target) return { ok: false, actual: 'file action=unoApi requires documentType and target.' };
     return {
       ok: true,
@@ -704,6 +844,200 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
   }
 }
 
+export function getOfficeJsApi(input: Pick<UnoApiInput, 'documentType'>): BrowserActionResult {
+  if (!input.documentType) return { ok: false, actual: 'file action=jsApi requires documentType.' };
+  const examples = {
+    presentation: `export async function createDocument(job) {
+  const pptx = new job.PptxGenJS();
+  pptx.layout = 'LAYOUT_WIDE';
+  const slide = pptx.addSlide();
+  slide.addText('Title', { x: 0.7, y: 0.5, w: 12, h: 0.6, fontSize: 28, bold: true, margin: 0, breakLine: false, fit: 'shrink' });
+  await pptx.writeFile({ fileName: job.outputPath });
+}`,
+    word: `export async function createDocument(job) {
+  const { Document, Packer, Paragraph, TextRun } = job.docx;
+  const document = new Document({ sections: [{ children: [new Paragraph({ children: [new TextRun({ text: 'Title', bold: true, size: 40 })] })] }] });
+  await job.writeOutput(await Packer.toBuffer(document));
+}`,
+    spreadsheet: `export async function createDocument(job) {
+  const workbook = new job.ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Summary');
+  sheet.addRow(['Item', 'Value']);
+  sheet.addRow(['Revenue', 1200]);
+  await workbook.xlsx.writeFile(job.outputPath);
+}`,
+  } as const;
+  return {
+    ok: true,
+    actual: JSON.stringify({
+      kind: 'office-js-api',
+      documentType: input.documentType,
+      libraries: {
+        presentation: 'pptxgenjs via job.PptxGenJS',
+        word: 'docx via job.docx',
+        spreadsheet: 'exceljs via job.ExcelJS',
+      },
+      rules: [
+        'Export exactly one async or synchronous createDocument(job) function.',
+        'The initial action=generate may be a small, runnable skeleton; do not try to author the entire document in one call. Add pages, sections, assets, and layout incrementally with repeated action=edit line-range changes, validating after each bounded change.',
+        'Write the final editable Office file to job.outputPath, or use await job.writeOutput(buffer) for docx buffers.',
+        'Use await job.assetPath(exactName) and await job.listAssets() for conversation assets.',
+        'Do not fetch remote URLs from the draft; download assets with the file tool first.',
+        'JavaScript mode creates PPTX, DOCX, or XLSX directly. A .pdf target is supported by creating the matching Office source for documentType and converting it with local LibreOffice.',
+        'For PDF, still write to job.outputPath exactly as shown; its temporary extension is already the correct .pptx, .docx, or .xlsx source format.',
+        'Existing-file modification remains UNO-based.',
+      ],
+      completeDocument: examples[input.documentType],
+    }),
+  };
+}
+
+type ValidatedDraftCandidate = {
+  assets: DocumentAsset[];
+  cacheHit: boolean;
+  generated: GeneratedFileOutput;
+  previewPath?: string;
+};
+
+function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
+  const digest = sourceDigest(draft.program || '');
+  const base = path.join(
+    artifactDir(runId, 'document-drafts'),
+    `.${sanitizeFileName(draft.documentId, 'document')}.${digest}.validation`,
+  );
+  return {
+    artifactPath: `${base}${extension}`,
+    metadataPath: `${base}.json`,
+    previewPath: `${base}.preview.pdf`,
+  };
+}
+
+function documentAssetsFingerprint(assets: DocumentAsset[]) {
+  return createHash('sha256').update(JSON.stringify(assets.map((asset) => ({
+    assetName: asset.assetName,
+    bytes: asset.bytes,
+    origin: asset.origin,
+    ref: asset.ref,
+  }))), 'utf8').digest('hex');
+}
+
+async function prepareValidatedDraft(input: {
+  runId?: string;
+  draft: OfficeDocumentDraft;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
+}): Promise<ValidatedDraftCandidate> {
+  if (!input.draft.program) throw new Error(`Office draft ${input.draft.documentId} has no source yet; call action=generate first.`);
+  // Save first: a failing program remains editable just like it would in a
+  // normal code editor, while the generated candidate remains unpublished.
+  await saveDraft(input.runId, input.draft);
+  const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+  const assetFingerprint = documentAssetsFingerprint(assets);
+  const extension = path.extname(input.draft.fileName).toLowerCase();
+  const cache = validationCachePaths(input.runId, input.draft, extension);
+  try {
+    const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as { assetFingerprint?: string };
+    if (metadata.assetFingerprint === assetFingerprint) {
+      const buffer = await readFile(cache.artifactPath);
+      const previewPdf = await readFile(cache.previewPath).catch(() => undefined);
+      return {
+        assets,
+        cacheHit: true,
+        generated: { buffer, extension: extension as GeneratedFileOutput['extension'], previewPdf },
+        previewPath: previewPdf ? cache.previewPath : undefined,
+      };
+    }
+  } catch {
+    // A missing or interrupted cache is not a document failure; regenerate it.
+  }
+  const generated = await generateFileBuffer({
+    ...input.draft,
+    programPath: draftProgramPath(input.runId, input.draft.documentId, input.draft.generator),
+    assetsPath: artifactDir(input.runId, 'document-assets'),
+    generator: input.draft.generator,
+    requiredSourceAssetName: input.draft.sourceDocument?.assetName,
+    abortSignal: input.abortSignal,
+  });
+  await writeFile(cache.artifactPath, generated.buffer);
+  if (generated.previewPdf) await writeFile(cache.previewPath, generated.previewPdf);
+  else await unlink(cache.previewPath).catch(() => undefined);
+  await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint }), 'utf8');
+  return { assets, cacheHit: false, generated, previewPath: generated.previewPdf ? cache.previewPath : undefined };
+}
+
+async function validateDraft(input: {
+  runId?: string;
+  draft: OfficeDocumentDraft;
+  includeVisualVerification?: boolean;
+  documentChanged?: boolean;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
+}): Promise<BrowserActionResult> {
+  try {
+    const candidate = await prepareValidatedDraft(input);
+    const needsOfficePreview = input.includeVisualVerification && [
+      '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
+    ].includes(candidate.generated.extension);
+    if (needsOfficePreview && (!candidate.generated.previewPdf || !candidate.previewPath)) {
+      throw new Error('LibreOffice UNO worker did not produce a PDF preview for draft validation.');
+    }
+    const visualVerification = needsOfficePreview
+      ? await renderBrowserChatAttachmentVisuals({
+          absolutePath: candidate.previewPath!,
+          buffer: candidate.generated.previewPdf!,
+          extension: '.pdf',
+          name: input.draft.fileName,
+          previewRoot: artifactDir(input.runId, 'attachment-previews'),
+        })
+      : undefined;
+    if (needsOfficePreview && (!visualVerification?.imagePaths.length || visualVerification.renderer !== 'pdf')) {
+      throw new Error(`visual quality gate failed: ${visualVerification?.warning || 'LibreOffice produced no page previews'}`);
+    }
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        kind: 'uno-draft-validation',
+        documentId: input.draft.documentId,
+        fileName: input.draft.fileName,
+        generator: input.draft.generator || 'uno',
+        sourceDigest: sourceDigest(input.draft.program || ''),
+        sourceCharacters: input.draft.program?.length || 0,
+        documentChanged: input.documentChanged || false,
+        cacheHit: candidate.cacheHit,
+        generationDiagnostics: candidate.generated.diagnostics,
+        qualityGate: {
+          structural: true,
+          visual: visualVerification ? {
+            previewGenerated: visualVerification.imagePaths.length > 0,
+            modelReviewRequired: true,
+            reviewedPages: visualVerification.renderedPages,
+          } : { status: 'not-performed' },
+        },
+      }),
+      referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
+    };
+  } catch (error) {
+    const source = input.draft.program || '';
+    return {
+      ok: false,
+      actual: JSON.stringify({
+        kind: 'uno-draft-validation',
+        documentId: input.draft.documentId,
+        fileName: input.draft.fileName,
+        generator: input.draft.generator || 'uno',
+        changed: input.documentChanged || false,
+        saved: true,
+        sourceDigest: sourceDigest(source),
+        sourceCharacters: source.length,
+        lineCount: draftSourceLineCount(source),
+        validation: 'failed',
+        requiredNextAction: 'read',
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    };
+  }
+}
+
 async function renderDraft(input: {
   runId?: string;
   draft: OfficeDocumentDraft;
@@ -712,47 +1046,28 @@ async function renderDraft(input: {
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
 }): Promise<BrowserActionResult> {
-  let verificationPath: string | undefined;
-  let previewPath: string | undefined;
+  let publishCandidatePath: string | undefined;
   try {
-    if (!input.draft.program) throw new Error(`UNO draft ${input.draft.documentId} has no program yet; call action=generate first.`);
-    // Also migrates legacy JSON-only drafts before the worker is given its real
-    // workspace path. This never changes the source.
-    await saveDraft(input.runId, input.draft);
+    const candidate = await prepareValidatedDraft(input);
+    const digest = sourceDigest(input.draft.program || '');
     const requestedName = sanitizeFileName(input.draft.fileName, `document-${Date.now()}.pdf`);
-    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
-    const generated = await generateFileBuffer({
-      ...input.draft,
-      programPath: draftProgramPath(input.runId, input.draft.documentId),
-      // The worker sees only the materialized per-run asset workspace. This
-      // includes every registered upload plus previous downloads and final
-      // generated artifacts, never an arbitrary host path.
-      assetsPath: artifactDir(input.runId, 'document-assets'),
-      abortSignal: input.abortSignal,
-    });
-    const dir = artifactDir(input.runId, 'generated');
+    const dir = path.join(
+      artifactDir(input.runId, 'generated'),
+      sanitizeFileName(input.draft.documentId, 'document'),
+      digest,
+    );
     await mkdir(dir, { recursive: true });
-    const existingRenderedName = input.draft.renderedFileName
-      ? sanitizeFileName(input.draft.renderedFileName, requestedName)
-      : undefined;
-    const target = existingRenderedName
-      ? { fileName: existingRenderedName, filePath: path.join(dir, existingRenderedName) }
-      : await uniqueArtifactPath(dir, requestedName);
+    const target = { fileName: requestedName, filePath: path.join(dir, requestedName) };
     const needsOfficePreview = input.includeVisualVerification && [
       '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
-    ].includes(generated.extension);
-    verificationPath = path.join(dir, `.render-${randomUUID()}${generated.extension}`);
-    await writeFile(verificationPath, generated.buffer, { flag: 'wx' });
-
-    previewPath = path.join(dir, `.preview-${randomUUID()}.pdf`);
-    if (needsOfficePreview && !generated.previewPdf) {
+    ].includes(candidate.generated.extension);
+    if (needsOfficePreview && (!candidate.generated.previewPdf || !candidate.previewPath)) {
       throw new Error('LibreOffice UNO worker did not produce a PDF preview for visual verification.');
     }
-    if (generated.previewPdf) await writeFile(previewPath, generated.previewPdf, { flag: 'wx' });
     const visualVerification = needsOfficePreview
       ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: previewPath,
-          buffer: generated.previewPdf!,
+          absolutePath: candidate.previewPath!,
+          buffer: candidate.generated.previewPdf!,
           extension: '.pdf',
           name: target.fileName,
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
@@ -764,31 +1079,44 @@ async function renderDraft(input: {
       throw new Error(`visual quality gate failed: ${visualVerification?.warning || 'LibreOffice produced no page previews'}`);
     }
 
-    // The candidate program and binary stay invisible until every generation,
-    // reload, and optional preview gate has passed.
-    await rename(verificationPath, target.filePath);
-    verificationPath = undefined;
+    // Only action=render publishes the already-validated candidate. Keep the
+    // previous artifact intact until the replacement binary is fully written.
+    publishCandidatePath = path.join(dir, `.render-${randomUUID()}${candidate.generated.extension}`);
+    await writeFile(publishCandidatePath, candidate.generated.buffer, { flag: 'wx' });
+    await rename(publishCandidatePath, target.filePath);
+    publishCandidatePath = undefined;
+    const artifact = artifactResultPayload({
+      kind: 'generated',
+      fileName: target.fileName,
+      filePath: target.filePath,
+      bytes: candidate.generated.buffer.byteLength,
+    });
+    input.draft.renderedArtifactId = artifact.artifactId;
     input.draft.renderedFileName = target.fileName;
+    input.draft.renderedSourceDigest = digest;
+    input.draft.renderedDigest = digest;
+    input.draft.visualQaArtifactId = undefined;
+    input.draft.visualQaDigest = undefined;
+    input.draft.visualQaPageCount = undefined;
+    input.draft.visualQaSeenPages = [];
     await saveDraft(input.runId, input.draft);
 
     return {
       ok: true,
       actual: JSON.stringify({
-        ...artifactResultPayload({
-          kind: 'generated',
-          fileName: target.fileName,
-          filePath: target.filePath,
-          bytes: generated.buffer.byteLength,
-        }),
+        ...artifact,
         documentId: input.draft.documentId,
+        sourceDigest: digest,
+        renderedDigest: digest,
         documentChanged: input.documentChanged || false,
-        availableAssets: assets.map((asset) => ({
+        cacheHit: candidate.cacheHit,
+        availableAssets: candidate.assets.map((asset) => ({
           assetName: asset.assetName,
           bytes: asset.bytes,
           origin: asset.origin,
           ref: asset.ref,
         })),
-        generationDiagnostics: generated.diagnostics,
+        generationDiagnostics: candidate.generated.diagnostics,
         qualityGate: {
           structural: true,
           visual: visualVerification ? {
@@ -806,6 +1134,8 @@ async function renderDraft(input: {
           renderedPages: visualVerification.renderedPages,
           renderer: visualVerification.renderer,
           warning: visualVerification.warning,
+          gateStatus: 'pending-model-review',
+          requiredCondition: 'visualQaDigest === renderedDigest and every indexed page has been read',
         } : {
           status: 'not-performed',
           reason: 'The selected model does not accept image input or the generated format has no page renderer; no visual conclusion was made.',
@@ -816,8 +1146,7 @@ async function renderDraft(input: {
   } catch (error) {
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
-    if (verificationPath) await unlink(verificationPath).catch(() => undefined);
-    if (previewPath) await unlink(previewPath).catch(() => undefined);
+    if (publishCandidatePath) await unlink(publishCandidatePath).catch(() => undefined);
   }
 }
 
@@ -833,6 +1162,9 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
     if (!String(input.fileName || '').trim()) return { ok: false, actual: 'file action=plan requires fileName.' };
     if (!input.documentType) return { ok: false, actual: 'file action=plan requires documentType.' };
     const requestedFileName = sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`);
+    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+    const sourcePlan = await plannedSourceDocument(input, assets);
+    const generator = configuredOfficeGenerator(requestedFileName, sourcePlan.operation);
     try {
       const existing = await loadDraft(input.runId, documentId);
       if (existing.documentType !== input.documentType) {
@@ -844,6 +1176,9 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       if (!existing.program && !existing.renderedFileName) {
         existing.fileName = requestedFileName;
         existing.intent = input.intent ?? existing.intent;
+        existing.operation = sourcePlan.operation;
+        existing.generator = generator;
+        existing.sourceDocument = sourcePlan.sourceDocument;
         await saveDraft(input.runId, existing);
       }
       return {
@@ -853,6 +1188,10 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
           documentId: existing.documentId,
           fileName: existing.fileName,
           documentType: existing.documentType,
+          operation: existing.operation || 'create',
+          generator: existing.generator || 'uno',
+          sourceDocument: existing.sourceDocument,
+          sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
           sourceCharacters: existing.program?.length || 0,
           reused: true,
         }),
@@ -870,10 +1209,26 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       documentType: input.documentType,
       fileName: requestedFileName,
       intent: input.intent,
+      operation: sourcePlan.operation,
+      generator,
+      sourceDocument: sourcePlan.sourceDocument,
       updatedAt: now,
     };
     await saveDraft(input.runId, draft);
-    return { ok: true, actual: JSON.stringify({ kind: 'document-plan', documentId: draft.documentId, fileName: draft.fileName, documentType: draft.documentType, sourceCharacters: 0 }) };
+    return { ok: true, actual: JSON.stringify({
+      kind: 'document-plan',
+      documentId: draft.documentId,
+      fileName: draft.fileName,
+      documentType: draft.documentType,
+      operation: draft.operation,
+      generator: draft.generator,
+      sourceDocument: draft.sourceDocument,
+      sourceFileName: path.basename(draftProgramPath(input.runId, draft.documentId, draft.generator)),
+      sourceCharacters: 0,
+      instruction: draft.operation === 'modify'
+        ? `Open the existing file with job.open_document(${JSON.stringify(draft.sourceDocument?.assetName)}), edit that component in place, and save it to job.output_url. Do not recreate the document.`
+        : undefined,
+    }) };
   } catch (error) {
     return { ok: false, actual: `file planning failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -884,22 +1239,24 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     const documentId = String(input.documentId || '').trim();
     if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
     const program = String(input.program || '').trim();
-    if (!program) return { ok: false, actual: 'file action=generate requires a complete Python UNO draft in program.' };
-    assertControlledUnoProgram(program);
+    if (!program) return { ok: false, actual: 'file action=generate requires a runnable source draft in program; start with a small validated skeleton, then add the document through action=edit.' };
     const persistedDraft = await loadDraft(input.runId, documentId);
+    if ((persistedDraft.generator || 'uno') === 'javascript') assertControlledOfficeJsProgram(program);
+    else assertControlledUnoProgram(program);
     if (persistedDraft.program) {
       return {
         ok: false,
-        actual: `UNO draft ${documentId} already has source. Do not send another complete program. Use action=read only when the current source is unknown, then action=edit with targeted edits=[{oldText,newText,replaceAll?}]. The edit is saved to draft.py before it is rendered.`,
+        actual: `Office draft ${documentId} already has source. Do not send another complete program. Use action=read only when the current source is unknown, then action=edit with line-range edits=[{startLine,endLine,newText}]. The edit is saved and validated before action=render publishes it.`,
       };
     }
     const draft = structuredClone(persistedDraft);
     draft.program = program;
     await saveDraft(input.runId, draft);
-    if (input.render !== false) return renderDraft({ ...input, draft, documentChanged: true });
-    return { ok: true, actual: JSON.stringify({ kind: 'uno-program', documentId, fileName: draft.fileName, sourceCharacters: program.length }) };
+    // Initial authoring validates the saved draft but never publishes a file.
+    if (input.render !== false) return validateDraft({ ...input, draft, documentChanged: true });
+    return { ok: true, actual: JSON.stringify({ kind: 'office-program', documentId, generator: draft.generator || 'uno', fileName: draft.fileName, sourceCharacters: program.length }) };
   } catch (error) {
-    return { ok: false, actual: `UNO program generation failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -910,26 +1267,204 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     if (typeof input.program === 'string' && input.program.trim()) {
       return {
         ok: false,
-        actual: 'file action=edit does not accept a complete program replacement. Read the current draft.py when needed and send only targeted edits=[{oldText,newText,replaceAll?}].',
+        actual: 'file action=edit does not accept a complete source replacement. Read the current line-numbered draft when needed and send edits=[{startLine,endLine,newText}].',
       };
     }
     if (!Array.isArray(input.edits) || !input.edits.length) {
-      return { ok: false, actual: 'file action=edit requires targeted edits=[{oldText,newText,replaceAll?}].' };
+      return { ok: false, actual: 'file action=edit requires line-range edits=[{startLine,endLine,newText}].' };
     }
     const persistedDraft = await loadDraft(input.runId, documentId);
-    if (!persistedDraft.program) return { ok: false, actual: `UNO draft ${documentId} has no program yet; call action=generate first.` };
+    if (!persistedDraft.program) return { ok: false, actual: `Office draft ${documentId} has no program yet; call action=generate first.` };
+    const currentDigest = sourceDigest(persistedDraft.program);
     const draft = structuredClone(persistedDraft);
-    draft.program = applyUnoDraftTextEdits(persistedDraft.program, input.edits);
+    draft.program = applyUnoDraftLineEdits(persistedDraft.program, input.edits);
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
-      return { ok: false, actual: 'file action=edit made no changes to draft.py.' };
+      return {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'uno-draft-edit',
+          documentId,
+          fileName: draft.fileName,
+          changed: false,
+          saved: false,
+          sourceCharacters: draft.program.length,
+          sourceDigest: currentDigest,
+          lineCount: draftSourceLineCount(draft.program),
+          validation: 'unchanged',
+        }),
+      };
     }
-    assertControlledUnoProgram(draft.program);
+    if ((draft.generator || 'uno') === 'javascript') assertControlledOfficeJsProgram(draft.program);
+    else assertControlledUnoProgram(draft.program);
     await saveDraft(input.runId, draft);
-    if (input.render !== false) return renderDraft({ ...input, draft, documentChanged: true });
-    return { ok: true, actual: JSON.stringify({ kind: 'uno-program', documentId, fileName: draft.fileName, sourceCharacters: draft.program.length, sourceDigest: sourceDigest(draft.program) }) };
+    // Editing behaves like a code editor: save, execute and report errors,
+    // but reserve the user-visible artifact for explicit action=render.
+    if (input.render !== false) return validateDraft({ ...input, draft, documentChanged: true });
+    return { ok: true, actual: JSON.stringify({
+      kind: 'office-program',
+      generator: draft.generator || 'uno',
+      documentId,
+      fileName: draft.fileName,
+      changed: true,
+      saved: true,
+      sourceCharacters: draft.program.length,
+      sourceDigest: sourceDigest(draft.program),
+      lineCount: draftSourceLineCount(draft.program),
+    }) };
   } catch (error) {
-    return { ok: false, actual: `UNO draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+export async function verifyCurrentUnoRenderedArtifact(input: {
+  runId?: string;
+  artifactId: string;
+}): Promise<BrowserActionResult> {
+  try {
+    const normalized = String(input.artifactId || '').replace(/\\/g, '/').replace(/^\/+/, '');
+    const segments = normalized.split('/').filter(Boolean);
+    const generatedIndex = segments.indexOf('generated');
+    // Downloads, template fills, and legacy flat generated artifacts do not
+    // carry a UNO source version in their Artifact ID.
+    if (generatedIndex < 0 || segments.length < generatedIndex + 4) return { ok: true, actual: 'unversioned-artifact' };
+    const documentId = segments[generatedIndex + 1];
+    const renderedDigest = segments[generatedIndex + 2];
+    if (!DOCUMENT_ID_PATTERN.test(documentId) || !/^[a-f0-9]{64}$/i.test(renderedDigest)) {
+      return { ok: true, actual: 'unversioned-artifact' };
+    }
+    const draft = await loadDraft(input.runId, documentId);
+    const currentDigest = sourceDigest(draft.program || '');
+    if (currentDigest !== renderedDigest || draft.renderedArtifactId !== normalized) {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'stale-file-visual-artifact',
+          documentId,
+          artifactId: normalized,
+          renderedSourceDigest: renderedDigest,
+          currentSourceDigest: currentDigest,
+          requiredNextAction: 'render',
+          error: 'This artifact does not represent the current source draft. Render the current documentId and use the new Artifact ID.',
+        }),
+      };
+    }
+    return { ok: true, actual: JSON.stringify({ kind: 'current-file-visual-artifact', documentId, sourceDigest: currentDigest }) };
+  } catch (error) {
+    return { ok: false, actual: `fileVisual version check failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+function versionedRenderedArtifact(artifactId: string) {
+  const normalized = String(artifactId || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  const segments = normalized.split('/').filter(Boolean);
+  const generatedIndex = segments.indexOf('generated');
+  if (generatedIndex < 0 || segments.length < generatedIndex + 4) return undefined;
+  const documentId = segments[generatedIndex + 1];
+  const renderedDigest = segments[generatedIndex + 2];
+  if (!DOCUMENT_ID_PATTERN.test(documentId) || !/^[a-f0-9]{64}$/i.test(renderedDigest)) return undefined;
+  return { artifactId: normalized, documentId, renderedDigest };
+}
+
+export async function recordOfficeVisualQaProgress(input: {
+  runId?: string;
+  artifactId: string;
+  action: 'index' | 'read';
+  result: BrowserActionResult;
+}): Promise<BrowserActionResult> {
+  if (!input.result.ok) return input.result;
+  const identity = versionedRenderedArtifact(input.artifactId);
+  if (!identity) return input.result;
+  try {
+    const payload = JSON.parse(String(input.result.actual || '')) as {
+      kind?: string;
+      screenshotCount?: number;
+      screenshots?: Array<{ pageNumber?: number }>;
+    };
+    return await withDraftLock(input.runId, identity.documentId, async () => {
+      const draft = await loadDraft(input.runId, identity.documentId);
+      if (draft.renderedArtifactId !== identity.artifactId || (draft.renderedDigest || draft.renderedSourceDigest) !== identity.renderedDigest) {
+        return { ok: false, actual: 'fileVisual QA progress rejected because the rendered artifact is no longer current.' };
+      }
+      if (draft.visualQaArtifactId !== identity.artifactId) {
+        draft.visualQaArtifactId = identity.artifactId;
+        draft.visualQaDigest = undefined;
+        draft.visualQaPageCount = undefined;
+        draft.visualQaSeenPages = [];
+      }
+      const screenshotCount = Number(payload.screenshotCount);
+      if (Number.isSafeInteger(screenshotCount) && screenshotCount > 0) draft.visualQaPageCount = screenshotCount;
+      if (input.action === 'read' && payload.kind === 'file-visual-read') {
+        const seen = new Set(draft.visualQaSeenPages || []);
+        for (const screenshot of payload.screenshots || []) {
+          const page = Number(screenshot.pageNumber);
+          if (Number.isSafeInteger(page) && page > 0 && (!draft.visualQaPageCount || page <= draft.visualQaPageCount)) seen.add(page);
+        }
+        draft.visualQaSeenPages = [...seen].sort((left, right) => left - right);
+      }
+      const pageCount = draft.visualQaPageCount || 0;
+      const completeCoverage = pageCount > 0
+        && Array.from({ length: pageCount }, (_, index) => index + 1).every((page) => draft.visualQaSeenPages?.includes(page));
+      draft.visualQaDigest = completeCoverage ? identity.renderedDigest : undefined;
+      await saveDraft(input.runId, draft);
+      return {
+        ...input.result,
+        actual: JSON.stringify({
+          ...payload,
+          visualQa: {
+            artifactId: identity.artifactId,
+            renderedDigest: identity.renderedDigest,
+            visualQaDigest: draft.visualQaDigest || null,
+            pageCount,
+            seenPageCount: draft.visualQaSeenPages?.length || 0,
+            seenPages: draft.visualQaSeenPages || [],
+            complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage,
+          },
+        }),
+      };
+    });
+  } catch (error) {
+    return { ok: false, actual: `fileVisual QA state update failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+export async function pendingOfficeVisualQa(runId?: string, artifactIds?: ReadonlySet<string>) {
+  const directory = artifactDir(runId, 'document-drafts');
+  const entries = await visibleFiles(directory);
+  const pending: Array<{
+    documentId: string;
+    artifactId: string;
+    renderedDigest: string;
+    visualQaDigest?: string;
+    pageCount: number;
+    seenPageCount: number;
+  }> = [];
+  for (const entry of entries) {
+    if (!entry.name.endsWith('.json') || entry.name.endsWith('.transaction.json')) continue;
+    try {
+      const draft = JSON.parse(await readFile(path.join(directory, entry.name), 'utf8')) as OfficeDocumentDraft;
+      const renderedDigest = draft.renderedDigest || draft.renderedSourceDigest;
+      if (!draft.renderedArtifactId || !renderedDigest) continue;
+      if (artifactIds && !artifactIds.has(draft.renderedArtifactId)) continue;
+      const pageCount = draft.visualQaPageCount || 0;
+      const seen = new Set(draft.visualQaSeenPages || []);
+      const completeCoverage = pageCount > 0 && Array.from({ length: pageCount }, (_, index) => seen.has(index + 1));
+      if (draft.visualQaArtifactId !== draft.renderedArtifactId
+        || draft.visualQaDigest !== renderedDigest
+        || !completeCoverage) {
+        pending.push({
+          documentId: draft.documentId,
+          artifactId: draft.renderedArtifactId,
+          renderedDigest,
+          visualQaDigest: draft.visualQaDigest,
+          pageCount,
+          seenPageCount: seen.size,
+        });
+      }
+    } catch {
+      // Ignore unrelated/corrupt sidecars; loadDraft reports them when addressed.
+    }
+  }
+  return pending;
 }
 
 async function renderFileArtifactUnlocked(input: RenderArtifactInput): Promise<BrowserActionResult> {
@@ -948,7 +1483,7 @@ export async function readUnoDraft(input: ReadUnoDraftInput): Promise<BrowserAct
     const documentId = requireDocumentId(input.documentId, 'read');
     return await withDraftLock(input.runId, documentId, () => readUnoDraftUnlocked({ ...input, documentId }));
   } catch (error) {
-    return { ok: false, actual: `UNO draft read failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office draft read failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -979,7 +1514,7 @@ export async function generateUnoFileArtifact(input: GenerateUnoProgramInput): P
     const documentId = requireDocumentId(input.documentId, 'generate');
     return await withDraftLock(input.runId, documentId, () => generateUnoFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
   } catch (error) {
-    return { ok: false, actual: `UNO program generation failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 
@@ -988,7 +1523,7 @@ export async function editUnoFileArtifact(input: EditUnoProgramInput): Promise<B
     const documentId = requireDocumentId(input.documentId, 'edit');
     return await withDraftLock(input.runId, documentId, () => editUnoFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
   } catch (error) {
-    return { ok: false, actual: `UNO draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: `Office draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 

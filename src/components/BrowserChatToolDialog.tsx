@@ -103,14 +103,14 @@ export function BrowserChatToolDialog({
 }: {
   detail: BrowserChatToolDialogDetail;
   onClose: () => void;
-  toolLabel: (name: string) => string;
+  toolLabel: (name: string, input: unknown) => string;
 }) {
   const { t } = useI18n();
   const [wrapInput, setWrapInput] = useState(true);
   const [wrapOutput, setWrapOutput] = useState(true);
   const [copiedPayload, setCopiedPayload] = useState<'input' | 'output' | null>(null);
   const copiedResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const toolName = toolLabel(detail.tool.name);
+  const toolName = toolLabel(detail.tool.name, detail.tool.input);
   const status = toolStatusLabel(detail.tool, detail.step);
   const emptyPayloadLabel = t('无');
   const inputPayload = formatToolPayload(detail.tool.input);

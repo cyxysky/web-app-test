@@ -43,13 +43,15 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /upload-only request, do not call file/i);
   assert.match(rules, /FileChooser\.setFiles/);
   assert.match(rules, /exactly one attachment (?:remains )?at the requested destination/i);
-  assert.match(rules, /action=plan → exactly one initial action=generate → action=render/);
-  assert.match(rules, /structured edits=\[\{oldText,newText,replaceAll\?\}\]/);
+  assert.match(rules, /action=plan.*action=generate.*action=edit.*action=render/);
+  assert.match(rules, /edits=\[\{startLine,endLine,newText\}\]/);
+  assert.match(rules, /visual QA is mandatory/i);
+  assert.match(rules, /every screenshot id/i);
   assert.doesNotMatch(rules, /expectedRevision/);
-  assert.match(rules, /Once draft\.py exists, including after a failed render, never call generate again/);
+  assert.match(rules, /Once draft\.py exists, never call generate again/);
   assert.match(rules, /Complete program replacement through edit is unsupported/);
   assert.match(rules, /different IDs and output formats may coexist/i);
-  assert.match(rules, /Do not perform a mandatory no-op edit/i);
+  assert.match(rules, /temporary LibreOffice worker output/i);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /extra contains mounted non-actionable records/);
@@ -117,7 +119,7 @@ test('screenshot guidance stays inside browserCode', () => {
 
 test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
   const rules = browserChatCodeRules(true).join('\n');
-  assert.equal(browserChatCodeRules(true).length, 11);
+  assert.equal(browserChatCodeRules(true).length, 12);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
@@ -164,8 +166,9 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /credentialVault\.fill/);
   assert.match(rules, /attachmentVault\.setInputFiles/);
   assert.match(rules, /upload-only request use attachmentVault/i);
-  assert.match(rules, /action=plan → exactly one initial action=generate → action=render/);
-  assert.match(rules, /structured edits=\[\{oldText,newText,replaceAll\?\}\]/);
+  assert.match(rules, /action=plan.*action=generate.*action=edit.*action=render/);
+  assert.match(rules, /edits=\[\{startLine,endLine,newText\}\]/);
+  assert.match(rules, /visual QA is mandatory/i);
   assert.match(rules, /different IDs and output formats may coexist/i);
   assert.match(rules, /deterministic batch in one bounded cell/i);
   assert.match(rules, /re-establish and verify the intended editable target and focus/i);

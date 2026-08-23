@@ -13,6 +13,13 @@ test('deterministically converts supported scalar transport values', () => {
   });
 });
 
+test('normalizes UNO and JavaScript API action casing', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'UNOApi' }), { action: 'unoApi' });
+  assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'UNO_API' }), { action: 'unoApi' });
+  assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'JSAPI' }), { action: 'jsApi' });
+  assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'Js-Api' }), { action: 'jsApi' });
+});
+
 test('does not reshape model-authored document values', () => {
   const outline = { item: [{ id: 'cover', title: 'Cover' }] };
   const input = { action: 'plan', outline };

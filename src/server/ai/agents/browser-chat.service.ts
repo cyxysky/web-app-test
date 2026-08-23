@@ -1945,9 +1945,12 @@ function browserChatTabs(session: BrowserChatSessionRecord): BrowserTabSnapshot[
 }
 
 function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChatContextUsage {
-  const fallbackMax = runtimeContextWindowTokens();
+  const fallbackMax = runtimeContextWindowTokens({
+    provider: session.modelProvider,
+    model: session.model,
+  });
   if (session.contextUsage && session.contextUsage.currentTokens > 0) {
-    return session.contextUsage;
+    return { ...session.contextUsage, maxTokens: fallbackMax };
   }
   for (let index = session.steps.length - 1; index >= 0; index -= 1) {
     const rawStats = session.steps[index]?.aiRequest?.options?.modelContextStats;
@@ -1987,12 +1990,15 @@ function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChat
   };
 }
 
-function browserChatContextUsageFromDebugDetails(details: unknown): BrowserChatContextUsage | undefined {
+function browserChatContextUsageFromDebugDetails(
+  details: unknown,
+  model: { provider?: string; model?: string },
+): BrowserChatContextUsage | undefined {
   const unwrapped = unwrapLogDetails(details).value;
   if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) return undefined;
   return browserChatContextUsageFromDebugRecord(
     unwrapped as Record<string, unknown>,
-    runtimeContextWindowTokens(),
+    runtimeContextWindowTokens(model),
   );
 }
 
@@ -5428,7 +5434,10 @@ async function runBrowserChatMessage(
           if (event.phase === 'ai:runtime:request'
             || event.phase === 'ai:context-compression:start'
             || event.phase === 'ai:context-compression:complete') {
-            session.contextUsage = browserChatContextUsageFromDebugDetails(event.details)
+            session.contextUsage = browserChatContextUsageFromDebugDetails(event.details, {
+              provider: session.modelProvider,
+              model: session.model,
+            })
               || session.contextUsage;
           }
           const outputCycle = browserChatAiOutputCycleFromDebugEvent({

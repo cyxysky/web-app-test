@@ -713,7 +713,7 @@ export function BrowserChatLogDialog({
           )}
           {hasMore && onLoadMore ? (
             <button
-              className="browser-chat-log-copy-button"
+              className="browser-chat-log-load-more"
               disabled={loadingMore}
               onClick={() => void onLoadMore()}
               type="button"

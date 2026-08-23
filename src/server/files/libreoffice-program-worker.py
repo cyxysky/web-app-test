@@ -9,7 +9,8 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import uno
@@ -95,6 +96,7 @@ class DocumentJob:
     document_type: str
     context: object
     desktop: object
+    opened_documents: set = field(default_factory=set, compare=False)
 
     @property
     def output_url(self):
@@ -152,6 +154,21 @@ class DocumentJob:
         if kind not in factories:
             raise ValueError(f'Unsupported document type: {kind}')
         return self.desktop.loadComponentFromURL(factories[kind], '_blank', 0, (self.property('Hidden', True),))
+
+    def open_document(self, name: str):
+        """Open an existing workspace Office file for in-place editing."""
+        source = self.asset_path(name)
+        component = self.desktop.loadComponentFromURL(
+            source.as_uri(), '_blank', 0,
+            (self.property('Hidden', True), self.property('ReadOnly', False)),
+        )
+        if component is None:
+            raise RuntimeError(f'LibreOffice could not open source asset {name!r}')
+        if not component.supportsService(expected_service(self.document_type)):
+            close_component(component)
+            raise ValueError(f'Source asset {name!r} is not a {self.document_type} document')
+        self.opened_documents.add(name)
+        return component
 
     def close(self, component):
         close_component(component)
@@ -242,10 +259,12 @@ def uno_cookbook(document_type):
     """
     common_rules = [
         'All geometry is in 1/100 mm. Read job.document_bounds(doc); never assume A4 or a slide size.',
+        'CharHeight is always measured in typographic points (pt), not 1/100 mm. Assign the requested point value directly; never multiply by 35.28 or any geometry conversion factor.',
         'uno.Enum(typeName, memberName) is for UNO enum types. uno.getConstantByName(fullyQualifiedName) is for constant groups. Never substitute guessed integers.',
         'Create a fresh end cursor with cursor = doc.Text.createTextCursor(); cursor.gotoEnd(False) before appending Writer content.',
         'ControlCharacter has paragraph/line characters but no PAGE_BREAK member. Writer page breaks use the paragraph BreakType enum.',
         'For Impress TextShape objects, assign Position and Size, call page.add(shape), and only then assign String/Text and text formatting. Text written before page.add(shape) is lost by this LibreOffice runtime.',
+        'For an existing-file modification plan, call job.open_document(exactSourceAssetName), mutate that returned component, and store it to job.output_url. Never replace it with job.new_document().',
         'Use storeToURL for PDF export and storeAsURL for editable Office formats. Select the filter from job.output_path.suffix.',
         'Close the document only after the synchronous store/export call has returned.',
     ]
@@ -277,6 +296,8 @@ def uno_cookbook(document_type):
     }
     if document_type == 'word':
         operations = {
+            'openExisting': '''doc = job.open_document('exact-source-asset-name.docx')
+# Modify this component and save to job.output_url; do not create a replacement document.''',
             'bounds': '''bounds = job.document_bounds(doc)
 # Exact keys: kind, pageWidth, pageHeight, leftMargin, rightMargin,
 # topMargin, bottomMargin, contentWidth, contentHeight. Values are 1/100 mm.
@@ -385,6 +406,8 @@ def create_document(job):
         coverage = ['create/save DOC/DOCX/ODT/PDF', 'native page bounds', 'append-at-end cursors', 'paragraph and line spacing', 'page breaks', 'images and anchors', 'relative table widths', 'page style and header']
     elif document_type == 'spreadsheet':
         operations = {
+            'openExisting': '''doc = job.open_document('exact-source-asset-name.xlsx')
+# Modify this component and save to job.output_url; do not create a replacement workbook.''',
             'bounds': '''bounds = job.document_bounds(doc)
 # Calc returns {'kind': 'spreadsheet', 'unit': '1/100 mm'}.
 # Cell layout uses rows/columns; drawing-layer objects use Point/Size in 1/100 mm.''',
@@ -435,6 +458,8 @@ def create_document(job):
         coverage = ['create/save XLS/XLSX/ODS/PDF', 'strings, numbers, and formulas', 'cell formatting', 'row/column sizing', 'merged cells and freeze panes', 'images on draw page', 'multiple sheets']
     else:
         operations = {
+            'openExisting': '''doc = job.open_document('exact-source-asset-name.pptx')
+# Modify this component and save to job.output_url; preserve all existing pages, images, and unrelated shapes.''',
             'bounds': '''bounds = job.document_bounds(doc)
 # Exact keys: kind, width, height. Values are 1/100 mm.
 slide_width, slide_height = bounds['width'], bounds['height']''',
@@ -444,7 +469,8 @@ size = uno.createUnoStruct('com.sun.star.awt.Size'); size.Width, size.Height = 2
 shape.Position, shape.Size = position, size
 page.add(shape)
 shape.String = 'Slide title'
-shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'AUTOFIT')
+# CharHeight is pt. Keep short text at a fixed size; resize the box/copy instead of hiding defects with scroll controls.
+shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'NONE')
 shape.CharHeight, shape.CharWeight = 28, 150.0
 ''',
             'image': '''import uno
@@ -491,16 +517,25 @@ def create_document(job):
     shape.Position, shape.Size = point(1600, 1200), size(bounds['width'] - 3200, 3200)
     page.add(shape)
     shape.String = 'UNO Impress deck'
-    shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'AUTOFIT')
+    shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'NONE')
     shape.CharHeight, shape.CharWeight = 28, 150.0
     save_document(doc, job)
     job.close(doc)'''
-        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'text shapes and AUTOFIT', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
+        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'text shapes with fixed point-size formatting', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
+    modification = save_examples[document_type] + '''
+
+def create_document(job):
+    # Replace this placeholder with sourceDocument.assetName returned by action=plan.
+    doc = job.open_document('exact-source-asset-name')
+    # Locate and edit only the requested existing content here.
+    save_document(doc, job)
+    job.close(doc)'''
     return {
         'status': 'copy these installed-runtime patterns; do not paraphrase them into guessed UNO calls',
         'coverage': coverage,
         'rules': common_rules,
         'completeDocument': complete,
+        'completeExistingDocumentModification': modification,
         'operations': operations,
     }
 
@@ -576,13 +611,69 @@ def inspect_uno_api(soffice, profile, document_type, target, query='', offset=0,
         shutdown_office(process, desktop)
 
 
-def verify_and_preview(soffice, profile, output, preview, document_type):
+def document_fidelity_snapshot(component, document_type):
+    if document_type == 'presentation':
+        pages, shapes, images, text_characters = component.DrawPages.Count, 0, 0, 0
+        for page_index in range(pages):
+            page = component.DrawPages.getByIndex(page_index)
+            shapes += page.getCount()
+            for shape_index in range(page.getCount()):
+                shape = page.getByIndex(shape_index)
+                try:
+                    if shape.supportsService('com.sun.star.drawing.GraphicObjectShape'):
+                        images += 1
+                except Exception:
+                    pass
+                try:
+                    text_characters += len(str(shape.String or ''))
+                except Exception:
+                    pass
+        return {'pages': pages, 'shapes': shapes, 'images': images, 'textCharacters': text_characters}
+    if document_type == 'spreadsheet':
+        return {'sheets': component.Sheets.Count}
+    return {'textCharacters': len(str(component.Text.String or ''))}
+
+
+def verify_modification_fidelity(source, output, document_type):
+    before = document_fidelity_snapshot(source, document_type)
+    after = document_fidelity_snapshot(output, document_type)
+    if document_type == 'presentation':
+        if after['pages'] != before['pages']:
+            raise RuntimeError(f'Existing-file fidelity check failed: page count changed from {before["pages"]} to {after["pages"]}.')
+        if after['images'] < before['images']:
+            raise RuntimeError(f'Existing-file fidelity check failed: embedded image count dropped from {before["images"]} to {after["images"]}.')
+        if before['shapes'] >= 4 and after['shapes'] < int(before['shapes'] * 0.65):
+            raise RuntimeError(f'Existing-file fidelity check failed: shape count dropped from {before["shapes"]} to {after["shapes"]}.')
+        if before['textCharacters'] >= 100 and after['textCharacters'] < int(before['textCharacters'] * 0.65):
+            raise RuntimeError(f'Existing-file fidelity check failed: text content dropped from {before["textCharacters"]} to {after["textCharacters"]} characters.')
+    elif document_type == 'spreadsheet' and after['sheets'] < before['sheets']:
+        raise RuntimeError(f'Existing-file fidelity check failed: sheet count dropped from {before["sheets"]} to {after["sheets"]}.')
+    elif document_type == 'word' and before['textCharacters'] >= 100 and after['textCharacters'] < int(before['textCharacters'] * 0.65):
+        raise RuntimeError(f'Existing-file fidelity check failed: text content dropped from {before["textCharacters"]} to {after["textCharacters"]} characters.')
+    return {'source': before, 'output': after}
+
+
+def verify_package_media_fidelity(source_path, output_path):
+    prefixes = {'.pptx': 'ppt/media/', '.docx': 'word/media/', '.xlsx': 'xl/media/'}
+    prefix = prefixes.get(source_path.suffix.lower())
+    if not prefix or output_path.suffix.lower() != source_path.suffix.lower():
+        return None
+    with zipfile.ZipFile(source_path) as archive:
+        source_media = sum(1 for name in archive.namelist() if name.startswith(prefix) and not name.endswith('/'))
+    with zipfile.ZipFile(output_path) as archive:
+        output_media = sum(1 for name in archive.namelist() if name.startswith(prefix) and not name.endswith('/'))
+    if output_media < source_media:
+        raise RuntimeError(f'Existing-file fidelity check failed: packaged media count dropped from {source_media} to {output_media}.')
+    return {'sourceMedia': source_media, 'outputMedia': output_media}
+
+
+def verify_and_preview(soffice, profile, output, preview, document_type, source=None):
     if output.suffix.lower() == '.pdf':
         if output.stat().st_size < 64:
             raise RuntimeError('Generated PDF is empty')
         preview.write_bytes(output.read_bytes())
         return {'format': 'pdf', 'verification': 'file-size'}
-    process = context = desktop = component = None
+    process = context = desktop = component = source_component = None
     try:
         process, context, desktop = connect_office(soffice, profile)
         # Verification must never contend with the writer for an editable
@@ -600,17 +691,29 @@ def verify_and_preview(soffice, profile, output, preview, document_type):
             raise RuntimeError('LibreOffice could not reopen the generated document')
         if not component.supportsService(expected_service(document_type)):
             raise RuntimeError(f'Generated file does not reopen as {document_type}')
+        fidelity = None
+        if source is not None:
+            package_fidelity = verify_package_media_fidelity(source, output)
+            source_component = desktop.loadComponentFromURL(
+                source.as_uri(), '_blank', 0,
+                (property_value('Hidden', True), property_value('ReadOnly', True)),
+            )
+            if source_component is None:
+                raise RuntimeError('LibreOffice could not reopen the source document for fidelity verification')
+            fidelity = verify_modification_fidelity(source_component, component, document_type)
+            fidelity['package'] = package_fidelity
         image_verification = verify_embedded_images(component, document_type)
         text_verification = verify_presentation_text(component) if document_type == 'presentation' else None
         component.storeToURL(preview.as_uri(), (property_value('FilterName', PDF_FILTERS[document_type]), property_value('Overwrite', True)))
         if not preview.is_file() or preview.stat().st_size < 64:
             raise RuntimeError('LibreOffice could not export a PDF preview')
         if document_type == 'presentation':
-            return {'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification}
+            return {'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification, 'fidelity': fidelity}
         if document_type == 'spreadsheet':
-            return {'format': 'spreadsheet', 'sheets': list(component.Sheets.getElementNames())}
-        return {'format': 'word', 'textCharacters': len(str(component.Text.String or '')), 'images': image_verification}
+            return {'format': 'spreadsheet', 'sheets': list(component.Sheets.getElementNames()), 'fidelity': fidelity}
+        return {'format': 'word', 'textCharacters': len(str(component.Text.String or '')), 'images': image_verification, 'fidelity': fidelity}
     finally:
+        close_component(source_component)
         close_component(component)
         shutdown_office(process, desktop)
 
@@ -717,6 +820,7 @@ def main():
     parser.add_argument('--preview')
     parser.add_argument('--assets')
     parser.add_argument('--expected-source-digest')
+    parser.add_argument('--required-source-asset')
     parser.add_argument('--inspect-target', choices=('all', 'document', 'page', 'text', 'sheet', 'cell', 'shape'))
     parser.add_argument('--api-query', default='')
     parser.add_argument('--api-offset', type=int, default=0)
@@ -756,11 +860,17 @@ def main():
                     'Call file action=unoApi for the relevant target, copy the matching returned cookbook operation, '
                     'and edit the current draft.py with that installed-runtime pattern.'
                 ) from error
+        if args.required_source_asset and args.required_source_asset not in job.opened_documents:
+            raise RuntimeError(
+                f'Existing-file modification must call job.open_document({args.required_source_asset!r}). '
+                'Creating a replacement document with job.new_document() is not allowed for this plan.'
+            )
         if not output.is_file() or output.stat().st_size < 64:
             raise RuntimeError('create_document(job) did not create the requested output file')
     finally:
         shutdown_office(process, desktop)
-    verification = verify_and_preview(soffice, profile.parent / 'verification-profile', output, preview, args.document_type)
+    source = (assets / args.required_source_asset).resolve() if args.required_source_asset else None
+    verification = verify_and_preview(soffice, profile.parent / 'verification-profile', output, preview, args.document_type, source)
     print(json.dumps({'bytes': output.stat().st_size, 'output': str(output), 'preview': str(preview), 'renderer': 'libreoffice-uno', 'verification': verification}, ensure_ascii=False))
 
 

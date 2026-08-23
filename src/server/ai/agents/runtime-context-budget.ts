@@ -1,10 +1,25 @@
-export function runtimeContextWindowTokens() {
+export type RuntimeContextModel = {
+  provider?: string;
+  model?: string;
+};
+
+function isGlmModel(input: RuntimeContextModel) {
+  return /(^|[\/:._-])glm(?:[\/:._-]|$)/i.test(String(input.model || '').trim());
+}
+
+export function runtimeContextWindowTokens(input: RuntimeContextModel = {}) {
+  if (isGlmModel(input)) {
+    const glmRaw = Number(process.env.AI_GLM_CONTEXT_WINDOW_TOKENS || '');
+    if (Number.isFinite(glmRaw) && glmRaw > 1000) return Math.floor(glmRaw);
+    return 1_000_000;
+  }
   const raw = Number(process.env.AI_CONTEXT_WINDOW_TOKENS || process.env.AI_MODEL_CONTEXT_TOKENS || '');
   if (Number.isFinite(raw) && raw > 1000) return Math.floor(raw);
   return 256000;
 }
 
-export function runtimeContextCompressionThresholdRatio() {
+export function runtimeContextCompressionThresholdRatio(input: RuntimeContextModel = {}) {
+  void input;
   return 0.85;
 }
 

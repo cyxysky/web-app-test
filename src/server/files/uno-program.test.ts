@@ -156,30 +156,33 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
     {
       documentType: 'word' as const,
       fileName: 'writer-cookbook.pdf',
-      operations: ['bounds', 'appendParagraph', 'pageBreak', 'image', 'table', 'pageStyleAndHeader', 'save'],
+      operations: ['openExisting', 'bounds', 'appendParagraph', 'pageBreak', 'image', 'table', 'pageStyleAndHeader', 'save'],
     },
     {
       documentType: 'spreadsheet' as const,
       fileName: 'calc-cookbook.xlsx',
-      operations: ['bounds', 'cellsAndFormula', 'mergeAndFreeze', 'image', 'secondSheet', 'save'],
+      operations: ['openExisting', 'bounds', 'cellsAndFormula', 'mergeAndFreeze', 'image', 'secondSheet', 'save'],
     },
     {
       documentType: 'presentation' as const,
       fileName: 'impress-cookbook.pptx',
-      operations: ['bounds', 'textShape', 'image', 'shape', 'newSlide', 'save'],
+      operations: ['openExisting', 'bounds', 'textShape', 'image', 'shape', 'newSlide', 'save'],
     },
   ];
   for (const item of cases) {
     const api = await inspectUnoApi({ documentType: item.documentType, target: 'document', limit: 1 });
     const cookbook = api.cookbook as {
       completeDocument?: string;
+      completeExistingDocumentModification?: string;
       coverage?: string[];
       operations?: Record<string, string>;
       rules?: string[];
     };
     assert.ok(cookbook.completeDocument?.includes('def create_document(job):'));
+    assert.ok(cookbook.completeExistingDocumentModification?.includes('job.open_document'));
     assert.ok(cookbook.coverage?.length);
     assert.ok(cookbook.rules?.some((rule) => rule.includes('Never substitute guessed integers')));
+    assert.ok(cookbook.rules?.some((rule) => rule.includes('CharHeight is always measured in typographic points')));
     for (const operation of item.operations) assert.ok(cookbook.operations?.[operation], `${item.documentType} cookbook is missing ${operation}`);
 
     const generated = await generateUnoProgramDocument({
@@ -190,6 +193,9 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
     assert.ok(generated.buffer.byteLength > 64);
     assert.ok(generated.previewPdf && generated.previewPdf.byteLength > 64);
     if (item.documentType === 'presentation') {
+      const textShape = cookbook.operations!.textShape;
+      assert.ok(textShape.indexOf('page.add(shape)') < textShape.indexOf("shape.String = 'Slide title'"));
+      assert.ok(textShape.indexOf("shape.String = 'Slide title'") < textShape.indexOf('shape.CharHeight'));
       const text = (generated.report.verification as { text?: { textCharacters?: number } }).text;
       assert.ok((text?.textCharacters || 0) > 0, 'Impress cookbook must persist text after reopening');
     }

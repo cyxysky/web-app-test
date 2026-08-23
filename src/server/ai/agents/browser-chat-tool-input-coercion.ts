@@ -76,9 +76,9 @@ function normalizedDocumentType(value: unknown) {
 function normalizedAction(value: unknown) {
   if (typeof value !== 'string') return value;
   const normalized = value.trim().toLowerCase();
-  return normalized === 'unoapi' || normalized === 'uno-api' || normalized === 'uno_api'
-    ? 'unoApi'
-    : normalized;
+  if (normalized === 'unoapi' || normalized === 'uno-api' || normalized === 'uno_api') return 'unoApi';
+  if (normalized === 'jsapi' || normalized === 'js-api' || normalized === 'js_api') return 'jsApi';
+  return normalized;
 }
 
 function documentTypeFromFileName(value: unknown) {

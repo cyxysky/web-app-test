@@ -54,6 +54,11 @@ export function floatingLayerZIndex(anchor: Pick<HTMLElement, 'closest'>) {
   return anchor.closest('[aria-modal="true"]') ? modalFloatingLayerZIndex : undefined;
 }
 
+function floatingLayerPortalTarget(anchor: HTMLElement | null) {
+  if (typeof document === 'undefined') return null;
+  return anchor?.closest<HTMLElement>('[role="dialog"]') || document.body;
+}
+
 function viewportBounds() {
   const viewport = window.visualViewport;
   const left = viewport?.offsetLeft || 0;
@@ -110,6 +115,9 @@ export function FloatingLayer({
     const layer = internalLayerRef.current;
     if (!anchor || !layer) return;
 
+    const portalTarget = floatingLayerPortalTarget(anchor);
+    if (!portalTarget) return;
+
     const bounds = viewportBounds();
     const anchorRect = anchor.getBoundingClientRect();
     const availableWidth = Math.max(0, bounds.width - floatingInset * 2);
@@ -135,17 +143,25 @@ export function FloatingLayer({
     const top = nextPlacement === 'bottom'
       ? Math.min(anchorRect.bottom + floatingGap, bounds.bottom - renderedHeight - floatingInset)
       : Math.max(bounds.top + floatingInset, anchorRect.top - renderedHeight - floatingGap);
+    const portalledIntoDialog = portalTarget !== document.body;
+    const portalRect = portalledIntoDialog ? portalTarget.getBoundingClientRect() : null;
+    const positionedLeft = portalRect
+      ? left - portalRect.left - portalTarget.clientLeft + portalTarget.scrollLeft
+      : left;
+    const positionedTop = portalRect
+      ? top - portalRect.top - portalTarget.clientTop + portalTarget.scrollTop
+      : top;
 
     setResolvedPlacement(nextPlacement);
     setLayoutStyle((current) => {
       const next: CSSProperties = {
         bottom: 'auto',
-        left: Math.round(left),
+        left: Math.round(positionedLeft),
         maxHeight: Math.floor(availableHeight),
         maxWidth: availableWidth,
-        position: 'fixed',
+        position: portalledIntoDialog ? 'absolute' : 'fixed',
         right: 'auto',
-        top: Math.round(top),
+        top: Math.round(positionedTop),
         visibility: 'visible',
         width: matchAnchorWidth || preferredWidth ? Math.round(width) : undefined,
       };
@@ -203,6 +219,8 @@ export function FloatingLayer({
   }, [active, allowNestedFloatingLayers, anchorRef, present]);
 
   if (!portalReady || !present) return null;
+  const portalTarget = floatingLayerPortalTarget(anchorRef.current);
+  if (!portalTarget) return null;
   return createPortal((
     <div
       aria-label={ariaLabel}
@@ -215,5 +233,5 @@ export function FloatingLayer({
     >
       {children}
     </div>
-  ), document.body);
+  ), portalTarget);
 }

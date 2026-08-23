@@ -75,7 +75,11 @@ function resolvedContextUsage(
   messages: BrowserChatMessage[],
 ) {
   const stored = session.contextUsage;
-  if (stored && stored.currentTokens > 0) return stored;
+  const effectiveMaxTokens = runtimeContextWindowTokens({
+    provider: session.modelProvider,
+    model: session.model,
+  });
+  if (stored && stored.currentTokens > 0) return { ...stored, maxTokens: effectiveMaxTokens };
   const source = session.modelContext?.activeMessages?.length
     ? session.modelContext.activeMessages
     : messages.map((message) => ({
@@ -90,7 +94,7 @@ function resolvedContextUsage(
   return {
     currentTokens: estimated.totalTokens,
     imageTokens: estimated.imageTokens,
-    maxTokens: stored?.maxTokens || runtimeContextWindowTokens(),
+    maxTokens: effectiveMaxTokens,
     textTokens: estimated.textTokens,
     toolTokens: stored?.toolTokens || 0,
   };

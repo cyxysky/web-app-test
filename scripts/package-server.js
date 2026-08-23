@@ -100,6 +100,10 @@ copyInto(
   path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
   path.join(serverRoot, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
 );
+copyInto(
+  path.join(root, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
+  path.join(serverRoot, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
+);
 copyBrowserSessionExtension();
 copyPlaywrightChromium();
 

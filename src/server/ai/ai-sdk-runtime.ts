@@ -26,11 +26,11 @@ export function aiRequestTimeoutMs(fallback = 120_000) {
   return positiveInteger(process.env.AI_REQUEST_TIMEOUT_MS, fallback);
 }
 
-/** Runtime chat requests have a product-level 120s minimum. This intentionally
- * does not inherit a lower legacy AI_REQUEST_TIMEOUT_MS value used by short
- * auxiliary model calls. */
+/** Agent Loop requests can spend substantially longer on a large prompt before
+ * emitting their first chunk. Keep this deadline separate from short auxiliary
+ * model calls and expose it in runtime settings. */
 export function aiRuntimeRequestTimeoutMs() {
-  return Math.max(120_000, positiveInteger(process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS, 120_000));
+  return positiveInteger(process.env.AI_RUNTIME_REQUEST_TIMEOUT_MS, 600_000);
 }
 
 /**
@@ -114,9 +114,9 @@ export function aiMaxOutputTokens(fallback = 32_768) {
 export function aiStreamTimeouts(requestTimeoutMs = aiRequestTimeoutMs()) {
   const requestMs = requestTimeoutMs;
   const toolMs = positiveInteger(process.env.AI_TOOL_TIMEOUT_MS, 120_000);
-  // A stale per-stream 30s setting must never undercut the runtime's 120s
-  // request deadline. The first chunk has its own SDK timer, so enforce the
-  // same lower bound here rather than only on the outer watchdog.
+  // A stale per-stream setting must never undercut the active request
+  // deadline. The first chunk has its own SDK timer, so enforce the same
+  // lower bound here rather than only on the outer watchdog.
   const configuredFirstChunkMs = positiveInteger(process.env.AI_STREAM_FIRST_CHUNK_TIMEOUT_MS, requestMs);
   const configuredChunkMs = positiveInteger(process.env.AI_STREAM_CHUNK_TIMEOUT_MS, requestMs);
   return {

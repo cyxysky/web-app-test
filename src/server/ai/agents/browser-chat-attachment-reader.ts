@@ -32,8 +32,6 @@ export type BrowserChatFileVisualInput = {
 
 type AttachmentKind = 'archive' | 'image' | 'pdf' | 'presentation' | 'spreadsheet' | 'tab' | 'text' | 'unknown' | 'word';
 
-const maxSourceBytes = 64 * 1024 * 1024;
-
 function normalizedOffset(value: unknown) {
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number) ? Math.max(0, Math.floor(number)) : 0;
@@ -119,7 +117,6 @@ export async function readBrowserChatAttachment(input: {
     const size = attachment.kind === 'tab' ? attachment.size : (await stat(input.absolutePath!)).size;
     const resolvedAttachment = size === attachment.size ? attachment : { ...attachment, size };
     if (attachment.kind !== 'tab' && size === 0) throw new Error('文件内容为空，无法解析。');
-    if (size && size > maxSourceBytes) throw new Error(`文件超过 ${formatSize(maxSourceBytes)}，暂不读取。`);
     const kind = attachmentKind(resolvedAttachment);
     const buffer = input.includeVisuals && kind !== 'tab' && kind !== 'image'
       ? await readFile(input.absolutePath!)
@@ -198,8 +195,6 @@ export async function readBrowserChatFileVisuals(input: {
   try {
     const metadata = await stat(input.absolutePath);
     if (!metadata.size) throw new Error('artifact is empty');
-    if (metadata.size > maxSourceBytes) throw new Error(`artifact exceeds ${formatSize(maxSourceBytes)}`);
-    const buffer = await readFile(input.absolutePath);
     const requestedScreenshotIds = Array.from(new Set((request.screenshotIds || []).map((value) => value.trim()).filter(Boolean)));
     if (request.action === 'read' && !requestedScreenshotIds.length) {
       return { ok: false, actual: 'fileVisual action=read requires at least one screenshotId returned by action=index.' };
@@ -214,7 +209,7 @@ export async function readBrowserChatFileVisuals(input: {
 
     const visuals = await renderBrowserChatAttachmentVisuals({
       absolutePath: input.absolutePath,
-      buffer,
+      cacheKey: `${request.artifactId}\0${metadata.size}\0${metadata.mtimeMs}`,
       extension: extensionOf(attachment),
       name: attachment.name,
       pages: request.action === 'read' ? requestedPages : [1],

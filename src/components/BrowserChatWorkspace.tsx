@@ -45,6 +45,8 @@ import {
   CornerDownLeft,
   CheckCircle2,
   Download,
+  FileOutput,
+  FilePlus2,
   FileSearch,
   FileText,
   Folder,
@@ -123,6 +125,10 @@ import {
 } from '@/components/browser-chat-realtime-model';
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
 import { browserChatToolValidationSummary } from '@/components/browser-chat-tool-error';
+import {
+  browserChatFileToolPresentation,
+  type BrowserChatFileToolPresentationKey,
+} from '@/components/browser-chat-file-tool-presentation';
 import {
   resolveEmbeddedBrowserTabLayout,
   resolveEmbeddedBrowserWheelScrollLeft,
@@ -1254,7 +1260,9 @@ function summarizeToolFields(fields: unknown, t: (value: string, params?: Record
     : t('{count} 项', { count: fields.length });
 }
 
-function browserChatToolLabel(name: string, t: (value: string) => string) {
+function browserChatToolLabel(name: string, input: unknown, t: (value: string) => string) {
+  const filePresentation = browserChatFileToolPresentation(name, input);
+  if (filePresentation) return t(filePresentation.label);
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
     file: '文件操作',
@@ -1294,9 +1302,15 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
   const lower = name.toLowerCase();
   if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
   if (name === 'file') {
-    const action = toolInputValue(record, ['action']);
-    const actionLabel = action === 'read' ? t('读取') : action === 'download' ? t('下载') : action === 'generate' ? t('生成') : action;
-    return [actionLabel, toolInputValue(record, ['fileName', 'attachmentId', 'artifactId', 'url', 'path'])].filter(Boolean).join(' · ');
+    return toolInputValue(record, [
+      'fileName',
+      'documentId',
+      'attachmentId',
+      'artifactId',
+      'url',
+      'path',
+      'documentType',
+    ]);
   }
   if (name === 'fileVisual') {
     const action = toolInputValue(record, ['action']);
@@ -1330,11 +1344,30 @@ function isSubagentSpawnTool(name: string, input: unknown) {
   return name === 'subagent' && asRecord(input)?.action === 'spawn';
 }
 
-function BrowserChatToolIcon({ name }: { name: string }) {
+function BrowserChatToolIcon({ input, name }: { input?: unknown; name: string }) {
   const lower = name.toLowerCase();
   if (name === 'browserCode') return <Braces size={13} />;
-  if (name === 'fileVisual') return <ImageIcon size={13} />;
-  if (lower === 'file' || lower.includes('fileoperation')) return <FileText size={13} />;
+  const filePresentation = browserChatFileToolPresentation(name, input);
+  if (filePresentation) {
+    const icons: Record<BrowserChatFileToolPresentationKey, ReactNode> = {
+      'create-draft': <FilePlus2 size={13} />,
+      'download-file': <Download size={13} />,
+      'edit-draft': <PencilLine size={13} />,
+      'file-visual-index': <ScanSearch size={13} />,
+      'file-visual-read': <ImageIcon size={13} />,
+      'plan-document': <ClipboardCheck size={13} />,
+      'read-attachment': <Paperclip size={13} />,
+      'read-draft': <FileSearch size={13} />,
+      'read-file': <FileText size={13} />,
+      'read-file-visuals': <ImageIcon size={13} />,
+      'render-file': <FileOutput size={13} />,
+      'uno-api': <Library size={13} />,
+    };
+    return icons[filePresentation.key];
+  }
+  if (lower === 'file' || lower.includes('fileoperation')) {
+    return <FileText size={13} />;
+  }
   if (lower.includes('subagent')) return <Waypoints size={13} />;
   if (lower.includes('screenshot') || lower.includes('capture')) return <ImageIcon size={13} />;
   if (lower.includes('type') || lower.includes('fill')) return <PencilLine size={13} />;
@@ -2852,12 +2885,14 @@ function BrowserChatToolUserActionTag({ action }: { action?: ReturnType<typeof t
 
 function BrowserChatToolCardContent({
   active = false,
+  input,
   label,
   meta,
   name,
   userAction,
 }: {
   active?: boolean;
+  input?: unknown;
   label: string;
   meta?: string;
   name: string;
@@ -2875,7 +2910,7 @@ function BrowserChatToolCardContent({
   return (
     <>
       <span className="browser-chat-tool-icon" aria-hidden="true">
-        <BrowserChatToolIcon name={name} />
+        <BrowserChatToolIcon input={input} name={name} />
       </span>
       {active ? (
         <AnimatedShinyText className="browser-chat-tool-content browser-chat-tool-shiny-text">
@@ -3161,7 +3196,7 @@ const BrowserChatPendingToolConfirmationCard = memo(function BrowserChatPendingT
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
 }) {
   const { t } = useI18n();
-  const label = browserChatToolLabel(pending.toolName, t);
+  const label = browserChatToolLabel(pending.toolName, undefined, t);
   return (
     <section className="browser-chat-tool-call browser-chat-pending-tool-confirmation">
       {pending.reason ? <p className="browser-chat-tool-reason">{pending.reason}</p> : null}
@@ -3339,7 +3374,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
   return (
     <>
       {toolCalls.map(({ tool, toolIndex }) => {
-        const label = browserChatToolLabel(tool.name, t);
+        const label = browserChatToolLabel(tool.name, tool.input, t);
         const meta = tool.invalid
           ? browserChatToolValidationSummary(tool.error || tool.result)
           : compactText(tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
@@ -3368,7 +3403,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
               <BrowserChatSubagentToolDisclosure
                 batchId={tool.id}
                 cardContent={(
-                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} input={tool.input} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
                 )}
                 className={stateClass}
                 isActive={isActiveTool}
@@ -3394,7 +3429,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                   onClick={() => onSelectTool({ stepIndex: step.index, step, toolIndex, tool })}
                   type="button"
                 >
-                  <BrowserChatToolCardContent active={isActiveTool} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
+                  <BrowserChatToolCardContent active={isActiveTool} input={tool.input} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
                   {isActiveTool ? <BrowserChatToolTailParticles /> : null}
                 </button>
                 <BrowserChatToolScreenshotButton tool={tool} />
@@ -3496,7 +3531,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         }
         const { tool, toolDetail } = entry;
         const executedTool = toolDetail.tool;
-        const label = browserChatToolLabel(executedTool.name, t);
+        const label = browserChatToolLabel(executedTool.name, executedTool.input, t);
         const meta = executedTool.invalid
           ? browserChatToolValidationSummary(executedTool.error || executedTool.result)
           : executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
@@ -3517,6 +3552,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const card = (
           <BrowserChatToolCardContent
             active={isActive}
+            input={executedTool.input}
             label={label}
             meta={visibleMeta}
             name={executedTool.name}
@@ -10805,7 +10841,7 @@ export function BrowserChatWorkspace({
         <BrowserChatToolDialog
           detail={liveToolDialog}
           onClose={closeToolDetails}
-          toolLabel={(name) => browserChatToolLabel(name, t)}
+          toolLabel={(name, input) => browserChatToolLabel(name, input, t)}
         />
       ) : null}
 
