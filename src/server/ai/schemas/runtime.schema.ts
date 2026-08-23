@@ -114,6 +114,13 @@ export type StepToolCall = {
   transient?: boolean;
   result?: string;
   rawResult?: unknown;
+  progress?: {
+    phase: string;
+    message: string;
+    current?: number;
+    total?: number;
+    elapsedMs?: number;
+  };
   contextBefore?: AiToolContextSnapshot;
   contextAfter?: AiToolContextSnapshot;
   screenshots?: Array<{
@@ -134,6 +141,13 @@ export type BrowserChatAiOutputTool = {
   ok?: boolean;
   result?: string;
   rawResult?: unknown;
+  progress?: {
+    phase: string;
+    message: string;
+    current?: number;
+    total?: number;
+    elapsedMs?: number;
+  };
 };
 
 export type BrowserChatAiOutputPart =

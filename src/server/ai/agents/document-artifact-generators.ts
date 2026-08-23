@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { stat } from 'node:fs/promises';
 import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '@/server/files/file-format-registry';
 import { generateUnoProgramDocument } from '@/server/files/uno-program';
 import { generateOfficeJsProgramDocument } from '@/server/files/office-js-program';
@@ -127,9 +128,54 @@ export async function generateFileBuffer(input: (GeneratedFileInput | Pick<Offic
     abortSignal: input.abortSignal,
   });
   return {
-    buffer: generated.buffer,
+    buffer: generated.buffer || (() => { throw new Error('Office generator did not return an in-memory artifact.'); })(),
     diagnostics: generated.report,
     extension,
     previewPdf: generated.previewPdf,
+  };
+}
+
+export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'documentType' | 'fileName'> & {
+  programPath: string;
+  outputPath: string;
+  previewPath: string;
+  assetsPath?: string;
+  generator?: 'javascript' | 'uno';
+  requiredSourceAssetName?: string;
+  abortSignal?: AbortSignal;
+  onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>;
+}) {
+  const extension = supportedGeneratedFileExtension(input.fileName);
+  if (!extension || generatedTextExtensions.has(extension)) throw new Error('Path-based generation requires an Office or PDF target.');
+  validateOfficeTarget(input, extension);
+  const generator = input.generator || 'uno';
+  const generated = generator === 'javascript'
+    ? await generateOfficeJsProgramDocument({
+        sourcePath: input.programPath,
+        fileName: path.basename(input.fileName),
+        documentType: input.documentType,
+        assetsPath: input.assetsPath,
+        abortSignal: input.abortSignal,
+        outputPath: input.outputPath,
+        previewPath: input.previewPath,
+        onProgress: input.onProgress,
+      })
+    : await generateUnoProgramDocument({
+        sourcePath: input.programPath,
+        fileName: path.basename(input.fileName),
+        documentType: input.documentType,
+        assetsPath: input.assetsPath,
+        requiredSourceAssetName: input.requiredSourceAssetName,
+        abortSignal: input.abortSignal,
+        outputPath: input.outputPath,
+        previewPath: input.previewPath,
+        onProgress: input.onProgress,
+      });
+  return {
+    bytes: (await stat(input.outputPath)).size,
+    diagnostics: generated.report,
+    extension,
+    outputPath: input.outputPath,
+    previewPath: input.previewPath,
   };
 }

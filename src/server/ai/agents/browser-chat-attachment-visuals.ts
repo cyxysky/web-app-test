@@ -11,6 +11,7 @@ import * as XLSX from 'xlsx';
 import { officePreviewExtensions, readableFileExtensions } from '@/server/files/file-format-registry';
 import { convertOfficeFile } from '@/server/files/libreoffice';
 import { artifactsRoot } from '@/server/storage/paths';
+import { inspectRenderedPage, type OfficeArtifactIssue } from '@/server/files/office-artifact-validator';
 
 export type BrowserChatAttachmentVisualResult = {
   imagePaths: string[];
@@ -18,9 +19,10 @@ export type BrowserChatAttachmentVisualResult = {
   renderedPages: number[];
   renderer: 'embedded-media' | 'html-preview' | 'libreoffice-pdf' | 'pdf' | 'unavailable';
   warning?: string;
+  automaticChecks?: Array<{ pageNumber: number; width?: number; height?: number; issues: OfficeArtifactIssue[] }>;
 };
 
-type VisualCacheManifest = Pick<BrowserChatAttachmentVisualResult, 'pageCount' | 'renderer' | 'warning'>;
+type VisualCacheManifest = Pick<BrowserChatAttachmentVisualResult, 'automaticChecks' | 'pageCount' | 'renderer' | 'warning'>;
 
 const defaultPreviewPages = [1, 2, 3, 4];
 const maxPreviewPagesPerRead = 6;
@@ -70,7 +72,12 @@ async function existingCache(directory: string, requestedPages: unknown) {
     const renderedPages = normalizedPages(requestedPages, manifest.pageCount);
     const imagePaths = renderedPages.map((pageNumber) => pageImagePath(directory, pageNumber));
     await Promise.all(imagePaths.map((filePath) => access(filePath, constants.R_OK)));
-    return { ...manifest, imagePaths, renderedPages } satisfies BrowserChatAttachmentVisualResult;
+    return {
+      ...manifest,
+      automaticChecks: manifest.automaticChecks?.filter((check) => renderedPages.includes(check.pageNumber)),
+      imagePaths,
+      renderedPages,
+    } satisfies BrowserChatAttachmentVisualResult;
   } catch {
     return undefined;
   }
@@ -101,12 +108,17 @@ async function renderPdfPages(buffer: Buffer, directory: string, requestedPages:
       await writeFile(target, Buffer.from(page.data));
       imagePaths.push(target);
     }
-    await writeManifest(directory, { pageCount: screenshots.total, renderer });
+    const automaticChecks = await Promise.all(imagePaths.map(async (imagePath, index) => ({
+      pageNumber: screenshots.pages[index].pageNumber,
+      ...await inspectRenderedPage(imagePath),
+    })));
+    await writeManifest(directory, { automaticChecks, pageCount: screenshots.total, renderer });
     return {
       imagePaths,
       pageCount: screenshots.total,
       renderedPages: screenshots.pages.map((page) => page.pageNumber),
       renderer,
+      automaticChecks,
     } satisfies BrowserChatAttachmentVisualResult;
   } finally {
     await parser.destroy();

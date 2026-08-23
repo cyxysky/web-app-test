@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import JSZip from 'jszip';
+import sharp from 'sharp';
 import { extractAttachmentTextInWorker } from '@/server/runtime/cpu-worker-pool';
 import { readBrowserChatAttachment } from './browser-chat-attachment-reader';
 import { BROWSER_CHAT_FILE_READ_MIN_CHARS, normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
@@ -51,6 +52,40 @@ test('CPU extraction reads source bytes inside the worker', async () => {
       await extractAttachmentTextInWorker({ extension: '.txt', kind: 'text', path: filePath }),
       'worker-owned attachment bytes',
     );
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test('readFile reports image dimensions from the exact saved artifact bytes', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-read-image-'));
+  const filePath = path.join(directory, 'layout-source.png');
+  await writeFile(filePath, await sharp({
+    create: {
+      width: 320,
+      height: 180,
+      channels: 4,
+      background: { r: 24, g: 32, b: 48, alpha: 1 },
+    },
+  }).png().toBuffer());
+
+  try {
+    const result = await readBrowserChatAttachment({
+      absolutePath: filePath,
+      attachment: {
+        id: 'image-layout-source',
+        kind: 'image',
+        name: 'layout-source.png',
+        path: 'generated/layout-source.png',
+        type: 'image/png',
+        url: '/api/artifacts/generated/layout-source.png',
+      },
+    });
+
+    assert.equal(result.ok, true, result.actual);
+    assert.match(result.actual, /Dimensions: 320 x 180 px/);
+    assert.match(result.actual, /Aspect ratio: 1\.777778/);
+    assert.match(result.actual, /exact saved artifact bytes/i);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

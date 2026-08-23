@@ -1,18 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream } from 'node:fs';
 import { access, copyFile, mkdir, open, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
+import sharp from 'sharp';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 import {
-  generateFileBuffer,
-  type GeneratedFileOutput,
+  generateFileToPaths,
 } from './document-artifact-generators';
-import { assertControlledUnoProgram, inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
-import { assertControlledOfficeJsProgram } from '@/server/files/office-js-program';
+import { inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
+import { validateOfficeArtifact } from '@/server/files/office-artifact-validator';
+import { analyzeOfficeProgram, type OfficeProgramDiagnostic } from '@/server/files/office-program-analysis';
 import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
@@ -27,10 +28,13 @@ import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 
 const FILE_DOWNLOAD_TIMEOUT_MS = 120_000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
+const FILE_DOWNLOAD_RETRY_DELAYS_MS = [750, 1_500, 3_000] as const;
 const DOCUMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const draftLocks = new Map<string, Promise<void>>();
+const activeDownloads = new Map<string, Promise<BrowserActionResult>>();
 const DRAFT_LOCK_WAIT_MS = 120_000;
 const STALE_DRAFT_LOCK_MS = 10 * 60_000;
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v4-units-preflight-recovery';
 
 type DownloadArtifactInput = {
   runId?: string;
@@ -60,26 +64,47 @@ type GenerateUnoProgramInput = {
   includeVisualVerification?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
+};
+
+export type FileGenerationProgress = {
+  phase: string;
+  message: string;
+  current?: number;
+  total?: number;
 };
 
 export type UnoDraftLineEdit = {
+  /** Defaults to replaceRange for compatibility with existing calls. */
+  kind?: 'deleteRange' | 'insertAfter' | 'insertBefore' | 'replaceRange' | 'replaceText';
   /** One-based, inclusive source line range from action=read. */
-  startLine: number;
-  endLine: number;
+  startLine?: number;
+  endLine?: number;
+  /** One-based anchor line for insertBefore/insertAfter. */
+  line?: number;
+  /** Exact current source text for replaceText. */
+  oldText?: string;
+  /** One-based occurrence for replaceText; omitted requires a unique match. */
+  occurrence?: number;
   newText: string;
 };
 
 type EditUnoProgramInput = {
   runId?: string;
   documentId?: string;
+  /** Optional @webpilot-unit path. Edits are scoped to that page/section source unit. */
+  path?: string;
   /** Optional legacy digest. A single chat owns its draft, so edits use the current source. */
   baseDigest?: string;
   edits?: UnoDraftLineEdit[];
+  patch?: string;
+  restoreRevision?: number;
   program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
 };
 
 type UnoApiInput = {
@@ -95,6 +120,7 @@ type UnoApiInput = {
 type ReadUnoDraftInput = {
   runId?: string;
   documentId?: string;
+  path?: string;
 };
 
 type RenderArtifactInput = {
@@ -103,6 +129,7 @@ type RenderArtifactInput = {
   includeVisualVerification?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
 };
 
 type FillDocumentTemplateArtifactInput = {
@@ -128,6 +155,12 @@ type ArtifactToolPayload = {
   operation?: string;
   sourceCharacters?: number;
   cacheHit?: boolean;
+  validation?: string;
+  validationStatus?: string;
+  rolledBack?: boolean;
+  currentRevision?: number | null;
+  lastSuccessfulRevision?: number | null;
+  error?: string;
 };
 
 export type FileArtifactToolResult = {
@@ -162,9 +195,50 @@ function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'd
 type DocumentAsset = {
   assetName: string;
   bytes: number;
+  sha256: string;
   origin: 'attachment' | 'download' | 'generated';
   ref?: string;
+  width?: number;
+  height?: number;
+  optimized?: boolean;
 };
+
+async function sha256File(filePath: string) {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+async function optimizeWorkspaceImage(filePath: string) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (!['.jpeg', '.jpg', '.png', '.tif', '.tiff', '.webp'].includes(extension)) return {};
+  const metadata = await sharp(filePath, { failOn: 'none' }).metadata();
+  const width = metadata.width;
+  const height = metadata.height;
+  const shouldOptimize = Boolean(
+    metadata.orientation
+    || metadata.space === 'cmyk'
+    || (width && height && (width > 4096 || height > 4096 || width * height > 20_000_000)),
+  );
+  if (!shouldOptimize) return { width, height, optimized: false };
+  const temporary = `${filePath}.${randomUUID()}.optimized${extension}`;
+  try {
+    let pipeline = sharp(filePath, { failOn: 'none' })
+      .rotate()
+      .resize({ width: 4096, height: 4096, fit: 'inside', withoutEnlargement: true })
+      .toColorspace('srgb');
+    if (extension === '.jpg' || extension === '.jpeg') pipeline = pipeline.jpeg({ quality: 88, mozjpeg: true });
+    else if (extension === '.png') pipeline = pipeline.png({ compressionLevel: 9, adaptiveFiltering: true });
+    else if (extension === '.webp') pipeline = pipeline.webp({ quality: 88 });
+    else pipeline = pipeline.tiff({ compression: 'lzw' });
+    await pipeline.toFile(temporary);
+    await rename(temporary, filePath);
+    const optimizedMetadata = await sharp(filePath, { failOn: 'none' }).metadata();
+    return { width: optimizedMetadata.width, height: optimizedMetadata.height, optimized: true };
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
 
 const documentExtensions: Record<OfficeDocumentKind, Set<string>> = {
   presentation: new Set(['.ppt', '.pptx', '.odp']),
@@ -216,15 +290,14 @@ async function plannedSourceDocument(input: PlanArtifactInput, assets: DocumentA
   }
   const asset = assets.find((item) => item.origin === 'attachment' && item.ref === binding.ref);
   if (!asset) throw new Error('The selected source attachment could not be mounted into the document workspace.');
-  const buffer = await readFile(binding.path);
   return {
     operation: 'modify' as const,
     sourceDocument: {
       assetName: asset.assetName,
       attachmentId: binding.ref,
-      bytes: buffer.byteLength,
+      bytes: asset.bytes,
       fileName: binding.name,
-      sha256: createHash('sha256').update(buffer).digest('hex'),
+      sha256: asset.sha256,
     },
   };
 }
@@ -282,6 +355,14 @@ export async function syncDocumentAssets(
 ): Promise<DocumentAsset[]> {
   const destination = artifactDir(runId, 'document-assets');
   await mkdir(destination, { recursive: true });
+  const cachePath = path.join(destination, '.asset-cache.json');
+  type CachedAsset = Pick<DocumentAsset, 'bytes' | 'height' | 'optimized' | 'sha256' | 'width'> & { pipelineVersion: string; sourceSha256: string };
+  let cache: Record<string, CachedAsset> = {};
+  try {
+    cache = JSON.parse(await readFile(cachePath, 'utf8')) as Record<string, CachedAsset>;
+  } catch {
+    // The asset cache is optional and recreated after an interrupted write.
+  }
   const sources: Array<{ name: string; path: string; origin: DocumentAsset['origin']; ref?: string }> = [];
   for (const binding of attachmentBindings) {
     if (!binding.name || !binding.path) continue;
@@ -301,18 +382,37 @@ export async function syncDocumentAssets(
   for (const source of sources) {
     try {
       const metadata = await stat(source.path);
-      if (!metadata.isFile() || metadata.size > FILE_DOWNLOAD_MAX_BYTES) continue;
+      if (!metadata.isFile()) continue;
       const assetName = assetFileName(
         source.name,
         source.origin === 'attachment' ? `attachment-${source.ref || 'file'}` : source.origin,
         claimed,
       );
-      await copyFile(source.path, path.join(destination, assetName));
-      result.push({ assetName, bytes: metadata.size, origin: source.origin, ref: source.ref });
+      const target = path.join(destination, assetName);
+      const sourceSha256 = await sha256File(source.path);
+      const cached = cache[assetName];
+      if (cached?.pipelineVersion === OFFICE_PIPELINE_VERSION && cached.sourceSha256 === sourceSha256) {
+        try {
+          const cachedMetadata = await stat(target);
+          if (cachedMetadata.isFile() && cachedMetadata.size === cached.bytes && await sha256File(target) === cached.sha256) {
+            result.push({ assetName, bytes: cached.bytes, sha256: cached.sha256, origin: source.origin, ref: source.ref, width: cached.width, height: cached.height, optimized: cached.optimized });
+            continue;
+          }
+        } catch {
+          // Rebuild a missing cached derivative below.
+        }
+      }
+      await copyFile(source.path, target);
+      const image = await optimizeWorkspaceImage(target).catch(() => ({}));
+      const copiedMetadata = await stat(target);
+      const asset: DocumentAsset = { assetName, bytes: copiedMetadata.size, sha256: await sha256File(target), origin: source.origin, ref: source.ref, ...image };
+      result.push(asset);
+      cache[assetName] = { pipelineVersion: OFFICE_PIPELINE_VERSION, sourceSha256, bytes: asset.bytes, sha256: asset.sha256, width: asset.width, height: asset.height, optimized: asset.optimized };
     } catch {
       // A stale upload or artifact must not make unrelated document authoring fail.
     }
   }
+  await writeFile(cachePath, JSON.stringify(cache), 'utf8').catch(() => undefined);
   return result;
 }
 
@@ -373,7 +473,13 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}`;
     }
     if (payload.kind === 'uno-draft-validation') {
+      if (payload.validation === 'failed' || payload.validationStatus === 'failed' || payload.rolledBack) {
+        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; editRolledBack=${payload.rolledBack === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
+      }
       return `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`;
+    }
+    if (payload.kind === 'office-source-unit-validation' && payload.validation === 'failed') {
+      return `Office source-unit validation failed: Document ID: ${payload.documentId}; editRolledBack=${payload.rolledBack === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
@@ -466,14 +572,29 @@ async function writeLimitedResponse(response: Response, filePath: string, maxByt
   return bytes;
 }
 
-export async function downloadFileArtifact(input: DownloadArtifactInput): Promise<BrowserActionResult> {
+async function downloadFileArtifactUnlocked(input: DownloadArtifactInput, url: string, cacheKey: string): Promise<BrowserActionResult> {
   try {
-    const url = resolveDownloadUrl(input);
+    const dir = artifactDir(input.runId, 'downloads');
+    const cacheDirectory = path.join(dir, '.url-cache');
+    const cachePath = path.join(cacheDirectory, `${cacheKey}.json`);
+    try {
+      const cached = JSON.parse(await readFile(cachePath, 'utf8')) as ArtifactToolPayload;
+      const cachedPath = path.resolve(String(cached.path || ''));
+      const relative = path.relative(path.resolve(dir), cachedPath);
+      const metadata = relative && !relative.startsWith('..') && !path.isAbsolute(relative)
+        ? await stat(cachedPath)
+        : undefined;
+      if (metadata?.isFile()) {
+        return { ok: true, actual: JSON.stringify({ ...cached, bytes: metadata.size, cacheHit: true }) };
+      }
+    } catch {
+      // A missing or stale URL cache is a normal cache miss.
+    }
     const abortController = new AbortController();
     const timer = setTimeout(() => abortController.abort(new Error(`Download timed out after ${FILE_DOWNLOAD_TIMEOUT_MS}ms`)), FILE_DOWNLOAD_TIMEOUT_MS);
 
     try {
-      const { response, resolvedUrl } = await fetchDownloadResponse(url, abortController.signal);
+      const { response, resolvedUrl } = await fetchDownloadResponseWithRetry(url, abortController.signal);
       if (!response.ok) {
         return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${resolvedUrl}` };
       }
@@ -482,7 +603,6 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
         || fileNameFromUrl(resolvedUrl)
         || `download-${Date.now()}.bin`;
       const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
-      const dir = artifactDir(input.runId, 'downloads');
       await mkdir(dir, { recursive: true });
       const target = await uniqueArtifactPath(dir, fileName);
       let bytes = 0;
@@ -493,16 +613,19 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
         throw error;
       }
 
-      return {
-        ok: true,
-        actual: JSON.stringify(artifactResultPayload({
+      const payload = {
+        ...artifactResultPayload({
           kind: 'download',
           fileName: target.fileName,
           filePath: target.filePath,
           bytes,
           sourceUrl: resolvedUrl,
-        })),
+        }),
+        cacheHit: false,
       };
+      await mkdir(cacheDirectory, { recursive: true });
+      await writeFile(cachePath, JSON.stringify(payload), 'utf8');
+      return { ok: true, actual: JSON.stringify(payload) };
     } finally {
       clearTimeout(timer);
     }
@@ -520,6 +643,14 @@ function draftProgramPath(runId: string | undefined, documentId: string, generat
     artifactDir(runId, 'document-drafts'),
     `${sanitizeFileName(documentId, 'document')}${generator === 'javascript' ? '.mjs' : '.py'}`,
   );
+}
+
+function draftRevisionDirectory(runId: string | undefined, documentId: string) {
+  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.revisions`);
+}
+
+function draftRevisionFileName(revision: number, generator: OfficeDocumentDraft['generator'] = 'uno') {
+  return `${String(revision).padStart(6, '0')}${generator === 'javascript' ? '.mjs' : '.py'}`;
 }
 
 function draftTransactionPath(runId: string | undefined, documentId: string) {
@@ -556,7 +687,18 @@ async function acquireFilesystemDraftLock(runId: string | undefined, documentId:
       if (code !== 'EEXIST') throw error;
       try {
         const metadata = await stat(lockPath);
-        if (Date.now() - metadata.mtimeMs > STALE_DRAFT_LOCK_MS) await unlink(lockPath).catch(() => undefined);
+        let ownerIsAlive = true;
+        try {
+          const owner = JSON.parse(await readFile(lockPath, 'utf8')) as { pid?: number };
+          if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) < 1) ownerIsAlive = false;
+          else process.kill(Number(owner.pid), 0);
+        } catch {
+          ownerIsAlive = false;
+        }
+        if (!ownerIsAlive || Date.now() - metadata.mtimeMs > STALE_DRAFT_LOCK_MS) {
+          await unlink(lockPath).catch(() => undefined);
+          continue;
+        }
       } catch (lockError) {
         const lockCode = lockError && typeof lockError === 'object' && 'code' in lockError ? String((lockError as { code?: unknown }).code || '') : '';
         if (lockCode !== 'ENOENT') throw lockError;
@@ -564,6 +706,26 @@ async function acquireFilesystemDraftLock(runId: string | undefined, documentId:
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for the workspace draft lock for ${documentId}.`);
       await racePromiseWithAbort(new Promise((resolve) => setTimeout(resolve, 50)), abortSignal);
     }
+  }
+}
+
+export async function downloadFileArtifact(input: DownloadArtifactInput): Promise<BrowserActionResult> {
+  let url: string;
+  try {
+    url = resolveDownloadUrl(input);
+  } catch (error) {
+    return { ok: false, actual: `downloadFile failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const cacheKey = downloadCacheKey(input, url);
+  const activeKey = `${sanitizeFileName(input.runId, 'adhoc')}:${cacheKey}`;
+  const existing = activeDownloads.get(activeKey);
+  if (existing) return existing;
+  const pending = downloadFileArtifactUnlocked(input, url, cacheKey);
+  activeDownloads.set(activeKey, pending);
+  try {
+    return await pending;
+  } finally {
+    if (activeDownloads.get(activeKey) === pending) activeDownloads.delete(activeKey);
   }
 }
 
@@ -611,6 +773,36 @@ async function fetchDownloadResponse(url: string, signal: AbortSignal) {
   if (!canonical || canonical === url) return { response, resolvedUrl: url };
   await response.body?.cancel().catch(() => undefined);
   return { response: await fetch(canonical, { signal, redirect: 'follow' }), resolvedUrl: canonical };
+}
+
+function downloadCacheKey(input: DownloadArtifactInput, url: string) {
+  return createHash('sha256').update(`${url}\n${String(input.fileName || '')}`, 'utf8').digest('hex');
+}
+
+function downloadRetryDelay(response: Response, attempt: number) {
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1_000);
+    const dateDelay = Date.parse(retryAfter) - Date.now();
+    if (Number.isFinite(dateDelay) && dateDelay > 0) return Math.min(30_000, dateDelay);
+  }
+  return FILE_DOWNLOAD_RETRY_DELAYS_MS[Math.min(attempt, FILE_DOWNLOAD_RETRY_DELAYS_MS.length - 1)];
+}
+
+async function waitForDownloadRetry(delayMs: number, signal: AbortSignal) {
+  await racePromiseWithAbort(new Promise<void>((resolve) => setTimeout(resolve, delayMs)), signal);
+}
+
+async function fetchDownloadResponseWithRetry(url: string, signal: AbortSignal) {
+  const retryable = new Set([429, 502, 503, 504]);
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await fetchDownloadResponse(url, signal);
+    if (!retryable.has(result.response.status) || attempt >= FILE_DOWNLOAD_RETRY_DELAYS_MS.length) return result;
+    const delayMs = downloadRetryDelay(result.response, attempt);
+    await result.response.body?.cancel().catch(() => undefined);
+    await waitForDownloadRetry(delayMs, signal);
+  }
 }
 
 async function writeDraftJsonAtomically(target: string, draft: OfficeDocumentDraft) {
@@ -668,6 +860,19 @@ async function loadDraft(runId: string | undefined, documentId: string) {
   parsed.generator ||= 'uno';
   parsed.operation ||= parsed.sourceDocument ? 'modify' : 'create';
   parsed.renderedDigest ||= parsed.renderedSourceDigest;
+  parsed.workflow ||= {
+    state: parsed.visualQaDigest && parsed.visualQaDigest === parsed.renderedDigest
+      ? 'completed'
+      : parsed.renderedDigest
+        ? 'qa-pending'
+        : parsed.validatedSourceDigest === parsed.sourceDigest
+          ? 'render-ready'
+          : parsed.program
+            ? 'authoring'
+            : 'planned',
+    checkpointAt: parsed.updatedAt || parsed.createdAt,
+    renderedDigest: parsed.renderedDigest,
+  };
   if (parsed.documentId !== documentId) throw new Error('Document draft identity does not match the requested documentId.');
   if (parsed.program) {
     try {
@@ -687,14 +892,29 @@ async function loadDraft(runId: string | undefined, documentId: string) {
       // A pre-workspace draft remains readable and is migrated on its next save.
     }
   }
+  if (parsed.workflow?.state === 'rendering' || parsed.workflow?.state === 'validating') {
+    const recoveredFrom = parsed.workflow.state;
+    const currentDigest = parsed.sourceDigest || sourceDigest(parsed.program || '');
+    parsed.workflow = {
+      state: parsed.visualQaDigest && parsed.visualQaDigest === parsed.renderedDigest
+        ? 'completed'
+        : parsed.renderedDigest === currentDigest
+          ? 'qa-pending'
+          : parsed.validatedSourceDigest === currentDigest
+            ? 'render-ready'
+            : 'authoring',
+      checkpointAt: new Date().toISOString(),
+      error: `Recovered after an interrupted ${recoveredFrom} stage; completed checkpoints were preserved.`,
+      recoveredFrom,
+      renderedDigest: parsed.renderedDigest,
+    };
+  }
   return parsed;
 }
 
-async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
+async function writeDraftWorkspace(runId: string | undefined, draft: OfficeDocumentDraft) {
   const dir = artifactDir(runId, 'document-drafts');
   await mkdir(dir, { recursive: true });
-  draft.updatedAt = new Date().toISOString();
-  draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
   const target = draftPath(runId, draft.documentId);
   const programTarget = draftProgramPath(runId, draft.documentId, draft.generator);
   const transactionTarget = draftTransactionPath(runId, draft.documentId);
@@ -720,12 +940,147 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   }
 }
 
+async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
+  const dir = artifactDir(runId, 'document-drafts');
+  await mkdir(dir, { recursive: true });
+  draft.updatedAt = new Date().toISOString();
+  draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
+  if (draft.program) synchronizeSourceUnits(draft);
+  if (draft.program && draft.sourceDigest) {
+    const revisions = Array.isArray(draft.revisions) ? [...draft.revisions] : [];
+    const latest = revisions.at(-1);
+    if (!latest || latest.sourceDigest !== draft.sourceDigest) {
+      const revision = Math.max(0, ...revisions.map((item) => Number(item.revision) || 0)) + 1;
+      const sourceFileName = draftRevisionFileName(revision, draft.generator);
+      const revisionDirectory = draftRevisionDirectory(runId, draft.documentId);
+      const revisionTarget = path.join(revisionDirectory, sourceFileName);
+      const revisionCandidate = path.join(revisionDirectory, `.${sourceFileName}.${randomUUID()}.tmp`);
+      await mkdir(revisionDirectory, { recursive: true });
+      try {
+        await writeFile(revisionCandidate, draft.program, { encoding: 'utf8', flag: 'wx' });
+        await rename(revisionCandidate, revisionTarget);
+      } finally {
+        await unlink(revisionCandidate).catch(() => undefined);
+      }
+      revisions.push({ revision, sourceDigest: draft.sourceDigest, createdAt: draft.updatedAt, sourceFileName });
+      draft.currentRevision = revision;
+      draft.revisions = revisions;
+    } else {
+      draft.currentRevision = latest.revision;
+      draft.revisions = revisions;
+    }
+  }
+  await writeDraftWorkspace(runId, draft);
+}
+
+async function restoreDraftSnapshot(
+  runId: string | undefined,
+  snapshot: OfficeDocumentDraft,
+  rejectedDraft: OfficeDocumentDraft,
+) {
+  const keep = new Set((snapshot.revisions || []).map((revision) => revision.sourceFileName));
+  const rejectedOnly = (rejectedDraft.revisions || []).filter((revision) => !keep.has(revision.sourceFileName));
+  await Promise.all(rejectedOnly.map((revision) => unlink(path.join(
+    draftRevisionDirectory(runId, snapshot.documentId),
+    path.basename(revision.sourceFileName),
+  )).catch(() => undefined)));
+  await writeDraftWorkspace(runId, structuredClone(snapshot));
+}
+
+function invalidateActiveVisualQa(draft: OfficeDocumentDraft) {
+  draft.visualQaArtifactId = undefined;
+  draft.visualQaDigest = undefined;
+  draft.visualQaPageCount = undefined;
+  draft.visualQaSeenPages = [];
+  draft.visualQaReviews = [];
+  draft.visualQaPageDigests = [];
+}
+
 function sourceDigest(source: string) {
   return createHash('sha256').update(source, 'utf8').digest('hex');
 }
 
 function normalizedDraftSource(source: string) {
   return source.replace(/\r\n?/g, '\n');
+}
+
+type ParsedSourceUnit = {
+  content: string;
+  endLine: number;
+  path: string;
+  startLine: number;
+};
+
+const SOURCE_UNIT_START = /^\s*(?:#|\/\/)\s*@webpilot-unit\s+([A-Za-z0-9][A-Za-z0-9._/-]{0,159})\s*$/;
+const SOURCE_UNIT_END = /^\s*(?:#|\/\/)\s*@webpilot-endunit\s*$/;
+
+function normalizedSourceUnitPath(value: string | undefined) {
+  const unitPath = String(value || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!unitPath || unitPath.includes('..') || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,159}$/.test(unitPath)) {
+    throw new Error('Office source unit path must be a relative path using letters, numbers, dot, underscore, slash, or hyphen.');
+  }
+  return unitPath;
+}
+
+function parseSourceUnits(source: string): ParsedSourceUnit[] {
+  const lines = normalizedDraftSource(source).split('\n');
+  const units: ParsedSourceUnit[] = [];
+  const names = new Set<string>();
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = SOURCE_UNIT_START.exec(lines[index]);
+    if (!match) continue;
+    const unitPath = normalizedSourceUnitPath(match[1]);
+    if (names.has(unitPath)) throw new Error(`Duplicate Office source unit path: ${unitPath}.`);
+    const endMarker = lines.findIndex((line, candidate) => candidate > index && SOURCE_UNIT_END.test(line));
+    if (endMarker < 0) throw new Error(`Office source unit ${unitPath} is missing @webpilot-endunit.`);
+    const nested = lines.slice(index + 1, endMarker).find((line) => SOURCE_UNIT_START.test(line));
+    if (nested) throw new Error(`Office source unit ${unitPath} contains a nested unit marker.`);
+    units.push({ path: unitPath, startLine: index + 2, endLine: endMarker, content: lines.slice(index + 1, endMarker).join('\n') });
+    names.add(unitPath);
+    index = endMarker;
+  }
+  return units;
+}
+
+function replaceSourceUnit(source: string, unit: ParsedSourceUnit, content: string) {
+  const lines = normalizedDraftSource(source).split('\n');
+  lines.splice(unit.startLine - 1, Math.max(0, unit.endLine - unit.startLine + 1), ...normalizedDraftSource(content).split('\n'));
+  return lines.join('\n');
+}
+
+function isolateSourceUnit(source: string, requestedPath: string, generator: OfficeDocumentDraft['generator']) {
+  const lines = normalizedDraftSource(source).split('\n');
+  const units = parseSourceUnits(source);
+  for (const unit of [...units].reverse()) {
+    if (unit.path === requestedPath) continue;
+    const current = lines.slice(unit.startLine - 1, unit.endLine);
+    const contentIndent = current.find((line) => line.trim())?.match(/^\s*/)?.[0];
+    const markerIndent = lines[unit.startLine - 2]?.match(/^\s*/)?.[0] || '';
+    const indent = contentIndent ?? `${markerIndent}${generator === 'javascript' ? '  ' : '    '}`;
+    const replacement = generator === 'javascript' ? `${indent}// unchanged source unit skipped during isolated validation` : `${indent}pass`;
+    lines.splice(unit.startLine - 1, Math.max(0, unit.endLine - unit.startLine + 1), replacement);
+  }
+  return lines.join('\n');
+}
+
+function synchronizeSourceUnits(draft: OfficeDocumentDraft, validation?: 'failed' | 'passed') {
+  const previous = new Map((draft.sourceUnits || []).map((unit) => [unit.path, unit]));
+  const units = parseSourceUnits(draft.program || '');
+  draft.sourceUnits = units.map((unit) => {
+    const digest = sourceDigest(unit.content);
+    const prior = previous.get(unit.path);
+    const alreadyValidated = prior?.validatedDigest === digest;
+    return {
+      path: unit.path,
+      sourceDigest: digest,
+      validatedDigest: validation === 'passed' ? digest : alreadyValidated ? digest : undefined,
+      status: validation === 'passed' || alreadyValidated
+        ? 'passed' as const
+        : validation === 'failed' || (prior?.sourceDigest === digest && prior.status === 'failed')
+          ? 'failed' as const
+          : 'pending' as const,
+    };
+  });
 }
 
 function draftSourceLineCount(source: string) {
@@ -744,12 +1099,52 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
     throw new Error('file action=edit requires at least one line edit.');
   }
   const normalized = normalizedDraftSource(source);
+  const textEdits = edits.filter((edit) => edit.kind === 'replaceText');
+  if (textEdits.length) {
+    if (textEdits.length !== edits.length) throw new Error('replaceText edits cannot be mixed with line edits in one atomic batch.');
+    const replacements = textEdits.map((edit, editIndex) => {
+      const oldText = normalizedDraftSource(String(edit.oldText || ''));
+      if (!oldText) throw new Error(`source edit ${editIndex + 1} replaceText requires non-empty oldText.`);
+      const offsets: number[] = [];
+      let cursor = 0;
+      while (cursor <= normalized.length - oldText.length) {
+        const found = normalized.indexOf(oldText, cursor);
+        if (found < 0) break;
+        offsets.push(found);
+        cursor = found + Math.max(1, oldText.length);
+      }
+      const occurrence = edit.occurrence === undefined ? undefined : Number(edit.occurrence);
+      if (occurrence !== undefined && (!Number.isInteger(occurrence) || occurrence < 1)) {
+        throw new Error(`source edit ${editIndex + 1} occurrence must be a positive integer.`);
+      }
+      if (!offsets.length) throw new Error(`source edit ${editIndex + 1} could not find oldText in the current source.`);
+      if (occurrence === undefined && offsets.length !== 1) {
+        throw new Error(`source edit ${editIndex + 1} oldText matched ${offsets.length} locations; provide occurrence or a larger exact source region.`);
+      }
+      const start = offsets[(occurrence || 1) - 1];
+      if (start === undefined) throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches.`);
+      return { start, end: start + oldText.length, newText: normalizedDraftSource(edit.newText), editIndex };
+    });
+    const ordered = [...replacements].sort((left, right) => left.start - right.start);
+    for (let index = 1; index < ordered.length; index += 1) {
+      if (ordered[index].start < ordered[index - 1].end) {
+        throw new Error(`source edits ${ordered[index - 1].editIndex + 1} and ${ordered[index].editIndex + 1} overlap.`);
+      }
+    }
+    let result = normalized;
+    for (const edit of replacements.sort((left, right) => right.start - left.start)) {
+      result = `${result.slice(0, edit.start)}${edit.newText}${result.slice(edit.end)}`;
+    }
+    return result;
+  }
   const hasFinalNewline = normalized.endsWith('\n');
   const lines = hasFinalNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
   const lineCount = lines.length;
   const ordered = edits.map((edit, editIndex) => {
-    const startLine = Number(edit?.startLine);
-    const endLine = Number(edit?.endLine);
+    const kind = edit.kind || 'replaceRange';
+    const anchorLine = Number(edit.line);
+    const startLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.startLine);
+    const endLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.endLine);
     if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
       throw new Error(`source edit ${editIndex + 1} requires integer startLine and endLine from action=read.`);
     }
@@ -759,7 +1154,15 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
     if (typeof edit.newText !== 'string') {
       throw new Error(`source edit ${editIndex + 1} requires string newText.`);
     }
-    return { ...edit, startLine, endLine, editIndex };
+    const currentLine = lines[startLine - 1];
+    const newText = kind === 'deleteRange'
+      ? ''
+      : kind === 'insertBefore'
+        ? `${edit.newText}${edit.newText.endsWith('\n') ? '' : '\n'}${currentLine}`
+        : kind === 'insertAfter'
+          ? `${currentLine}\n${edit.newText}`
+          : edit.newText;
+    return { ...edit, startLine, endLine, newText, editIndex };
   });
   const ascending = [...ordered].sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine);
   for (let index = 1; index < ascending.length; index += 1) {
@@ -773,6 +1176,53 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
     lines.splice(edit.startLine - 1, edit.endLine - edit.startLine + 1, ...replacementLines);
   }
   return `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`;
+}
+
+export function applyUnoDraftPatch(source: string, patchText: string) {
+  const normalized = normalizedDraftSource(source);
+  const hasFinalNewline = normalized.endsWith('\n');
+  const sourceLines = (hasFinalNewline ? normalized.slice(0, -1) : normalized).split('\n');
+  const patchLines = normalizedDraftSource(String(patchText || '')).split('\n');
+  const output: string[] = [];
+  let sourceIndex = 0;
+  let patchIndex = 0;
+  let hunkCount = 0;
+  while (patchIndex < patchLines.length) {
+    const header = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/.exec(patchLines[patchIndex]);
+    if (!header) {
+      patchIndex += 1;
+      continue;
+    }
+    hunkCount += 1;
+    const oldStart = Number(header[1]) - 1;
+    if (oldStart < sourceIndex || oldStart > sourceLines.length) throw new Error(`patch hunk ${hunkCount} has an invalid or overlapping source range.`);
+    output.push(...sourceLines.slice(sourceIndex, oldStart));
+    sourceIndex = oldStart;
+    patchIndex += 1;
+    while (patchIndex < patchLines.length && !patchLines[patchIndex].startsWith('@@ ')) {
+      const line = patchLines[patchIndex];
+      patchIndex += 1;
+      if (line.startsWith('\\ No newline at end of file')) continue;
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ' || marker === '-') {
+        if (sourceLines[sourceIndex] !== text) {
+          throw new Error(`patch hunk ${hunkCount} no longer matches source line ${sourceIndex + 1}. Read the current draft and regenerate the patch.`);
+        }
+        if (marker === ' ') output.push(text);
+        sourceIndex += 1;
+      } else if (marker === '+') {
+        output.push(text);
+      } else if (line === '') {
+        // A trailing empty line outside a hunk is harmless.
+      } else {
+        throw new Error(`patch hunk ${hunkCount} contains an invalid line marker.`);
+      }
+    }
+  }
+  if (!hunkCount) throw new Error('file action=edit patch requires at least one unified diff hunk.');
+  output.push(...sourceLines.slice(sourceIndex));
+  return `${output.join('\n')}${hasFinalNewline ? '\n' : ''}`;
 }
 
 function numberedDraftSource(source: string) {
@@ -790,6 +1240,13 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
     if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading an Office source draft.' };
     const draft = await loadDraft(input.runId, documentId);
     if (!draft.program) return { ok: false, actual: `Office draft ${documentId} has no source yet; call action=generate first.` };
+    const units = parseSourceUnits(draft.program);
+    const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
+    const requestedUnit = requestedPath ? units.find((unit) => unit.path === requestedPath) : undefined;
+    if (requestedPath && !requestedUnit) {
+      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Read the document without path to list available source units.` };
+    }
+    const readableSource = requestedUnit?.content ?? draft.program;
     return {
       ok: true,
       actual: JSON.stringify({
@@ -805,9 +1262,29 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
           assetName: draft.sourceDocument.assetName,
           fileName: draft.sourceDocument.fileName,
         } : undefined,
-        sourceDigest: sourceDigest(draft.program),
-        lineCount: draftSourceLineCount(draft.program),
-        program: numberedDraftSource(draft.program),
+        sourceDigest: sourceDigest(readableSource),
+        documentSourceDigest: sourceDigest(draft.program),
+        currentRevision: draft.currentRevision || null,
+        validatedRevision: draft.validatedRevision || null,
+        validatedSourceDigest: draft.validatedSourceDigest || null,
+        validationStatus: draft.validationStatus || 'pending',
+        validationDiagnostics: draft.validationDiagnostics || [],
+        workflow: draft.workflow,
+        revisions: (draft.revisions || []).map((revision) => ({
+          revision: revision.revision,
+          sourceDigest: revision.sourceDigest,
+          createdAt: revision.createdAt,
+        })),
+        sourceUnitPath: requestedUnit?.path,
+        sourceUnitGlobalLines: requestedUnit ? { startLine: requestedUnit.startLine, endLine: requestedUnit.endLine } : undefined,
+        sourceUnits: units.map((unit) => ({
+          path: unit.path,
+          sourceDigest: sourceDigest(unit.content),
+          lineCount: draftSourceLineCount(unit.content),
+          status: draft.sourceUnits?.find((state) => state.path === unit.path)?.status || 'pending',
+        })),
+        lineCount: draftSourceLineCount(readableSource),
+        program: numberedDraftSource(readableSource),
       }),
     };
   } catch (error) {
@@ -831,7 +1308,7 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
     if (!input.documentType || !input.target) return { ok: false, actual: 'file action=unoApi requires documentType and target.' };
     return {
       ok: true,
-      actual: JSON.stringify({ kind: 'uno-api', ...(await inspectUnoApi({
+      actual: JSON.stringify({ kind: 'uno-api', sourceUnitGuidance: 'For large sources, optional # @webpilot-unit pages/slide-001 and # @webpilot-endunit markers allow path-scoped read/edit with local line numbers. Keep shared helpers outside page units.', ...(await inspectUnoApi({
         documentType: input.documentType,
         target: input.target,
         query: input.query,
@@ -844,19 +1321,62 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
   }
 }
 
-export function getOfficeJsApi(input: Pick<UnoApiInput, 'documentType'>): BrowserActionResult {
-  if (!input.documentType) return { ok: false, actual: 'file action=jsApi requires documentType.' };
+export async function getOfficeJsApi(
+  input: Pick<UnoApiInput, 'runId' | 'documentId' | 'documentType'>,
+): Promise<BrowserActionResult> {
+  const documentId = String(input.documentId || '').trim();
+  if (!documentId) {
+    return { ok: false, actual: 'file action=jsApi requires the documentId returned by action=plan.' };
+  }
+  let draft: OfficeDocumentDraft;
+  try {
+    draft = await loadDraft(input.runId, documentId);
+  } catch (error) {
+    const code = error && typeof error === 'object' && 'code' in error
+      ? String((error as { code?: unknown }).code || '')
+      : '';
+    if (code === 'ENOENT') {
+      return { ok: false, actual: `Office draft ${documentId} is not planned. Call action=plan before action=jsApi.` };
+    }
+    return { ok: false, actual: `JavaScript Office API inspection failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if ((draft.generator || 'uno') !== 'javascript') {
+    return {
+      ok: false,
+      actual: `Document ${documentId} uses UNO generation. JavaScript API guidance is unavailable for this draft; call action=unoApi instead.`,
+    };
+  }
+  if (input.documentType && input.documentType !== draft.documentType) {
+    return {
+      ok: false,
+      actual: `Document ${documentId} is planned as ${draft.documentType}, not ${input.documentType}. Use the planned documentType.`,
+    };
+  }
+  const documentType = draft.documentType;
   const examples = {
     presentation: `export async function createDocument(job) {
   const pptx = new job.PptxGenJS();
   pptx.layout = 'LAYOUT_WIDE';
+  const assets = await job.listAssets();
+  const exactImageName = 'replace-with-an-exact-name-from-availableAssets.png';
+  const image = assets.find((asset) => asset.name === exactImageName);
   const slide = pptx.addSlide();
   slide.addText('Title', { x: 0.7, y: 0.5, w: 12, h: 0.6, fontSize: 28, bold: true, margin: 0, breakLine: false, fit: 'shrink' });
+  if (image) slide.addImage({ path: await job.assetPath(image.name), x: 0.7, y: 1.4, w: 5.2, h: 3.2 });
   await pptx.writeFile({ fileName: job.outputPath });
 }`,
     word: `export async function createDocument(job) {
-  const { Document, Packer, Paragraph, TextRun } = job.docx;
-  const document = new Document({ sections: [{ children: [new Paragraph({ children: [new TextRun({ text: 'Title', bold: true, size: 40 })] })] }] });
+  const { Document, Packer, PageBreak, Paragraph, Table, TableCell, TableRow, TextRun } = job.docx;
+  const table = new Table({ rows: [new TableRow({ children: [
+    new TableCell({ children: [new Paragraph('Item')] }),
+    new TableCell({ children: [new Paragraph('Value')] }),
+  ] })] });
+  const document = new Document({ sections: [{ children: [
+    new Paragraph({ children: [new TextRun({ text: 'Title', bold: true, size: 40 })] }),
+    table,
+    new Paragraph({ children: [new PageBreak()] }),
+    new Paragraph('Second page'),
+  ] }] });
   await job.writeOutput(await Packer.toBuffer(document));
 }`,
     spreadsheet: `export async function createDocument(job) {
@@ -867,11 +1387,36 @@ export function getOfficeJsApi(input: Pick<UnoApiInput, 'documentType'>): Browse
   await workbook.xlsx.writeFile(job.outputPath);
 }`,
   } as const;
+  const recipes = {
+    assets: `const assets = await job.listAssets(); // [{ name, bytes }]
+const assetByName = new Map(assets.map((asset) => [asset.name, asset]));
+const exactName = 'copy-the-exact-availableAssets-name.png';
+if (!assetByName.has(exactName)) throw new Error('Missing asset: ' + exactName);
+const localPath = await job.assetPath(exactName);`,
+    presentationImage: `const slide = pptx.addSlide();
+slide.addImage({ path: await job.assetPath(exactName), x: 0.7, y: 1.2, w: 5.4, h: 3.4 });`,
+    wordImage: `import { readFile } from 'node:fs/promises';
+const { ImageRun, Paragraph } = job.docx;
+const imageBytes = await readFile(await job.assetPath(exactName));
+const imageParagraph = new Paragraph({ children: [new ImageRun({ data: imageBytes, transformation: { width: 640, height: 360 } })] });`,
+    wordTable: `const { Paragraph, Table, TableCell, TableRow } = job.docx;
+const table = new Table({ rows: [
+  new TableRow({ children: [
+    new TableCell({ children: [new Paragraph('Item')] }),
+    new TableCell({ children: [new Paragraph('Value')] }),
+  ] }),
+] });`,
+    wordPageBreak: `const { PageBreak, Paragraph } = job.docx;
+const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
+    pdf: `// For a planned .pdf, author the planned Word/PowerPoint/Spreadsheet source normally.
+// job.outputPath already points to the correct temporary Office extension.
+// The server converts that Office output to PDF after createDocument returns.`,
+  };
   return {
     ok: true,
     actual: JSON.stringify({
       kind: 'office-js-api',
-      documentType: input.documentType,
+      documentType,
       libraries: {
         presentation: 'pptxgenjs via job.PptxGenJS',
         word: 'docx via job.docx',
@@ -879,15 +1424,23 @@ export function getOfficeJsApi(input: Pick<UnoApiInput, 'documentType'>): Browse
       },
       rules: [
         'Export exactly one async or synchronous createDocument(job) function.',
-        'The initial action=generate may be a small, runnable skeleton; do not try to author the entire document in one call. Add pages, sections, assets, and layout incrementally with repeated action=edit line-range changes, validating after each bounded change.',
+        'Recommended workflow: action=generate may create a small runnable skeleton, then repeated action=edit calls can add pages, sections, assets, and layout incrementally. This is guidance, not a size restriction; a complete runnable initial program remains valid when appropriate.',
+        'For large sources, optional // @webpilot-unit pages/slide-001 and // @webpilot-endunit markers let later file read/edit calls use path="pages/slide-001" and local line numbers. Keep shared theme/helpers outside page units.',
         'Write the final editable Office file to job.outputPath, or use await job.writeOutput(buffer) for docx buffers.',
-        'Use await job.assetPath(exactName) and await job.listAssets() for conversation assets.',
+        'job.listAssets() returns objects shaped exactly as { name, bytes }, never strings. Read asset.name; never call split() on an asset object.',
+        'Use the exact availableAssets/listAssets name without URL encoding, decoding, basename guessing, or invented prefixes, then call await job.assetPath(exactName).',
+        'For DOCX images, read local bytes from await job.assetPath(exactName) and pass them to ImageRun. Do not pass a path string as ImageRun data.',
+        'DOCX Table.rows must contain TableRow instances, and each TableRow.children must contain TableCell instances; plain nested arrays are invalid.',
+        'Insert a DOCX page break with a PageBreak child inside a Paragraph.',
+        'To inspect an already-downloaded image asset, call file action=read with its exact artifactId. That result reports dimensions and aspect ratio from the saved bytes; do not probe a remote thumbnail URL with browserCode.',
         'Do not fetch remote URLs from the draft; download assets with the file tool first.',
         'JavaScript mode creates PPTX, DOCX, or XLSX directly. A .pdf target is supported by creating the matching Office source for documentType and converting it with local LibreOffice.',
         'For PDF, still write to job.outputPath exactly as shown; its temporary extension is already the correct .pptx, .docx, or .xlsx source format.',
         'Existing-file modification remains UNO-based.',
+        'A rejected action=edit candidate is rolled back to the previous working source. Use the returned lastSuccessfulRevision/recoverySuggestion, make a focused edit, and call action=read only when fresh line numbers are needed.',
       ],
-      completeDocument: examples[input.documentType],
+      recipes,
+      completeDocument: examples[documentType],
     }),
   };
 }
@@ -895,8 +1448,14 @@ export function getOfficeJsApi(input: Pick<UnoApiInput, 'documentType'>): Browse
 type ValidatedDraftCandidate = {
   assets: DocumentAsset[];
   cacheHit: boolean;
-  generated: GeneratedFileOutput;
-  previewPath?: string;
+  validation: Awaited<ReturnType<typeof validateOfficeArtifact>>;
+  generated: {
+    bytes: number;
+    diagnostics?: unknown;
+    extension: string;
+    outputPath: string;
+    previewPath?: string;
+  };
 };
 
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
@@ -913,24 +1472,31 @@ function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDr
 }
 
 function documentAssetsFingerprint(assets: DocumentAsset[]) {
-  return createHash('sha256').update(JSON.stringify(assets.map((asset) => ({
+  return createHash('sha256').update(JSON.stringify({
+    pipelineVersion: OFFICE_PIPELINE_VERSION,
+    assets: assets.map((asset) => ({
     assetName: asset.assetName,
     bytes: asset.bytes,
+    sha256: asset.sha256,
     origin: asset.origin,
     ref: asset.ref,
-  }))), 'utf8').digest('hex');
+    })),
+  }), 'utf8').digest('hex');
 }
 
-async function prepareValidatedDraft(input: {
+async function prepareValidatedDraftLegacy(input: {
   runId?: string;
   draft: OfficeDocumentDraft;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
-}): Promise<ValidatedDraftCandidate> {
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
+}): Promise<Omit<ValidatedDraftCandidate, 'validation'>> {
   if (!input.draft.program) throw new Error(`Office draft ${input.draft.documentId} has no source yet; call action=generate first.`);
-  // Save first: a failing program remains editable just like it would in a
-  // normal code editor, while the generated candidate remains unpublished.
+  // Validation runs against the workspace candidate. action=edit restores the
+  // previous snapshot if this candidate fails; initial generation keeps its
+  // first source so the model can repair the skeleton.
   await saveDraft(input.runId, input.draft);
+  await input.onProgress?.({ phase: 'assets', message: '正在同步文件素材' });
   const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
   const assetFingerprint = documentAssetsFingerprint(assets);
   const extension = path.extname(input.draft.fileName).toLowerCase();
@@ -938,31 +1504,124 @@ async function prepareValidatedDraft(input: {
   try {
     const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as { assetFingerprint?: string };
     if (metadata.assetFingerprint === assetFingerprint) {
-      const buffer = await readFile(cache.artifactPath);
-      const previewPdf = await readFile(cache.previewPath).catch(() => undefined);
+      const artifactMetadata = await stat(cache.artifactPath);
+      const previewMetadata = await stat(cache.previewPath).catch(() => undefined);
       return {
         assets,
         cacheHit: true,
-        generated: { buffer, extension: extension as GeneratedFileOutput['extension'], previewPdf },
-        previewPath: previewPdf ? cache.previewPath : undefined,
+        generated: {
+          bytes: artifactMetadata.size,
+          extension,
+          outputPath: cache.artifactPath,
+          previewPath: previewMetadata?.isFile() ? cache.previewPath : undefined,
+        },
       };
     }
   } catch {
     // A missing or interrupted cache is not a document failure; regenerate it.
   }
-  const generated = await generateFileBuffer({
+  await input.onProgress?.({ phase: 'execute', message: '正在执行文档脚本' });
+  const generated = await generateFileToPaths({
     ...input.draft,
     programPath: draftProgramPath(input.runId, input.draft.documentId, input.draft.generator),
+    outputPath: cache.artifactPath,
+    previewPath: cache.previewPath,
     assetsPath: artifactDir(input.runId, 'document-assets'),
     generator: input.draft.generator,
     requiredSourceAssetName: input.draft.sourceDocument?.assetName,
     abortSignal: input.abortSignal,
+    onProgress: input.onProgress,
   });
-  await writeFile(cache.artifactPath, generated.buffer);
-  if (generated.previewPdf) await writeFile(cache.previewPath, generated.previewPdf);
-  else await unlink(cache.previewPath).catch(() => undefined);
   await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint }), 'utf8');
-  return { assets, cacheHit: false, generated, previewPath: generated.previewPdf ? cache.previewPath : undefined };
+  return { assets, cacheHit: false, generated };
+}
+
+async function prepareValidatedDraft(input: {
+  runId?: string;
+  draft: OfficeDocumentDraft;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
+}): Promise<ValidatedDraftCandidate> {
+  if (!input.draft.program) throw new Error(`Office draft ${input.draft.documentId} has no source yet; call action=generate first.`);
+  try {
+    input.draft.validationStatus = 'pending';
+    input.draft.workflow = { state: 'validating', checkpointAt: new Date().toISOString() };
+    await saveDraft(input.runId, input.draft);
+    await input.onProgress?.({ phase: 'static-analysis', message: '正在检查脚本语法和确定性错误' });
+    const staticAnalysis = await analyzeOfficeProgram(input.draft.program, input.draft.generator || 'uno');
+    const parsedUnits = parseSourceUnits(input.draft.program);
+    const staticDiagnostics = staticAnalysis.diagnostics.map((diagnostic) => {
+      const unit = diagnostic.line
+        ? parsedUnits.find((candidate) => diagnostic.line! >= candidate.startLine && diagnostic.line! <= candidate.endLine)
+        : undefined;
+      return unit ? { ...diagnostic, unitPath: unit.path } : diagnostic;
+    });
+    input.draft.validationDiagnostics = staticDiagnostics;
+    if (!staticAnalysis.passed) {
+      const error = new Error(staticDiagnostics
+        .filter((item) => item.severity === 'error')
+        .map((item) => `${item.line || '?'}:${item.column || '?'} ${item.message}`)
+        .join('\n'));
+      Object.assign(error, { diagnostics: staticDiagnostics });
+      throw error;
+    }
+    let candidate = await prepareValidatedDraftLegacy(input);
+    await input.onProgress?.({ phase: 'artifact-validation', message: '正在执行统一 Office、字体和嵌入图片检查' });
+    let validation = await validateOfficeArtifact({
+      absolutePath: candidate.generated.outputPath,
+      extension: candidate.generated.extension,
+    });
+    if (!validation.passed && candidate.cacheHit) {
+      const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
+      await Promise.all([
+        unlink(cache.artifactPath).catch(() => undefined),
+        unlink(cache.metadataPath).catch(() => undefined),
+        unlink(cache.previewPath).catch(() => undefined),
+      ]);
+      candidate = await prepareValidatedDraftLegacy(input);
+      validation = await validateOfficeArtifact({
+        absolutePath: candidate.generated.outputPath,
+        extension: candidate.generated.extension,
+      });
+    }
+    if (!validation.passed) {
+      const error = new Error(validation.issues
+        .filter((issue) => issue.severity === 'error')
+        .map((issue) => issue.message)
+        .join('\n'));
+      Object.assign(error, { diagnostics: validation.issues });
+      throw error;
+    }
+    input.draft.validationStatus = 'passed';
+    input.draft.validatedRevision = input.draft.currentRevision;
+    input.draft.validatedSourceDigest = sourceDigest(input.draft.program);
+    input.draft.validationDiagnostics = [
+      ...staticDiagnostics,
+      ...validation.issues.map((issue) => ({ code: issue.code, message: issue.message, severity: issue.severity })),
+    ];
+    synchronizeSourceUnits(input.draft, 'passed');
+    input.draft.workflow = { state: 'render-ready', checkpointAt: new Date().toISOString() };
+    await saveDraft(input.runId, input.draft);
+    return { ...candidate, validation };
+  } catch (error) {
+    const diagnostics = error && typeof error === 'object' && 'diagnostics' in error
+      ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
+      : undefined;
+    input.draft.validationStatus = 'failed';
+    input.draft.validationDiagnostics = diagnostics || [{
+      message: error instanceof Error ? error.message : String(error),
+      severity: 'error',
+    }];
+    synchronizeSourceUnits(input.draft, 'failed');
+    input.draft.workflow = {
+      state: 'authoring',
+      checkpointAt: new Date().toISOString(),
+      error: error instanceof Error ? error.message : String(error),
+    };
+    await saveDraft(input.runId, input.draft);
+    throw error;
+  }
 }
 
 async function validateDraft(input: {
@@ -972,19 +1631,21 @@ async function validateDraft(input: {
   documentChanged?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
 }): Promise<BrowserActionResult> {
   try {
     const candidate = await prepareValidatedDraft(input);
     const needsOfficePreview = input.includeVisualVerification && [
       '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
     ].includes(candidate.generated.extension);
-    if (needsOfficePreview && (!candidate.generated.previewPdf || !candidate.previewPath)) {
+    if (needsOfficePreview && !candidate.generated.previewPath) {
       throw new Error('LibreOffice UNO worker did not produce a PDF preview for draft validation.');
     }
+    if (needsOfficePreview) await input.onProgress?.({ phase: 'visual', message: '正在生成验证预览' });
     const visualVerification = needsOfficePreview
       ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: candidate.previewPath!,
-          buffer: candidate.generated.previewPdf!,
+          absolutePath: candidate.generated.previewPath!,
+          cacheKey: `${sourceDigest(input.draft.program || '')}:validation`,
           extension: '.pdf',
           name: input.draft.fileName,
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
@@ -1002,15 +1663,21 @@ async function validateDraft(input: {
         generator: input.draft.generator || 'uno',
         sourceDigest: sourceDigest(input.draft.program || ''),
         sourceCharacters: input.draft.program?.length || 0,
+        currentRevision: input.draft.currentRevision || null,
+        validatedRevision: input.draft.validatedRevision || null,
+        validationStatus: input.draft.validationStatus,
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         generationDiagnostics: candidate.generated.diagnostics,
+        automaticValidation: candidate.validation,
+        workflow: input.draft.workflow,
         qualityGate: {
           structural: true,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
-            reviewedPages: visualVerification.renderedPages,
+            previewPages: visualVerification.renderedPages,
+            fullReviewStatus: 'pending',
           } : { status: 'not-performed' },
         },
       }),
@@ -1029,12 +1696,139 @@ async function validateDraft(input: {
         saved: true,
         sourceDigest: sourceDigest(source),
         sourceCharacters: source.length,
+        currentRevision: input.draft.currentRevision || null,
+        validatedRevision: input.draft.validatedRevision || null,
         lineCount: draftSourceLineCount(source),
         validation: 'failed',
         requiredNextAction: 'read',
+        diagnostics: input.draft.validationDiagnostics || [],
         error: error instanceof Error ? error.message : String(error),
       }),
     };
+  }
+}
+
+async function validateDraftSourceUnit(input: {
+  runId?: string;
+  draft: OfficeDocumentDraft;
+  sourceUnitPath: string;
+  includeVisualVerification?: boolean;
+  attachmentBindings?: BrowserCodeAttachmentBinding[];
+  abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
+}): Promise<BrowserActionResult> {
+  const extension = path.extname(input.draft.fileName).toLowerCase();
+  const suffix = randomUUID();
+  const directory = artifactDir(input.runId, 'document-drafts');
+  const sourcePath = path.join(directory, `.unit-${suffix}${input.draft.generator === 'javascript' ? '.mjs' : '.py'}`);
+  const outputPath = path.join(directory, `.unit-${suffix}${extension}`);
+  const previewPath = path.join(directory, `.unit-${suffix}.preview.pdf`);
+  try {
+    if (!input.draft.program) throw new Error('The Office draft has no working source.');
+    const unit = parseSourceUnits(input.draft.program).find((candidate) => candidate.path === input.sourceUnitPath);
+    if (!unit) throw new Error(`Office source unit ${input.sourceUnitPath} does not exist.`);
+    const isolatedSource = isolateSourceUnit(input.draft.program, input.sourceUnitPath, input.draft.generator);
+    await input.onProgress?.({ phase: 'unit-static-analysis', message: `正在检查 ${input.sourceUnitPath}` });
+    const staticAnalysis = await analyzeOfficeProgram(isolatedSource, input.draft.generator || 'uno');
+    if (!staticAnalysis.passed) {
+      const error = new Error(staticAnalysis.diagnostics.filter((item) => item.severity === 'error').map((item) => item.message).join('\n'));
+      Object.assign(error, { diagnostics: staticAnalysis.diagnostics });
+      throw error;
+    }
+    await mkdir(directory, { recursive: true });
+    await writeFile(sourcePath, isolatedSource, 'utf8');
+    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+    await input.onProgress?.({ phase: 'unit-execute', message: `正在隔离执行 ${input.sourceUnitPath}` });
+    const generated = await generateFileToPaths({
+      ...input.draft,
+      programPath: sourcePath,
+      outputPath,
+      previewPath,
+      assetsPath: artifactDir(input.runId, 'document-assets'),
+      generator: input.draft.generator,
+      requiredSourceAssetName: input.draft.sourceDocument?.assetName,
+      abortSignal: input.abortSignal,
+      onProgress: input.onProgress,
+    });
+    const validation = await validateOfficeArtifact({ absolutePath: generated.outputPath, extension: generated.extension });
+    if (!validation.passed) {
+      const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
+      Object.assign(error, { diagnostics: validation.issues });
+      throw error;
+    }
+    const needsVisuals = Boolean(input.includeVisualVerification && generated.previewPath);
+    const visualVerification = needsVisuals
+      ? await renderBrowserChatAttachmentVisuals({
+          absolutePath: generated.previewPath!,
+          cacheKey: `${sourceDigest(unit.content)}:unit-validation`,
+          extension: '.pdf',
+          name: `${input.draft.fileName}:${input.sourceUnitPath}`,
+          previewRoot: artifactDir(input.runId, 'attachment-previews'),
+        })
+      : undefined;
+    const state = input.draft.sourceUnits?.find((item) => item.path === input.sourceUnitPath);
+    if (state) {
+      state.sourceDigest = sourceDigest(unit.content);
+      state.validatedDigest = state.sourceDigest;
+      state.status = 'passed';
+    }
+    input.draft.validationStatus = 'pending';
+    input.draft.validationDiagnostics = [
+      ...staticAnalysis.diagnostics.map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath })),
+      ...validation.issues.map((issue) => ({ code: issue.code, message: issue.message, severity: issue.severity, unitPath: input.sourceUnitPath })),
+    ];
+    input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
+    await saveDraft(input.runId, input.draft);
+    return {
+      ok: true,
+      actual: JSON.stringify({
+        kind: 'office-source-unit-validation',
+        documentId: input.draft.documentId,
+        sourceUnitPath: input.sourceUnitPath,
+        sourceUnitDigest: sourceDigest(unit.content),
+        validation: 'passed',
+        renderable: input.draft.validatedSourceDigest === sourceDigest(input.draft.program),
+        currentRevision: input.draft.currentRevision || null,
+        assets: assets.map((asset) => ({ assetName: asset.assetName, sha256: asset.sha256, width: asset.width, height: asset.height, optimized: asset.optimized })),
+        automaticValidation: validation,
+        automaticVisualChecks: visualVerification?.automaticChecks || [],
+        requiredNextAction: 'Continue editing other units, or call render for final full-document validation and publication.',
+      }),
+      referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
+    };
+  } catch (error) {
+    const state = input.draft.sourceUnits?.find((item) => item.path === input.sourceUnitPath);
+    if (state) {
+      state.validatedDigest = undefined;
+      state.status = 'failed';
+    }
+    const diagnostics = error && typeof error === 'object' && 'diagnostics' in error
+      ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
+      : undefined;
+    input.draft.validationStatus = 'failed';
+    input.draft.validationDiagnostics = (diagnostics || [{ message: error instanceof Error ? error.message : String(error), severity: 'error' as const }])
+      .map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath }));
+    input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) };
+    await saveDraft(input.runId, input.draft);
+    return {
+      ok: false,
+      actual: JSON.stringify({
+        kind: 'office-source-unit-validation',
+        documentId: input.draft.documentId,
+        sourceUnitPath: input.sourceUnitPath,
+        validation: 'failed',
+        saved: true,
+        renderable: false,
+        diagnostics: input.draft.validationDiagnostics,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    };
+  } finally {
+    await Promise.all([
+      unlink(sourcePath).catch(() => undefined),
+      unlink(outputPath).catch(() => undefined),
+      unlink(previewPath).catch(() => undefined),
+    ]);
   }
 }
 
@@ -1045,11 +1839,17 @@ async function renderDraft(input: {
   documentChanged?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   abortSignal?: AbortSignal;
+  onProgress?: (progress: FileGenerationProgress) => void | Promise<void>;
 }): Promise<BrowserActionResult> {
   let publishCandidatePath: string | undefined;
   try {
     const candidate = await prepareValidatedDraft(input);
     const digest = sourceDigest(input.draft.program || '');
+    if (input.draft.validatedSourceDigest !== digest || input.draft.validationStatus !== 'passed') {
+      throw new Error('The working source has not passed validation and cannot be rendered. Continue editing the saved working revision until validation passes.');
+    }
+    input.draft.workflow = { state: 'rendering', checkpointAt: new Date().toISOString() };
+    await saveDraft(input.runId, input.draft);
     const requestedName = sanitizeFileName(input.draft.fileName, `document-${Date.now()}.pdf`);
     const dir = path.join(
       artifactDir(input.runId, 'generated'),
@@ -1061,13 +1861,14 @@ async function renderDraft(input: {
     const needsOfficePreview = input.includeVisualVerification && [
       '.doc', '.docx', '.odt', '.pdf', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp',
     ].includes(candidate.generated.extension);
-    if (needsOfficePreview && (!candidate.generated.previewPdf || !candidate.previewPath)) {
+    if (needsOfficePreview && !candidate.generated.previewPath) {
       throw new Error('LibreOffice UNO worker did not produce a PDF preview for visual verification.');
     }
+    if (needsOfficePreview) await input.onProgress?.({ phase: 'visual', message: '正在生成逐页预览' });
     const visualVerification = needsOfficePreview
       ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: candidate.previewPath!,
-          buffer: candidate.generated.previewPdf!,
+          absolutePath: candidate.generated.previewPath!,
+          cacheKey: `${digest}:render`,
           extension: '.pdf',
           name: target.fileName,
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
@@ -1081,15 +1882,16 @@ async function renderDraft(input: {
 
     // Only action=render publishes the already-validated candidate. Keep the
     // previous artifact intact until the replacement binary is fully written.
+    await input.onProgress?.({ phase: 'publish', message: '正在发布最终文件' });
     publishCandidatePath = path.join(dir, `.render-${randomUUID()}${candidate.generated.extension}`);
-    await writeFile(publishCandidatePath, candidate.generated.buffer, { flag: 'wx' });
+    await copyFile(candidate.generated.outputPath, publishCandidatePath);
     await rename(publishCandidatePath, target.filePath);
     publishCandidatePath = undefined;
     const artifact = artifactResultPayload({
       kind: 'generated',
       fileName: target.fileName,
       filePath: target.filePath,
-      bytes: candidate.generated.buffer.byteLength,
+      bytes: candidate.generated.bytes,
     });
     input.draft.renderedArtifactId = artifact.artifactId;
     input.draft.renderedFileName = target.fileName;
@@ -1099,6 +1901,13 @@ async function renderDraft(input: {
     input.draft.visualQaDigest = undefined;
     input.draft.visualQaPageCount = undefined;
     input.draft.visualQaSeenPages = [];
+    input.draft.visualQaReviews = [];
+    input.draft.visualQaPageDigests = [];
+    input.draft.workflow = {
+      state: visualVerification ? 'qa-pending' : 'completed',
+      checkpointAt: new Date().toISOString(),
+      renderedDigest: digest,
+    };
     await saveDraft(input.runId, input.draft);
 
     return {
@@ -1108,21 +1917,29 @@ async function renderDraft(input: {
         documentId: input.draft.documentId,
         sourceDigest: digest,
         renderedDigest: digest,
+        currentRevision: input.draft.currentRevision || null,
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         availableAssets: candidate.assets.map((asset) => ({
           assetName: asset.assetName,
           bytes: asset.bytes,
+          sha256: asset.sha256,
           origin: asset.origin,
           ref: asset.ref,
+          width: asset.width,
+          height: asset.height,
+          optimized: asset.optimized,
         })),
         generationDiagnostics: candidate.generated.diagnostics,
+        automaticValidation: candidate.validation,
+        workflow: input.draft.workflow,
         qualityGate: {
           structural: true,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
-            reviewedPages: visualVerification.renderedPages,
+            previewPages: visualVerification.renderedPages,
+            fullReviewStatus: 'pending',
           } : {
             status: 'not-performed',
             reason: 'The selected model does not accept image input; this result is structurally verified only.',
@@ -1134,8 +1951,9 @@ async function renderDraft(input: {
           renderedPages: visualVerification.renderedPages,
           renderer: visualVerification.renderer,
           warning: visualVerification.warning,
+          automaticChecks: visualVerification.automaticChecks || [],
           gateStatus: 'pending-model-review',
-          requiredCondition: 'visualQaDigest === renderedDigest and every indexed page has been read',
+          requiredCondition: 'visualQaDigest === renderedDigest, every indexed page has been read, and every page has an explicit passed review',
         } : {
           status: 'not-performed',
           reason: 'The selected model does not accept image input or the generated format has no page renderer; no visual conclusion was made.',
@@ -1193,6 +2011,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
           sourceDocument: existing.sourceDocument,
           sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
           sourceCharacters: existing.program?.length || 0,
+          workflow: existing.workflow,
           reused: true,
         }),
       };
@@ -1212,6 +2031,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       operation: sourcePlan.operation,
       generator,
       sourceDocument: sourcePlan.sourceDocument,
+      workflow: { state: 'planned', checkpointAt: now },
       updatedAt: now,
     };
     await saveDraft(input.runId, draft);
@@ -1225,6 +2045,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       sourceDocument: draft.sourceDocument,
       sourceFileName: path.basename(draftProgramPath(input.runId, draft.documentId, draft.generator)),
       sourceCharacters: 0,
+      workflow: draft.workflow,
       instruction: draft.operation === 'modify'
         ? `Open the existing file with job.open_document(${JSON.stringify(draft.sourceDocument?.assetName)}), edit that component in place, and save it to job.output_url. Do not recreate the document.`
         : undefined,
@@ -1239,10 +2060,19 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     const documentId = String(input.documentId || '').trim();
     if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
     const program = String(input.program || '').trim();
-    if (!program) return { ok: false, actual: 'file action=generate requires a runnable source draft in program; start with a small validated skeleton, then add the document through action=edit.' };
-    const persistedDraft = await loadDraft(input.runId, documentId);
-    if ((persistedDraft.generator || 'uno') === 'javascript') assertControlledOfficeJsProgram(program);
-    else assertControlledUnoProgram(program);
+    if (!program) return { ok: false, actual: 'file action=generate requires a runnable source draft in program. A small validated skeleton followed by action=edit is recommended, but a complete runnable initial program is also allowed.' };
+    let persistedDraft: OfficeDocumentDraft;
+    try {
+      persistedDraft = await loadDraft(input.runId, documentId);
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code || '')
+        : '';
+      if (code === 'ENOENT') {
+        return { ok: false, actual: `Office draft ${documentId} is not planned. Call action=plan before action=generate.` };
+      }
+      throw error;
+    }
     if (persistedDraft.program) {
       return {
         ok: false,
@@ -1251,10 +2081,13 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     }
     const draft = structuredClone(persistedDraft);
     draft.program = program;
+    draft.validationStatus = 'pending';
+    draft.validationDiagnostics = [];
+    draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
     await saveDraft(input.runId, draft);
     // Initial authoring validates the saved draft but never publishes a file.
     if (input.render !== false) return validateDraft({ ...input, draft, documentChanged: true });
-    return { ok: true, actual: JSON.stringify({ kind: 'office-program', documentId, generator: draft.generator || 'uno', fileName: draft.fileName, sourceCharacters: program.length }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'office-program', documentId, generator: draft.generator || 'uno', fileName: draft.fileName, currentRevision: draft.currentRevision || null, sourceCharacters: program.length, workflow: draft.workflow }) };
   } catch (error) {
     return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -1270,14 +2103,44 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
         actual: 'file action=edit does not accept a complete source replacement. Read the current line-numbered draft when needed and send edits=[{startLine,endLine,newText}].',
       };
     }
-    if (!Array.isArray(input.edits) || !input.edits.length) {
-      return { ok: false, actual: 'file action=edit requires line-range edits=[{startLine,endLine,newText}].' };
-    }
     const persistedDraft = await loadDraft(input.runId, documentId);
     if (!persistedDraft.program) return { ok: false, actual: `Office draft ${documentId} has no program yet; call action=generate first.` };
-    const currentDigest = sourceDigest(persistedDraft.program);
+    const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
+    const sourceUnits = parseSourceUnits(persistedDraft.program);
+    const requestedUnit = requestedPath ? sourceUnits.find((unit) => unit.path === requestedPath) : undefined;
+    if (requestedPath && !requestedUnit) {
+      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Read the document without path to list available units.` };
+    }
+    if (requestedPath && input.restoreRevision !== undefined) {
+      return { ok: false, actual: 'restoreRevision restores the complete document source and cannot be scoped to one source unit path.' };
+    }
+    const editableSource = requestedUnit?.content ?? persistedDraft.program;
+    const currentDigest = sourceDigest(editableSource);
     const draft = structuredClone(persistedDraft);
-    draft.program = applyUnoDraftLineEdits(persistedDraft.program, input.edits);
+    if (input.restoreRevision !== undefined) {
+      const revisionNumber = Number(input.restoreRevision);
+      const revision = persistedDraft.revisions?.find((item) => item.revision === revisionNumber);
+      if (!Number.isInteger(revisionNumber) || revisionNumber < 1 || !revision) {
+        return {
+          ok: false,
+          actual: `Office draft ${documentId} has no revision ${input.restoreRevision}. Read the draft to obtain the available revision numbers.`,
+        };
+      }
+      const revisionPath = path.join(draftRevisionDirectory(input.runId, documentId), path.basename(revision.sourceFileName));
+      draft.program = await readFile(revisionPath, 'utf8');
+    } else {
+      if (typeof input.patch === 'string' && input.patch.trim()) {
+        if (input.edits?.length) return { ok: false, actual: 'file action=edit accepts patch or edits, not both in one atomic call.' };
+        const edited = applyUnoDraftPatch(editableSource, input.patch);
+        draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
+      } else {
+        if (!Array.isArray(input.edits) || !input.edits.length) {
+          return { ok: false, actual: 'file action=edit requires edits, patch, or restoreRevision.' };
+        }
+        const edited = applyUnoDraftLineEdits(editableSource, input.edits);
+        draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
+      }
+    }
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {
         ok: true,
@@ -1289,27 +2152,71 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           saved: false,
           sourceCharacters: draft.program.length,
           sourceDigest: currentDigest,
-          lineCount: draftSourceLineCount(draft.program),
+          sourceUnitPath: requestedUnit?.path,
+          lineCount: draftSourceLineCount(editableSource),
           validation: 'unchanged',
         }),
       };
     }
-    if ((draft.generator || 'uno') === 'javascript') assertControlledOfficeJsProgram(draft.program);
-    else assertControlledUnoProgram(draft.program);
+    draft.validationStatus = 'pending';
+    draft.validationDiagnostics = [];
+    invalidateActiveVisualQa(draft);
+    draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
+    // Validate a candidate transactionally. A rejected edit must not poison
+    // the next edit with broken syntax or stale line coordinates.
+    if (input.render !== false) {
+      const validationResult = await (requestedUnit
+        ? validateDraftSourceUnit({ ...input, draft, sourceUnitPath: requestedUnit.path })
+        : validateDraft({ ...input, draft, documentChanged: true }));
+      if (!validationResult.ok) {
+        const rejectedSourceDigest = sourceDigest(draft.program || '');
+        const rejectedRevision = draft.currentRevision || null;
+        const rejectedDiagnostics = draft.validationDiagnostics || [];
+        await restoreDraftSnapshot(input.runId, persistedDraft, draft);
+        let failure: Record<string, unknown> = {};
+        try {
+          failure = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
+        } catch {
+          failure = { error: validationResult.actual || 'validation failed' };
+        }
+        return {
+          ok: false,
+          actual: JSON.stringify({
+            ...failure,
+            changed: false,
+            candidateChanged: true,
+            saved: false,
+            rolledBack: true,
+            rejectedSourceDigest,
+            rejectedRevision,
+            sourceDigest: sourceDigest(persistedDraft.program || ''),
+            sourceCharacters: persistedDraft.program?.length || 0,
+            currentRevision: persistedDraft.currentRevision || null,
+            lastSuccessfulRevision: persistedDraft.validatedRevision || persistedDraft.currentRevision || null,
+            diagnostics: failure.diagnostics || rejectedDiagnostics,
+            validation: 'failed',
+            requiredNextAction: 'edit',
+            recoverySuggestion: 'The rejected candidate was rolled back. Continue from the current draft with a smaller focused edit; call action=read only if you need fresh line numbers, or use restoreRevision from the returned revision history.',
+            workflow: persistedDraft.workflow,
+          }),
+        };
+      }
+      return validationResult;
+    }
     await saveDraft(input.runId, draft);
-    // Editing behaves like a code editor: save, execute and report errors,
-    // but reserve the user-visible artifact for explicit action=render.
-    if (input.render !== false) return validateDraft({ ...input, draft, documentChanged: true });
     return { ok: true, actual: JSON.stringify({
       kind: 'office-program',
       generator: draft.generator || 'uno',
       documentId,
       fileName: draft.fileName,
+      currentRevision: draft.currentRevision || null,
       changed: true,
       saved: true,
       sourceCharacters: draft.program.length,
       sourceDigest: sourceDigest(draft.program),
+      sourceUnitPath: requestedUnit?.path,
       lineCount: draftSourceLineCount(draft.program),
+      workflow: draft.workflow,
     }) };
   } catch (error) {
     return { ok: false, actual: `Office draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -1368,7 +2275,7 @@ function versionedRenderedArtifact(artifactId: string) {
 export async function recordOfficeVisualQaProgress(input: {
   runId?: string;
   artifactId: string;
-  action: 'index' | 'read';
+  action: 'index' | 'read' | 'report';
   result: BrowserActionResult;
 }): Promise<BrowserActionResult> {
   if (!input.result.ok) return input.result;
@@ -1378,7 +2285,12 @@ export async function recordOfficeVisualQaProgress(input: {
     const payload = JSON.parse(String(input.result.actual || '')) as {
       kind?: string;
       screenshotCount?: number;
-      screenshots?: Array<{ pageNumber?: number }>;
+      screenshots?: Array<{ pageNumber?: number; screenshotDigest?: string }>;
+      reviews?: Array<{
+        pageNumber?: number;
+        status?: 'failed' | 'passed';
+        issues?: Array<{ type?: string; description?: string; region?: string; severity?: 'error' | 'warning' }>;
+      }>;
     };
     return await withDraftLock(input.runId, identity.documentId, async () => {
       const draft = await loadDraft(input.runId, identity.documentId);
@@ -1390,21 +2302,72 @@ export async function recordOfficeVisualQaProgress(input: {
         draft.visualQaDigest = undefined;
         draft.visualQaPageCount = undefined;
         draft.visualQaSeenPages = [];
+        draft.visualQaReviews = [];
+        draft.visualQaPageDigests = [];
       }
       const screenshotCount = Number(payload.screenshotCount);
       if (Number.isSafeInteger(screenshotCount) && screenshotCount > 0) draft.visualQaPageCount = screenshotCount;
       if (input.action === 'read' && payload.kind === 'file-visual-read') {
         const seen = new Set(draft.visualQaSeenPages || []);
+        const pageDigests = new Map((draft.visualQaPageDigests || []).map((item) => [item.pageNumber, item.screenshotDigest]));
+        const reviewed = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
+        const reviewCache = new Map((draft.visualQaReviewCache || []).map((review) => [review.screenshotDigest, review]));
         for (const screenshot of payload.screenshots || []) {
           const page = Number(screenshot.pageNumber);
-          if (Number.isSafeInteger(page) && page > 0 && (!draft.visualQaPageCount || page <= draft.visualQaPageCount)) seen.add(page);
+          if (Number.isSafeInteger(page) && page > 0 && (!draft.visualQaPageCount || page <= draft.visualQaPageCount)) {
+            seen.add(page);
+            const screenshotDigest = String(screenshot.screenshotDigest || '');
+            if (/^[a-f0-9]{64}$/i.test(screenshotDigest)) {
+              pageDigests.set(page, screenshotDigest);
+              const cached = reviewCache.get(screenshotDigest);
+              if (cached?.status === 'passed') reviewed.set(page, { pageNumber: page, status: 'passed', issues: [] });
+            }
+          }
         }
         draft.visualQaSeenPages = [...seen].sort((left, right) => left - right);
+        draft.visualQaPageDigests = [...pageDigests].map(([pageNumber, screenshotDigest]) => ({ pageNumber, screenshotDigest }));
+        draft.visualQaReviews = [...reviewed.values()].sort((left, right) => left.pageNumber - right.pageNumber);
+      }
+      if (input.action === 'report' && payload.kind === 'file-visual-report') {
+        const reviewed = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
+        const seen = new Set(draft.visualQaSeenPages || []);
+        for (const review of payload.reviews || []) {
+          const pageNumber = Number(review.pageNumber);
+          if (!Number.isSafeInteger(pageNumber) || pageNumber < 1 || !seen.has(pageNumber)) {
+            return { ok: false, actual: `fileVisual review rejected: page ${pageNumber || '?'} has not been read from the current artifact.` };
+          }
+          const issues = (review.issues || []).map((issue) => ({
+            type: String(issue.type || '').trim(),
+            description: String(issue.description || '').trim(),
+            ...(issue.region ? { region: String(issue.region).trim() } : {}),
+            ...(issue.severity ? { severity: issue.severity } : {}),
+          })).filter((issue) => issue.type && issue.description);
+          if (review.status === 'passed' && issues.length) return { ok: false, actual: `fileVisual review rejected: passed page ${pageNumber} contains issues.` };
+          if (review.status === 'failed' && !issues.length) return { ok: false, actual: `fileVisual review rejected: failed page ${pageNumber} requires issue details.` };
+          if (review.status !== 'passed' && review.status !== 'failed') return { ok: false, actual: `fileVisual review rejected: page ${pageNumber} requires status passed or failed.` };
+          reviewed.set(pageNumber, { pageNumber, status: review.status, issues });
+        }
+        draft.visualQaReviews = [...reviewed.values()].sort((left, right) => left.pageNumber - right.pageNumber);
+        const cache = new Map((draft.visualQaReviewCache || []).map((review) => [review.screenshotDigest, review]));
+        const pageDigests = new Map((draft.visualQaPageDigests || []).map((item) => [item.pageNumber, item.screenshotDigest]));
+        for (const review of draft.visualQaReviews) {
+          const screenshotDigest = pageDigests.get(review.pageNumber);
+          if (screenshotDigest) cache.set(screenshotDigest, { screenshotDigest, status: review.status, issues: review.issues });
+        }
+        draft.visualQaReviewCache = [...cache.values()].slice(-1_000);
       }
       const pageCount = draft.visualQaPageCount || 0;
       const completeCoverage = pageCount > 0
         && Array.from({ length: pageCount }, (_, index) => index + 1).every((page) => draft.visualQaSeenPages?.includes(page));
-      draft.visualQaDigest = completeCoverage ? identity.renderedDigest : undefined;
+      const reviews = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
+      const completePassingReview = pageCount > 0
+        && Array.from({ length: pageCount }, (_, index) => reviews.get(index + 1)?.status === 'passed');
+      draft.visualQaDigest = completeCoverage && completePassingReview ? identity.renderedDigest : undefined;
+      draft.workflow = {
+        state: draft.visualQaDigest === identity.renderedDigest ? 'completed' : 'qa-pending',
+        checkpointAt: new Date().toISOString(),
+        renderedDigest: identity.renderedDigest,
+      };
       await saveDraft(input.runId, draft);
       return {
         ...input.result,
@@ -1417,7 +2380,9 @@ export async function recordOfficeVisualQaProgress(input: {
             pageCount,
             seenPageCount: draft.visualQaSeenPages?.length || 0,
             seenPages: draft.visualQaSeenPages || [],
-            complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage,
+            reviewedPageCount: draft.visualQaReviews?.length || 0,
+            failedPages: (draft.visualQaReviews || []).filter((review) => review.status === 'failed').map((review) => review.pageNumber),
+            complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage && completePassingReview,
           },
         }),
       };
@@ -1437,6 +2402,8 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
     visualQaDigest?: string;
     pageCount: number;
     seenPageCount: number;
+    reviewedPageCount: number;
+    failedPages: number[];
   }> = [];
   for (const entry of entries) {
     if (!entry.name.endsWith('.json') || entry.name.endsWith('.transaction.json')) continue;
@@ -1448,9 +2415,13 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
       const pageCount = draft.visualQaPageCount || 0;
       const seen = new Set(draft.visualQaSeenPages || []);
       const completeCoverage = pageCount > 0 && Array.from({ length: pageCount }, (_, index) => seen.has(index + 1));
+      const reviews = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
+      const completePassingReview = pageCount > 0
+        && Array.from({ length: pageCount }, (_, index) => reviews.get(index + 1)?.status === 'passed');
       if (draft.visualQaArtifactId !== draft.renderedArtifactId
         || draft.visualQaDigest !== renderedDigest
-        || !completeCoverage) {
+        || !completeCoverage
+        || !completePassingReview) {
         pending.push({
           documentId: draft.documentId,
           artifactId: draft.renderedArtifactId,
@@ -1458,6 +2429,10 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
           visualQaDigest: draft.visualQaDigest,
           pageCount,
           seenPageCount: seen.size,
+          reviewedPageCount: reviews.size,
+          failedPages: Array.from(reviews.values())
+            .filter((review) => review.status === 'failed')
+            .map((review) => review.pageNumber),
         });
       }
     } catch {
@@ -1501,7 +2476,16 @@ export async function planFileArtifact(input: PlanArtifactInput): Promise<Browse
       ...result,
       actual: JSON.stringify({
         ...payload,
-        availableAssets: assets.map((asset) => ({ assetName: asset.assetName, bytes: asset.bytes, origin: asset.origin, ref: asset.ref })),
+        availableAssets: assets.map((asset) => ({
+          assetName: asset.assetName,
+          bytes: asset.bytes,
+          sha256: asset.sha256,
+          origin: asset.origin,
+          ref: asset.ref,
+          width: asset.width,
+          height: asset.height,
+          optimized: asset.optimized,
+        })),
       }),
     };
   } catch {

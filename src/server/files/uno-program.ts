@@ -7,13 +7,17 @@ import path from 'node:path';
 import type { OfficeDocumentKind } from './office-document-spec';
 import { resolveLibreOfficeExecutable, resolveLibreOfficePythonExecutable } from './libreoffice';
 
-const WORKER_TIMEOUT_MS = 120_000;
+const WORKER_IDLE_TIMEOUT_MS = Math.max(60_000, Number(process.env.OFFICE_WORKER_IDLE_TIMEOUT_MS) || 120_000);
+const WORKER_HARD_TIMEOUT_MS = Math.max(WORKER_IDLE_TIMEOUT_MS, Number(process.env.OFFICE_WORKER_HARD_TIMEOUT_MS) || 30 * 60_000);
+const PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__';
 const PROGRAM_ENTRYPOINT = /^\s*def\s+create_document\s*\(\s*job\s*\)\s*:/m;
 const OUTPUT_EXTENSIONS = new Set(['.doc', '.docx', '.odt', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp', '.pdf']);
 
 export type UnoGeneratedDocument = {
   buffer: Buffer;
+  outputPath: string;
   previewPdf?: Buffer;
+  previewPath: string;
   report: Record<string, unknown>;
 };
 
@@ -28,7 +32,6 @@ export function assertControlledUnoProgram(sourceCode: string) {
   if (!PROGRAM_ENTRYPOINT.test(sourceCode)) {
     throw new Error('UNO source must define def create_document(job): with exactly one job parameter.');
   }
-  if (sourceCode.length > 180_000) throw new Error('UNO source exceeds the 180000 character limit.');
 }
 
 export async function resolveUnoProgramWorker() {
@@ -92,6 +95,7 @@ function runWorker(input: {
   libreOfficeProgramDirectory: string;
   requireBytes?: boolean;
   abortSignal?: AbortSignal;
+  onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>;
 }) {
   return new Promise<Record<string, unknown>>((resolve, reject) => {
     if (input.abortSignal?.aborted) {
@@ -100,10 +104,13 @@ function runWorker(input: {
     }
     const existingPythonPath = String(process.env.PYTHONPATH || '').trim();
     let settled = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let idleTimeout: ReturnType<typeof setTimeout> | undefined;
+    let hardTimeout: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
-      if (timeout) clearTimeout(timeout);
-      timeout = undefined;
+      if (idleTimeout) clearTimeout(idleTimeout);
+      if (hardTimeout) clearTimeout(hardTimeout);
+      idleTimeout = undefined;
+      hardTimeout = undefined;
       input.abortSignal?.removeEventListener('abort', onAbort);
     };
     const failAndTerminate = (error: Error) => {
@@ -137,10 +144,29 @@ function runWorker(input: {
       chunks.push(chunk);
     };
     child.stdout?.on('data', (chunk: Buffer) => collect(stdoutChunks, chunk));
-    child.stderr?.on('data', (chunk: Buffer) => collect(stderrChunks, chunk));
+    let stderrPending = '';
+    const resetIdleTimeout = () => {
+      if (idleTimeout) clearTimeout(idleTimeout);
+      idleTimeout = setTimeout(() => {
+        failAndTerminate(new Error(`LibreOffice UNO program worker made no progress for ${WORKER_IDLE_TIMEOUT_MS}ms. The saved draft remains editable.`));
+      }, WORKER_IDLE_TIMEOUT_MS);
+      idleTimeout.unref?.();
+    };
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrPending += chunk.toString('utf8');
+      const lines = stderrPending.split(/\r?\n/);
+      stderrPending = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith(PROGRESS_PREFIX)) {
+          resetIdleTimeout();
+          try { void Promise.resolve(input.onProgress?.(JSON.parse(line.slice(PROGRESS_PREFIX.length)))).catch(() => undefined); } catch { /* Ignore malformed progress only. */ }
+        } else collect(stderrChunks, Buffer.from(`${line}\n`, 'utf8'));
+      }
+    });
     child.once('error', (error) => failAndTerminate(error));
     child.once('close', (code, signal) => {
       if (settled) return;
+      if (stderrPending) stderrChunks.push(Buffer.from(stderrPending, 'utf8'));
       settled = true;
       cleanup();
       const stdout = Buffer.concat(stdoutChunks).toString('utf8');
@@ -157,10 +183,11 @@ function runWorker(input: {
         reject(new Error(`LibreOffice UNO program worker returned unreadable diagnostics: ${parseError instanceof Error ? parseError.message : String(parseError)}`));
       }
     });
-    timeout = setTimeout(() => {
-      failAndTerminate(new Error(`LibreOffice UNO program worker timed out after ${WORKER_TIMEOUT_MS}ms. The draft may be stuck in a loop or blocking UNO call; edit the saved program before rendering the same source again.`));
-    }, WORKER_TIMEOUT_MS);
-    timeout.unref?.();
+    resetIdleTimeout();
+    hardTimeout = setTimeout(() => {
+      failAndTerminate(new Error(`LibreOffice UNO program worker exceeded the ${WORKER_HARD_TIMEOUT_MS}ms hard limit. The saved draft remains editable.`));
+    }, WORKER_HARD_TIMEOUT_MS);
+    hardTimeout.unref?.();
     input.abortSignal?.addEventListener('abort', onAbort, { once: true });
   });
 }
@@ -208,6 +235,9 @@ export async function generateUnoProgramDocument(input: {
   assetsPath?: string;
   requiredSourceAssetName?: string;
   abortSignal?: AbortSignal;
+  outputPath?: string;
+  previewPath?: string;
+  onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>;
 }): Promise<UnoGeneratedDocument> {
   if (input.abortSignal?.aborted) throw abortReason(input.abortSignal);
   if (Boolean(input.sourceCode) === Boolean(input.sourcePath)) throw new Error('UNO generation requires exactly one of sourceCode or sourcePath.');
@@ -225,8 +255,8 @@ export async function generateUnoProgramDocument(input: {
 
   const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-uno-program-'));
   try {
-    const outputPath = path.join(directory, `output${extension}`);
-    const previewPath = path.join(directory, 'preview.pdf');
+    const outputPath = input.outputPath || path.join(directory, `output${extension}`);
+    const previewPath = input.previewPath || path.join(directory, 'preview.pdf');
     const programPath = input.sourcePath || path.join(directory, 'draft.py');
     const profilePath = path.join(directory, 'profile');
     if (!input.sourcePath) await writeFile(programPath, sourceCode, 'utf8');
@@ -246,10 +276,13 @@ export async function generateUnoProgramDocument(input: {
       ],
       libreOfficeProgramDirectory: path.dirname(soffice),
       abortSignal: input.abortSignal,
+      onProgress: input.onProgress,
     });
     return {
-      buffer: await readFile(outputPath),
-      previewPdf: await readFile(previewPath),
+      buffer: input.outputPath ? Buffer.alloc(0) : await readFile(outputPath),
+      outputPath,
+      previewPdf: input.previewPath ? undefined : await readFile(previewPath),
+      previewPath,
       report,
     };
   } finally {

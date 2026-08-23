@@ -5,8 +5,10 @@ import ast
 import contextlib
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import zipfile
@@ -671,7 +673,7 @@ def verify_and_preview(soffice, profile, output, preview, document_type, source=
     if output.suffix.lower() == '.pdf':
         if output.stat().st_size < 64:
             raise RuntimeError('Generated PDF is empty')
-        preview.write_bytes(output.read_bytes())
+        shutil.copyfile(output, preview)
         return {'format': 'pdf', 'verification': 'file-size'}
     process = context = desktop = component = source_component = None
     try:
@@ -704,14 +706,17 @@ def verify_and_preview(soffice, profile, output, preview, document_type, source=
             fidelity['package'] = package_fidelity
         image_verification = verify_embedded_images(component, document_type)
         text_verification = verify_presentation_text(component) if document_type == 'presentation' else None
+        layout_verification = verify_presentation_layout(component) if document_type == 'presentation' else None
+        spreadsheet_verification = verify_spreadsheet_content(component) if document_type == 'spreadsheet' else None
+        word_verification = verify_word_content(component, image_verification) if document_type == 'word' else None
         component.storeToURL(preview.as_uri(), (property_value('FilterName', PDF_FILTERS[document_type]), property_value('Overwrite', True)))
         if not preview.is_file() or preview.stat().st_size < 64:
             raise RuntimeError('LibreOffice could not export a PDF preview')
         if document_type == 'presentation':
-            return {'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification, 'fidelity': fidelity}
+            return {'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification, 'layout': layout_verification, 'fidelity': fidelity}
         if document_type == 'spreadsheet':
-            return {'format': 'spreadsheet', 'sheets': list(component.Sheets.getElementNames()), 'fidelity': fidelity}
-        return {'format': 'word', 'textCharacters': len(str(component.Text.String or '')), 'images': image_verification, 'fidelity': fidelity}
+            return {'format': 'spreadsheet', 'sheets': list(component.Sheets.getElementNames()), 'content': spreadsheet_verification, 'fidelity': fidelity}
+        return {'format': 'word', 'textCharacters': len(str(component.Text.String or '')), 'images': image_verification, 'content': word_verification, 'fidelity': fidelity}
     finally:
         close_component(source_component)
         close_component(component)
@@ -754,6 +759,100 @@ def verify_presentation_text(component):
         'textCharacters': text_characters,
         'shapeTypes': shape_types,
     }
+
+
+def verify_presentation_layout(component):
+    """Reject objective slide defects and report high-confidence overlap diagnostics."""
+    issues = []
+    checked_text_shapes = 0
+    for page_index in range(component.DrawPages.Count):
+        page = component.DrawPages.getByIndex(page_index)
+        page_width, page_height = int(page.Width), int(page.Height)
+        if page.getCount() == 0:
+            issues.append({'severity': 'error', 'type': 'empty_page', 'page': page_index + 1, 'description': 'Page has no shapes.'})
+            continue
+        text_boxes = []
+        for shape_index in range(page.getCount()):
+            shape = page.getByIndex(shape_index)
+            try:
+                value = str(shape.String or '').strip()
+            except Exception:
+                value = ''
+            if not value:
+                continue
+            checked_text_shapes += 1
+            position, shape_size = shape.Position, shape.Size
+            x, y = int(position.X), int(position.Y)
+            width, height = int(shape_size.Width), int(shape_size.Height)
+            if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > page_width or y + height > page_height:
+                issues.append({
+                    'severity': 'error', 'type': 'text_out_of_bounds', 'page': page_index + 1,
+                    'shape': shape_index + 1,
+                    'description': f'Text box is outside slide bounds: x={x}, y={y}, width={width}, height={height}, slideWidth={page_width}, slideHeight={page_height}.',
+                })
+            text_boxes.append({'shape': shape_index + 1, 'text': value[:80], 'x': x, 'y': y, 'width': width, 'height': height})
+        for left_index in range(len(text_boxes)):
+            left = text_boxes[left_index]
+            for right in text_boxes[left_index + 1:]:
+                overlap_width = max(0, min(left['x'] + left['width'], right['x'] + right['width']) - max(left['x'], right['x']))
+                overlap_height = max(0, min(left['y'] + left['height'], right['y'] + right['height']) - max(left['y'], right['y']))
+                overlap_area = overlap_width * overlap_height
+                smaller_area = min(left['width'] * left['height'], right['width'] * right['height'])
+                if smaller_area > 0 and overlap_area / smaller_area >= 0.75:
+                    issues.append({
+                        'severity': 'error', 'type': 'text_overlap', 'page': page_index + 1,
+                        'shapes': [left['shape'], right['shape']],
+                        'description': f'High-confidence text-box overlap between shapes {left["shape"]} and {right["shape"]}.',
+                    })
+    errors = [issue for issue in issues if issue['severity'] == 'error']
+    if errors:
+        summary = '; '.join(f'page {item["page"]}: {item["type"]} - {item["description"]}' for item in errors[:8])
+        raise RuntimeError(f'Presentation layout verification failed: {summary}')
+    return {'checkedTextShapes': checked_text_shapes, 'issues': issues}
+
+
+def verify_word_content(component, image_verification):
+    text = str(component.Text.String or '').strip()
+    image_count = int((image_verification or {}).get('checked', 0))
+    try:
+        drawing_count = int(component.DrawPage.getCount())
+    except Exception:
+        drawing_count = 0
+    if not text and image_count == 0 and drawing_count == 0:
+        raise RuntimeError('Writer content verification failed: the generated document has no readable text or images.')
+    return {'textCharacters': len(text), 'images': image_count, 'drawingObjects': drawing_count}
+
+
+def verify_spreadsheet_content(component):
+    sheets = component.Sheets
+    if sheets.Count < 1:
+        raise RuntimeError('Spreadsheet content verification failed: the workbook has no sheets.')
+    summaries, formula_errors = [], []
+    for sheet_name in sheets.getElementNames():
+        sheet = sheets.getByName(sheet_name)
+        cursor = sheet.createCursor()
+        cursor.gotoEndOfUsedArea(True)
+        address = cursor.RangeAddress
+        used_rows = int(address.EndRow) + 1
+        used_columns = int(address.EndColumn) + 1
+        non_empty = 0
+        for row in range(min(used_rows, 500)):
+            for column in range(min(used_columns, 100)):
+                cell = sheet.getCellByPosition(column, row)
+                formula = str(getattr(cell, 'Formula', '') or '')
+                value = str(getattr(cell, 'String', '') or '')
+                if formula or value or float(getattr(cell, 'Value', 0) or 0) != 0:
+                    non_empty += 1
+                error_code = int(getattr(cell, 'Error', 0) or 0)
+                if error_code:
+                    formula_errors.append({'sheet': sheet_name, 'row': row + 1, 'column': column + 1, 'error': error_code})
+        summaries.append({'sheet': sheet_name, 'usedRows': used_rows, 'usedColumns': used_columns, 'nonEmptyCellsScanned': non_empty})
+    if not any(item['nonEmptyCellsScanned'] for item in summaries):
+        raise RuntimeError('Spreadsheet content verification failed: every sheet is empty.')
+    if formula_errors:
+        sample = ', '.join(f'{item["sheet"]}!R{item["row"]}C{item["column"]}:{item["error"]}' for item in formula_errors[:10])
+        raise RuntimeError(f'Spreadsheet formula verification failed: {len(formula_errors)} formula errors detected ({sample}).')
+    return {'sheets': summaries, 'formulaErrors': 0}
 
 
 def verify_embedded_images(component, document_type):
@@ -813,6 +912,19 @@ def verify_embedded_images(component, document_type):
     return {'checked': 0}
 
 
+PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__'
+
+
+def emit_progress(phase, message, current=None, total=None):
+    payload = {'phase': phase, 'message': message}
+    if current is not None:
+        payload['current'] = current
+    if total is not None:
+        payload['total'] = total
+    sys.stderr.write(PROGRESS_PREFIX + json.dumps(payload, ensure_ascii=False) + '\n')
+    sys.stderr.flush()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--program')
@@ -847,13 +959,25 @@ def main():
     output.parent.mkdir(parents=True, exist_ok=True)
     process = context = desktop = None
     try:
+        emit_progress('execute', '正在启动 LibreOffice')
         process, context, desktop = connect_office(soffice, profile)
         namespace = program_namespace(program)
         job = DocumentJob(output, assets, args.document_type, context, desktop)
         # Keep draft print output out of the machine-readable report channel.
         with contextlib.redirect_stdout(sys.stderr):
             try:
-                namespace['create_document'](job)
+                emit_progress('execute', '正在执行文档脚本')
+                heartbeat_stop = threading.Event()
+                heartbeat = threading.Thread(
+                    target=lambda: [emit_progress('execute', '文档脚本仍在执行') for _ in iter(lambda: not heartbeat_stop.wait(10), False)],
+                    daemon=True,
+                )
+                heartbeat.start()
+                try:
+                    namespace['create_document'](job)
+                finally:
+                    heartbeat_stop.set()
+                    heartbeat.join(timeout=1)
             except AttributeError as error:
                 raise RuntimeError(
                     f'UNO draft attempted an unavailable member: {error}. '
@@ -867,10 +991,12 @@ def main():
             )
         if not output.is_file() or output.stat().st_size < 64:
             raise RuntimeError('create_document(job) did not create the requested output file')
+        emit_progress('reopen', '文档已保存，正在重新打开验证')
     finally:
         shutdown_office(process, desktop)
     source = (assets / args.required_source_asset).resolve() if args.required_source_asset else None
     verification = verify_and_preview(soffice, profile.parent / 'verification-profile', output, preview, args.document_type, source)
+    emit_progress('visual', '结构验证完成，预览已生成')
     print(json.dumps({'bytes': output.stat().st_size, 'output': str(output), 'preview': str(preview), 'renderer': 'libreoffice-uno', 'verification': verification}, ensure_ascii=False))
 
 

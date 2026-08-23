@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
-import { sortBrowserChatAiOutputCycles } from '@/lib/browser-chat-output-cycles';
+import { browserChatAiOutputViewFromResponse, sortBrowserChatAiOutputCycles } from '@/lib/browser-chat-output-cycles';
 import { aiOutputViewFromResponse, buildAiCycleToolDetailMap } from './BrowserChatWorkspace';
 
 test('orders late-arriving child Agent cycles by their original execution step', () => {
@@ -124,6 +124,21 @@ test('uses the provider tool-result directly and keeps identical retries distinc
   const details = buildAiCycleToolDetailMap([{ id: 'cycle', output, stepIndex: 1 }], []);
   assert.equal(details.get('cycle:0')?.tool.result, 'saved first image');
   assert.equal(details.get('cycle:1')?.tool.result, 'saved retry');
+});
+
+test('uses the tool business result instead of treating every provider tool-result as success', () => {
+  const response = {
+    content: [
+      { type: 'tool-call', toolCallId: 'failed-file', toolName: 'file', input: { action: 'plan' } },
+      { type: 'tool-result', toolCallId: 'failed-file', output: { ok: false, actual: 'file planning failed' } },
+    ],
+  };
+
+  for (const output of [aiOutputViewFromResponse(response), browserChatAiOutputViewFromResponse(response)]) {
+    assert.equal(output.tools[0]?.ok, false);
+    assert.equal(output.tools[0]?.result, 'file planning failed');
+    assert.equal(output.tools[0]?.error, 'file planning failed');
+  }
 });
 
 test('provider results retain their exact persisted indexes without creating bottom fallback duplicates', () => {

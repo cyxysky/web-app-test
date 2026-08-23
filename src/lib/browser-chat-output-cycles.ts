@@ -108,18 +108,22 @@ function applyToolResultToOutput(output: BrowserChatAiOutputView, part: unknown)
   if (type !== 'tool-result' && type !== 'tool_result' && type !== 'tool-error' && type !== 'tool_error') return false;
   const id = stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id);
   if (!id) return true;
-  const rawResult = type === 'tool-result' || type === 'tool_result'
+  const transportSucceeded = type === 'tool-result' || type === 'tool_result';
+  const rawResult = transportSucceeded
     ? (record.output ?? record.result)
     : (record.error ?? record.output ?? record.result);
-  const result = stringFromUnknown(rawResult) || (type === 'tool-result' || type === 'tool_result'
-    ? 'Tool completed.'
-    : toolErrorFromUnknown(rawResult));
+  const businessResult = asRecord(rawResult);
+  const succeeded = transportSucceeded && (typeof businessResult?.ok !== 'boolean' || businessResult.ok);
+  const result = stringFromUnknown(businessResult?.actual)
+    || stringFromUnknown(businessResult?.error)
+    || stringFromUnknown(rawResult)
+    || (succeeded ? 'Tool completed.' : toolErrorFromUnknown(rawResult));
   const tool = [...output.tools].reverse().find((item) => item.id === id);
   if (!tool) return true;
-  tool.ok = type === 'tool-result' || type === 'tool_result';
+  tool.ok = succeeded;
   tool.result = result;
   tool.rawResult = rawResult;
-  if (tool.ok === false) tool.error = result;
+  if (!succeeded) tool.error = result;
   return true;
 }
 

@@ -130,6 +130,40 @@ export type OfficeDocumentDraft = {
   program?: string;
   /** SHA-256 of the workspace draft.py content, used to detect split-brain metadata. */
   sourceDigest?: string;
+  /** Monotonic editor revision. Restoring an older source creates a new revision. */
+  currentRevision?: number;
+  /** Most recent revision that passed static analysis, execution, reopen, and structural validation. */
+  validatedRevision?: number;
+  validatedSourceDigest?: string;
+  validationStatus?: 'failed' | 'pending' | 'passed';
+  validationDiagnostics?: Array<{
+    code?: string;
+    column?: number;
+    line?: number;
+    message: string;
+    severity?: 'error' | 'warning';
+    unitPath?: string;
+  }>;
+  /** Optional logical page/section units embedded in the source through @webpilot-unit markers. */
+  sourceUnits?: Array<{
+    path: string;
+    sourceDigest: string;
+    validatedDigest?: string;
+    status: 'failed' | 'pending' | 'passed';
+  }>;
+  workflow?: {
+    state: 'authoring' | 'completed' | 'failed' | 'planned' | 'qa-pending' | 'render-ready' | 'rendering' | 'validating';
+    checkpointAt: string;
+    error?: string;
+    recoveredFrom?: 'rendering' | 'validating';
+    renderedDigest?: string;
+  };
+  revisions?: Array<{
+    revision: number;
+    sourceDigest: string;
+    createdAt: string;
+    sourceFileName: string;
+  }>;
   /** Artifact identity of the last published source. A later edit makes this stale. */
   renderedArtifactId?: string;
   /** Current published source digest. Kept alongside renderedSourceDigest for legacy metadata compatibility. */
@@ -141,5 +175,27 @@ export type OfficeDocumentDraft = {
   visualQaDigest?: string;
   visualQaPageCount?: number;
   visualQaSeenPages?: number[];
+  visualQaReviews?: Array<{
+    pageNumber: number;
+    status: 'failed' | 'passed';
+    issues: Array<{
+      type: string;
+      description: string;
+      region?: string;
+      severity?: 'error' | 'warning';
+    }>;
+  }>;
+  /** Exact rendered screenshot hashes used to safely reuse passed reviews across artifact revisions. */
+  visualQaPageDigests?: Array<{ pageNumber: number; screenshotDigest: string }>;
+  visualQaReviewCache?: Array<{
+    screenshotDigest: string;
+    status: 'failed' | 'passed';
+    issues: Array<{
+      type: string;
+      description: string;
+      region?: string;
+      severity?: 'error' | 'warning';
+    }>;
+  }>;
   updatedAt: string;
 };

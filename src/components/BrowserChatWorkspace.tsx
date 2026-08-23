@@ -956,9 +956,13 @@ function applyToolResultToAiOutput(output: BrowserChatAiOutputView, part: unknow
   if (type !== 'tool-result' && type !== 'tool_result' && type !== 'tool-error' && type !== 'tool_error') return false;
   const id = stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id);
   if (!id) return true;
-  const succeeded = type === 'tool-result' || type === 'tool_result';
-  const rawResult = succeeded ? (record.output ?? record.result) : (record.error ?? record.output ?? record.result);
-  const result = textFromAiContentPart(asRecord(rawResult) || { value: rawResult })
+  const transportSucceeded = type === 'tool-result' || type === 'tool_result';
+  const rawResult = transportSucceeded ? (record.output ?? record.result) : (record.error ?? record.output ?? record.result);
+  const businessResult = asRecord(rawResult);
+  const succeeded = transportSucceeded && (typeof businessResult?.ok !== 'boolean' || businessResult.ok);
+  const result = stringFromUnknown(businessResult?.actual)
+    || stringFromUnknown(businessResult?.error)
+    || textFromAiContentPart(businessResult || { value: rawResult })
     || (succeeded ? 'Tool completed.' : toolErrorFromUnknown(rawResult));
   const tool = [...output.tools].reverse().find((item) => item.id === id);
   if (!tool) return true;
@@ -3390,7 +3394,10 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           toolOk: tool.ok,
         });
         if (onlyPendingConfirmation && !pendingConfirmation) return null;
-        const visibleMeta = [meta, pendingConfirmation ? t('等待用户确认') : translatedStatus].filter(Boolean).join(' · ');
+        const progressMeta = isActiveTool && tool.progress?.message
+          ? `${tool.progress.message}${tool.progress.current !== undefined && tool.progress.total ? ` ${tool.progress.current}/${tool.progress.total}` : ''}`
+          : '';
+        const visibleMeta = [meta, progressMeta, pendingConfirmation ? t('等待用户确认') : translatedStatus].filter(Boolean).join(' · ');
         const userAction = pendingConfirmation
           ? undefined
           : toolUserActionForTool(logs, step.index, tool.name, tool.input);

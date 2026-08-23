@@ -2337,6 +2337,15 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   color: var(--foreground);
 }
 
+/* Running rows sit inside the live timeline rather than a hoverable history
+   chip. Keep their baseline aligned with completed rows without the chip's
+   extra vertical hit-area. */
+.browser-chat-current-tool-stack .browser-chat-tool-card.is-running,
+.browser-chat-current-tool-stack .browser-chat-ai-call-card.is-running {
+  min-height: 22px;
+  padding-block: 2px;
+}
+
 .browser-chat-tool-card.is-failed,
 .browser-chat-ai-call-card.is-failed {
   background: transparent;

@@ -72,6 +72,8 @@ def create_document(job):
     });
     assert.equal(readResult.ok, true, readResult.actual);
     assert.equal(readResult.referenceImagePaths?.length, 2);
+    const readPayload = JSON.parse(readResult.actual) as { screenshots: Array<{ screenshotDigest?: string }> };
+    assert.ok(readPayload.screenshots.every((screenshot) => /^[a-f0-9]{64}$/.test(screenshot.screenshotDigest || '')));
     assert.match(readResult.referenceImagePaths?.[0] || '', /page-0002\.png$/);
     assert.match(readResult.referenceImagePaths?.[1] || '', /page-0001\.png$/);
   } finally {
@@ -106,6 +108,35 @@ def create_document(job):
       assert.equal(cached.renderer, 'libreoffice-pdf');
       assert.deepEqual(cached.renderedPages, [1]);
     }
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('fileVisual records explicit structured page reviews separately from screenshot reads', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-file-visual-report-'));
+  const artifactPath = path.join(root, 'report.pptx');
+  await writeFile(artifactPath, Buffer.from('saved-office-artifact'));
+  try {
+    const result = await readBrowserChatFileVisuals({
+      absolutePath: artifactPath,
+      attachment: {
+        id: 'generated/report.pptx',
+        kind: 'file',
+        name: 'report.pptx',
+        path: 'generated/report.pptx',
+        type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        url: '',
+      },
+      request: {
+        action: 'report',
+        artifactId: 'generated/report.pptx',
+        reviews: [{ screenshotId: 'screenshot-0001', status: 'passed', issues: [] }],
+      },
+    });
+    assert.equal(result.ok, true, result.actual);
+    assert.match(result.actual, /file-visual-report/);
+    assert.match(result.actual, /"status":"passed"/);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

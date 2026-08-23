@@ -118,7 +118,7 @@ async function convertStagedOfficeFile(input: {
   const outputName = (await readdir(outputDirectory))
     .find((name) => path.extname(name).toLowerCase() === input.targetExtension.toLowerCase());
   if (!outputName) throw new Error(`LibreOffice did not produce a ${input.targetExtension} file.`);
-  return readFile(path.join(outputDirectory, outputName));
+  return path.join(outputDirectory, outputName);
 }
 
 export async function convertOfficeFile(input: {
@@ -130,11 +130,31 @@ export async function convertOfficeFile(input: {
   try {
     const sourcePath = path.join(temporaryDirectory, `source${input.sourceExtension}`);
     await copyFile(input.absolutePath, sourcePath);
-    return await convertStagedOfficeFile({
+    const convertedPath = await convertStagedOfficeFile({
       sourcePath,
       targetExtension: input.targetExtension,
       temporaryDirectory,
     });
+    return convertedPath ? await readFile(convertedPath) : undefined;
+  } finally {
+    await rm(temporaryDirectory, { force: true, recursive: true });
+  }
+}
+
+export async function convertOfficeFileToPath(input: {
+  absolutePath: string;
+  sourceExtension: string;
+  targetExtension: string;
+  targetPath: string;
+}) {
+  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-convert-'));
+  try {
+    const sourcePath = path.join(temporaryDirectory, `source${input.sourceExtension}`);
+    await copyFile(input.absolutePath, sourcePath);
+    const convertedPath = await convertStagedOfficeFile({ sourcePath, targetExtension: input.targetExtension, temporaryDirectory });
+    if (!convertedPath) return false;
+    await copyFile(convertedPath, input.targetPath);
+    return true;
   } finally {
     await rm(temporaryDirectory, { force: true, recursive: true });
   }

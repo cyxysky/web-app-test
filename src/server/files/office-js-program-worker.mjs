@@ -15,6 +15,11 @@ const programPath = path.resolve(value('--program') || '');
 const outputPath = path.resolve(value('--output') || '');
 const assetsPath = path.resolve(value('--assets') || '.');
 const expectedDigest = value('--expected-source-digest');
+const PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__';
+
+function progress(phase, message, current, total) {
+  process.stderr.write(`${PROGRESS_PREFIX}${JSON.stringify({ phase, message, ...(current === undefined ? {} : { current }), ...(total === undefined ? {} : { total }) })}\n`);
+}
 
 function assetPath(name) {
   const candidate = path.resolve(assetsPath, String(name || ''));
@@ -26,6 +31,7 @@ function assetPath(name) {
 }
 
 async function main() {
+  progress('execute', '正在加载 JavaScript 文档脚本');
   const source = await (await import('node:fs/promises')).readFile(programPath, 'utf8');
   const digest = createHash('sha256').update(source, 'utf8').digest('hex');
   if (expectedDigest && digest !== expectedDigest) throw new Error('JavaScript draft changed after validation.');
@@ -49,9 +55,17 @@ async function main() {
     docx,
     ExcelJS,
   });
-  await draft.createDocument(job);
+  progress('execute', '正在执行 JavaScript 文档脚本');
+  const heartbeat = setInterval(() => progress('execute', 'JavaScript 文档脚本仍在执行'), 10_000);
+  heartbeat.unref?.();
+  try {
+    await draft.createDocument(job);
+  } finally {
+    clearInterval(heartbeat);
+  }
   const output = await stat(outputPath);
   if (!output.isFile() || output.size < 64) throw new Error('createDocument(job) did not create the requested Office file.');
+  progress('reopen', '文档已保存，正在重新打开验证');
   process.stdout.write(JSON.stringify({ bytes: output.size, renderer: 'javascript-office', sourceDigest: digest }));
 }
 

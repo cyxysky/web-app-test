@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
+import sharp from 'sharp';
 import { extractAttachmentTextInWorker } from '@/server/runtime/cpu-worker-pool';
 import { fileFormatForName, normalizedFileExtension } from '@/server/files/file-format-registry';
 import { normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
@@ -23,9 +25,19 @@ export type BrowserChatAttachmentReadResult = {
 };
 
 export type BrowserChatFileVisualInput = {
-  action: 'index' | 'read';
+  action: 'index' | 'read' | 'report';
   artifactId: string;
   screenshotIds?: string[];
+  reviews?: Array<{
+    screenshotId: string;
+    status: 'failed' | 'passed';
+    issues?: Array<{
+      type: string;
+      description: string;
+      region?: string;
+      severity?: 'error' | 'warning';
+    }>;
+  }>;
   offset?: number;
   limit?: number;
 };
@@ -67,8 +79,27 @@ export function browserChatAttachmentMetadata(attachment: BrowserChatReadableAtt
 
 async function extractAttachmentText(attachment: BrowserChatReadableAttachment, absolutePath?: string, reusableBuffer?: Buffer) {
   const kind = attachmentKind(attachment);
+  if (kind === 'image') {
+    if (!absolutePath) throw new Error('Could not locate the saved image artifact.');
+    const buffer = reusableBuffer || await readFile(absolutePath);
+    const metadata = await sharp(buffer, { failOn: 'none' }).metadata();
+    const rawWidth = metadata.width || 0;
+    const rawHeight = metadata.height || 0;
+    const swapsAxes = [5, 6, 7, 8].includes(metadata.orientation || 0);
+    const width = swapsAxes ? rawHeight : rawWidth;
+    const height = swapsAxes ? rawWidth : rawHeight;
+    return [
+      '[Image artifact metadata]',
+      `Name: ${attachment.name}`,
+      `Saved bytes: ${buffer.byteLength}`,
+      `Format: ${metadata.format || extensionOf(attachment).replace(/^\./, '') || 'unknown'}`,
+      `Dimensions: ${width || 'unknown'} x ${height || 'unknown'} px`,
+      `Aspect ratio: ${width && height ? (width / height).toFixed(6) : 'unknown'}`,
+      ...(metadata.orientation ? [`EXIF orientation: ${metadata.orientation}`] : []),
+      'These values were read from the exact saved artifact bytes. Use them for Office layout instead of probing the remote source URL in browserCode.',
+    ].join('\n');
+  }
   if (kind === 'tab') return `[标签页引用：${attachment.sourceUrl || attachment.url || attachment.name}]`;
-  if (kind === 'image') return '[图片附件：原始图片会作为图像输入交给支持视觉的模型。]';
   if (!absolutePath) throw new Error('无法定位文件，无法解析。');
   const extracted = await extractAttachmentTextInWorker({ extension: extensionOf(attachment), kind, path: absolutePath });
   if (extensionOf(attachment) !== '.docx') return extracted;
@@ -195,6 +226,34 @@ export async function readBrowserChatFileVisuals(input: {
   try {
     const metadata = await stat(input.absolutePath);
     if (!metadata.size) throw new Error('artifact is empty');
+    if (request.action === 'report') {
+      if (!request.reviews?.length) return { ok: false, actual: 'fileVisual action=report requires at least one page review.' };
+      const reviews = request.reviews.map((review) => {
+        const pageNumber = screenshotPage(review.screenshotId);
+        if (!pageNumber) throw new Error(`invalid screenshotId in visual review: ${review.screenshotId}`);
+        const issues = (review.issues || []).map((issue) => ({
+          type: String(issue.type || '').trim(),
+          description: String(issue.description || '').trim(),
+          ...(issue.region ? { region: String(issue.region).trim() } : {}),
+          ...(issue.severity ? { severity: issue.severity } : {}),
+        })).filter((issue) => issue.type && issue.description);
+        if (review.status === 'passed' && issues.length) throw new Error(`passed review ${review.screenshotId} cannot contain issues`);
+        if (review.status === 'failed' && !issues.length) throw new Error(`failed review ${review.screenshotId} requires at least one issue`);
+        return { screenshotId: review.screenshotId, pageNumber, status: review.status, issues };
+      });
+      return {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'file-visual-report',
+          artifactId: request.artifactId,
+          fileName: attachment.name,
+          reviews,
+          instruction: reviews.some((review) => review.status === 'failed')
+            ? 'Fix every reported issue, render a replacement artifact, and restart visual QA from index.'
+            : 'Continue reading and reporting unreviewed pages until every indexed page has an explicit passed review.',
+        }),
+      };
+    }
     const requestedScreenshotIds = Array.from(new Set((request.screenshotIds || []).map((value) => value.trim()).filter(Boolean)));
     if (request.action === 'read' && !requestedScreenshotIds.length) {
       return { ok: false, actual: 'fileVisual action=read requires at least one screenshotId returned by action=index.' };
@@ -243,6 +302,7 @@ export async function readBrowserChatFileVisuals(input: {
           nextOffset: end < screenshotCount ? end : null,
           renderer: visuals.renderer,
           warning: visuals.warning,
+          automaticChecks: visuals.automaticChecks || [],
           instruction: 'Call fileVisual action=read with one to six exact screenshotIds. Continue in ordered batches until every required page has been inspected.',
         }),
       };
@@ -257,6 +317,14 @@ export async function readBrowserChatFileVisuals(input: {
         actual: `fileVisual could not render requested screenshot pages: ${missing.length ? missing.join(', ') : 'renderer returned an incomplete image set'}.`,
       };
     }
+    const screenshotRecords = await Promise.all((requestedPages as number[]).map(async (pageNumber) => {
+      const imagePath = imagePathByPage.get(pageNumber)!;
+      return {
+        screenshotId: screenshotId(pageNumber),
+        pageNumber,
+        screenshotDigest: createHash('sha256').update(await readFile(imagePath)).digest('hex'),
+      };
+    }));
     return {
       ok: true,
       actual: JSON.stringify({
@@ -264,12 +332,10 @@ export async function readBrowserChatFileVisuals(input: {
         artifactId: request.artifactId,
         fileName: attachment.name,
         screenshotCount,
-        screenshots: (requestedPages as number[]).map((pageNumber) => ({
-          screenshotId: screenshotId(pageNumber),
-          pageNumber,
-        })),
+        screenshots: screenshotRecords,
         renderer: visuals.renderer,
         warning: visuals.warning,
+        automaticChecks: visuals.automaticChecks || [],
         instruction: 'The requested screenshots are attached to the next model request. Inspect their visible layout before deciding whether the artifact passes or needs a targeted edit.',
       }),
       referenceImagePaths: orderedImagePaths,

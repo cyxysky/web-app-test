@@ -1,18 +1,19 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { convertOfficeFile } from './libreoffice';
+import { convertOfficeFile, convertOfficeFileToPath } from './libreoffice';
 import type { OfficeDocumentKind } from './office-document-spec';
 
-const WORKER_TIMEOUT_MS = 120_000;
+const WORKER_IDLE_TIMEOUT_MS = Math.max(60_000, Number(process.env.OFFICE_WORKER_IDLE_TIMEOUT_MS) || 120_000);
+const WORKER_HARD_TIMEOUT_MS = Math.max(WORKER_IDLE_TIMEOUT_MS, Number(process.env.OFFICE_WORKER_HARD_TIMEOUT_MS) || 30 * 60_000);
+const PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__';
 const PROGRAM_ENTRYPOINT = /export\s+(?:async\s+)?function\s+createDocument\s*\(\s*job\s*\)/m;
 
 export function assertControlledOfficeJsProgram(sourceCode: string) {
   if (!PROGRAM_ENTRYPOINT.test(sourceCode)) throw new Error('JavaScript Office source must export function createDocument(job).');
-  if (sourceCode.length > 180_000) throw new Error('JavaScript Office source exceeds the 180000 character limit.');
 }
 
 async function resolveWorker() {
@@ -40,7 +41,12 @@ function terminate(child: ChildProcess) {
   spawn('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
 }
 
-function runWorker(worker: string, args: string[], abortSignal?: AbortSignal) {
+function runWorker(
+  worker: string,
+  args: string[],
+  abortSignal?: AbortSignal,
+  onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>,
+) {
   return new Promise<Record<string, unknown>>((resolve, reject) => {
     if (abortSignal?.aborted) {
       reject(abortSignal.reason instanceof Error ? abortSignal.reason : new Error('JavaScript Office generation was aborted.'));
@@ -50,10 +56,24 @@ function runWorker(worker: string, args: string[], abortSignal?: AbortSignal) {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     let settled = false;
+    let idleTimeout: ReturnType<typeof setTimeout> | undefined;
+    const hardTimeout = setTimeout(() => finish(() => {
+      terminate(child);
+      reject(new Error(`JavaScript Office worker exceeded the ${WORKER_HARD_TIMEOUT_MS}ms hard limit.`));
+    }), WORKER_HARD_TIMEOUT_MS);
+    const resetIdleTimeout = () => {
+      if (idleTimeout) clearTimeout(idleTimeout);
+      idleTimeout = setTimeout(() => finish(() => {
+        terminate(child);
+        reject(new Error(`JavaScript Office worker made no progress for ${WORKER_IDLE_TIMEOUT_MS}ms.`));
+      }), WORKER_IDLE_TIMEOUT_MS);
+      idleTimeout.unref?.();
+    };
     const finish = (callback: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
+      if (idleTimeout) clearTimeout(idleTimeout);
+      clearTimeout(hardTimeout);
       abortSignal?.removeEventListener('abort', onAbort);
       callback();
     };
@@ -62,11 +82,22 @@ function runWorker(worker: string, args: string[], abortSignal?: AbortSignal) {
       reject(abortSignal?.reason instanceof Error ? abortSignal.reason : new Error('JavaScript Office generation was aborted.'));
     });
     child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
-    child.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk));
+    let stderrPending = '';
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderrPending += chunk.toString('utf8');
+      const lines = stderrPending.split(/\r?\n/);
+      stderrPending = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith(PROGRESS_PREFIX)) {
+          resetIdleTimeout();
+          try { void Promise.resolve(onProgress?.(JSON.parse(line.slice(PROGRESS_PREFIX.length)))).catch(() => undefined); } catch { /* Ignore malformed progress only. */ }
+        } else stderr.push(Buffer.from(`${line}\n`, 'utf8'));
+      }
+    });
     child.once('error', (error) => finish(() => reject(error)));
     child.once('close', (code) => finish(() => {
       if (code !== 0) {
-        reject(new Error(Buffer.concat(stderr).toString('utf8') || `JavaScript Office worker exited with code ${code}.`));
+        reject(new Error(`${Buffer.concat(stderr).toString('utf8')}${stderrPending}` || `JavaScript Office worker exited with code ${code}.`));
         return;
       }
       try {
@@ -75,11 +106,8 @@ function runWorker(worker: string, args: string[], abortSignal?: AbortSignal) {
         reject(new Error(`JavaScript Office worker returned invalid diagnostics: ${error instanceof Error ? error.message : String(error)}`));
       }
     }));
-    const timeout = setTimeout(() => finish(() => {
-      terminate(child);
-      reject(new Error(`JavaScript Office worker timed out after ${WORKER_TIMEOUT_MS}ms.`));
-    }), WORKER_TIMEOUT_MS);
-    timeout.unref?.();
+    resetIdleTimeout();
+    hardTimeout.unref?.();
     abortSignal?.addEventListener('abort', onAbort, { once: true });
   });
 }
@@ -91,6 +119,9 @@ export async function generateOfficeJsProgramDocument(input: {
   documentType: OfficeDocumentKind;
   assetsPath?: string;
   abortSignal?: AbortSignal;
+  outputPath?: string;
+  previewPath?: string;
+  onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>;
 }) {
   if (Boolean(input.sourceCode) === Boolean(input.sourcePath)) throw new Error('JavaScript Office generation requires exactly one sourceCode or sourcePath.');
   const sourceCode = input.sourceCode ?? await readFile(input.sourcePath!, 'utf8');
@@ -107,19 +138,31 @@ export async function generateOfficeJsProgramDocument(input: {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-js-'));
   try {
     const programPath = input.sourcePath || path.join(temporaryDirectory, 'draft.mjs');
-    const outputPath = path.join(temporaryDirectory, `output${outputExtension}`);
+    const authoredPath = requestedExtension === '.pdf' || !input.outputPath
+      ? path.join(temporaryDirectory, `output${outputExtension}`)
+      : input.outputPath;
     if (!input.sourcePath) await writeFile(programPath, sourceCode, 'utf8');
     const report = await runWorker(await resolveWorker(), [
       '--program', programPath,
-      '--output', outputPath,
+      '--output', authoredPath,
       '--assets', input.assetsPath || temporaryDirectory,
       '--expected-source-digest', createHash('sha256').update(sourceCode, 'utf8').digest('hex'),
-    ], input.abortSignal);
-    const previewPdf = await convertOfficeFile({ absolutePath: outputPath, sourceExtension: outputExtension, targetExtension: '.pdf' });
-    if (!previewPdf) throw new Error('LibreOffice is required to reopen and preview JavaScript-generated Office files.');
+    ], input.abortSignal, input.onProgress);
+    await input.onProgress?.({ phase: 'reopen', message: '正在使用 LibreOffice 重新打开并验证文档' });
+    const previewPath = input.previewPath || path.join(temporaryDirectory, 'preview.pdf');
+    const wrotePreview = input.previewPath
+      ? await convertOfficeFileToPath({ absolutePath: authoredPath, sourceExtension: outputExtension, targetExtension: '.pdf', targetPath: previewPath })
+      : false;
+    const previewPdf = input.previewPath ? undefined : await convertOfficeFile({ absolutePath: authoredPath, sourceExtension: outputExtension, targetExtension: '.pdf' });
+    if (!wrotePreview && !previewPdf) throw new Error('LibreOffice is required to reopen and preview JavaScript-generated Office files.');
+    await input.onProgress?.({ phase: 'visual', message: '文档验证完成，预览已生成' });
+    if (requestedExtension === '.pdf' && input.outputPath) await copyFile(previewPath, input.outputPath);
+    const deliveredPath = input.outputPath || (requestedExtension === '.pdf' ? previewPath : authoredPath);
     return {
-      buffer: requestedExtension === '.pdf' ? previewPdf : await readFile(outputPath),
+      buffer: input.outputPath ? undefined : requestedExtension === '.pdf' ? previewPdf : await readFile(authoredPath),
+      outputPath: deliveredPath,
       previewPdf,
+      previewPath,
       report: {
         ...report,
         requestedExtension,
