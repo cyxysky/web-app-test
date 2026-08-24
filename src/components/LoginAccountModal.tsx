@@ -116,6 +116,7 @@ export function LoginAccountModal({
   return (
     <AppModal
       ariaLabelledBy="login-account-modal-title"
+      dialogClassName="ui-modal ui-modal--form login-account-modal"
       dismissable={!saving}
       keyboardDismissable={!saving}
       onClose={onClose}

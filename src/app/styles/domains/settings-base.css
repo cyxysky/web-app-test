@@ -717,7 +717,7 @@
 
 .ui-modal--personal-memory {
   height: auto;
-  width: min(92vw, 920px);
+  width: min(100%, 760px);
 }
 
 .personal-memory-form {
@@ -876,7 +876,7 @@
 }
 
 .login-account-modal {
-  width: min(92vw, 620px);
+  width: min(100%, 760px);
 }
 
 .login-account-modal-icon {

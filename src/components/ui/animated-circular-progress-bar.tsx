@@ -32,12 +32,17 @@ export function AnimatedCircularProgressBar({
   const circumference = 2 * Math.PI * radius;
   const targetProgress = (clamped - min) / safeRange;
   const progress = useMotionValue(reduceMotion ? targetProgress : 0);
-  const spring = useSpring(progress, { damping: 28, stiffness: 90 });
+  const spring = useSpring(progress, { damping: 24, stiffness: 62 });
   const dashOffset = useTransform(spring, (latest) => circumference * (1 - latest));
 
   useEffect(() => {
-    if (reduceMotion) progress.jump(targetProgress);
-    else progress.set(targetProgress);
+    if (reduceMotion) {
+      progress.jump(targetProgress);
+      return undefined;
+    }
+
+    const frame = window.requestAnimationFrame(() => progress.set(targetProgress));
+    return () => window.cancelAnimationFrame(frame);
   }, [progress, reduceMotion, targetProgress]);
 
   return (

@@ -62,7 +62,7 @@ export function WorkspaceModeTabs({
         const nextKey = String(key) as WorkspaceModeKey;
         if (nextKey !== activeKey) router.push(nextKey);
       }}
-      orientation={collapsed && desktopLayout ? 'vertical' : 'horizontal'}
+      orientation={desktopLayout ? 'vertical' : 'horizontal'}
       selectedKey={activeKey}
     >
       <Tabs.ListContainer>

@@ -86,17 +86,33 @@ body {
   line-height: 1.5;
 }
 
-*:not([data-slot], [data-slot] *)::-webkit-scrollbar {
-  height: 10px;
-  width: 8px;
+*::-webkit-scrollbar {
+  height: 8px !important;
+  width: 8px !important;
 }
 
-*:not([data-slot], [data-slot] *)::-webkit-scrollbar-thumb {
-  background: var(--scrollbar-thumb);
-  background-clip: padding-box;
-  border: 2px dashed transparent;
-  border-radius: 5px;
-  padding: 2px;
+*::-webkit-scrollbar-button {
+  display: none !important;
+  height: 0 !important;
+  width: 0 !important;
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent !important;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: var(--scrollbar-thumb) !important;
+  background-clip: padding-box !important;
+  border: 2px dashed transparent !important;
+  border-radius: 5px !important;
+  padding: 2px !important;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: var(--scrollbar-thumb-hover) !important;
+  background-clip: padding-box !important;
 }
 
 :where(button, input, textarea, select):not([data-slot], [data-slot] *) {
@@ -780,12 +796,19 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal.ui-modal--skill {
-  --ui-modal-inline-size: 1180px;
-  height: min(calc(100dvh - 48px), 920px);
+  --ui-modal-inline-size: 760px;
+  height: auto;
+}
+
+.ui-modal.ui-modal--form {
+  --ui-modal-inline-size: 760px;
+  height: auto;
+  max-height: min(88dvh, 780px);
 }
 
 /* Compact form dialogs use one quiet, input-first card language. */
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -806,23 +829,27 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 :root[data-theme="dark"] .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
   .ui-modal--personal-memory,
   .browser-chat-message-generation-dialog
 ) {
-  --form-dialog-surface: #151515;
+  --form-dialog-surface: #17181c;
   --form-dialog-field: #242426;
   --form-dialog-field-border: #3a3a3d;
   --form-dialog-title: #fafafa;
   --form-dialog-label: #c4c4c8;
   --form-dialog-value: #f4f4f5;
   --form-dialog-placeholder: #98989f;
+  background: var(--form-dialog-surface) !important;
+  border-color: var(--form-dialog-field-border) !important;
   box-shadow: 0 28px 88px rgba(0, 0, 0, .58);
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -836,6 +863,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -847,6 +875,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -860,6 +889,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -872,6 +902,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -882,6 +913,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -893,6 +925,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -906,6 +939,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -925,6 +959,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -940,6 +975,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -951,6 +987,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -963,6 +1000,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -981,6 +1019,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 .ui-modal:is(
+  .ui-modal--form,
   .ui-modal--compact,
   .automation-dialog,
   .login-account-modal,
@@ -990,6 +1029,95 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   border-radius: 999px;
   min-height: 42px;
   padding-inline: 18px;
+}
+
+/* Shared form-dialog structure for Skill, memory, account and automation editors. */
+.ui-modal.ui-modal--form {
+  border-radius: 24px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+}
+
+.ui-modal.ui-modal--form :is(
+  [data-slot="modal-header"],
+  [data-slot="modal-body"],
+  [data-slot="modal-footer"]
+) {
+  background: var(--form-dialog-surface) !important;
+}
+
+.ui-modal.ui-modal--form :is([data-slot="modal-header"], .app-modal-header) {
+  border-bottom: 0;
+  min-height: 0;
+  padding: 18px 24px 10px;
+}
+
+.ui-modal.ui-modal--form :is([data-slot="modal-body"], .app-modal-body) {
+  padding: 16px 24px !important;
+}
+
+.ui-modal.ui-modal--form :is([data-slot="modal-footer"], .app-modal-footer) {
+  border-top: 0;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px 24px 18px;
+}
+
+.ui-modal.ui-modal--form [data-slot="modal-header"] :is([data-slot="heading"], h2) {
+  color: var(--form-dialog-title);
+  font-size: 17px;
+  font-weight: 720;
+}
+
+.ui-modal.ui-modal--form [data-slot="modal-header"] p {
+  color: var(--form-dialog-label);
+  font-size: 13px;
+  margin-top: 5px;
+}
+
+.ui-modal.ui-modal--form [data-slot="modal-close-trigger"] {
+  color: var(--form-dialog-label);
+}
+
+.ui-modal.ui-modal--form :is(
+  [data-slot="input-group"],
+  [data-slot="textarea"],
+  .custom-select-button
+) {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background: var(--form-dialog-field) !important;
+  border: 1px solid var(--form-dialog-field-border) !important;
+  border-radius: 12px;
+  box-shadow: none !important;
+  color: var(--form-dialog-value);
+  min-height: 42px;
+}
+
+.ui-modal.ui-modal--form [data-slot="input-group-input"] {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  color: var(--form-dialog-value);
+}
+
+.ui-modal.ui-modal--form :is(
+  [data-slot="input-group"],
+  [data-slot="textarea"],
+  .custom-select-button
+):focus-within {
+  border-color: color-mix(in srgb, var(--form-dialog-value) 42%, var(--form-dialog-field-border)) !important;
+}
+
+.ui-modal.ui-modal--form :is(input, textarea)::placeholder {
+  color: var(--form-dialog-placeholder);
+  opacity: 1;
+}
+
+.ui-modal.ui-modal--form [data-slot="modal-footer"] .ui-button {
+  border-radius: 10px;
+  min-height: 38px;
+  padding-inline: 16px;
 }
 
 /* Magic UI registry primitives, wired through the local Shadcn component layer. */

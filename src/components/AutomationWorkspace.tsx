@@ -1424,10 +1424,11 @@ export function AutomationWorkspace({
       {dialog === 'case' ? (
         <AppModal
           ariaLabelledBy="automation-case-dialog-title"
+          dialogClassName="ui-modal ui-modal--form automation-dialog"
           dismissable={!savingCase}
           keyboardDismissable={!savingCase}
           onClose={closeDialog}
-          size="lg"
+          size="wide"
         >
           <form className="webpilot-modal-form" onSubmit={createCase}>
             <header className="ui-modal-header">
@@ -1499,10 +1500,11 @@ export function AutomationWorkspace({
       {dialog === 'schedule' ? (
         <AppModal
           ariaLabelledBy="automation-schedule-dialog-title"
+          dialogClassName="ui-modal ui-modal--form automation-dialog"
           dismissable={!savingSchedule}
           keyboardDismissable={!savingSchedule}
           onClose={closeDialog}
-          size="md"
+          size="wide"
         >
           <form className="webpilot-modal-form" onSubmit={createSchedule}>
             <header className="ui-modal-header">

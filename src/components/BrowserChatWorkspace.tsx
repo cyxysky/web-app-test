@@ -85,6 +85,7 @@ import {
   Square,
   Star,
   Trash2,
+  UserRound,
   Volume2,
   VolumeX,
   Waypoints,
@@ -5529,8 +5530,6 @@ function BrowserChatSafetySelector({
   safetyMode: BrowserChatSafetyMode;
 }) {
   const { t } = useI18n();
-  const [open, setOpen] = useState(false);
-  const menuId = useId();
   const safetyLabel = safetyMode === 'full' ? t('完全模式') : t('严格模式');
   const currentTokens = Math.max(0, contextUsage?.currentTokens || 0);
   const maxTokens = Math.max(1, contextUsage?.maxTokens || 256_000);
@@ -5544,71 +5543,25 @@ function BrowserChatSafetySelector({
   const toolDisplay = compactContextTokens(toolTokens);
   const imageDisplay = compactContextTokens(imageTokens);
 
-  useEffect(() => {
-    if (!disabled) return;
-    setOpen(false);
-  }, [disabled]);
-
   return (
     <div className="browser-chat-mode-selector" data-i18n-skip>
-      <Popover isOpen={open} onOpenChange={setOpen}>
-        <Button
-          aria-controls={menuId}
-          aria-expanded={open}
-          aria-haspopup="dialog"
-          aria-label={t('执行权限：{mode}', { mode: safetyLabel })}
-          className="browser-chat-mode-selector-trigger"
-          isDisabled={disabled}
-          variant="ghost"
+      <Button
+        aria-pressed={safetyMode === 'full'}
+        aria-label={t('执行权限：{mode}', { mode: safetyLabel })}
+        className="browser-chat-mode-selector-trigger glass chip strict"
+        isDisabled={disabled}
+        onPress={() => onSafetyModeChange(safetyMode === 'full' ? 'strict' : 'full')}
+        variant="ghost"
+      >
+        <ShieldCheck aria-hidden="true" size={18} />
+        <span>{safetyLabel}</span>
+        <span
+          aria-hidden="true"
+          className={`browser-chat-safety-toggle${safetyMode === 'full' ? ' is-on' : ''}`}
         >
-          <ShieldCheck aria-hidden="true" size={18} />
-          <span>{safetyLabel}</span>
-          <ChevronDown aria-hidden="true" className={open ? 'is-open' : undefined} size={14} />
-        </Button>
-        <Popover.Content
-          containerPadding={8}
-          offset={6}
-          placement="top start"
-        >
-          <Popover.Dialog aria-label={t('执行权限')} className="browser-chat-mode-selector-dialog" id={menuId}>
-            <section className="browser-chat-mode-selector-section">
-              <header>
-                <strong>{t('执行权限')}</strong>
-              </header>
-              <div aria-label={t('安全性')} className="browser-chat-mode-selector-options" role="radiogroup">
-                <button
-                  aria-checked={safetyMode === 'strict'}
-                  className={safetyMode === 'strict' ? 'active' : undefined}
-                  onClick={() => {
-                    onSafetyModeChange('strict');
-                    setOpen(false);
-                  }}
-                  role="radio"
-                  title={t('严谨模式下，一些模型认为重要的操作需要用户手动确认执行')}
-                  type="button"
-                >
-                  <span>{t('严谨')}</span>
-                  {safetyMode === 'strict' ? <Check aria-hidden="true" size={14} /> : null}
-                </button>
-                <button
-                  aria-checked={safetyMode === 'full'}
-                  className={safetyMode === 'full' ? 'active' : undefined}
-                  onClick={() => {
-                    onSafetyModeChange('full');
-                    setOpen(false);
-                  }}
-                  role="radio"
-                  title={t('完全模式下，模型不需要征求用户手动确认执行')}
-                  type="button"
-                >
-                  <span>{t('完全')}</span>
-                  {safetyMode === 'full' ? <Check aria-hidden="true" size={14} /> : null}
-                </button>
-              </div>
-            </section>
-          </Popover.Dialog>
-        </Popover.Content>
-      </Popover>
+          <span />
+        </span>
+      </Button>
 
       <div
         aria-label={t('当前上下文 {current} / 最大上下文 {max}', {
@@ -5626,8 +5579,8 @@ function BrowserChatSafetySelector({
           className="browser-chat-context-ring"
           max={maxTokens}
           min={0}
-          size={20}
-          strokeWidth={2.25}
+          size={22}
+          strokeWidth={2.4}
           value={currentTokens}
         />
         <div aria-hidden="true" className="browser-chat-context-card">
@@ -5738,7 +5691,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   const attachmentsById = useMemo(() => new Map(attachments.map((attachment) => [attachment.id, attachment])), [attachments]);
   const compactModelSelectionOptions = useMemo(() => modelSelectionOptions.map((option) => ({
     ...option,
-    selectedLabel: option.label,
+    selectedLabel: option.label.toLocaleLowerCase(),
   })), [modelSelectionOptions]);
 
   useEffect(() => {
@@ -6219,7 +6172,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   return (
     <>
       <form
-        className="browser-chat-compose browser-chat-compose--reference"
+        className="browser-chat-compose browser-chat-compose--reference composer"
         onDragOver={handleReferenceDragOver}
         onDrop={handleReferenceDrop}
         onSubmit={(event) => {
@@ -6227,6 +6180,8 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           void submitDraft();
         }}
       >
+        <div aria-hidden="true" className="composer-gloss" />
+        <div aria-hidden="true" className="composer-rim" />
         <input
           ref={imageInputRef}
           className="browser-chat-image-input"
@@ -6282,7 +6237,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
         ) : null}
         <div
           ref={editorRef}
-          className="browser-chat-inline-editor"
+          className="browser-chat-inline-editor editor"
           contentEditable={!busy && !loading}
           data-placeholder={t('问问题，尽管问…')}
           onClick={(event) => {
@@ -6372,10 +6327,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           <div className="browser-chat-compose-tools">
             <button
               aria-label={t('上传文件')}
-              className="browser-chat-attach"
+              className="browser-chat-attach glass attach"
               disabled={currentBusy || uploadingImage || attachments.length >= BROWSER_CHAT_MAX_REFERENCES}
               onClick={() => imageInputRef.current?.click()}
-              title={t('上传文件')}
               type="button"
             >
               {uploadingImage ? <Loader2 className="spin" size={17} /> : <Paperclip size={20} />}
@@ -6389,7 +6343,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           </div>
           {managementActions}
           <div className="browser-chat-compose-submit">
-            <div className="browser-chat-model-control">
+            <div className="browser-chat-model-control glass chip model">
               <CustomSelect
                 className="browser-chat-provider-select"
                 disabled={currentBusy || loading || !modelSelectionOptions.length}
@@ -6414,13 +6368,18 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
               </button>
             ) : null}
             <RainbowButton
-              className="browser-chat-send"
+              className="browser-chat-send send"
               disabled={(!composerText && !attachments.length && !selectedSkillIds.length) || !modelSelectionOptions.length || busy || interrupting || loading || uploadingImage}
               aria-label={t('发送')}
               size="icon"
               type="submit"
             >
-              {busy ? <Loader2 className="spin" size={18} /> : <SendHorizontal size={20} strokeWidth={2.1} />}
+              {busy ? <Loader2 className="spin" size={18} /> : (
+                <svg aria-hidden="true" className="browser-chat-send-icon" fill="none" viewBox="0 0 24 24">
+                  <path d="M3.55 10.25 20.05 4c1.12-.43 2.2.55 1.96 1.73l-2.73 13.63c-.24 1.2-1.7 1.66-2.58.81l-6.78-6.46-1.65 4.22c-.4 1.02-1.93.75-1.95-.35l-.1-5.55-2.68-1.02c-.98-.37-.98-1.39.01-1.76Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.72" />
+                  <path d="m6.23 12.03 10.2-4.19M9.92 13.71 6.3 12.08" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.72" />
+                </svg>
+              )}
             </RainbowButton>
           </div>
         </div>
@@ -11124,16 +11083,16 @@ export function BrowserChatWorkspace({
           loadingMoreSkills={loadingMoreSkills}
           managementActions={(
             <div aria-label={t('快捷管理')} className="browser-chat-management-shortcuts" role="group">
-              <button aria-label={t('Skills 管理')} onClick={() => setManagementTab('skills')} title={t('Skills 管理')} type="button">
+              <button aria-label={t('Skills 管理')} className="glass chip skill" onClick={() => setManagementTab('skills')} title={t('Skills 管理')} type="button">
                 <Braces aria-hidden="true" size={14} />
                 <span>{t('技能')}</span>
               </button>
-              <button aria-label={t('个性化记忆')} onClick={() => setManagementTab('memory')} title={t('个性化记忆')} type="button">
+              <button aria-label={t('个性化记忆')} className="glass chip memory" onClick={() => setManagementTab('memory')} title={t('个性化记忆')} type="button">
                 <Brain aria-hidden="true" size={14} />
                 <span>{t('记忆')}</span>
               </button>
-              <button aria-label={t('登录账号')} onClick={() => setManagementTab('accounts')} title={t('登录账号')} type="button">
-                <KeyRound aria-hidden="true" size={14} />
+              <button aria-label={t('登录账号')} className="glass chip account" onClick={() => setManagementTab('accounts')} title={t('登录账号')} type="button">
+                <UserRound aria-hidden="true" size={14} />
                 <span>{t('账号')}</span>
               </button>
             </div>

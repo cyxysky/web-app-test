@@ -426,6 +426,7 @@ export function SkillsManager({
       {editorMode ? (
         <AppModal
           ariaLabelledBy="skills-manager-modal-title"
+          dialogClassName="ui-modal ui-modal--form ui-modal--skill"
           dismissable={!saving}
           keyboardDismissable={!saving}
           onClose={closeEditorModal}

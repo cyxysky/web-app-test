@@ -311,7 +311,6 @@
   color: #e7e9ec;
   min-height: 0;
   overflow: auto;
-  scrollbar-color: #41464c transparent;
 }
 
 .browser-chat-tool-output-code {

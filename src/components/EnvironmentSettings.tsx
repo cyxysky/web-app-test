@@ -792,6 +792,7 @@ export function EnvironmentSettings({
     return (
       <AppModal
         ariaLabelledBy="personal-memory-modal-title"
+        dialogClassName="ui-modal ui-modal--form ui-modal--personal-memory"
         dismissable={!savingPersonalMemory}
         keyboardDismissable={!savingPersonalMemory}
         onClose={closePersonalMemoryEditor}
