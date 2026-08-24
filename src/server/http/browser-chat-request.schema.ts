@@ -40,6 +40,10 @@ export const setBrowserChatGroupRequestSchema = z.object({
   groupId: text(120).default(''),
 }).strict();
 
+export const updateBrowserChatSessionRequestSchema = z.object({
+  title: text(240).min(1),
+}).strict();
+
 export const browserChatToolConfirmationRequestSchema = z.object({
   confirmationId: text(120).min(1),
   action: z.enum(['confirm', 'cancel']),

@@ -1,5 +1,6 @@
 .browser-chat-tool-dialog-overlay {
   padding: clamp(14px, 2.5vw, 36px);
+  z-index: 2147483004 !important;
 }
 
 .browser-chat-tool-dialog {

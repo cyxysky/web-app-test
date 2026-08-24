@@ -8,6 +8,7 @@ type AppModalSize = 'cover' | 'full' | 'lg' | 'log' | 'management' | 'md' | 'med
 type AppModalProps = {
   ariaLabel?: string;
   ariaLabelledBy?: string;
+  backdropClassName?: string;
   children: ReactNode;
   dismissable?: boolean;
   dialogClassName?: string;
@@ -130,6 +131,7 @@ function modalDialogStyle(size: AppModalSize): CSSProperties | undefined {
 export function AppModal({
   ariaLabel,
   ariaLabelledBy,
+  backdropClassName,
   children,
   dismissable = true,
   dialogClassName,
@@ -146,6 +148,7 @@ export function AppModal({
   return (
     <Modal>
       <Modal.Backdrop
+        className={backdropClassName}
         isDismissable={dismissable}
         isKeyboardDismissDisabled={!keyboardDismissable}
         isOpen={open}

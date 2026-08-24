@@ -9,9 +9,43 @@ import {
   clearBrowserChatSubagentBatchRegistryForTests,
   preserveBrowserChatSubagentSummary,
   resolvedBrowserChatSubagentStatus,
+  runBrowserChatSubagentAttemptWithRetry,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
 } from './browser-chat-subagents';
+
+test('a child Agent retries once after a thrown or zero-tool failure', async () => {
+  const thrownAttempts: number[] = [];
+  const thrownResult = await runBrowserChatSubagentAttemptWithRetry({
+    run: async (attempt) => {
+      thrownAttempts.push(attempt);
+      if (attempt === 1) throw new Error('request unavailable');
+      return { status: 'passed' as const, toolCount: 1 };
+    },
+    shouldRetryResult: () => false,
+    retryReasonFromError: (error) => String(error),
+    retryReasonFromResult: () => '',
+    onRetry: () => undefined,
+  });
+  assert.deepEqual(thrownAttempts, [1, 2]);
+  assert.equal(thrownResult.status, 'passed');
+
+  const zeroToolAttempts: number[] = [];
+  const zeroToolResult = await runBrowserChatSubagentAttemptWithRetry({
+    run: async (attempt) => {
+      zeroToolAttempts.push(attempt);
+      return attempt === 1
+        ? { status: 'failed' as const, toolCount: 0 }
+        : { status: 'passed' as const, toolCount: 2 };
+    },
+    shouldRetryResult: (result) => result.status === 'failed' && result.toolCount === 0,
+    retryReasonFromError: (error) => String(error),
+    retryReasonFromResult: () => 'no tools executed',
+    onRetry: () => undefined,
+  });
+  assert.deepEqual(zeroToolAttempts, [1, 2]);
+  assert.equal(zeroToolResult.toolCount, 2);
+});
 
 test('running child Agent progress exposes tool calls and results before completion', () => {
   const messages = browserChatSubagentMessagesFromProgress({

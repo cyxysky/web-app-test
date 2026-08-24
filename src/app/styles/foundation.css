@@ -240,7 +240,7 @@ body {
   box-shadow: 0 1px 2px color-mix(in srgb, var(--danger) 22%, transparent);
 }
 
-html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow-trigger, .domain-list-search > button):not([data-slot], [data-slot] *) {
+html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send, .browser-chat-scroll-to-bottom):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow-trigger, .domain-list-search > button):not([data-slot], [data-slot] *) {
   backdrop-filter: none !important;
   background: transparent !important;
   border: 0 !important;

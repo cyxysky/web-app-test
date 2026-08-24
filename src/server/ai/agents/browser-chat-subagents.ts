@@ -22,6 +22,27 @@ export type BrowserChatSubagentConfirmationInteraction = {
   decision: 'confirmed' | 'cancelled';
 };
 
+export async function runBrowserChatSubagentAttemptWithRetry<TResult>(input: {
+  run: (attemptNumber: 1 | 2, retryReason: string) => Promise<TResult>;
+  shouldRetryResult: (result: TResult) => boolean;
+  retryReasonFromError: (error: unknown) => string;
+  retryReasonFromResult: (result: TResult) => string;
+  onRetry: (retryReason: string) => void | Promise<void>;
+}) {
+  let firstResult: TResult;
+  try {
+    firstResult = await input.run(1, '');
+  } catch (error) {
+    const retryReason = input.retryReasonFromError(error);
+    await input.onRetry(retryReason);
+    return input.run(2, retryReason);
+  }
+  if (!input.shouldRetryResult(firstResult)) return firstResult;
+  const retryReason = input.retryReasonFromResult(firstResult);
+  await input.onRetry(retryReason);
+  return input.run(2, retryReason);
+}
+
 const subagentMessageMaxChars = 512_000;
 const subagentMessageChainMaxChars = 2_000_000;
 

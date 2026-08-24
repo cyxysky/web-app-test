@@ -8,7 +8,7 @@
   min-width: 0;
   position: relative;
   --browser-chat-pane-inline-padding: clamp(16px, 3vw, 30px);
-  padding: clamp(20px, 2.4vw, 28px) clamp(16px, 3vw, 30px) 22px;
+  padding: 8px clamp(16px, 3vw, 30px) 22px;
 }
 
 .browser-chat-chat-pane:not(.has-messages) {
@@ -20,7 +20,181 @@
 
 .browser-chat-chat-pane.has-messages {
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+}
+
+.browser-chat-conversation-header {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 20px;
+  justify-content: space-between;
+  min-height: 36px;
+  min-width: 0;
+  position: relative;
+  width: 100%;
+  z-index: 19;
+}
+
+.browser-chat-conversation-title-area {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.browser-chat-conversation-title-area h1 {
+  color: var(--foreground);
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.45;
+  margin: 0;
+  max-width: min(720px, 62vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-conversation-title-edit,
+.browser-chat-conversation-title-form button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  width: 28px;
+}
+
+.browser-chat-conversation-title-edit:hover,
+.browser-chat-conversation-title-form button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-conversation-title-form {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+
+.browser-chat-conversation-title-form > [data-slot="input-group"] {
+  min-width: 220px;
+  width: min(560px, 52vw);
+}
+
+.browser-chat-conversation-title-form [data-slot="input-group-input"] {
+  font-size: 15px;
+  font-weight: 600;
+  height: 34px;
+}
+
+.browser-chat-conversation-title-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.browser-chat-conversation-header-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
+  position: relative;
+}
+
+.browser-chat-conversation-share {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--foreground);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 13px;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.browser-chat-conversation-share:hover,
+.browser-chat-conversation-share.is-copied {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+}
+
+.browser-chat-conversation-share.is-copied {
+  color: var(--accent-strong);
+}
+
+.browser-chat-conversation-direct-action {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  font-size: 13px;
+  gap: 6px;
+  height: 32px;
+  justify-content: center;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+
+.browser-chat-conversation-direct-action:not(:disabled):hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-conversation-direct-action.is-danger {
+  color: var(--danger);
+}
+
+.browser-chat-conversation-direct-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.browser-chat-conversation-more .browser-chat-overflow-trigger {
+  height: 32px;
+  min-height: 32px;
+  width: 32px;
+}
+
+.browser-chat-conversation-popover-anchors {
+  height: 1px;
+  pointer-events: none;
+  position: absolute;
+  right: 14px;
+  top: calc(100% + 2px);
+  width: 1px;
+}
+
+.browser-chat-conversation-popover-anchors .is-anchor-only {
+  height: 1px;
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 1px;
+}
+
+.browser-chat-conversation-popover-anchors .is-anchor-only > button,
+.browser-chat-conversation-popover-anchors .is-anchor-only > [data-slot] > button {
+  height: 1px;
+  min-height: 1px;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  width: 1px;
 }
 
 .browser-chat-pane-actions {
@@ -225,6 +399,36 @@
   border-radius: 0 var(--app-radius-sm) var(--app-radius-sm) 0;
   color: var(--muted-strong);
   padding: 8px 12px;
+}
+
+.browser-chat-markdown-table-scroll {
+  margin: 4px 0;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.browser-chat-markdown-table-scroll .table__scroll-container {
+  max-width: 100%;
+}
+
+.browser-chat-markdown-table-scroll .table__content {
+  min-width: 100%;
+  width: max-content;
+}
+
+.browser-chat-markdown-table-scroll .table__row {
+  height: auto;
+}
+
+.browser-chat-markdown-table-scroll :where(.table__column, .table__cell) {
+  height: auto;
+  min-width: 96px;
+  vertical-align: middle;
+  white-space: normal;
+}
+
+.browser-chat-markdown-table-scroll .table__column {
+  white-space: nowrap;
 }
 
 .browser-chat-process-summary {
@@ -1698,13 +1902,26 @@
 }
 
 @container browser-chat-main (max-width: 760px) {
+  .browser-chat-conversation-header {
+    gap: 8px;
+  }
+
+  .browser-chat-conversation-title-area h1 {
+    max-width: 46vw;
+  }
+
+  .browser-chat-conversation-title-form > [data-slot="input-group"] {
+    min-width: 150px;
+    width: 42vw;
+  }
+
   .browser-chat-chat-pane,
   .browser-chat-chat-pane.embedded-chat {
     --browser-chat-pane-inline-padding: 16px;
     height: auto;
     min-height: 100%;
     overflow: visible;
-    padding: 20px 16px;
+    padding: 10px 16px 20px;
   }
 
   .browser-chat-embedded-workspace,
@@ -2175,7 +2392,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 /* A quiet execution rail keeps narrative and actions visually connected
  * without turning the conversation into a stack of cards. */
 .browser-chat-process-body-content {
-  gap: 2px;
+  gap: 1px;
   padding: 8px 4px 8px 32px;
   position: relative;
 }
@@ -2242,7 +2459,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   .browser-chat-agent-step,
   .browser-chat-tool-stack
 ) {
-  gap: 2px;
+  gap: 1px;
 }
 
 .browser-chat-process-body-content .browser-chat-agent-thinking {
@@ -2294,7 +2511,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-tool-chips > .browser-chat-executed-body {
   gap: 1px;
-  padding: 3px 0;
+  padding: 0;
 }
 
 .browser-chat-ai-cycle-tools {
@@ -2309,14 +2526,16 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-tool-card,
 .browser-chat-ai-call-card {
+  align-items: center;
   background: transparent;
   border: 0;
   border-radius: 999px;
+  box-sizing: border-box;
   box-shadow: none;
   color: var(--foreground);
   gap: 6px;
-  min-height: 26px;
-  padding: 8px 12px 8px 6px;
+  min-height: 34px;
+  padding: 4px 12px 4px 6px;
   transition: background-color 120ms ease, color 120ms ease;
 }
 
@@ -2337,15 +2556,6 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   color: var(--foreground);
 }
 
-/* Running rows sit inside the live timeline rather than a hoverable history
-   chip. Keep their baseline aligned with completed rows without the chip's
-   extra vertical hit-area. */
-.browser-chat-current-tool-stack .browser-chat-tool-card.is-running,
-.browser-chat-current-tool-stack .browser-chat-ai-call-card.is-running {
-  min-height: 22px;
-  padding-block: 2px;
-}
-
 .browser-chat-tool-card.is-failed,
 .browser-chat-ai-call-card.is-failed {
   background: transparent;
@@ -2364,6 +2574,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-tool-icon {
+  align-self: center;
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -2384,6 +2595,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   display: flex;
   flex: 1 1 auto;
   gap: 6px;
+  min-height: 18px;
   min-width: 0;
 }
 
@@ -2396,7 +2608,10 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-tool-label {
+  align-items: center;
+  display: inline-flex;
   flex: 0 0 auto;
+  min-height: 18px;
   min-width: 0;
 }
 
@@ -2439,10 +2654,10 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-subagent-tool > .browser-chat-tool-card-row > .browser-chat-subagent-tool-chip {
-  align-items: flex-start;
+  align-items: center;
   cursor: default;
   max-width: 100%;
-  min-height: 26px;
+  min-height: 34px;
   overflow: visible;
   width: max-content;
 }
@@ -2456,7 +2671,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-subagent-tool-chip .browser-chat-tool-content,
 .browser-chat-subagent-tool-chip .browser-chat-tool-label {
-  align-items: baseline;
+  align-items: center;
   flex-wrap: wrap;
   overflow: visible;
   row-gap: 4px;
@@ -2550,7 +2765,9 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-subagent-list .browser-chat-subagent-status-icon {
+  background: transparent;
   border: 0;
+  border-color: transparent;
   color: var(--muted);
   height: 16px;
   width: 16px;
@@ -2577,15 +2794,15 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-subagent-list .browser-chat-subagent-row-meta {
   align-items: center;
-  background: var(--panel-soft);
-  border-radius: 24px;
+  background: transparent;
+  border-radius: 0;
   color: var(--muted-strong);
   display: inline-flex;
   flex: 0 0 auto;
   font-size: 11px;
-  height: 22px;
+  height: auto;
   line-height: 1;
-  padding: 0 9px;
+  padding: 0;
   white-space: nowrap;
 }
 
@@ -2656,6 +2873,69 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 .browser-chat-message-scroll-shell > .browser-chat-message-list {
   height: 100%;
+}
+
+.browser-chat-single-tool-group,
+.browser-chat-current-tool-stack,
+.browser-chat-single-tool-group > .browser-chat-ai-cycle,
+.browser-chat-current-tool-stack > .browser-chat-agent-step {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+.browser-chat-tool-card-row {
+  min-height: 34px;
+}
+
+.browser-chat-scroll-to-bottom {
+  align-items: center;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border-strong) 78%, transparent);
+  border-radius: 999px;
+  bottom: 12px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.14);
+  color: var(--foreground);
+  cursor: pointer;
+  display: inline-flex;
+  height: 42px;
+  justify-content: center;
+  left: 50%;
+  opacity: 0;
+  padding: 0;
+  pointer-events: none;
+  position: absolute;
+  transform: translateX(-50%) translateY(8px) scale(0.86);
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    box-shadow 140ms ease,
+    opacity 180ms ease,
+    transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    visibility 0s linear 180ms;
+  visibility: hidden;
+  width: 42px;
+  z-index: 8;
+}
+
+.browser-chat-scroll-to-bottom.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateX(-50%) translateY(0) scale(1);
+  transition-delay: 0s;
+  visibility: visible;
+}
+
+.browser-chat-scroll-to-bottom.is-visible:hover {
+  background: var(--panel-elevated);
+  border-color: var(--border-strong);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+  transform: translateX(-50%) translateY(-1px) scale(1);
+}
+
+.browser-chat-scroll-to-bottom:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--focus-ring) 48%, transparent);
+  outline-offset: 3px;
 }
 
 .browser-chat-message-progressive-blur {
@@ -2863,6 +3143,7 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 
 @media (prefers-reduced-motion: reduce) {
   .browser-chat-compose--reference .browser-chat-send.magic-rainbow-button { animation: none; }
+  .browser-chat-scroll-to-bottom { transition: none; }
   .browser-chat-message-progressive-blur { opacity: .55; }
   .browser-chat-context-card,
   .browser-chat-context-progress > span { transition: none; }

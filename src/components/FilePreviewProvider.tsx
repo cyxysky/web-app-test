@@ -166,6 +166,7 @@ export function FilePreviewProvider({ children }: { children: ReactNode }) {
   const dialog = request ? (
     <AppModal
       ariaLabelledBy={titleId}
+      backdropClassName="file-preview-overlay"
       dialogClassName="file-preview-dialog"
       onClose={closeFilePreview}
       size="preview"

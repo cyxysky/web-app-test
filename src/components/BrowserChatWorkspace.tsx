@@ -1,6 +1,6 @@
 'use client';
 
-import { Children, createContext, isValidElement, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -26,10 +26,11 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
-import { Button, Checkbox, Popover, Table, TextArea } from '@heroui/react';
+import { Button, Checkbox, Popover, TextArea } from '@heroui/react';
 import dynamic from 'next/dynamic';
 import {
   AppWindow,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   BadgeCheck,
@@ -74,6 +75,7 @@ import {
   ScanSearch,
   ScrollText,
   SendHorizontal,
+  Share2,
   Settings,
   ShieldCheck,
   Sparkles,
@@ -163,9 +165,7 @@ import {
   browserChatArtifactExtension,
   browserChatArtifactFileName,
   browserChatArtifactIsImage,
-  browserChatArtifactsFromSteps,
   browserChatScreenshotIsInternalDocumentPreview,
-  mergeBrowserChatArtifactSummaries,
   type BrowserChatArtifactSummary,
 } from '@/lib/browser-chat-artifacts';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
@@ -1102,7 +1102,7 @@ export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], st
         && (typeof cycle.stepIndex !== 'number' || candidate.stepIndex === cycle.stepIndex)
       );
       const idMatches = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
-      let detail = idMatches
+      const detail = idMatches
         ? [...idMatches].sort((left, right) => {
           const score = (candidate: BrowserChatToolDetail) => (
             (candidate.tool.rawResult !== undefined ? 8 : 0)
@@ -2207,14 +2207,6 @@ function handleBrowserChatMarkdownLinkClick(event: ReactMouseEvent<HTMLAnchorEle
   bridge.createTab({ url }).catch(() => undefined);
 }
 
-function BrowserChatMarkdownTableHeader({ children }: { children?: ReactNode }) {
-  const headerRow = Children.toArray(children).find((child) => isValidElement<{ children?: ReactNode }>(child));
-  const columns = isValidElement<{ children?: ReactNode }>(headerRow)
-    ? headerRow.props.children
-    : children;
-  return <Table.Header>{columns}</Table.Header>;
-}
-
 const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   const normalizedMarkdown = useMemo(() => normalizeBrowserChatMarkdown(markdown), [markdown]);
   return (
@@ -2236,19 +2228,17 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
             />
           ),
           table: ({ children }) => (
-            <Table>
-              <Table.ScrollContainer>
-                <Table.Content aria-label="Markdown table">
-                  {children}
-                </Table.Content>
-              </Table.ScrollContainer>
-            </Table>
+            <div className="browser-chat-markdown-table-scroll table-root table-root--primary">
+              <div className="table__scroll-container">
+                <table className="table__content">{children}</table>
+              </div>
+            </div>
           ),
-          thead: ({ children }) => <BrowserChatMarkdownTableHeader>{children}</BrowserChatMarkdownTableHeader>,
-          tbody: ({ children }) => <Table.Body>{children}</Table.Body>,
-          tr: ({ children }) => <Table.Row>{children}</Table.Row>,
-          th: ({ children }) => <Table.Column>{children}</Table.Column>,
-          td: ({ children }) => <Table.Cell>{children}</Table.Cell>,
+          thead: ({ children }) => <thead className="table__header">{children}</thead>,
+          tbody: ({ children }) => <tbody className="table__body">{children}</tbody>,
+          tr: ({ children }) => <tr className="table__row">{children}</tr>,
+          th: ({ children }) => <th className="table__column">{children}</th>,
+          td: ({ children }) => <td className="table__cell">{children}</td>,
         }}
       >
         {normalizedMarkdown}
@@ -2258,6 +2248,7 @@ const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { ma
 });
 
 const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
+  anchorOnly = false,
   downloads,
   open,
   onClose,
@@ -2266,6 +2257,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   onToggle,
   panelWidth,
 }: {
+  anchorOnly?: boolean;
   downloads: SystemDownloadItem[];
   open: boolean;
   onClose: () => void;
@@ -2359,7 +2351,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   }
 
   return (
-    <div className="browser-chat-download-center">
+    <div className={`browser-chat-download-center${anchorOnly ? ' is-anchor-only' : ''}`}>
       <Popover
         isOpen={open}
         onOpenChange={(nextOpen) => {
@@ -2368,10 +2360,12 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
         }}
       >
         <Button
+          aria-hidden={anchorOnly || undefined}
           aria-controls={popoverId}
           aria-expanded={open}
           aria-label={t('下载')}
           className={activeCount ? 'ui-icon-button browser-chat-download-button active' : 'ui-icon-button browser-chat-download-button'}
+          excludeFromTabOrder={anchorOnly}
           variant="ghost"
         >
           <Download size={17} />
@@ -2498,6 +2492,7 @@ const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
 });
 
 const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCenter({
+  anchorOnly = false,
   disabled,
   groupId,
   onClose,
@@ -2506,6 +2501,7 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
   open,
   panelWidth,
 }: {
+  anchorOnly?: boolean;
   disabled?: boolean;
   groupId?: string;
   onClose: () => void;
@@ -2555,7 +2551,7 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
   const displayedGroupId = pendingGroupId || groupId;
 
   return (
-    <div className="browser-chat-group-binding-center">
+    <div className={`browser-chat-group-binding-center${anchorOnly ? ' is-anchor-only' : ''}`}>
       <Popover
         isOpen={open}
         onOpenChange={(nextOpen) => {
@@ -2564,10 +2560,12 @@ const BrowserChatGroupBindingCenter = memo(function BrowserChatGroupBindingCente
         }}
       >
         <Button
+          aria-hidden={anchorOnly || undefined}
           aria-controls={popoverId}
           aria-expanded={open}
           aria-label={t('绑定浏览器标签组')}
           className="ui-icon-button browser-chat-group-binding-button"
+          excludeFromTabOrder={anchorOnly}
           isDisabled={disabled}
           style={{ '--browser-chat-bound-group-color': embeddedBrowserGroupIconColor(displayedGroupId) } as CSSProperties}
           variant="ghost"
@@ -2950,19 +2948,38 @@ function browserChatArtifactOpenUrl(artifact: BrowserChatArtifactSummary) {
   return artifact.url || artifactApiUrl(artifact.path) || artifact.downloadUrl;
 }
 
+function browserChatArtifactFileIcon(fileName: string, openUrl: string) {
+  if (browserChatArtifactIsImage(fileName)) {
+    return <img alt="" loading="lazy" src={openUrl} />;
+  }
+  const extension = browserChatArtifactExtension(fileName) || '';
+  const icon = /^(?:PPT|PPTX|ODP)$/i.test(extension)
+    ? { name: 'PowerPoint', src: '/file-icons/powerpoint.svg' }
+    : /^(?:DOC|DOCX|ODT|RTF)$/i.test(extension)
+      ? { name: 'Word', src: '/file-icons/word.svg' }
+      : /^(?:XLS|XLSX|XLSM|XLSB|CSV|ODS)$/i.test(extension)
+        ? { name: 'Excel', src: '/file-icons/excel.svg' }
+        : undefined;
+  if (!icon) return <FileText size={20} />;
+  return (
+    <img
+      alt=""
+      className="browser-chat-output-file-brand-icon"
+      draggable={false}
+      src={withWebPilotBasePath(icon.src)}
+      title={icon.name}
+    />
+  );
+}
+
 function BrowserChatMessageArtifactCards({
   artifacts,
-  steps,
 }: {
   artifacts?: BrowserChatArtifactSummary[];
-  steps: StepExecutionResult[];
 }) {
   const { t } = useI18n();
   const preview = useContext(BrowserChatScreenshotPreviewContext);
-  const messageArtifacts = useMemo(() => mergeBrowserChatArtifactSummaries(
-    artifacts,
-    browserChatArtifactsFromSteps(steps),
-  ), [artifacts, steps]);
+  const messageArtifacts = useMemo(() => artifacts || [], [artifacts]);
   const screenshots = useMemo(() => messageArtifacts.flatMap((artifact): BrowserChatRenderableScreenshot[] => {
     if (artifact.kind !== 'screenshot' || !artifact.path) return [];
     const url = browserChatArtifactOpenUrl(artifact);
@@ -2978,60 +2995,134 @@ function BrowserChatMessageArtifactCards({
     const openUrl = browserChatArtifactOpenUrl(artifact);
     return openUrl ? [{ ...artifact, openUrl }] : [];
   }), [messageArtifacts]);
-  if (!files.length && (!preview || !screenshots.length)) return null;
+  const [filesExpanded, setFilesExpanded] = useState(true);
+  if (!files.length && !screenshots.length) return null;
   return (
-    <section aria-label={t('本轮生成的文件和截图')} className="browser-chat-message-artifacts">
-      {files.map((file) => {
-        const metadata = [
-          typeof file.bytes === 'number' ? formatDownloadBytes(file.bytes) : '',
-          file.pageCount ? t('{count} 页', { count: file.pageCount }) : '',
-        ].filter(Boolean);
-        return (
-          <a
-            aria-label={t('打开文件 {name}', { name: file.fileName })}
-            className="browser-chat-message-artifact-card is-file"
-            href={file.openUrl}
-            key={file.id}
-            rel="noopener noreferrer"
-            target="_blank"
-          >
-            <span className="browser-chat-message-artifact-preview is-file" aria-hidden="true">
-              {browserChatArtifactIsImage(file.fileName)
-                ? <img alt="" loading="lazy" src={file.openUrl} />
-                : <FileText size={15} />}
-            </span>
-            <span className="browser-chat-message-artifact-copy">
-              <strong>{file.fileName}</strong>
-              <small>{metadata.join(' · ') || browserChatArtifactExtension(file.fileName) || t('文件')}</small>
-            </span>
-          </a>
-        );
-      })}
-      {preview ? screenshots.map((screenshot, index) => {
-        const rawTitle = screenshot.title.replace(/\s+explicit image\s+\d+$/i, '').trim();
-        const title = rawTitle && rawTitle !== 'browserCode'
-          ? rawTitle
-          : t('操作截图 {index}', { index: index + 1 });
-        const fileName = browserChatArtifactFileName(screenshot.path);
-        const extension = browserChatArtifactExtension(fileName) || t('图片');
-        return (
+    <section aria-label={t('输出文件')} className={`browser-chat-message-artifacts${filesExpanded ? ' is-expanded' : ''}`}>
           <button
-            aria-label={t('查看截图 {index}', { index: index + 1 })}
-            className="browser-chat-message-artifact-card is-screenshot"
-            key={`screenshot:${screenshot.path}`}
-            onClick={() => preview.open(screenshots, index)}
+            aria-expanded={filesExpanded}
+            className="browser-chat-output-files-heading"
+            onClick={() => setFilesExpanded((current) => !current)}
             type="button"
           >
-            <span className="browser-chat-message-artifact-preview">
-              <img alt="" loading="lazy" src={screenshot.url} />
-            </span>
-            <span className="browser-chat-message-artifact-copy">
-              <strong>{title}</strong>
-              <small>{extension} · {t('截图')}</small>
-            </span>
+            <ChevronDown aria-hidden="true" size={14} />
+            <span>{t('输出文件')}</span>
           </button>
-        );
-      }) : null}
+          <div className="browser-chat-output-files-shell" inert={!filesExpanded}>
+            <div className="browser-chat-output-file-list">
+              {files.map((file) => {
+                const extension = browserChatArtifactExtension(file.fileName);
+                const metadata = [
+                  typeof file.bytes === 'number' ? formatDownloadBytes(file.bytes) : '',
+                  extension,
+                  file.pageCount ? t('{count} 页', { count: file.pageCount }) : '',
+                ].filter(Boolean);
+                return (
+                  <article className="browser-chat-output-file-row" key={file.id}>
+                    <a
+                      aria-label={t('打开文件 {name}', { name: file.fileName })}
+                      className="browser-chat-output-file-main"
+                      href={file.openUrl}
+                      rel="noopener noreferrer"
+                      target="_blank"
+                    >
+                      <span className={`browser-chat-output-file-icon${browserChatArtifactIsImage(file.fileName) ? ' is-image' : ''}`} aria-hidden="true">
+                        {browserChatArtifactFileIcon(file.fileName, file.openUrl)}
+                      </span>
+                      <span className="browser-chat-output-file-copy">
+                        <strong>{file.fileName}</strong>
+                        <small>{metadata.join(' · ') || t('文件')}</small>
+                      </span>
+                    </a>
+                    <span className="browser-chat-output-file-actions">
+                      <a
+                        aria-label={`${t('下载文件')}：${file.fileName}`}
+                        download={file.fileName}
+                        href={file.downloadUrl || file.openUrl}
+                        rel="noopener noreferrer"
+                        title={t('下载文件')}
+                      >
+                        <Download size={15} />
+                      </a>
+                      <a
+                        aria-label={t('打开文件 {name}', { name: file.fileName })}
+                        href={file.openUrl}
+                        rel="noopener noreferrer"
+                        target="_blank"
+                        title={t('打开文件 {name}', { name: file.fileName })}
+                      >
+                        <SquareArrowOutUpRight size={15} />
+                      </a>
+                    </span>
+                  </article>
+                );
+              })}
+              {screenshots.map((screenshot, index) => {
+                const rawTitle = screenshot.title.replace(/\s+explicit image\s+\d+$/i, '').trim();
+                const title = rawTitle && rawTitle !== 'browserCode'
+                  ? rawTitle
+                  : t('操作截图 {index}', { index: index + 1 });
+                const fileName = browserChatArtifactFileName(screenshot.path) || `screenshot-${index + 1}.png`;
+                const extension = browserChatArtifactExtension(fileName) || t('图片');
+                return (
+                  <article className="browser-chat-output-file-row is-screenshot" key={`screenshot:${screenshot.path}`}>
+                    {preview ? (
+                      <button
+                        aria-label={t('查看截图 {index}', { index: index + 1 })}
+                        className="browser-chat-output-file-main"
+                        onClick={() => preview.open(screenshots, index)}
+                        type="button"
+                      >
+                        <span className="browser-chat-output-file-icon is-image" aria-hidden="true">
+                          <img alt="" loading="lazy" src={screenshot.url} />
+                        </span>
+                        <span className="browser-chat-output-file-copy">
+                          <strong>{title}</strong>
+                          <small>{extension} · {t('截图')}</small>
+                        </span>
+                      </button>
+                    ) : (
+                      <a
+                        aria-label={t('打开文件 {name}', { name: title })}
+                        className="browser-chat-output-file-main"
+                        href={screenshot.url}
+                        rel="noopener noreferrer"
+                        target="_blank"
+                      >
+                        <span className="browser-chat-output-file-icon is-image" aria-hidden="true">
+                          <img alt="" loading="lazy" src={screenshot.url} />
+                        </span>
+                        <span className="browser-chat-output-file-copy">
+                          <strong>{title}</strong>
+                          <small>{extension} · {t('截图')}</small>
+                        </span>
+                      </a>
+                    )}
+                    <span className="browser-chat-output-file-actions">
+                      <a
+                        aria-label={`${t('下载文件')}：${title}`}
+                        download={fileName}
+                        href={screenshot.url}
+                        rel="noopener noreferrer"
+                        title={t('下载文件')}
+                      >
+                        <Download size={15} />
+                      </a>
+                      <a
+                        aria-label={t('打开文件 {name}', { name: title })}
+                        href={screenshot.url}
+                        rel="noopener noreferrer"
+                        target="_blank"
+                        title={t('打开文件 {name}', { name: title })}
+                      >
+                        <SquareArrowOutUpRight size={15} />
+                      </a>
+                    </span>
+                  </article>
+                );
+              })}
+            </div>
+          </div>
     </section>
   );
 }
@@ -3053,6 +3144,7 @@ function BrowserChatScreenshotPreviewDialog({
   return (
     <AppModal
       ariaLabel={t('截图预览')}
+      backdropClassName="browser-chat-tool-image-overlay"
       dialogClassName="browser-chat-tool-image-dialog"
       onClose={onClose}
       size="media"
@@ -3742,6 +3834,19 @@ type BrowserChatSubagentPanelContextValue = {
 
 const BrowserChatSubagentPanelContext = createContext<BrowserChatSubagentPanelContextValue | null>(null);
 
+const BROWSER_CHAT_SUBAGENT_PANEL_DEFAULT_WIDTH = 680;
+const BROWSER_CHAT_SUBAGENT_PANEL_MIN_WIDTH = 420;
+const BROWSER_CHAT_SUBAGENT_PANEL_VIEWPORT_GUTTER = 48;
+
+function browserChatClampSubagentPanelWidth(width: number) {
+  if (typeof window === 'undefined') return Math.max(BROWSER_CHAT_SUBAGENT_PANEL_MIN_WIDTH, width);
+  const maximumWidth = Math.max(
+    BROWSER_CHAT_SUBAGENT_PANEL_MIN_WIDTH,
+    window.innerWidth - BROWSER_CHAT_SUBAGENT_PANEL_VIEWPORT_GUTTER,
+  );
+  return Math.min(Math.max(BROWSER_CHAT_SUBAGENT_PANEL_MIN_WIDTH, width), maximumWidth);
+}
+
 function browserChatSubagentStatusPresentation(subagent: Pick<BrowserChatSubagentView, 'status' | 'summary'>) {
   if (subagent.status === 'passed') return { className: 'status-passed', label: '已完成' };
   if (subagent.status === 'failed' && subagent.summary?.trim()) return { className: 'status-partial', label: '已返回结果' };
@@ -3862,16 +3967,101 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
   const { t } = useI18n();
   const titleId = useId();
   const status = browserChatSubagentStatusPresentation(subagent);
+  const [closing, setClosing] = useState(false);
+  const [panelWidth, setPanelWidth] = useState(BROWSER_CHAT_SUBAGENT_PANEL_DEFAULT_WIDTH);
+  const [resizing, setResizing] = useState(false);
+  const closeTimerRef = useRef(0);
+  const panelRef = useRef<HTMLElement | null>(null);
+  const panelResizeRef = useRef<{ pointerId: number; startWidth: number; startX: number } | null>(null);
+  const panelResizeBodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
+  const restorePanelResizeBodyStyles = useCallback(() => {
+    const previous = panelResizeBodyStyleRef.current;
+    if (!previous) return;
+    document.body.style.cursor = previous.cursor;
+    document.body.style.userSelect = previous.userSelect;
+    panelResizeBodyStyleRef.current = null;
+  }, []);
+  const finishPanelResize = useCallback((handle?: HTMLDivElement, pointerId?: number) => {
+    if (handle && pointerId !== undefined && handle.hasPointerCapture(pointerId)) {
+      handle.releasePointerCapture(pointerId);
+    }
+    panelResizeRef.current = null;
+    setResizing(false);
+    restorePanelResizeBodyStyles();
+  }, [restorePanelResizeBodyStyles]);
+  const handlePanelResizePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || window.innerWidth <= 680) return;
+    event.preventDefault();
+    const startWidth = panelRef.current?.getBoundingClientRect().width || panelWidth;
+    panelResizeRef.current = { pointerId: event.pointerId, startWidth, startX: event.clientX };
+    panelResizeBodyStyleRef.current = {
+      cursor: document.body.style.cursor,
+      userSelect: document.body.style.userSelect,
+    };
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setResizing(true);
+  }, [panelWidth]);
+  const handlePanelResizePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const resize = panelResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    setPanelWidth(browserChatClampSubagentPanelWidth(resize.startWidth + resize.startX - event.clientX));
+  }, []);
+  const handlePanelResizePointerEnd = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (panelResizeRef.current?.pointerId !== event.pointerId) return;
+    finishPanelResize(event.currentTarget, event.pointerId);
+  }, [finishPanelResize]);
+  const handlePanelResizeKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    const delta = event.key === 'ArrowLeft' ? 24 : event.key === 'ArrowRight' ? -24 : 0;
+    if (!delta) return;
+    event.preventDefault();
+    setPanelWidth((current) => browserChatClampSubagentPanelWidth(current + delta));
+  }, []);
+  const requestClose = useCallback(() => {
+    if (closeTimerRef.current) return;
+    setClosing(true);
+    closeTimerRef.current = window.setTimeout(() => {
+      closeTimerRef.current = 0;
+      onClose();
+    }, 180);
+  }, [onClose]);
+
+  useEscapeDismiss(true, requestClose);
+  useEffect(() => {
+    const handleResize = () => setPanelWidth((current) => browserChatClampSubagentPanelWidth(current));
+    window.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (closeTimerRef.current) window.clearTimeout(closeTimerRef.current);
+      restorePanelResizeBodyStyles();
+    };
+  }, [restorePanelResizeBodyStyles]);
 
   return createPortal((
-    <div className="browser-chat-subagent-panel-layer" onMouseDown={onClose}>
+    <div className={`browser-chat-subagent-panel-layer${closing ? ' is-closing' : ''}`} onMouseDown={requestClose}>
       <aside
         aria-labelledby={titleId}
         aria-modal="true"
-        className="browser-chat-subagent-panel"
+        className={`browser-chat-subagent-panel${resizing ? ' is-resizing' : ''}`}
         onMouseDown={(event) => event.stopPropagation()}
+        ref={panelRef}
         role="dialog"
+        style={{ '--browser-chat-subagent-panel-width': `${panelWidth}px` } as CSSProperties}
       >
+        <div
+          aria-label={t('调整子 Agent 侧边栏宽度')}
+          aria-orientation="vertical"
+          className="browser-chat-subagent-panel-resizer"
+          onKeyDown={handlePanelResizeKeyDown}
+          onLostPointerCapture={handlePanelResizePointerEnd}
+          onPointerCancel={handlePanelResizePointerEnd}
+          onPointerDown={handlePanelResizePointerDown}
+          onPointerMove={handlePanelResizePointerMove}
+          onPointerUp={handlePanelResizePointerEnd}
+          role="separator"
+          tabIndex={0}
+        />
         <header className="browser-chat-subagent-panel-header">
           <div className="browser-chat-subagent-panel-heading">
             <span className={`browser-chat-subagent-status-icon ${status.className}`} aria-hidden="true">
@@ -3891,7 +4081,7 @@ const BrowserChatSubagentPanel = memo(function BrowserChatSubagentPanel({
               </p>
             </div>
           </div>
-          <button aria-label={t('关闭子 Agent 详情')} className="ui-icon-button browser-chat-subagent-panel-close" onClick={onClose} title={t('关闭')} type="button">
+          <button aria-label={t('关闭子 Agent 详情')} className="ui-icon-button browser-chat-subagent-panel-close" onClick={requestClose} title={t('关闭')} type="button">
             <X size={18} />
           </button>
         </header>
@@ -4548,7 +4738,6 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           ) : null}
         </BrowserChatProcessDisclosure>
       ) : null}
-      {!running ? <BrowserChatMessageArtifactCards artifacts={message.artifacts} steps={steps} /> : null}
       {manualVerificationPaused ? (
         <BrowserChatManualVerificationCard
           onResume={!running ? onResumeHumanVerification : undefined}
@@ -4565,6 +4754,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
         <p className="browser-chat-agent-empty">{t('AI 已完成本轮操作，未返回额外文本。')}</p>
       ) : null}
+      {!running ? <BrowserChatMessageArtifactCards artifacts={message.artifacts} /> : null}
     </div>
   );
 });
@@ -4854,10 +5044,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
+  const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
   const [screenshotPreview, setScreenshotPreview] = useState<BrowserChatScreenshotPreview | null>(null);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const followLatestRef = useRef(true);
+  const scrollingToLatestRef = useRef(false);
+  const scrollToLatestTimerRef = useRef(0);
   const earlierLoadInFlightRef = useRef(false);
   const earlierLoadArmedRef = useRef(true);
   const historyHeightFrameRef = useRef(0);
@@ -4887,7 +5081,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     openSubagent,
   }), [closeSubagent, openSubagent, selectedSubagentId]);
   const screenshotPreviewContext = useMemo(() => ({ open: openScreenshotPreview }), [openScreenshotPreview]);
-  useEscapeDismiss(Boolean(selectedSubagentId), closeSubagent);
   const getScrollContainer = useCallback(() => {
     return scrollRef.current;
   }, []);
@@ -4965,6 +5158,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       pendingHistoryHeightRef.current = null;
       earlierLoadInFlightRef.current = false;
       earlierLoadArmedRef.current = true;
+      setShowScrollToBottom(false);
     }
     const pendingHistoryHeight = pendingHistoryHeightRef.current;
     if (
@@ -4990,6 +5184,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       container.style.scrollBehavior = previousScrollBehavior;
       followLatestRef.current = true;
+      setShowScrollToBottom(false);
     };
     scrollToBottom();
     if (!initialPositioning && !sessionChanged) return undefined;
@@ -5029,7 +5224,33 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       return;
     }
     const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (scrollingToLatestRef.current) {
+      followLatestRef.current = true;
+      setShowScrollToBottom(false);
+      return;
+    }
     followLatestRef.current = distanceFromBottom <= 16;
+    setShowScrollToBottom(distanceFromBottom > 72);
+  }, [getScrollContainer]);
+
+  const scrollToLatest = useCallback(() => {
+    const container = getScrollContainer();
+    if (!container) return;
+    if (scrollToLatestTimerRef.current) window.clearTimeout(scrollToLatestTimerRef.current);
+    scrollingToLatestRef.current = true;
+    followLatestRef.current = true;
+    setShowScrollToBottom(false);
+    container.scrollTo({
+      behavior: 'smooth',
+      top: Math.max(0, container.scrollHeight - container.clientHeight),
+    });
+    scrollToLatestTimerRef.current = window.setTimeout(() => {
+      scrollToLatestTimerRef.current = 0;
+      scrollingToLatestRef.current = false;
+      const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+      followLatestRef.current = distanceFromBottom <= 16;
+      setShowScrollToBottom(distanceFromBottom > 72);
+    }, 520);
   }, [getScrollContainer]);
 
   useLayoutEffect(() => {
@@ -5048,6 +5269,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       if (cancelled) return;
       container.scrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       followLatestRef.current = true;
+      setShowScrollToBottom(false);
       if (performance.now() - startedAt < 420) frame = requestAnimationFrame(pinToBottom);
     };
 
@@ -5163,6 +5385,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
 
   useEffect(() => () => {
     if (historyHeightFrameRef.current) cancelAnimationFrame(historyHeightFrameRef.current);
+    if (scrollToLatestTimerRef.current) window.clearTimeout(scrollToLatestTimerRef.current);
   }, []);
 
   return (
@@ -5209,7 +5432,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemSteps = declaredStepIndexes.length
           ? declaredStepIndexes
             .map((stepIndex) => stepsByIndex.get(stepIndex))
-            .filter((step): step is StepExecutionResult => Boolean(step))
+            .filter((step): step is StepExecutionResult => step?.messageId === item.id)
           : [...stepsByIndex.values()].filter((step) => step.messageId === item.id);
         const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
         const itemOutputCycles = outputCycles.filter((cycle) => cycle.messageId === item.id);
@@ -5244,6 +5467,17 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           <div aria-hidden="true" className="browser-chat-message-list-end" />
         </div>
           </div>
+          <button
+            aria-hidden={!showScrollToBottom}
+            aria-label={t('滚动到底部')}
+            className={`browser-chat-scroll-to-bottom${showScrollToBottom ? ' is-visible' : ' is-hidden'}`}
+            onClick={scrollToLatest}
+            tabIndex={showScrollToBottom ? 0 : -1}
+            title={showScrollToBottom ? t('滚动到底部') : undefined}
+            type="button"
+          >
+            <ArrowDown aria-hidden="true" size={20} />
+          </button>
           <ProgressiveBlur className="browser-chat-message-progressive-blur" height="52px" position="both" />
         </div>
         <BrowserChatScreenshotPreviewDialog
@@ -7499,10 +7733,12 @@ function BrowserChatWebPreviewModal({
   return (
     <AppModal
       ariaLabel={t('实时界面')}
+      backdropClassName="browser-chat-web-preview-overlay"
+      dialogClassName="browser-chat-web-preview-modal"
       onClose={onClose}
       size="full"
     >
-        <header className="ui-modal-header browser-chat-web-preview-header" style={{ padding: '0px 16px'}}>
+        <header className="ui-modal-header browser-chat-web-preview-header">
           <div className="ui-modal-heading">
             <div className="browser-chat-web-preview-title-row">
               <h2 className="ui-modal-title">{t('实时界面')}</h2>
@@ -7520,7 +7756,7 @@ function BrowserChatWebPreviewModal({
               </span>
             </div>
           </div>
-          <button aria-label={t('关闭实时界面')} className="ui-icon-button ui-modal-close" onClick={onClose} title={t('关闭')} type="button">
+          <button aria-label={t('关闭实时界面')} className="browser-chat-web-preview-close" onClick={onClose} title={t('关闭')} type="button">
             <X size={18} />
           </button>
         </header>
@@ -9028,6 +9264,11 @@ export function BrowserChatWorkspace({
   const [embeddedBrowserDialogOpen, setEmbeddedBrowserDialogOpen] = useState(false);
   const [webPreviewRuntime, setWebPreviewRuntime] = useState(false);
   const [webPreviewOpen, setWebPreviewOpen] = useState(false);
+  const [editingConversationTitle, setEditingConversationTitle] = useState(false);
+  const [conversationTitleDraft, setConversationTitleDraft] = useState('');
+  const [savingConversationTitle, setSavingConversationTitle] = useState(false);
+  const [shareLinkCopied, setShareLinkCopied] = useState(false);
+  const shareLinkFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionUiKey = `${session?.userId || requestUserId}:${session?.id || 'new'}`;
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
@@ -9556,6 +9797,16 @@ export function BrowserChatWorkspace({
   useEffect(() => {
     if (session?.id) activeSessionIdRef.current = session.id;
   }, [session?.id]);
+
+  useEffect(() => {
+    setEditingConversationTitle(false);
+    setConversationTitleDraft('');
+    setShareLinkCopied(false);
+  }, [session?.id]);
+
+  useEffect(() => () => {
+    if (shareLinkFeedbackTimerRef.current) clearTimeout(shareLinkFeedbackTimerRef.current);
+  }, []);
 
   useEffect(() => () => {
     releaseSessionRuntime(activeSessionIdRef.current);
@@ -10586,56 +10837,205 @@ export function BrowserChatWorkspace({
     }
   }
 
-  const renderChatPaneActions = () => (
-    <div className="browser-chat-pane-actions">
-      {webPreviewRuntime && session ? (
+  function startConversationTitleEdit() {
+    if (!session) return;
+    setConversationTitleDraft(sessionDisplayTitle(session));
+    setEditingConversationTitle(true);
+  }
+
+  async function saveConversationTitle(event?: FormEvent<HTMLFormElement>) {
+    event?.preventDefault();
+    if (!session || savingConversationTitle) return;
+    const title = conversationTitleDraft.trim();
+    if (!title) return;
+    if (title === sessionDisplayTitle(session)) {
+      setEditingConversationTitle(false);
+      return;
+    }
+    const previous = session;
+    const sessionId = session.id;
+    setSavingConversationTitle(true);
+    setError('');
+    upsertSession({
+      ...session,
+      title,
+      titleFileName: undefined,
+      updatedAt: new Date().toISOString(),
+    }, { activate: true });
+    try {
+      const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+      const data = await readApiJson<Record<string, unknown>>(response, '修改对话标题失败');
+      upsertSession(data.session as BrowserChatSession, { activate: activeSessionIdRef.current === sessionId });
+      setConversationTitleDraft(title);
+      setEditingConversationTitle(false);
+    } catch (renameError) {
+      upsertSession(previous, { activate: activeSessionIdRef.current === sessionId });
+      setError(renameError instanceof Error ? renameError.message : '修改对话标题失败');
+    } finally {
+      setSavingConversationTitle(false);
+    }
+  }
+
+  async function shareConversationLink() {
+    if (!session) return;
+    const href = new URL(
+      browserChatSessionNavigationHref(window.location.href, session.id),
+      window.location.origin,
+    ).toString();
+    try {
+      try {
+        await navigator.clipboard.writeText(href);
+      } catch {
+        const textarea = document.createElement('textarea');
+        textarea.value = href;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand('copy');
+        textarea.remove();
+        if (!copied) throw new Error('复制对话链接失败');
+      }
+    } catch (shareError) {
+      setError(shareError instanceof Error ? shareError.message : '复制对话链接失败');
+      return;
+    }
+    setShareLinkCopied(true);
+    if (shareLinkFeedbackTimerRef.current) clearTimeout(shareLinkFeedbackTimerRef.current);
+    shareLinkFeedbackTimerRef.current = setTimeout(() => setShareLinkCopied(false), 1800);
+  }
+
+  const renderChatPaneHeader = () => session && hasMessages ? (
+    <header className="browser-chat-conversation-header">
+      <div className="browser-chat-conversation-title-area">
+        {editingConversationTitle ? (
+          <form className="browser-chat-conversation-title-form" onSubmit={(event) => void saveConversationTitle(event)}>
+            <AppInput
+              aria-label={t('对话标题')}
+              autoFocus
+              disabled={savingConversationTitle}
+              maxLength={240}
+              onChange={(event) => setConversationTitleDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== 'Escape') return;
+                event.preventDefault();
+                setEditingConversationTitle(false);
+              }}
+              value={conversationTitleDraft}
+            />
+            <button aria-label={t('保存标题')} disabled={!conversationTitleDraft.trim() || savingConversationTitle} title={t('保存标题')} type="submit">
+              {savingConversationTitle ? <Loader2 className="spin" size={15} /> : <Check size={15} />}
+            </button>
+            <button aria-label={t('取消修改')} disabled={savingConversationTitle} onClick={() => setEditingConversationTitle(false)} title={t('取消')} type="button">
+              <X size={15} />
+            </button>
+          </form>
+        ) : (
+          <>
+            <h1 title={sessionDisplayTitle(session)}>{sessionDisplayTitle(session)}</h1>
+            <button
+              aria-label={t('修改对话标题')}
+              className="browser-chat-conversation-title-edit"
+              onClick={startConversationTitleEdit}
+              title={t('修改对话标题')}
+              type="button"
+            >
+              <PencilLine aria-hidden="true" size={15} />
+            </button>
+          </>
+        )}
+      </div>
+      <div className="browser-chat-conversation-header-actions">
         <button
-          aria-label={t('打开实时界面')}
-          className="browser-chat-web-preview-button"
-          disabled={session.status === 'closed'}
-          onClick={() => setWebPreviewOpen(true)}
-          title={session.status === 'closed' ? t('当前对话已结束') : t('打开实时界面')}
+          aria-label={shareLinkCopied ? t('对话链接已复制') : t('分享对话')}
+          className={`browser-chat-conversation-share${shareLinkCopied ? ' is-copied' : ''}`}
+          onClick={() => void shareConversationLink()}
+          title={t('复制对话链接')}
           type="button"
         >
-          <AppWindow size={17} />
+          {shareLinkCopied ? <Check aria-hidden="true" size={15} /> : <Share2 aria-hidden="true" size={15} />}
+          <span>{shareLinkCopied ? t('已复制链接') : t('分享')}</span>
         </button>
-      ) : null}
-      {session ? (
-        <button className="browser-chat-close" disabled={session.status === 'closed' || currentBusy} onClick={closeSession} title={t('结束会话')} type="button">
-          <Power size={17} />
+        {webPreviewRuntime ? (
+          <button
+            aria-label={t('打开实时界面')}
+            className="browser-chat-conversation-direct-action"
+            disabled={session.status === 'closed'}
+            onClick={() => setWebPreviewOpen(true)}
+            title={session.status === 'closed' ? t('当前对话已结束') : t('打开实时界面')}
+            type="button"
+          >
+            <AppWindow aria-hidden="true" size={17} />
+            <span>{t('实时界面')}</span>
+          </button>
+        ) : null}
+        <button
+          aria-label={t('结束会话并关闭浏览器')}
+          className="browser-chat-conversation-direct-action is-danger"
+          disabled={session.status === 'closed' || currentBusy}
+          onClick={closeSession}
+          title={t('结束会话并关闭浏览器')}
+          type="button"
+        >
+          <Power aria-hidden="true" size={17} />
+          <span>{t('关闭浏览器')}</span>
         </button>
-      ) : null}
-      {!webPreviewRuntime ? (
-        <>
-          <BrowserChatGroupBindingCenter
-            disabled={!session?.id}
-            groupId={session?.browserGroupId}
-            onClose={() => setBrowserGroupPickerOpen(false)}
-            onSelect={assignBrowserGroup}
-            onToggle={toggleBrowserGroupPicker}
-            open={browserGroupPickerOpen}
-            panelWidth={downloadPanelWidth}
-          />
-          <BrowserChatDownloadCenter
-            downloads={downloads}
-            open={downloadCenterOpen}
-            onClose={() => setDownloadCenterOpen(false)}
-            onPreview={previewDownload}
-            onRemove={(id) => {
-              removedDownloadIdsRef.current.add(id);
-              setDownloads((current) => current.filter((download) => download.id !== id));
-            }}
-            onToggle={toggleDownloadCenter}
-            panelWidth={downloadPanelWidth}
-          />
-        </>
-      ) : null}
-    </div>
-  );
+        {!webPreviewRuntime ? (
+          <WorkspaceOverflowMenu
+            className="browser-chat-conversation-more"
+            icon={<MoreHorizontal size={17} />}
+            label={t('更多对话操作')}
+            title={t('更多对话操作')}
+          >
+              <button onClick={toggleBrowserGroupPicker} type="button">
+                <Folder size={16} />
+                <span>{t('浏览器标签组')}</span>
+              </button>
+              <button onClick={toggleDownloadCenter} type="button">
+                <Download size={16} />
+                <span>{t('下载管理')}</span>
+              </button>
+          </WorkspaceOverflowMenu>
+        ) : null}
+        {!webPreviewRuntime ? (
+          <div aria-hidden="true" className="browser-chat-conversation-popover-anchors">
+            <BrowserChatGroupBindingCenter
+              anchorOnly
+              disabled={!session.id}
+              groupId={session.browserGroupId}
+              onClose={() => setBrowserGroupPickerOpen(false)}
+              onSelect={assignBrowserGroup}
+              onToggle={toggleBrowserGroupPicker}
+              open={browserGroupPickerOpen}
+              panelWidth={downloadPanelWidth}
+            />
+            <BrowserChatDownloadCenter
+              anchorOnly
+              downloads={downloads}
+              open={downloadCenterOpen}
+              onClose={() => setDownloadCenterOpen(false)}
+              onPreview={previewDownload}
+              onRemove={(id) => {
+                removedDownloadIdsRef.current.add(id);
+                setDownloads((current) => current.filter((download) => download.id !== id));
+              }}
+              onToggle={toggleDownloadCenter}
+              panelWidth={downloadPanelWidth}
+            />
+          </div>
+        ) : null}
+      </div>
+    </header>
+  ) : null;
 
   const renderChatPane = () => (
     <div className={`${hasChatContent ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`}>
-      {renderChatPaneActions()}
+      {renderChatPaneHeader()}
 
       {hasMessages ? (
         <BrowserChatMessageList

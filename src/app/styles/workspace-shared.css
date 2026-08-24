@@ -107,9 +107,12 @@
 }
 
 .browser-chat-brand strong {
+  align-items: center;
   color: var(--foreground);
+  display: inline-flex;
   font-size: 15px;
   font-weight: 600;
+  gap: 9px;
   letter-spacing: -0.025em;
   min-width: 0;
   overflow-wrap: anywhere;
@@ -117,6 +120,22 @@
     opacity 0.16s ease,
     transform 0.16s ease;
   white-space: normal;
+}
+
+.browser-chat-brand-mark {
+  align-items: center;
+  background: #69cfbb;
+  border-radius: 6px;
+  color: #ffffff;
+  display: inline-flex;
+  flex: 0 0 22px;
+  font-size: 14px;
+  font-weight: 760;
+  height: 22px;
+  justify-content: center;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  width: 22px;
 }
 
 .browser-chat-nav,
@@ -1898,7 +1917,12 @@
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .browser-chat-history-stage {
     flex: 1 1 auto;
+    margin-right: -12px;
     min-height: 0;
+  }
+
+  .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .browser-chat-recent-list {
+    padding-right: 12px;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .browser-chat-history-date-label {

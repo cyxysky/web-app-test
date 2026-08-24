@@ -29,10 +29,6 @@ import {
   readBrowserChatStepsByIndexes,
 } from '@/server/storage/browser-chat-history-store';
 import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-store';
-import {
-  browserChatArtifactsFromSteps,
-  mergeBrowserChatArtifactSummaries,
-} from '@/lib/browser-chat-artifacts';
 
 function belongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: string | number) {
   return normalizeApplicationUserId(session.userId) === normalizeApplicationUserId(userId);
@@ -100,28 +96,6 @@ function resolvedContextUsage(
   };
 }
 
-function withBrowserChatMessageArtifacts(sessionId: string, messages: BrowserChatMessage[]) {
-  const assistantMessagesWithSteps = messages.filter((message) => (
-    message.role === 'assistant' && Boolean(message.stepIndexes?.length)
-  ));
-  const stepIndexes = Array.from(new Set(
-    assistantMessagesWithSteps.flatMap((message) => message.stepIndexes || []),
-  ));
-  if (!stepIndexes.length) return messages;
-  const steps = readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, stepIndexes);
-  return messages.map((message) => {
-    if (message.role !== 'assistant' || !message.stepIndexes?.length) return message;
-    const ownedIndexes = new Set(message.stepIndexes || []);
-    const artifacts = mergeBrowserChatArtifactSummaries(
-      message.artifacts,
-      browserChatArtifactsFromSteps(steps.filter((step) => (
-        step.messageId === message.id || ownedIndexes.has(step.index)
-      ))),
-    );
-    return { ...message, artifacts };
-  });
-}
-
 export function listBrowserChatSessionSummaries(
   userId?: string | number,
   input: { beforeId?: string; beforeUpdatedAt?: string; limit?: number } = {},
@@ -163,7 +137,6 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
         .sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
     };
   }
-  messages = { ...messages, items: withBrowserChatMessageArtifacts(sessionId, messages.items) };
   const activeSteps = activeMessage
     ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, activeMessage.stepIndexes || [])
         .filter((step) => !step.messageId || step.messageId === activeMessage.id)
@@ -214,14 +187,11 @@ export function readBrowserChatSessionHistoryPage(
         ),
       })
     : undefined;
-  const enrichedMessages = messages
-    ? { ...messages, items: withBrowserChatMessageArtifacts(sessionId, messages.items) }
-    : undefined;
   return {
-    ...(enrichedMessages ? { messages: enrichedMessages.items } : {}),
+    ...(messages ? { messages: messages.items } : {}),
     history: {
-      ...(enrichedMessages ? {
-        messages: { cursor: enrichedMessages.cursor, hasMore: enrichedMessages.hasMore },
+      ...(messages ? {
+        messages: { cursor: messages.cursor, hasMore: messages.hasMore },
       } : {}),
     },
   };

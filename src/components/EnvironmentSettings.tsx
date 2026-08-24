@@ -1367,7 +1367,7 @@ export function EnvironmentSettings({
           ) : null}
 
           {activeTab === 'model' ? (
-            <section>
+            <section className="settings-model-section">
               <div className="settings-section-head">
                 <div>
                   <h2>{t('模型配置')}</h2>
@@ -1386,7 +1386,10 @@ export function EnvironmentSettings({
                   </button>
                 </div>
               </div>
-              <div className="settings-card">
+              <div className="settings-card settings-model-card">
+                <div className="settings-model-group">
+                  <h3>{t('基础')}</h3>
+                  <div className="settings-model-group-body">
                 <div className="settings-row">
                   <div>
                     <strong>{t('默认服务商')}</strong>
@@ -1436,9 +1439,13 @@ export function EnvironmentSettings({
                     searchPlaceholder={t('搜索模型')}
                   />
                 </div>
+                  </div>
+                </div>
+                <div className="settings-model-group">
+                  <h3>{t('模型列表')}</h3>
+                  <div className="settings-model-group-body">
                 <div className="settings-row settings-model-list-row">
                   <div>
-                    <strong>{t('可用模型')}</strong>
                     <span>{t('一个服务商可以维护多个模型，运行时可在下拉框里按服务商分组选择。')}</span>
                   </div>
                   <div className="settings-model-list-control">
@@ -1481,6 +1488,11 @@ export function EnvironmentSettings({
                     </button>
                   </div>
                 </div>
+                  </div>
+                </div>
+                <div className="settings-model-group">
+                  <h3>{t('连接')}</h3>
+                  <div className="settings-model-group-body">
                 <div className="settings-row">
                   <div>
                     <strong>{t('访问密钥')}</strong>
@@ -1524,6 +1536,8 @@ export function EnvironmentSettings({
                     />
                   </div>
                 ) : null}
+                  </div>
+                </div>
               </div>
             </section>
           ) : null}

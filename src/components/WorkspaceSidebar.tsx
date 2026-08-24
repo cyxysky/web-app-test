@@ -62,7 +62,10 @@ export function WorkspaceSidebar({
   return (
     <aside className={className ? `browser-chat-sidebar ${className}` : 'browser-chat-sidebar'}>
       <div className="browser-chat-brand">
-        <strong>DOMP WebPilot</strong>
+        <strong>
+          <span aria-hidden="true" className="browser-chat-brand-mark">D</span>
+          <span>DOMP WebPilot</span>
+        </strong>
         <button
           aria-label={collapseLabel}
           className="ui-icon-button"

@@ -8,6 +8,7 @@ import sharp from 'sharp';
 import { artifactApiUrl, artifactApiUrlFromRelative } from '@/lib/artifacts';
 import type { BrowserActionResult } from '@/server/browser/browser-session';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
+import { fileFormatForExtension, fileFormatForMimeType, normalizedFileExtension } from '@/server/files/file-format-registry';
 import {
   generateFileToPaths,
 } from './document-artifact-generators';
@@ -29,6 +30,7 @@ import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 const FILE_DOWNLOAD_TIMEOUT_MS = 120_000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
 const FILE_DOWNLOAD_RETRY_DELAYS_MS = [750, 1_500, 3_000] as const;
+const FILE_DOWNLOAD_CACHE_VERSION = 'mime-extension-v1';
 const DOCUMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const draftLocks = new Map<string, Promise<void>>();
 const activeDownloads = new Map<string, Promise<BrowserActionResult>>();
@@ -43,6 +45,7 @@ type DownloadArtifactInput = {
   urlOrPath?: string;
   sourcePageUrl?: string;
   fileName?: string | null;
+  fileType?: string | null;
 };
 
 type PlanArtifactInput = {
@@ -527,6 +530,34 @@ function fileNameFromUrl(value: string) {
   }
 }
 
+function normalizedDownloadFileType(value: string | undefined | null) {
+  const fileType = String(value || '').trim().toLowerCase();
+  if (!/^[a-z0-9]{1,10}$/.test(fileType)) {
+    throw new Error('downloadFile requires fileType as a file extension without a dot, for example jpg, pdf, or docx.');
+  }
+  return `.${fileType}`;
+}
+
+function sameRegisteredFileType(left: string, right: string) {
+  const leftMime = fileFormatForExtension(left)?.mimeType.split(';')[0].trim().toLowerCase();
+  const rightMime = fileFormatForExtension(right)?.mimeType.split(';')[0].trim().toLowerCase();
+  return Boolean(leftMime && rightMime && leftMime === rightMime);
+}
+
+function fileNameWithResponseExtension(fileName: string, requestedExtension: string, contentType: string | null) {
+  const normalizedContentType = String(contentType || '').split(';')[0].trim().toLowerCase();
+  const responseExtension = normalizedContentType && normalizedContentType !== 'application/octet-stream'
+    ? fileFormatForMimeType(normalizedContentType)?.extension
+    : undefined;
+  const effectiveExtension = !responseExtension || sameRegisteredFileType(requestedExtension, responseExtension)
+    ? requestedExtension
+    : responseExtension;
+  const currentExtension = normalizedFileExtension(fileName);
+  if (!currentExtension) return `${fileName}${effectiveExtension}`;
+  if (currentExtension === effectiveExtension || sameRegisteredFileType(currentExtension, effectiveExtension)) return fileName;
+  return `${fileName.slice(0, -currentExtension.length)}${effectiveExtension}`;
+}
+
 function resolveDownloadUrl(input: DownloadArtifactInput) {
   const raw = String(input.url || input.urlOrPath || input.path || '').trim();
   if (!raw) throw new Error('downloadFile requires url, path, or urlOrPath.');
@@ -602,7 +633,12 @@ async function downloadFileArtifactUnlocked(input: DownloadArtifactInput, url: s
         || parseContentDispositionFileName(response.headers.get('content-disposition'))
         || fileNameFromUrl(resolvedUrl)
         || `download-${Date.now()}.bin`;
-      const fileName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
+      const sanitizedName = sanitizeFileName(suggestedName, `download-${Date.now()}.bin`);
+      const fileName = fileNameWithResponseExtension(
+        sanitizedName,
+        normalizedDownloadFileType(input.fileType),
+        response.headers.get('content-type'),
+      );
       await mkdir(dir, { recursive: true });
       const target = await uniqueArtifactPath(dir, fileName);
       let bytes = 0;
@@ -710,6 +746,16 @@ async function acquireFilesystemDraftLock(runId: string | undefined, documentId:
 }
 
 export async function downloadFileArtifact(input: DownloadArtifactInput): Promise<BrowserActionResult> {
+  let requestedExtension: string;
+  try {
+    requestedExtension = normalizedDownloadFileType(input.fileType);
+  } catch (error) {
+    return { ok: false, actual: `downloadFile failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  const explicitExtension = normalizedFileExtension(String(input.fileName || ''));
+  if (explicitExtension && explicitExtension !== requestedExtension && !sameRegisteredFileType(explicitExtension, requestedExtension)) {
+    return { ok: false, actual: `downloadFile failed: fileName extension ${explicitExtension} does not match fileType ${input.fileType}.` };
+  }
   let url: string;
   try {
     url = resolveDownloadUrl(input);
@@ -776,7 +822,9 @@ async function fetchDownloadResponse(url: string, signal: AbortSignal) {
 }
 
 function downloadCacheKey(input: DownloadArtifactInput, url: string) {
-  return createHash('sha256').update(`${url}\n${String(input.fileName || '')}`, 'utf8').digest('hex');
+  return createHash('sha256')
+    .update(`${FILE_DOWNLOAD_CACHE_VERSION}\n${url}\n${String(input.fileName || '')}\n${String(input.fileType || '')}`, 'utf8')
+    .digest('hex');
 }
 
 function downloadRetryDelay(response: Response, attempt: number) {

@@ -66,6 +66,7 @@ import {
   limitBrowserChatSubagentMessages,
   preserveBrowserChatSubagentSummary,
   resolvedBrowserChatSubagentStatus,
+  runBrowserChatSubagentAttemptWithRetry,
   runOrReuseBrowserChatSubagentBatch,
   settleBrowserChatSubagents,
   type BrowserChatSubagentConfirmationInteraction,
@@ -3294,6 +3295,18 @@ export function setBrowserChatSessionGroup(sessionId: string, groupId: string, u
   return clientSnapshot(session);
 }
 
+export function updateBrowserChatSessionTitle(sessionId: string, title: string, userId?: string | number) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) return undefined;
+  const normalized = title.trim();
+  if (!normalized || normalized.length > 240) throw new Error('Invalid browser chat session title');
+  session.title = normalized;
+  session.titleFileName = undefined;
+  session.updatedAt = now();
+  persistAndNotify(session.id);
+  return clientSnapshot(session);
+}
+
 export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
   const summaries = new Map(readSessionSummaries(input.userId).map((session) => [session.id, session]));
   for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
@@ -4083,12 +4096,9 @@ function updateAssistantMessage(
   const index = session.messages.findIndex((message) => message.id === assistantMessageId);
   if (index < 0) return;
   const updated = updater(session.messages[index]);
-  const linkedStepIndexes = new Set(updated.stepIndexes || []);
   const artifacts = mergeBrowserChatArtifactSummaries(
     updated.artifacts,
-    browserChatArtifactsFromSteps(session.steps.filter((step) => (
-      step.messageId === assistantMessageId || linkedStepIndexes.has(step.index)
-    ))),
+    browserChatArtifactsFromSteps(session.steps.filter((step) => step.messageId === assistantMessageId)),
   );
   session.messages[index] = {
     ...updated,
@@ -4902,14 +4912,17 @@ async function executeBrowserChatSubagentBatch(input: {
         usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
       });
       const initialRuntimeContext = getRuntimeOperationalContext();
-      const result = await executeInteractiveBrowserTurn({
+      const executeChildAttempt = (attemptNumber: number, retryReason = '') => executeInteractiveBrowserTurn({
         session: child,
         runId: `${session.id}_${task.id}`,
-        turnId: `${assistantMessageId}:subagent:${task.id}`,
+        turnId: `${assistantMessageId}:subagent:${task.id}:attempt:${attemptNumber}`,
         targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
           `你是并行子 Agent“${task.title}”。只完成当前这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
+          retryReason
+            ? `[自动重试 ${attemptNumber}/2] 上一次子任务在没有执行任何工具时失败：${retryReason}。重新读取当前页面状态，从头执行本任务，不要只复述上一次错误。`
+            : '',
           '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
           inheritedStorageState
             ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
@@ -4985,6 +4998,31 @@ async function executeBrowserChatSubagentBatch(input: {
             messages: liveSubagentMessages(),
           });
           persistAndNotify(session.id, { defer: true });
+        },
+      });
+      const result = await runBrowserChatSubagentAttemptWithRetry({
+        run: executeChildAttempt,
+        shouldRetryResult: (attemptResult) => (
+          attemptResult.status === 'failed'
+          && attemptResult.newSteps.reduce((count, step) => count + (step.tools || []).length, 0) === 0
+        ),
+        retryReasonFromError: userFacingErrorMessage,
+        retryReasonFromResult: (attemptResult) => userFacingErrorMessage(
+          attemptResult.reply || attemptResult.newSteps.at(-1)?.actual || '子 Agent 未执行任何工具即结束',
+        ),
+        onRetry: () => {
+          if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+          streamedSubagentText = '';
+          childSteps.clear();
+          updateBrowserChatStoredSubagent(session.id, task.id, {
+          status: 'running',
+          content: '',
+          currentAction: '首次执行失败，正在自动重试 2/2',
+          error: undefined,
+          steps: [],
+          messages: [browserChatSubagentInputMessage(task.id, task.instruction)],
+          });
+          persistAndNotify(session.id);
         },
       });
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
@@ -5313,7 +5351,11 @@ async function runBrowserChatMessage(
     try {
       assertTurnActive();
       appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
-      const browser = await browserForTurnDecision(session, assertTurnActive);
+      // Bind the turn to the browser that actually finished starting. Keeping a
+      // merely planned BrowserSession here allowed preview/startup work to
+      // replace it while the model was deciding, so the first browser tool was
+      // guaranteed to fail against a stale object reference.
+      const browser = await ensureStarted(session, assertTurnActive, { preferExistingPage: true });
       assertTurnActive();
       const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
@@ -5367,7 +5409,7 @@ async function runBrowserChatMessage(
           assertTurnActive();
           const startedBrowser = await ensureStarted(session, assertTurnActive);
           assertTurnActive();
-          if (startedBrowser !== browser) throw new Error('Browser session changed while the AI was deciding; retry this browser tool on the active session.');
+          if (startedBrowser !== browser) throw new Error('The active browser session was replaced after this turn started.');
         },
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),

@@ -1,3 +1,7 @@
+.file-preview-overlay {
+  z-index: 2147483005 !important;
+}
+
 .file-preview-dialog {
   display: flex;
   flex-direction: column;

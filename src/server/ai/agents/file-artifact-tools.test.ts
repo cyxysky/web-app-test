@@ -90,7 +90,7 @@ test('deduplicates concurrent downloads and reuses the per-run URL cache', async
     return new Response('cached-download', { status: 200, headers: { 'content-type': 'text/plain' } });
   };
   try {
-    const input = { runId: 'chat_test', url: 'https://example.test/asset.txt' };
+    const input = { fileType: 'txt', runId: 'chat_test', url: 'https://example.test/asset.txt' };
     const [first, concurrent] = await Promise.all([downloadFileArtifact(input), downloadFileArtifact(input)]);
     assert.equal(first.ok, true, first.actual);
     assert.equal(concurrent.actual, first.actual);
@@ -99,6 +99,105 @@ test('deduplicates concurrent downloads and reuses the per-run URL cache', async
     assert.equal(cached.ok, true, cached.actual);
     assert.equal(JSON.parse(cached.actual || '{}').cacheHit, true);
     assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousRoot;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('uses the required model-provided file type when a downloaded URL has no extension', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-extension-'));
+  const previousRoot = process.env.ARTIFACTS_DIR;
+  const previousFetch = globalThis.fetch;
+  process.env.ARTIFACTS_DIR = root;
+  globalThis.fetch = async () => new Response('jpeg-content', {
+    status: 200,
+    headers: { 'content-type': 'image/jpeg' },
+  });
+  try {
+    const downloaded = await downloadFileArtifact({
+      fileType: 'jpg',
+      runId: 'chat_test',
+      url: 'https://images.example.test/photo-1547721064-da6cfb341d50?w=1920&q=80',
+    });
+    assert.equal(downloaded.ok, true, downloaded.actual);
+    const payload = JSON.parse(downloaded.actual || '{}') as { fileName?: string; path?: string };
+    assert.equal(payload.fileName, 'photo-1547721064-da6cfb341d50.jpg');
+    assert.equal(path.extname(payload.path || ''), '.jpg');
+    assert.equal(await readFile(payload.path || '', 'utf8'), 'jpeg-content');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousRoot;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('rejects a download before fetching when the model omits fileType', async () => {
+  const previousFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response('unexpected');
+  };
+  try {
+    const downloaded = await downloadFileArtifact({
+      runId: 'chat_test',
+      url: 'https://downloads.example.test/file',
+    });
+    assert.equal(downloaded.ok, false);
+    assert.match(downloaded.actual || '', /requires fileType/);
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('corrects a model-provided download file type when the response reports a different format', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-type-correction-'));
+  const previousRoot = process.env.ARTIFACTS_DIR;
+  const previousFetch = globalThis.fetch;
+  process.env.ARTIFACTS_DIR = root;
+  globalThis.fetch = async () => new Response('jpeg-content', {
+    status: 200,
+    headers: { 'content-type': 'image/jpeg' },
+  });
+  try {
+    const downloaded = await downloadFileArtifact({
+      fileType: 'png',
+      runId: 'chat_test',
+      url: 'https://images.example.test/photo',
+    });
+    assert.equal(downloaded.ok, true, downloaded.actual);
+    assert.equal(JSON.parse(downloaded.actual || '{}').fileName, 'photo.jpeg');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousRoot;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('keeps a provided download extension instead of replacing it from the response MIME type', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-explicit-extension-'));
+  const previousRoot = process.env.ARTIFACTS_DIR;
+  const previousFetch = globalThis.fetch;
+  process.env.ARTIFACTS_DIR = root;
+  globalThis.fetch = async () => new Response('content', {
+    status: 200,
+    headers: { 'content-type': 'application/octet-stream' },
+  });
+  try {
+    const downloaded = await downloadFileArtifact({
+      fileName: 'custom-image.png',
+      fileType: 'png',
+      runId: 'chat_test',
+      url: 'https://downloads.example.test/file',
+    });
+    assert.equal(downloaded.ok, true, downloaded.actual);
+    assert.equal(JSON.parse(downloaded.actual || '{}').fileName, 'custom-image.png');
   } finally {
     globalThis.fetch = previousFetch;
     if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;

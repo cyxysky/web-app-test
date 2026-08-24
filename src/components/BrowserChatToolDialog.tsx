@@ -146,6 +146,7 @@ export function BrowserChatToolDialog({
   return (
     <AppModal
       ariaLabelledBy="browser-chat-tool-dialog-title"
+      backdropClassName="browser-chat-tool-dialog-overlay"
       dialogClassName="browser-chat-tool-dialog"
       onClose={onClose}
       size="log"

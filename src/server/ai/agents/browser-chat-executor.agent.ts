@@ -227,8 +227,8 @@ const codexRuntimeObjectSchema = z.object({
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
     skillId: z.string().nullable().optional(),
-  }).describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason.'),
-});
+  }).passthrough().describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason. Tool-specific keys not listed in this common envelope are preserved. Example file parameters: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. Example browserCode parameters: {"code":"nodeRepl.write({url: page.url(), title: await page.title()})"}.'),
+}).describe('Return exactly one object with type, optional message, and params. Example: {"type":"file","message":"准备演示文稿","params":{"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}}.');
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
 // 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
@@ -1133,7 +1133,22 @@ function makeBrowserTools(
   const toolContextShape = {
     reason: toolReasonInput,
   };
-  const browserToolInput = <T extends z.ZodRawShape>(shape: T) => z.object({ ...toolContextShape, ...shape });
+  const withToolInputExamples = <TSchema extends z.ZodType>(
+    schema: TSchema,
+    examples: readonly Record<string, unknown>[],
+  ): TSchema => {
+    if (!examples.length) return schema;
+    const exampleDescription = examples
+      .map((example, index) => `Example ${index + 1}: ${JSON.stringify(example)}`)
+      .join(' ');
+    return schema
+      .describe(`Valid tool parameter examples. ${exampleDescription}`)
+      .meta({ examples: examples.map((example) => ({ ...example })) }) as TSchema;
+  };
+  const browserToolInput = <T extends z.ZodRawShape>(
+    shape: T,
+    examples: readonly Record<string, unknown>[] = [],
+  ) => withToolInputExamples(z.object({ ...toolContextShape, ...shape }), examples);
   const fileProgressReporter = (trace?: ToolTrace) => async (progress: FileGenerationProgress) => {
     if (!trace) return;
     trace.progress = {
@@ -1210,7 +1225,7 @@ function makeBrowserTools(
   const sharedTools = {
     readBrowserState: tool({
       description: 'When a request needs live browser evidence or browser interaction, this must be its first browser tool. It reads the current conversation tab group, all tabs in that group, the active page URL/title, and the current page state without changing the browser. Do not call it for a request that can be answered without the live browser.',
-      inputSchema: browserToolInput({}),
+      inputSchema: browserToolInput({}, [{ reason: '读取当前会话浏览器状态' }]),
       execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, {
         runId: referenceOptions?.runId,
         stepIndex: referenceOptions?.stepIndex,
@@ -1222,7 +1237,7 @@ function makeBrowserTools(
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
-      }),
+      }, [{ reason: '读取当前页面地址和标题', code: 'nodeRepl.write({ url: page.url(), title: await page.title() })' }]),
       execute: (input, execution) => {
         return record('browserCode', input, (abortSignal) => {
           const violation = browserCodeServiceFileDeliveryViolation(input.code);
@@ -1243,7 +1258,7 @@ function makeBrowserTools(
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
       inputSchema: browserToolInput({
         maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
-      }),
+      }, [{ reason: '等待用户完成验证码', maxMs: 180000 }]),
       execute: (input, execution) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs), execution),
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
@@ -1260,7 +1275,10 @@ function makeBrowserTools(
           instruction: z.string().min(1).max(4_000).optional().describe('Flat fallback instruction when spawning exactly one child Agent.'),
           url: z.string().url().max(4_000).optional().describe('Flat fallback URL when spawning exactly one child Agent.'),
           uuid: z.string().uuid().optional().describe('One child Agent UUID returned by action=spawn; required only for action=read.'),
-        }).superRefine((input, context) => {
+        }, [
+          { reason: '并行分析独立页面', action: 'spawn', tasks: [{ title: '分析需求A', url: 'https://example.com/a', instruction: '分析页面并返回关键证据。' }] },
+          { reason: '读取子 Agent 分析结果', action: 'read', uuid: '123e4567-e89b-12d3-a456-426614174000' },
+        ]).superRefine((input, context) => {
           if (input.action === 'spawn') {
             const hasFlatTask = Boolean(input.title && input.instruction && input.url);
             if (!input.tasks?.length && !hasFlatTask) {
@@ -1308,7 +1326,7 @@ function makeBrowserTools(
         inputSchema: browserToolInput({
           action: z.literal('read'),
           skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
-        }),
+        }, [{ reason: '读取当前站点操作规范', action: 'read', skillId: 'domp-90-system' }]),
         execute: (input, execution) => record('skill', input, () => referenceOptions.readSkill!(input.skillId), execution),
       }),
     } : {}),
@@ -1318,19 +1336,20 @@ function makeBrowserTools(
       // gateways mishandle a discriminated union/oneOf and reject a perfectly
       // usable file call before the action-specific implementation can return
       // a helpful correction. Each action validates its required fields below.
-      inputSchema: z.preprocess(
+      inputSchema: withToolInputExamples(z.preprocess(
         (input) => coerceBrowserChatToolInput('file', input),
         z.object({
           reason: z.string().min(1).max(300).optional().describe('Optional concise reason; it never changes file behavior.'),
-          action: z.string().max(32).optional().describe('Exactly one action: read, download, plan, generate, edit, unoApi, jsApi, or render. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. jsApi returns the cookbook for JavaScript generation mode.'),
-          attachmentId: z.string().max(160).optional(),
-          artifactId: z.string().max(4_000).optional(),
-          documentId: z.string().max(96).optional(),
-          fileName: z.string().max(180).optional(),
+          action: z.string().max(32).optional().describe('Exactly one action: read, download, plan, generate, edit, unoApi, jsApi, or render. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. jsApi returns the cookbook for JavaScript generation mode.'),
+          attachmentId: z.string().max(160).optional().describe('Exact user attachment id returned in conversation metadata. Example: "attachment-7f3a".'),
+          artifactId: z.string().max(4_000).optional().describe('Exact Artifact ID returned by a previous successful file tool result; never invent it.'),
+          documentId: z.string().max(96).optional().describe('Stable model-chosen id reused across plan, API lookup, generate, edit, render, and visual correction. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. Example: "xsbn-5d-yxg-guide".'),
+          fileName: z.string().max(180).optional().describe('Optional output file name including the target extension. Examples: "西双版纳5日游攻略-野象谷周边.pptx", "项目复盘.docx", or "预算明细.xlsx".'),
+          fileType: z.string().regex(/^[a-z0-9]{1,10}$/).optional().describe('Required for action=download: the expected file extension without a dot, such as jpg, png, pdf, docx, xlsx, or pptx. Always infer and provide it even when fileName is omitted.'),
           documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('For plan/unoApi only: word, spreadsheet, or presentation. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
           operation: z.enum(['create', 'modify']).optional().describe('For plan: create a new document or modify an attached existing Office document.'),
           sourceAttachmentId: z.string().max(160).optional().describe('For operation=modify: exact attachment id of the existing Office file.'),
-          intent: z.string().max(8_000).optional(),
+          intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
           url: z.string().max(8_000).optional(),
           path: z.string().max(8_000).optional().describe('For draft read/edit, an optional relative @webpilot-unit path such as pages/slide-008; for download, a source path or URL as documented by that action.'),
           urlOrPath: z.string().max(8_000).optional(),
@@ -1355,7 +1374,21 @@ function makeBrowserTools(
           target: z.enum(['all', 'document', 'page', 'text', 'sheet', 'cell', 'shape']).optional(),
           query: z.string().max(120).optional(),
         }).passthrough(),
-      ),
+      ), [
+        { reason: 'Download the referenced JPEG image', action: 'download', urlOrPath: 'https://example.com/image', fileType: 'jpg' },
+        {
+          action: 'plan',
+          reason: '规划西双版纳攻略演示文稿',
+          documentId: 'xsbn-5d-yxg-guide',
+          fileName: '西双版纳5日游攻略-野象谷周边.pptx',
+          documentType: 'presentation',
+          operation: 'create',
+          intent: '创建一份西双版纳5日游攻略演示文稿',
+        },
+        { reason: '读取当前文稿源文件', action: 'read', documentId: 'xsbn-5d-yxg-guide' },
+        { reason: '修改文稿中的行程页', action: 'edit', documentId: 'xsbn-5d-yxg-guide', edits: [{ kind: 'replaceRange', startLine: 120, endLine: 128, newText: '# replacement source' }] },
+        { reason: '渲染当前文稿版本', action: 'render', documentId: 'xsbn-5d-yxg-guide' },
+      ]),
       execute: (input, execution) => {
         if (input.action === 'read') {
           if (input.documentId) {
@@ -1443,7 +1476,11 @@ function makeBrowserTools(
             }).strict()).min(1).max(6).optional().describe('For action=report: explicit conclusions for screenshots already read from this artifact.'),
             offset: z.number().int().min(0).optional().describe('For action=index only: zero-based screenshot-list offset. Defaults to 0.'),
             limit: z.number().int().min(1).max(200).optional().describe('For action=index only: number of screenshot ids to list. Defaults to 100.'),
-          }).superRefine((input, context) => {
+          }, [
+            { reason: '列出当前文稿的全部预览页', action: 'index', artifactId: 'exact-artifact-id-from-file-result', offset: 0, limit: 100 },
+            { reason: '读取前两页预览图', action: 'read', artifactId: 'exact-artifact-id-from-file-result', screenshotIds: ['screenshot-0001', 'screenshot-0002'] },
+            { reason: '提交第一页视觉检查结论', action: 'report', artifactId: 'exact-artifact-id-from-file-result', reviews: [{ screenshotId: 'screenshot-0001', status: 'passed' }] },
+          ]).superRefine((input, context) => {
             if (input.action === 'read' && !input.screenshotIds?.length) {
               context.addIssue({ code: z.ZodIssueCode.custom, message: 'read requires screenshotIds.', path: ['screenshotIds'] });
             }
@@ -3823,6 +3860,7 @@ export async function executeRecordedBrowserOperation(
           urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
           sourcePageUrl: session.currentUrl(),
           fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+          fileType: typeof input.fileType === 'string' ? input.fileType : undefined,
         });
       }
       if (input.action === 'plan') {
@@ -3918,6 +3956,7 @@ export async function executeRecordedBrowserOperation(
         urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
         sourcePageUrl: session.currentUrl(),
         fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+        fileType: typeof input.fileType === 'string' ? input.fileType : undefined,
       });
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
