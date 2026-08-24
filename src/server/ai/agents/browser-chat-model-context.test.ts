@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { ModelMessage } from 'ai';
 import {
   appendInterruptedBrowserChatTurn,
+  appendTerminalBrowserChatTurn,
   compactBrowserChatModelTranscript,
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
@@ -43,7 +44,7 @@ test('keeps the native AI SDK user, tool call, tool result, and final assistant 
   });
 });
 
-test('serializes binary AI SDK file parts as valid data URLs', () => {
+test('omits binary AI SDK file parts from persistent model context', () => {
   const messages: ModelMessage[] = [{
     role: 'user',
     content: [
@@ -53,10 +54,27 @@ test('serializes binary AI SDK file parts as valid data URLs', () => {
   }];
 
   const stored = serializableBrowserChatModelMessages(messages);
-  const file = Array.isArray(stored[0]?.content) ? stored[0].content[1] : undefined;
-  assert.equal(file?.type, 'file');
-  if (file?.type !== 'file') assert.fail('expected a file part');
-  assert.equal(file.data, 'data:image/png;base64,aW1hZ2UtYnl0ZXM=');
+  assert.equal(Array.isArray(stored[0]?.content), true);
+  assert.equal(Array.isArray(stored[0]?.content) ? stored[0].content.length : 0, 1);
+  assert.doesNotMatch(JSON.stringify(stored), /base64|image-bytes/);
+});
+
+test('removes legacy persisted data URL file parts while loading model context', () => {
+  const context = normalizeBrowserChatModelContext({
+    version: 1,
+    transcript: [],
+    activeMessages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'keep this instruction' },
+        { type: 'file', data: 'data:image/png;base64,aW1hZ2UtYnl0ZXM=', mediaType: 'image/png' },
+      ],
+    }],
+  });
+
+  assert.equal(Array.isArray(context.activeMessages[0]?.content), true);
+  assert.equal(Array.isArray(context.activeMessages[0]?.content) ? context.activeMessages[0].content.length : 0, 1);
+  assert.doesNotMatch(JSON.stringify(context), /base64/);
 });
 
 test('falls back to the transcript when an active chain was not stored', () => {
@@ -76,6 +94,41 @@ test('retains the complete active model working set', () => {
   assert.equal(context.activeMessages.length, 220);
   assert.equal(context.activeMessages[0]?.content, 'active-0');
   assert.equal(context.activeMessages.at(-1)?.content, 'active-219');
+});
+
+test('a failed terminal turn remains available to the next model cycle without duplicating its user message', () => {
+  const stored = appendTerminalBrowserChatTurn(
+    [{ role: 'user', content: 'finish the report' }],
+    'finish the report',
+    'Execution failed: upstream timeout.',
+  );
+
+  assert.deepEqual(stored, [
+    { role: 'user', content: 'finish the report' },
+    { role: 'assistant', content: 'Execution failed: upstream timeout.' },
+  ]);
+});
+
+test('retains the durable continuation summary independently from active message markers', () => {
+  const context = normalizeBrowserChatModelContext({
+    version: 1,
+    transcript: [],
+    activeMessages: [{ role: 'user', content: '继续' }],
+    lastCompression: {
+      compressedAt: '2026-08-24T00:00:00.000Z',
+      continuationSummary: '{"completed":["已读取需求"],"nextStep":"继续生成"}',
+      estimatedTokensAfter: 40_000,
+      estimatedTokensBefore: 220_000,
+      retainedMessageCount: 3,
+      summarizedMessageCount: 150,
+      targetCeilingTokens: 51_200,
+      targetFloorTokens: 25_600,
+      thresholdTokens: 217_600,
+      windowTokens: 256_000,
+    },
+  });
+
+  assert.match(context.lastCompression?.continuationSummary || '', /已读取需求/);
 });
 
 test('does not separate a large tool result from its tool call', () => {

@@ -76,6 +76,14 @@ test('browser chat history uses stable cursors and returns oldest-to-newest chun
       history.readBrowserChatStepsByIndexes<{ index: number }>(defaultSnapshot.id, [5, 2, 5]).map((step) => step.index),
       [2, 5],
     );
+    assert.deepEqual(
+      history.readAllBrowserChatMessages<{ id: string }>(defaultSnapshot.id).map((message) => message.id),
+      Array.from({ length: 12 }, (_, index) => `d${index + 1}`),
+    );
+    assert.deepEqual(
+      history.readAllBrowserChatSteps<{ index: number }>(defaultSnapshot.id).map((step) => step.index),
+      Array.from({ length: 12 }, (_, index) => index + 1),
+    );
   } finally {
     databaseModule.getSqliteDatabase().close();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

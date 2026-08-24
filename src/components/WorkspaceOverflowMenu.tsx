@@ -37,7 +37,12 @@ export function WorkspaceOverflowMenu({
         >
           {icon}
         </Button>
-        <Popover.Content containerPadding={8} offset={6} placement="bottom end">
+        <Popover.Content
+          className="browser-chat-overflow-popover"
+          containerPadding={8}
+          offset={6}
+          placement="bottom end"
+        >
           <Popover.Dialog
             aria-label={label}
             className="browser-chat-popover-actions"

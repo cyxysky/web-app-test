@@ -75,9 +75,9 @@ function resolvedContextUsage(
     provider: session.modelProvider,
     model: session.model,
   });
-  if (stored && stored.currentTokens > 0) return { ...stored, maxTokens: effectiveMaxTokens };
-  const source = session.modelContext?.activeMessages?.length
-    ? session.modelContext.activeMessages
+  const activeMessages = session.modelContext?.activeMessages || [];
+  const source = activeMessages.length
+    ? activeMessages
     : messages.map((message) => ({
         role: message.role,
         content: message.content,
@@ -87,12 +87,16 @@ function resolvedContextUsage(
         })),
       }));
   const estimated = estimateRuntimeMessageContext(source);
+  if (!activeMessages.length && stored && stored.currentTokens > 0) {
+    return { ...stored, maxTokens: effectiveMaxTokens };
+  }
+  const toolTokens = stored?.toolTokens || 0;
   return {
-    currentTokens: estimated.totalTokens,
+    currentTokens: estimated.totalTokens + toolTokens,
     imageTokens: estimated.imageTokens,
     maxTokens: effectiveMaxTokens,
     textTokens: estimated.textTokens,
-    toolTokens: stored?.toolTokens || 0,
+    toolTokens,
   };
 }
 

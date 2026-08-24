@@ -43,6 +43,7 @@ import {
 } from '@/lib/browser-chat-artifacts';
 import {
   appendInterruptedBrowserChatTurn,
+  appendTerminalBrowserChatTurn,
   compactBrowserChatModelTranscript,
   normalizeBrowserChatModelContext,
   serializableBrowserChatModelMessages,
@@ -139,6 +140,8 @@ import {
 } from '@/server/storage/sqlite-record-store';
 import {
   BROWSER_CHAT_MESSAGE_PAGE_SIZE,
+  readAllBrowserChatMessages,
+  readAllBrowserChatSteps,
   readBrowserChatSessionHeader,
   readBrowserChatSessionOwner,
   readBrowserChatSessionWindow,
@@ -1442,15 +1445,18 @@ function normalizeSkillIds(value: unknown) {
 function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifactId: string): BrowserChatAttachment | undefined {
   const segments = artifactId.replace(/\\/g, '/').split('/').filter(Boolean);
   if (segments.some((segment) => segment === '.' || segment === '..')) return undefined;
-  if (segments.length < 3 || segments[0] !== session.id || !['downloads', 'generated'].includes(segments[1])) return undefined;
   const name = segments.at(-1) || 'artifact';
+  const type = artifactContentType(name);
+  const managedArtifact = segments.length >= 3 && ['downloads', 'generated', 'screenshots'].includes(segments[1]);
+  const rootScreenshot = segments.length === 2 && type.startsWith('image/');
+  if (segments[0] !== session.id || (!managedArtifact && !rootScreenshot)) return undefined;
   return {
     id: `artifact:${segments.join('/')}`,
     kind: 'file',
     name,
     path: segments.join('/'),
     size: undefined,
-    type: artifactContentType(name),
+    type,
     url: artifactApiUrlFromRelative(segments.join('/')),
   };
 }
@@ -1458,9 +1464,10 @@ function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifac
 async function readFileForSession(
   session: BrowserChatSessionRecord,
   input: BrowserChatReadFileInput,
+  historicalMessages: BrowserChatMessage[] = [],
 ) {
   const attachment = input.attachmentId
-    ? [...session.messages]
+    ? mergePersistedMessages(historicalMessages, session.messages)
       .reverse()
       .flatMap((message) => message.attachments || [])
       .find((item) => item.id === input.attachmentId)
@@ -1624,6 +1631,8 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   modelText: string;
   explicitlySelectedSkills?: SkillRecord[];
   usedMemoryIds?: Set<string>;
+  historicalMessages?: BrowserChatMessage[];
+  historicalSteps?: StepExecutionResult[];
 }) {
   const loadedSkills = new Map<string, SkillRecord>();
   const usedMemoryIds = input.usedMemoryIds || new Set<string>();
@@ -1673,7 +1682,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
         formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
-        conversationFileRegistry(input.session),
+        conversationFileRegistry(input.session, input.historicalMessages, input.historicalSteps),
         browserChatCredentialPrompt(credentials.credentials),
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
@@ -1762,17 +1771,26 @@ async function readFileVisualsForSession(
 }
 
 /** Persistent file inventory survives model-context compression. */
-function conversationFileRegistry(session: BrowserChatSessionRecord) {
+function conversationFileRegistry(
+  session: BrowserChatSessionRecord,
+  historicalMessages: BrowserChatMessage[] = [],
+  historicalSteps: StepExecutionResult[] = [],
+) {
+  const messages = mergePersistedMessages(historicalMessages, session.messages);
+  const steps = mergePersistedSteps(historicalSteps, session.steps);
   const uploads = new Map<string, BrowserChatAttachment>();
-  for (const message of session.messages) {
+  for (const message of [...messages].reverse()) {
     for (const attachment of message.attachments || []) {
-      if (attachment.kind !== 'tab' && !uploads.has(attachment.id)) uploads.set(attachment.id, attachment);
+      const absolutePath = uploadedBrowserChatAttachmentPath(attachment, session.userId);
+      if (attachment.kind !== 'tab' && !uploads.has(attachment.id) && absolutePath && existsSync(absolutePath)) {
+        uploads.set(attachment.id, attachment);
+      }
     }
   }
   const artifacts = mergeBrowserChatArtifactSummaries(
-    ...session.messages.map((message) => message.artifacts),
-    browserChatArtifactsFromSteps(session.steps),
-  );
+    ...messages.map((message) => message.artifacts),
+    browserChatArtifactsFromSteps(steps),
+  ).reverse();
   const lines = [
     ...[...uploads.values()].map((attachment) => (
       `- upload | name=${JSON.stringify(attachment.name)} | attachmentId=${attachment.id} | read=file(action=read, attachmentId=${JSON.stringify(attachment.id)})`
@@ -1782,7 +1800,9 @@ function conversationFileRegistry(session: BrowserChatSessionRecord) {
         ? path.relative(artifactsRoot(), artifact.path).replace(/\\/g, '/')
         : '';
       const artifactId = relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : '';
-      if (!artifactId) return [];
+      const attachment = artifactId ? artifactAttachmentForSession(session, artifactId) : undefined;
+      const absolutePath = attachment ? uploadedBrowserChatAttachmentPath(attachment, session.userId) : undefined;
+      if (!artifactId || !absolutePath || !existsSync(absolutePath)) return [];
       return [`- artifact | name=${JSON.stringify(artifact.fileName)} | artifactId=${artifactId} | documentId=${artifact.documentId || '-'} | read=file(action=read, artifactId=${JSON.stringify(artifactId)})`];
     }),
   ];
@@ -1882,9 +1902,10 @@ function compactBrowserChatSubagentRecord(record: BrowserChatSubagentRecord): Br
 
 function browserCodeAttachmentBindingsForSession(
   session: BrowserChatSessionRecord,
+  historicalMessages: BrowserChatMessage[] = [],
 ): BrowserCodeAttachmentBinding[] {
   const bindings = new Map<string, BrowserCodeAttachmentBinding>();
-  for (const message of session.messages) {
+  for (const message of mergePersistedMessages(historicalMessages, session.messages)) {
     if (message.role !== 'user') continue;
     for (const attachment of message.attachments || []) {
       if (attachment.kind === 'tab' || bindings.has(attachment.id)) continue;
@@ -2001,6 +2022,21 @@ function browserChatContextUsageFromDebugDetails(
     unwrapped as Record<string, unknown>,
     runtimeContextWindowTokens(model),
   );
+}
+
+function refreshBrowserChatTerminalContextUsage(session: BrowserChatSessionRecord) {
+  const estimated = estimateRuntimeMessageContext(session.modelContext.activeMessages);
+  const toolTokens = Math.max(0, browserChatContextUsage(session).toolTokens);
+  session.contextUsage = {
+    currentTokens: estimated.totalTokens + toolTokens,
+    imageTokens: estimated.imageTokens,
+    maxTokens: runtimeContextWindowTokens({
+      provider: session.modelProvider,
+      model: session.model,
+    }),
+    textTokens: estimated.textTokens,
+    toolTokens,
+  };
 }
 
 function sessionSnapshotHeader(
@@ -3000,6 +3036,14 @@ async function persistAndNotifyTerminal(sessionId: string) {
   if (pendingWrite && !(await pendingWrite)) return false;
   scheduleBrowserChatSessionEviction(sessionId);
   return true;
+}
+
+async function persistBrowserChatCheckpoint(sessionId: string) {
+  clearPendingPersist(sessionId);
+  const persisted = persistSession(sessionId, { mergePersisted: false });
+  if (!persisted) return false;
+  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  return pendingWrite ? pendingWrite : true;
 }
 
 function persistDeletedSessions(items: Array<{ id: string; userId: string }>) {
@@ -5357,6 +5401,8 @@ async function runBrowserChatMessage(
       // guaranteed to fail against a stale object reference.
       const browser = await ensureStarted(session, assertTurnActive, { preferExistingPage: true });
       assertTurnActive();
+      const historicalMessages = readAllBrowserChatMessages<BrowserChatMessage>(session.id);
+      const historicalSteps = readAllBrowserChatSteps<StepExecutionResult>(session.id);
       const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
@@ -5365,6 +5411,8 @@ async function runBrowserChatMessage(
         modelText,
         explicitlySelectedSkills: skills,
         usedMemoryIds,
+        historicalMessages,
+        historicalSteps,
       });
       const initialRuntimeContext = getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
@@ -5385,6 +5433,7 @@ async function runBrowserChatMessage(
         modelInstruction: modelText,
         operationalContext: initialRuntimeContext.operationalContext,
         conversation: session.modelContext.activeMessages,
+        continuationSummary: session.modelContext.lastCompression?.continuationSummary,
         completedSteps: session.steps,
         safetyMode: session.safetyMode,
         memoryTools: createPersonalMemoryTools({
@@ -5413,9 +5462,9 @@ async function runBrowserChatMessage(
         },
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
-        readFile: (input) => readFileForSession(session, input),
+        readFile: (input) => readFileForSession(session, input, historicalMessages),
         readFileVisuals: (input) => readFileVisualsForSession(session, input),
-        attachmentBindings: browserCodeAttachmentBindingsForSession(session),
+        attachmentBindings: browserCodeAttachmentBindingsForSession(session, historicalMessages),
         onTextStream: ({ text: streamedText }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const timestamp = now();
@@ -5446,6 +5495,19 @@ async function runBrowserChatMessage(
             activeMessages: serializableBrowserChatModelMessages(activeMessages),
           });
           persistAndNotify(session.id, { defer: true, mergePersisted: false });
+        },
+        onContextCompression: async ({ activeMessages, contextCompression }) => {
+          assertTurnActive();
+          session.modelContext = normalizeBrowserChatModelContext({
+            ...session.modelContext,
+            version: 1,
+            activeMessages: serializableBrowserChatModelMessages(activeMessages),
+            lastCompression: contextCompression,
+          });
+          if (!(await persistBrowserChatCheckpoint(session.id))) {
+            throw new Error('Failed to persist the browser-chat context compression checkpoint.');
+          }
+          assertTurnActive();
         },
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -5527,6 +5589,7 @@ async function runBrowserChatMessage(
       replaceSessionSteps(session, result.steps.map((step) => (
         step.index >= fromStepIndex ? { ...step, messageId: assistantMessageId } : step
       )));
+      refreshBrowserChatTerminalContextUsage(session);
       session.consoleErrors = result.consoleErrors;
       session.networkErrors = result.networkErrors;
       queuePersonalMemoryExtraction({ session, browser, text, result, userMessageId, assistantMessageId });
@@ -5590,6 +5653,7 @@ async function runBrowserChatMessage(
       if (!stillActive) return;
       const message = userFacingErrorMessage(error);
       const details = errorLogDetails(error);
+      const terminalReply = interrupted ? browserChatInterruptedReply : `执行异常：${message}`;
       if (isDeadBrowserSessionError(error)) {
         await session.browser?.close({ keepOpen: true }).catch(() => undefined);
         session.browser = undefined;
@@ -5609,11 +5673,19 @@ async function runBrowserChatMessage(
       });
       updateAssistantMessage(session, assistantMessageId, (item) => ({
         ...item,
-        content: interrupted ? browserChatInterruptedReply : `执行异常：${message}`,
+        content: terminalReply,
         updatedAt: session.updatedAt,
         status: interrupted ? 'interrupted' : 'failed',
         activity: undefined,
       }));
+      if (!interrupted) {
+        session.modelContext = normalizeBrowserChatModelContext({
+          ...session.modelContext,
+          transcript: appendTerminalBrowserChatTurn(session.modelContext.transcript, modelText, terminalReply),
+          activeMessages: appendTerminalBrowserChatTurn(session.modelContext.activeMessages, modelText, terminalReply),
+        });
+      }
+      refreshBrowserChatTerminalContextUsage(session);
       clearRegisteredBrowserChatTurn(activeTurns, session.id, assistantMessageId, abortController);
       await persistAndNotifyTerminal(session.id);
       compactBrowserChatRuntimeWindow(session);

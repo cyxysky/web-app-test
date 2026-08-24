@@ -11,17 +11,14 @@ import {
   Clock3,
   Download,
   ExternalLink,
-  Gauge,
   Globe2,
   History,
   ListChecks,
   Loader2,
-  MessageSquare,
-  MoreHorizontal,
   Play,
   Plus,
   RefreshCw,
-  Settings,
+  SlidersHorizontal,
   Sparkles,
   StopCircle,
   Trash2,
@@ -32,7 +29,7 @@ import {
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
-import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import {
   WorkspaceSidebarArchiveFilter,
   WorkspaceSidebarArchiveHeader,
@@ -1022,16 +1019,18 @@ export function AutomationWorkspace({
         themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
       >
 
-        <nav className="browser-chat-nav" aria-label={t('工作模式')}>
-          <WorkspaceNavItem href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
-          <WorkspaceNavItem active href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
-          {userId === '1' ? (
-            <WorkspaceNavItem href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
-          ) : null}
-          <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
-        </nav>
+        <WorkspaceModeTabs
+          activeKey="/automation"
+          aiOperationsLabel={t('AI 运营')}
+          ariaLabel={t('工作模式')}
+          automationLabel={t('自动化')}
+          collapsed={sidebarCollapsed}
+          conversationLabel={t('对话模式')}
+          settingsLabel={t('设置')}
+          showAiOperations={userId === '1'}
+        />
 
-        <section className="browser-chat-sidebar-section browser-chat-recent-section workspace-sidebar-archive">
+        <section className="browser-chat-sidebar-section browser-chat-recent-section workspace-sidebar-archive browser-chat-conversation-history">
           <div className="browser-chat-recent-panel">
             <WorkspaceSidebarArchiveHeader
               actions={(
@@ -1048,7 +1047,7 @@ export function AutomationWorkspace({
                 </button>
                 <WorkspaceOverflowMenu
                   className="browser-chat-recent-actions"
-                  icon={<MoreHorizontal size={16} />}
+                  icon={<SlidersHorizontal size={16} />}
                   label={t('更多操作')}
                   title={t('更多操作')}
                 >
@@ -1086,6 +1085,7 @@ export function AutomationWorkspace({
             ) : filteredCases.length ? (
               <WorkspaceHistoryList
                 className="browser-chat-recent-list workspace-sidebar-archive-list"
+                compactGroupHeaders
                 footer={!loading && caseListPage.hasMore ? (
                   <li className="workspace-sidebar-archive-footer">
                     <button
@@ -1147,6 +1147,7 @@ export function AutomationWorkspace({
                       )}
                       id={`automation-case-${item.id}`}
                       iconTone={itemActiveRuns.length ? 'running' : item.enabled ? 'enabled' : 'muted'}
+                      meta={formatTime(item.updatedAt, language)}
                       onOpen={() => setSelectedCaseId(item.id)}
                       title={item.name}
                       titleAttribute={`${item.name} · ${statusDescription}`}

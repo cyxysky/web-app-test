@@ -25,7 +25,6 @@ import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-del
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
-  BROWSER_CHAT_FILE_READ_MIN_CHARS,
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
 import {
@@ -67,6 +66,7 @@ import {
 } from './runtime-tool-selection';
 import { browserToolApprovalRequest } from './browser-tool-approval';
 import {
+  estimateRuntimeMessageContext,
   estimateRuntimeTextTokens,
   runtimeContextCompressionTargetCeilingRatio,
   runtimeContextCompressionTargetFloorRatio,
@@ -77,11 +77,13 @@ import type { BrowserChatModelContextCompression } from './browser-chat-model-co
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
+  ensureRuntimeContinuationSummaryMessage,
   fallbackRuntimeContinuationSummary,
   mergeRuntimeModelMessageChain,
   normalizeRuntimeContinuationSummary,
   sanitizeRuntimeContinuationSummary,
   selectRecentRuntimeMessageBlocks,
+  runtimeContinuationSummaryMarker,
 } from './runtime-context-compression';
 import {
   isEffectiveToolTraceFailure,
@@ -1102,7 +1104,6 @@ function makeBrowserTools(
     stepIndex?: number;
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
-    toolExecutionGate?: { stepNumber: number };
     getAiRequest?: () => AiRequestSnapshot | undefined;
     abortSignal?: AbortSignal;
     shouldContinue?: () => boolean;
@@ -1126,7 +1127,6 @@ function makeBrowserTools(
   // Models may return independent tool calls together. Execute every call in the response, but
   // serialize them so browser/page state and a document draft cannot be mutated concurrently.
   // This preserves tool-call order without silently dropping work from the same model step.
-  const toolExecutionGate = referenceOptions?.toolExecutionGate || { stepNumber: 0 };
   let toolExecutionQueue = Promise.resolve();
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
@@ -1707,11 +1707,22 @@ function sanitizeModelLogValue(
   if (Array.isArray(value)) {
     return value.map((item) => sanitizeModelLogValue(item, imagePaths, state, seen));
   }
+  const sourceRecord = value as Record<string, unknown>;
+  const sourceMediaType = typeof sourceRecord.mediaType === 'string' ? sourceRecord.mediaType : '';
+  const serializedFilePart = sourceRecord.type === 'file' && typeof sourceRecord.data === 'string' && sourceRecord.data.startsWith('data:');
   const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+  for (const [key, item] of Object.entries(sourceRecord)) {
     if (key === 'image') {
       const imagePath = imagePaths[state.imageIndex++];
       output[key] = binaryLogDescriptor(item, imagePath);
+    } else if (key === 'data' && serializedFilePart && typeof item === 'string') {
+      const commaIndex = item.indexOf(',');
+      const payloadCharacters = commaIndex >= 0 ? item.length - commaIndex - 1 : item.length;
+      output[key] = {
+        kind: 'serialized-file-data',
+        mediaType: sourceMediaType || item.slice(5, item.indexOf(';') > 5 ? item.indexOf(';') : item.indexOf(',')),
+        approximateBytes: Math.floor(payloadCharacters * 3 / 4),
+      };
     } else {
       output[key] = sanitizeModelLogValue(item, imagePaths, state, seen);
     }
@@ -1735,38 +1746,33 @@ function sanitizeModelInputForStats(system: string | undefined, messages: unknow
 }
 
 function modelMessagesTextAndImageStats(messages: unknown, tools?: RuntimeToolDefinitions) {
-  let text = '';
-  let imageCount = 0;
-  const walk = (value: unknown) => {
+  const contextEstimate = estimateRuntimeMessageContext(messages);
+  let textCharacters = 0;
+  const countTextCharacters = (value: unknown) => {
     if (typeof value === 'string') {
-      text += `\n${value}`;
+      textCharacters += value.length;
       return;
     }
     if (!value || typeof value !== 'object') return;
     if (Array.isArray(value)) {
-      value.forEach(walk);
+      value.forEach(countTextCharacters);
       return;
     }
-    const record = value as Record<string, unknown>;
-    if (record.type === 'image' || (record.image && typeof record.image === 'object')) {
-      imageCount += 1;
-      return;
-    }
-    Object.values(record).forEach(walk);
+    Object.values(value as Record<string, unknown>).forEach(countTextCharacters);
   };
-  walk(messages);
+  countTextCharacters(messages);
   const serialized = JSON.stringify(messages) || '';
-  const estimatedValueTextTokens = estimateRuntimeTextTokens(text);
+  const estimatedValueTextTokens = contextEstimate.textTokens;
   const estimatedSerializedTextTokens = estimateRuntimeTextTokens(serialized);
   const estimatedTextTokens = Math.max(estimatedValueTextTokens, estimatedSerializedTextTokens);
-  const estimatedImageTokens = imageCount * imageTokenEstimatePerImage();
+  const estimatedImageTokens = contextEstimate.imageCount * imageTokenEstimatePerImage();
   const toolSchema = toolSchemaEstimateInput(tools);
   const serializedToolSchema = JSON.stringify(toolSchema) || '';
   const estimatedToolSchemaTokens = estimateRuntimeTextTokens(serializedToolSchema);
   return {
-    textCharacters: text.length,
+    textCharacters,
     serializedCharacters: serialized.length,
-    imageCount,
+    imageCount: contextEstimate.imageCount,
     toolCount: toolSchema.length,
     toolSchemaCharacters: serializedToolSchema.length,
     estimatedValueTextTokens,
@@ -1992,12 +1998,17 @@ async function executeRuntimeStep(input: {
   appendInstruction?: boolean;
   operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
+  continuationSummary?: string;
   referenceImagePaths?: string[];
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
+  onContextCompression?: (update: {
+    activeMessages: ModelMessage[];
+    contextCompression: BrowserChatModelContextCompression;
+  }) => void | Promise<void>;
   suppressTextOutput?: boolean;
   getRuntimeOperationalContext?: () => BrowserChatOperationalContext | Promise<BrowserChatOperationalContext>;
   browserStatePreflightComplete?: boolean;
@@ -2163,7 +2174,13 @@ async function executeRuntimeStep(input: {
         });
       }
     };
-    const historyMessages = [...(input.conversation || [])] as RuntimeModelMessage[];
+    const continuationDirectiveMarker = '[WebPilot continuation directive]';
+    const runtimeOperationalContextMarker = '[WebPilot runtime operational context]';
+    const durableContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
+    const historyMessages = ensureRuntimeContinuationSummaryMessage(
+      [...(input.conversation || [])] as RuntimeModelMessage[],
+      durableContinuationSummary,
+    );
     const initialImagePaths = [...initialVisualPaths, ...initialUserReferenceImagePaths];
     const initialImages: Awaited<ReturnType<typeof readScreenshotForAi>>[] = [];
     for (const imagePath of initialImagePaths) {
@@ -2237,9 +2254,6 @@ async function executeRuntimeStep(input: {
     let contextSegmentationTurns = 0;
     let lastPreparedMessages = [...initialMessages];
     let latestContextCompression: BrowserChatModelContextCompression | undefined;
-    const continuationSummaryMarker = '[WebPilot continuation summary]';
-    const continuationDirectiveMarker = '[WebPilot continuation directive]';
-    const runtimeOperationalContextMarker = '[WebPilot runtime operational context]';
     const originalGoal = requirementOf(runtimeRecord).trim();
     const continuationDirectiveText = [
       continuationDirectiveMarker,
@@ -2250,13 +2264,15 @@ async function executeRuntimeStep(input: {
     let compactedModelContext: RuntimeModelMessage[] | undefined;
     let compactedSourceMessageCount = 0;
     const restoredContinuationMessage = initialMessages.find((message) => (
-      textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+      textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
     ));
-    let continuationSummaryText = restoredContinuationMessage
-      ? sanitizeRuntimeContinuationSummary(
-        textFromUnknown(restoredContinuationMessage.content).slice(continuationSummaryMarker.length),
-      )
-      : '';
+    let continuationSummaryText = durableContinuationSummary || (
+      restoredContinuationMessage
+        ? sanitizeRuntimeContinuationSummary(
+          textFromUnknown(restoredContinuationMessage.content).slice(runtimeContinuationSummaryMarker.length),
+        )
+        : ''
+    );
 
     function isRedundantOriginalGoalMessage(message: RuntimeModelMessage) {
       return Boolean(
@@ -2284,7 +2300,7 @@ async function executeRuntimeStep(input: {
     function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
       if (!compactedModelContext?.length) return sourceMessages;
       const markerIndex = sourceMessages.findIndex((message) => (
-        textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+        textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
       ));
       if (markerIndex >= 0) {
         return sourceMessages.slice(markerIndex + Math.min(
@@ -2462,7 +2478,7 @@ async function executeRuntimeStep(input: {
           codexMode ? undefined : nativeToolsRef.current,
         );
         const summarySourceMessages = messagesToSend.filter((message) => (
-          !textFromUnknown(message.content).startsWith(continuationSummaryMarker)
+          !textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
           && !isRedundantOriginalGoalMessage(message)
         ));
         const blocks = atomicRuntimeModelMessageBlocks(summarySourceMessages);
@@ -2516,7 +2532,7 @@ async function executeRuntimeStep(input: {
         continuationSummaryText = summary;
         contextSegmentationTurns += 1;
         messagesToSend = [
-          { role: 'user' as const, content: `${continuationSummaryMarker}\n${summary}` },
+          { role: 'user' as const, content: `${runtimeContinuationSummaryMarker}\n${summary}` },
           ...retainedMessages,
           { role: 'user' as const, content: continuationDirectiveText },
         ];
@@ -2551,6 +2567,7 @@ async function executeRuntimeStep(input: {
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
         latestContextCompression = {
           compressedAt: new Date().toISOString(),
+          continuationSummary: summary,
           estimatedTokensBefore: messageStats.estimatedTotalTokens,
           estimatedTokensAfter: afterStats.estimatedTotalTokens,
           retainedMessageCount: messagesToSend.length - 1,
@@ -2560,6 +2577,10 @@ async function executeRuntimeStep(input: {
           thresholdTokens,
           windowTokens,
         };
+        await input.onContextCompression?.({
+          activeMessages: [...messagesToSend],
+          contextCompression: latestContextCompression,
+        });
         modelContextSegmentation = {
           segment: contextSegmentationTurns,
           reason: 'modelMessages exceeded context threshold',
@@ -2760,7 +2781,6 @@ async function executeRuntimeStep(input: {
       runId: input.runId,
       stepIndex,
       visualContext,
-      toolExecutionGate,
       getAiRequest: () => aiRequest,
       abortSignal,
       shouldContinue: input.shouldContinue,
@@ -3350,6 +3370,7 @@ export async function executeInteractiveBrowserTurn(input: {
   modelInstruction?: string;
   operationalContext?: string;
   conversation?: InteractiveBrowserTurnMessage[];
+  continuationSummary?: string;
   completedSteps?: StepExecutionResult[];
   safetyMode?: BrowserChatSafetyMode;
   referenceImagePaths?: string[];
@@ -3359,6 +3380,10 @@ export async function executeInteractiveBrowserTurn(input: {
   onModelMessages?: (update: {
     activeMessages: ModelMessage[];
     turnMessages: ModelMessage[];
+  }) => void | Promise<void>;
+  onContextCompression?: (update: {
+    activeMessages: ModelMessage[];
+    contextCompression: BrowserChatModelContextCompression;
   }) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
@@ -3380,6 +3405,7 @@ export async function executeInteractiveBrowserTurn(input: {
   const steps = [...(input.completedSteps || [])];
   const newSteps: StepExecutionResult[] = [];
   let activeModelMessages = [...(input.conversation || [])];
+  let activeContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
   const turnModelMessages: ModelMessage[] = [];
   let contextCompression: BrowserChatModelContextCompression | undefined;
   const runtimeRecord = createInteractiveBrowserRuntimeRecord({
@@ -3444,6 +3470,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         appendInstruction: initialRuntimeStep || Boolean(requiredSubagentInstruction) || Boolean(requiredVisualQaInstruction),
         operationalContext: input.operationalContext,
         conversation: activeModelMessages,
+        continuationSummary: activeContinuationSummary,
         referenceImagePaths: input.referenceImagePaths,
         getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         browserStatePreflightComplete,
@@ -3468,6 +3495,12 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         onTextStream: requiredVisualQa
           ? (update) => { withheldTextUpdate = update; }
           : input.onTextStream,
+        onContextCompression: async (update) => {
+          activeModelMessages = [...update.activeMessages];
+          activeContinuationSummary = update.contextCompression.continuationSummary;
+          contextCompression = update.contextCompression;
+          await input.onContextCompression?.(update);
+        },
         onDebug: input.onDebug,
         onToolTrace: async (trace, progress) => {
           ensureActive();
@@ -3491,6 +3524,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
       });
       ensureActive();
       contextCompression = actionResult.contextCompression || contextCompression;
+      activeContinuationSummary = actionResult.contextCompression?.continuationSummary || activeContinuationSummary;
       browserStatePreflightComplete ||= actionResult.traces.some((trace) => trace.name === 'readBrowserState' && Boolean(trace.result));
       for (const trace of actionResult.traces) {
         const toolInput = splitToolInputAndReason(trace.input).input;

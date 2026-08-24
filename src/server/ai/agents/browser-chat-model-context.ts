@@ -3,6 +3,7 @@ import { browserChatInterruptedTurnContextMarker } from './browser-chat-reply-te
 
 export type BrowserChatModelContextCompression = {
   compressedAt: string;
+  continuationSummary: string;
   estimatedTokensAfter: number;
   estimatedTokensBefore: number;
   retainedMessageCount: number;
@@ -20,34 +21,19 @@ export type BrowserChatModelContext = {
   lastCompression?: BrowserChatModelContextCompression;
 };
 
-function serializableData(value: unknown, mediaType?: string): unknown {
-  if (Buffer.isBuffer(value)) {
-    return `data:${mediaType || 'application/octet-stream'};base64,${value.toString('base64')}`;
-  }
-  if (value instanceof ArrayBuffer) {
-    return `data:${mediaType || 'application/octet-stream'};base64,${Buffer.from(value).toString('base64')}`;
-  }
-  if (ArrayBuffer.isView(value)) {
-    return `data:${mediaType || 'application/octet-stream'};base64,${Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString('base64')}`;
-  }
-  return value;
-}
+const persistentBinaryOmissionText = '[Binary visual input omitted from persistent model context; use the conversation file registry to read it again.]';
 
-function serializableValue(value: unknown, parentMediaType?: string): unknown {
-  const binary = serializableData(value, parentMediaType);
-  if (binary !== value) return binary;
-  if (Array.isArray(value)) return value.map((item) => serializableValue(item));
-  if (!value || typeof value !== 'object') return value;
-  const record = value as Record<string, unknown>;
-  const mediaType = typeof record.mediaType === 'string' ? record.mediaType : parentMediaType;
-  return Object.fromEntries(Object.entries(record).map(([key, child]) => [
-    key,
-    key === 'data' ? serializableData(child, mediaType) : serializableValue(child, mediaType),
-  ]));
+function withoutPersistentBinaryParts(message: ModelMessage): ModelMessage {
+  if (!Array.isArray(message.content)) return message;
+  const content = message.content.filter((part) => (
+    !part || typeof part !== 'object' || !('type' in part) || (part.type !== 'file' && part.type !== 'image')
+  ));
+  if (content.length) return { ...message, content } as ModelMessage;
+  return { ...message, content: persistentBinaryOmissionText } as ModelMessage;
 }
 
 export function serializableBrowserChatModelMessages(messages: ModelMessage[]) {
-  return normalizeBrowserChatModelMessages(serializableValue(messages));
+  return normalizeBrowserChatModelMessages(messages.map(withoutPersistentBinaryParts));
 }
 
 export function compactBrowserChatModelTranscript(messages: ModelMessage[]) {
@@ -95,11 +81,26 @@ export function appendInterruptedBrowserChatTurn(
   return serializableBrowserChatModelMessages(next);
 }
 
+export function appendTerminalBrowserChatTurn(
+  messages: ModelMessage[],
+  userContent: string,
+  assistantContent: string,
+) {
+  const next = [...messages];
+  if (!messagesContainText(next, 'user', userContent)) {
+    next.push({ role: 'user', content: userContent });
+  }
+  if (!messagesContainText(next, 'assistant', assistantContent)) {
+    next.push({ role: 'assistant', content: assistantContent });
+  }
+  return serializableBrowserChatModelMessages(next);
+}
+
 export function normalizeBrowserChatModelMessages(value: unknown): ModelMessage[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((message) => {
     const parsed = modelMessageSchema.safeParse(message);
-    return parsed.success ? [parsed.data] : [];
+    return parsed.success ? [withoutPersistentBinaryParts(parsed.data)] : [];
   });
 }
 

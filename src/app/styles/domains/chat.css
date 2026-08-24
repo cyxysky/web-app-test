@@ -526,6 +526,7 @@
 .browser-chat-composer-shell,
 .browser-chat-composer-shell:has(.browser-chat-compose--reference) {
   bottom: max(30px, env(safe-area-inset-bottom));
+  container-type: inline-size;
   gap: 6px;
   max-width: var(--browser-chat-content-width);
   width: min(100%, var(--browser-chat-content-width));
@@ -652,40 +653,211 @@
 }
 
 .browser-chat-compose.browser-chat-compose--reference {
+  --composer-prism-left: #8178f4;
+  --composer-prism-mid: #78a9f4;
+  --composer-prism-right: #48d3c8;
+  --composer-send-fill: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent) 14%, #746dff) 0%,
+    color-mix(in srgb, var(--accent) 34%, #5c9fff) 49%,
+    color-mix(in srgb, var(--accent) 78%, #43d6c9) 100%
+  );
+  --composer-send-hover-fill: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--accent-hover) 20%, #6d67f7),
+    color-mix(in srgb, var(--accent-hover) 42%, #5297f2) 49%,
+    color-mix(in srgb, var(--accent-hover) 82%, #3dcabf)
+  );
+  --composer-control-fill:
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.92) 0%,
+      rgba(255, 255, 255, 0.76) 42%,
+      rgba(247, 250, 255, 0.62) 100%
+    ) padding-box,
+    linear-gradient(
+      142deg,
+      rgba(255, 255, 255, 0.96),
+      rgba(205, 212, 231, 0.66) 56%,
+      rgba(195, 225, 229, 0.5)
+    ) border-box;
+  --composer-control-hover-fill:
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--panel) 88%, var(--accent-soft)),
+      color-mix(in srgb, var(--panel) 68%, var(--accent-soft))
+    ) padding-box,
+    linear-gradient(
+      145deg,
+      color-mix(in srgb, var(--panel) 92%, transparent),
+      color-mix(in srgb, var(--composer-prism-mid) 44%, transparent),
+      color-mix(in srgb, var(--composer-prism-right) 52%, transparent)
+    ) border-box;
+  --composer-control-shadow:
+    0 2px 4px rgba(67, 79, 108, 0.055),
+    0 7px 20px rgba(73, 85, 113, 0.085),
+    -5px 7px 22px rgba(129, 120, 244, 0.035),
+    5px 7px 22px rgba(72, 211, 200, 0.04),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98),
+    inset 0 -1px 0 rgba(112, 128, 160, 0.055);
+  aspect-ratio: 1424 / 381;
+  background:
+    radial-gradient(
+      ellipse 46% 92% at 0% 100%,
+      rgba(129, 120, 244, 0.11),
+      transparent 70%
+    ) padding-box,
+    radial-gradient(
+      ellipse 44% 94% at 100% 100%,
+      rgba(72, 211, 200, 0.13),
+      transparent 70%
+    ) padding-box,
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.84),
+      rgba(252, 253, 255, 0.74) 58%,
+      rgba(248, 250, 255, 0.76)
+    ) padding-box,
+    linear-gradient(
+      103deg,
+      rgba(129, 120, 244, 0.48) 0%,
+      rgba(211, 213, 250, 0.34) 29%,
+      rgba(255, 255, 255, 0.92) 50%,
+      rgba(211, 235, 239, 0.38) 74%,
+      rgba(72, 211, 200, 0.5) 100%
+    ) border-box;
+  border: 1px solid transparent;
+  border-radius: 3.93cqi;
+  box-shadow:
+    -2cqi 2.05cqi 6cqi rgba(129, 120, 244, 0.18),
+    2.15cqi 2.15cqi 6.2cqi rgba(72, 211, 200, 0.2),
+    0 1.7cqi 3.8cqi rgba(74, 87, 116, 0.11),
+    0 0.22cqi 0.7cqi rgba(74, 87, 116, 0.055),
+    inset 0 1px 0 rgba(255, 255, 255, 0.98),
+    inset 0 -1px 0 rgba(126, 139, 180, 0.045);
   display: grid;
   overflow: visible;
   padding: 0;
   position: relative;
-  background: var(--panel);
-  border: 1px solid color-mix(in srgb, var(--border-strong) 54%, var(--border));
-  border-radius: 16px;
-  box-shadow:
-    0 8px 22px color-mix(in srgb, #111827 5%, transparent),
-    0 1px 2px color-mix(in srgb, #111827 3%, transparent);
   gap: 0;
-  grid-template-rows: minmax(74px, auto) 48px;
-  min-height: 122px;
+  grid-template-rows: 65.4% 34.6%;
+  min-height: 0;
+}
+
+html body form.browser-chat-compose.browser-chat-compose--reference {
+  -webkit-backdrop-filter: blur(30px) saturate(1.12);
+  backdrop-filter: blur(30px) saturate(1.12);
+}
+
+.browser-chat-compose.browser-chat-compose--reference::before {
+  -webkit-backdrop-filter: blur(26px) saturate(1.08);
+  backdrop-filter: blur(26px) saturate(1.08);
+  background:
+    radial-gradient(
+      ellipse 64% 86% at 50% 0%,
+      rgba(255, 255, 255, 0.58),
+      transparent 74%
+    ),
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.92),
+      rgba(250, 252, 255, 0.8)
+    );
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 3.35cqi;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--panel) 98%, transparent),
+    inset 0 -1px 0 rgba(126, 139, 180, 0.045),
+    0 1px 2px rgba(74, 87, 116, 0.03),
+    0 0.7cqi 2cqi rgba(82, 96, 122, 0.035);
+  content: '';
+  inset: 1.05cqi 1.05cqi 9.27cqi;
+  pointer-events: none;
+  position: absolute;
+  z-index: 1;
+}
+
+.browser-chat-compose.browser-chat-compose--reference::after {
+  background:
+    linear-gradient(
+      118deg,
+      rgba(255, 255, 255, 0.44) 0%,
+      rgba(255, 255, 255, 0.11) 32%,
+      transparent 54%
+    ),
+    linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0) 56%,
+      rgba(247, 249, 255, 0.2)
+    );
+  border: 1px solid rgba(255, 255, 255, 0.48);
+  border-radius: calc(3.93cqi - 1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.68),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.12);
+  content: '';
+  inset: 1px;
+  pointer-events: none;
+  position: absolute;
+  z-index: 0;
 }
 
 .browser-chat-compose.browser-chat-compose--reference:focus-within {
-  border-color: color-mix(in srgb, var(--focus-ring) 52%, var(--border));
   box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--focus-ring) 11%, transparent),
-    0 14px 38px color-mix(in srgb, #111827 9%, transparent);
+    0 0 0 3px color-mix(in srgb, var(--focus-ring) 9%, transparent),
+    -1.45cqi 1.9cqi 4.6cqi rgba(129, 120, 244, 0.15),
+    1.65cqi 2cqi 4.8cqi rgba(72, 211, 200, 0.17),
+    0 1.6cqi 3.6cqi rgba(83, 96, 120, 0.09),
+    inset 0 1px 0 rgba(255, 255, 255, 0.96);
   transform: none;
 }
 
 .browser-chat-compose--reference .browser-chat-inline-editor {
+  align-self: stretch;
+  box-sizing: border-box;
   font-size: 14px;
+  height: auto;
   line-height: 24px;
-  max-height: 152px;
-  min-height: 74px;
-  padding: 14px 16px 4px;
+  margin: 1.05cqi 1.05cqi 0;
+  max-height: none;
+  min-height: 0;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+  padding: 10px 16px 4px;
+  position: relative;
+  scrollbar-color: color-mix(in srgb, var(--muted) 42%, transparent) transparent;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  word-break: normal;
+  z-index: 2;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor::-webkit-scrollbar {
+  width: 8px;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor::-webkit-scrollbar-track {
+  background: transparent;
+  margin-block: 14px 8px;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--muted) 38%, transparent);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+  border-radius: 999px;
+}
+
+.browser-chat-compose--reference .browser-chat-inline-editor::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--muted-strong) 52%, transparent);
+  background-clip: padding-box;
 }
 
 .browser-chat-compose--reference .browser-chat-inline-editor:empty::after,
 .browser-chat-compose--reference .browser-chat-inline-editor[data-empty="true"]::after {
   color: var(--muted);
+  font-style: italic;
+  opacity: 0.72;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-actions {
@@ -693,9 +865,12 @@
   background: transparent;
   border: 0;
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  min-height: 48px;
-  padding: 5px 10px 7px;
+  gap: 1.8cqi;
+  grid-template-columns: 26.7cqi 38.5cqi 24.8cqi;
+  min-height: 0;
+  padding: 1.25cqi 2.7cqi 2.05cqi;
+  position: relative;
+  z-index: 2;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-tools,
@@ -705,151 +880,183 @@
   flex-wrap: nowrap;
   justify-self: stretch;
   min-width: 0;
-  gap: 7px;
+  gap: 0;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-tools {
   display: flex;
+  gap: 3.5cqi;
   justify-self: start;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-submit {
   border-left: 0;
   display: grid;
-  gap: 12px;
-  grid-template-columns: minmax(0, 1fr) 38px;
+  gap: 2.4cqi;
+  grid-template-columns: 15cqi 5.2cqi;
   justify-self: end;
-  padding-left: 18px;
+  padding-left: 0;
   position: relative;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-submit::before {
-  background: color-mix(in srgb, var(--border) 46%, transparent);
-  content: '';
-  height: 18px;
-  left: 0;
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 1px;
+  content: none;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
-  grid-template-columns: minmax(0, 1fr) 38px 38px;
+  gap: 1.4cqi;
+  grid-template-columns: 9.8cqi 3.2cqi 5.2cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-attach {
-  background: transparent;
-  border: 0;
+  border: 1px solid transparent;
   border-radius: 50%;
   color: var(--muted-strong);
-  height: 34px;
-  width: 34px;
+  height: 5.2cqi;
+  width: 5.2cqi;
+}
+
+.browser-chat-compose--reference .browser-chat-attach svg {
+  height: 2.15cqi;
+  width: 2.15cqi;
+}
+
+html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--reference .browser-chat-attach {
+  -webkit-backdrop-filter: blur(20px) saturate(1.1) !important;
+  backdrop-filter: blur(20px) saturate(1.1) !important;
+  background: var(--composer-control-fill) !important;
+  border: 1px solid transparent !important;
+  box-shadow: var(--composer-control-shadow) !important;
 }
 
 .browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
-  background: transparent;
+  background: var(--composer-control-hover-fill);
+  border-color: transparent;
   color: var(--foreground);
+}
+
+html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
+  background: var(--composer-control-hover-fill) !important;
+  border-color: transparent !important;
 }
 
 .browser-chat-compose--reference .browser-chat-mode-selector {
   border-left: 0;
-  padding-left: 12px;
+  padding-left: 0;
   position: relative;
 }
 
 .browser-chat-compose--reference .browser-chat-mode-selector::before {
-  background: color-mix(in srgb, var(--border) 46%, transparent);
-  content: '';
-  height: 18px;
-  left: 0;
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 1px;
+  content: none;
 }
 
-.browser-chat-compose-actions > .browser-chat-management-shortcuts {
-  gap: 0;
-  justify-self: end;
+.browser-chat-compose--reference .browser-chat-context-usage {
+  display: none;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts {
+  gap: 1.9cqi;
+  justify-self: center;
   min-width: 0;
+  width: 38.5cqi;
 }
 
-.browser-chat-compose-actions > .browser-chat-management-shortcuts button {
-  font-size: 13px;
-  height: 30px;
-  padding-inline: 16px;
+.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--muted-strong);
+  flex: 0 0 10.7cqi;
+  font-size: 1.5cqi;
+  gap: 0.65cqi;
+  height: 4.55cqi;
+  justify-content: center;
+  padding-inline: 0;
   position: relative;
 }
 
-.browser-chat-compose-actions > .browser-chat-management-shortcuts button + button {
-  border-left: 0;
+.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button svg {
+  height: 1.55cqi;
+  width: 1.55cqi;
+}
+
+.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button + button {
   border-radius: 999px;
-  margin-left: 1px;
+  margin-left: 0;
 }
 
-.browser-chat-compose-actions > .browser-chat-management-shortcuts button + button::before {
-  background: color-mix(in srgb, var(--border) 46%, transparent);
-  content: '';
-  height: 18px;
-  left: -1px;
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 1px;
-}
-
-.browser-chat-compose-actions > .browser-chat-management-shortcuts button:hover {
-  background: transparent;
+.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button:hover {
+  background: var(--composer-control-hover-fill);
+  border-color: transparent;
   color: var(--foreground);
 }
 
 .browser-chat-compose--reference .browser-chat-model-control {
   align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 0;
+  border: 1px solid transparent;
+  border-radius: 999px;
   display: flex;
   flex: 1 1 auto;
   max-width: none;
   min-width: 0;
-  padding: 0;
+  padding: 0 1.15cqi;
   width: 100%;
-  min-height: 36px;
+  min-height: 4.55cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
-  justify-content: flex-end;
+  justify-content: center;
   min-width: 0;
-  padding: 0 2px;
+  padding: 0;
   width: 100% !important;
-  color: var(--muted-strong);
-  font-size: 12px;
-  font-weight: 500;
-  min-height: 36px;
+  color: var(--foreground);
+  font-size: 1.5cqi;
+  font-weight: 540;
+  min-height: 4.4cqi;
+}
+
+.browser-chat-compose--reference :is(
+  .browser-chat-mode-selector-trigger,
+  .browser-chat-model-control,
+  .browser-chat-management-shortcuts button
+) {
+  -webkit-backdrop-filter: blur(20px) saturate(1.1);
+  backdrop-filter: blur(20px) saturate(1.1);
+  background: var(--composer-control-fill);
+  border-color: transparent;
+  box-shadow: var(--composer-control-shadow);
 }
 
 .browser-chat-compose--reference .browser-chat-send,
 .browser-chat-compose--reference .browser-chat-stop {
-  background: var(--accent-strong);
-  box-shadow: none;
   color: #ffffff;
   border-radius: 50%;
-  height: 36px;
-  width: 36px;
+  height: 5.2cqi;
+  width: 5.2cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-send {
   border-radius: 50%;
-  height: 36px;
-  width: 36px;
-  background: var(--accent-strong);
-  box-shadow: 0 5px 14px color-mix(in srgb, var(--accent-strong) 22%, transparent);
+  height: 5.2cqi;
+  width: 5.2cqi;
+  background: var(--composer-send-fill);
+  border: 1px solid color-mix(in srgb, var(--panel) 72%, transparent);
+  box-shadow:
+    -3px 7px 18px rgba(116, 109, 255, 0.16),
+    4px 7px 18px rgba(67, 214, 201, 0.19),
+    0 2px 5px rgba(53, 64, 90, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.64),
+    inset 0 -1px 0 rgba(47, 151, 173, 0.16);
   color: #ffffff;
 }
 
+.browser-chat-compose--reference .browser-chat-send svg,
+.browser-chat-compose--reference .browser-chat-stop svg {
+  height: 2.2cqi;
+  width: 2.2cqi;
+}
+
 .browser-chat-compose--reference .browser-chat-send:not(.magic-rainbow-button):not(:disabled):hover {
-  background: var(--accent-hover);
+  background: var(--composer-send-hover-fill);
   color: #ffffff;
 }
 
@@ -862,36 +1069,134 @@
 
 .browser-chat-compose--reference .browser-chat-send:disabled {
   opacity: 1;
-  background: var(--accent-strong) !important;
+  background: var(--composer-send-fill) !important;
   color: #ffffff !important;
 }
 
-.browser-chat-mode-selector-trigger {
+.browser-chat-compose--reference .browser-chat-mode-selector-trigger {
   align-items: center;
   display: inline-flex;
-  gap: 5px;
-  height: 30px;
-  padding: 0 3px;
-  border: 0;
+  gap: 0.7cqi;
+  height: 4.55cqi;
+  justify-content: center;
+  padding: 0 1.7cqi;
+  border: 1px solid transparent;
   outline: 0;
-  background: transparent;
+  background: var(--composer-control-fill);
   cursor: pointer;
   font: inherit;
   line-height: 1;
   white-space: nowrap;
   transition: color 140ms ease;
-  border-radius: var(--app-radius-sm);
+  border-radius: 999px;
+  box-shadow: var(--composer-control-shadow);
   color: var(--muted-strong);
-  font-size: 12px;
+  font-size: 1.5cqi;
   font-weight: 500;
+  width: 16cqi;
 }
 
-.browser-chat-mode-selector-trigger:hover:not(:disabled),
-.browser-chat-mode-selector-trigger[aria-expanded="true"] {
-  background: transparent !important;
+.browser-chat-compose--reference .browser-chat-mode-selector-trigger svg {
+  height: 1.6cqi;
+  width: 1.6cqi;
+}
+
+.browser-chat-compose--reference .browser-chat-mode-selector-trigger:hover:not(:disabled),
+.browser-chat-compose--reference .browser-chat-mode-selector-trigger[aria-expanded="true"] {
+  background: var(--composer-control-hover-fill) !important;
   border-color: transparent !important;
-  box-shadow: none !important;
   color: var(--foreground);
+}
+
+/* The embedded side panel keeps the same glass hierarchy at a compact scale. */
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose.browser-chat-compose--reference {
+  aspect-ratio: auto;
+  border-radius: 22px;
+  grid-template-rows: minmax(82px, auto) 56px;
+  min-height: 138px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose.browser-chat-compose--reference::before {
+  border-radius: 17px;
+  inset: 8px 8px 56px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose.browser-chat-compose--reference::after {
+  border-radius: 21px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-inline-editor {
+  font-size: 14px;
+  height: auto;
+  line-height: 1.5;
+  margin: 8px 8px 0;
+  max-height: 152px;
+  min-height: 82px;
+  padding: 10px 16px 4px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-compose-actions {
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 56px;
+  padding: 7px 9px 9px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose-actions > .browser-chat-management-shortcuts {
+  display: none;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-compose-tools {
+  gap: 7px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-compose-submit {
+  gap: 7px;
+  grid-template-columns: minmax(105px, 1fr) 40px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
+  gap: 5px;
+  grid-template-columns: minmax(72px, 1fr) 34px 40px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference :is(
+  .browser-chat-attach,
+  .browser-chat-send,
+  .browser-chat-stop
+) {
+  height: 40px;
+  width: 40px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-attach svg,
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-send svg,
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-stop svg {
+  height: 18px;
+  width: 18px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-mode-selector-trigger {
+  font-size: 12px;
+  gap: 5px;
+  height: 40px;
+  padding: 0 10px;
+  width: clamp(108px, 31cqi, 132px);
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-mode-selector-trigger svg {
+  height: 16px;
+  width: 16px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-model-control {
+  min-height: 40px;
+  padding-inline: 10px;
+}
+
+.browser-chat-chat-pane.embedded-chat .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
+  font-size: 12px;
+  min-height: 38px;
 }
 
 .browser-chat-mode-selector-section > header strong {
@@ -1503,19 +1808,99 @@
 }
 
 :root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference {
-  background: color-mix(in srgb, var(--panel-elevated) 96%, transparent);
-  border-color: var(--border-strong);
+  --composer-control-fill:
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--panel-elevated) 84%, transparent),
+      color-mix(in srgb, var(--panel) 70%, transparent)
+    ) padding-box,
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.16),
+      color-mix(in srgb, var(--composer-prism-left) 26%, transparent) 48%,
+      color-mix(in srgb, var(--composer-prism-right) 34%, transparent)
+    ) border-box;
+  --composer-control-hover-fill:
+    linear-gradient(
+      155deg,
+      color-mix(in srgb, var(--panel-elevated) 74%, var(--accent-soft)),
+      color-mix(in srgb, var(--panel) 62%, var(--accent-soft))
+    ) padding-box,
+    linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.2),
+      color-mix(in srgb, var(--composer-prism-mid) 42%, transparent),
+      color-mix(in srgb, var(--composer-prism-right) 48%, transparent)
+    ) border-box;
+  --composer-control-shadow:
+    0 0.5cqi 1.35cqi rgba(0, 0, 0, 0.28),
+    0 0.1cqi 0.3cqi rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.13),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+  background:
+    radial-gradient(
+      ellipse 58% 98% at -4% 110%,
+      color-mix(in srgb, var(--composer-prism-left) 18%, transparent),
+      transparent 68%
+    ) padding-box,
+    radial-gradient(
+      ellipse 52% 94% at 103% 108%,
+      color-mix(in srgb, var(--composer-prism-right) 18%, transparent),
+      transparent 69%
+    ) padding-box,
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--panel-elevated) 80%, transparent),
+      color-mix(in srgb, var(--panel) 66%, transparent)
+    ) padding-box,
+    linear-gradient(
+      104deg,
+      color-mix(in srgb, var(--composer-prism-left) 60%, transparent),
+      rgba(255, 255, 255, 0.15) 37%,
+      rgba(255, 255, 255, 0.12) 59%,
+      color-mix(in srgb, var(--composer-prism-right) 62%, transparent)
+    ) border-box;
+  border-color: transparent;
   box-shadow:
-    0 10px 28px rgba(0, 0, 0, 0.24),
-    var(--shadow-xs);
+    -1.35cqi 1.7cqi 4cqi color-mix(in srgb, var(--composer-prism-left) 10%, transparent),
+    1.55cqi 1.8cqi 4.2cqi color-mix(in srgb, var(--composer-prism-right) 11%, transparent),
+    0 1.45cqi 3.2cqi rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.3);
   color: var(--foreground);
 }
 
-:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference:focus-within {
-  border-color: color-mix(in srgb, var(--focus-ring) 54%, var(--border));
+:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference::before {
+  background:
+    radial-gradient(
+      ellipse 55% 120% at -8% 108%,
+      color-mix(in srgb, var(--composer-prism-left) 7%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 48% 112% at 106% 108%,
+      color-mix(in srgb, var(--composer-prism-right) 8%, transparent),
+      transparent 72%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--panel-elevated) 88%, transparent),
+      color-mix(in srgb, var(--panel) 72%, transparent)
+    );
+  border-color: rgba(255, 255, 255, 0.07);
   box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--focus-ring) 12%, transparent),
-    0 16px 42px rgba(0, 0, 0, 0.32);
+    inset 0 1px 0 rgba(255, 255, 255, 0.1),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.28),
+    0 0.55cqi 1.8cqi rgba(0, 0, 0, 0.12);
+}
+
+:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference:focus-within {
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--focus-ring) 11%, transparent),
+    -1.45cqi 1.9cqi 4.3cqi color-mix(in srgb, var(--composer-prism-left) 12%, transparent),
+    1.65cqi 2cqi 4.5cqi color-mix(in srgb, var(--composer-prism-right) 13%, transparent),
+    0 1.6cqi 3.5cqi rgba(0, 0, 0, 0.38),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14);
 }
 
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor:empty::after,
@@ -1525,8 +1910,8 @@
 }
 
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-send:disabled {
-  background: var(--panel-warm);
-  color: var(--muted);
+  background: var(--composer-send-fill) !important;
+  color: #ffffff !important;
 }
 
 :root[data-theme="dark"] .browser-chat-inline-token {
@@ -2013,30 +2398,55 @@
   }
 
   .browser-chat-compose.browser-chat-compose--reference {
+    aspect-ratio: auto;
     border-radius: 17px;
     grid-template-rows: minmax(76px, auto) 54px;
     min-height: 130px;
   }
 
+  .browser-chat-compose.browser-chat-compose--reference::before {
+    border-radius: 14px;
+    inset: 7px 7px 54px;
+  }
+
+  .browser-chat-compose.browser-chat-compose--reference::after {
+    border-radius: 16px;
+  }
+
   .browser-chat-compose--reference .browser-chat-inline-editor {
+    font-size: 14px;
+    height: auto;
+    line-height: 1.5;
+    margin: 7px 7px 0;
+    max-height: 152px;
     min-height: 76px;
-    padding: 14px 14px 5px;
+    padding: 10px 16px 4px;
   }
 
   .browser-chat-compose--reference .browser-chat-compose-actions {
     align-items: center;
+    gap: 6px;
     grid-template-columns: auto minmax(0, 1fr);
     min-height: 54px;
     padding: 6px 7px 8px 8px;
   }
 
-  .browser-chat-compose-actions > .browser-chat-management-shortcuts {
+  .browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts {
     display: none;
   }
 
-  .browser-chat-compose--reference .browser-chat-compose-tools,
+  .browser-chat-compose--reference .browser-chat-compose-tools {
+    gap: 6px;
+  }
+
   .browser-chat-compose--reference .browser-chat-compose-submit {
+    gap: 6px;
+    grid-template-columns: minmax(96px, 1fr) 40px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
     gap: 4px;
+    grid-template-columns: minmax(68px, 1fr) 34px 40px;
   }
 
   .browser-chat-compose--reference .browser-chat-attach,
@@ -2046,8 +2456,34 @@
     width: 40px;
   }
 
-  .browser-chat-mode-selector-trigger {
-    height: 36px;
+  .browser-chat-compose--reference .browser-chat-attach svg,
+  .browser-chat-compose--reference .browser-chat-send svg,
+  .browser-chat-compose--reference .browser-chat-stop svg {
+    height: 18px;
+    width: 18px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-mode-selector-trigger {
+    font-size: 12px;
+    gap: 5px;
+    height: 40px;
+    padding: 0 10px;
+    width: 124px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-mode-selector-trigger svg {
+    height: 16px;
+    width: 16px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-model-control {
+    min-height: 40px;
+    padding-inline: 10px;
+  }
+
+  .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
+    font-size: 12px;
+    min-height: 38px;
   }
 
   .browser-chat-pane-actions {
@@ -2125,8 +2561,18 @@
   }
 
   .browser-chat-compose--reference .browser-chat-compose-actions {
+    gap: 8px;
     grid-template-columns: minmax(0, 1fr);
     padding-inline: 9px;
+  }
+
+  .browser-chat-compose.browser-chat-compose--reference {
+    grid-template-rows: minmax(76px, auto) auto;
+    min-height: 184px;
+  }
+
+  .browser-chat-compose.browser-chat-compose--reference::before {
+    bottom: 108px;
   }
 
   .browser-chat-compose--reference .browser-chat-compose-tools {
@@ -3093,39 +3539,28 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-strong) 18%, transparent);
 }
 
-@property --browser-chat-rainbow-angle {
-  syntax: '<angle>';
-  inherits: false;
-  initial-value: 0deg;
-}
-
 .browser-chat-compose--reference .browser-chat-send.magic-rainbow-button {
-  --browser-chat-rainbow-angle: 0deg;
-  --magic-rainbow-surface: var(--accent-strong);
-  animation: browser-chat-rainbow-spin 3.2s linear infinite;
-  background-color: transparent;
-  background-image:
-    linear-gradient(var(--magic-rainbow-surface), var(--magic-rainbow-surface)),
-    conic-gradient(from var(--browser-chat-rainbow-angle), var(--magic-rainbow-1), var(--magic-rainbow-2), var(--magic-rainbow-3), var(--magic-rainbow-4), var(--magic-rainbow-5), var(--magic-rainbow-1));
-  background-clip: padding-box, border-box;
-  background-origin: padding-box, border-box;
-  background-position: 0 0;
-  background-repeat: no-repeat;
-  background-size: 100% 100%;
-  border: 2px solid transparent;
+  animation: none;
+  background: var(--composer-send-fill);
+  border: 1px solid color-mix(in srgb, var(--panel) 70%, transparent);
+  box-shadow:
+    -3px 7px 18px rgba(116, 109, 255, 0.16),
+    4px 7px 18px rgba(67, 214, 201, 0.19),
+    0 2px 5px rgba(53, 64, 90, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.64),
+    inset 0 -1px 0 rgba(47, 151, 173, 0.16);
 }
 
 .browser-chat-compose--reference .browser-chat-send.magic-rainbow-button:not(:disabled):hover {
-  --magic-rainbow-surface: var(--accent-hover);
-  animation-play-state: paused;
+  background: var(--composer-send-hover-fill);
+  box-shadow:
+    0 9px 20px color-mix(in srgb, var(--accent) 34%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.48);
+  transform: translateY(-1px);
 }
 
 .browser-chat-compose--reference .browser-chat-send.magic-rainbow-button:disabled {
-  animation-play-state: paused;
-}
-
-@keyframes browser-chat-rainbow-spin {
-  to { --browser-chat-rainbow-angle: 360deg; }
+  animation: none;
 }
 
 @media (max-width: 620px) {

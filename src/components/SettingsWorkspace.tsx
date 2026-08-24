@@ -6,16 +6,12 @@ import {
   Brain,
   Braces,
   Bug,
-  Gauge,
   KeyRound,
   Loader2,
   Lock,
-  MessageSquare,
   PanelLeft,
-  Settings,
   SlidersHorizontal,
   SquareTerminal,
-  Workflow,
   X,
 } from 'lucide-react';
 import { EnvironmentSettings, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
@@ -23,7 +19,7 @@ import {
   environmentSettingsTabsForUser,
   isAdministratorOnlySettingsTab,
 } from '@/components/environment-settings-model';
-import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import type { SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
@@ -139,14 +135,16 @@ export function SettingsWorkspace({
         themeToggleLabel={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
         themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
       >
-        <nav className="browser-chat-nav" aria-label={t('工作模式')}>
-          <WorkspaceNavItem href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
-          <WorkspaceNavItem href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
-          {defaultUserId === '1' ? (
-            <WorkspaceNavItem href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
-          ) : null}
-          <WorkspaceNavItem active icon={<Settings size={17} />} label={t('设置')} onClick={() => undefined} />
-        </nav>
+        <WorkspaceModeTabs
+          activeKey="/settings"
+          aiOperationsLabel={t('AI 运营')}
+          ariaLabel={t('工作模式')}
+          automationLabel={t('自动化')}
+          collapsed={sidebarCollapsed}
+          conversationLabel={t('对话模式')}
+          settingsLabel={t('设置')}
+          showAiOperations={defaultUserId === '1'}
+        />
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
           <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
             {visibleSettingsTabs.map((tab) => (

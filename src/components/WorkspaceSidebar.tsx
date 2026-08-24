@@ -1,8 +1,9 @@
 'use client';
 
-import { PanelLeft } from 'lucide-react';
-import Link from 'next/link';
-import type { ReactNode } from 'react';
+import { Gauge, MessageCircleMore, PanelLeft, Settings, Workflow } from 'lucide-react';
+import { Tabs } from '@heroui/react';
+import { useRouter } from 'next/navigation';
+import { useEffect, useState, type ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
 import { WebPilotHelpCenter } from '@/components/WebPilotHelpCenter';
 import { AnimatedThemeToggler } from '@/components/ui/animated-theme-toggler';
@@ -19,32 +20,78 @@ type WorkspaceSidebarProps = {
   themeToggleTitle: string;
 };
 
-type WorkspaceNavItemProps = {
-  active?: boolean;
-  href?: string;
-  icon: ReactNode;
-  label: string;
-  onClick?: () => void;
+type WorkspaceModeKey = '/browser-chat' | '/automation' | '/admin/ai-operations' | '/settings';
+
+type WorkspaceModeTabsProps = {
+  activeKey: WorkspaceModeKey;
+  aiOperationsLabel: string;
+  ariaLabel: string;
+  automationLabel: string;
+  collapsed: boolean;
+  conversationLabel: string;
+  settingsLabel: string;
+  showAiOperations?: boolean;
 };
 
-export function WorkspaceNavItem({ active = false, href, icon, label, onClick }: WorkspaceNavItemProps) {
-  const className = active ? 'browser-chat-nav-item active' : 'browser-chat-nav-item';
-  const visibleLabel = href === '/browser-chat' ? label.replace(/(?:模式| Mode)$/u, '') : label;
+export function WorkspaceModeTabs({
+  activeKey,
+  aiOperationsLabel,
+  ariaLabel,
+  automationLabel,
+  collapsed,
+  conversationLabel,
+  settingsLabel,
+  showAiOperations = false,
+}: WorkspaceModeTabsProps) {
+  const router = useRouter();
+  const [desktopLayout, setDesktopLayout] = useState(false);
+  const visibleConversationLabel = conversationLabel.replace(/(?:模式| Mode)$/u, '');
 
-  if (onClick) {
-    return (
-      <button aria-current={active ? 'page' : undefined} aria-label={label} className={className} onClick={onClick} title={label} type="button">
-        {icon}
-        <span>{visibleLabel}</span>
-      </button>
-    );
-  }
-  if (!href) return null;
+  useEffect(() => {
+    const desktopQuery = window.matchMedia('(min-width: 1025px)');
+    const syncDesktopLayout = () => setDesktopLayout(desktopQuery.matches);
+    syncDesktopLayout();
+    desktopQuery.addEventListener('change', syncDesktopLayout);
+    return () => desktopQuery.removeEventListener('change', syncDesktopLayout);
+  }, []);
+
   return (
-    <Link aria-current={active ? 'page' : undefined} aria-label={label} className={className} href={href} title={label}>
-      {icon}
-      <span>{visibleLabel}</span>
-    </Link>
+    <Tabs
+      className="workspace-mode-tabs"
+      onSelectionChange={(key) => {
+        const nextKey = String(key) as WorkspaceModeKey;
+        if (nextKey !== activeKey) router.push(nextKey);
+      }}
+      orientation={collapsed && desktopLayout ? 'vertical' : 'horizontal'}
+      selectedKey={activeKey}
+    >
+      <Tabs.ListContainer>
+        <Tabs.List aria-label={ariaLabel}>
+          <Tabs.Tab aria-label={conversationLabel} id="/browser-chat">
+            <MessageCircleMore aria-hidden="true" />
+            <span className="workspace-mode-tab-label">{visibleConversationLabel}</span>
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          <Tabs.Tab aria-label={automationLabel} id="/automation">
+            <Workflow aria-hidden="true" />
+            <span className="workspace-mode-tab-label">{automationLabel}</span>
+            <Tabs.Indicator />
+          </Tabs.Tab>
+          {showAiOperations ? (
+            <Tabs.Tab aria-label={aiOperationsLabel} id="/admin/ai-operations">
+              <Gauge aria-hidden="true" />
+              <span className="workspace-mode-tab-label">{aiOperationsLabel}</span>
+              <Tabs.Indicator />
+            </Tabs.Tab>
+          ) : null}
+          <Tabs.Tab aria-label={settingsLabel} id="/settings">
+            <Settings aria-hidden="true" />
+            <span className="workspace-mode-tab-label">{settingsLabel}</span>
+            <Tabs.Indicator />
+          </Tabs.Tab>
+        </Tabs.List>
+      </Tabs.ListContainer>
+    </Tabs>
   );
 }
 

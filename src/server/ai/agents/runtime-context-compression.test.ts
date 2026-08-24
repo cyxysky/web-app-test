@@ -4,6 +4,7 @@ import type { ModelMessage } from 'ai';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
+  ensureRuntimeContinuationSummaryMessage,
   fallbackRuntimeContinuationSummary,
   mergeRuntimeModelMessageChain,
   normalizeRuntimeContinuationSummary,
@@ -114,6 +115,21 @@ test('continuation compression explicitly merges a previous summary with only a 
   assert.match(prompt, /New unsummarized message delta JSON/);
   assert.match(prompt, /Never copy raw screenshots, AX trees, page\.domSnapshot\(\) output, domChanges payloads/);
   assert.doesNotMatch(prompt, /Complete message history/);
+});
+
+test('restores a durable continuation summary when the active message marker is missing', () => {
+  const restored = ensureRuntimeContinuationSummaryMessage(
+    [{ role: 'user', content: '继续生成' }],
+    JSON.stringify({ completed: ['资料下载完成'], nextStep: '继续视觉检查' }),
+  );
+
+  assert.equal(restored.length, 2);
+  assert.match(String(restored[0]?.content), /^\[WebPilot continuation summary\]/);
+  assert.match(String(restored[0]?.content), /资料下载完成/);
+  const replaced = ensureRuntimeContinuationSummaryMessage(restored, '{"nextStep":"重复"}');
+  assert.equal(replaced.length, 2);
+  assert.match(String(replaced[0]?.content), /重复/);
+  assert.doesNotMatch(String(replaced[0]?.content), /资料下载完成/);
 });
 
 test('continuation summaries discard raw AX and DOM-change payloads', () => {

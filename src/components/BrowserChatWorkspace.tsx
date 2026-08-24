@@ -64,6 +64,7 @@ import {
   MoreHorizontal,
   MousePointer2,
   Network,
+  PanelLeftClose,
   PanelRight,
   Paperclip,
   PencilLine,
@@ -78,6 +79,7 @@ import {
   Share2,
   Settings,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   SquareArrowOutUpRight,
   Square,
@@ -136,7 +138,7 @@ import {
   resolveEmbeddedBrowserWheelScrollLeft,
   type EmbeddedBrowserTabDensity,
 } from '@/components/embedded-browser-tab-layout';
-import { WorkspaceNavItem, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
 import {
   WorkspaceSidebarArchiveFilter,
   WorkspaceSidebarArchiveHeader,
@@ -2095,6 +2097,16 @@ function mergeBrowserChatSessionRealtimePatch(
 
 function sessionSortTime(session: BrowserChatSession) {
   return session.updatedAt || session.createdAt || '';
+}
+
+function sessionSidebarTime(session: BrowserChatSession, language: 'zh' | 'en') {
+  const timestamp = Date.parse(sessionSortTime(session));
+  if (!Number.isFinite(timestamp)) return '';
+  return new Intl.DateTimeFormat(language === 'en' ? 'en-US' : 'zh-CN', {
+    hour: '2-digit',
+    hour12: false,
+    minute: '2-digit',
+  }).format(timestamp);
 }
 
 function sessionTimeValue(session: BrowserChatSession) {
@@ -6272,7 +6284,7 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
           ref={editorRef}
           className="browser-chat-inline-editor"
           contentEditable={!busy && !loading}
-          data-placeholder={t('问问题，尽管问')}
+          data-placeholder={t('问问题，尽管问…')}
           onClick={(event) => {
             const target = event.target;
             if (!(target instanceof Element)) return;
@@ -10659,10 +10671,14 @@ export function BrowserChatWorkspace({
                 ) : null}
                 <WorkspaceOverflowMenu
                   className="browser-chat-recent-actions"
-                  icon={<MoreHorizontal size={16} />}
+                  icon={<SlidersHorizontal size={16} />}
                   label={t('对话操作')}
                   title={t('对话操作')}
                 >
+                  <button onClick={toggleSidebarCollapsed} type="button">
+                    <PanelLeftClose size={15} />
+                    <span>{t('折叠侧边栏')}</span>
+                  </button>
                   {recentSessions.length ? (
                     <button
                       onClick={() => {
@@ -10696,7 +10712,7 @@ export function BrowserChatWorkspace({
               clearTitle={t('清空筛选')}
               disabled={loadingSessionHistory}
               onChange={setHistoryFilter}
-              placeholder={t('筛选对话')}
+              placeholder={t('搜索对话')}
               value={historyFilter}
             />
           </WorkspaceSidebarArchiveHeader>
@@ -10710,6 +10726,7 @@ export function BrowserChatWorkspace({
             <WorkspaceHistoryList
               aria-busy={loadingMoreSessions}
               className="browser-chat-recent-list workspace-sidebar-archive-list"
+              compactGroupHeaders
               footer={sessionListPage.hasMore && sessionListPage.next ? (
                 <li
                   className={`browser-chat-history-scroll-sentinel${loadingMoreSessions ? ' is-loading' : ''}`}
@@ -10782,6 +10799,7 @@ export function BrowserChatWorkspace({
                         ? <FileText aria-hidden="true" size={16} />
                         : undefined}
                       iconTone={active ? 'accent' : 'muted'}
+                      meta={sessionSidebarTime(item, language)}
                       onOpen={() => {
                         setMobileHistoryOpen(false);
                         void loadSession(item.id);
@@ -11156,13 +11174,16 @@ export function BrowserChatWorkspace({
         themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
       >
 
-        <nav className="browser-chat-nav" aria-label={t('工作模式')}>          <WorkspaceNavItem active href="/browser-chat" icon={<MessageSquare size={17} />} label={t('对话模式')} />
-          <WorkspaceNavItem href="/automation" icon={<Workflow size={17} />} label={t('自动化')} />
-          {requestUserId === '1' ? (
-            <WorkspaceNavItem href="/admin/ai-operations" icon={<Gauge size={17} />} label={t('AI 运营')} />
-          ) : null}
-          <WorkspaceNavItem href="/settings" icon={<Settings size={17} />} label={t('设置')} />
-        </nav>
+        <WorkspaceModeTabs
+          activeKey="/browser-chat"
+          aiOperationsLabel={t('AI 运营')}
+          ariaLabel={t('工作模式')}
+          automationLabel={t('自动化')}
+          collapsed={sidebarCollapsed}
+          conversationLabel={t('对话模式')}
+          settingsLabel={t('设置')}
+          showAiOperations={requestUserId === '1'}
+        />
 
         {renderSidebarDetail()}
 

@@ -49,3 +49,17 @@ test('counts image parts without treating base64 image data as text', () => {
   assert.ok(estimate.imageTokens > 0);
   assert.ok(estimate.textTokens < estimateRuntimeTextTokens('a'.repeat(50_000)));
 });
+
+test('counts persisted AI SDK file image parts without treating data URLs as text', () => {
+  const estimate = estimateRuntimeMessageContext([{
+    role: 'user',
+    content: [
+      { type: 'text', text: '继续检查上一轮图片' },
+      { type: 'file', mediaType: 'image/png', data: 'data:image/png;base64,' + 'a'.repeat(500_000) },
+    ],
+  }]);
+
+  assert.equal(estimate.imageCount, 1);
+  assert.ok(estimate.imageTokens > 0);
+  assert.ok(estimate.textTokens < estimateRuntimeTextTokens('a'.repeat(500_000)));
+});

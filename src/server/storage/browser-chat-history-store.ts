@@ -115,6 +115,18 @@ export function readBrowserChatMessageById<T>(sessionId: string, messageId: stri
   return row?.record_json ? parseJson<T>(row.record_json) : undefined;
 }
 
+export function readAllBrowserChatMessages<T>(sessionId: string) {
+  const rows = getSqliteDatabase().prepare(`
+    SELECT record_json
+    FROM browser_chat_message
+    WHERE session_id = ?
+    ORDER BY time ASC, id ASC
+  `).all(sessionId) as Array<{ record_json: string }>;
+  return rows
+    .map((row) => parseJson<T>(row.record_json))
+    .filter((item): item is T => item !== undefined);
+}
+
 export function readBrowserChatLatestActiveAssistantMessage<T>(sessionId: string) {
   const row = getSqliteDatabase().prepare(`
     SELECT record_json
@@ -169,6 +181,18 @@ export function readBrowserChatStepsByIndexes<T>(sessionId: string, stepIndexes:
       ORDER BY step_index ASC
     `).all(sessionId, ...chunk) as Array<{ record_json: string }>);
   }
+  return rows
+    .map((row) => parseJson<T>(row.record_json))
+    .filter((item): item is T => item !== undefined);
+}
+
+export function readAllBrowserChatSteps<T>(sessionId: string) {
+  const rows = getSqliteDatabase().prepare(`
+    SELECT record_json
+    FROM browser_chat_step
+    WHERE session_id = ?
+    ORDER BY step_index ASC
+  `).all(sessionId) as Array<{ record_json: string }>;
   return rows
     .map((row) => parseJson<T>(row.record_json))
     .filter((item): item is T => item !== undefined);

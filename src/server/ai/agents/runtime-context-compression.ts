@@ -27,6 +27,8 @@ type RuntimeContinuationSummary = {
 
 const TRANSIENT_BROWSER_EVIDENCE_KEYS = new Set(['axTree', 'domChanges', 'domSnapshot']);
 
+export const runtimeContinuationSummaryMarker = '[WebPilot continuation summary]';
+
 function modelMessageContainsToolCall(message: ModelMessage) {
   return message.role === 'assistant'
     && Array.isArray(message.content)
@@ -120,6 +122,22 @@ export function sanitizeRuntimeContinuationSummary(value: string) {
   } catch {
     return /\[ax-tree\]|"(?:axTree|domChanges|domSnapshot)"\s*:/.test(trimmed) ? '' : trimmed;
   }
+}
+
+export function ensureRuntimeContinuationSummaryMessage(
+  messages: ModelMessage[],
+  continuationSummary: string,
+) {
+  const summary = sanitizeRuntimeContinuationSummary(continuationSummary);
+  if (!summary) return [...messages];
+  const withoutSummaryMarkers = messages.filter((message) => !(
+    typeof message.content === 'string'
+    && message.content.startsWith(runtimeContinuationSummaryMarker)
+  ));
+  return [{
+    role: 'user' as const,
+    content: `${runtimeContinuationSummaryMarker}\n${summary}`,
+  }, ...withoutSummaryMarkers];
 }
 
 function parsedRuntimeContinuationSummary(value: string | undefined) {
