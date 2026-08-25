@@ -157,13 +157,29 @@ For unattended browser tasks, keep `HEADLESS_BROWSER=true`. For account-based in
 
 ## Package a Windows HTTP server
 
-To distribute the backend without Electron, create a self-contained service archive on the build machine:
+To distribute the backend without Electron as a single Windows installer, run:
+
+```powershell
+npm run server:installer
+```
+
+This produces `dist-server/WebPilot-Server-Setup-<version>-x64.exe`. The installer:
+
+- bundles the build machine's compatible Node.js runtime, so Node.js is not required on the target machine;
+- installs the complete Next.js server, Playwright Chromium, and LibreOffice under `Program Files`;
+- registers and starts the automatic `WebPilotServer` Windows service;
+- listens on `0.0.0.0:3000` and adds a TCP 3000 firewall rule for domain/private networks;
+- stores runtime data and service logs under `C:\ProgramData\WebPilot` so upgrades do not overwrite them.
+
+Administrator permission is required during installation. Uninstalling removes the service, application files, and firewall rule, while preserving `C:\ProgramData\WebPilot`.
+
+To create only the unpacked server directory on the build machine, run:
 
 ```powershell
 npm run server:package
 ```
 
-This produces `dist-server/WebPilot-Server`. The target machine only needs Node.js 22.16 or later: copy this directory and run `start.cmd`. It includes the complete production dependency tree and the Playwright Chromium binary, so the target machine does not need `npm install` or `npx playwright install chromium`.
+This produces `dist-server/WebPilot-Server`. When copied directly instead of installed through the EXE, the target machine needs Node.js 22.16 or later and starts it with `start.cmd`. It includes the complete production dependency tree, Playwright Chromium, and LibreOffice, so the target machine does not need `npm install`, `npx playwright install chromium`, or a separate LibreOffice installation.
 
 By default it listens on all network interfaces at port `3000` (locally: `http://127.0.0.1:3000`), stores application data under `runtime/`, and runs the browser headlessly. Set `PORT`, `APP_DATA_DIR`, `ARTIFACTS_DIR`, or `HEADLESS_BROWSER` before `start.cmd` to override those defaults.
 
@@ -190,36 +206,7 @@ docker login
 docker push "${DockerHubUser}/webpilot-qa:${ImageVersion}"
 docker push "${DockerHubUser}/webpilot-qa:latest"
 ```
-1.你现在新建标签页，还是会把组挤到被遮挡的地方
-2.你现在删除按钮还是和文本重叠了，你能不能用flex布局，文本overflow：hidden？
 
 
-在wiki里面创建一个最新的DOMP更新日志
-流程是：
-1.进入这个界面https://wiki.shterm.com/pages/viewpage.action?pageId=327681890
-2.在新标签页打开这个https://wiki.shterm.com/pages/viewpage.action?pageId=478021312，里面是版本发布的模板，复制里面的模板
-3.当前是否是大版本更新
- - 如果是大版本更新，就在https://wiki.shterm.com/pages/viewpage.action?pageId=327681890这个目录下新建一个，后续操作修改的名称是vx.x.x(最新的大版本) 版本发布自动配置方案
- - 如果是小版本更新，就选中最新的大版本发布配置方案，在里面新建，后续操作修改的名称是vx.x.x(大版本) 0806(月份天) 版本发布自动配置方案
-4.在对应目录下点击新建后，进入界面编辑，修改标题为，修改发布时间为当天，存在2种更新时间点：如果中午更新就是12:00，如果晚上更新就是22:00。
-5.点击发布进行发布
-
-
-
-
-1.新建wiki的domp发版内容
-
-2.在domp列表页进行过滤，找到特定的内容
-
-3.domp创建需求
-
-4.分析domp需求，给出测试用例md
-
-5.
-
-
-
-1.通一轮对话调用多个子agent，渲染位置错误，后续子agent会渲染之前已执行的子agent内容
-2.而且现在模型会并行读取子agent的内容，这样不行，强制让模型串行读取子agent内容，保证子agent读取正常
-3.为什么用户已中止的对话里面的内容不会进入消息？这不是明显的bug？用户中止可能是模型的一些操作存在问题，用户进行矫正，但是模型执行的内容是实打实存在的啊
-4.主子agent渲染的样式完全不同啊，我说了，子agent渲染的样式完全参照主agent实现
+1.还有所有文件操作skill，也作为内嵌skill，包括文件生成，编辑，查看等所有文件这个工具能够进行的操作，都集合成一个skill，并且强制要求模型在进行文件操作时读取
+2.还有什么工具也需要skill提示，你给出方案

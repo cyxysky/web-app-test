@@ -6,6 +6,7 @@ export type RuntimeRetryCategory =
   | 'invalid-request'
   | 'network'
   | 'provider-overloaded'
+  | 'protocol'
   | 'rate-limited'
   | 'request-timeout'
   | 'server-error'
@@ -138,9 +139,20 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   const code = (firstString(records, ['code', 'errno', 'type']) || '').toUpperCase();
   const statusCode = firstNumber(records, ['status', 'statusCode', 'httpStatusCode']);
   const retryAfterMs = retryAfterFromRecords(records);
+  const privateToolProtocolRetryable = records.some((record) => record.privateToolProtocolRetryable === true);
+  const privateToolProtocolFailure = records.some((record) => record.privateToolProtocolRetryable === false)
+    || name === 'AI_PrivateToolProtocolError';
 
   if (signal?.aborted || name === 'AbortError' || /\b(aborted|cancelled|canceled)\b/.test(normalizedMessage)) {
     return { category: 'aborted', reason: 'request was aborted', retryable: false, statusCode };
+  }
+  if (privateToolProtocolFailure) {
+    return {
+      category: 'protocol',
+      reason: 'provider emitted a private textual tool protocol',
+      retryable: privateToolProtocolRetryable,
+      statusCode,
+    };
   }
   if (statusCode === 401 || statusCode === 403 || /\b(api key|authentication|unauthori[sz]ed|forbidden)\b/.test(normalizedMessage)) {
     return { category: 'authentication', reason: `authentication failure${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };

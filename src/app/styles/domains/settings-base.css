@@ -505,6 +505,25 @@
   min-width: 0;
 }
 
+.management-data-table-grid [data-slot="table-body"] > tr:only-child > th[role="rowheader"] {
+  height: 148px;
+  padding: 0;
+  text-align: center;
+}
+
+.management-table-empty-state {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-size: 13px;
+  justify-content: center;
+  line-height: 1.6;
+  min-height: 148px;
+  padding: 24px;
+  text-align: center;
+  width: 100%;
+}
+
 
 .management-table-primary-column {
   width: 27%;

@@ -22,19 +22,28 @@ import {
   aiSdkToolResultRequiresContinuation,
 } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
-import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
+import {
+  browserCodeRuntimeSkillContent,
+  browserCodeRuntimeSkillId,
+  browserCodeRuntimeSkillWasRead,
+  browserCodeToolRequiresRuntimeSkill,
+} from './browser-code-runtime-skill';
+import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
   normalizeBrowserChatFileReadLimit,
 } from './browser-chat-file-read';
 import {
   repairFileArtifactDownloadLinks,
+  convertFileArtifact,
   downloadFileArtifact,
   editUnoFileArtifact,
   formatFileArtifactResult,
   generateUnoFileArtifact,
   getOfficeJsApi,
   getUnoApi,
+  listOfficeDrafts,
+  pendingOfficeDocumentWork,
   pendingOfficeVisualQa,
   planFileArtifact,
   readUnoDraft,
@@ -62,9 +71,12 @@ import {
   browserToolBlockedBeforeBrowserState,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
+  runtimeBrowserSessionToolNames,
+  runtimeToolRequiresBrowserSession,
   runtimeToolLoopStopToolNames,
 } from './runtime-tool-selection';
 import { browserToolApprovalRequest } from './browser-tool-approval';
+import { withToolFailureGuidance } from './runtime-tool-failure-guidance';
 import {
   estimateRuntimeMessageContext,
   estimateRuntimeTextTokens,
@@ -1049,6 +1061,7 @@ async function executeTracedBrowserAction(input: {
       actual: `Tool ${name} threw after execution started: ${infrastructureError(error)}`,
     };
   }
+  result = withToolFailureGuidance(name, result);
   trace.actionElapsedMs = elapsedSince(actionStartedAt);
 
   throwIfStopped(abortSignal, shouldContinue);
@@ -1128,6 +1141,7 @@ function makeBrowserTools(
   // serialize them so browser/page state and a document draft cannot be mutated concurrently.
   // This preserves tool-call order without silently dropping work from the same model step.
   let toolExecutionQueue = Promise.resolve();
+  let browserCodeRuntimeSkillLoaded = browserCodeRuntimeSkillWasRead(traces);
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
@@ -1166,13 +1180,18 @@ function makeBrowserTools(
     const run = async () => {
       throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
       const actionAfterBrowserStart = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
+        if (browserCodeToolRequiresRuntimeSkill(name, browserCodeRuntimeSkillLoaded)) {
+          return {
+            ok: false,
+            actual: `Tool ${name} was not executed. Read the hidden built-in Skill ${browserCodeRuntimeSkillId} with skill action=read in a separate model step, then call readBrowserState before retrying browserCode.`,
+          } satisfies BrowserActionResult;
+        }
         if (
           referenceOptions?.browserStatePreflightComplete
           && browserToolBlockedBeforeBrowserState(
             name,
             !referenceOptions.browserStatePreflightComplete(),
-            browserSessionToolNames,
-            input,
+            runtimeBrowserSessionToolNames,
           )
         ) {
           return {
@@ -1180,7 +1199,7 @@ function makeBrowserTools(
             actual: `Tool ${name} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
           } satisfies BrowserActionResult;
         }
-        if (toolRequiresBrowserSession(name, input)) await referenceOptions?.ensureBrowserStarted?.();
+        if (runtimeToolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
         return action(actionSignal, trace);
       };
       const traceVisualContext = referenceOptions?.visualContext;
@@ -1320,18 +1339,24 @@ function makeBrowserTools(
         },
       }),
     } : {}),
-    ...(referenceOptions?.readSkill ? {
-      skill: tool({
-        description: 'Manage Skills through one action-based tool. Use action=read with the exact Skill id from the system prompt before performing browser actions governed by that Skill. Do not read it again while it remains loaded.',
-        inputSchema: browserToolInput({
-          action: z.literal('read'),
-          skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <skill> summary.'),
-        }, [{ reason: '读取当前站点操作规范', action: 'read', skillId: 'domp-90-system' }]),
-        execute: (input, execution) => record('skill', input, () => referenceOptions.readSkill!(input.skillId), execution),
-      }),
-    } : {}),
+    skill: tool({
+      description: `Read Skills through one action-based tool. Before the first browserCode call in every Agent run, action=read with hidden built-in Skill id ${browserCodeRuntimeSkillId} is mandatory. User Skills still use their exact ids from the system prompt and are not read again while loaded.`,
+      inputSchema: browserToolInput({
+        action: z.literal('read'),
+        skillId: z.string().min(1).max(160).describe(`Exact Skill id. The mandatory browser runtime Skill id is ${browserCodeRuntimeSkillId}.`),
+      }, [{ reason: '读取浏览器代码运行规范', action: 'read', skillId: browserCodeRuntimeSkillId }]),
+      execute: (input, execution) => record('skill', input, async () => {
+        if (input.skillId === browserCodeRuntimeSkillId) {
+          browserCodeRuntimeSkillLoaded = true;
+          return { ok: true, actual: browserCodeRuntimeSkillContent } satisfies BrowserActionResult;
+        }
+        return referenceOptions?.readSkill
+          ? referenceOptions.readSkill(input.skillId)
+          : { ok: false, actual: `Skill ${input.skillId} is unavailable in this runtime.` } satisfies BrowserActionResult;
+      }, execution),
+    }),
     file: tool({
-      description: 'Read, download, create, or modify files through one source workspace per documentId. New documents use plan -> generate -> repeated edit -> render. A small runnable initial skeleton followed by incremental edits is recommended, while a complete runnable initial program is also allowed. edit supports replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText, and restoreRevision; it validates a candidate transactionally, commits only on success, and returns rollback/recovery details on failure. Large scripts may optionally mark logical page/section units with `# @webpilot-unit pages/page-001` / `# @webpilot-endunit` (or // for JS); read/edit with path scopes line numbers and edits to that unit without adding another action. render only publishes a revision that passed static analysis, execution, Office reopen, and unified artifact checks. Any source change invalidates prior full visual QA; validation previews never count as reviewed pages. To modify an attached Office file, plan with operation=modify and sourceAttachmentId; edit that component and preserve unrelated content. Settings select UNO or JavaScript generation. Both API actions require the planned documentId. read returns line-numbered source, sourceDigest, revisions, unit states, validation status, and the durable workflow checkpoint; downloaded images return dimensions and aspect ratio from saved bytes. edit never accepts an unversioned whole-source replacement. render publishes a versioned candidate. For vision models, delivery remains blocked until every page is read and explicitly reported passed for the current renderedDigest.',
+      description: 'List, read, download, convert, create, or modify files through one source workspace per documentId. Start or resume Office work with list and reuse its exact documentId. New documents use plan -> generate -> repeated edit -> render. convert transforms an existing Office artifact to PDF using sourceArtifactId. A small runnable initial skeleton followed by incremental edits is recommended, while a complete runnable initial program is also allowed. edit supports replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText, and restoreRevision; it validates a candidate transactionally, commits only on success, and returns rollback/recovery details on failure. Large scripts may optionally mark logical page/section units with `# @webpilot-unit pages/page-001` / `# @webpilot-endunit` (or // for JS); read/edit with path scopes line numbers and edits to that unit without adding another action. render only publishes a revision that passed static analysis, execution, Office reopen, and unified artifact checks. Any source change invalidates prior full visual QA; validation previews never count as reviewed pages. To modify an attached Office file, plan with operation=modify and sourceAttachmentId; edit that component and preserve unrelated content. Settings select UNO or JavaScript generation. Both API actions require the planned documentId. read returns line-numbered source, sourceDigest, revisions, unit states, validation status, and the durable workflow checkpoint; downloaded images return dimensions and aspect ratio from saved bytes. edit never accepts an unversioned whole-source replacement. render publishes a versioned candidate. For vision models, delivery remains blocked until every page is read and explicitly reported passed for the current renderedDigest.',
       // Keep the provider-facing schema flat. Several OpenAI-compatible
       // gateways mishandle a discriminated union/oneOf and reject a perfectly
       // usable file call before the action-specific implementation can return
@@ -1340,9 +1365,10 @@ function makeBrowserTools(
         (input) => coerceBrowserChatToolInput('file', input),
         z.object({
           reason: z.string().min(1).max(300).optional().describe('Optional concise reason; it never changes file behavior.'),
-          action: z.string().max(32).optional().describe('Exactly one action: read, download, plan, generate, edit, unoApi, jsApi, or render. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. jsApi returns the cookbook for JavaScript generation mode.'),
+          action: z.string().max(32).optional().describe('Exactly one action: list, read, download, convert, plan, generate, edit, unoApi, jsApi, or render. Call list before starting or resuming Office work. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. jsApi returns the cookbook for JavaScript generation mode.'),
           attachmentId: z.string().max(160).optional().describe('Exact user attachment id returned in conversation metadata. Example: "attachment-7f3a".'),
           artifactId: z.string().max(4_000).optional().describe('Exact Artifact ID returned by a previous successful file tool result; never invent it.'),
+          sourceArtifactId: z.string().max(4_000).optional().describe('For action=convert: exact Artifact ID of the source Office file.'),
           documentId: z.string().max(96).optional().describe('Stable model-chosen id reused across plan, API lookup, generate, edit, render, and visual correction. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. Example: "xsbn-5d-yxg-guide".'),
           fileName: z.string().max(180).optional().describe('Optional output file name including the target extension. Examples: "西双版纳5日游攻略-野象谷周边.pptx", "项目复盘.docx", or "预算明细.xlsx".'),
           fileType: z.string().regex(/^[a-z0-9]{1,10}$/).optional().describe('Required for action=download: the expected file extension without a dot, such as jpg, png, pdf, docx, xlsx, or pptx. Always infer and provide it even when fileName is omitted.'),
@@ -1390,6 +1416,9 @@ function makeBrowserTools(
         { reason: '渲染当前文稿版本', action: 'render', documentId: 'xsbn-5d-yxg-guide' },
       ]),
       execute: (input, execution) => {
+        if (input.action === 'list') {
+          return record('file', input, () => listOfficeDrafts({ runId: referenceOptions?.runId }), execution);
+        }
         if (input.action === 'read') {
           if (input.documentId) {
             return record('file', input, () => readUnoDraft({ documentId: input.documentId, path: input.path, runId: referenceOptions?.runId }), execution);
@@ -1407,6 +1436,14 @@ function makeBrowserTools(
         }
         if (input.action === 'download') {
           return record('file', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution);
+        }
+        if (input.action === 'convert') {
+          return record('file', input, () => convertFileArtifact({
+            runId: referenceOptions?.runId,
+            sourceArtifactId: input.sourceArtifactId,
+            fileName: input.fileName,
+            includeVisualVerification: modelSupportsScreenshotInput(),
+          }), execution);
         }
         if (input.action === 'plan') {
           return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings }), execution);
@@ -1451,7 +1488,7 @@ function makeBrowserTools(
         }
         return record('file', input, () => Promise.resolve({
           ok: false,
-          actual: 'file requires one action: read | download | plan | generate | edit | unoApi | jsApi | render. To modify an attachment, plan with operation=modify and sourceAttachmentId. Do not retry an empty object.',
+          actual: 'file requires one action: list | read | download | convert | plan | generate | edit | unoApi | jsApi | render. To modify an attachment, plan with operation=modify and sourceAttachmentId. Do not retry an empty object.',
         }), execution);
       },
     }),
@@ -1589,21 +1626,6 @@ function runtimeToolNames(includeVisualTools = true) {
     ...(includeVisualTools ? ['fileVisual'] : []),
     'skill',
   ];
-}
-
-const browserSessionToolNames = new Set([
-  'readBrowserState',
-  'browserCode',
-  'waitForHumanVerification',
-  'subagent',
-]);
-
-function toolRequiresBrowserSession(name: string, input?: unknown) {
-  // Child result reads are served from this chat session's stored subagent
-  // record. Only spawning a child depends on the current browser session.
-  return browserSessionToolNames.has(name)
-    && !(name === 'subagent'
-      && Boolean(input && typeof input === 'object' && 'action' in input && input.action === 'read'));
 }
 
 function isCodexProvider() {
@@ -2092,6 +2114,7 @@ async function executeRuntimeStep(input: {
   let lastAiRequest: AiRequestSnapshot | undefined;
   let lastRetryState: RuntimeRetryState | undefined;
   let consecutiveRequestFailures = 0;
+  let privateToolProtocolFailures = 0;
   const durableTraces: ToolTrace[] = [];
 
   function rememberRetryState(state: RuntimeRetryState) {
@@ -2120,8 +2143,7 @@ async function executeRuntimeStep(input: {
     const externalTools = codexMode ? {} : (input.memoryTools || {});
     const externalToolNames = new Set(Object.keys(externalTools));
     const availableRuntimeToolNames = [...runtimeToolNames(imageInputAvailable && Boolean(input.readFileVisuals)), ...externalToolNames].filter((name) => (
-      (name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent))
-      && (name !== 'skill' || Boolean(input.readSkill))
+      name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent)
     ));
     const runtimeTools = runtimeAllowedToolTypes({
       browserChatMode: true,
@@ -2131,7 +2153,7 @@ async function executeRuntimeStep(input: {
     });
     const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
     const allowedToolTypes = requestedToolTypes
-      ? runtimeTools.filter((toolType) => toolType === 'readBrowserState' || requestedToolTypes.has(toolType))
+      ? runtimeTools.filter((toolType) => toolType === 'readBrowserState' || toolType === 'skill' || requestedToolTypes.has(toolType))
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
@@ -2823,7 +2845,6 @@ async function executeRuntimeStep(input: {
       hasToolCall<typeof toolsForRequest>(toolName)
     ));
     try {
-      let streamedStepNumber = 0;
       let streamedStepText = '';
       const runtimeContext = {
         operationalContext: activeOperationalContext,
@@ -2839,7 +2860,6 @@ async function executeRuntimeStep(input: {
         toolExecutionGate.stepNumber = stepNumber;
         stepTraceStarts.set(stepNumber, traces.length);
         stepStartedAt.set(stepNumber, Date.now());
-        streamedStepNumber = stepNumber;
         streamedStepText = '';
         await onAttemptDebug?.({
           phase: 'ai:runtime:request',
@@ -2923,10 +2943,13 @@ async function executeRuntimeStep(input: {
         requestWatchdog.touch();
         ensureActive();
         latestText = event.text || '';
-        const visibleText = input.suppressTextOutput ? '' : latestText;
-        const debugResponseText = input.suppressTextOutput
-          ? 'AI response withheld pending mandatory visual QA.'
-          : latestText || 'AI returned no text; tool call completed.';
+        const hasStructuredToolCalls = Array.isArray(event.toolCalls) && event.toolCalls.length > 0;
+        const visibleText = input.suppressTextOutput || hasStructuredToolCalls || containsPrivateToolProtocol(latestText)
+          ? ''
+          : normalizeBrowserChatFinalReplyText(latestText);
+        const debugResponseText = input.suppressTextOutput || hasStructuredToolCalls
+          ? 'AI response withheld until the tool workflow reaches a terminal response.'
+          : visibleText || 'AI returned no text; tool call completed.';
         const turnIndex = typeof event.stepNumber === 'number' ? event.stepNumber : toolExecutionGate.stepNumber;
         if (visibleText) {
           await onTextStream?.({
@@ -3021,12 +3044,6 @@ async function executeRuntimeStep(input: {
             ensureActive();
             streamedStepText += chunk.text;
             latestText = streamedStepText;
-            await onTextStream?.({
-              delta: chunk.text,
-              stepNumber: streamedStepNumber,
-              text: streamedStepText,
-            });
-            ensureActive();
           },
         });
       let resultText: Awaited<typeof result.text>;
@@ -3063,6 +3080,24 @@ async function executeRuntimeStep(input: {
         responseToolResultCount,
         resultSteps.reduce((count, step) => count + step.toolResults.length, 0),
       );
+      const modelSettings = getModelSettings();
+      const miniMaxRuntime = /minimax/i.test(`${modelSettings.provider} ${modelSettings.model}`);
+      if (miniMaxRuntime && containsPrivateToolProtocol(resultText || latestText) && toolCallCount === 0) {
+        privateToolProtocolFailures += 1;
+        if (lastRetryState) {
+          lastRetryState.messages = [
+            ...lastRetryState.messages,
+            {
+              role: 'user',
+              content: '[Provider protocol correction] The previous response emitted a private textual tool protocol. Do not repeat or quote it. Use only the standard structured tool_calls interface supplied by this request, or return ordinary final text when no tool is needed.',
+            },
+          ];
+        }
+        const error = new Error('MiniMax emitted a private textual tool protocol instead of a standard structured tool call.');
+        error.name = 'AI_PrivateToolProtocolError';
+        Object.assign(error, { privateToolProtocolRetryable: privateToolProtocolFailures === 1 });
+        throw error;
+      }
       if (aiSdkEmptyStopRequiresRetry({
         finishReason: resultFinishReason,
         responseText: resultText,
@@ -3321,6 +3356,7 @@ export type InteractiveBrowserTurnResult = {
   modelMessages: ModelMessage[];
   turnMessages: ModelMessage[];
   contextCompression?: BrowserChatModelContextCompression;
+  continuationSummary?: string;
 };
 
 function browserChatSafetyInstructions(mode?: BrowserChatSafetyMode) {
@@ -3385,6 +3421,7 @@ export async function executeInteractiveBrowserTurn(input: {
     activeMessages: ModelMessage[];
     contextCompression: BrowserChatModelContextCompression;
   }) => void | Promise<void>;
+  onContinuationSummary?: (summary: string) => void | Promise<void>;
   onDebug?: ExecutionDebug;
   abortSignal?: AbortSignal;
   shouldContinue?: () => boolean;
@@ -3418,6 +3455,8 @@ export async function executeInteractiveBrowserTurn(input: {
   let endedWithFinalAnswer = false;
   let browserStatePreflightComplete = false;
   const turnRenderedArtifactIds = new Set<string>();
+  const turnDocumentIds = new Set<string>();
+  const requiresOfficeVisualQa = modelSupportsScreenshotInput() && Boolean(input.readFileVisuals);
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
@@ -3443,10 +3482,14 @@ export async function executeInteractiveBrowserTurn(input: {
     try {
       const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
       const requiredSubagentUuid = pendingSubagentUuids[0];
-      const pendingVisualQa = modelSupportsScreenshotInput() && input.readFileVisuals
+      const pendingVisualQa = requiresOfficeVisualQa
         ? await pendingOfficeVisualQa(input.runId, turnRenderedArtifactIds)
         : [];
       const requiredVisualQa = pendingVisualQa[0];
+      const pendingDocumentWork = await pendingOfficeDocumentWork(input.runId, turnDocumentIds, {
+        requireVisualQa: requiresOfficeVisualQa,
+      });
+      const requiredDocumentWork = pendingDocumentWork[0];
       const initialRuntimeStep = turnModelMessages.length === 0;
       const requiredSubagentInstruction = requiredSubagentUuid
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
@@ -3455,6 +3498,10 @@ export async function executeInteractiveBrowserTurn(input: {
         ? `[Mandatory Office visual QA gate]
 Continue the current artifact workflow; do not restart the user's original task, revisit source research, or recreate already generated documents. Do not present a delivery/final-success summary yet.
 The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered yet. Its renderedDigest is ${requiredVisualQa.renderedDigest}, visualQaDigest is ${requiredVisualQa.visualQaDigest || 'null'}, ${requiredVisualQa.seenPageCount}/${requiredVisualQa.pageCount || '?'} pages have been read, and ${requiredVisualQa.reviewedPageCount}/${requiredVisualQa.pageCount || '?'} pages have explicit reviews${requiredVisualQa.failedPages.length ? ` (failed pages: ${requiredVisualQa.failedPages.join(', ')})` : ''}. Call fileVisual index/read and then report an explicit passed/failed conclusion for every page. Reading alone never passes QA. Success is forbidden until every page passes and visualQaDigest === renderedDigest.`
+        : '';
+      const requiredDocumentWorkInstruction = requiredDocumentWork
+        ? `[Mandatory Office document completion gate]
+Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The committed workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. A final response is forbidden until the committed source is rendered and any required visual QA is completed.`
         : '';
       actionResult = await executeRuntimeStep({
         session: input.session,
@@ -3466,8 +3513,9 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
           initialRuntimeStep ? input.modelInstruction || input.instruction : '',
           requiredSubagentInstruction,
           requiredVisualQaInstruction,
+          requiredDocumentWorkInstruction,
         ].filter(Boolean).join('\n\n'),
-        appendInstruction: initialRuntimeStep || Boolean(requiredSubagentInstruction) || Boolean(requiredVisualQaInstruction),
+        appendInstruction: initialRuntimeStep || Boolean(requiredSubagentInstruction) || Boolean(requiredVisualQaInstruction) || Boolean(requiredDocumentWorkInstruction),
         operationalContext: input.operationalContext,
         conversation: activeModelMessages,
         continuationSummary: activeContinuationSummary,
@@ -3489,12 +3537,10 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         ensureBrowserStarted: input.ensureBrowserStarted,
         memoryTools: input.memoryTools,
         useToolLoopAgent: input.useToolLoopAgent,
-        suppressTextOutput: Boolean(requiredVisualQa),
-        // Do not expose a premature "completed" response while the mandatory
-        // visual gate still owns this turn. Tool activity remains visible.
-        onTextStream: requiredVisualQa
-          ? (update) => { withheldTextUpdate = update; }
-          : input.onTextStream,
+        suppressTextOutput: Boolean(requiredVisualQa || requiredDocumentWork),
+        // Text is held server-side until every terminal gate below accepts the
+        // response. Tool progress remains visible through onProgress.
+        onTextStream: (update) => { withheldTextUpdate = update; },
         onContextCompression: async (update) => {
           activeModelMessages = [...update.activeMessages];
           activeContinuationSummary = update.contextCompression.continuationSummary;
@@ -3528,9 +3574,23 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
       browserStatePreflightComplete ||= actionResult.traces.some((trace) => trace.name === 'readBrowserState' && Boolean(trace.result));
       for (const trace of actionResult.traces) {
         const toolInput = splitToolInputAndReason(trace.input).input;
+        if (trace.name === 'file' && typeof toolInput.documentId === 'string' && toolInput.documentId) {
+          turnDocumentIds.add(toolInput.documentId);
+        }
         if (trace.name !== 'file' || toolInput.action !== 'render' || trace.result?.ok !== true) continue;
         const artifactId = parseJsonObjectText(trace.result.actual)?.artifactId;
         if (typeof artifactId === 'string' && artifactId) turnRenderedArtifactIds.add(artifactId);
+      }
+      if (actionResult.traces.length) {
+        activeContinuationSummary = fallbackRuntimeContinuationSummary({
+          goal: input.instruction,
+          stepIndex,
+          agentStep: newSteps.length + 1,
+          previousSummary: activeContinuationSummary,
+          recentToolAttempts: formatCurrentToolAttemptSummary(actionResult.traces, 5),
+          runtimeState: continuationRuntimeStateFromTraces(actionResult.traces),
+        });
+        await input.onContinuationSummary?.(activeContinuationSummary);
       }
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
@@ -3573,7 +3633,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
       if (actionResult.responseFinished) {
-        const pendingVisualQa = modelSupportsScreenshotInput() && input.readFileVisuals
+        const pendingVisualQa = requiresOfficeVisualQa
           ? await pendingOfficeVisualQa(input.runId, turnRenderedArtifactIds)
           : [];
         if (pendingVisualQa.length) {
@@ -3582,6 +3642,18 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
             stepIndex,
             message: 'A rendered Office artifact has not completed full-page visual QA; rejecting the final response.',
             details: { pendingVisualQa },
+          });
+          continue;
+        }
+        const pendingDocumentWork = await pendingOfficeDocumentWork(input.runId, turnDocumentIds, {
+          requireVisualQa: requiresOfficeVisualQa,
+        });
+        if (pendingDocumentWork.length) {
+          await input.onDebug?.({
+            phase: 'chat:file-document-completion-required',
+            stepIndex,
+            message: 'An Office document has pending committed workflow work; rejecting the final response.',
+            details: { pendingDocumentWork },
           });
           continue;
         }
@@ -3638,7 +3710,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
       continue;
     }
     if (actionResult.responseFinished) {
-      const pendingVisualQa = modelSupportsScreenshotInput() && input.readFileVisuals
+      const pendingVisualQa = requiresOfficeVisualQa
         ? await pendingOfficeVisualQa(input.runId, turnRenderedArtifactIds)
         : [];
       if (pendingVisualQa.length) {
@@ -3647,6 +3719,18 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
           stepIndex,
           message: 'A rendered Office artifact has not completed full-page visual QA; rejecting the final response.',
           details: { pendingVisualQa },
+        });
+        continue;
+      }
+      const pendingDocumentWork = await pendingOfficeDocumentWork(input.runId, turnDocumentIds, {
+        requireVisualQa: requiresOfficeVisualQa,
+      });
+      if (pendingDocumentWork.length) {
+        await input.onDebug?.({
+          phase: 'chat:file-document-completion-required',
+          stepIndex,
+          message: 'An Office document has pending committed workflow work; rejecting the final response.',
+          details: { pendingDocumentWork },
         });
         continue;
       }
@@ -3696,6 +3780,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
     modelMessages: activeModelMessages,
     turnMessages: turnModelMessages,
     contextCompression,
+    continuationSummary: activeContinuationSummary || undefined,
   };
 }
 
@@ -3883,6 +3968,9 @@ export async function executeRecordedBrowserOperation(
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'file':
+      if (input.action === 'list') {
+        return listOfficeDrafts({ runId });
+      }
       if (input.action === 'read' && typeof input.documentId === 'string') {
         return readUnoDraft({ runId, documentId: input.documentId });
       }
@@ -3895,6 +3983,14 @@ export async function executeRecordedBrowserOperation(
           sourcePageUrl: session.currentUrl(),
           fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
           fileType: typeof input.fileType === 'string' ? input.fileType : undefined,
+        });
+      }
+      if (input.action === 'convert') {
+        return convertFileArtifact({
+          runId,
+          sourceArtifactId: typeof input.sourceArtifactId === 'string' ? input.sourceArtifactId : undefined,
+          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
+          includeVisualVerification: true,
         });
       }
       if (input.action === 'plan') {
@@ -4158,9 +4254,12 @@ async function executeCodexRuntimeObject(input: {
       return recordOfficeVisualQaProgress({ runId, artifactId, action, result: visualResult });
     }
     if (type === 'skill' && normalizedParams.action === 'read') {
-      if (!readSkill) return { ok: false, actual: 'skill action=read is unavailable in this runtime.' };
       const skillId = typeof normalizedParams.skillId === 'string' ? normalizedParams.skillId.trim() : '';
       if (!skillId) return { ok: false, actual: 'skill action=read requires one Skill id.' };
+      if (skillId === browserCodeRuntimeSkillId) {
+        return { ok: true, actual: browserCodeRuntimeSkillContent };
+      }
+      if (!readSkill) return { ok: false, actual: 'skill action=read is unavailable in this runtime.' };
       return readSkill(skillId);
     }
     return executeRecordedBrowserOperation(session, flow, {
@@ -4184,11 +4283,16 @@ async function executeCodexRuntimeObject(input: {
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {
+      if (browserCodeToolRequiresRuntimeSkill(type, browserCodeRuntimeSkillWasRead(traces))) {
+        return {
+          ok: false,
+          actual: `Tool ${type} was not executed. Read the hidden built-in Skill ${browserCodeRuntimeSkillId} with skill action=read in a separate model step, then call readBrowserState before retrying browserCode.`,
+        } satisfies BrowserActionResult;
+      }
       if (browserToolBlockedBeforeBrowserState(
         type,
         !Boolean(browserStatePreflightComplete),
-        browserSessionToolNames,
-        normalizedParams,
+        runtimeBrowserSessionToolNames,
       )) {
         return {
           ok: false,
@@ -4208,7 +4312,7 @@ async function executeCodexRuntimeObject(input: {
           actual: 'Skipped before execution because the user cancelled this server-approved tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
         } satisfies BrowserActionResult;
       }
-      if (toolRequiresBrowserSession(type, normalizedParams)) await ensureBrowserStarted?.();
+      if (runtimeToolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
       const result = await runTool(trace?.id);
       if (approval === 'approved') {
         return {

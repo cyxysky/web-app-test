@@ -4773,6 +4773,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  deletingQueuedMessage,
   generatingAutomationMessageId,
   skillsById,
   generatingSkillMessageId,
@@ -4784,6 +4785,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   manualVerificationRequired,
   onGenerateAutomationCase,
   onGenerateSkill,
+  onDeleteQueuedMessage,
   onLoadMessageRecords,
   onPreviewImage,
   onResolveToolConfirmation,
@@ -4795,6 +4797,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   resolvingConfirmationId,
   resumingHumanVerification,
 }: {
+  deletingQueuedMessage?: boolean;
   generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
   item: BrowserChatMessage;
@@ -4805,6 +4808,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   manualVerificationRequired?: boolean;
   onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
+  onDeleteQueuedMessage?: (messageId: string) => void | Promise<void>;
   onLoadMessageRecords: BrowserChatMessageRecordLoader;
   onPreviewImage: (attachment: BrowserChatAttachment) => void;
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
@@ -4866,7 +4870,23 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
               onPreviewImage={onPreviewImage}
               skills={messageSkills}
             />
-            {waitingInQueue ? <span className="browser-chat-message-queue-status">{t('排队中')}</span> : null}
+            {waitingInQueue ? (
+              <div className="browser-chat-message-queue-actions">
+                <span className="browser-chat-message-queue-status">{t('排队中')}</span>
+                {onDeleteQueuedMessage ? (
+                  <button
+                    aria-label={t('删除排队消息')}
+                    className="browser-chat-message-queue-delete"
+                    disabled={deletingQueuedMessage}
+                    onClick={() => void onDeleteQueuedMessage(item.id)}
+                    title={t('删除排队消息')}
+                    type="button"
+                  >
+                    {deletingQueuedMessage ? <Loader2 className="spin" size={13} /> : <Trash2 size={13} />}
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
             {/* <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
               最后更新 {formatLogTime(messageUpdateTime(item))}
             </time> */}
@@ -4998,6 +5018,8 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
 
 const BrowserChatMessageList = memo(function BrowserChatMessageList({
   availableSkills,
+  deletableQueuedMessageIds,
+  deletingQueuedMessageIds,
   generatingAutomationMessageId,
   generatingSkillMessageId,
   historyHasMore,
@@ -5008,6 +5030,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   outputCycles,
   onGenerateAutomationCase,
   onGenerateSkill,
+  onDeleteQueuedMessage,
   onLoadMessageRecords,
   onLoadEarlier,
   onInitialPositioned,
@@ -5028,6 +5051,8 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   stepsByIndex,
 }: {
   availableSkills: SkillRecord[];
+  deletableQueuedMessageIds: Set<string>;
+  deletingQueuedMessageIds: Set<string>;
   generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
   historyHasMore?: boolean;
@@ -5038,6 +5063,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   outputCycles: BrowserChatAiOutputCycle[];
   onGenerateAutomationCase: (messageId: string) => void | Promise<void>;
   onGenerateSkill: (messageId: string) => void | Promise<void>;
+  onDeleteQueuedMessage: (messageId: string) => void | Promise<void>;
   onLoadMessageRecords: BrowserChatMessageRecordLoader;
   onLoadEarlier?: () => void | Promise<void>;
   onInitialPositioned?: (sessionId?: string) => void;
@@ -5452,6 +5478,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemSubagents = subagents.filter((subagent) => subagent.messageId === item.id);
         return (
           <BrowserChatMessageItem
+            deletingQueuedMessage={deletingQueuedMessageIds.has(item.id)}
             generatingAutomationMessageId={generatingAutomationMessageId}
             generatingSkillMessageId={generatingSkillMessageId}
             item={item}
@@ -5463,6 +5490,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             manualVerificationRequired={Boolean(sessionAwaitingHuman && item.id === lastAssistantMessageId)}
             onGenerateAutomationCase={onGenerateAutomationCase}
             onGenerateSkill={onGenerateSkill}
+            onDeleteQueuedMessage={deletableQueuedMessageIds.has(item.id) ? onDeleteQueuedMessage : undefined}
             onLoadMessageRecords={onLoadMessageRecords}
             onPreviewImage={onPreviewImage}
             onResolveToolConfirmation={onResolveToolConfirmation}
@@ -9200,6 +9228,7 @@ export function BrowserChatWorkspace({
   const [embeddedChatCollapsed, setEmbeddedChatCollapsed] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [deletingSessionIds, setDeletingSessionIds] = useState<Set<string>>(() => new Set());
+  const [deletingQueuedMessageIds, setDeletingQueuedMessageIds] = useState<Set<string>>(() => new Set());
   const deletingSessionIdsRef = useRef(new Set<string>());
   const [deletingSelectedSessions, setDeletingSelectedSessions] = useState(false);
   const [recentSelectionMode, setRecentSelectionMode] = useState(false);
@@ -9247,6 +9276,10 @@ export function BrowserChatWorkspace({
   const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
   const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
+  const deletableQueuedMessageIds = useMemo(
+    () => new Set((session?.queuedTurns || []).map((turn) => turn.userMessageId)),
+    [session?.queuedTurns],
+  );
   const steps = useMemo(() => session?.steps || [], [session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
   const generationSkillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
@@ -10033,6 +10066,29 @@ export function BrowserChatWorkspace({
     });
     const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
     return data.session as BrowserChatSession;
+  }
+
+  async function deleteQueuedMessage(messageId: string) {
+    const sessionId = session?.id;
+    if (!sessionId || deletingQueuedMessageIds.has(messageId)) return;
+    setDeletingQueuedMessageIds((current) => new Set(current).add(messageId));
+    setError('');
+    try {
+      const response = await fetch(browserChatApiUrl(
+        `/api/browser-chat/${encodeURIComponent(sessionId)}/queued-messages/${encodeURIComponent(messageId)}`,
+      ), { method: 'DELETE' });
+      const data = await readApiJson<{ session: BrowserChatSession }>(response, '删除排队消息失败');
+      upsertSession(data.session, { activate: activeSessionIdRef.current === sessionId });
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : '删除排队消息失败');
+      await refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
+    } finally {
+      setDeletingQueuedMessageIds((current) => {
+        const next = new Set(current);
+        next.delete(messageId);
+        return next;
+      });
+    }
   }
 
   async function uploadChatFiles(files: FileList | File[]) {
@@ -11018,6 +11074,8 @@ export function BrowserChatWorkspace({
         <BrowserChatMessageList
           key={`messages:${sessionUiKey}:${messageViewportGeneration}`}
           availableSkills={skills}
+          deletableQueuedMessageIds={deletableQueuedMessageIds}
+          deletingQueuedMessageIds={deletingQueuedMessageIds}
           generatingAutomationMessageId={generatingAutomationMessageId}
           generatingSkillMessageId={generatingSkillMessageId}
           historyHasMore={browserChatHasEarlierMessages(session?.history)}
@@ -11028,6 +11086,7 @@ export function BrowserChatWorkspace({
           outputCycles={session?.outputCycles || []}
           onGenerateAutomationCase={generateMessageAutomationCase}
           onGenerateSkill={generateMessageSkill}
+          onDeleteQueuedMessage={deleteQueuedMessage}
           onLoadMessageRecords={loadMessageRecords}
           onLoadEarlier={loadEarlierHistory}
           onInitialPositioned={markMessageViewportReady}
@@ -11122,7 +11181,7 @@ export function BrowserChatWorkspace({
 
   return (
     <BrowserChatReasoningVisibilityContext.Provider value={showReasoning}>
-    <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed' : 'browser-chat-layout'}>
+    <section className={sidebarCollapsed ? 'browser-chat-layout browser-chat-conversation-layout sidebar-collapsed' : 'browser-chat-layout browser-chat-conversation-layout'}>
       <WorkspaceSidebar
         collapsed={sidebarCollapsed}
         collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}

@@ -112,7 +112,7 @@ export async function generateFileBuffer(input: (GeneratedFileInput | Pick<Offic
   }
   if (!input.program?.trim() && !input.programPath) throw new Error('Office document generation requires a saved source draft from file action=generate or action=edit.');
   validateOfficeTarget(input, extension);
-  const generator = input.generator || 'uno';
+  const generator = input.generator || 'javascript';
   const generated = generator === 'javascript' ? await generateOfficeJsProgramDocument({
     ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
     fileName: path.basename(input.fileName),
@@ -148,7 +148,7 @@ export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'docum
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension || generatedTextExtensions.has(extension)) throw new Error('Path-based generation requires an Office or PDF target.');
   validateOfficeTarget(input, extension);
-  const generator = input.generator || 'uno';
+  const generator = input.generator || 'javascript';
   const generated = generator === 'javascript'
     ? await generateOfficeJsProgramDocument({
         sourcePath: input.programPath,

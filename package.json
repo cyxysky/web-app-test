@@ -10,6 +10,7 @@
     "dev": "node server/webpilot-server.js --dev",
     "build": "next build",
     "server:package": "npm run build && node scripts/package-server.js",
+    "server:installer": "npm run server:package && node scripts/package-server-installer.js",
     "desktop:prepare": "npm run build && node scripts/prepare-electron-server.js",
     "desktop:pack": "npm run desktop:installer",
     "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",

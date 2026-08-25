@@ -19,6 +19,7 @@ export type BrowserChatModelContext = {
   transcript: ModelMessage[];
   activeMessages: ModelMessage[];
   lastCompression?: BrowserChatModelContextCompression;
+  continuationSummary?: string;
 };
 
 const persistentBinaryOmissionText = '[Binary visual input omitted from persistent model context; use the conversation file registry to read it again.]';
@@ -113,10 +114,14 @@ export function normalizeBrowserChatModelContext(value: unknown): BrowserChatMod
     normalizeBrowserChatModelMessages(record.activeMessages),
   );
   const compression = record.lastCompression;
+  const continuationSummary = typeof record.continuationSummary === 'string'
+    ? record.continuationSummary.trim().slice(0, 24_000)
+    : '';
   return {
     version: 1,
     transcript,
     activeMessages: activeMessages.length ? activeMessages : transcript,
     ...(compression && typeof compression === 'object' ? { lastCompression: compression } : {}),
+    ...(continuationSummary ? { continuationSummary } : {}),
   };
 }

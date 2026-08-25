@@ -7,7 +7,9 @@ const test = require('node:test');
 const {
   assertProductionRuntimeSource,
   copyProductionRuntime,
+  copyServerRuntime,
   productionPackagePaths,
+  serverRuntimeFilePaths,
 } = require('./server-package-layout');
 
 function temporaryDirectory() {
@@ -106,6 +108,31 @@ test('production runtime rejects a missing non-optional package from the lock fi
     fs.writeFileSync(lockPath, JSON.stringify(lock));
 
     assert.throws(() => productionPackagePaths(root), /missing-runtime-package/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('custom server packaging includes every runtime file and excludes tests', () => {
+  const root = temporaryDirectory();
+  try {
+    const source = path.join(root, 'server');
+    const target = path.join(root, 'package', 'server');
+    fs.mkdirSync(path.join(source, 'support'), { recursive: true });
+    fs.writeFileSync(path.join(source, 'webpilot-server.js'), "require('./process-memory-monitor');\n");
+    fs.writeFileSync(path.join(source, 'process-memory-monitor.js'), 'module.exports = {};\n');
+    fs.writeFileSync(path.join(source, 'webpilot-server.test.js'), 'throw new Error();\n');
+    fs.writeFileSync(path.join(source, 'support', 'runtime.json'), '{}');
+
+    assert.deepEqual(serverRuntimeFilePaths(root), [
+      'process-memory-monitor.js',
+      path.join('support', 'runtime.json'),
+      'webpilot-server.js',
+    ]);
+    assert.deepEqual(copyServerRuntime(root, target), serverRuntimeFilePaths(root));
+    assert.equal(fs.existsSync(path.join(target, 'process-memory-monitor.js')), true);
+    assert.equal(fs.existsSync(path.join(target, 'support', 'runtime.json')), true);
+    assert.equal(fs.existsSync(path.join(target, 'webpilot-server.test.js')), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

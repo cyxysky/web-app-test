@@ -3,6 +3,42 @@ import test from 'node:test';
 import type { Page } from 'playwright';
 import { BrowserSession } from './browser-session';
 
+test('blocked browserCode actions identify the covering and active surface ids', async (context) => {
+  const session = new BrowserSession({
+    headless: true,
+    isolated: true,
+    runId: 'surface-id-actionability-test',
+  });
+  context.after(async () => session.close());
+  await session.start();
+  const page = Reflect.get(session, 'activePage') as Page;
+  await page.setContent('<button id="background-action" type="button">Background action</button>');
+  await session.readDomObservationSnapshot({ mode: 'full' });
+  await page.evaluate(() => {
+    const blocker = document.createElement('div');
+    blocker.id = 'loading-backdrop';
+    blocker.setAttribute('aria-label', 'Saving changes');
+    blocker.setAttribute('aria-modal', 'true');
+    blocker.setAttribute('role', 'dialog');
+    blocker.style.cssText = 'background:rgba(0,0,0,.35);inset:0;position:fixed;z-index:2000';
+    blocker.innerHTML = '<div role="status">Saving</div>';
+    document.body.append(blocker);
+  });
+  const observed = await session.readDomObservationSnapshot({ mode: 'full' });
+  const surfaceId = observed.observation.activeSurface?.id;
+  assert.ok(surfaceId, JSON.stringify(observed.observation));
+
+  const blocked = await session.executeBrowserCode({
+    code: `await page.locator('#background-action').click();`,
+    runId: 'surface-id-actionability-test',
+    stepIndex: 1,
+  });
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.actual, /ACTIONABILITY_FAILED/);
+  assert.equal(blocked.actual.includes(`coveredBySurfaceId=${surfaceId}`), true, blocked.actual);
+  assert.equal(blocked.actual.includes(`activeSurfaceId=${surfaceId}`), true, blocked.actual);
+});
+
 test('initial high-z interface chrome stays metadata instead of becoming the active surface', async (context) => {
   const session = new BrowserSession({
     headless: true,

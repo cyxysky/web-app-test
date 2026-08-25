@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -11,6 +12,8 @@ import {
   formatFileArtifactResult,
   generateUnoFileArtifact,
   getOfficeJsApi,
+  listOfficeDrafts,
+  pendingOfficeDocumentWork,
   planFileArtifact,
   readUnoDraft,
   renderFileArtifact,
@@ -99,6 +102,36 @@ test('deduplicates concurrent downloads and reuses the per-run URL cache', async
     assert.equal(cached.ok, true, cached.actual);
     assert.equal(JSON.parse(cached.actual || '{}').cacheHit, true);
     assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousRoot;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('serializes different downloads from the same domain', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-domain-queue-'));
+  const previousRoot = process.env.ARTIFACTS_DIR;
+  const previousFetch = globalThis.fetch;
+  process.env.ARTIFACTS_DIR = root;
+  let active = 0;
+  let maximumActive = 0;
+  globalThis.fetch = async (input) => {
+    active += 1;
+    maximumActive = Math.max(maximumActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    active -= 1;
+    return new Response(`download:${String(input)}`, { status: 200, headers: { 'content-type': 'text/plain' } });
+  };
+  try {
+    const [first, second] = await Promise.all([
+      downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/a.txt', fileType: 'txt' }),
+      downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/b.txt', fileType: 'txt' }),
+    ]);
+    assert.equal(first.ok, true, first.actual);
+    assert.equal(second.ok, true, second.actual);
+    assert.equal(maximumActive, 1);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
@@ -243,7 +276,9 @@ test('returns concrete JavaScript cookbook recipes for assets, tables, page brea
 test('does not infer existing-file modification from natural-language intent', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-plan-create-'));
   const previous = process.env.ARTIFACTS_DIR;
+  const previousMode = process.env.OFFICE_GENERATION_MODE;
   process.env.ARTIFACTS_DIR = root;
+  delete process.env.OFFICE_GENERATION_MODE;
   try {
     const planned = await planFileArtifact({
       documentId: 'new-repair-guide',
@@ -253,10 +288,14 @@ test('does not infer existing-file modification from natural-language intent', a
       runId: 'chat_test',
     });
     assert.equal(planned.ok, true, planned.actual);
-    assert.equal(JSON.parse(planned.actual || '{}').operation, 'create');
+    const payload = JSON.parse(planned.actual || '{}') as { generator?: string; operation?: string };
+    assert.equal(payload.operation, 'create');
+    assert.equal(payload.generator, 'javascript');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
+    if (previousMode === undefined) delete process.env.OFFICE_GENERATION_MODE;
+    else process.env.OFFICE_GENERATION_MODE = previousMode;
     await rm(root, { force: true, recursive: true });
   }
 });
@@ -468,16 +507,19 @@ test('reads and edits one marked page unit without changing other source units',
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
   const unitProgram = `def create_document(job):
+    document = job.new_document('word')
+    cursor = document.Text.createTextCursor()
     # @webpilot-unit pages/page-001
-    first = 'page one'
+    document.Text.insertString(cursor, 'page one', False)
     # @webpilot-endunit
     # @webpilot-unit pages/page-002
-    second = 'page two'
+    document.Text.insertString(cursor, 'page two', False)
     # @webpilot-endunit
-    return (first, second)
+    document.storeAsURL(job.output_url, (job.property('FilterName', 'Office Open XML Text'),))
+    job.close(document)
 `;
   try {
-    await planFileArtifact({ documentId: 'unit-workflow', documentType: 'presentation', fileName: 'units.pptx', runId: 'chat_test' });
+    await planFileArtifact({ documentId: 'unit-workflow', documentType: 'word', fileName: 'units.docx', runId: 'chat_test' });
     const generated = await generateUnoFileArtifact({ documentId: 'unit-workflow', program: unitProgram, render: false, runId: 'chat_test' });
     assert.equal(generated.ok, true, generated.actual);
     const unitRead = await readUnoDraft({ documentId: 'unit-workflow', path: 'pages/page-002', runId: 'chat_test' });
@@ -491,7 +533,7 @@ test('reads and edits one marked page unit without changing other source units',
     const edited = await editUnoFileArtifact({
       documentId: 'unit-workflow',
       path: 'pages/page-002',
-      edits: [{ startLine: 1, endLine: 1, newText: "    second = 'updated page two'" }],
+      edits: [{ startLine: 1, endLine: 1, newText: "    document.Text.insertString(cursor, 'updated page two', False)" }],
       render: false,
       runId: 'chat_test',
     });
@@ -501,7 +543,7 @@ test('reads and edits one marked page unit without changing other source units',
     assert.match(complete.actual || '', /updated page two/);
     const state = JSON.parse(complete.actual || '{}') as { sourceUnits?: Array<{ path: string; status: string }> };
     assert.deepEqual(state.sourceUnits?.map((unit) => unit.path), ['pages/page-001', 'pages/page-002']);
-    assert.equal(state.sourceUnits?.find((unit) => unit.path === 'pages/page-002')?.status, 'pending');
+    assert.equal(state.sourceUnits?.find((unit) => unit.path === 'pages/page-002')?.status, 'passed');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -523,7 +565,7 @@ test('recovers an interrupted validation checkpoint after a backend restart', as
     const recovered = await readUnoDraft({ documentId: 'recover-workflow', runId: 'chat_test' });
     assert.equal(recovered.ok, true, recovered.actual);
     const payload = JSON.parse(recovered.actual || '{}') as { workflow?: { state?: string; recoveredFrom?: string } };
-    assert.equal(payload.workflow?.state, 'authoring');
+    assert.equal(payload.workflow?.state, 'render-ready');
     assert.equal(payload.workflow?.recoveredFrom, 'validating');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
@@ -564,7 +606,7 @@ test('applies current line edits after the initial draft without a version hands
       runId: 'chat_test',
     });
     assert.equal(stale.ok, true, stale.actual);
-    assert.equal(JSON.parse(stale.actual || '{}').changed, true);
+    assert.equal(JSON.parse(stale.actual || '{}').documentChanged, true);
 
     const edited = await editUnoFileArtifact({
       documentId: 'editor-workflow',
@@ -593,7 +635,7 @@ test('applies current line edits after the initial draft without a version hands
       runId: 'chat_test',
     });
     assert.equal(replaced.ok, false, replaced.actual);
-    assert.match(replaced.actual || '', /does not accept a complete program replacement/);
+    assert.match(replaced.actual || '', /does not accept a complete source replacement/);
     assert.match(await readFile(path.join(root, 'chat_test', 'document-drafts', 'editor-workflow.py'), 'utf8'), /targeted edit/);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
@@ -659,7 +701,56 @@ test('rejects a draft that does not implement the UNO entrypoint', async () => {
       runId: 'chat_test',
     });
     assert.equal(result.ok, false);
-    assert.match(result.actual || '', /must define def create_document/);
+    assert.match(result.actual || '', /must define create_document\(job\)/);
+    const catalog = await listOfficeDrafts({ runId: 'chat_test' });
+    assert.equal(catalog.ok, true, catalog.actual);
+    const catalogEntry = (JSON.parse(catalog.actual || '{}') as { drafts?: Array<{ documentId?: string; sourceDigest?: string | null; state?: string }> })
+      .drafts?.find((draft) => draft.documentId === 'rejected-program');
+    assert.equal(catalogEntry?.sourceDigest, null);
+    assert.equal(catalogEntry?.state, 'planned');
+    const pending = await pendingOfficeDocumentWork('chat_test', new Set(['rejected-program']));
+    assert.equal(pending[0]?.requiredNextAction, 'generate');
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('does not require visual QA when the active model cannot inspect images', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-structural-only-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({
+      documentId: 'structural-only-model', documentType: 'word', fileName: 'report.docx', runId: 'chat_test',
+    });
+    const draftsDir = path.join(root, 'chat_test', 'document-drafts');
+    const metadataPath = path.join(draftsDir, 'structural-only-model.json');
+    const draft = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
+    const digest = createHash('sha256').update(wordProgram).digest('hex');
+    await writeFile(path.join(draftsDir, 'structural-only-model.py'), wordProgram, 'utf8');
+    await writeFile(metadataPath, JSON.stringify({
+      ...draft,
+      program: wordProgram,
+      renderedDigest: digest,
+      renderedSourceDigest: digest,
+      sourceDigest: digest,
+      workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString() },
+    }), 'utf8');
+
+    const visualModelPending = await pendingOfficeDocumentWork(
+      'chat_test',
+      new Set(['structural-only-model']),
+    );
+    assert.equal(visualModelPending[0]?.requiredNextAction, 'fileVisual');
+
+    const textModelPending = await pendingOfficeDocumentWork(
+      'chat_test',
+      new Set(['structural-only-model']),
+      { requireVisualQa: false },
+    );
+    assert.deepEqual(textModelPending, []);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;

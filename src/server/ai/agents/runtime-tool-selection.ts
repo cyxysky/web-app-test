@@ -3,6 +3,16 @@ export const runtimeToolLoopStopToolNames = [
   'subagent',
 ] as const;
 
+export const runtimeBrowserSessionToolNames: ReadonlySet<string> = new Set([
+  'readBrowserState',
+  'browserCode',
+  'waitForHumanVerification',
+]);
+
+export function runtimeToolRequiresBrowserSession(toolName: string) {
+  return runtimeBrowserSessionToolNames.has(toolName);
+}
+
 export function runtimeAllowedToolTypes({
   browserChatMode,
   codexMode,
@@ -33,15 +43,8 @@ export function browserToolBlockedBeforeBrowserState(
   toolName: string,
   preflightPending: boolean,
   browserToolNames: ReadonlySet<string>,
-  input?: unknown,
 ) {
-  // `subagent.read` only returns an already-persisted child result. It neither
-  // observes nor changes the live browser, so a browser preflight would turn a
-  // harmless result read into a stale-session failure.
-  const isSubagentResultRead = toolName === 'subagent'
-    && Boolean(input && typeof input === 'object' && 'action' in input && input.action === 'read');
   return preflightPending
     && toolName !== 'readBrowserState'
-    && !isSubagentResultRead
     && browserToolNames.has(toolName);
 }

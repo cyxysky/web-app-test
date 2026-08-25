@@ -829,6 +829,58 @@ test('browserCode does not scroll the background when a viewport overlay blocks 
   }
 });
 
+test('browserCode skips the Playwright trial when a viewport overlay covers a visible target', async () => {
+  await page.setContent(`
+    <style>
+      body { margin: 0; min-height: 2200px; }
+      #covered-visible-action { margin-top: 300px; }
+      #loading-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, 0.05); }
+    </style>
+    <button id="covered-visible-action">Covered visible action</button>
+    <div id="loading-backdrop"></div>
+  `);
+  try {
+    await page.evaluate(() => window.scrollTo(0, 240));
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    const blocked = await run(`
+      await page.locator('#covered-visible-action').click();
+    `);
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error || '', /viewport-blocking layer/i);
+    assert.match(blocked.error || '', /trial skipped to preserve/i);
+    assert.doesNotMatch(blocked.error || '', /trial failed/i);
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
+test('browserCode skips scrolling an iframe target when the parent viewport is blocked', async () => {
+  await page.setContent(`
+    <style>
+      body { margin: 0; min-height: 2200px; }
+      iframe { display: block; height: 180px; margin-top: 300px; width: 500px; }
+      #loading-backdrop { position: fixed; inset: 0; z-index: 1000; background: rgba(0, 0, 0, 0.05); }
+    </style>
+    <iframe id="editor-frame" srcdoc="<!doctype html><body id='tinymce' contenteditable='true'>Draft</body>"></iframe>
+    <div id="loading-backdrop"></div>
+  `);
+  try {
+    await page.evaluate(() => window.scrollTo(0, 240));
+    const scrollBefore = await page.evaluate(() => window.scrollY);
+    const blocked = await run(`
+      await page.frameLocator('iframe#editor-frame').locator('body#tinymce').click();
+    `);
+    assert.equal(blocked.ok, false);
+    assert.match(blocked.error || '', /iframe#editor-frame/i);
+    assert.match(blocked.error || '', /trial skipped to preserve/i);
+    assert.doesNotMatch(blocked.error || '', /trial failed/i);
+    assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
+  } finally {
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
 test('browserCode emits screenshots from the same JavaScript cell', async () => {
   const result = await run(`
     var emittedScreenshot = await page.screenshot({ type: 'png' });
@@ -891,6 +943,23 @@ test('browserCode exposes browser and tab lifecycle as JavaScript APIs', async (
     hasCua: true,
     navigationUrl: 'about:blank#runtime-ready',
     openTabCount: 2,
+  });
+});
+
+test('browser.tabs.new accepts a URL string and navigates the selected tab', async () => {
+  const result = await run(`
+    var stringUrlTab = await browser.tabs.new('data:text/html,<title>String URL tab</title><main>Opened directly</main>');
+    nodeRepl.write({
+      pageTitle: await page.title(),
+      tabTitle: await stringUrlTab.title(),
+      url: stringUrlTab.url(),
+    });
+  `);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.value, {
+    pageTitle: 'String URL tab',
+    tabTitle: 'String URL tab',
+    url: 'data:text/html,<title>String URL tab</title><main>Opened directly</main>',
   });
 });
 

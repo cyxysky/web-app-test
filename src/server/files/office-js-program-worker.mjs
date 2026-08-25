@@ -30,6 +30,13 @@ function assetPath(name) {
   return access(candidate).then(() => candidate);
 }
 
+function normalizeOutputBytes(value) {
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  throw new TypeError('job.writeOutput expects Buffer, ArrayBuffer, or an ArrayBuffer view.');
+}
+
 async function main() {
   progress('execute', '正在加载 JavaScript 文档脚本');
   const source = await (await import('node:fs/promises')).readFile(programPath, 'utf8');
@@ -50,7 +57,7 @@ async function main() {
       name: item.name,
       bytes: (await stat(path.join(assetsPath, item.name))).size,
     }))),
-    writeOutput: async (bytes) => writeFile(outputPath, bytes),
+    writeOutput: async (bytes) => writeFile(outputPath, normalizeOutputBytes(bytes)),
     PptxGenJS,
     docx,
     ExcelJS,

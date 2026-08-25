@@ -400,7 +400,11 @@ export const store = {
     for (const definition of runtimeEnvDefinitions) {
       const item = savedByKey.get(definition.key);
       if (item?.enabled === false) continue;
-      process.env[definition.key] = item?.value ?? definition.defaultValue;
+      const configuredValue = item?.value ?? definition.defaultValue;
+      const deploymentValue = process.env[definition.key];
+      if (!item && deploymentValue !== undefined) continue;
+      if (!configuredValue.trim() && deploymentValue?.trim()) continue;
+      process.env[definition.key] = configuredValue;
     }
     applyModelConfig(data.modelConfig);
     return data.runtimeEnv;

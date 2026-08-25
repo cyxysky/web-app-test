@@ -505,9 +505,10 @@ async function main() {
     dir: appDir,
     hostname,
     port,
-    // Next 16.3's default Turbopack development compiler evicts inactive graph
-    // data during long sessions. Keep the compiler default instead of forcing
-    // Webpack into the same long-lived process as the API runtime.
+    // Turbopack 16.3 can lose an incremental HMR graph cell during long-lived
+    // sessions and then panic on every subscription retry. Use Next's stable
+    // Webpack development path for both the UI and isolated API runtime.
+    webpack: dev,
     ...(compiledConfig ? { conf: compiledConfig } : {}),
   });
   const handle = application.getRequestHandler();

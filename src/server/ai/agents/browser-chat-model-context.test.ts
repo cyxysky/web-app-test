@@ -131,6 +131,17 @@ test('retains the durable continuation summary independently from active message
   assert.match(context.lastCompression?.continuationSummary || '', /已读取需求/);
 });
 
+test('retains a per-step continuation checkpoint without requiring context compression', () => {
+  const context = normalizeBrowserChatModelContext({
+    version: 1,
+    transcript: [],
+    activeMessages: [{ role: 'user', content: 'continue the Office document' }],
+    continuationSummary: '{"completed":["planned documentId=report-1"],"nextStep":"generate"}',
+  });
+  assert.match(context.continuationSummary || '', /documentId=report-1/);
+  assert.match(context.continuationSummary || '', /generate/);
+});
+
 test('does not separate a large tool result from its tool call', () => {
   const messages: ModelMessage[] = [
     { role: 'user', content: '读取大页面' },

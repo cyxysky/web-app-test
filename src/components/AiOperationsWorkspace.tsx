@@ -6,8 +6,6 @@ import {
   Bot,
   CircleAlert,
   Clock3,
-  Cpu,
-  Database,
   Gauge,
   LockKeyhole,
   RefreshCw,
@@ -357,10 +355,8 @@ export function AiOperationsWorkspace({
           </div>
 
           <section className="ai-operations-panel ai-operations-runtime-panel">
-            <header className="ai-operations-panel-header"><div><h2>{t('系统与运营总览')}</h2><p>{t('当前运行队列、工作线程与统计范围内的核心运营指标')}</p></div></header>
+            <header className="ai-operations-panel-header"><div><h2>{t('系统与运营总览')}</h2><p>{t('统计范围内的核心运营指标')}</p></div></header>
             <div className="ai-operations-metric-grid" aria-label={t('系统与运营总览')}>
-              <MetricCard detail={data.runtime.sqliteWrites.workerActive ? t('工作线程运行中') : t('当前空闲')} icon={Database} label={t('SQLite 写入队列')} value={data.runtime.sqliteWrites.pending} />
-              <MetricCard detail={`${data.runtime.cpuWorkers.queued} ${t('个等待任务')}`} icon={Cpu} label={t('CPU 工作线程')} value={`${data.runtime.cpuWorkers.active}/${data.runtime.cpuWorkers.workers}`} />
               <MetricCard detail={`${overview.automationRuns} ${t('次范围内运行')}`} icon={Workflow} label={t('启用的执行计划')} value={overview.enabledSchedules} />
               <MetricCard detail={data.timezone} icon={Clock3} label={t('数据生成时间')} value={dateTime(data.generatedAt)} />
               <MetricCard detail={`${overview.chatTasks} 对话 · ${overview.automationRuns} 自动化`} icon={Activity} label={t('任务总量')} value={compactNumber(overview.totalTasks)} />
@@ -453,7 +449,7 @@ export function AiOperationsWorkspace({
           </div>
 
           <div className="ai-operations-table-grid">
-            <section className="ai-operations-panel">
+            <section className="ai-operations-table-section">
               <header className="ai-operations-panel-header"><div><h2>{t('用户使用情况')}</h2><p>{t('按用户统计任务量和执行结果')}</p></div></header>
               {data.users.length ? (
                 <DataTable<AiOperationsDashboardData['users'][number]>
@@ -481,7 +477,7 @@ export function AiOperationsWorkspace({
               ) : <EmptyState>{t('暂无用户使用数据')}</EmptyState>}
             </section>
 
-            <section className="ai-operations-panel">
+            <section className="ai-operations-table-section">
               <header className="ai-operations-panel-header"><div><h2>{t('模型使用情况')}</h2><p>{t('历史任务与当前服务进程 Token 指标')}</p></div></header>
               {data.models.length ? (
                 <DataTable<AiOperationsDashboardData['models'][number]>

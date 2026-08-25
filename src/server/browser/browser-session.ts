@@ -138,6 +138,15 @@ export type BrowserSessionOptions = {
   actionFrameLimit?: number;
 };
 
+export type BrowserChildSessionOptions = Pick<BrowserSessionOptions,
+  'actionFrameLimit' | 'isMarked' | 'popupWaitMs' | 'runId' | 'slowMoMs'
+> & {
+  /** Keeps the parent's visible page focused after the child page is created. */
+  background?: boolean;
+  /** Copies per-tab sessionStorage into the child's new page on matching origins. */
+  inheritSessionStorage?: boolean;
+};
+
 export type BrowserSessionCookie = {
   name: string;
   url: string;
@@ -201,6 +210,8 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Concrete recovery action returned for every failed runtime tool operation. */
+  requiredNextAction?: string;
   /** Browser-owned control mirrored into the remote live-preview surface. */
   liveControl?: BrowserLiveNativeControl;
   /** Native select menu mirrored into the remote live-preview surface. */
@@ -667,7 +678,10 @@ type AiDomRuntime = {
     reason: string;
     descriptor: string;
     coveredBy?: string;
+    coveredBySurfaceId?: string;
+    activeSurfaceId?: string;
     failureKind?: 'occluded';
+    preserveScroll?: boolean;
   };
   isOverlay: (element: Element) => boolean;
   isTraversable: (element: Element) => boolean;
@@ -1702,6 +1716,8 @@ export class BrowserSession {
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
   private releaseSharedBrowser?: (force?: boolean) => Promise<void>;
+  private parentBrowserSession?: BrowserSession;
+  private childBrowserSessions = new Set<BrowserSession>();
   private managedProfileDir?: string;
   private livePreviewStateListeners = new Set<BrowserLivePreviewStateListener>();
   private livePreviewNativeListeners = new Set<(event: BrowserLiveNativeEvent) => void>();
@@ -1711,6 +1727,7 @@ export class BrowserSession {
   private livePreviewTabsNotifyScheduled = false;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
+  private pageGroupMarkPromises = new WeakMap<Page, Promise<void>>();
   private navigationSequenceByPage = new WeakMap<Page, number>();
   private browserRuntimeRevisionByFrame = new WeakMap<Frame, number>();
   private browserRuntimeInstalledRevisionByFrame = new WeakMap<Frame, string>();
@@ -1775,6 +1792,74 @@ export class BrowserSession {
 
   async exportStorageState() {
     return this.context?.storageState({ indexedDB: true });
+  }
+
+  private async sessionStorageByOrigin() {
+    const snapshots = await Promise.all(this.sessionPages().map(async (page) => {
+      if (page.isClosed()) return undefined;
+      return page.evaluate(() => {
+        if (!/^https?:$/.test(location.protocol)) return undefined;
+        return {
+          origin: location.origin,
+          values: Object.fromEntries(Array.from({ length: sessionStorage.length }, (_, index) => {
+            const key = sessionStorage.key(index);
+            return key === null ? undefined : [key, sessionStorage.getItem(key) || ''];
+          }).filter((item): item is [string, string] => Boolean(item))),
+        };
+      }).catch(() => undefined);
+    }));
+    return Object.fromEntries(snapshots
+      .filter((item): item is { origin: string; values: Record<string, string> } => Boolean(item?.origin))
+      .map((item) => [item.origin, item.values]));
+  }
+
+  async forkChildSession(options: BrowserChildSessionOptions): Promise<BrowserSession> {
+    if (!this.context || !this.isUsable()) throw new Error('Parent browser session has not started');
+    const context = this.context;
+    const restorePage = options.background === false ? undefined : this.page;
+    const inheritedSessionStorage = options.inheritSessionStorage === false
+      ? {}
+      : await this.sessionStorageByOrigin();
+    const child = new BrowserSession({
+      actionFrameLimit: options.actionFrameLimit,
+      browserSurface: this.browserSurface,
+      isMarked: options.isMarked,
+      popupWaitMs: options.popupWaitMs,
+      preferExistingPage: false,
+      runId: options.runId,
+      slowMoMs: options.slowMoMs,
+    });
+    child.browserSurface = this.browserSurface;
+    child.transportKind = this.transportKind;
+    child.browserOwnership = 'shared';
+    child.browser = this.browser;
+    child.browserCodeConnection = this.browserCodeConnection;
+    child.context = context;
+    child.parentBrowserSession = this;
+    child.nativeTabGrouperEnabled = this.nativeTabGrouperEnabled;
+    child.usesSessionGroupPageSelection = true;
+    this.childBrowserSessions.add(child);
+    try {
+      await child.prepareContext(context, { claimPages: false });
+      child.installOwnedPageDiscovery(context);
+      const page = await context.newPage();
+      await this.pageGroupMarkPromises.get(page)?.catch(() => undefined);
+      this.releaseOwnedPage(page);
+      child.claimPage(page);
+      if (Object.keys(inheritedSessionStorage).length) {
+        await page.addInitScript((storageByOrigin) => {
+          const values = storageByOrigin[location.origin];
+          if (!values) return;
+          for (const [key, value] of Object.entries(values)) sessionStorage.setItem(key, value);
+        }, inheritedSessionStorage);
+      }
+      await child.ensurePageGroup(page);
+      if (restorePage && !restorePage.isClosed()) await restorePage.bringToFront().catch(() => undefined);
+      return child;
+    } catch (error) {
+      await child.close({ force: true }).catch(() => undefined);
+      throw error;
+    }
   }
 
   async injectCookies(cookies: BrowserSessionCookie[]) {
@@ -2310,7 +2395,11 @@ export class BrowserSession {
     }
     this.attachPageListeners(page);
     if (!alreadyOwned) {
-      void this.markPageGroup(page);
+      const markPromise = this.markPageGroup(page).finally(() => {
+        if (this.pageGroupMarkPromises.get(page) === markPromise) this.pageGroupMarkPromises.delete(page);
+      });
+      this.pageGroupMarkPromises.set(page, markPromise);
+      void markPromise;
       this.notifyLivePreviewTabsChanged();
       page.once('close', () => {
         this.ownedPages.delete(page);
@@ -2324,6 +2413,14 @@ export class BrowserSession {
     }
     if (options.makeActive !== false) this.page = page;
     return true;
+  }
+
+  private releaseOwnedPage(page: Page) {
+    if (!this.ownedPages.delete(page)) return;
+    livePreviewVisibilityOwners.delete(page);
+    if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
+    if (this.page === page) this.page = this.sessionPages()[0];
+    this.notifyLivePreviewTabsChanged();
   }
 
   private handleLivePreviewVisibility(page: Page, visible: boolean) {
@@ -4978,12 +5075,17 @@ export class BrowserSession {
     this.browserCodeKernel = undefined;
     this.browserCodeKernelRevision = undefined;
     try {
+      if (this.childBrowserSessions.size) {
+        const children = [...this.childBrowserSessions];
+        this.childBrowserSessions.clear();
+        await Promise.all(children.map((child) => child.close({ closePages: true, force: options.force }).catch(() => undefined)));
+      }
       if (this.context && this.pageDiscoveryListener) {
         this.context.off('page', this.pageDiscoveryListener);
         this.pageDiscoveryListener = undefined;
       }
       if (this.browserOwnership === 'shared') {
-        if (this.browserSurface !== 'electron-embedded' && !shouldKeepOpen && !options.preservePages) {
+        if ((this.parentBrowserSession || this.browserSurface !== 'electron-embedded') && !shouldKeepOpen && !options.preservePages) {
           await this.closeOwnedPages();
         }
         await this.releaseSharedBrowser?.(options.force);
@@ -5025,6 +5127,8 @@ export class BrowserSession {
       await this.browser?.close().catch(() => undefined);
       await this.browserServer?.close().catch(() => undefined);
     } finally {
+      this.parentBrowserSession?.childBrowserSessions.delete(this);
+      this.parentBrowserSession = undefined;
       if (!shouldKeepOpen || disposeLocalState) {
         unregisterBrowserSession(this);
         this.page = undefined;

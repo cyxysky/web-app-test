@@ -152,8 +152,16 @@ function openAiCompatibleModel(
     if (!baseURL) {
       throw new Error(`${provider} has no Base URL. Configure the complete OpenAI-compatible /v1 endpoint in model settings.`);
     }
-    const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
     const extraRequestParameters = extraOpenAICompatibleRequestParameters(extraRequestParametersEnvironmentName);
+    if (/minimax/i.test(`${modelId} ${baseURL}`)) {
+      const { createMiniMaxOpenAIV4 } = await import('@/server/ai/providers/minimax-openai-v4-provider');
+      return createMiniMaxOpenAIV4({
+        apiKey: optionalEnvironmentValue(apiKeyEnvironmentName) || '',
+        baseURL,
+        extraRequestParameters,
+      })(modelId);
+    }
+    const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
     return createOpenAICompatible({
       name: provider,
       baseURL,
@@ -239,20 +247,7 @@ export function getModel(): GenerateTextModel {
   if (provider === 'lmstudio') return openAiCompatibleModel(provider, model, 'LMSTUDIO_BASE_URL', 'http://localhost:1234/v1', 'LMSTUDIO_API_KEY', 'LMSTUDIO_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'llama-cpp') return openAiCompatibleModel(provider, model, 'LLAMA_CPP_BASE_URL', 'http://localhost:8080/v1', 'LLAMA_CPP_API_KEY', 'LLAMA_CPP_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'ollama') return openAiCompatibleModel(provider, model, 'OLLAMA_BASE_URL', 'http://localhost:11434/v1', 'OLLAMA_API_KEY', 'OLLAMA_EXTRA_REQUEST_PARAMETERS');
-  if (provider === 'openai-compatible') return lazyLanguageModel(provider, model, async () => {
-    const baseURL = optionalEnvironmentValue('OPENAI_COMPATIBLE_BASE_URL');
-    if (!baseURL) {
-      throw new Error('OpenAI 兼容接口尚未配置 Base URL。请在“模型配置”中填写完整的 /v1 地址。');
-    }
-    const { createOpenAICompatible } = await import('@ai-sdk/openai-compatible');
-    const extraRequestParameters = extraOpenAICompatibleRequestParameters('OPENAI_COMPATIBLE_EXTRA_REQUEST_PARAMETERS');
-    return createOpenAICompatible({
-      name: provider,
-      baseURL,
-      apiKey: optionalEnvironmentValue('OPENAI_COMPATIBLE_API_KEY'),
-      transformRequestBody: (body) => mergeExtraOpenAICompatibleRequestParameters(body, extraRequestParameters),
-    })(model) as unknown as LoadedLanguageModel;
-  });
+  if (provider === 'openai-compatible') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_BASE_URL', '', 'OPENAI_COMPATIBLE_API_KEY', 'OPENAI_COMPATIBLE_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'openai-compatible-2') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_2_BASE_URL', '', 'OPENAI_COMPATIBLE_2_API_KEY', 'OPENAI_COMPATIBLE_2_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'openai-compatible-3') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_3_BASE_URL', '', 'OPENAI_COMPATIBLE_3_API_KEY', 'OPENAI_COMPATIBLE_3_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'minimax') return lazyLanguageModel(provider, model, async () => {

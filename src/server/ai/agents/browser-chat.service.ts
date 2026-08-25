@@ -95,6 +95,7 @@ import {
 } from '@/server/ai/agents/skill-context';
 import { expandMultilingualRetrievalQuery } from '@/server/ai/retrieval-query';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
+import { officeDraftCatalogForPrompt } from '@/server/ai/agents/file-artifact-tools';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -883,6 +884,12 @@ function markMessageDirty(session: BrowserChatSessionRecord, message: BrowserCha
   dirty.messages.set(message.id, message);
 }
 
+function markMessageRemoved(session: BrowserChatSessionRecord, messageId: string) {
+  const dirty = dirtyRecordsFor(session.id);
+  dirty.messages.delete(messageId);
+  dirty.removedMessageIds.add(messageId);
+}
+
 function markStepDirty(session: BrowserChatSessionRecord, step: StepExecutionResult) {
   const dirty = dirtyRecordsFor(session.id);
   dirty.removedStepIndexes.delete(step.index);
@@ -1640,7 +1647,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   const query = [input.text, input.modelText, input.session.title].filter(Boolean).join('\n');
   const retrievalQueries = await expandMultilingualRetrievalQuery(query);
   let availableSkillIds = new Set<string>();
-  const getContext = () => {
+  const getContext = async () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
     const allSkills = store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready');
     const activeLoadedSkills = [...loadedSkills.values()];
@@ -1677,12 +1684,14 @@ async function createBrowserChatRuntimeOperationalContext(input: {
       }] : [],
       input.modelText,
     );
+    const officeDraftCatalog = await officeDraftCatalogForPrompt(input.session.id);
     return {
       operationalContext: [
         formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
         conversationFileRegistry(input.session, input.historicalMessages, input.historicalSteps),
+        officeDraftCatalog,
         browserChatCredentialPrompt(credentials.credentials),
       ].filter(Boolean).join('\n\n'),
       credentialBindings: credentials.bindings,
@@ -4041,6 +4050,43 @@ export async function sendBrowserChatMessage(
   return clientSnapshot(session);
 }
 
+export function deleteQueuedBrowserChatMessage(
+  sessionId: string,
+  messageId: string,
+  userId?: string | number,
+) {
+  const session = hydrateSession(sessionId);
+  if (!session || !sessionBelongsToUser(session, userId)) return undefined;
+
+  const normalizedMessageId = messageId.trim();
+  const queuedTurnIndex = session.queuedTurns.findIndex((turn) => turn.userMessageId === normalizedMessageId);
+  const messageIndex = session.messages.findIndex((message) => (
+    message.id === normalizedMessageId
+    && message.role === 'user'
+    && message.status === 'queued'
+  ));
+  if (queuedTurnIndex < 0 || messageIndex < 0) {
+    throw new ApiRequestError('Only messages that are still queued can be deleted', {
+      code: 'queued_message_not_deletable',
+      status: 409,
+    });
+  }
+
+  const [queuedTurn] = session.queuedTurns.splice(queuedTurnIndex, 1);
+  session.messages.splice(messageIndex, 1);
+  markMessageRemoved(session, normalizedMessageId);
+  session.updatedAt = now();
+  appendLog(session, 'chat:queue:deleted', '排队消息已删除', {
+    messageId: null,
+    details: {
+      queuedTurnId: queuedTurn.id,
+      userMessageId: normalizedMessageId,
+      queueLength: session.queuedTurns.length,
+    },
+  });
+  return clientSnapshot(session);
+}
+
 function latestManualVerificationAssistant(session: BrowserChatSessionRecord) {
   for (let index = session.messages.length - 1; index >= 0; index -= 1) {
     const message = session.messages[index];
@@ -4841,6 +4887,75 @@ function readBrowserChatSubagent(sessionId: string): BrowserChatSubagentReader {
   };
 }
 
+type BrowserChatSubagentBrowserAuthMode = 'shared-context' | 'storage-snapshot' | 'profile';
+
+async function createBrowserChatSubagentBrowser(
+  session: BrowserChatSessionRecord,
+  subagentId: string,
+  assertTurnActive: BrowserChatTurnGuard,
+) {
+  let parentBrowser = restoreBrowserSessionPrototype(session.browser);
+  if (!parentBrowser?.isUsable()) {
+    try {
+      parentBrowser = await ensureStarted(session, assertTurnActive, { preferExistingPage: true });
+    } catch (error) {
+      appendLog(session, 'subagent:browser:parent-start-fallback', '子 Agent 无法启动父级浏览器上下文，已回退到独立浏览器配置。', {
+        messageId: session.activeAssistantMessageId,
+        details: { error: userFacingErrorMessage(error), subagentId },
+      });
+      parentBrowser = undefined;
+    }
+  }
+  if (parentBrowser?.isUsable()) {
+    try {
+      const browser = await parentBrowser.forkChildSession({
+        ...browserChatBrowserExecutionOptions(),
+        background: true,
+        inheritSessionStorage: true,
+        isMarked: true,
+        runId: `${session.id}_${subagentId}`,
+      });
+      return { authMode: 'shared-context' as const, browser };
+    } catch (error) {
+      appendLog(session, 'subagent:browser:fork-fallback', '子 Agent 无法派生父级浏览器页面，已回退到独立浏览器并复制当前登录状态。', {
+        messageId: session.activeAssistantMessageId,
+        details: { error: userFacingErrorMessage(error), subagentId },
+      });
+    }
+  }
+
+  const inheritedStorageState = parentBrowser?.isUsable()
+    ? await parentBrowser.exportStorageState().catch(() => undefined)
+    : undefined;
+  const browserProfileKey = browserChatBrowserProfileKey(session);
+  const browser = new BrowserSession({
+    browserSurface: 'external',
+    headless: true,
+    browserProfileKey,
+    sharedBrowserRuntimeKey: browserProfileKey,
+    storageState: inheritedStorageState,
+    ...browserChatBrowserExecutionOptions(),
+    isMarked: true,
+    preferExistingPage: false,
+    runId: `${session.id}_${subagentId}`,
+  });
+  await browser.start();
+  return {
+    authMode: inheritedStorageState ? 'storage-snapshot' as const : 'profile' as const,
+    browser,
+  };
+}
+
+function browserChatSubagentAuthPrompt(authMode: BrowserChatSubagentBrowserAuthMode) {
+  if (authMode === 'shared-context') {
+    return '你的独立后台页面与父 Agent 实时共享同一个浏览器身份环境，包括 Cookie、localStorage 和 IndexedDB；不要重新登录，也不要退出登录，因为登录态变化会同时影响父 Agent 和其他子 Agent。';
+  }
+  if (authMode === 'storage-snapshot') {
+    return '独立浏览器已复制父会话启动时的 Cookie、localStorage 和 IndexedDB 登录状态；请先直接访问目标地址验证登录态，不要重新登录。后续登录态变化不会自动同步回父 Agent。';
+  }
+  return '当前没有正在运行的父级浏览器上下文；独立浏览器会复用当前用户的持久化浏览器配置。请先直接访问目标地址验证登录态，不要猜测页面内容。';
+}
+
 async function executeBrowserChatSubagentBatch(input: {
   session: BrowserChatSessionRecord;
   assistantMessageId: string;
@@ -4905,9 +5020,6 @@ async function executeBrowserChatSubagentBatch(input: {
     { recordLogs: false, serialize: true },
   );
 
-  const inheritedStorageState = session.browser?.isUsable()
-    ? await session.browser.exportStorageState().catch(() => undefined)
-    : undefined;
   const summaryGuidanceChars = browserChatSubagentSuggestedSummaryChars();
 
   const settled = await settleBrowserChatSubagents(tasks, async (task) => {
@@ -4917,18 +5029,7 @@ async function executeBrowserChatSubagentBatch(input: {
       currentAction: '正在启动',
     });
     persistAndNotify(session.id);
-    const browserProfileKey = browserChatBrowserProfileKey(session);
-    const child = new BrowserSession({
-      browserSurface: 'external',
-      headless: true,
-      browserProfileKey,
-      sharedBrowserRuntimeKey: browserProfileKey,
-      storageState: inheritedStorageState,
-      ...browserChatBrowserExecutionOptions(),
-      isMarked: true,
-      preferExistingPage: false,
-      runId: `${session.id}_${task.id}`,
-    });
+    let child: BrowserSession | undefined;
     const childSteps = new Map<number, StepExecutionResult>();
     const childOutputCycles: BrowserChatAiOutputCycle[] = [];
     let streamedSubagentText = '';
@@ -4944,23 +5045,27 @@ async function executeBrowserChatSubagentBatch(input: {
       });
     };
     try {
-      await child.start();
+      const childBrowser = await createBrowserChatSubagentBrowser(session, task.id, () => {
+        if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
+      });
+      const activeChild = childBrowser.browser;
+      child = activeChild;
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
-      if (task.url) await child.open(task.url);
+      if (task.url) await activeChild.open(task.url);
       if (!ownsTurn()) throw abortController.signal.reason || new Error('对话已中断');
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
-        browser: child,
+        browser: activeChild,
         text: task.instruction,
         modelText: task.instruction,
         usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
       });
-      const initialRuntimeContext = getRuntimeOperationalContext();
+      const initialRuntimeContext = await getRuntimeOperationalContext();
       const executeChildAttempt = (attemptNumber: number, retryReason = '') => executeInteractiveBrowserTurn({
-        session: child,
+        session: activeChild,
         runId: `${session.id}_${task.id}`,
         turnId: `${assistantMessageId}:subagent:${task.id}:attempt:${attemptNumber}`,
-        targetUrl: task.url || session.targetUrl || child.currentUrl() || 'about:blank',
+        targetUrl: task.url || session.targetUrl || activeChild.currentUrl() || 'about:blank',
         instruction: task.instruction,
         modelInstruction: [
           `你是并行子 Agent“${task.title}”。只完成当前这个独立分支，并返回可追溯事实、来源地址、页面证据、失败原因和未解决问题。`,
@@ -4968,10 +5073,8 @@ async function executeBrowserChatSubagentBatch(input: {
             ? `[自动重试 ${attemptNumber}/2] 上一次子任务在没有执行任何工具时失败：${retryReason}。重新读取当前页面状态，从头执行本任务，不要只复述上一次错误。`
             : '',
           '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
-          inheritedStorageState
-            ? '无头浏览器已经复制主会话当前的 Cookie、localStorage 和 IndexedDB 登录态。请先直接访问目标地址验证登录态，不要重新登录。'
-            : '主会话当前没有可复制的浏览器登录态；如果目标页面要求登录，请明确返回登录阻塞，不要猜测页面内容。',
-          '你运行在无头浏览器中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要等待用户操作隐藏页面；请明确报告阻塞证据并把该步骤交回主 Agent。',
+          browserChatSubagentAuthPrompt(childBrowser.authMode),
+          '你运行在独立的子 Agent 页面中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要继续尝试绕过；请明确报告阻塞证据并把该步骤交回主 Agent。',
           '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
@@ -4993,7 +5096,7 @@ async function executeBrowserChatSubagentBatch(input: {
         requestToolConfirmation: session.safetyMode === 'strict'
           ? (request) => requestBatchToolConfirmation(
             request,
-            child,
+            activeChild,
             (interaction) => recordBrowserChatSubagentConfirmation(session.id, task.id, interaction),
             task.id,
           )
@@ -5132,7 +5235,7 @@ async function executeBrowserChatSubagentBatch(input: {
         content: partialContent,
       };
     } finally {
-      await child.close().catch(() => undefined);
+      await child?.close().catch(() => undefined);
     }
   });
 
@@ -5184,7 +5287,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
       usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
     }),
   );
-  const initialRuntimeContext = getRuntimeOperationalContext();
+  const initialRuntimeContext = await getRuntimeOperationalContext();
   const requestSubagentToolConfirmation = createBrowserChatTurnToolConfirmation(
     session,
     assistantMessageId,
@@ -5395,11 +5498,11 @@ async function runBrowserChatMessage(
     try {
       assertTurnActive();
       appendLog(session, 'chat:run:start', '开始处理本轮对话操作');
-      // Bind the turn to the browser that actually finished starting. Keeping a
-      // merely planned BrowserSession here allowed preview/startup work to
-      // replace it while the model was deciding, so the first browser tool was
-      // guaranteed to fail against a stale object reference.
-      const browser = await ensureStarted(session, assertTurnActive, { preferExistingPage: true });
+      // Reserve one stable BrowserSession for this turn without launching it.
+      // The first main-browser tool starts this exact instance through
+      // ensureBrowserStarted. Subagent browser work starts it explicitly when
+      // acquiring a shared child page; ordinary chat, file, and skill work does not.
+      const browser = await browserForTurnDecision(session, assertTurnActive, { preferExistingPage: true });
       assertTurnActive();
       const historicalMessages = readAllBrowserChatMessages<BrowserChatMessage>(session.id);
       const historicalSteps = readAllBrowserChatSteps<StepExecutionResult>(session.id);
@@ -5414,7 +5517,7 @@ async function runBrowserChatMessage(
         historicalMessages,
         historicalSteps,
       });
-      const initialRuntimeContext = getRuntimeOperationalContext();
+      const initialRuntimeContext = await getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
       const referenceImagePaths = attachments
         .filter(isBrowserChatImageAttachment)
@@ -5433,7 +5536,7 @@ async function runBrowserChatMessage(
         modelInstruction: modelText,
         operationalContext: initialRuntimeContext.operationalContext,
         conversation: session.modelContext.activeMessages,
-        continuationSummary: session.modelContext.lastCompression?.continuationSummary,
+        continuationSummary: session.modelContext.continuationSummary || session.modelContext.lastCompression?.continuationSummary,
         completedSteps: session.steps,
         safetyMode: session.safetyMode,
         memoryTools: createPersonalMemoryTools({
@@ -5509,6 +5612,17 @@ async function runBrowserChatMessage(
           }
           assertTurnActive();
         },
+        onContinuationSummary: async (continuationSummary) => {
+          assertTurnActive();
+          session.modelContext = normalizeBrowserChatModelContext({
+            ...session.modelContext,
+            continuationSummary,
+          });
+          if (!(await persistBrowserChatCheckpoint(session.id))) {
+            throw new Error('Failed to persist the browser-chat continuation checkpoint.');
+          }
+          assertTurnActive();
+        },
         onProgress: (step) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const ownedStep = { ...step, messageId: assistantMessageId };
@@ -5581,6 +5695,7 @@ async function runBrowserChatMessage(
           ...turnMessages,
         ]),
         activeMessages: serializableBrowserChatModelMessages(result.modelMessages),
+        ...(result.continuationSummary ? { continuationSummary: result.continuationSummary } : {}),
         ...(result.contextCompression ? { lastCompression: result.contextCompression } : (
           session.modelContext.lastCompression ? { lastCompression: session.modelContext.lastCompression } : {}
         )),

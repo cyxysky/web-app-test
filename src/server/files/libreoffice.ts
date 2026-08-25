@@ -9,8 +9,13 @@ const pythonUnoProbeCache = new Map<string, Promise<boolean>>();
 
 export async function resolveLibreOfficeExecutable() {
   const configured = String(process.env.LIBREOFFICE_PATH || '').trim();
+  const packagedRoot = String(process.env.WEBPILOT_SERVER_ROOT || '').trim();
+  const executableName = process.platform === 'win32' ? 'soffice.exe' : 'soffice';
   const candidates = [
     configured,
+    packagedRoot ? path.join(packagedRoot, 'libreoffice', 'program', executableName) : '',
+    path.join(process.cwd(), 'libreoffice', 'program', executableName),
+    path.join(process.cwd(), '..', 'libreoffice', 'program', executableName),
     process.platform === 'win32' ? path.join(process.env.ProgramFiles || 'C:\\Program Files', 'LibreOffice', 'program', 'soffice.exe') : '',
     process.platform === 'win32' ? path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'LibreOffice', 'program', 'soffice.exe') : '',
     ...String(process.env.PATH || '').split(path.delimiter).flatMap((directory) => {

@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('node:fs');
 const path = require('node:path');
-const { copyProductionRuntime } = require('./server-package-layout');
+const { copyProductionRuntime, copyServerRuntime } = require('./server-package-layout');
 
 const root = path.resolve(__dirname, '..');
 const outputRoot = path.join(root, 'dist-desktop');
@@ -16,9 +16,7 @@ function copyInto(source, target) {
 fs.rmSync(outputRoot, { recursive: true, force: true });
 const productionPackagePaths = copyProductionRuntime(root, serverOutput);
 copyInto(path.join(root, 'public'), path.join(serverOutput, 'public'));
-copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverOutput, 'webpilot-server.js'));
-copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverOutput, 'webpilot-identity.js'));
-copyInto(path.join(root, 'server', 'realtime-refresh-hub.js'), path.join(serverOutput, 'realtime-refresh-hub.js'));
+const serverRuntimeFiles = copyServerRuntime(root, serverOutput);
 copyInto(
   path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
   path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
@@ -43,4 +41,4 @@ if (
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run npm run build before packaging.');
 }
 
-console.log(`Prepared desktop server with ${productionPackagePaths.length} package directories at ${serverOutput}`);
+console.log(`Prepared desktop server with ${productionPackagePaths.length} package directories and ${serverRuntimeFiles.length} custom server files at ${serverOutput}`);

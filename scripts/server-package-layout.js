@@ -67,6 +67,39 @@ function copyBuildOutput(projectRoot, target) {
   });
 }
 
+function serverRuntimeFilePaths(projectRoot) {
+  const sourceRoot = path.join(projectRoot, 'server');
+  const entryPath = path.join(sourceRoot, 'webpilot-server.js');
+  if (!fs.existsSync(entryPath)) {
+    throw new Error(`The custom server entry is missing: ${entryPath}`);
+  }
+
+  const runtimeFiles = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(entryPath);
+      } else if (entry.isFile() && !entry.name.endsWith('.test.js')) {
+        runtimeFiles.push(path.relative(sourceRoot, entryPath));
+      }
+    }
+  };
+  visit(sourceRoot);
+  return runtimeFiles.sort();
+}
+
+function copyServerRuntime(projectRoot, target) {
+  const sourceRoot = path.join(projectRoot, 'server');
+  const runtimeFiles = serverRuntimeFilePaths(projectRoot);
+  for (const relativePath of runtimeFiles) {
+    const destination = path.join(target, relativePath);
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.cpSync(path.join(sourceRoot, relativePath), destination);
+  }
+  return runtimeFiles;
+}
+
 function copyProductionRuntime(projectRoot, target) {
   const packagePaths = productionPackagePaths(projectRoot);
   fs.rmSync(target, { recursive: true, force: true });
@@ -89,6 +122,8 @@ function copyProductionRuntime(projectRoot, target) {
 module.exports = {
   assertProductionRuntimeSource,
   copyProductionRuntime,
+  copyServerRuntime,
   productionPackagePaths,
   requiredProductionRuntimeEntries,
+  serverRuntimeFilePaths,
 };

@@ -159,6 +159,31 @@ test('custom OpenAI-compatible provider uses its independent Base URL and key', 
   }
 });
 
+test('custom OpenAI-compatible MiniMax models use the MiniMax protocol adapter', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousBaseURL = process.env.OPENAI_COMPATIBLE_BASE_URL;
+  const previousApiKey = process.env.OPENAI_COMPATIBLE_API_KEY;
+  let requestBody: Record<string, unknown> = {};
+  globalThis.fetch = async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
+    throw new Error('custom-minimax-provider-called');
+  };
+  process.env.OPENAI_COMPATIBLE_BASE_URL = 'https://gateway.example/v1';
+  process.env.OPENAI_COMPATIBLE_API_KEY = 'custom-minimax-key';
+  try {
+    const model = withModelSettings(
+      { provider: 'openai-compatible', model: 'MiniMax-M2.5' },
+      () => getModel(),
+    ) as LanguageModelV4;
+    await assert.rejects(async () => await model.doGenerate(minimalCall), /custom-minimax-provider-called/);
+    assert.equal(requestBody.reasoning_split, true);
+  } finally {
+    globalThis.fetch = previousFetch;
+    restoreEnvironmentValue('OPENAI_COMPATIBLE_BASE_URL', previousBaseURL);
+    restoreEnvironmentValue('OPENAI_COMPATIBLE_API_KEY', previousApiKey);
+  }
+});
+
 test('the second and third OpenAI-compatible providers use isolated endpoints and keys', async () => {
   const previousFetch = globalThis.fetch;
   const environments = [

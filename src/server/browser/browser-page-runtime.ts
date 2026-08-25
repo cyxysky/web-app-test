@@ -2433,6 +2433,14 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       ) return undefined;
       return candidate;
     };
+    const surfaceFailureContext = (coveredBy?: Element) => {
+      const activeSurfaceId = resolveSurfaceState().activeEntry?.surface.id;
+      const coveredBySurfaceId = coveredBy ? surfaceIdForElement(coveredBy) : undefined;
+      return {
+        ...(coveredBySurfaceId ? { coveredBySurfaceId } : {}),
+        ...(activeSurfaceId ? { activeSurfaceId } : {}),
+      };
+    };
     if (action && !/^(screenshot|ariaSnapshot|innerText|textContent|getAttribute|inputValue|count)$/.test(action)) {
       rememberSurfaceSource(element);
     }
@@ -2496,6 +2504,8 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
             descriptor: targetDescriptor,
             failureKind: 'occluded' as const,
             coveredBy: descriptor(currentViewportBlocker),
+            ...surfaceFailureContext(currentViewportBlocker),
+            preserveScroll: true,
           };
         }
         if (!intersectsViewport && targetStyle?.position === 'fixed') {
@@ -2518,6 +2528,8 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
             descriptor: targetDescriptor,
             failureKind: 'occluded' as const,
             ...(coveredBy ? { coveredBy: descriptor(coveredBy) } : {}),
+            ...surfaceFailureContext(blockingLayer || coveredBy),
+            ...(blockingLayer ? { preserveScroll: true } : {}),
           };
         }
       }

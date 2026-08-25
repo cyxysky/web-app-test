@@ -7,10 +7,26 @@ const browserChatContextOnlyMarkers = [
   '[The user interrupted this turn before the assistant produced text. Any completed tool messages remain valid conversation history.]',
 ] as const;
 
+const privateToolProtocolPattern = /(?:<(?:minimax:)?tool_call\b[^>]*>|<function_calls\b[^>]*>|<invoke\b[^>]*>|[◁＜]\s*(?:tool_call|function_calls|invoke)\s*[▷＞])/i;
+
+export function containsPrivateToolProtocol(value: string | undefined) {
+  return privateToolProtocolPattern.test(value || '');
+}
+
+function removePrivateToolProtocol(value: string) {
+  let text = value
+    .replace(/<(?:minimax:)?tool_call\b[^>]*>[\s\S]*?<\/(?:minimax:)?tool_call\s*>/gi, '')
+    .replace(/<function_calls\b[^>]*>[\s\S]*?<\/function_calls\s*>/gi, '')
+    .replace(/[◁＜]\s*(?:tool_call|function_calls|invoke)\s*[▷＞][\s\S]*?[◁＜]\s*\/(?:tool_call|function_calls|invoke)\s*[▷＞]/gi, '');
+  const dangling = text.search(privateToolProtocolPattern);
+  if (dangling >= 0) text = text.slice(0, dangling);
+  return text;
+}
+
 export function normalizeBrowserChatFinalReplyText(value: string | undefined) {
   return browserChatContextOnlyMarkers.reduce(
     (text, marker) => text.replaceAll(marker, ''),
-    (value || '').replace(/\r\n?/g, '\n'),
+    removePrivateToolProtocol((value || '').replace(/\r\n?/g, '\n')),
   )
     .replace(/\n{3,}/g, '\n\n')
     .trim();

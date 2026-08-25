@@ -2111,10 +2111,40 @@
 
 .browser-chat-message-queue-status {
   color: var(--muted);
-  display: block;
   font-size: 11px;
   line-height: 1;
-  text-align: right;
+}
+
+.browser-chat-message-queue-actions {
+  align-items: center;
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  margin-top: 5px;
+}
+
+.browser-chat-message-queue-delete {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  padding: 0;
+  width: 22px;
+}
+
+.browser-chat-message-queue-delete:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+.browser-chat-message-queue-delete:disabled {
+  cursor: default;
+  opacity: 0.55;
 }
 
 .browser-chat-message small {

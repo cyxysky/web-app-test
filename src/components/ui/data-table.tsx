@@ -1,6 +1,6 @@
 'use client';
 
-import { Table, type SortDescriptor } from '@heroui/react';
+import { EmptyState, Table, type SortDescriptor } from '@heroui/react';
 import { useDeferredValue, useMemo, useState, type ReactNode } from 'react';
 
 export type DataTableColumn<T> = {
@@ -36,6 +36,7 @@ function compareValues(
 }
 
 export function DataTable<T>({
+  className,
   columns,
   data,
   emptyText,
@@ -79,7 +80,7 @@ export function DataTable<T>({
   }), [getRowId, renderExpandedRow, sortedData]);
 
   return (
-    <Table>
+    <Table className={className}>
       <Table.ScrollContainer>
         <Table.Content
           aria-label="Data table"
@@ -103,7 +104,9 @@ export function DataTable<T>({
             ))}
           </Table.Header>
           <Table.Body items={rows} renderEmptyState={() => (
-            <div>{emptyText}</div>
+            <EmptyState className="management-table-empty-state">
+              <span>{emptyText}</span>
+            </EmptyState>
           )}>
             {(row) => row.kind === 'expanded' ? (
               <Table.Row id={row.id}>

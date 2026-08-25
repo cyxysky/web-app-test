@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
+import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 
 test('final browser-chat replies preserve Markdown block boundaries', () => {
   const markdown = [
@@ -37,4 +37,14 @@ test('DOM observations are never treated as final assistant prose', () => {
   assert.equal(isBrowserChatDomObservationText('<button uid=dom-3-42 aria-label="关闭"></button>'), true);
   assert.equal(isBrowserChatDomObservationText('uid=12 button "Save"'), true);
   assert.equal(isBrowserChatDomObservationText('已完成操作，当前页面显示保存成功。'), false);
+});
+
+test('MiniMax private textual tool protocol is detected and never shown as assistant prose', () => {
+  const complete = 'I will inspect it.\n<minimax:tool_call>{"name":"file","arguments":{"action":"list"}}</minimax:tool_call>';
+  const dangling = 'Working on it\n<tool_call>{"name":"file"';
+  assert.equal(containsPrivateToolProtocol(complete), true);
+  assert.equal(containsPrivateToolProtocol(dangling), true);
+  assert.equal(normalizeBrowserChatFinalReplyText(complete), 'I will inspect it.');
+  assert.equal(normalizeBrowserChatFinalReplyText(dangling), 'Working on it');
+  assert.equal(containsPrivateToolProtocol('ordinary final answer'), false);
 });

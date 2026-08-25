@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const fs = require('node:fs');
 const path = require('node:path');
-const { copyProductionRuntime } = require('./server-package-layout');
+const { copyProductionRuntime, copyServerRuntime } = require('./server-package-layout');
 
 const root = path.resolve(__dirname, '..');
 const packageName = 'WebPilot-Server';
@@ -21,6 +21,36 @@ function copyInto(source, target) {
   if (!fs.existsSync(source)) return;
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.cpSync(source, target, { recursive: true });
+}
+
+function findLibreOfficeRoot() {
+  const configuredExecutable = String(process.env.LIBREOFFICE_PATH || '').trim();
+  const candidates = [
+    process.env.LIBREOFFICE_BUNDLE_DIR,
+    configuredExecutable ? path.resolve(path.dirname(configuredExecutable), '..') : '',
+    process.env.ProgramFiles && path.join(process.env.ProgramFiles, 'LibreOffice'),
+    process.env['ProgramFiles(x86)'] && path.join(process.env['ProgramFiles(x86)'], 'LibreOffice'),
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    const libreOfficeRoot = path.resolve(candidate);
+    if (fs.existsSync(path.join(libreOfficeRoot, 'program', 'soffice.exe'))) return libreOfficeRoot;
+  }
+
+  throw new Error(
+    'LibreOffice was not found. Install LibreOffice or set LIBREOFFICE_BUNDLE_DIR before packaging the server.',
+  );
+}
+
+function copyLibreOffice() {
+  const sourceRoot = findLibreOfficeRoot();
+  const targetRoot = path.join(distributionRoot, 'libreoffice');
+  copyDir(sourceRoot, targetRoot);
+
+  const packagedExecutable = path.join(targetRoot, 'program', 'soffice.exe');
+  if (!fs.existsSync(packagedExecutable)) {
+    throw new Error(`Packaged LibreOffice executable is missing: ${packagedExecutable}`);
+  }
 }
 
 function findBrowserRevisionDir(executablePath) {
@@ -46,12 +76,19 @@ function copyPlaywrightChromium() {
 
 function writeStartScript() {
   const startScript = `@echo off\r\nsetlocal\r\n\r\nset "WEBPILOT_SERVER_ROOT=%~dp0"\r\nif not defined APP_DATA_DIR set "APP_DATA_DIR=%WEBPILOT_SERVER_ROOT%runtime"\r\nif not defined ARTIFACTS_DIR set "ARTIFACTS_DIR=%APP_DATA_DIR%\\artifacts"\r\nif not defined PLAYWRIGHT_BROWSERS_PATH set "PLAYWRIGHT_BROWSERS_PATH=%WEBPILOT_SERVER_ROOT%ms-playwright"\r\nif not defined HOSTNAME set "HOSTNAME=0.0.0.0"\r\nif not defined PORT set "PORT=17890"\r\nif not defined NODE_ENV set "NODE_ENV=production"\r\nif not defined HEADLESS_BROWSER set "HEADLESS_BROWSER=true"\r\n\r\nif not exist "%APP_DATA_DIR%" mkdir "%APP_DATA_DIR%"\r\nif not exist "%ARTIFACTS_DIR%" mkdir "%ARTIFACTS_DIR%"\r\n\r\npushd "%WEBPILOT_SERVER_ROOT%server"\r\nnode webpilot-server.js\r\nset "WEBPILOT_SERVER_EXIT_CODE=%ERRORLEVEL%"\r\npopd\r\nexit /b %WEBPILOT_SERVER_EXIT_CODE%\r\n`;
-  fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), startScript.replace('PORT=17890', 'PORT=3000'), 'utf8');
+  const packagedStartScript = startScript
+    .replace(
+      'if not defined HOSTNAME',
+      'if not defined LIBREOFFICE_PATH set "LIBREOFFICE_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\soffice.exe"\r\nif not defined LIBREOFFICE_PYTHON_PATH set "LIBREOFFICE_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\python.exe"\r\nif not defined HOSTNAME',
+    )
+    .replace('PORT=17890', 'PORT=3000');
+  fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), packagedStartScript, 'utf8');
 }
 
 function writeReadme() {
   const readme = `# WebPilot HTTP Server\n\nRequirements: Node.js 22.16 or later. No npm install is required.\n\n1. Extract this directory.\n2. Run start.cmd.\n3. Open http://127.0.0.1:17890.\n\nLocal direct access uses WEBPILOT_DEFAULT_USER_ID (default: 1). For an online mounted deployment, set WEBPILOT_REQUIRE_MOUNT_USER_ID=true and pass userId to WebPilotQA.mount().\n\nThe service listens on all network interfaces by default. To change the port, run \`set PORT=3000 && start.cmd\` from Command Prompt, or set \`$env:PORT = '3000'; .\\start.cmd\` in PowerShell. HTTP and WebSocket traffic share this one public port.\n\nRuntime data, artifacts, and browser profiles are written under the runtime directory unless APP_DATA_DIR or ARTIFACTS_DIR is set. Playwright Chromium is included in this package.\n`;
   const packagedReadme = readme
+    .replace('Playwright Chromium is included in this package.', 'Playwright Chromium and LibreOffice are included in this package.')
     .replace('http://127.0.0.1:17890', 'http://127.0.0.1:3000')
     .replace('set PORT=3000 && start.cmd', 'set PORT=17890 && start.cmd')
     .replace("$env:PORT = '3000'", "$env:PORT = '17890'");
@@ -93,9 +130,7 @@ function prepareOutputDirectory() {
 prepareOutputDirectory();
 const productionPackagePaths = copyProductionRuntime(root, serverRoot);
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
-copyInto(path.join(root, 'server', 'webpilot-server.js'), path.join(serverRoot, 'webpilot-server.js'));
-copyInto(path.join(root, 'server', 'webpilot-identity.js'), path.join(serverRoot, 'webpilot-identity.js'));
-copyInto(path.join(root, 'server', 'realtime-refresh-hub.js'), path.join(serverRoot, 'realtime-refresh-hub.js'));
+const serverRuntimeFiles = copyServerRuntime(root, serverRoot);
 copyInto(
   path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
   path.join(serverRoot, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
@@ -105,6 +140,7 @@ copyInto(
   path.join(serverRoot, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
 );
 copyBrowserSessionExtension();
+copyLibreOffice();
 copyPlaywrightChromium();
 
 if (
@@ -114,6 +150,7 @@ if (
   || !fs.existsSync(path.join(serverRoot, 'webpilot-identity.js'))
   || !fs.existsSync(path.join(serverRoot, 'realtime-refresh-hub.js'))
   || !fs.existsSync(path.join(serverRoot, 'node_modules', 'next', 'package.json'))
+  || !fs.existsSync(path.join(distributionRoot, 'libreoffice', 'program', 'soffice.exe'))
 ) {
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
 }
@@ -121,4 +158,4 @@ if (
 writeStartScript();
 writeReadme();
 
-console.log(`Production server package created with ${productionPackagePaths.length} package directories:\n  ${distributionRoot}`);
+console.log(`Production server package created with ${productionPackagePaths.length} package directories and ${serverRuntimeFiles.length} custom server files:\n  ${distributionRoot}`);

@@ -57,6 +57,24 @@ test('runtime retry accepts SDK error and other finish states', () => {
   });
 });
 
+test('private tool protocol gets exactly one retry opportunity', () => {
+  const first = Object.assign(new Error('private protocol'), {
+    name: 'AI_PrivateToolProtocolError',
+    privateToolProtocolRetryable: true,
+  });
+  const repeated = Object.assign(new Error('private protocol'), {
+    name: 'AI_PrivateToolProtocolError',
+    privateToolProtocolRetryable: false,
+  });
+  assert.deepEqual(classifyRuntimeRetry(first), {
+    category: 'protocol',
+    reason: 'provider emitted a private textual tool protocol',
+    retryable: true,
+    statusCode: undefined,
+  });
+  assert.equal(classifyRuntimeRetry(repeated).retryable, false);
+});
+
 test('runtime retry honors Retry-After before exponential jitter', () => {
   const decision = classifyRuntimeRetry({ status: 429, headers: { 'retry-after': '1.5' } });
   assert.equal(decision.retryAfterMs, 1500);

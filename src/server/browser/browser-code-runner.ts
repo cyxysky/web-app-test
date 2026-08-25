@@ -599,8 +599,12 @@ function browserCodeKernelMain() {
     }, { x: point.x, y: point.y, pointerKind: kind }).catch(() => undefined);
   };
 
+  const locatorFrame = (locator: object) => (
+    Reflect.get(locator, '_frame') as import('playwright').Frame | undefined
+  );
+
   const locatorPage = (locator: object) => {
-    const frame = Reflect.get(locator, '_frame') as { _page?: import('playwright').Page; page?: () => import('playwright').Page } | undefined;
+    const frame = locatorFrame(locator) as (import('playwright').Frame & { _page?: import('playwright').Page }) | undefined;
     if (typeof frame?.page === 'function') return frame.page();
     return frame?._page;
   };
@@ -799,6 +803,10 @@ function browserCodeKernelMain() {
     let results = await candidateSet.evaluateAll((elements, operation) => {
       const browserWindow = window as Window & {
         __aiDomRuntime?: {
+          pageObservation?: () => {
+            activeSurface?: { id: string };
+            surfaces: Array<{ id: string; descriptor: string }>;
+          };
           actionability?: (
             target: Element,
             options?: { action?: string },
@@ -807,6 +815,8 @@ function browserCodeKernelMain() {
             reason: string;
             descriptor: string;
             coveredBy?: string;
+            coveredBySurfaceId?: string;
+            activeSurfaceId?: string;
             failureKind?: 'occluded';
             preserveScroll?: boolean;
           };
@@ -818,6 +828,8 @@ function browserCodeKernelMain() {
         reason: string;
         descriptor: string;
         coveredBy?: string;
+        coveredBySurfaceId?: string;
+        activeSurfaceId?: string;
         failureKind?: 'occluded';
         preserveScroll?: boolean;
       } => {
@@ -867,11 +879,16 @@ function browserCodeKernelMain() {
             && rect.bottom > 0
             && rect.left < window.innerWidth
             && rect.top < window.innerHeight;
-          if (!intersectsViewport && !blockingLayer) {
-            const candidate = document.elementFromPoint(
-              Math.max(0, Math.floor(window.innerWidth / 2)),
-              Math.max(0, Math.floor(window.innerHeight / 2)),
-            );
+          if (!blockingLayer) {
+            const candidate = intersectsViewport
+              ? document.elementFromPoint(
+                Math.min(window.innerWidth - 1, Math.max(0, Math.floor(rect.left + rect.width / 2))),
+                Math.min(window.innerHeight - 1, Math.max(0, Math.floor(rect.top + rect.height / 2))),
+              )
+              : document.elementFromPoint(
+                Math.max(0, Math.floor(window.innerWidth / 2)),
+                Math.max(0, Math.floor(window.innerHeight / 2)),
+              );
             if (candidate && !candidate.contains(element) && !element.contains(candidate)) {
               const style = getComputedStyle(candidate);
               const blockerRect = candidate.getBoundingClientRect();
@@ -890,12 +907,18 @@ function browserCodeKernelMain() {
           if (!blockingLayer) return shared;
           if (!shared.ok && shared.failureKind !== 'occluded') return shared;
           const blockerDescriptor = `${blockingLayer.tagName.toLowerCase()}${blockingLayer.id ? `#${blockingLayer.id}` : ''}`;
+          const surfaceObservation = runtime?.pageObservation?.();
+          const coveredBySurfaceId = surfaceObservation?.surfaces
+            .find((surface) => surface.descriptor === blockerDescriptor)?.id;
           return {
+            ...shared,
             ok: false,
             reason: `${descriptor} is outside the active foreground surface ${blockerDescriptor}; close or dismiss that surface before targeting the background`,
             descriptor,
             failureKind: 'occluded',
             coveredBy: blockerDescriptor,
+            ...(coveredBySurfaceId ? { coveredBySurfaceId } : {}),
+            ...(surfaceObservation?.activeSurface?.id ? { activeSurfaceId: surfaceObservation.activeSurface.id } : {}),
             preserveScroll: true,
           };
         }
@@ -907,7 +930,7 @@ function browserCodeKernelMain() {
           const blockerDescriptor = `${blockingLayer.tagName.toLowerCase()}${blockingLayer.id ? `#${blockingLayer.id}` : ''}`;
           return {
             ok: false,
-            reason: `${descriptor} is outside the viewport behind viewport-blocking layer ${blockerDescriptor}`,
+            reason: `${descriptor} is covered by viewport-blocking layer ${blockerDescriptor}`,
             descriptor,
             failureKind: 'occluded',
             coveredBy: blockerDescriptor,
@@ -972,6 +995,78 @@ function browserCodeKernelMain() {
         ? normalizedAction
         : undefined;
     if (trialMethod) {
+      const locatorSelector = Reflect.get(originalCandidate, '_selector');
+      const locatorRootFrame = locatorFrame(originalCandidate);
+      const enterFrameMarker = ' >> internal:control=enter-frame >> ';
+      const frameOwnerLocators: import('playwright').Locator[] = [];
+      if (locatorRootFrame && typeof locatorSelector === 'string') {
+        let markerIndex = locatorSelector.indexOf(enterFrameMarker);
+        while (markerIndex >= 0) {
+          frameOwnerLocators.push(locatorRootFrame.locator(locatorSelector.slice(0, markerIndex)));
+          markerIndex = locatorSelector.indexOf(enterFrameMarker, markerIndex + enterFrameMarker.length);
+        }
+      }
+      for (const frameElement of frameOwnerLocators) {
+        const ownerActionability = await frameElement.evaluate((element, operation) => {
+          const browserWindow = window as Window & {
+            __aiDomRuntime?: {
+              actionability?: (target: Element, options?: { action?: string }) => {
+                ok: boolean;
+                reason: string;
+                descriptor: string;
+                coveredBy?: string;
+                coveredBySurfaceId?: string;
+                activeSurfaceId?: string;
+                failureKind?: 'occluded';
+                preserveScroll?: boolean;
+              };
+            };
+          };
+          const shared = browserWindow.__aiDomRuntime?.actionability?.(element, { action: operation });
+          if (shared && (!shared.ok || shared.preserveScroll)) return shared;
+          const rect = element.getBoundingClientRect();
+          const candidate = document.elementFromPoint(
+            Math.min(window.innerWidth - 1, Math.max(0, Math.floor(rect.left + rect.width / 2))),
+            Math.min(window.innerHeight - 1, Math.max(0, Math.floor(rect.top + rect.height / 2))),
+          );
+          if (candidate && !candidate.contains(element) && !element.contains(candidate)) {
+            const style = getComputedStyle(candidate);
+            const blockerRect = candidate.getBoundingClientRect();
+            const horizontalCoverage = Math.max(0, Math.min(window.innerWidth, blockerRect.right) - Math.max(0, blockerRect.left));
+            const verticalCoverage = Math.max(0, Math.min(window.innerHeight, blockerRect.bottom) - Math.max(0, blockerRect.top));
+            if (
+              ['fixed', 'absolute', 'sticky'].includes(style.position)
+              && horizontalCoverage >= window.innerWidth * 0.8
+              && verticalCoverage >= window.innerHeight * 0.8
+            ) {
+              const coveredBy = `${candidate.tagName.toLowerCase()}${candidate.id ? `#${candidate.id}` : ''}`;
+              const descriptor = `${element.tagName.toLowerCase()}${element.id ? `#${element.id}` : ''}`;
+              return {
+                ok: false,
+                reason: `${descriptor} is covered by viewport-blocking layer ${coveredBy}`,
+                descriptor,
+                coveredBy,
+                failureKind: 'occluded' as const,
+                preserveScroll: true,
+              };
+            }
+          }
+          return shared;
+        }, normalizedAction).catch(() => undefined);
+        if (ownerActionability && !ownerActionability.ok && ownerActionability.preserveScroll) {
+          results = results.map((result) => ({
+            ...result,
+            ok: false,
+            reason: `${result.descriptor} is inside ${ownerActionability.descriptor}, which is blocked: ${ownerActionability.reason}`,
+            coveredBy: ownerActionability.coveredBy,
+            coveredBySurfaceId: ownerActionability.coveredBySurfaceId,
+            activeSurfaceId: ownerActionability.activeSurfaceId,
+            failureKind: 'occluded' as const,
+            preserveScroll: true,
+          }));
+          break;
+        }
+      }
       const nativeTrialAction = nativeLocatorActions.get(trialMethod);
       const trialResults: typeof results = [];
       for (const [index, result] of results.entries()) {
@@ -1067,6 +1162,8 @@ function browserCodeKernelMain() {
         .map(({ index, result }) => (
           `#${index + 1} ${result.descriptor}: ${result.ok ? 'actionable' : result.reason}`
           + (result.coveredBy ? `; covered by ${result.coveredBy}` : '')
+          + (result.coveredBySurfaceId ? `; coveredBySurfaceId=${result.coveredBySurfaceId}` : '')
+          + (result.activeSurfaceId ? `; activeSurfaceId=${result.activeSurfaceId}` : '')
         )).join(' | ');
       throw new Error(
         `ACTIONABILITY_FAILED: ${action} matched ${originalCount} elements; ${visibilityStage}; `
@@ -2241,15 +2338,23 @@ function browserCodeKernelMain() {
         return Promise.all([...keepPages].filter(Boolean).map((candidatePage) => tabInfo(candidatePage!)));
       },
       list: async () => (await currentSessionTabEntries()).map((entry) => tabForPage(entry.page)),
-      new: async (options: { url?: string } = {}) => {
+      new: async (input: string | { url?: string } = {}) => {
         recordAction('tabs.new');
+        if (typeof input !== 'string' && (!input || typeof input !== 'object' || Array.isArray(input))) {
+          throw new Error('browser.tabs.new expects a URL string or an options object such as { url: "https://example.com/" }.');
+        }
+        const options = typeof input === 'string' ? { url: input } : input;
+        const requestedUrl = options.url?.trim();
+        if (options.url !== undefined && !requestedUrl) {
+          throw new Error('browser.tabs.new received an empty URL. Omit the argument for a blank tab or provide a non-empty URL.');
+        }
         const selected = replServer?.context.context as import('playwright').BrowserContext | undefined;
         const targetContext = selected || browser?.contexts()[0];
         if (!targetContext) throw new Error('No browser context is available.');
         const newPage = await createSessionPage(targetContext);
         agentCreatedPages.add(newPage);
         selectPage(newPage);
-        if (options.url) await newPage.goto(options.url);
+        if (requestedUrl) await newPage.goto(requestedUrl);
         return tabForPage(newPage);
       },
       use: async (value: unknown) => {

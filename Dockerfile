@@ -35,10 +35,11 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
 COPY --from=build /app/.env ./.env
 COPY --from=build /app/next.config.ts ./next.config.ts
-COPY --from=build /app/server/webpilot-server.js /app/server/webpilot-identity.js /app/server/realtime-refresh-hub.js ./server/
+COPY --from=build /app/server ./server
 COPY src/server/files/libreoffice-program-worker.py ./src/server/files/libreoffice-program-worker.py
 
-RUN mkdir -p .data artifacts
+RUN find ./server -type f -name '*.test.js' -delete \
+    && mkdir -p .data artifacts
 
 EXPOSE 3000
 
