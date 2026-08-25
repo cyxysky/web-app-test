@@ -1877,7 +1877,7 @@
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-mode-tabs {
-    margin-inline: 2px 6px;
+    margin-inline: 2px;
     width: auto;
   }
 
@@ -1899,7 +1899,7 @@
     border-radius: 6px;
     flex: 0 0 30px;
     font-size: 13px;
-    gap: 6px;
+    gap: 8px;
     height: 30px;
     justify-content: flex-start;
     min-height: 30px;

@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { parse } from 'acorn';
 import type { BrowserTextSelectionSpec } from './editable-text-selection';
+import type { BrowserCodeRuntimeMode } from './browser-code-runtime-mode';
 
 export type BrowserCodeConnection = {
   protocol: 'playwright' | 'cdp';
@@ -114,6 +116,29 @@ export type BrowserCodeRunResult = {
   };
 };
 
+function browserCodeFailureText(value: unknown) {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const message = typeof record.message === 'string' ? record.message.trim() : '';
+  if (message) return message;
+  const name = typeof record.name === 'string' ? record.name.trim() : '';
+  return name || undefined;
+}
+
+/**
+ * A browserCode cell may catch an exception and accidentally publish
+ * `{ ok: false }` as ordinary evidence. Treat that explicit top-level result
+ * shape as a failed execution contract instead of allowing a false success.
+ */
+export function browserCodeReportedFailure(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.ok !== false) return undefined;
+  const detail = browserCodeFailureText(record.error) || browserCodeFailureText(record.message);
+  return detail || 'browserCode returned a top-level { ok: false } result.';
+}
+
 export type BrowserCodeKernelMemoryUsage = {
   arrayBuffers?: number;
   external: number;
@@ -184,7 +209,156 @@ function evaluateCallContainsDomClick(code: string) {
   return false;
 }
 
-export function browserCodePolicyViolation(code: string) {
+type BrowserCodeAstNode = {
+  type: string;
+  [key: string]: unknown;
+};
+
+function parseBrowserCodeAst(code: string) {
+  try {
+    return parse(code, {
+      allowAwaitOutsideFunction: true,
+      allowReturnOutsideFunction: true,
+      ecmaVersion: 'latest',
+      sourceType: 'script',
+    }) as unknown as BrowserCodeAstNode;
+  } catch {
+    return undefined;
+  }
+}
+
+function walkBrowserCodeAst(node: BrowserCodeAstNode, visit: (node: BrowserCodeAstNode) => boolean | void) {
+  if (visit(node) === false) return false;
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        if (child && typeof child === 'object' && typeof (child as BrowserCodeAstNode).type === 'string') {
+          if (!walkBrowserCodeAst(child as BrowserCodeAstNode, visit)) return false;
+        }
+      }
+    } else if (value && typeof value === 'object' && typeof (value as BrowserCodeAstNode).type === 'string') {
+      if (!walkBrowserCodeAst(value as BrowserCodeAstNode, visit)) return false;
+    }
+  }
+  return true;
+}
+
+function collectBindingNames(pattern: BrowserCodeAstNode | undefined, names: Set<string>) {
+  if (!pattern) return;
+  if (pattern.type === 'Identifier' && typeof pattern.name === 'string') {
+    names.add(pattern.name);
+    return;
+  }
+  if (pattern.type === 'RestElement') {
+    collectBindingNames(pattern.argument as BrowserCodeAstNode | undefined, names);
+    return;
+  }
+  if (pattern.type === 'AssignmentPattern') {
+    collectBindingNames(pattern.left as BrowserCodeAstNode | undefined, names);
+    return;
+  }
+  if (pattern.type === 'ArrayPattern' && Array.isArray(pattern.elements)) {
+    for (const element of pattern.elements) collectBindingNames(element as BrowserCodeAstNode | undefined, names);
+    return;
+  }
+  if (pattern.type === 'ObjectPattern' && Array.isArray(pattern.properties)) {
+    for (const property of pattern.properties) {
+      const node = property as BrowserCodeAstNode;
+      collectBindingNames((node.type === 'Property' ? node.value : node.argument) as BrowserCodeAstNode | undefined, names);
+    }
+  }
+}
+
+function declaredBrowserCodeNames(ast: BrowserCodeAstNode) {
+  const names = new Set<string>();
+  walkBrowserCodeAst(ast, (node) => {
+    if (node.type === 'VariableDeclarator') collectBindingNames(node.id as BrowserCodeAstNode | undefined, names);
+    if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression') {
+      collectBindingNames(node.id as BrowserCodeAstNode | undefined, names);
+      if (Array.isArray(node.params)) {
+        for (const parameter of node.params) collectBindingNames(parameter as BrowserCodeAstNode, names);
+      }
+    }
+    if (node.type === 'ClassDeclaration' || node.type === 'ClassExpression') {
+      collectBindingNames(node.id as BrowserCodeAstNode | undefined, names);
+    }
+    if (node.type === 'CatchClause') collectBindingNames(node.param as BrowserCodeAstNode | undefined, names);
+    if (node.type === 'ImportSpecifier' || node.type === 'ImportDefaultSpecifier' || node.type === 'ImportNamespaceSpecifier') {
+      collectBindingNames(node.local as BrowserCodeAstNode | undefined, names);
+    }
+  });
+  return names;
+}
+
+function restrictedRuntimeIdentifierViolation(code: string) {
+  const ast = parseBrowserCodeAst(code);
+  if (!ast) return undefined;
+  const declaredNames = declaredBrowserCodeNames(ast);
+  const forbiddenNames = new Set(['page', 'context', 'browser', 'tab', 'agent', 'attachmentVault', 'credentialVault']);
+  let violation: string | undefined;
+  walkBrowserCodeAst(ast, (node) => {
+    if (node.type !== 'MemberExpression' && node.type !== 'OptionalMemberExpression') return;
+    const receiver = node.object as BrowserCodeAstNode | undefined;
+    if (
+      receiver?.type === 'Identifier'
+      && typeof receiver.name === 'string'
+      && forbiddenNames.has(receiver.name)
+      && !declaredNames.has(receiver.name)
+    ) {
+      violation = receiver.name;
+      return false;
+    }
+  });
+  return violation;
+}
+
+function browserCodeMemberPath(node: BrowserCodeAstNode | undefined): string[] | undefined {
+  if (!node) return undefined;
+  if (node.type === 'Identifier' && typeof node.name === 'string') return [node.name];
+  if (node.type !== 'MemberExpression' && node.type !== 'OptionalMemberExpression') return undefined;
+  const parent = browserCodeMemberPath(node.object as BrowserCodeAstNode | undefined);
+  if (!parent) return undefined;
+  const property = node.property as BrowserCodeAstNode | undefined;
+  const name = node.computed === true
+    ? property?.type === 'Literal' && typeof property.value === 'string' ? property.value : undefined
+    : property?.type === 'Identifier' && typeof property.name === 'string' ? property.name : undefined;
+  return name ? [...parent, name] : undefined;
+}
+
+export function browserCodeHasImageOperation(code: string) {
+  const ast = parseBrowserCodeAst(code);
+  if (!ast) return false;
+  let found = false;
+  walkBrowserCodeAst(ast, (node) => {
+    const path = browserCodeMemberPath(node)?.join('.');
+    if (path === 'browserApi.screenshot' || path === 'nodeRepl.emitImage' || path?.endsWith('.screenshot')) {
+      found = true;
+      return false;
+    }
+    if (
+      node.type === 'VariableDeclarator'
+      && (node.init as BrowserCodeAstNode | undefined)?.type === 'Identifier'
+      && ['browserApi', 'nodeRepl'].includes(String((node.init as BrowserCodeAstNode).name || ''))
+      && (node.id as BrowserCodeAstNode | undefined)?.type === 'ObjectPattern'
+    ) {
+      const properties = (node.id as BrowserCodeAstNode).properties;
+      if (Array.isArray(properties) && properties.some((property) => {
+        const key = (property as BrowserCodeAstNode).key as BrowserCodeAstNode | undefined;
+        return key?.type === 'Identifier' && ['screenshot', 'emitImage'].includes(String(key.name || ''));
+      })) {
+        found = true;
+        return false;
+      }
+    }
+  });
+  return found;
+}
+
+export function browserCodePolicyViolation(code: string, mode: BrowserCodeRuntimeMode = 'free') {
+  if (mode === 'restricted' && restrictedRuntimeIdentifierViolation(code)) {
+    return 'Restricted browserCode exposes only browserApi, nodeRepl, and console. Read system-browser-api-runtime and replace direct Playwright/runtime-object access with the documented browserApi method.';
+  }
   if (/\.dispatchEvent\s*\(\s*(?:[^,()]+,\s*)?['"]click['"]/i.test(code)) {
     return 'browserCode forbids dispatchEvent("click") because it bypasses Playwright actionability. Refresh the DOM evidence and use one unique visible Playwright locator.';
   }
@@ -229,6 +403,7 @@ export type BrowserCodeKernelOptions = {
   maxHeapBytes?: number;
   maxRssBytes?: number;
   readyTimeoutMs?: number;
+  runtimeMode?: BrowserCodeRuntimeMode;
   sessionGroupId?: string;
 };
 
@@ -243,7 +418,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 29;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 30;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -251,7 +426,7 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, normalized));
 }
 
-function browserCodeWithoutComments(code: string) {
+function browserCodeWithoutComments(code: string, eraseStrings = false) {
   let result = '';
   let quote = '';
   let escaped = false;
@@ -280,7 +455,7 @@ function browserCodeWithoutComments(code: string) {
       continue;
     }
     if (quote) {
-      result += character;
+      result += eraseStrings && character !== '\n' && character !== '\r' ? ' ' : character;
       if (escaped) escaped = false;
       else if (character === '\\') escaped = true;
       else if (character === quote) quote = '';
@@ -298,15 +473,19 @@ function browserCodeWithoutComments(code: string) {
       index += 1;
       continue;
     }
-    if (character === '\'' || character === '"' || character === '`') quote = character;
-    result += character;
+    if (character === '\'' || character === '"' || character === '`') {
+      quote = character;
+      result += eraseStrings ? ' ' : character;
+    } else {
+      result += character;
+    }
   }
   return result;
 }
 
 export function browserCodeHasCommittingAction(code: string) {
   const source = browserCodeWithoutComments(code);
-  return /\.(?:click|dblclick|check|uncheck|press|setInputFiles|selectOption|submit)\s*\(/i.test(source)
+  return /\.(?:click|dblclick|check|uncheck|press|setInputFiles|selectOption|submit|act|navigate|keyboard|pointer|setTextSelection)\s*\(/i.test(source)
     || /\bfetch\s*\([\s\S]*?\bmethod\s*:\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]/i.test(source)
     || /\.open\s*\(\s*['"`](?:POST|PUT|PATCH|DELETE)['"`]/i.test(source)
     || /\bsendBeacon\s*\(/i.test(source)
@@ -383,6 +562,9 @@ function browserCodeKernelMain() {
     url: string;
     width: number;
   };
+  type CoordinateRectEvidence = CoordinateClickEvidence & {
+    rect: { height: number; width: number; x: number; y: number };
+  };
   type KernelPageObservation = BrowserCodePageObservation;
   type ActionObservation = {
     action: string;
@@ -396,6 +578,8 @@ function browserCodeKernelMain() {
   );
   let browser: import('playwright').Browser | undefined;
   let replServer: import('node:repl').REPLServer | undefined;
+  let runtimeMode: BrowserCodeRuntimeMode = 'free';
+  let selectedRuntimePage: import('playwright').Page | undefined;
   let sessionGroupId = '';
   let activeExecution: {
     actions: string[];
@@ -407,12 +591,15 @@ function browserCodeKernelMain() {
     attachments: Map<string, BrowserCodeAttachmentBinding>;
     credentials: Map<string, BrowserCodeCredentialBinding>;
     pendingCoordinateClickEvidence: Map<import('playwright').Page, CoordinateClickEvidence>;
+    pendingCoordinateRectEvidence: Map<import('playwright').Page, CoordinateRectEvidence[]>;
     observationsBeforeAction: WeakMap<import('playwright').Page, KernelPageObservation>;
     verification?: BrowserCodeActivity['verification'];
   } | undefined;
   const screenshotProvenance = new WeakMap<object, CoordinateClickEvidence & { fullPage: boolean }>();
   const screenshotProvenanceByDigest = new Map<string, CoordinateClickEvidence & { fullPage: boolean }>();
   const coordinateClickEvidenceByDocument = new Map<string, CoordinateClickEvidence>();
+  const coordinateRectEvidenceByDocument = new Map<string, CoordinateRectEvidence[]>();
+  const restrictedObservedCssTargetsByPage = new WeakMap<import('playwright').Page, { documentId: string; targets: Set<string> }>();
   const lastActionObservationByPage = new WeakMap<import('playwright').Page, ActionObservation>();
   let chain = Promise.resolve();
 
@@ -1234,18 +1421,67 @@ function browserCodeKernelMain() {
     && evidence.scrollY === current.scrollY
   );
 
-  const consumeCoordinateClickEvidence = async (page: import('playwright').Page) => {
+  const coordinateEvidenceMaxAgeMs = 5 * 60_000;
+
+  const coordinatePointInsideRect = (
+    x: number,
+    y: number,
+    rect: CoordinateRectEvidence['rect'],
+  ) => (
+    Number.isFinite(x)
+    && Number.isFinite(y)
+    && rect.width > 0
+    && rect.height > 0
+    && x >= rect.x
+    && x <= rect.x + rect.width
+    && y >= rect.y
+    && y <= rect.y + rect.height
+  );
+
+  const requireCoordinateClickEvidence = async (
+    page: import('playwright').Page,
+    x: number,
+    y: number,
+  ) => {
     const current = await captureCoordinateClickState(page);
-    const evidence = current
+    if (!current || !Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error('Coordinate clicking requires finite viewport coordinates and current page evidence.');
+    }
+    if (x < 0 || y < 0 || x > current.width || y > current.height) {
+      throw new Error(`Coordinate (${x}, ${y}) is outside the current ${current.width}x${current.height} viewport.`);
+    }
+
+    const screenshotEvidence = current
       ? coordinateClickEvidenceByDocument.get(current.documentId)
       : undefined;
-    if (!evidence || !current) {
-      throw new Error('Coordinate clicking requires a viewport screenshot emitted by the previous browserCode cell and reviewed by the model before this cell.');
+    if (
+      screenshotEvidence
+      && Date.now() - screenshotEvidence.capturedAt <= coordinateEvidenceMaxAgeMs
+      && sameCoordinateClickState(screenshotEvidence, current)
+    ) {
+      return;
     }
-    coordinateClickEvidenceByDocument.delete(current.documentId);
-    if (Date.now() - evidence.capturedAt > 5 * 60_000 || !sameCoordinateClickState(evidence, current)) {
-      throw new Error('The previously emitted viewport screenshot is stale because the page document, URL, viewport, zoom, or scroll position changed. Emit and review a new screenshot in a separate browserCode cell.');
+    if (screenshotEvidence) coordinateClickEvidenceByDocument.delete(current.documentId);
+
+    const publishedRects = coordinateRectEvidenceByDocument.get(current.documentId) || [];
+    const pendingRects = activeExecution?.pendingCoordinateRectEvidence.get(page) || [];
+    const validRects = [...publishedRects, ...pendingRects].filter((evidence) => (
+      Date.now() - evidence.capturedAt <= coordinateEvidenceMaxAgeMs
+      && sameCoordinateClickState(evidence, current)
+    ));
+    if (validRects.some((evidence) => coordinatePointInsideRect(x, y, evidence.rect))) {
+      return;
     }
+    if (publishedRects.length) {
+      if (validRects.length) coordinateRectEvidenceByDocument.set(current.documentId, validRects.slice(-50));
+      else coordinateRectEvidenceByDocument.delete(current.documentId);
+    }
+
+    throw new Error(
+      'Coordinate clicking requires either a fresh emitted viewport screenshot from a previous browserCode cell, '
+      + 'or a point inside the current rect returned by boundingBox() for one exact visible actionable Locator. '
+      + 'Screenshot evidence remains reusable until the document, URL, viewport, zoom, scroll position, or five-minute validity window changes.',
+    );
   };
 
   const decoratePageScreenshotPrototype = (page: import('playwright').Page) => {
@@ -1409,6 +1645,7 @@ function browserCodeKernelMain() {
     const frameLocator = framePrototype && Reflect.get(framePrototype, 'locator');
     const locatorFilter = Reflect.get(prototype, 'filter');
     const locatorFill = Reflect.get(prototype, 'fill');
+    const locatorBoundingBox = Reflect.get(prototype, 'boundingBox');
     if (!nativeFrameLocator && typeof frameLocator === 'function') {
       nativeFrameLocator = frameLocator as (this: object, selector: string) => import('playwright').Locator;
     }
@@ -1419,6 +1656,48 @@ function browserCodeKernelMain() {
       nativeLocatorFilter = locatorFilter as (this: object, options?: unknown) => import('playwright').Locator;
     }
     pointerDecoratedLocatorPrototypes.add(prototype);
+    if (typeof locatorBoundingBox === 'function') {
+      try {
+        Object.defineProperty(prototype, 'boundingBox', {
+          configurable: true,
+          value: async function trackedLocatorBoundingBox(this: object, ...args: unknown[]) {
+            const targetPage = locatorPage(this);
+            const targetLocator = targetPage && activeExecution
+              ? await resolveActionableLocator(this, 'click')
+              : this;
+            const rect = await Reflect.apply(locatorBoundingBox, targetLocator, args) as {
+              height: number;
+              width: number;
+              x: number;
+              y: number;
+            } | null;
+            if (
+              targetPage
+              && activeExecution
+              && rect
+              && [rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)
+              && rect.width > 0
+              && rect.height > 0
+            ) {
+              const state = await captureCoordinateClickState(targetPage);
+              if (state) {
+                const evidence: CoordinateRectEvidence = {
+                  ...state,
+                  capturedAt: Date.now(),
+                  rect: { height: rect.height, width: rect.width, x: rect.x, y: rect.y },
+                };
+                const previous = activeExecution.pendingCoordinateRectEvidence.get(targetPage) || [];
+                activeExecution.pendingCoordinateRectEvidence.set(targetPage, [...previous, evidence].slice(-50));
+              }
+            }
+            return rect;
+          },
+          writable: true,
+        });
+      } catch {
+        // Keep the native boundingBox implementation when the Playwright prototype is immutable.
+      }
+    }
     for (const name of ['locator', 'getByAltText', 'getByLabel', 'getByPlaceholder', 'getByRole', 'getByTestId', 'getByText', 'getByTitle']) {
       const original = Reflect.get(prototype, name);
       if (typeof original !== 'function') continue;
@@ -1729,7 +2008,7 @@ function browserCodeKernelMain() {
         Object.defineProperty(mouse, 'click', {
           configurable: true,
           value: async (x: number, y: number, options?: { button?: string; clickCount?: number }) => {
-            await consumeCoordinateClickEvidence(page);
+            await requireCoordinateClickEvidence(page, x, y);
             await markPageObserved(page);
             prepareStateChangingAction(page, 'mouse.click');
             const kind = options?.button === 'right' ? 'right' : (options?.clickCount || 1) > 1 ? 'double' : 'click';
@@ -1803,9 +2082,12 @@ function browserCodeKernelMain() {
     if (!replServer) throw new Error('browserCode JavaScript kernel is not initialized.');
     if (page.isClosed()) throw new Error('Cannot select a closed browser tab.');
     decoratePage(page);
-    replServer.context.page = page;
-    replServer.context.context = page.context();
-    replServer.context.tab = tabForPage(page);
+    selectedRuntimePage = page;
+    if (runtimeMode === 'free') {
+      replServer.context.page = page;
+      replServer.context.context = page.context();
+      replServer.context.tab = tabForPage(page);
+    }
     recordAction('tab.use');
     return page;
   };
@@ -2289,7 +2571,7 @@ function browserCodeKernelMain() {
     })).catch(() => ({ id: undefined, title: undefined }));
     return {
       id: tabId(page),
-      active: replServer?.context.page === page,
+      active: selectedRuntimePage === page,
       groupId: group.id,
       groupTitle: group.title,
       lastOpened: Date.now(),
@@ -2318,6 +2600,7 @@ function browserCodeKernelMain() {
       'Use browser.tabs.list()/new()/use()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), attachmentVault.setInputFiles(), and nodeRepl.emitImage().',
       'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: CSS-hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
+      'Coordinate clicks require either reusable fresh viewport-screenshot evidence from a previous cell or a point inside a rect returned by boundingBox() for one exact visible actionable Locator. Rect-derived clicks work without image input.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       'Every session Page exposes setTextSelection(locator, spec). Call it on the Page that owns the locator, including for frame locators, then use that same Page keyboard.insertText()/press() in the same cell. Use browser.tabs.use(tab) or tab.use() when the global page binding should switch tabs.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
@@ -2348,7 +2631,7 @@ function browserCodeKernelMain() {
         if (options.url !== undefined && !requestedUrl) {
           throw new Error('browser.tabs.new received an empty URL. Omit the argument for a blank tab or provide a non-empty URL.');
         }
-        const selected = replServer?.context.context as import('playwright').BrowserContext | undefined;
+        const selected = selectedRuntimePage?.context();
         const targetContext = selected || browser?.contexts()[0];
         if (!targetContext) throw new Error('No browser context is available.');
         const newPage = await createSessionPage(targetContext);
@@ -2373,7 +2656,7 @@ function browserCodeKernelMain() {
     type: 'playwright',
     user: Object.freeze({
       claimTab: async (value: unknown) => {
-        const currentPage = replServer?.context.page as import('playwright').Page | undefined;
+        const currentPage = selectedRuntimePage;
         const claimedPage = value === undefined || value === null
           ? currentPage && !currentPage.isClosed() ? currentPage : currentPages().at(-1)
           : pageFromTab(value);
@@ -2402,6 +2685,916 @@ function browserCodeKernelMain() {
     }),
   });
 
+  type RestrictedLocatorTarget = {
+    tabId?: string;
+    frame?: { exact?: boolean; name?: string; selector?: string; url?: string };
+    within?: RestrictedLocatorTarget;
+    by: 'role' | 'text' | 'label' | 'placeholder' | 'testId' | 'altText' | 'title' | 'css' | 'id';
+    role?: string;
+    name?: string;
+    text?: string;
+    selector?: string;
+    id?: string;
+    exact?: boolean;
+    filter?: { hasText?: string; hasNotText?: string; visible?: boolean };
+    index?: number | 'first' | 'last';
+  };
+
+  const restrictedRecord = (value: unknown, label: string) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`${label} must be an object.`);
+    }
+    return value as Record<string, unknown>;
+  };
+
+  const restrictedExactRecord = (
+    value: unknown,
+    label: string,
+    allowedKeys: readonly string[],
+    fieldHints: Record<string, string> = {},
+  ) => {
+    const record = restrictedRecord(value, label);
+    const allowed = new Set(allowedKeys);
+    const unexpected = Object.keys(record).filter((key) => !allowed.has(key));
+    if (unexpected.length) {
+      const hints = unexpected.map((key) => fieldHints[key]).filter(Boolean);
+      throw new Error(
+        `${label} contains unsupported field${unexpected.length === 1 ? '' : 's'}: ${unexpected.join(', ')}.`
+        + (hints.length ? ` ${hints.join(' ')}` : ` Allowed fields: ${allowedKeys.join(', ')}.`),
+      );
+    }
+    return record;
+  };
+
+  const restrictedString = (value: unknown, label: string) => {
+    const text = typeof value === 'string' ? value.trim() : '';
+    if (!text) throw new Error(`${label} must be a non-empty string.`);
+    return text;
+  };
+
+  const restrictedTimeout = (value: unknown) => {
+    if (value === undefined) return undefined;
+    const timeout = Number(value);
+    if (!Number.isFinite(timeout) || timeout <= 0 || timeout > 120_000) {
+      throw new Error('timeoutMs must be between 1 and 120000.');
+    }
+    return Math.floor(timeout);
+  };
+
+  const restrictedPage = async (tabIdValue?: unknown) => {
+    const requestedId = typeof tabIdValue === 'string' ? tabIdValue.trim() : '';
+    const page = requestedId
+      ? pageFromTab(requestedId)
+      : selectedRuntimePage && !selectedRuntimePage.isClosed()
+        ? selectedRuntimePage
+        : (await currentSessionTabEntries()).find((entry) => entry.info.active)?.page
+          || (await currentSessionTabEntries()).at(-1)?.page;
+    if (!page || page.isClosed()) throw new Error('The requested browser tab is no longer available.');
+    if (sessionGroupId) {
+      const info = await tabInfo(page);
+      if (info.groupId !== sessionGroupId) {
+        throw new Error('The requested browser tab does not belong to the current conversation tab group.');
+      }
+    }
+    decoratePage(page);
+    tabForPage(page);
+    return page;
+  };
+
+  const restrictedCssTargetKey = (target: unknown) => {
+    if (!target || typeof target !== 'object' || Array.isArray(target)) return undefined;
+    const record = target as Record<string, unknown>;
+    if (record.by !== 'css' || typeof record.selector !== 'string' || !record.selector.trim()) return undefined;
+    const stable = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(stable);
+      if (!value || typeof value !== 'object') return value;
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => key !== 'tabId')
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, stable(item)]));
+    };
+    return JSON.stringify(stable(record));
+  };
+
+  const rememberRestrictedCssTarget = async (page: import('playwright').Page, target: unknown, count: number) => {
+    const key = count > 0 ? restrictedCssTargetKey(target) : undefined;
+    if (!key) return;
+    const state = await captureCoordinateClickState(page);
+    if (!state) return;
+    const previous = restrictedObservedCssTargetsByPage.get(page);
+    const targets = previous?.documentId === state.documentId ? previous.targets : new Set<string>();
+    targets.add(key);
+    restrictedObservedCssTargetsByPage.set(page, { documentId: state.documentId, targets });
+  };
+
+  const requireRestrictedCssTargetEvidence = async (page: import('playwright').Page, target: unknown) => {
+    const key = restrictedCssTargetKey(target);
+    if (!key) return;
+    const state = await captureCoordinateClickState(page);
+    const observed = restrictedObservedCssTargetsByPage.get(page);
+    if (state && observed?.documentId === state.documentId && observed.targets.has(key)) return;
+    throw new Error(
+      'EVIDENCE REQUIRED: CSS action targets must first be resolved by browserApi.read({target,operation:"count"}) '
+      + 'or browserApi.inspect({target}) and return at least one current rendered match. Do not use an action as a selector probe.',
+    );
+  };
+
+  const restrictedLocator = async (
+    page: import('playwright').Page,
+    rawTarget: unknown,
+    inheritedRoot?: unknown,
+  ): Promise<import('playwright').Locator> => {
+    const target = restrictedExactRecord(rawTarget, 'LocatorTarget', [
+      'tabId', 'frame', 'within', 'by', 'role', 'name', 'text', 'selector', 'id', 'exact', 'filter', 'index',
+    ]) as RestrictedLocatorTarget;
+    const by = restrictedString(target.by, 'LocatorTarget.by') as RestrictedLocatorTarget['by'];
+    type RestrictedLocatorRoot = import('playwright').Page
+      | import('playwright').Frame
+      | import('playwright').FrameLocator
+      | import('playwright').Locator;
+    let root = inheritedRoot as RestrictedLocatorRoot | undefined;
+    if (!root) {
+      root = page;
+      if (target.frame) {
+        const frame = restrictedExactRecord(target.frame, 'LocatorTarget.frame', ['exact', 'name', 'selector', 'url']);
+        const selector = typeof frame.selector === 'string' ? frame.selector.trim() : '';
+        if (selector) {
+          root = page.frameLocator(selector);
+        } else {
+          const name = typeof frame.name === 'string' ? frame.name.trim() : '';
+          const url = typeof frame.url === 'string' ? frame.url.trim() : '';
+          if (!name && !url) throw new Error('LocatorTarget.frame requires selector, name, or url.');
+          const exact = frame.exact === true;
+          const frames = page.frames().filter((candidateFrame) => {
+            if (name) return exact ? candidateFrame.name() === name : candidateFrame.name().includes(name);
+            return exact ? candidateFrame.url() === url : candidateFrame.url().includes(url);
+          });
+          if (frames.length !== 1) {
+            throw new Error(`LocatorTarget.frame matched ${frames.length} frames; refine it to exactly one.`);
+          }
+          root = frames[0];
+        }
+      }
+    }
+    if (target.within) root = await restrictedLocator(page, target.within, root);
+    if (!root) throw new Error('LocatorTarget could not resolve its page/frame scope.');
+    const exact = target.exact === true;
+    let locator: import('playwright').Locator;
+    switch (by) {
+      case 'role': {
+        const role = restrictedString(target.role, 'LocatorTarget.role');
+        locator = root.getByRole(role as Parameters<import('playwright').Page['getByRole']>[0], {
+          ...(typeof target.name === 'string' ? { name: target.name } : {}),
+          exact,
+        });
+        break;
+      }
+      case 'text': locator = root.getByText(restrictedString(target.text, 'LocatorTarget.text'), { exact }); break;
+      case 'label': locator = root.getByLabel(restrictedString(target.text, 'LocatorTarget.text'), { exact }); break;
+      case 'placeholder': locator = root.getByPlaceholder(restrictedString(target.text, 'LocatorTarget.text'), { exact }); break;
+      case 'testId': locator = root.getByTestId(restrictedString(target.text, 'LocatorTarget.text')); break;
+      case 'altText': locator = root.getByAltText(restrictedString(target.text, 'LocatorTarget.text'), { exact }); break;
+      case 'title': locator = root.getByTitle(restrictedString(target.text, 'LocatorTarget.text'), { exact }); break;
+      case 'css': locator = root.locator(restrictedString(target.selector, 'LocatorTarget.selector')); break;
+      case 'id': locator = root.locator(`[id=${JSON.stringify(restrictedString(target.id, 'LocatorTarget.id'))}]`); break;
+      default: throw new Error(`Unsupported LocatorTarget.by: ${by}.`);
+    }
+    if (target.filter) {
+      const filter = restrictedExactRecord(target.filter, 'LocatorTarget.filter', ['hasText', 'hasNotText', 'visible']);
+      locator = locator.filter({
+        ...(typeof filter.hasText === 'string' ? { hasText: filter.hasText } : {}),
+        ...(typeof filter.hasNotText === 'string' ? { hasNotText: filter.hasNotText } : {}),
+        ...(typeof filter.visible === 'boolean' ? { visible: filter.visible } : {}),
+      });
+    }
+    if (target.index === 'first') locator = locator.first();
+    else if (target.index === 'last') locator = locator.last();
+    else if (typeof target.index === 'number' && Number.isFinite(target.index)) locator = locator.nth(Math.floor(target.index));
+    return locator;
+  };
+
+  const restrictedSingleLocator = async (page: import('playwright').Page, target: unknown) => {
+    const locator = await restrictedLocator(page, target);
+    const count = await locator.count();
+    if (count !== 1) throw new Error(`LocatorTarget matched ${count} rendered elements; refine it to exactly one.`);
+    return locator;
+  };
+
+  const restrictedCredentialSafeValue = (value: unknown) => {
+    if (typeof value !== 'string' || !activeExecution) return value;
+    return [...activeExecution.credentials.values()].some((credential) => credential.value === value)
+      ? '[credential-redacted]'
+      : value;
+  };
+
+  const restrictedInspect = async (inputValue: unknown) => {
+    const input = inputValue === undefined
+      ? {}
+      : restrictedExactRecord(inputValue, 'browserApi.inspect input', ['target', 'tabId', 'limit', 'attributes']);
+    const target = input.target;
+    const page = await restrictedPage(
+      target && typeof target === 'object' && !Array.isArray(target)
+        ? (target as Record<string, unknown>).tabId
+        : input.tabId,
+    );
+    const locator = target
+      ? await restrictedLocator(page, target)
+      : page.locator('input, select, textarea, button, a, [role], [contenteditable="true"]');
+    const count = await locator.count();
+    if (target) await rememberRestrictedCssTarget(page, target, count);
+    const requestedLimit = input.limit === undefined ? 20 : Number(input.limit);
+    const limit = Math.max(1, Math.min(100, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 20));
+    const requestedAttributes = Array.isArray(input.attributes)
+      ? input.attributes.map((value) => String(value).trim()).filter(Boolean).slice(0, 30)
+      : ['id', 'name', 'type', 'role', 'aria-label', 'aria-expanded', 'aria-checked', 'placeholder', 'href', 'data-testid'];
+    const items = [];
+    for (let index = 0; index < Math.min(count, limit); index += 1) {
+      const item = locator.nth(index);
+      const attributes: Record<string, string> = {};
+      for (const name of requestedAttributes) {
+        const value = await item.getAttribute(name).catch(() => null);
+        if (value !== null) attributes[name] = value;
+      }
+      const tag = await item.evaluate((element) => element.tagName.toLowerCase()).catch(() => '');
+      const text = (await item.innerText({ timeout: browserCodeActionTimeoutMs }).catch(() => '')).trim().slice(0, 2_000);
+      const value = restrictedCredentialSafeValue(
+        await item.inputValue({ timeout: browserCodeActionTimeoutMs }).catch(() => undefined),
+      );
+      const checked = await item.isChecked({ timeout: browserCodeActionTimeoutMs }).catch(() => undefined);
+      const rect = await item.boundingBox().catch(() => null);
+      items.push({
+        index,
+        tag,
+        text,
+        ...(value !== undefined ? { value } : {}),
+        ...(attributes.role ? { role: attributes.role } : {}),
+        visible: await item.isVisible().catch(() => false),
+        enabled: await item.isEnabled().catch(() => false),
+        editable: await item.isEditable().catch(() => false),
+        ...(checked !== undefined ? { checked } : {}),
+        attributes,
+        ...(rect ? { rect } : {}),
+      });
+    }
+    return { count, items };
+  };
+
+  const restrictedRead = async (inputValue: unknown) => {
+    const input = restrictedExactRecord(inputValue, 'browserApi.read input', [
+      'target', 'operation', 'attribute', 'attributes', 'limit',
+    ]);
+    const target = restrictedRecord(input.target, 'browserApi.read target');
+    const page = await restrictedPage(target.tabId);
+    const locator = await restrictedLocator(page, target);
+    const operation = restrictedString(input.operation, 'browserApi.read operation');
+    const limitValue = input.limit === undefined ? 50 : Number(input.limit);
+    const limit = Math.max(1, Math.min(100, Number.isFinite(limitValue) ? Math.floor(limitValue) : 50));
+    if (operation === 'count') {
+      const count = await locator.count();
+      await rememberRestrictedCssTarget(page, target, count);
+      return count;
+    }
+    if (operation === 'texts') {
+      const texts = (await locator.allInnerTexts()).slice(0, limit);
+      await rememberRestrictedCssTarget(page, target, texts.length);
+      return texts;
+    }
+    if (operation === 'values') {
+      const count = Math.min(await locator.count(), limit);
+      const values = [];
+      for (let index = 0; index < count; index += 1) {
+        values.push(restrictedCredentialSafeValue(await locator.nth(index).inputValue()));
+      }
+      await rememberRestrictedCssTarget(page, target, count);
+      return values;
+    }
+    const item = await restrictedSingleLocator(page, target);
+    await rememberRestrictedCssTarget(page, target, 1);
+    if (operation === 'text') return item.innerText();
+    if (operation === 'value') return restrictedCredentialSafeValue(await item.inputValue());
+    if (operation === 'attribute') {
+      return restrictedCredentialSafeValue(await item.getAttribute(restrictedString(input.attribute, 'browserApi.read attribute')));
+    }
+    if (operation === 'attributes') {
+      const names = Array.isArray(input.attributes)
+        ? input.attributes.map((value) => restrictedString(value, 'browserApi.read attributes[]')).slice(0, 30)
+        : [];
+      if (!names.length) throw new Error('browserApi.read attributes requires a non-empty attributes array.');
+      const values: Record<string, string | null> = {};
+      for (const name of names) values[name] = restrictedCredentialSafeValue(await item.getAttribute(name)) as string | null;
+      return values;
+    }
+    if (operation === 'visible') return item.isVisible();
+    if (operation === 'enabled') return item.isEnabled();
+    if (operation === 'editable') return item.isEditable();
+    if (operation === 'checked') return item.isChecked();
+    if (operation === 'rect') {
+      const rect = await item.boundingBox();
+      if (!rect) throw new Error('The exact target has no current rendered rectangle.');
+      return rect;
+    }
+    if (operation === 'aria') return item.ariaSnapshot({ timeout: browserCodeActionTimeoutMs });
+    if (operation === 'html') return item.innerHTML();
+    throw new Error(`Unsupported browserApi.read operation: ${operation}.`);
+  };
+
+  const restrictedTabs = Object.freeze({
+    list: async () => (await currentSessionTabEntries()).map((entry) => entry.info),
+    current: async () => tabInfo(await restrictedPage()),
+    new: async (inputValue: unknown = {}) => {
+      const input = typeof inputValue === 'string' ? { url: inputValue } : restrictedRecord(inputValue, 'browserApi.tabs.new input');
+      const wrapper = await browserRuntime.tabs.new(
+        typeof input.url === 'string' ? { url: restrictedString(input.url, 'browserApi.tabs.new url') } : {},
+      );
+      const page = pageFromTab(wrapper);
+      if (!page) throw new Error('The newly created browser tab is unavailable.');
+      return tabInfo(page);
+    },
+    use: async (inputValue: unknown) => {
+      const input = restrictedRecord(inputValue, 'browserApi.tabs.use input');
+      const page = await restrictedPage(restrictedString(input.tabId, 'browserApi.tabs.use tabId'));
+      selectPage(page);
+      return tabInfo(page);
+    },
+    close: async (inputValue: unknown = {}) => {
+      const input = restrictedRecord(inputValue, 'browserApi.tabs.close input');
+      const page = await restrictedPage(input.tabId);
+      const closed = tabId(page);
+      recordAction('tabs.close');
+      await page.close();
+      const remaining = await currentSessionTabEntries();
+      const nextPage = remaining.at(-1)?.page;
+      if (nextPage) selectPage(nextPage);
+      else selectedRuntimePage = undefined;
+      return { closed, ...(nextPage ? { current: await tabInfo(nextPage) } : {}) };
+    },
+    finalize: async (inputValue: unknown = {}) => {
+      const input = restrictedRecord(inputValue, 'browserApi.tabs.finalize input');
+      const keep = Array.isArray(input.keep) ? input.keep : [];
+      const normalized = await Promise.all(keep.map(async (value) => {
+        const item = restrictedRecord(value, 'browserApi.tabs.finalize keep[]');
+        const status: 'deliverable' | 'handoff' | undefined = item.status === 'handoff' ? 'handoff' : item.status === 'deliverable' ? 'deliverable' : undefined;
+        if (!status) throw new Error('browserApi.tabs.finalize keep[].status must be deliverable or handoff.');
+        return { status, tab: tabForPage(await restrictedPage(restrictedString(item.tabId, 'browserApi.tabs.finalize keep[].tabId'))) };
+      }));
+      return browserRuntime.tabs.finalize({ keep: normalized });
+    },
+  });
+
+  const restrictedNavigate = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.navigate input');
+    const action = restrictedString(input.action, 'browserApi.navigate action');
+    const page = await restrictedPage(input.tabId);
+    const timeout = restrictedTimeout(input.timeoutMs);
+    const waitUntil = typeof input.waitUntil === 'string'
+      ? input.waitUntil as NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil']
+      : undefined;
+    if (action === 'goto') await page.goto(restrictedString(input.url, 'browserApi.navigate url'), { timeout, waitUntil });
+    else if (action === 'reload') await page.reload({ timeout, waitUntil } as Parameters<import('playwright').Page['reload']>[0]);
+    else if (action === 'back') await page.goBack({ timeout, waitUntil } as Parameters<import('playwright').Page['goBack']>[0]);
+    else if (action === 'forward') await page.goForward({ timeout, waitUntil } as Parameters<import('playwright').Page['goForward']>[0]);
+    else throw new Error(`Unsupported browserApi.navigate action: ${action}.`);
+    return tabInfo(page);
+  };
+
+  const restrictedAct = async (inputValue: unknown) => {
+    const input = restrictedExactRecord(inputValue, 'browserApi.act input', [
+      'target', 'target2', 'action', 'text', 'key', 'delay', 'value', 'attachmentId', 'credentialRef',
+      'button', 'clickCount', 'modifiers', 'position', 'force', 'timeoutMs', 'expectNavigation',
+      'expectPopup', 'expectResponse', 'expectDownload', 'dialog',
+    ], {
+      filter: 'Move filter under target.filter.',
+      index: 'Move index under target.index.',
+      within: 'Move within under target.within.',
+      frame: 'Move frame under target.frame.',
+    });
+    const target = restrictedRecord(input.target, 'browserApi.act target');
+    const page = await restrictedPage(target.tabId);
+    const action = restrictedString(input.action, 'browserApi.act action');
+    if (action !== 'upload') await requireRestrictedCssTargetEvidence(page, target);
+    const locator = action === 'upload'
+      ? await restrictedLocator(page, target)
+      : await restrictedSingleLocator(page, target);
+    const timeout = restrictedTimeout(input.timeoutMs);
+    if (action !== 'upload' && !(await locator.isVisible().catch(() => false))) {
+      throw new Error(
+        `ACTIONABILITY FAILED: browserApi.act action=${action} resolved a hidden native element or an element inside a hidden ancestor. `
+        + 'force cannot make hidden controls interactive. Inspect the current active surface and operate its visible custom trigger, option, or increment/decrement control instead.',
+      );
+    }
+    const actionOptions = {
+      ...(typeof input.button === 'string' ? { button: input.button as 'left' | 'middle' | 'right' } : {}),
+      ...(typeof input.clickCount === 'number' ? { clickCount: Math.floor(input.clickCount) } : {}),
+      ...(Array.isArray(input.modifiers) ? { modifiers: input.modifiers as Array<'Alt' | 'Control' | 'ControlOrMeta' | 'Meta' | 'Shift'> } : {}),
+      ...(input.position && typeof input.position === 'object' ? { position: input.position as { x: number; y: number } } : {}),
+      ...(typeof input.force === 'boolean' ? { force: input.force } : {}),
+      ...(timeout ? { timeout } : {}),
+    };
+    const eventTimeout = restrictedTimeout(
+      input.expectNavigation && typeof input.expectNavigation === 'object'
+        ? (input.expectNavigation as Record<string, unknown>).timeoutMs
+        : input.timeoutMs,
+    ) || browserCodeNavigationTimeoutMs;
+    const dialogPromise = input.dialog && typeof input.dialog === 'object'
+      ? page.waitForEvent('dialog', { timeout: eventTimeout }).then(async (dialog) => {
+        const options = restrictedRecord(input.dialog, 'browserApi.act dialog');
+        if (options.action === 'accept') await dialog.accept(typeof options.promptText === 'string' ? options.promptText : undefined);
+        else if (options.action === 'dismiss') await dialog.dismiss();
+        else throw new Error('browserApi.act dialog.action must be accept or dismiss.');
+        return { message: dialog.message(), type: dialog.type() };
+      })
+      : undefined;
+    const popupPromise = input.expectPopup === true
+      ? page.waitForEvent('popup', { timeout: eventTimeout })
+      : undefined;
+    const responseInput = input.expectResponse && typeof input.expectResponse === 'object'
+      ? input.expectResponse as Record<string, unknown>
+      : undefined;
+    const responsePromise = responseInput
+      ? page.waitForResponse((candidate) => {
+        const expected = restrictedString(responseInput.url, 'browserApi.act expectResponse.url');
+        const urlMatches = responseInput.exact === true ? candidate.url() === expected : candidate.url().includes(expected);
+        const statusMatches = responseInput.status === undefined || candidate.status() === Number(responseInput.status);
+        const methodMatches = responseInput.method === undefined || candidate.request().method() === String(responseInput.method).toUpperCase();
+        return urlMatches && statusMatches && methodMatches;
+      }, { timeout: restrictedTimeout(responseInput.timeoutMs) || eventTimeout })
+      : undefined;
+    const downloadPromise = input.expectDownload === true
+      ? page.waitForEvent('download', { timeout: eventTimeout })
+      : undefined;
+    const navigationInput = input.expectNavigation && typeof input.expectNavigation === 'object'
+      ? input.expectNavigation as Record<string, unknown>
+      : undefined;
+    const navigationPromise = navigationInput
+      ? typeof navigationInput.url === 'string'
+        ? page.waitForURL(navigationInput.url, {
+          timeout: eventTimeout,
+          waitUntil: typeof navigationInput.waitUntil === 'string'
+            ? navigationInput.waitUntil as NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil']
+            : undefined,
+        })
+        : page.waitForNavigation({
+          timeout: eventTimeout,
+          waitUntil: typeof navigationInput.waitUntil === 'string'
+            ? navigationInput.waitUntil as NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil']
+            : undefined,
+        })
+      : undefined;
+    let value: unknown;
+    if (action === 'click') value = await locator.click(actionOptions);
+    else if (action === 'dblclick') value = await locator.dblclick(actionOptions);
+    else if (action === 'hover') value = await locator.hover(actionOptions);
+    else if (action === 'tap') value = await locator.tap(actionOptions);
+    else if (action === 'focus') value = await locator.focus({ timeout });
+    else if (action === 'blur') value = await locator.blur({ timeout });
+    else if (action === 'fill') value = await locator.fill(typeof input.text === 'string' ? input.text : '', { timeout });
+    else if (action === 'clear') value = await locator.clear({ timeout });
+    else if (action === 'type') value = await locator.pressSequentially(typeof input.text === 'string' ? input.text : '', { delay: Number(input.delay) || 0, timeout });
+    else if (action === 'press') value = await locator.press(restrictedString(input.key, 'browserApi.act key'), { delay: Number(input.delay) || 0, timeout });
+    else if (action === 'check') value = await locator.check(actionOptions);
+    else if (action === 'uncheck') value = await locator.uncheck(actionOptions);
+    else if (action === 'selectOption') value = await locator.selectOption(input.value as Parameters<import('playwright').Locator['selectOption']>[0], { timeout });
+    else if (action === 'setInputValue') {
+      const descriptor = await locator.evaluate((element) => ({
+        tag: element.tagName.toLowerCase(),
+        type: element instanceof HTMLInputElement ? element.type.toLowerCase() : '',
+      }));
+      if (descriptor.tag === 'select') {
+        const selected = await locator.selectOption(input.value as Parameters<import('playwright').Locator['selectOption']>[0], { timeout });
+        value = { selected, value: restrictedCredentialSafeValue(await locator.inputValue({ timeout })) };
+      } else if (descriptor.tag === 'input' || descriptor.tag === 'textarea') {
+        if (descriptor.type === 'file') throw new Error('browserApi.act setInputValue cannot set file inputs; use action="upload" with attachmentId.');
+        if (descriptor.type === 'checkbox' || descriptor.type === 'radio') {
+          throw new Error(`browserApi.act setInputValue cannot set input[type=${descriptor.type}]; use action="check" or "uncheck".`);
+        }
+        if (typeof input.value !== 'string' && typeof input.value !== 'number') {
+          throw new Error('browserApi.act setInputValue requires a string or number value for input/textarea controls.');
+        }
+        const nextValue = String(input.value);
+        const formats: Record<string, RegExp> = {
+          date: /^\d{4}-\d{2}-\d{2}$/,
+          time: /^\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/,
+          month: /^\d{4}-\d{2}$/,
+          week: /^\d{4}-W\d{2}$/,
+          'datetime-local': /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?$/,
+          color: /^#[0-9a-f]{6}$/i,
+        };
+        const format = formats[descriptor.type];
+        if (format && !format.test(nextValue)) {
+          throw new Error(`browserApi.act setInputValue received invalid input[type=${descriptor.type}] value format: ${nextValue}.`);
+        }
+        if ((descriptor.type === 'number' || descriptor.type === 'range') && !Number.isFinite(Number(nextValue))) {
+          throw new Error(`browserApi.act setInputValue requires a finite numeric value for input[type=${descriptor.type}].`);
+        }
+        await locator.fill(nextValue, { timeout });
+        value = { type: descriptor.type || descriptor.tag, value: restrictedCredentialSafeValue(await locator.inputValue({ timeout })) };
+      } else {
+        throw new Error(`browserApi.act setInputValue supports only input, textarea, and select; received ${descriptor.tag || 'unknown'}.`);
+      }
+    }
+    else if (action === 'scrollIntoView') value = await locator.scrollIntoViewIfNeeded({ timeout });
+    else if (action === 'dragTo') {
+      const destinationTarget = restrictedRecord(input.target2, 'browserApi.act target2');
+      await requireRestrictedCssTargetEvidence(page, destinationTarget);
+      const destination = await restrictedSingleLocator(page, destinationTarget);
+      if (!(await destination.isVisible().catch(() => false))) {
+        throw new Error('ACTIONABILITY FAILED: browserApi.act dragTo destination is hidden or inside a hidden ancestor.');
+      }
+      value = await locator.dragTo(destination, { force: input.force === true, timeout });
+    } else if (action === 'upload') {
+      const upload = await attachmentVault.setInputFiles(locator, restrictedString(input.attachmentId, 'browserApi.act attachmentId'));
+      value = {
+        uploaded: upload.uploaded,
+        fileName: upload.fileName,
+        selectedFiles: upload.selectedFiles,
+      };
+    } else if (action === 'credentialFill') {
+      value = await credentialVault.fill(locator, restrictedString(input.credentialRef, 'browserApi.act credentialRef'));
+    } else {
+      throw new Error(`Unsupported browserApi.act action: ${action}.`);
+    }
+    const [popup, dialog, , response, download] = await Promise.all([
+      popupPromise || Promise.resolve(undefined),
+      dialogPromise || Promise.resolve(undefined),
+      navigationPromise || Promise.resolve(undefined),
+      responsePromise || Promise.resolve(undefined),
+      downloadPromise || Promise.resolve(undefined),
+    ] as const);
+    if (popup) {
+      decoratePage(popup);
+      agentCreatedPages.add(popup);
+      selectPage(popup);
+    }
+    const actionSurface = lastActionObservationByPage.get(page)?.after;
+    return {
+      action,
+      tab: await tabInfo(popup || page),
+      ...(value !== undefined ? { value } : {}),
+      ...(popup ? { popup: await tabInfo(popup) } : {}),
+      ...(dialog ? { dialog } : {}),
+      ...(response ? { response: { method: response.request().method(), status: response.status(), url: response.url() } } : {}),
+      ...(download ? { download: { suggestedFilename: download.suggestedFilename(), url: download.url() } } : {}),
+      ...(actionSurface ? {
+        surface: {
+          activeSurface: actionSurface.activeSurface,
+          surfaceTransition: actionSurface.surfaceTransition,
+          topSurfaceIds: actionSurface.topSurfaceIds,
+        },
+      } : {}),
+    };
+  };
+
+  const restrictedKeyboard = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.keyboard input');
+    const action = restrictedString(input.action, 'browserApi.keyboard action');
+    const page = await restrictedPage(input.tabId);
+    if (action === 'press') await page.keyboard.press(restrictedString(input.key, 'browserApi.keyboard key'), { delay: Number(input.delay) || 0 });
+    else if (action === 'type') await page.keyboard.type(typeof input.text === 'string' ? input.text : '', { delay: Number(input.delay) || 0 });
+    else if (action === 'insertText') await page.keyboard.insertText(typeof input.text === 'string' ? input.text : '');
+    else throw new Error(`Unsupported browserApi.keyboard action: ${action}.`);
+    return { action, tab: await tabInfo(page) };
+  };
+
+  const restrictedPointerPositionByPage = new WeakMap<import('playwright').Page, { x: number; y: number }>();
+
+  const restrictedPointer = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.pointer input');
+    const action = restrictedString(input.action, 'browserApi.pointer action');
+    const page = await restrictedPage(input.tabId);
+    const button = typeof input.button === 'string' ? input.button as 'left' | 'middle' | 'right' : undefined;
+    if (action === 'click' || action === 'dblclick') {
+      const x = Number(input.x);
+      const y = Number(input.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('browserApi.pointer click requires finite x and y.');
+      await page.mouse.click(x, y, { button, clickCount: action === 'dblclick' ? 2 : Number(input.clickCount) || 1 });
+      restrictedPointerPositionByPage.set(page, { x, y });
+    } else if (action === 'move') {
+      const x = Number(input.x);
+      const y = Number(input.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('browserApi.pointer move requires finite x and y.');
+      await requireCoordinateClickEvidence(page, x, y);
+      await page.mouse.move(x, y, { steps: Number(input.steps) || 1 });
+      restrictedPointerPositionByPage.set(page, { x, y });
+    } else if (action === 'down' || action === 'up') {
+      const position = restrictedPointerPositionByPage.get(page);
+      if (!position) throw new Error(`browserApi.pointer ${action} requires a preceding evidenced move or click on this tab.`);
+      await requireCoordinateClickEvidence(page, position.x, position.y);
+      if (action === 'down') await page.mouse.down({ button });
+      else await page.mouse.up({ button });
+    }
+    else if (action === 'wheel') await page.mouse.wheel(Number(input.deltaX) || 0, Number(input.deltaY) || 0);
+    else throw new Error(`Unsupported browserApi.pointer action: ${action}.`);
+    return { action, tab: await tabInfo(page) };
+  };
+
+  const rememberRestrictedScreenshot = async (
+    page: import('playwright').Page,
+    image: Buffer,
+    fullPage: boolean,
+  ) => {
+    const state = await captureCoordinateClickState(page);
+    if (!state) return image;
+    const provenance = { ...state, capturedAt: Date.now(), fullPage };
+    screenshotProvenance.set(image, provenance);
+    screenshotProvenanceByDigest.set(imageDigest(image), provenance);
+    while (screenshotProvenanceByDigest.size > 20) {
+      const oldestDigest = screenshotProvenanceByDigest.keys().next().value;
+      if (typeof oldestDigest !== 'string') break;
+      screenshotProvenanceByDigest.delete(oldestDigest);
+    }
+    return image;
+  };
+
+  const captureRestrictedViewport = async (
+    page: import('playwright').Page,
+    options: { fullPage: boolean; quality?: number; type: 'jpeg' | 'png' },
+  ) => {
+    let client: Awaited<ReturnType<import('playwright').BrowserContext['newCDPSession']>> | undefined;
+    try {
+      client = await page.context().newCDPSession(page);
+      const capture = settleKernelTask((async () => {
+        const metrics = await client!.send('Page.getLayoutMetrics');
+        const source = options.fullPage ? metrics.cssContentSize : metrics.cssVisualViewport;
+        const x = 'pageX' in source ? source.pageX : source.x;
+        const y = 'pageY' in source ? source.pageY : source.y;
+        const width = 'clientWidth' in source ? source.clientWidth : source.width;
+        const height = 'clientHeight' in source ? source.clientHeight : source.height;
+        return client!.send('Page.captureScreenshot', {
+          captureBeyondViewport: options.fullPage,
+          clip: {
+            x,
+            y,
+            width: Math.max(1, width),
+            height: Math.max(1, height),
+            scale: 1,
+          },
+          format: options.type,
+          fromSurface: true,
+          optimizeForSpeed: true,
+          ...(options.type === 'jpeg' && options.quality ? { quality: options.quality } : {}),
+        });
+      })(), 8_000, 'Fast browser screenshot');
+      const captured = await capture;
+      if (!captured.ok) throw new Error(captured.error);
+      return rememberRestrictedScreenshot(page, ChildBuffer.from(captured.value.data, 'base64'), options.fullPage);
+    } catch (error) {
+      safeConsole.warn(`Fast screenshot unavailable; using Playwright fallback: ${error instanceof Error ? error.message : String(error)}`);
+      const image = await page.screenshot({
+        fullPage: options.fullPage,
+        type: options.type,
+        timeout: 8_000,
+        ...(options.type === 'jpeg' && options.quality ? { quality: options.quality } : {}),
+      });
+      return image;
+    } finally {
+      await client?.detach().catch(() => undefined);
+    }
+  };
+
+  const restrictedScreenshot = async (inputValue: unknown = {}) => {
+    const input = restrictedExactRecord(inputValue, 'browserApi.screenshot input', [
+      'tabId', 'target', 'fullPage', 'type', 'quality',
+    ]);
+    const target = input.target && typeof input.target === 'object' && !Array.isArray(input.target)
+      ? input.target as Record<string, unknown>
+      : undefined;
+    const page = await restrictedPage(target?.tabId || input.tabId);
+    const type = input.type === 'jpeg' ? 'jpeg' : 'png';
+    const screenshotOptions = {
+      fullPage: input.fullPage === true,
+      type,
+      ...(type === 'jpeg' && Number.isFinite(Number(input.quality))
+        ? { quality: Math.max(1, Math.min(100, Math.floor(Number(input.quality)))) }
+        : {}),
+    } as const;
+    const image = target
+      ? await (await restrictedSingleLocator(page, target)).screenshot({
+        type,
+        timeout: 8_000,
+        ...(type === 'jpeg' && 'quality' in screenshotOptions ? { quality: screenshotOptions.quality } : {}),
+      })
+      : await captureRestrictedViewport(page, screenshotOptions);
+    const emitted = await nodeRepl.emitImage(image);
+    return { ...emitted, tab: await tabInfo(page) };
+  };
+
+  const restrictedViewport = async (inputValue: unknown = {}) => {
+    const input = restrictedRecord(inputValue, 'browserApi.viewport input');
+    const page = await restrictedPage(input.tabId);
+    const action = input.action === undefined ? 'get' : restrictedString(input.action, 'browserApi.viewport action');
+    if (action === 'set') {
+      const width = Number(input.width);
+      const height = Number(input.height);
+      if (!Number.isInteger(width) || width < 1 || width > 10_000 || !Number.isInteger(height) || height < 1 || height > 10_000) {
+        throw new Error('browserApi.viewport set requires integer width and height between 1 and 10000.');
+      }
+      recordAction('viewport.set');
+      await page.setViewportSize({ width, height });
+    } else if (action !== 'get') {
+      throw new Error('browserApi.viewport action must be get or set.');
+    }
+    const metrics = await page.evaluate(() => ({
+      devicePixelRatio: window.devicePixelRatio,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      visualScale: window.visualViewport?.scale || 1,
+    }));
+    return { action, viewport: page.viewportSize(), ...metrics, tab: await tabInfo(page) };
+  };
+
+  const restrictedWait = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.wait input');
+    const kind = restrictedString(input.kind, 'browserApi.wait kind');
+    const page = await restrictedPage(input.tabId || (
+      input.target && typeof input.target === 'object' && !Array.isArray(input.target)
+        ? (input.target as Record<string, unknown>).tabId
+        : undefined
+    ));
+    const timeout = restrictedTimeout(input.timeoutMs);
+    if (kind === 'timeout') {
+      const ms = Number(input.ms);
+      if (!Number.isFinite(ms) || ms < 0 || ms > 30_000) throw new Error('browserApi.wait timeout ms must be between 0 and 30000.');
+      await page.waitForTimeout(ms);
+      return { kind, ms };
+    }
+    if (kind === 'loadState') {
+      const state = input.state === 'networkidle' || input.state === 'load' ? input.state : 'domcontentloaded';
+      await page.waitForLoadState(state, { timeout });
+      return { kind, state, url: page.url() };
+    }
+    if (kind === 'url') {
+      const expected = restrictedString(input.url, 'browserApi.wait url');
+      const waitUntil = typeof input.waitUntil === 'string'
+        ? input.waitUntil as NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil']
+        : undefined;
+      await page.waitForURL(input.exact === true ? expected : (url) => url.href.includes(expected), { timeout, waitUntil });
+      return { kind, url: page.url() };
+    }
+    if (kind === 'locator') {
+      const locator = await restrictedLocator(page, restrictedRecord(input.target, 'browserApi.wait target'));
+      const state = input.state === 'attached' || input.state === 'detached' || input.state === 'hidden' ? input.state : 'visible';
+      await locator.waitFor({ state, timeout });
+      return { kind, state, count: await locator.count() };
+    }
+    if (kind === 'response') {
+      const expected = restrictedString(input.url, 'browserApi.wait url');
+      const response = await page.waitForResponse((candidate) => {
+        const urlMatches = input.exact === true ? candidate.url() === expected : candidate.url().includes(expected);
+        const statusMatches = input.status === undefined || candidate.status() === Number(input.status);
+        const methodMatches = input.method === undefined || candidate.request().method() === String(input.method).toUpperCase();
+        return urlMatches && statusMatches && methodMatches;
+      }, { timeout });
+      return { kind, url: response.url(), status: response.status(), method: response.request().method() };
+    }
+    throw new Error(`Unsupported browserApi.wait kind: ${kind}.`);
+  };
+
+  const restrictedVerify = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.verify input');
+    const page = await restrictedPage(input.tabId || (
+      input.target && typeof input.target === 'object' && !Array.isArray(input.target)
+        ? (input.target as Record<string, unknown>).tabId
+        : undefined
+    ));
+    const locator = input.target ? await restrictedLocator(page, input.target) : undefined;
+    return verifyPageState(page, {
+      description: restrictedString(input.description, 'browserApi.verify description'),
+      ...(locator ? { locator } : {}),
+      ...(typeof input.state === 'string' ? { state: input.state as BrowserCodeVerifyStateInput['state'] } : {}),
+      ...(typeof input.attribute === 'string' ? { attribute: input.attribute } : {}),
+      ...(typeof input.equals === 'string' ? { equals: input.equals } : {}),
+      ...(typeof input.includes === 'string' ? { includes: input.includes } : {}),
+      ...(typeof input.url === 'string' ? { url: input.url } : {}),
+      ...(typeof input.activeSurface === 'string' ? { activeSurface: input.activeSurface as BrowserCodeVerifyStateInput['activeSurface'] } : {}),
+    });
+  };
+
+  const restrictedSetTextSelection = async (inputValue: unknown) => {
+    const input = restrictedRecord(inputValue, 'browserApi.setTextSelection input');
+    const target = restrictedRecord(input.target, 'browserApi.setTextSelection target');
+    const page = await restrictedPage(target.tabId);
+    const locator = await restrictedSingleLocator(page, target);
+    const selection = restrictedRecord(input.selection, 'browserApi.setTextSelection selection') as BrowserTextSelectionSpec;
+    const extendedPage = page as import('playwright').Page & {
+      setTextSelection: (targetLocator: import('playwright').Locator, spec: BrowserTextSelectionSpec) => Promise<unknown>;
+    };
+    return extendedPage.setTextSelection(locator, selection);
+  };
+
+  const restrictedAuditForm = async (inputValue: unknown = {}) => {
+    const input = restrictedRecord(inputValue, 'browserApi.auditForm input');
+    const page = await restrictedPage(input.tabId);
+    const root = input.root ? await restrictedLocator(page, input.root) : page.locator('body');
+    const controls = root.locator('input, select, textarea, button, [contenteditable="true"]');
+    const count = await controls.count();
+    const requestedLimit = input.limit === undefined ? 100 : Number(input.limit);
+    const limit = Math.max(1, Math.min(200, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 100));
+    const items = [];
+    let unresolved = 0;
+    for (let index = 0; index < Math.min(count, limit); index += 1) {
+      const control = controls.nth(index);
+      const attributes: Record<string, string | null> = {};
+      for (const name of ['id', 'name', 'type', 'role', 'aria-label', 'placeholder', 'required', 'disabled', 'data-testid']) {
+        attributes[name] = await control.getAttribute(name).catch(() => null);
+      }
+      const text = (await control.innerText().catch(() => '')).trim().slice(0, 500);
+      const label = attributes['aria-label'] || attributes.placeholder || text;
+      if (!label) unresolved += 1;
+      items.push({
+        index,
+        tag: await control.evaluate((element) => element.tagName.toLowerCase()).catch(() => ''),
+        label,
+        attributes,
+        editable: await control.isEditable().catch(() => false),
+        enabled: await control.isEnabled().catch(() => false),
+        checked: await control.isChecked().catch(() => undefined),
+      });
+    }
+    return { controls: items, count, unresolved, truncated: count > limit };
+  };
+
+  const browserApi = Object.freeze({
+    documentation: async () => [
+      'Restricted browserCode exposes only browserApi, nodeRepl, and console.',
+      'Read system-browser-api-runtime for complete signatures and examples.',
+      'Available methods: documentation, current, snapshot, surface, inspect, read, tabs.*, navigate, act, keyboard, pointer, setTextSelection, screenshot, viewport, wait, verify, auditForm.',
+      'All inputs are documented plain records and all outputs are JSON-safe values; no Playwright or DOM objects are returned.',
+    ].join('\n'),
+    current: async () => tabInfo(await restrictedPage()),
+    snapshot: async (inputValue: unknown = {}) => {
+      const input = restrictedRecord(inputValue, 'browserApi.snapshot input');
+      const page = await restrictedPage(input.tabId);
+      const extendedPage = page as import('playwright').Page & { domSnapshot: (options?: { scope?: 'active' | 'all' }) => Promise<string> };
+      return extendedPage.domSnapshot({ scope: input.scope === 'all' ? 'all' : 'active' });
+    },
+    surface: async (inputValue: unknown = {}) => {
+      const input = restrictedRecord(inputValue, 'browserApi.surface input');
+      const page = await restrictedPage(input.tabId);
+      const extendedPage = page as import('playwright').Page & { activeSurface: () => Promise<unknown> };
+      return extendedPage.activeSurface();
+    },
+    inspect: restrictedInspect,
+    read: restrictedRead,
+    tabs: restrictedTabs,
+    navigate: restrictedNavigate,
+    act: restrictedAct,
+    keyboard: restrictedKeyboard,
+    pointer: restrictedPointer,
+    setTextSelection: restrictedSetTextSelection,
+    screenshot: restrictedScreenshot,
+    viewport: restrictedViewport,
+    wait: restrictedWait,
+    verify: restrictedVerify,
+    auditForm: restrictedAuditForm,
+  });
+
+  const restrictedBrowserApiRoutes = new Map<string, (...args: unknown[]) => unknown>([
+    ['documentation', browserApi.documentation],
+    ['current', browserApi.current],
+    ['snapshot', browserApi.snapshot],
+    ['surface', browserApi.surface],
+    ['inspect', browserApi.inspect],
+    ['read', browserApi.read],
+    ['tabs.list', browserApi.tabs.list],
+    ['tabs.current', browserApi.tabs.current],
+    ['tabs.new', browserApi.tabs.new],
+    ['tabs.use', browserApi.tabs.use],
+    ['tabs.close', browserApi.tabs.close],
+    ['tabs.finalize', browserApi.tabs.finalize],
+    ['navigate', browserApi.navigate],
+    ['act', browserApi.act],
+    ['keyboard', browserApi.keyboard],
+    ['pointer', browserApi.pointer],
+    ['setTextSelection', browserApi.setTextSelection],
+    ['screenshot', browserApi.screenshot],
+    ['viewport', browserApi.viewport],
+    ['wait', browserApi.wait],
+    ['verify', browserApi.verify],
+    ['auditForm', browserApi.auditForm],
+  ]);
+
+  const restrictedBrowserApiDispatch = (route: unknown, args: unknown) => {
+    const method = restrictedBrowserApiRoutes.get(typeof route === 'string' ? route : '');
+    if (!method) throw new Error(`Unknown restricted browser API route: ${String(route)}.`);
+    return method(...(Array.isArray(args) ? args : []));
+  };
+
+  const restrictedNodeReplDispatch = (route: unknown, args: unknown) => {
+    if (route !== 'write') throw new Error(`Unknown restricted nodeRepl route: ${String(route)}.`);
+    return nodeRepl.write(Array.isArray(args) ? args[0] : undefined);
+  };
+
+  const restrictedConsoleDispatch = (route: unknown, args: unknown) => {
+    if (!['log', 'info', 'warn', 'error'].includes(String(route))) {
+      throw new Error(`Unknown restricted console route: ${String(route)}.`);
+    }
+    return Reflect.apply(
+      safeConsole[String(route) as 'log' | 'info' | 'warn' | 'error'],
+      safeConsole,
+      Array.isArray(args) ? args : [],
+    );
+  };
+
   const evaluateCell = (code: string) => new Promise<unknown>((resolve, reject) => {
     if (!replServer) {
       reject(new Error('browserCode JavaScript kernel is not initialized.'));
@@ -2423,8 +3616,90 @@ function browserCodeKernelMain() {
     });
   });
 
-  const initialize = async (input: { connection: BrowserCodeConnection; sessionGroupId?: string }) => {
+  const installRestrictedRuntimeBindings = async () => {
+    if (!replServer) throw new Error('browserCode JavaScript kernel is not initialized.');
+    Object.defineProperties(replServer.context, {
+      __browserApiHostDispatch: {
+        configurable: true,
+        enumerable: false,
+        value: restrictedBrowserApiDispatch,
+        writable: false,
+      },
+      __nodeReplHostDispatch: {
+        configurable: true,
+        enumerable: false,
+        value: restrictedNodeReplDispatch,
+        writable: false,
+      },
+      __consoleHostDispatch: {
+        configurable: true,
+        enumerable: false,
+        value: restrictedConsoleDispatch,
+        writable: false,
+      },
+    });
+    await evaluateCell([
+      '{',
+      '  const browserDispatch = globalThis.__browserApiHostDispatch;',
+      '  const replDispatch = globalThis.__nodeReplHostDispatch;',
+      '  const consoleDispatch = globalThis.__consoleHostDispatch;',
+      '  delete globalThis.__browserApiHostDispatch;',
+      '  delete globalThis.__nodeReplHostDispatch;',
+      '  delete globalThis.__consoleHostDispatch;',
+      '  const clone = (value) => {',
+      '    if (value === undefined) return undefined;',
+      '    return JSON.parse(JSON.stringify(value));',
+      '  };',
+      '  const call = async (route, args) => {',
+      '    try { return clone(await browserDispatch(route, args)); }',
+      '    catch (error) { throw new Error(error && error.message ? String(error.message) : String(error)); }',
+      '  };',
+      '  const tabs = Object.freeze({',
+      '    list: (...args) => call("tabs.list", args),',
+      '    current: (...args) => call("tabs.current", args),',
+      '    new: (...args) => call("tabs.new", args),',
+      '    use: (...args) => call("tabs.use", args),',
+      '    close: (...args) => call("tabs.close", args),',
+      '    finalize: (...args) => call("tabs.finalize", args),',
+      '  });',
+      '  const api = Object.freeze({',
+      '    documentation: (...args) => call("documentation", args),',
+      '    current: (...args) => call("current", args),',
+      '    snapshot: (...args) => call("snapshot", args),',
+      '    surface: (...args) => call("surface", args),',
+      '    inspect: (...args) => call("inspect", args),',
+      '    read: (...args) => call("read", args),',
+      '    tabs,',
+      '    navigate: (...args) => call("navigate", args),',
+      '    act: (...args) => call("act", args),',
+      '    keyboard: (...args) => call("keyboard", args),',
+      '    pointer: (...args) => call("pointer", args),',
+      '    setTextSelection: (...args) => call("setTextSelection", args),',
+      '    screenshot: (...args) => call("screenshot", args),',
+      '    viewport: (...args) => call("viewport", args),',
+      '    wait: (...args) => call("wait", args),',
+      '    verify: (...args) => call("verify", args),',
+      '    auditForm: (...args) => call("auditForm", args),',
+      '  });',
+      '  const replApi = Object.freeze({ write: (...args) => replDispatch("write", args) });',
+      '  const consoleApi = Object.freeze({',
+      '    log: (...args) => consoleDispatch("log", args),',
+      '    info: (...args) => consoleDispatch("info", args),',
+      '    warn: (...args) => consoleDispatch("warn", args),',
+      '    error: (...args) => consoleDispatch("error", args),',
+      '  });',
+      '  Object.defineProperties(globalThis, {',
+      '    browserApi: { configurable:false, enumerable:true, value:api, writable:false },',
+      '    nodeRepl: { configurable:false, enumerable:true, value:replApi, writable:false },',
+      '    console: { configurable:false, enumerable:true, value:consoleApi, writable:false },',
+      '  });',
+      '}',
+    ].join('\n'));
+  };
+
+  const initialize = async (input: { connection: BrowserCodeConnection; runtimeMode?: BrowserCodeRuntimeMode; sessionGroupId?: string }) => {
     if (browser || replServer) return;
+    runtimeMode = input.runtimeMode === 'restricted' ? 'restricted' : 'free';
     sessionGroupId = String(input.sessionGroupId || '').trim();
     const { chromium } = childRequire('playwright') as typeof import('playwright');
     browser = input.connection.protocol === 'cdp'
@@ -2445,19 +3720,25 @@ function browserCodeKernelMain() {
       terminal: false,
       useGlobal: false,
     });
-    Object.defineProperties(replServer.context, {
+    const sharedBindings: PropertyDescriptorMap = {
       Buffer: { configurable: false, enumerable: false, value: undefined, writable: false },
-      attachmentVault: { configurable: false, enumerable: true, value: attachmentVault, writable: false },
-      console: { configurable: false, enumerable: true, value: safeConsole, writable: false },
       global: { configurable: false, enumerable: false, value: undefined, writable: false },
       module: { configurable: false, enumerable: false, value: undefined, writable: false },
-      nodeRepl: { configurable: false, enumerable: true, value: nodeRepl, writable: false },
-      credentialVault: { configurable: false, enumerable: true, value: credentialVault, writable: false },
-      agent: { configurable: false, enumerable: true, value: agentRuntime, writable: false },
-      browser: { configurable: false, enumerable: true, value: browserRuntime, writable: false },
       process: { configurable: false, enumerable: false, value: undefined, writable: false },
       require: { configurable: false, enumerable: false, value: undefined, writable: false },
-    });
+    };
+    Object.defineProperties(replServer.context, runtimeMode === 'restricted'
+      ? sharedBindings
+      : {
+        ...sharedBindings,
+        console: { configurable: false, enumerable: true, value: safeConsole, writable: false },
+        nodeRepl: { configurable: false, enumerable: true, value: nodeRepl, writable: false },
+        attachmentVault: { configurable: false, enumerable: true, value: attachmentVault, writable: false },
+        credentialVault: { configurable: false, enumerable: true, value: credentialVault, writable: false },
+        agent: { configurable: false, enumerable: true, value: agentRuntime, writable: false },
+        browser: { configurable: false, enumerable: true, value: browserRuntime, writable: false },
+      });
+    if (runtimeMode === 'restricted') await installRestrictedRuntimeBindings();
     send({ type: 'ready' });
   };
 
@@ -2495,9 +3776,13 @@ function browserCodeKernelMain() {
       contextPage.setDefaultTimeout(browserCodeActionTimeoutMs);
       contextPage.setDefaultNavigationTimeout(browserCodeNavigationTimeoutMs);
     }
-    replServer.context.page = page;
-    replServer.context.context = browserContext;
-    replServer.context.tab = tabForPage(page);
+    selectedRuntimePage = page;
+    tabForPage(page);
+    if (runtimeMode === 'free') {
+      replServer.context.page = page;
+      replServer.context.context = browserContext;
+      replServer.context.tab = tabForPage(page);
+    }
     activeExecution = {
       actions: [],
       imageBytes: 0,
@@ -2508,6 +3793,7 @@ function browserCodeKernelMain() {
       attachments: new Map((input.attachments || []).map((attachment) => [attachment.ref, attachment])),
       credentials: new Map((input.credentials || []).map((credential) => [credential.ref, credential])),
       pendingCoordinateClickEvidence: new Map(),
+      pendingCoordinateRectEvidence: new Map(),
       observationsBeforeAction: new WeakMap(),
     };
     const publishPendingCoordinateClickEvidence = async () => {
@@ -2521,6 +3807,18 @@ function browserCodeKernelMain() {
           coordinateClickEvidenceByDocument.delete(oldestDocumentId);
         }
       }
+      for (const evidenceList of activeExecution.pendingCoordinateRectEvidence.values()) {
+        for (const evidence of evidenceList) {
+          const previous = coordinateRectEvidenceByDocument.get(evidence.documentId) || [];
+          coordinateRectEvidenceByDocument.delete(evidence.documentId);
+          coordinateRectEvidenceByDocument.set(evidence.documentId, [...previous, evidence].slice(-50));
+        }
+        while (coordinateRectEvidenceByDocument.size > 20) {
+          const oldestDocumentId = coordinateRectEvidenceByDocument.keys().next().value;
+          if (typeof oldestDocumentId !== 'string') break;
+          coordinateRectEvidenceByDocument.delete(oldestDocumentId);
+        }
+      }
     };
 
     try {
@@ -2529,7 +3827,7 @@ function browserCodeKernelMain() {
       const outputs = activeExecution.outputs;
       const images = activeExecution.images;
       const logs = activeExecution.logs;
-      const selectedPage = replServer.context.page as import('playwright').Page | undefined;
+      const selectedPage = selectedRuntimePage;
       const finalPage = selectedPage && !selectedPage.isClosed() ? selectedPage : undefined;
       const finalPageCount = browserContext.pages().filter((candidatePage) => !candidatePage.isClosed()).length;
       const navigationChanged = Boolean(finalPage && finalPage.url() !== initialUrl);
@@ -2593,7 +3891,7 @@ function browserCodeKernelMain() {
     const input = rawInput as Record<string, unknown>;
     chain = chain.then(async () => {
       if (input.type === 'init') {
-        await initialize(input as { connection: BrowserCodeConnection; sessionGroupId?: string });
+        await initialize(input as { connection: BrowserCodeConnection; runtimeMode?: BrowserCodeRuntimeMode; sessionGroupId?: string });
         return;
       }
       if (input.type === 'execute') {
@@ -2741,7 +4039,13 @@ export class BrowserCodeKernel {
       ? Math.max(1_000, Math.floor(input.maxOutputChars))
       : undefined;
     let attachmentBindings: BrowserCodeAttachmentBinding[] = [];
-    if (/\battachmentVault\s*\.\s*setInputFiles\s*\(/i.test(browserCodeWithoutComments(input.code))) {
+    if (
+      /\battachmentVault\s*\.\s*setInputFiles\s*\(/i.test(browserCodeWithoutComments(input.code))
+      || (
+        this.options.runtimeMode === 'restricted'
+        && /\bbrowserApi\s*\.\s*act\s*\(/i.test(browserCodeWithoutComments(input.code))
+      )
+    ) {
       try {
         if (!this.tempDir) throw new Error('browserCode attachment staging directory is unavailable.');
         attachmentBindings = (input.attachments || []).map((attachment, index) => {
@@ -2882,6 +4186,7 @@ export class BrowserCodeKernel {
     child.send({
       type: 'init',
       connection: this.connection,
+      runtimeMode: this.options.runtimeMode === 'restricted' ? 'restricted' : 'free',
       sessionGroupId: String(this.options.sessionGroupId || '').trim(),
     }, (error) => {
       if (!error) return;

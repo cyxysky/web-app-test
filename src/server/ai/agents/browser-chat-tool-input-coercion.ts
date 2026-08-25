@@ -90,8 +90,28 @@ function documentTypeFromFileName(value: unknown) {
   return undefined;
 }
 
+function browserCodeFromGeneratedMarkup(value: unknown) {
+  if (typeof value !== 'string') return value;
+  let code = value.trim();
+  code = code
+    .replace(/^```(?:javascript|js)?[ \t]*\r?\n/i, '')
+    .replace(/\r?\n```[ \t]*$/i, '')
+    .replace(/^<code(?:\s[^>]*)?>\s*/i, '')
+    .replace(/\s*<\/code>$/i, '')
+    .trim();
+  return code;
+}
+
 /** Scalar transport normalization only; never reshape a document or program. */
 export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
+  if (toolName === 'browserCode') {
+    const source = recordFromUnknown(unwrapToolTransport(value));
+    if (!source) return value;
+    return {
+      ...source,
+      ...('code' in source ? { code: browserCodeFromGeneratedMarkup(source.code) } : {}),
+    };
+  }
   if (toolName !== 'file' && toolName !== 'fileVisual') return value;
   const source = recordFromUnknown(unwrapToolTransport(value));
   if (!source) return value;

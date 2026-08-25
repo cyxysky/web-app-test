@@ -93,6 +93,7 @@ function normalizeLoosePipeTables(value: string) {
 
 function normalizeMarkdownSegment(value: string) {
   return normalizeLoosePipeTables(restoreCollapsedMarkdownBlocks(value))
+    .replace(/(^|\n)(#{1,6})(?=[A-Za-z\u3400-\u9fff])/g, '$1$2 ')
     .replace(/\\\*\\\*([^\n]+?)\\\*\\\*/g, '**$1**')
     .replace(/\*\*((?:https?:\/\/)[^\s*<>]+)\*\*/gi, '**<$1>**')
     .replace(/\r\n?/g, '\n')

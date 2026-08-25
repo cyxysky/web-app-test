@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, browserChatCodeRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserCodeRules, browserContextLine, screenshotObservationRule } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
-    ...browserCodeRules(),
-    ...browserActionRules(screenshotAvailable),
-    screenshotObservationRule(screenshotAvailable),
+    ...browserCodeRules('free'),
+    ...browserActionRules(screenshotAvailable, 'free'),
+    screenshotObservationRule(screenshotAvailable, 'free'),
   ].join('\n');
 }
 
@@ -43,15 +43,13 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /upload-only request, do not call file/i);
   assert.match(rules, /FileChooser\.setFiles/);
   assert.match(rules, /exactly one attachment (?:remains )?at the requested destination/i);
-  assert.match(rules, /action=plan.*action=generate.*action=edit.*action=render/);
-  assert.match(rules, /action=edit supports replaceRange, insertBefore, insertAfter, deleteRange/);
-  assert.match(rules, /visual QA is mandatory/i);
-  assert.match(rules, /explicit passed review for every page/i);
+  assert.match(rules, /system-file-artifact-runtime/);
+  assert.match(rules, /system-subagent-runtime/);
+  assert.match(rules, /file plan\/generate\/edit\/render\/convert\/jsApi\/unoApi/);
+  assert.match(rules, /file list\/read\/download remain available/);
   assert.doesNotMatch(rules, /expectedRevision/);
-  assert.match(rules, /Once source exists, never call generate again/);
-  assert.match(rules, /Complete unversioned program replacement through edit is unsupported/);
-  assert.match(rules, /different IDs and output formats may coexist/i);
-  assert.match(rules, /configured UNO or JavaScript mode/i);
+  assert.doesNotMatch(rules, /lastSuccessfulRevision/);
+  assert.doesNotMatch(rules, /CharHeight/);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /extra contains mounted non-actionable records/);
@@ -94,9 +92,11 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /record the failed locator and actual count/i);
   assert.match(rules, /do not (?:describe|call) (?:a )?failure as transient/i);
   assert.doesNotMatch(rules, /do not omit the failed tool call from the final report/i);
-  assert.match(rules, /two separate model steps/);
-  assert.match(rules, /Same-cell screenshot-and-click is forbidden/);
-  assert.match(rules, /document, URL, viewport, zoom, or scroll-position change/i);
+  assert.match(rules, /multiple coordinate clicks/i);
+  assert.match(rules, /Locator\.boundingBox\(\)/);
+  assert.match(rules, /works for non-visual models/i);
+  assert.match(rules, /same-cell screenshot-and-click is forbidden/i);
+  assert.match(rules, /document, URL, viewport, zoom, (?:or )?scroll[ -]position/i);
   assert.match(rules, /Playwright delivery alone does not prove business success/);
   assert.match(rules, /newly opened nonmodal surface as a bounded interaction transaction/);
   assert.match(rules, /final read-only check of both business success and page\.activeSurface/);
@@ -115,20 +115,26 @@ test('screenshot guidance stays inside browserCode', () => {
   assert.match(combinedRules(true), /page\.screenshot/);
   assert.doesNotMatch(combinedRules(false), /takeScreenshot/);
   assert.match(combinedRules(false), /browserCode for inspection and browser operations/);
+  assert.match(combinedRules(false), /current exact Locator\.boundingBox\(\) rect/);
+  assert.match(browserChatCodeRules(false, 'free').join('\n'), /rect-derived coordinate targeting is supported/i);
+  assert.doesNotMatch(browserChatCodeRules(false, 'free').join('\n'), /coordinate targeting (?:is|are) unavailable/i);
 });
 
 test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
-  const rules = browserChatCodeRules(true).join('\n');
-  assert.equal(browserChatCodeRules(true).length, 14);
+  const rules = browserChatCodeRules(true, 'free').join('\n');
+  assert.equal(browserChatCodeRules(true, 'free').length, 13);
   assert.match(rules, /system-browser-code-runtime/);
+  assert.match(rules, /system-file-artifact-runtime/);
+  assert.match(rules, /system-subagent-runtime/);
   assert.match(rules, /runtime rejects browserCode until that read succeeds/i);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /never an automatic axTree/);
-  assert.match(rules, /separate read-only cell/i);
+  assert.match(rules, /successful readBrowserState result is the required initial read-only observation/i);
   assert.match(rules, /browser\.user\.openTabs/);
-  assert.match(rules, /active tab, its group, current page, and relevant rendered state/i);
+  assert.match(rules, /instead of spending another model step reproducing the same inventory/i);
+  assert.match(rules, /targeted read-only browserCode cell only when/i);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /not a full snapshot/);
   assert.match(rules, /never translate or invent a selector/i);
@@ -163,13 +169,28 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /never create a failure log, verification log, transparency disclosure/i);
   assert.match(rules, /visual overlap alone does not/);
   assert.match(rules, /nodeRepl\.emitImage/);
-  assert.match(rules, /next cell/);
+  assert.match(rules, /multiple coordinate\/CUA clicks in later cells/i);
+  assert.match(rules, /five-minute validity/i);
   assert.match(rules, /context\.pages/);
   assert.match(rules, /credentialVault\.fill/);
-  assert.match(rules, /action=plan.*action=generate.*action=edit.*action=render/);
-  assert.match(rules, /action=edit supports replaceRange, insertBefore, insertAfter, deleteRange/);
-  assert.match(rules, /visual QA is mandatory/i);
-  assert.match(rules, /different IDs and output formats may coexist/i);
+  assert.match(rules, /file plan\/generate\/edit\/render\/convert\/jsApi\/unoApi/);
+  assert.match(rules, /file list\/read\/download remain available/);
+  assert.doesNotMatch(rules, /lastSuccessfulRevision/);
   assert.match(rules, /deterministic batch in one bounded cell/i);
   assert.match(rules, /re-establish and verify the intended editable target and focus/i);
+});
+
+test('restricted browser mode injects only the browserApi Skill and API vocabulary', () => {
+  const rules = browserChatCodeRules(true, 'restricted').join('\n');
+  assert.match(rules, /system-browser-api-runtime/);
+  assert.doesNotMatch(rules, /system-browser-code-runtime/);
+  assert.match(rules, /only browserApi, nodeRepl, and console/i);
+  assert.match(rules, /tab lifecycle, navigation, frames/i);
+  assert.match(rules, /browserApi\.snapshot\/read\/inspect/);
+  assert.match(rules, /multiple later coordinate clicks/i);
+  assert.match(rules, /never silently replace an unavailable value/i);
+  assert.doesNotMatch(rules, /receives the real Playwright page\/context/i);
+  assert.match(browserContextLine('restricted'), /system-browser-api-runtime/);
+  assert.match(screenshotObservationRule(false, 'restricted'), /browserApi\.read/);
+  assert.match(browserActionRules(false, 'restricted').join('\n'), /browserApi\.act/);
 });

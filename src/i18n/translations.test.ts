@@ -13,7 +13,6 @@ test('settings translations cover browser, account, and shared-resource copy', (
   assert.equal(translateText('en', '实时预览 JPEG 质量'), 'Live preview JPEG quality');
   assert.equal(translateText('en', '实时预览传输模式'), 'Live preview transport mode');
   assert.equal(translateText('en', 'H.264 视频流（推荐）'), 'H.264 video stream (recommended)');
-  assert.equal(translateText('en', '浏览器启动时最大化'), 'Maximize browser on launch');
   assert.equal(translateText('en', '登录账号'), 'Login accounts');
   assert.equal(
     translateText('en', '{count} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用', { count: 6 }),

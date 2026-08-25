@@ -47,12 +47,14 @@ import { captureDomSnapshot } from './dom-snapshot';
 import {
   BROWSER_CODE_KERNEL_RUNTIME_REVISION,
   browserCodePolicyViolation,
+  browserCodeReportedFailure,
   BrowserCodeKernel,
   type BrowserCodeAttachmentBinding,
   type BrowserCodeActivity,
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
 } from './browser-code-runner';
+import { resolveBrowserCodeRuntimeMode, type BrowserCodeRuntimeMode } from './browser-code-runtime-mode';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 import {
   compactDiagnosticText,
@@ -210,6 +212,10 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Stable runtime failure category used for category-specific recovery guidance. */
+  failureCategory?: string;
+  /** Hidden runtime Skill that must be loaded before retrying this tool call. */
+  requiredSkillId?: string;
   /** Concrete recovery action returned for every failed runtime tool operation. */
   requiredNextAction?: string;
   /** Browser-owned control mirrored into the remote live-preview surface. */
@@ -1681,6 +1687,7 @@ export class BrowserSession {
   private browserServer?: BrowserServer;
   private browserCodeConnection?: BrowserCodeConnection;
   private browserCodeKernel?: BrowserCodeKernel;
+  private browserCodeKernelMode?: BrowserCodeRuntimeMode;
   private browserCodeKernelRevision?: number;
   private context?: BrowserContext;
   private page?: Page;
@@ -4895,7 +4902,8 @@ export class BrowserSession {
     const code = String(input.code || '');
     if (!code.trim()) return { ok: false, actual: 'browserCode requires non-empty JavaScript.' };
     if (code.length > 40_000) return { ok: false, actual: 'browserCode JavaScript exceeds the 40000 character limit.' };
-    const policyViolation = browserCodePolicyViolation(code);
+    const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
+    const policyViolation = browserCodePolicyViolation(code, browserCodeRuntimeMode);
     if (policyViolation) return { ok: false, actual: policyViolation };
     if (!this.browserCodeConnection) {
       return { ok: false, actual: 'browserCode has no direct Playwright connection for this browser session.' };
@@ -4919,14 +4927,19 @@ export class BrowserSession {
 
     if (
       this.browserCodeKernel
-      && this.browserCodeKernelRevision !== BROWSER_CODE_KERNEL_RUNTIME_REVISION
+      && (
+        this.browserCodeKernelRevision !== BROWSER_CODE_KERNEL_RUNTIME_REVISION
+        || this.browserCodeKernelMode !== browserCodeRuntimeMode
+      )
     ) {
       await this.browserCodeKernel.close();
       this.browserCodeKernel = undefined;
     }
     const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection, {
+      runtimeMode: browserCodeRuntimeMode,
       sessionGroupId: this.pageGroupId,
     });
+    this.browserCodeKernelMode = browserCodeRuntimeMode;
     this.browserCodeKernelRevision = BROWSER_CODE_KERNEL_RUNTIME_REVISION;
     const executionContext = this.context;
     const pagesBeforeExecution = new Set(executionContext?.pages() || []);
@@ -5021,12 +5034,17 @@ export class BrowserSession {
       ? { ...domChanges, observation: undefined }
       : undefined;
     const dependencyFailures = this.drainBrowserCodeDependencyFailures();
+    const reportedFailure = execution.ok
+      ? browserCodeReportedFailure(execution.value)
+      : undefined;
+    const effectiveOk = execution.ok && !reportedFailure;
+    const effectiveError = execution.error || reportedFailure;
     const result: BrowserActionResult = {
-      ok: execution.ok,
+      ok: effectiveOk,
       actual: JSON.stringify({
-        ok: execution.ok,
+        ok: effectiveOk,
         result: execution.value ?? null,
-        error: execution.error ?? null,
+        error: effectiveError ?? null,
         aborted: execution.aborted === true,
         elapsedMs: execution.elapsedMs,
         ...(execution.kernelReset ? {
@@ -5073,6 +5091,7 @@ export class BrowserSession {
     let disposeLocalState = false;
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
+    this.browserCodeKernelMode = undefined;
     this.browserCodeKernelRevision = undefined;
     try {
       if (this.childBrowserSessions.size) {
@@ -5137,6 +5156,7 @@ export class BrowserSession {
         this.browserServer = undefined;
         this.browserCodeConnection = undefined;
         this.browserCodeKernel = undefined;
+        this.browserCodeKernelMode = undefined;
         this.browserCodeKernelRevision = undefined;
         this.managedProfileDir = undefined;
         this.ownedPages.clear();

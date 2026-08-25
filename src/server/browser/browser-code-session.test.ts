@@ -230,6 +230,21 @@ test('BrowserSession executes browserCode against the controlled Playwright page
   assert.equal('domChanges' in readOnlyFailureResult, false);
   assert.equal('axTree' in readOnlyFailureResult, false);
   assert.equal('postActionObservation' in readOnlyFailureResult, false);
+
+  const reportedFailure = await session.executeBrowserCode({
+    code: `nodeRepl.write({ ok: false, error: 'screenshot timed out' });`,
+    runId: 'browser-code-session-test',
+    stepIndex: 7,
+  });
+  assert.equal(reportedFailure.ok, false);
+  const reportedFailureResult = JSON.parse(reportedFailure.actual) as {
+    error?: string;
+    ok?: boolean;
+    result?: { error?: string; ok?: boolean };
+  };
+  assert.equal(reportedFailureResult.ok, false);
+  assert.equal(reportedFailureResult.error, 'screenshot timed out');
+  assert.deepEqual(reportedFailureResult.result, { ok: false, error: 'screenshot timed out' });
 });
 
 test('browserCode-created tabs are owned and group-marked before preview starts', async (context) => {

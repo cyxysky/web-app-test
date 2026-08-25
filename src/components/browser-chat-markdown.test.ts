@@ -27,6 +27,27 @@ test('keeps valid Markdown and code spans intact', () => {
   assert.equal(normalizeBrowserChatMarkdown(markdown), markdown);
 });
 
+test('repairs model headings that omit the required space without changing code', () => {
+  const markdown = [
+    '##酒店预订表单填写完成总结',
+    '',
+    '```txt',
+    '##not-a-heading-inside-code',
+    '```',
+    '',
+    '`##inline-code`',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.match(normalized, /^## 酒店预订表单填写完成总结/);
+  assert.match(normalized, /```txt\n##not-a-heading-inside-code\n```/);
+  assert.match(normalized, /`##inline-code`/);
+  assert.match(html, /<h2>酒店预订表单填写完成总结<\/h2>/);
+});
+
 test('repairs a fenced code block attached to preceding prose', () => {
   const markdown = '安全提醒：关闭端口 ```bash\nfirewall-cmd --reload\n```\n\n### 关键点\n\n- 后续正文';
   const normalized = normalizeBrowserChatMarkdown(markdown);

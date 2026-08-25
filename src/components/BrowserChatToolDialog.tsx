@@ -96,6 +96,16 @@ function toolResultPayload(value: unknown) {
   return formatToolPayload(value);
 }
 
+function toolInputPayload(tool: BrowserChatToolCall) {
+  if (!tool.reason) return formatToolPayload(tool.input);
+  const input = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input)
+    ? tool.input as Record<string, unknown>
+    : tool.input === undefined
+      ? {}
+      : { input: tool.input };
+  return formatToolPayload({ ...input, reason: tool.reason });
+}
+
 export function BrowserChatToolDialog({
   detail,
   onClose,
@@ -113,7 +123,10 @@ export function BrowserChatToolDialog({
   const toolName = toolLabel(detail.tool.name, detail.tool.input);
   const status = toolStatusLabel(detail.tool, detail.step);
   const emptyPayloadLabel = t('无');
-  const inputPayload = formatToolPayload(detail.tool.input);
+  // Tool traces store the semantic reason separately from `input`. Recombine
+  // them here so two calls that differ only by a missing reason do not look
+  // identical in the diagnostics dialog.
+  const inputPayload = toolInputPayload(detail.tool);
   const displayedInputPayload = inputPayload || emptyPayloadLabel;
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';

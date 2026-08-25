@@ -59,3 +59,27 @@ test('drops fields from the retired optimistic revision protocol', () => {
   assert.equal(repairBrowserChatToolCallInput('file', '{"action":"render","expectedRevision":"3"}'), '{"action":"render"}');
   assert.equal(repairBrowserChatToolCallInput('file', '{"action":"plan","outline":{"item":[]}}'), undefined);
 });
+
+test('removes accidental outer Markdown or HTML wrappers from browserCode only', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+    reason: '读取标题',
+    code: 'nodeRepl.write(await browserApi.current());</code>',
+  }), {
+    reason: '读取标题',
+    code: 'nodeRepl.write(await browserApi.current());',
+  });
+  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+    reason: '读取标题',
+    code: '```js\nnodeRepl.write(await browserApi.current())\n```',
+  }), {
+    reason: '读取标题',
+    code: 'nodeRepl.write(await browserApi.current())',
+  });
+  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+    reason: '读取 HTML',
+    code: 'nodeRepl.write("<code>inside</code>")',
+  }), {
+    reason: '读取 HTML',
+    code: 'nodeRepl.write("<code>inside</code>")',
+  });
+});

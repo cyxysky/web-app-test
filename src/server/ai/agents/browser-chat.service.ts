@@ -6,6 +6,7 @@ import type {
   BrowserCodeAttachmentBinding,
   BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
+import { resolveBrowserCodeRuntimeMode } from '@/server/browser/browser-code-runtime-mode';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
@@ -1170,10 +1171,9 @@ function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown)
     model: modelInput,
     provider: providerInput,
   });
-  const imageInputGloballyEnabled = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase() !== 'false';
   return {
     ...selection,
-    supportsImageInput: imageInputGloballyEnabled && modelCapabilities(
+    supportsImageInput: modelCapabilities(
       config?.providers?.[selection.provider],
       selection.provider,
       selection.model,
@@ -5075,7 +5075,9 @@ async function executeBrowserChatSubagentBatch(input: {
           '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
           browserChatSubagentAuthPrompt(childBrowser.authMode),
           '你运行在独立的子 Agent 页面中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要继续尝试绕过；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          '浏览器检查与操作统一使用 browserCode，在一个受限程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
+          resolveBrowserCodeRuntimeMode() === 'restricted'
+            ? '浏览器检查与操作统一使用 browserCode，只调用已加载 Skill 中记录的 browserApi；不要引用 Playwright page/context/browser/tab，并返回可追溯的结构化证据。'
+            : '浏览器检查与操作统一使用 browserCode，在隔离程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
           summaryGuidanceChars
@@ -5642,10 +5644,11 @@ async function runBrowserChatMessage(
             }));
           }
           session.updatedAt = now();
-          // Tool traces arrive once before execution and again with the result.
-          // Persist both edges synchronously so the UI first renders a running
-          // card, then updates that same card to its completed/failed state.
-          persistAndNotify(session.id, { mergePersisted: false });
+          // Tool progress is cumulative: the latest step contains every trace
+          // seen so far. Coalesce bursty start/completion updates into the
+          // existing short persistence window; terminal/checkpoint paths still
+          // flush synchronously, so no final state is left pending.
+          persistAndNotify(session.id, { defer: true, mergePersisted: false });
         },
         onDebug: (event) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
@@ -5666,12 +5669,7 @@ async function runBrowserChatMessage(
             stepIndex: event.stepIndex,
           });
           if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
-          const persistImmediately = event.phase === 'ai:runtime:request'
-            || event.phase === 'ai:runtime:response'
-            || event.phase === 'ai:tool'
-            || event.phase === 'ai:runtime:attempt'
-            || event.phase === 'ai:runtime:attempt-failed'
-            || event.phase === 'ai:runtime:attempt-succeeded'
+          const persistImmediately = event.phase === 'ai:runtime:attempt-failed'
             || event.phase === 'ai:runtime:retry'
             || event.phase === 'ai:runtime:retry-exhausted'
             || event.phase === 'ai:runtime:retry-skipped'

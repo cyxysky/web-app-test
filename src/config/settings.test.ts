@@ -103,14 +103,19 @@ test('browser preview exposes H.264 video transport with 2K and 4K encoder setti
   assert.equal(idleTimeout?.min, 60000);
   assert.equal(idleTimeout?.max, 86400000);
 
-  assert.equal(runtimeEnvDefinition('FFMPEG_PATH')?.control, 'text');
+});
+
+test('browser code runtime can switch between free code and restricted API modes', () => {
+  const runtimeMode = runtimeEnvDefinition('BROWSER_CODE_RUNTIME_MODE');
+  assert.ok(runtimeMode);
+  assert.equal(runtimeMode.control, 'select');
+  assert.equal(runtimeMode.defaultValue, 'free');
+  assert.deepEqual(runtimeMode.options?.map((option) => option.value), ['free', 'restricted']);
+  assert.equal(normalizeRuntimeEnvValue(runtimeMode, 'restricted'), 'restricted');
+  assert.equal(normalizeRuntimeEnvValue(runtimeMode, 'unknown'), 'unknown');
 });
 
 test('browser viewport size and output quality are configured independently', () => {
-  const maximize = runtimeEnvDefinition('BROWSER_FULLSCREEN');
-  assert.equal(maximize?.label, '浏览器启动时最大化');
-  assert.match(maximize?.description || '', /打开实时预览不会改变/);
-
   const viewport = runtimeEnvDefinition('BROWSER_VIEWPORT_MODE');
   assert.ok(viewport);
   assert.equal(viewport.control, 'select');
@@ -143,8 +148,21 @@ test('settings omit unused automatic screenshot and context compression controls
     'AI_VISUAL_COMPRESSED_PINNED_LIMIT',
     'AI_PROMPT_SCREENSHOT_REFERENCE_LIMIT',
     'AI_CONTEXT_COMPRESSION_THRESHOLD',
+    'SEND_SCREENSHOT_TO_AI',
+    'BROWSER_CDP_ENDPOINT',
+    'BROWSER_USER_DATA_DIR',
+    'BROWSER_CHANNEL',
+    'BROWSER_FULLSCREEN',
+    'BROWSER_SLOW_MO_MS',
+    'BROWSER_ACTION_SETTLE_MS',
+    'BROWSER_POPUP_WAIT_MS',
+    'AI_SCREENSHOT_MAX_KB',
+    'FFMPEG_PATH',
+    'LIBREOFFICE_PATH',
+    'LIBREOFFICE_PYTHON_PATH',
+    'BROWSER_CHAT_SLOW_MO_MS',
+    'BROWSER_CHAT_POPUP_WAIT_MS',
   ]) {
     assert.equal(runtimeEnvDefinition(key), undefined, `${key} should not be exposed`);
   }
-  assert.equal(runtimeEnvDefinition('SEND_SCREENSHOT_TO_AI')?.label, 'AI 图片输入');
 });

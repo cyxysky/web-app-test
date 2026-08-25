@@ -11,9 +11,11 @@ import {
   type BrowserActionResult,
 } from '@/server/browser/browser-session';
 import {
+  browserCodeHasImageOperation,
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
+import { resolveBrowserCodeRuntimeMode } from '@/server/browser/browser-code-runtime-mode';
 import { richTextToPlainText } from '@/lib/rich-text';
 import {
   aiSdkEmptyStopRequiresRetry,
@@ -22,12 +24,15 @@ import {
   aiSdkToolResultRequiresContinuation,
 } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
+import { fileArtifactRuntimeSkillId } from './file-artifact-runtime-skill';
 import {
-  browserCodeRuntimeSkillContent,
-  browserCodeRuntimeSkillId,
-  browserCodeRuntimeSkillWasRead,
-  browserCodeToolRequiresRuntimeSkill,
-} from './browser-code-runtime-skill';
+  activeBrowserRuntimeSkillId,
+  hiddenRuntimeSkillContent,
+  hiddenRuntimeSkillGateResult,
+  hiddenRuntimeSkillIdsReadFromTraces,
+  runtimeToolTypesAfterHiddenSkillGate,
+} from './hidden-runtime-skills';
+import { subagentRuntimeSkillId } from './subagent-runtime-skill';
 import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
@@ -56,7 +61,12 @@ import {
 import { browserChatCodeRules } from './runtime-prompt-rules';
 import { readScreenshotForAi } from './browser-chat-image-input';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
-import { cloneRuntimeRetryState, type RuntimeRetryState as RuntimeRetryStateBase } from './runtime-retry-state';
+import {
+  attachRuntimeFailureRecovery,
+  cloneRuntimeRetryState,
+  runtimeFailureRecoveryFromError,
+  type RuntimeRetryState as RuntimeRetryStateBase,
+} from './runtime-retry-state';
 import {
   classifyRuntimeRetry,
   runtimeExecutionDetails,
@@ -85,7 +95,10 @@ import {
   runtimeContextCompressionThresholdRatio,
   runtimeContextWindowTokens,
 } from './runtime-context-budget';
-import type { BrowserChatModelContextCompression } from './browser-chat-model-context';
+import {
+  appendTerminalBrowserChatTurn,
+  type BrowserChatModelContextCompression,
+} from './browser-chat-model-context';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
@@ -241,13 +254,12 @@ const codexRuntimeObjectSchema = z.object({
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
     skillId: z.string().nullable().optional(),
-  }).passthrough().describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason. Tool-specific keys not listed in this common envelope are preserved. Example file parameters: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. Example browserCode parameters: {"code":"nodeRepl.write({url: page.url(), title: await page.title()})"}.'),
+  }).passthrough().describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason. Tool-specific keys not listed in this common envelope are preserved. Example file parameters: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. The browserCode tool supplies the code example for the currently selected runtime mode.'),
 }).describe('Return exactly one object with type, optional message, and params. Example: {"type":"file","message":"准备演示文稿","params":{"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}}.');
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
 // 判断当前模型配置是否支持图片输入；这只是模型能力判断，不代表一定会发送截图。
-function modelSupportsScreenshotInput() {
-  if (process.env.SEND_SCREENSHOT_TO_AI === 'false') return false;
+function modelSupportsImageInput() {
   return getModelSettings().supportsImageInput;
 }
 
@@ -1067,10 +1079,6 @@ async function executeTracedBrowserAction(input: {
   throwIfStopped(abortSignal, shouldContinue);
   trace.result = result;
   postprocessStartedAt = Date.now();
-  await notifyRuntimeToolTrace(onToolTrace, trace);
-  postprocessTimings.notifyResultMs = elapsedSince(postprocessStartedAt);
-  throwIfStopped(abortSignal, shouldContinue);
-  postprocessStartedAt = Date.now();
   result = await finalizeToolTraceVisuals({
     trace,
     result,
@@ -1092,14 +1100,18 @@ async function executeTracedBrowserAction(input: {
   return result;
 }
 
-const initialBrowserStateCode = 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
+function initialBrowserStateCode() {
+  return resolveBrowserCodeRuntimeMode() === 'restricted'
+    ? 'nodeRepl.write({ tabs: await browserApi.tabs.list(), activePage: await browserApi.current(), pageState: await browserApi.snapshot() })'
+    : 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
+}
 
 async function readCurrentBrowserState(
   session: BrowserSession,
   options: { runId?: string; stepIndex?: number; abortSignal?: AbortSignal } = {},
 ): Promise<BrowserActionResult> {
   return session.executeBrowserCode({
-    code: initialBrowserStateCode,
+    code: initialBrowserStateCode(),
     maxOutputChars: 40_000,
     runId: options.runId || 'browser-state',
     stepIndex: options.stepIndex || 0,
@@ -1135,13 +1147,18 @@ function makeBrowserTools(
     credentialBindings?: BrowserCodeCredentialBinding[];
     getCredentialBindings?: () => BrowserCodeCredentialBinding[] | undefined;
     browserStatePreflightComplete?: () => boolean;
+    loadedHiddenRuntimeSkillIds?: Set<string>;
   },
 ) {
+  const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
+  const imageInputAvailable = modelSupportsImageInput();
+  const browserRuntimeSkillId = activeBrowserRuntimeSkillId(browserCodeRuntimeMode);
   // Models may return independent tool calls together. Execute every call in the response, but
   // serialize them so browser/page state and a document draft cannot be mutated concurrently.
   // This preserves tool-call order without silently dropping work from the same model step.
   let toolExecutionQueue = Promise.resolve();
-  let browserCodeRuntimeSkillLoaded = browserCodeRuntimeSkillWasRead(traces);
+  const loadedHiddenRuntimeSkillIds = referenceOptions?.loadedHiddenRuntimeSkillIds || new Set<string>();
+  for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
@@ -1180,12 +1197,8 @@ function makeBrowserTools(
     const run = async () => {
       throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
       const actionAfterBrowserStart = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
-        if (browserCodeToolRequiresRuntimeSkill(name, browserCodeRuntimeSkillLoaded)) {
-          return {
-            ok: false,
-            actual: `Tool ${name} was not executed. Read the hidden built-in Skill ${browserCodeRuntimeSkillId} with skill action=read in a separate model step, then call readBrowserState before retrying browserCode.`,
-          } satisfies BrowserActionResult;
-        }
+        const runtimeSkillGate = hiddenRuntimeSkillGateResult(name, input, loadedHiddenRuntimeSkillIds);
+        if (runtimeSkillGate) return runtimeSkillGate;
         if (
           referenceOptions?.browserStatePreflightComplete
           && browserToolBlockedBeforeBrowserState(
@@ -1252,15 +1265,31 @@ function makeBrowserTools(
       }), execution),
     }),
     browserCode: tool({
-      description: 'This is the real browser control tool. It CAN navigate or open URLs, claim/open/switch tabs, click links and controls, type, select, upload, inspect, and verify the visible page. Use await page.goto(url) for same-tab navigation, browser.tabs.new(url) for a new tab, and Playwright locators for observed links and controls. Never claim browser navigation/clicking is unavailable, never replace navigation with a file download, and never ask the user to navigate manually while browserCode is present unless an actual browserCode call failed and that failure is reported. Execute one bounded JavaScript cell against the real Playwright page/context. At the start of every new or resumed user request, the first browser-changing cell must be preceded by a separate read-only cell that returns browser.user.openTabs(), page.url(), page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads; confirm the existing active tab/group and current page before acting. page.domSnapshot() returns one string containing page-state surfaces/topSurfaceIds/surfaceStack plus an AX tree scoped to the most recently active top-level surface by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Surface data is informational evidence of likely overlays, never an action permission boundary. Treat each newly opened nonmodal surface as a bounded transaction: verify it closed before targeting outside it, otherwise close it with an observed control, trigger, or Escape and verify with page.activeSurface(). Before claiming completion, read business success and page.activeSurface(), resolve or disclose residual top surfaces, and report every failed tool call. Every result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells. Operation/navigation/tab-change results include final page identity and direct incremental domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(value), not console.log, to return compact code results. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or attribute must appear verbatim in the latest explicit read or direct domChanges; if it does not, run a targeted read-only inspection instead of trying a plausible selector. An explicit ARIA role overrides the native tag for role locators. Multiple actions may run in one cell; use targeted reads before a dependent operation when an earlier action can change later target assumptions. Never infer control type, editability, interaction sequence, or completion from labels or appearance. After a zero-match, timeout, or actionability failure, preserve the failed locator and actual count/error, inspect fresh evidence, and do not call it transient or omit it from the final report merely because a retry succeeds. Page and Locator factory methods automatically remove CSS-hidden matches and matches without a non-empty rendered rectangle before count() or positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable; use an exact DOM locator copied from current evidence when a role locator omits it. Runtime applies target-style and a supplemental hit test followed by authoritative action-specific Playwright trials, and executes only the unique remaining candidate that passes. first(), last(), and nth() are allowed when the model intentionally selects a positional candidate. If fresh evidence proves an overlay or backdrop intentionally blocks one exact rendered target, the model may use that unique Locator with force:true and must verify the resulting surface state; it must never force an ambiguous, visually hidden, detached, disabled, or unobserved target. Hidden file inputs are accepted only through attachmentVault.setInputFiles(locator, attachmentId). For a user-provided attachment, do not call file merely to upload it, never reconstruct its bytes/base64, and never use a local path, Locator/Page.setInputFiles(), or FileChooser.setFiles(). Place and verify the editor caret at the requested destination before opening the upload surface, then use the exact attachmentId listed in conversation metadata and verify exactly one attachment remains at that destination. An ancestor pointer-events:none alone does not reject a target. Every session Playwright Page exposes setTextSelection. For precise editing in an input, textarea, or contenteditable, including frame locators, call targetPage.setTextSelection(locator, spec) on the Page that owns the locator, then use targetPage.keyboard.insertText() or targetPage.keyboard.press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Use browser.tabs.use(tab) or tab.use() to switch the global page/tab binding. Use nodeRepl.emitImage(await page.screenshot(...)) for visual evidence. Coordinate clicks still require a viewport image from the previous cell. credentialVault.fill(locator, ref) fills credentials without returning raw values. Scripted DOM clicks remain forbidden.',
+      description: browserCodeRuntimeMode === 'restricted'
+        ? `Execute one bounded JavaScript cell against the live browser through the documented restricted browserApi. Only browserApi, nodeRepl, and console are exposed.${imageInputAvailable ? ' browserApi.screenshot emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use browserApi.read/inspect rect evidence instead.'} Before the first call, read hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires readBrowserState.`
+        : `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} Before the first call in this Agent run, read hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires the readBrowserState preflight.`,
       inputSchema: browserToolInput({
-        code: z.string().min(1).max(40_000).describe('Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...) and screenshots with await nodeRepl.emitImage(await page.screenshot(...)). Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.'),
+        code: z.string().min(1).max(40_000).describe(browserCodeRuntimeMode === 'restricted'
+          ? `Ordinary JavaScript cell for the persistent restricted kernel. Use only documented browserApi methods with top-level await; page/context/browser/tab and Playwright objects are absent. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await browserApi.screenshot(...).' : ' Do not call browserApi.screenshot; this model has no image input.'} Prefer top-level var or fresh binding names. No wrapper, module, export, import, or Markdown fence.`
+          : `Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await nodeRepl.emitImage(await page.screenshot(...)).' : ' Do not call screenshot or nodeRepl.emitImage; this model has no image input.'} Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.`),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
-      }, [{ reason: '读取当前页面地址和标题', code: 'nodeRepl.write({ url: page.url(), title: await page.title() })' }]),
-      execute: (input, execution) => {
+      }, [{
+        reason: '读取当前页面地址和标题',
+        code: browserCodeRuntimeMode === 'restricted'
+          ? 'nodeRepl.write(await browserApi.current())'
+          : 'nodeRepl.write({ url: page.url(), title: await page.title() })',
+      }]),
+      execute: (rawInput, execution) => {
+        const input = coerceBrowserChatToolInput('browserCode', rawInput) as typeof rawInput;
         return record('browserCode', input, (abortSignal) => {
           const violation = browserCodeServiceFileDeliveryViolation(input.code);
           if (violation) return Promise.resolve({ ok: false, actual: violation });
+          if (!imageInputAvailable && browserCodeHasImageOperation(input.code)) {
+            return Promise.resolve({
+              ok: false,
+              actual: 'Image operation rejected: the selected model is not configured with image input support. Use browserApi.read/inspect and exact rect evidence instead.',
+            });
+          }
           return session.executeBrowserCode({
             code: input.code,
             maxOutputChars: input.maxOutputChars,
@@ -1282,7 +1311,7 @@ function makeBrowserTools(
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
       subagent: tool({
-        description: 'Manage child Agents. For action=spawn, pass multiple independent tasks in tasks; for exactly one task, the provider-safe flat title, url, and instruction fields are also accepted. For action=read, pass one returned UUID. Do not repeat a rejected parameter shape, delegate dependent steps, or delegate multiple actions on the same interactive page.',
+        description: `Spawn independent child Agents or read one returned result UUID. action=spawn requires hidden Skill ${subagentRuntimeSkillId}; action=read is never gated so pending results remain recoverable.`,
         inputSchema: browserToolInput({
           action: z.enum(['spawn', 'read']),
           tasks: z.array(z.object({
@@ -1340,15 +1369,26 @@ function makeBrowserTools(
       }),
     } : {}),
     skill: tool({
-      description: `Read Skills through one action-based tool. Before the first browserCode call in every Agent run, action=read with hidden built-in Skill id ${browserCodeRuntimeSkillId} is mandatory. User Skills still use their exact ids from the system prompt and are not read again while loaded.`,
-      inputSchema: browserToolInput({
+      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${browserRuntimeSkillId}, ${fileArtifactRuntimeSkillId}, and ${subagentRuntimeSkillId}; successful reads remain loaded only for the current Agent run.`,
+      inputSchema: withToolInputExamples(z.preprocess((value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+        const record = value as Record<string, unknown>;
+        if (typeof record.reason === 'string' && record.reason.trim()) return value;
+        const skillId = typeof record.skillId === 'string' ? record.skillId.trim() : '';
+        return { ...record, reason: skillId ? `读取 Skill：${skillId}` : '读取运行规范' };
+      }, z.object({
+        reason: toolReasonInput,
         action: z.literal('read'),
-        skillId: z.string().min(1).max(160).describe(`Exact Skill id. The mandatory browser runtime Skill id is ${browserCodeRuntimeSkillId}.`),
-      }, [{ reason: '读取浏览器代码运行规范', action: 'read', skillId: browserCodeRuntimeSkillId }]),
+        skillId: z.string().min(1).max(160).describe('Exact Skill id from an available <system_skill> or user Skill summary.'),
+      })), [
+        { reason: '读取浏览器代码运行规范', action: 'read', skillId: browserRuntimeSkillId },
+        { reason: '读取文件产物运行规范', action: 'read', skillId: fileArtifactRuntimeSkillId },
+        { reason: '读取子 Agent 运行规范', action: 'read', skillId: subagentRuntimeSkillId },
+      ]),
       execute: (input, execution) => record('skill', input, async () => {
-        if (input.skillId === browserCodeRuntimeSkillId) {
-          browserCodeRuntimeSkillLoaded = true;
-          return { ok: true, actual: browserCodeRuntimeSkillContent } satisfies BrowserActionResult;
+        const hiddenContent = hiddenRuntimeSkillContent(input.skillId);
+        if (hiddenContent) {
+          return { ok: true, actual: hiddenContent } satisfies BrowserActionResult;
         }
         return referenceOptions?.readSkill
           ? referenceOptions.readSkill(input.skillId)
@@ -1356,7 +1396,7 @@ function makeBrowserTools(
       }, execution),
     }),
     file: tool({
-      description: 'List, read, download, convert, create, or modify files through one source workspace per documentId. Start or resume Office work with list and reuse its exact documentId. New documents use plan -> generate -> repeated edit -> render. convert transforms an existing Office artifact to PDF using sourceArtifactId. A small runnable initial skeleton followed by incremental edits is recommended, while a complete runnable initial program is also allowed. edit supports replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText, and restoreRevision; it validates a candidate transactionally, commits only on success, and returns rollback/recovery details on failure. Large scripts may optionally mark logical page/section units with `# @webpilot-unit pages/page-001` / `# @webpilot-endunit` (or // for JS); read/edit with path scopes line numbers and edits to that unit without adding another action. render only publishes a revision that passed static analysis, execution, Office reopen, and unified artifact checks. Any source change invalidates prior full visual QA; validation previews never count as reviewed pages. To modify an attached Office file, plan with operation=modify and sourceAttachmentId; edit that component and preserve unrelated content. Settings select UNO or JavaScript generation. Both API actions require the planned documentId. read returns line-numbered source, sourceDigest, revisions, unit states, validation status, and the durable workflow checkpoint; downloaded images return dimensions and aspect ratio from saved bytes. edit never accepts an unversioned whole-source replacement. render publishes a versioned candidate. For vision models, delivery remains blocked until every page is read and explicitly reported passed for the current renderedDigest.',
+      description: `List, read, download, convert, create, modify, or render file artifacts in a stable documentId workspace. list/read/download are ungated; plan/generate/edit/render/convert/jsApi/unoApi require hidden Skill ${fileArtifactRuntimeSkillId}.`,
       // Keep the provider-facing schema flat. Several OpenAI-compatible
       // gateways mishandle a discriminated union/oneOf and reject a perfectly
       // usable file call before the action-specific implementation can return
@@ -1423,7 +1463,7 @@ function makeBrowserTools(
           if (input.documentId) {
             return record('file', input, () => readUnoDraft({ documentId: input.documentId, path: input.path, runId: referenceOptions?.runId }), execution);
           }
-          const includeVisuals = modelSupportsScreenshotInput()
+          const includeVisuals = modelSupportsImageInput()
             && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
           const normalizedInput = {
             ...input,
@@ -1442,7 +1482,7 @@ function makeBrowserTools(
             runId: referenceOptions?.runId,
             sourceArtifactId: input.sourceArtifactId,
             fileName: input.fileName,
-            includeVisualVerification: modelSupportsScreenshotInput(),
+            includeVisualVerification: modelSupportsImageInput(),
           }), execution);
         }
         if (input.action === 'plan') {
@@ -1455,10 +1495,10 @@ function makeBrowserTools(
           return record('file', input, () => getOfficeJsApi({ ...input, runId: referenceOptions?.runId }), execution);
         }
         if (input.action === 'generate') {
-          return record('file', input, (abortSignal, trace) => generateUnoFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+          return record('file', input, (abortSignal, trace) => generateUnoFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
         }
         if (input.action === 'render') {
-          return record('file', input, (abortSignal, trace) => renderFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsScreenshotInput() }), execution);
+          return record('file', input, (abortSignal, trace) => renderFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
         }
         if (input.action === 'edit') {
           const edits: UnoDraftLineEdit[] | undefined = input.edits?.map((edit) => ({
@@ -1483,7 +1523,7 @@ function makeBrowserTools(
             onProgress: fileProgressReporter(trace),
             runId: referenceOptions?.runId,
             attachmentBindings: referenceOptions?.attachmentBindings,
-            includeVisualVerification: modelSupportsScreenshotInput(),
+            includeVisualVerification: modelSupportsImageInput(),
           }), execution);
         }
         return record('file', input, () => Promise.resolve({
@@ -1492,9 +1532,9 @@ function makeBrowserTools(
         }), execution);
       },
     }),
-    ...(modelSupportsScreenshotInput() && referenceOptions?.readFileVisuals ? {
+    ...(modelSupportsImageInput() && referenceOptions?.readFileVisuals ? {
       fileVisual: tool({
-        description: 'Mandatory visual QA for a generated PDF or Office artifact. Call index, then read every screenshot in ordered batches, and after actually inspecting the attached images call report with an explicit passed/failed review for each read page. A read alone never passes QA. Failed reviews require structured issue type, description, region, and severity; fix them, render a replacement, and restart QA. Delivery is allowed only when every indexed page was read and explicitly reported passed for the exact current artifact.',
+        description: `Index, read, and report page-level visual QA for the exact current artifact. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
         inputSchema: z.preprocess(
           (input) => coerceBrowserChatToolInput('fileVisual', input),
           browserToolInput({
@@ -1584,31 +1624,37 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
   const rawCaseSystemPrompt = systemPromptOf(runtimeRecord);
   const caseSystemPrompt = browserChatSystemPromptForRuntime(rawCaseSystemPrompt);
   const customPrompt = customRuntimePromptFromEnv();
-  const screenshotAvailable = modelSupportsScreenshotInput();
-  const documentAuthoringRule = '- Office/PDF authoring uses plan -> generate -> repeated edit -> render. Prefer a small runnable skeleton followed by incremental edits when useful; this is a recommendation, not a size restriction, and a complete runnable initial program is allowed. edit validates a candidate transactionally and commits only on success; a failure restores the previous draft and returns lastSuccessfulRevision plus recovery guidance. Continue with a focused edit and read only when fresh line numbers are needed. render only publishes the matching validatedSourceDigest. read returns line-numbered source, revision history, validation diagnostics, and workflow state; edit supports range replacement, insertion, deletion, exact replacement, and restoreRevision. Large scripts may optionally use @webpilot-unit page/section markers and path-scoped read/edit, without adding another action. plan operation=modify with sourceAttachmentId is the existing-file modification entrance. For new files, after plan call unoApi only for UNO or jsApi only for JavaScript with the planned documentId. Image dimensions must come from reading saved artifact bytes. In UNO, geometry is 1/100 mm but CharHeight is pt, and Impress TextShape order is Position/Size -> page.add -> String/Text -> formatting. Any source change invalidates earlier full visual QA; preview/sample pages do not count as reviewed. render publishes a versioned candidate. A vision-capable model must read every page and then explicitly report every page passed; reading screenshots alone never completes QA. Success requires visualQaDigest === renderedDigest.';
+  const screenshotAvailable = modelSupportsImageInput();
+  const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
   return [
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
     '',
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
-    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
-    '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
+    browserCodeRuntimeMode === 'restricted'
+      ? '- browserCode is the real browser operation mechanism. Use the documented browserApi for navigation, tabs, reads, frames, actions, keyboard/pointer input, uploads, screenshots, waits, surfaces, and verification. page/context/browser/tab and Playwright objects are absent. After readBrowserState, use browserCode for requested live operations unless a real call proves the operation unavailable.'
+      : '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
+    browserCodeRuntimeMode === 'restricted'
+      ? '- Keep tool input limited to exact arguments and a concise semantic reason. Operation results include incremental domChanges; use browserApi.snapshot/read/inspect for explicit current evidence and browserApi.surface for structured popup state.'
+      : '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- User-role messages beginning with [WebPilot runtime operational context], [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.',
+    '- Treat user-specified dates, times, locations, quantities, names, and option values as exact business constraints. Never silently replace an unavailable value with a nearby, rounded, first-suggestion, or default value; preserve the requested value and ask the user or report the blocker.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
-    documentAuthoringRule,
     screenshotAvailable && input.fileVisualAvailable
-      ? '- VISUAL QA IS A MANDATORY DELIVERY GATE. A successful render is only a candidate, never completion. Call fileVisual action=index with its exact Artifact ID, then action=read in consecutive ordered batches of at most six screenshot ids until every returned page screenshot has been seen; never sample only the cover, first page, or representative pages. Inspect every page individually for: text clipped by a box or canvas edge; text behind or covered by an image/card/shape; unintended text-shape overlap; word or character-by-character wrapping; an intended one-line title/subtitle wrapping; captions obscured by other content; off-canvas or empty content; distorted/cropped images; broken tables/charts; contrast; and alignment. The deck fails visual QA if any one issue exists. Read the line-numbered draft, repair only the affected line ranges with edits=[{startLine,endLine,newText}], render a new Artifact, and repeat the complete all-page inspection using only that new Artifact ID. Do not state or imply that layout problems are fixed, that every page was checked, or that the file is visually verified until the final Artifact has passed this exact process.'
+      ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
       : screenshotAvailable
         ? '- A successful render is only a candidate. Inspect every returned preview and generationDiagnostics for clipping, overlap, hidden text, word/character wrapping, unexpectedly wrapped titles, covered captions, off-canvas content, empty pages, image distortion, broken tables/charts, contrast, and alignment. If a defect exists, read the line-numbered draft, edit its affected line ranges, render again, and inspect the replacement preview. Do not claim full visual verification when a complete screenshot-by-screenshot review was unavailable.'
       : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
     '- PDF is a first-class deliverable, never an unsupported format or a manual-save workaround. UNO can produce it directly; JavaScript mode authors the matching Office intermediate and the local worker converts that exact result to PDF.',
-    ...browserChatCodeRules(screenshotAvailable),
+    ...browserChatCodeRules(screenshotAvailable, browserCodeRuntimeMode),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
-    '- When a request contains multiple independent URLs, documents, pages, research questions, comparisons, or test branches, call subagent action=spawn with tasks=[{ title, url, instruction }, ...], one self-contained item per child. All three fields are required. For exactly one child, omit tasks and send title, url, and instruction as flat fields. Child Agents execute concurrently subject to the configured global concurrency. After the batch completes, call subagent action=read for exactly one returned UUID per model step, in returned order; never read or synthesize multiple child results in parallel. If spawn is rejected for its input shape, do not retry that shape: use the flat single-task form once or continue in the main Agent. Never produce a chain of schema-debug retries. Keep dependent steps, multiple actions on one interactive page, final synthesis, and externally consequential operations in the main Agent.',
+    `- Use subagent action=spawn only for independent parallel work and read ${subagentRuntimeSkillId} first. action=read stays ungated; collect one returned UUID per model step in the required order, then integrate results in the parent Agent.`,
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
-    '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
+    browserCodeRuntimeMode === 'restricted'
+      ? '- To upload a registered user attachment, call browserApi.act({target, action:"upload", attachmentId}) with one exact observed file-input target. Never reconstruct bytes or use a path. Verify exactly one attachment at the requested destination.'
+      : '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
@@ -2042,6 +2088,7 @@ async function executeRuntimeStep(input: {
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
+  loadedHiddenRuntimeSkillIds?: Set<string>;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
@@ -2058,24 +2105,23 @@ async function executeRuntimeStep(input: {
     onToolTrace,
     onTextStream,
   } = input;
-  const screenshotInputEnabled = false;
-  const imageInputAvailable = modelSupportsScreenshotInput();
-  const browserCodeImageOutputEnabled = imageInputAvailable;
+  const imageInputAvailable = modelSupportsImageInput();
   const markerEnabled = false;
+  const loadedHiddenRuntimeSkillIds = input.loadedHiddenRuntimeSkillIds || new Set<string>();
   const ensureActive = () => throwIfStopped(abortSignal, input.shouldContinue);
   ensureActive();
   await onDebug?.({
     phase: 'ai:runtime-input:start',
     stepIndex,
     message: 'Preparing runtime input for browserCode execution.',
-    details: { screenshotInputEnabled, markerEnabled },
+    details: { imageInputAvailable, markerEnabled },
   });
   const contextMs = 0;
   const screenshotReadStartedAt = Date.now();
   const screenshot = undefined;
   ensureActive();
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
-  const userReferenceImages = modelSupportsScreenshotInput()
+  const userReferenceImages = modelSupportsImageInput()
     ? await Promise.all(userReferenceImagePaths.map(async (imagePath) => ({
         imagePath,
         image: await readScreenshotForAi(imagePath).catch(() => undefined),
@@ -2104,7 +2150,7 @@ async function executeRuntimeStep(input: {
       contextMs,
       screenshotReadMs,
       promptMs,
-      screenshotInputEnabled,
+      imageInputAvailable,
       screenshotBytes: undefined,
       markerScreenshotBytes: undefined,
       selectedReferenceScreenshotCount: 0,
@@ -2168,7 +2214,7 @@ async function executeRuntimeStep(input: {
     const pendingObservationMessages: PendingObservationMessage[] = [];
     const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
       const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('fileVisual:read');
-      if (!modelSupportsScreenshotInput()) {
+      if (!modelSupportsImageInput()) {
         if (documentVisualQa) {
           void onAttemptDebug?.({
             phase: 'ai:document-visual-qa:unavailable',
@@ -2266,7 +2312,7 @@ async function executeRuntimeStep(input: {
       imagePaths: messageImagePaths,
       imageAttached: Boolean(messageImagePaths.length),
       tools: allowedToolTypes,
-      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsScreenshotInput: imageInputAvailable, screenshotInputEnabled, browserCodeImageOutputEnabled, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
+      options: { agentLoop: true, explicitPageState: true, visualContext: visualContext.snapshot(), imageCount: messageImagePaths.length, isMarked: false, markerOverlayInScreenshot: false, separateMarkerMap: false, modelSupportsImageInput: imageInputAvailable, visualClickMode: false, codexObjectMode: codexMode, selectedReferenceScreenshotCount: 0, userReferenceImageCount: initialUserReferenceImagePaths.length },
     });
     lastAiRequest = aiRequest;
     const toolExecutionGate = { stepNumber: 0 };
@@ -2422,6 +2468,11 @@ async function executeRuntimeStep(input: {
 
     async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
       ensureActive();
+      // Promote successful reads only at the next model-step boundary. A model
+      // cannot bypass the gate by emitting skill and a governed tool together.
+      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) {
+        loadedHiddenRuntimeSkillIds.add(skillId);
+      }
       if (input.getRuntimeOperationalContext) {
         try {
           const runtimeContext = await input.getRuntimeOperationalContext();
@@ -2443,10 +2494,11 @@ async function executeRuntimeStep(input: {
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
         : '';
       const browserStateGatePending = requiresBrowserStatePreflight(Boolean(input.browserStatePreflightComplete), traces);
-      // Keep the complete tool contract visible so a model using the known tool name receives
-      // a normal prerequisite result instead of the SDK's misleading AI_NoSuchToolError.
-      // Execution is still blocked below until readBrowserState has completed.
-      const stepAllowedToolTypes = allowedToolTypes;
+      const stepAllowedToolTypes = runtimeToolTypesAfterHiddenSkillGate(
+        allowedToolTypes,
+        loadedHiddenRuntimeSkillIds,
+        resolveBrowserCodeRuntimeMode(),
+      );
       const baseSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const activeModelSettings = getModelSettings();
@@ -2655,9 +2707,10 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, screenshotInputEnabled, browserCodeImageOutputEnabled, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
-      const activeTools = browserStateGatePending
+      const hiddenSkillGateActive = stepAllowedToolTypes.length !== allowedToolTypes.length;
+      const activeTools = browserStateGatePending || hiddenSkillGateActive
         ? stepAllowedToolTypes as Array<keyof typeof toolsForRequest>
         : requiredSubagentUuid
           ? ['subagent'] as Array<keyof typeof toolsForRequest>
@@ -2731,6 +2784,7 @@ async function executeRuntimeStep(input: {
         readFile: input.readFile,
         readFileVisuals: input.readFileVisuals,
         readSkill: input.readSkill,
+        loadedHiddenRuntimeSkillIds,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: activeCredentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
@@ -2813,6 +2867,7 @@ async function executeRuntimeStep(input: {
       readFile: input.readFile,
       readFileVisuals: input.readFileVisuals,
       readSkill: input.readSkill,
+      loadedHiddenRuntimeSkillIds,
       attachmentBindings: input.attachmentBindings,
       credentialBindings: input.credentialBindings,
       getCredentialBindings: () => activeCredentialBindings,
@@ -3138,7 +3193,10 @@ async function executeRuntimeStep(input: {
     } catch (error) {
       requestWatchdog.dispose();
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
-      if (error && typeof error === 'object') (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
+      if (error && typeof error === 'object') {
+        (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
+        attachRuntimeFailureRecovery(error, lastRetryState, historyMessages.length, turnInputMessages);
+      }
       throw error;
     }
   }
@@ -3454,9 +3512,12 @@ export async function executeInteractiveBrowserTurn(input: {
   let reply = '';
   let endedWithFinalAnswer = false;
   let browserStatePreflightComplete = false;
+  // Runtime Skills are scoped to this Agent run. Every model step and both
+  // tool protocols share successful reads, but a new invocation starts empty.
+  const loadedHiddenRuntimeSkillIds = new Set<string>();
   const turnRenderedArtifactIds = new Set<string>();
   const turnDocumentIds = new Set<string>();
-  const requiresOfficeVisualQa = modelSupportsScreenshotInput() && Boolean(input.readFileVisuals);
+  const requiresOfficeVisualQa = modelSupportsImageInput() && Boolean(input.readFileVisuals);
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
@@ -3532,6 +3593,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         readFile: input.readFile,
         readFileVisuals: input.readFileVisuals,
         readSkill: input.readSkill,
+        loadedHiddenRuntimeSkillIds,
         attachmentBindings: input.attachmentBindings,
         credentialBindings: input.credentialBindings,
         ensureBrowserStarted: input.ensureBrowserStarted,
@@ -3564,6 +3626,9 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       ensureActive();
       activeModelMessages = actionResult.modelMessages;
       turnModelMessages.push(...actionResult.turnMessages);
+      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(actionResult.traces)) {
+        loadedHiddenRuntimeSkillIds.add(skillId);
+      }
       await input.onModelMessages?.({
         activeMessages: [...activeModelMessages],
         turnMessages: [...turnModelMessages],
@@ -3595,6 +3660,22 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
     } catch (error) {
       if (isBrowserChatAbortError(error, input.abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(input.abortSignal);
       const retryInfo = runtimeRetryFromError(error);
+      const recovery = runtimeFailureRecoveryFromError(error);
+      if (recovery?.messages.length) {
+        activeModelMessages = [...recovery.messages];
+        turnModelMessages.splice(0, turnModelMessages.length, ...recovery.turnMessages);
+      }
+      if (liveToolTraces.length) {
+        activeContinuationSummary = fallbackRuntimeContinuationSummary({
+          goal: input.instruction,
+          stepIndex,
+          agentStep: newSteps.length + 1,
+          previousSummary: activeContinuationSummary,
+          recentToolAttempts: formatCurrentToolAttemptSummary(liveToolTraces, 8),
+          runtimeState: continuationRuntimeStateFromTraces(liveToolTraces),
+        });
+        await input.onContinuationSummary?.(activeContinuationSummary);
+      }
       ensureActive();
       const recoveredVisualContext = latestToolProgress?.visualContext;
       const errorStep = await createRuntimeErrorStep({
@@ -3623,6 +3704,24 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       });
       finalStatus = 'failed';
       reply = userFacingRecoverableRuntimeError(error);
+      activeModelMessages = appendTerminalBrowserChatTurn(
+        activeModelMessages,
+        input.modelInstruction || input.instruction,
+        reply,
+      );
+      turnModelMessages.splice(
+        0,
+        turnModelMessages.length,
+        ...appendTerminalBrowserChatTurn(
+          turnModelMessages,
+          input.modelInstruction || input.instruction,
+          reply,
+        ),
+      );
+      await input.onModelMessages?.({
+        activeMessages: [...activeModelMessages],
+        turnMessages: [...turnModelMessages],
+      });
       endedWithFinalAnswer = true;
       break;
     }
@@ -4114,6 +4213,7 @@ async function executeCodexRuntimeObject(input: {
   readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
+  loadedHiddenRuntimeSkillIds?: Set<string>;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
   credentialBindings?: BrowserCodeCredentialBinding[];
   ensureBrowserStarted?: () => Promise<void>;
@@ -4122,6 +4222,8 @@ async function executeCodexRuntimeObject(input: {
   onReferenceImage?: (input: { path: string; source: string }) => void;
 }) {
   const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readFileVisuals, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
+  const loadedHiddenRuntimeSkillIds = input.loadedHiddenRuntimeSkillIds || new Set<string>();
+  for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
@@ -4142,7 +4244,9 @@ async function executeCodexRuntimeObject(input: {
     };
   }
 
-  const normalizedParams = { ...params };
+  const normalizedParams = {
+    ...(coerceBrowserChatToolInput(type, params) as Record<string, unknown>),
+  };
   if (type === 'file' && normalizedParams.action === 'read') {
     normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
     normalizedParams.pages = Array.isArray(normalizedParams.pages)
@@ -4150,7 +4254,7 @@ async function executeCodexRuntimeObject(input: {
           .map((page) => Number(page))
           .filter((page) => Number.isSafeInteger(page) && page > 0))).slice(0, 6)
       : undefined;
-    normalizedParams.includeVisuals = modelSupportsScreenshotInput()
+    normalizedParams.includeVisuals = modelSupportsImageInput()
       && (typeof normalizedParams.includeVisuals === 'boolean'
         ? normalizedParams.includeVisuals
         : normalizedParams.offset === undefined || Number(normalizedParams.offset) === 0 || Boolean((normalizedParams.pages as number[] | undefined)?.length));
@@ -4256,8 +4360,10 @@ async function executeCodexRuntimeObject(input: {
     if (type === 'skill' && normalizedParams.action === 'read') {
       const skillId = typeof normalizedParams.skillId === 'string' ? normalizedParams.skillId.trim() : '';
       if (!skillId) return { ok: false, actual: 'skill action=read requires one Skill id.' };
-      if (skillId === browserCodeRuntimeSkillId) {
-        return { ok: true, actual: browserCodeRuntimeSkillContent };
+      const hiddenContent = hiddenRuntimeSkillContent(skillId);
+      if (hiddenContent) {
+        loadedHiddenRuntimeSkillIds.add(skillId);
+        return { ok: true, actual: hiddenContent };
       }
       if (!readSkill) return { ok: false, actual: 'skill action=read is unavailable in this runtime.' };
       return readSkill(skillId);
@@ -4283,12 +4389,8 @@ async function executeCodexRuntimeObject(input: {
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {
-      if (browserCodeToolRequiresRuntimeSkill(type, browserCodeRuntimeSkillWasRead(traces))) {
-        return {
-          ok: false,
-          actual: `Tool ${type} was not executed. Read the hidden built-in Skill ${browserCodeRuntimeSkillId} with skill action=read in a separate model step, then call readBrowserState before retrying browserCode.`,
-        } satisfies BrowserActionResult;
-      }
+      const runtimeSkillGate = hiddenRuntimeSkillGateResult(type, normalizedParams, loadedHiddenRuntimeSkillIds);
+      if (runtimeSkillGate) return runtimeSkillGate;
       if (browserToolBlockedBeforeBrowserState(
         type,
         !Boolean(browserStatePreflightComplete),

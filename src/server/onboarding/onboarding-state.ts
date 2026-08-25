@@ -172,10 +172,8 @@ export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadi
   const modelReady = Boolean(providerSettings?.enabled && providerSettings.model && (
     providerDefinition.localAuth || localProvider || customCompatibleReady || providerSettings.hasApiKey
   ));
-  const screenshotSetting = String(process.env.SEND_SCREENSHOT_TO_AI || '').trim().toLowerCase();
   const selectedModel = String(providerSettings?.model || '');
-  const visionReady = screenshotSetting !== 'false'
-    && modelCapabilities(providerSettings, provider, selectedModel).imageInput;
+  const visionReady = modelCapabilities(providerSettings, provider, selectedModel).imageInput;
   const libreOfficeExecutable = await resolveLibreOfficeExecutable();
   const libreOfficePython = libreOfficeExecutable
     ? await resolveLibreOfficePythonExecutable(libreOfficeExecutable)
