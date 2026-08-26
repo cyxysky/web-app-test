@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { copyProductionRuntime, copyServerRuntime } = require('./server-package-layout');
+const { assertGlinerRuntime, copyGlinerRuntime } = require('./gliner-runtime-layout');
 
 const root = path.resolve(__dirname, '..');
 const packageName = 'WebPilot-Server';
@@ -79,7 +80,7 @@ function writeStartScript() {
   const packagedStartScript = startScript
     .replace(
       'if not defined HOSTNAME',
-      'if not defined LIBREOFFICE_PATH set "LIBREOFFICE_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\soffice.exe"\r\nif not defined LIBREOFFICE_PYTHON_PATH set "LIBREOFFICE_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\python.exe"\r\nif not defined HOSTNAME',
+      'if not defined LIBREOFFICE_PATH set "LIBREOFFICE_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\soffice.exe"\r\nif not defined LIBREOFFICE_PYTHON_PATH set "LIBREOFFICE_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\python.exe"\r\nif not defined AI_SENSITIVE_DATA_FILTER_ENABLED set "AI_SENSITIVE_DATA_FILTER_ENABLED=true"\r\nif not defined AI_SENSITIVE_DATA_FILTER_FAILURE_MODE set "AI_SENSITIVE_DATA_FILTER_FAILURE_MODE=closed"\r\nif not defined GLINER_BATCH_SIZE set "GLINER_BATCH_SIZE=8"\r\nif not defined GLINER_DEVICE set "GLINER_DEVICE=cpu"\r\nif not defined GLINER_RUNTIME_MODE set "GLINER_RUNTIME_MODE=local"\r\nif not defined GLINER_SERVICE_URL set "GLINER_SERVICE_URL=http://127.0.0.1:18001"\r\nif not defined GLINER_PYTHON_PATH set "GLINER_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\python\\python.exe"\r\nif not defined GLINER_SERVICE_DIR set "GLINER_SERVICE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\service"\r\nif not defined GLINER_MODEL_BUNDLE_DIR set "GLINER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\models\\gliner2"\r\nif not defined GLINER_CHINESE_NER_MODEL_BUNDLE_DIR set "GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\models\\chinese-roberta"\r\nif not defined HOSTNAME',
     )
     .replace('PORT=17890', 'PORT=3000');
   fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), packagedStartScript, 'utf8');
@@ -88,7 +89,7 @@ function writeStartScript() {
 function writeReadme() {
   const readme = `# WebPilot HTTP Server\n\nRequirements: Node.js 22.16 or later. No npm install is required.\n\n1. Extract this directory.\n2. Run start.cmd.\n3. Open http://127.0.0.1:17890.\n\nLocal direct access uses WEBPILOT_DEFAULT_USER_ID (default: 1). For an online mounted deployment, set WEBPILOT_REQUIRE_MOUNT_USER_ID=true and pass userId to WebPilotQA.mount().\n\nThe service listens on all network interfaces by default. To change the port, run \`set PORT=3000 && start.cmd\` from Command Prompt, or set \`$env:PORT = '3000'; .\\start.cmd\` in PowerShell. HTTP and WebSocket traffic share this one public port.\n\nRuntime data, artifacts, and browser profiles are written under the runtime directory unless APP_DATA_DIR or ARTIFACTS_DIR is set. Playwright Chromium is included in this package.\n`;
   const packagedReadme = readme
-    .replace('Playwright Chromium is included in this package.', 'Playwright Chromium and LibreOffice are included in this package.')
+    .replace('Playwright Chromium is included in this package.', 'Playwright Chromium, LibreOffice, Python, GLiNER, and the multilingual redaction model are included in this package. No separate runtime installation is required.')
     .replace('http://127.0.0.1:17890', 'http://127.0.0.1:3000')
     .replace('set PORT=3000 && start.cmd', 'set PORT=17890 && start.cmd')
     .replace("$env:PORT = '3000'", "$env:PORT = '17890'");
@@ -131,6 +132,7 @@ prepareOutputDirectory();
 const productionPackagePaths = copyProductionRuntime(root, serverRoot);
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
 const serverRuntimeFiles = copyServerRuntime(root, serverRoot);
+copyGlinerRuntime(path.join(serverRoot, 'gliner-runtime'));
 copyInto(
   path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
   path.join(serverRoot, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
@@ -154,6 +156,7 @@ if (
 ) {
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
 }
+assertGlinerRuntime(path.join(serverRoot, 'gliner-runtime'));
 
 writeStartScript();
 writeReadme();

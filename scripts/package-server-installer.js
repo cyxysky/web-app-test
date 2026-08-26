@@ -43,7 +43,17 @@ function assertSupportedNodeVersion(version = process.versions.node) {
 function createServiceXml() {
   const environment = {
     APP_DATA_DIR: '%ProgramData%\\WebPilot\\runtime',
+    AI_SENSITIVE_DATA_FILTER_ENABLED: 'true',
+    AI_SENSITIVE_DATA_FILTER_FAILURE_MODE: 'closed',
     ARTIFACTS_DIR: '%ProgramData%\\WebPilot\\runtime\\artifacts',
+    GLINER_BATCH_SIZE: '8',
+    GLINER_DEVICE: 'cpu',
+    GLINER_MODEL_BUNDLE_DIR: '%BASE%\\server\\gliner-runtime\\models\\gliner2',
+    GLINER_CHINESE_NER_MODEL_BUNDLE_DIR: '%BASE%\\server\\gliner-runtime\\models\\chinese-roberta',
+    GLINER_PYTHON_PATH: '%BASE%\\server\\gliner-runtime\\python\\python.exe',
+    GLINER_RUNTIME_MODE: 'local',
+    GLINER_SERVICE_DIR: '%BASE%\\server\\gliner-runtime\\service',
+    GLINER_SERVICE_URL: 'http://127.0.0.1:18001',
     HEADLESS_BROWSER: 'true',
     HOSTNAME: '0.0.0.0',
     LIBREOFFICE_PATH: '%BASE%\\libreoffice\\program\\soffice.exe',
@@ -204,6 +214,12 @@ function requiredServerPackageEntries(packageRoot = distributionRoot) {
     path.join(packageRoot, 'server', 'webpilot-server.js'),
     path.join(packageRoot, 'ms-playwright'),
     path.join(packageRoot, 'libreoffice', 'program', 'soffice.exe'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'python', 'python.exe'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'app.py'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'candidate_resolution.py'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'entity_boundaries.py'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'gliner2', 'config.json'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'chinese-roberta', 'config.json'),
   ];
 }
 

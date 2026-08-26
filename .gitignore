@@ -27,6 +27,10 @@ id_ed25519.*
 /dist-desktop
 /dist-server
 /dist-electron
+/dist-gliner-runtime
 /.swc
 /.workflow-data
 /.workflow-vitest
+/.venv-gliner
+**/__pycache__/
+*.py[cod]

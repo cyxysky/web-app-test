@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { createRequire } = require('node:module');
+const { assertGlinerRuntime } = require('./gliner-runtime-layout');
 
 function findBrowserRevisionDir(executablePath) {
   let dir = path.dirname(executablePath);
@@ -93,6 +94,7 @@ exports.default = async function afterPack(context) {
   fs.cpSync(source, target, { recursive: true });
 
   assertPackagedServerRuntime(path.join(context.appOutDir, 'resources', 'server'));
+  assertGlinerRuntime(path.join(context.appOutDir, 'resources', 'server', 'gliner-runtime'));
 
   copyPlaywrightChromium(context);
   copyLibreOffice(context);

@@ -38,6 +38,13 @@ import {
   environmentSettingsTabs,
   environmentSettingsTabsForUser,
 } from '@/components/environment-settings-model';
+import {
+  duplicateExtraRequestParameterKeys,
+  parseExtraRequestParameterPairs,
+  serializeExtraRequestParameterPairs,
+  type ExtraRequestParameterPair,
+} from '@/lib/extra-request-parameters';
+import type { SensitiveDataEvaluationCase } from '@/lib/sensitive-data-evaluation';
 
 export {
   environmentSettingsTabs,
@@ -95,6 +102,47 @@ type PersonalMemoryDraft = {
 };
 
 type PersonalMemoryEditorMode = 'create' | 'edit' | null;
+
+type ExtraRequestParameterDraft = ExtraRequestParameterPair & {
+  id: string;
+};
+
+type SensitiveDataTestReplacement = {
+  original: string;
+  placeholder: string;
+  label: string;
+  start: number;
+  end: number;
+};
+
+type SensitiveDataTestResult = {
+  text: string;
+  replacements: SensitiveDataTestReplacement[];
+};
+
+type SensitiveDataEvaluationDraft = Omit<SensitiveDataEvaluationCase, 'expectedValues'> & {
+  expectedValuesText: string;
+};
+
+type SensitiveDataEvaluationCaseResult = {
+  id: string;
+  passed: boolean;
+  text: string;
+  detectedValues: string[];
+  missingValues: string[];
+  unexpectedValues: string[];
+};
+
+type SensitiveDataEvaluationRun = {
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    precision: number;
+    recall: number;
+  };
+  results: SensitiveDataEvaluationCaseResult[];
+};
 
 type SystemBridge = {
   cancelDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
@@ -220,6 +268,40 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
   };
 }
 
+function extraRequestParameterDrafts(config: ModelConfig) {
+  const drafts: Partial<Record<ModelProvider, ExtraRequestParameterDraft[]>> = {};
+  for (const definition of modelProviderDefinitions) {
+    drafts[definition.value] = parseExtraRequestParameterPairs(
+      providerSettings(config, definition.value).extraRequestParameters,
+    ).map((pair, index) => ({
+      ...pair,
+      id: `${definition.value}:${index}:${pair.key}`,
+    }));
+  }
+  return drafts;
+}
+
+function sensitiveDataEvaluationDrafts(cases: SensitiveDataEvaluationCase[] = []): SensitiveDataEvaluationDraft[] {
+  return cases.map((item) => ({
+    id: item.id,
+    name: item.name,
+    text: item.text,
+    expectedValuesText: item.expectedValues.join('\n'),
+  }));
+}
+
+function sensitiveDataEvaluationPayload(cases: SensitiveDataEvaluationDraft[]): SensitiveDataEvaluationCase[] {
+  return cases.map((item) => ({
+    id: item.id,
+    name: item.name.trim(),
+    text: item.text,
+    expectedValues: [...new Set(item.expectedValuesText
+      .split(/\r?\n/)
+      .map((value) => value.trim())
+      .filter(Boolean))],
+  }));
+}
+
 function draftModelRows(definition: ReturnType<typeof modelProviderDefinition>, settings: ModelProviderSettings) {
   const rows = Array.isArray(settings.models) && settings.models.length
     ? settings.models
@@ -270,6 +352,10 @@ export function EnvironmentSettings({
   const [items, setItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
   const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
+  const [extraRequestParameterRows, setExtraRequestParameterRows] = useState<Partial<Record<ModelProvider, ExtraRequestParameterDraft[]>>>(() => (
+    extraRequestParameterDrafts(createModelConfig(initialData?.modelConfig))
+  ));
+  const extraRequestParameterIdRef = useRef(0);
   const [personalMemoryItems, setPersonalMemoryItems] = useState<PersonalMemoryItem[]>([]);
   const [personalMemoryDraft, setPersonalMemoryDraft] = useState<PersonalMemoryDraft>(() => createPersonalMemoryDraft());
   const [personalMemoryEditorMode, setPersonalMemoryEditorMode] = useState<PersonalMemoryEditorMode>(null);
@@ -283,6 +369,18 @@ export function EnvironmentSettings({
   const [loading, setLoading] = useState(!initialData && shouldLoadEnvironmentConfig && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
+  const [sensitiveDataTestInput, setSensitiveDataTestInput] = useState('');
+  const [sensitiveDataTestResult, setSensitiveDataTestResult] = useState<SensitiveDataTestResult | null>(null);
+  const [sensitiveDataTestError, setSensitiveDataTestError] = useState('');
+  const [testingSensitiveData, setTestingSensitiveData] = useState(false);
+  const [sensitiveDataEvaluationCases, setSensitiveDataEvaluationCases] = useState<SensitiveDataEvaluationDraft[]>([]);
+  const [sensitiveDataEvaluationRun, setSensitiveDataEvaluationRun] = useState<SensitiveDataEvaluationRun | null>(null);
+  const [sensitiveDataEvaluationError, setSensitiveDataEvaluationError] = useState('');
+  const [sensitiveDataEvaluationLoaded, setSensitiveDataEvaluationLoaded] = useState(false);
+  const [loadingSensitiveDataEvaluation, setLoadingSensitiveDataEvaluation] = useState(false);
+  const [savingSensitiveDataEvaluation, setSavingSensitiveDataEvaluation] = useState(false);
+  const [runningSensitiveDataEvaluation, setRunningSensitiveDataEvaluation] = useState(false);
+  const sensitiveDataEvaluationIdRef = useRef(0);
   const [loadingPersonalMemory, setLoadingPersonalMemory] = useState(false);
   const personalMemoryLoadSequenceRef = useRef(0);
   const [savingPersonalMemory, setSavingPersonalMemory] = useState(false);
@@ -318,6 +416,38 @@ export function EnvironmentSettings({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [adminSettingsAccessToken, adminSettingsPasswordRequired]);
 
+  useEffect(() => {
+    if (
+      activeTab !== 'sensitive-data'
+      || sensitiveDataEvaluationLoaded
+      || (adminSettingsPasswordRequired && !adminSettingsAccessToken)
+    ) return;
+    const controller = new AbortController();
+    setLoadingSensitiveDataEvaluation(true);
+    setSensitiveDataEvaluationError('');
+    void (async () => {
+      try {
+        const response = await fetch(withWebPilotBasePath('/api/settings/sensitive-data-evaluation'), {
+          cache: 'no-store',
+          headers: adminSettingsAccessToken ? { Authorization: `Bearer ${adminSettingsAccessToken}` } : {},
+          signal: controller.signal,
+        });
+        const data = await readApiJson<{ cases?: SensitiveDataEvaluationCase[] }>(response, '读取脱敏评测集失败');
+        if (controller.signal.aborted) return;
+        setSensitiveDataEvaluationCases(sensitiveDataEvaluationDrafts(data.cases));
+        setSensitiveDataEvaluationLoaded(true);
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setSensitiveDataEvaluationError(error instanceof Error ? t(error.message) : t('读取脱敏评测集失败'));
+      } finally {
+        if (!controller.signal.aborted) setLoadingSensitiveDataEvaluation(false);
+      }
+    })();
+    return () => controller.abort();
+  // Loading is intentionally keyed to the selected tab and admin access grant.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, adminSettingsAccessToken, adminSettingsPasswordRequired]);
+
   async function load() {
     setLoading(true);
     try {
@@ -331,6 +461,7 @@ export function EnvironmentSettings({
       setItems(envData.saved || []);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
+      setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
     } finally {
       setLoading(false);
     }
@@ -394,6 +525,145 @@ export function EnvironmentSettings({
         },
       };
     });
+  }
+
+  async function runSensitiveDataTest() {
+    if (!sensitiveDataTestInput.trim() || testingSensitiveData) return;
+    setTestingSensitiveData(true);
+    setSensitiveDataTestError('');
+    try {
+      const response = await fetch(withWebPilotBasePath('/api/settings/sensitive-data-test'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...adminSettingsAuthorizationHeaders },
+        body: JSON.stringify({ text: sensitiveDataTestInput }),
+      });
+      const data = await readApiJson<SensitiveDataTestResult>(response, t('敏感数据过滤测试失败'));
+      setSensitiveDataTestResult({
+        text: String(data.text || ''),
+        replacements: Array.isArray(data.replacements) ? data.replacements : [],
+      });
+    } catch (error) {
+      setSensitiveDataTestResult(null);
+      setSensitiveDataTestError(error instanceof Error ? t(error.message) : t('敏感数据过滤测试失败'));
+    } finally {
+      setTestingSensitiveData(false);
+    }
+  }
+
+  function addSensitiveDataEvaluationCase() {
+    setSensitiveDataEvaluationCases((current) => [
+      ...current,
+      {
+        id: `evaluation:${Date.now()}:${sensitiveDataEvaluationIdRef.current++}`,
+        name: '',
+        text: '',
+        expectedValuesText: '',
+      },
+    ]);
+    setSensitiveDataEvaluationRun(null);
+    setSensitiveDataEvaluationError('');
+  }
+
+  function updateSensitiveDataEvaluationCase(id: string, patch: Partial<SensitiveDataEvaluationDraft>) {
+    setSensitiveDataEvaluationCases((current) => current.map((item) => item.id === id ? { ...item, ...patch } : item));
+    setSensitiveDataEvaluationRun(null);
+    setSensitiveDataEvaluationError('');
+  }
+
+  function removeSensitiveDataEvaluationCase(id: string) {
+    setSensitiveDataEvaluationCases((current) => current.filter((item) => item.id !== id));
+    setSensitiveDataEvaluationRun(null);
+    setSensitiveDataEvaluationError('');
+  }
+
+  function validSensitiveDataEvaluationPayload() {
+    if (sensitiveDataEvaluationCases.some((item) => !item.text.trim())) {
+      setSensitiveDataEvaluationError(t('评测用例文本不能为空。'));
+      return null;
+    }
+    return sensitiveDataEvaluationPayload(sensitiveDataEvaluationCases);
+  }
+
+  async function saveSensitiveDataEvaluationCases() {
+    if (savingSensitiveDataEvaluation) return;
+    const cases = validSensitiveDataEvaluationPayload();
+    if (!cases) return;
+    setSavingSensitiveDataEvaluation(true);
+    setSensitiveDataEvaluationError('');
+    try {
+      const response = await fetch(withWebPilotBasePath('/api/settings/sensitive-data-evaluation'), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...adminSettingsAuthorizationHeaders },
+        body: JSON.stringify({ cases }),
+      });
+      const data = await readApiJson<{ cases?: SensitiveDataEvaluationCase[] }>(response, t('保存脱敏评测集失败'));
+      setSensitiveDataEvaluationCases(sensitiveDataEvaluationDrafts(data.cases));
+      setSensitiveDataEvaluationLoaded(true);
+    } catch (error) {
+      setSensitiveDataEvaluationError(error instanceof Error ? t(error.message) : t('保存脱敏评测集失败'));
+    } finally {
+      setSavingSensitiveDataEvaluation(false);
+    }
+  }
+
+  async function runSensitiveDataEvaluation() {
+    if (runningSensitiveDataEvaluation) return;
+    const cases = validSensitiveDataEvaluationPayload();
+    if (!cases) return;
+    if (!cases.length) {
+      setSensitiveDataEvaluationError(t('请至少添加一个评测用例。'));
+      return;
+    }
+    setRunningSensitiveDataEvaluation(true);
+    setSensitiveDataEvaluationError('');
+    try {
+      const response = await fetch(withWebPilotBasePath('/api/settings/sensitive-data-evaluation'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...adminSettingsAuthorizationHeaders },
+        body: JSON.stringify({ cases }),
+      });
+      const data = await readApiJson<SensitiveDataEvaluationRun>(response, t('运行脱敏评测失败'));
+      setSensitiveDataEvaluationRun(data);
+    } catch (error) {
+      setSensitiveDataEvaluationRun(null);
+      setSensitiveDataEvaluationError(error instanceof Error ? t(error.message) : t('运行脱敏评测失败'));
+    } finally {
+      setRunningSensitiveDataEvaluation(false);
+    }
+  }
+
+  function commitActiveProviderExtraRequestParameters(rows: ExtraRequestParameterDraft[]) {
+    setExtraRequestParameterRows((current) => ({
+      ...current,
+      [activeProvider]: rows,
+    }));
+    updateActiveProviderSettings({ extraRequestParameters: serializeExtraRequestParameterPairs(rows) });
+  }
+
+  function addActiveProviderExtraRequestParameter() {
+    commitActiveProviderExtraRequestParameters([
+      ...activeProviderExtraRequestParameterRows,
+      {
+        id: `${activeProvider}:new:${extraRequestParameterIdRef.current++}`,
+        key: '',
+        value: '',
+      },
+    ]);
+  }
+
+  function updateActiveProviderExtraRequestParameter(
+    id: string,
+    patch: Partial<ExtraRequestParameterPair>,
+  ) {
+    commitActiveProviderExtraRequestParameters(
+      activeProviderExtraRequestParameterRows.map((row) => row.id === id ? { ...row, ...patch } : row),
+    );
+  }
+
+  function removeActiveProviderExtraRequestParameter(id: string) {
+    commitActiveProviderExtraRequestParameters(
+      activeProviderExtraRequestParameterRows.filter((row) => row.id !== id),
+    );
   }
 
   function setActiveProviderModels(
@@ -478,6 +748,13 @@ export function EnvironmentSettings({
   }
 
   async function saveModel() {
+    for (const definition of modelProviderDefinitions) {
+      const duplicates = duplicateExtraRequestParameterKeys(extraRequestParameterRows[definition.value] || []);
+      if (duplicates.length) {
+        window.alert(t('额外请求参数名不能重复：{keys}', { keys: duplicates.join(', ') }));
+        return;
+      }
+    }
     const payload = createModelConfig(modelDraft || modelConfig);
     setSavingModel(true);
     startGlobalLoading(t('正在保存模型配置'));
@@ -491,6 +768,7 @@ export function EnvironmentSettings({
       const nextModel = createModelConfig(data.config);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
+      setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
       onModelSaved?.();
     } finally {
       setSavingModel(false);
@@ -507,6 +785,7 @@ export function EnvironmentSettings({
     const nextModel = createModelConfig(data.config);
     setModelConfig(nextModel);
     setModelDraft(nextModel);
+    setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
     onModelSaved?.();
   }
 
@@ -709,6 +988,192 @@ export function EnvironmentSettings({
       setDeletingPersonalMemoryId('');
       stopGlobalLoading();
     }
+  }
+
+  function renderSensitiveDataTestPanel() {
+    const evaluationResults = new Map((sensitiveDataEvaluationRun?.results || []).map((item) => [item.id, item]));
+    return (
+      <div className="settings-sensitive-data-test">
+        <div className="settings-sensitive-data-test-head">
+          <div>
+            <h3>{t('敏感数据过滤测试')}</h3>
+            <span>{t('使用当前已保存的 GLiNER 配置测试文本脱敏；测试不会调用任何 AI 模型，也不会保存输入和结果。')}</span>
+          </div>
+          <button
+            className="ui-button ui-button--primary"
+            disabled={testingSensitiveData || !sensitiveDataTestInput.trim()}
+            onClick={runSensitiveDataTest}
+            type="button"
+          >
+            {testingSensitiveData ? <Loader2 className="spin" size={15} /> : null}
+            {t(testingSensitiveData ? '正在检测' : '开始检测')}
+          </button>
+        </div>
+        <div className="settings-sensitive-data-test-grid">
+          <label className="settings-sensitive-data-test-field">
+            <strong>{t('待检测文本')}</strong>
+            <TextArea
+              className="settings-sensitive-data-test-input"
+              fullWidth
+              placeholder={t('例如：张三的邮箱是 zhangsan@example.com，手机号是 13800138000。')}
+              value={sensitiveDataTestInput}
+              onChange={(event) => {
+                setSensitiveDataTestInput(event.target.value);
+                setSensitiveDataTestResult(null);
+                setSensitiveDataTestError('');
+              }}
+            />
+          </label>
+          <div className="settings-sensitive-data-test-field">
+            <strong>{t('脱敏结果')}</strong>
+            <pre aria-live="polite" className={`settings-sensitive-data-test-output${sensitiveDataTestResult ? ' has-result' : ''}`}>
+              {sensitiveDataTestResult?.text || t('检测完成后在此显示结果。')}
+            </pre>
+          </div>
+        </div>
+        {sensitiveDataTestError ? (
+          <div className="settings-sensitive-data-test-error" role="alert">{sensitiveDataTestError}</div>
+        ) : null}
+        {sensitiveDataTestResult ? (
+          <div className="settings-sensitive-data-replacements">
+            <div className="settings-sensitive-data-replacements-head">
+              <strong>{t('替换明细')}</strong>
+              <span>{t('{count} 项', { count: sensitiveDataTestResult.replacements.length })}</span>
+            </div>
+            {sensitiveDataTestResult.replacements.length ? (
+              <div className="settings-sensitive-data-replacement-list">
+                {sensitiveDataTestResult.replacements.map((replacement, index) => (
+                  <div className="settings-sensitive-data-replacement-row" key={`${replacement.start}:${replacement.end}:${index}`}>
+                    <code>{replacement.original}</code>
+                    <span aria-hidden="true">→</span>
+                    <code>{replacement.placeholder}</code>
+                    <span className="settings-sensitive-data-label">{replacement.label}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="settings-sensitive-data-test-empty">{t('未检测到敏感内容。')}</div>
+            )}
+          </div>
+        ) : null}
+        <div className="settings-sensitive-data-evaluation">
+          <div className="settings-sensitive-data-evaluation-head">
+            <div>
+              <h3>{t('脱敏评测集')}</h3>
+              <span>{t('配置可复用用例并批量评测。每个预期敏感原文单独占一行，系统按原文精确匹配统计通过率、精确率和召回率。')}</span>
+            </div>
+            <div className="settings-sensitive-data-evaluation-actions">
+              <button
+                className="ui-button"
+                disabled={savingSensitiveDataEvaluation || loadingSensitiveDataEvaluation}
+                onClick={saveSensitiveDataEvaluationCases}
+                type="button"
+              >
+                {savingSensitiveDataEvaluation ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+                {t('保存评测集')}
+              </button>
+              <button
+                className="ui-button ui-button--primary"
+                disabled={runningSensitiveDataEvaluation || loadingSensitiveDataEvaluation || !sensitiveDataEvaluationCases.length}
+                onClick={runSensitiveDataEvaluation}
+                type="button"
+              >
+                {runningSensitiveDataEvaluation ? <Loader2 className="spin" size={15} /> : null}
+                {t(runningSensitiveDataEvaluation ? '正在评测' : '运行评测')}
+              </button>
+              <button className="ui-button" onClick={addSensitiveDataEvaluationCase} type="button">
+                <Plus size={15} />
+                {t('新增用例')}
+              </button>
+            </div>
+          </div>
+          <div className="settings-sensitive-data-evaluation-note">
+            {t('评测集会保存在本机配置数据库中，请只使用合成测试数据，不要保存真实密码、令牌或个人隐私。')}
+          </div>
+          {sensitiveDataEvaluationError ? (
+            <div className="settings-sensitive-data-test-error" role="alert">{sensitiveDataEvaluationError}</div>
+          ) : null}
+          {sensitiveDataEvaluationRun ? (
+            <div className="settings-sensitive-data-evaluation-summary" aria-live="polite">
+              <div><strong>{sensitiveDataEvaluationRun.summary.passed}/{sensitiveDataEvaluationRun.summary.total}</strong><span>{t('通过用例')}</span></div>
+              <div><strong>{Math.round(sensitiveDataEvaluationRun.summary.precision * 100)}%</strong><span>{t('精确率')}</span></div>
+              <div><strong>{Math.round(sensitiveDataEvaluationRun.summary.recall * 100)}%</strong><span>{t('召回率')}</span></div>
+            </div>
+          ) : null}
+          {loadingSensitiveDataEvaluation ? (
+            <div className="settings-sensitive-data-test-empty"><Loader2 className="spin" size={16} /> {t('正在读取评测集')}</div>
+          ) : sensitiveDataEvaluationCases.length ? (
+            <div className="settings-sensitive-data-evaluation-list">
+              {sensitiveDataEvaluationCases.map((item, index) => {
+                const result = evaluationResults.get(item.id);
+                return (
+                  <article className="settings-sensitive-data-evaluation-case" key={item.id}>
+                    <div className="settings-sensitive-data-evaluation-case-head">
+                      <AppInput
+                        aria-label={t('用例名称')}
+                        onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { name: event.target.value })}
+                        placeholder={t('用例 {index}', { index: index + 1 })}
+                        value={item.name}
+                      />
+                      {result ? (
+                        <span className={`settings-sensitive-data-evaluation-status ${result.passed ? 'passed' : 'failed'}`}>
+                          {t(result.passed ? '通过' : '未通过')}
+                        </span>
+                      ) : null}
+                      <button
+                        aria-label={t('删除用例')}
+                        className="ui-button ui-button--icon"
+                        onClick={() => removeSensitiveDataEvaluationCase(item.id)}
+                        type="button"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                    <div className="settings-sensitive-data-evaluation-case-grid">
+                      <label className="settings-sensitive-data-test-field">
+                        <strong>{t('评测文本')}</strong>
+                        <TextArea
+                          className="settings-sensitive-data-evaluation-textarea"
+                          fullWidth
+                          onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { text: event.target.value })}
+                          placeholder={t('输入包含合成敏感数据的测试文本。')}
+                          value={item.text}
+                        />
+                      </label>
+                      <label className="settings-sensitive-data-test-field">
+                        <strong>{t('预期敏感原文（每行一项）')}</strong>
+                        <TextArea
+                          className="settings-sensitive-data-evaluation-textarea"
+                          fullWidth
+                          onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { expectedValuesText: event.target.value })}
+                          placeholder={t('例如：\nzhangsan@example.com\n13800138000')}
+                          value={item.expectedValuesText}
+                        />
+                      </label>
+                    </div>
+                    {result ? (
+                      <div className="settings-sensitive-data-evaluation-result">
+                        <div>
+                          <strong>{t('脱敏结果')}</strong>
+                          <pre>{result.text}</pre>
+                        </div>
+                        <div className="settings-sensitive-data-evaluation-findings">
+                          <span><strong>{t('已检测')}</strong>{result.detectedValues.length ? result.detectedValues.join(' · ') : t('无')}</span>
+                          {result.missingValues.length ? <span className="missing"><strong>{t('漏检')}</strong>{result.missingValues.join(' · ')}</span> : null}
+                          {result.unexpectedValues.length ? <span className="unexpected"><strong>{t('误报')}</strong>{result.unexpectedValues.join(' · ')}</span> : null}
+                        </div>
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="settings-sensitive-data-test-empty">{t('暂无评测用例，点击“新增用例”开始配置。')}</div>
+          )}
+        </div>
+      </div>
+    );
   }
 
   function renderRuntimeControl(item: EnvRow, index: number) {
@@ -1272,6 +1737,8 @@ export function EnvironmentSettings({
   const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const activeProviderEnabled = activeProviderSettings.enabled === true;
   const activeProviderSupportsExtraRequestParameters = activeProvider === 'minimax' || activeProvider.startsWith('openai-compatible');
+  const activeProviderExtraRequestParameterRows = extraRequestParameterRows[activeProvider] || [];
+  const activeProviderDuplicateExtraRequestParameterKeys = duplicateExtraRequestParameterKeys(activeProviderExtraRequestParameterRows);
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
     .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
@@ -1286,7 +1753,7 @@ export function EnvironmentSettings({
           </Link>
           <div>
             <h1>{t('环境配置')}</h1>
-            <span>{t('模型、浏览器、运行控制和调试参数全部在网页配置中管理。')}</span>
+            <span>{t('模型、浏览器、敏感数据过滤、运行控制和调试参数全部在网页配置中管理。')}</span>
           </div>
         </header>
       )}
@@ -1308,7 +1775,7 @@ export function EnvironmentSettings({
               <LiquidGlassLoader />
               <div>
                 <h2>{t('正在读取环境配置')}</h2>
-                <span>{t('正在加载模型、浏览器、运行控制和调试参数。')}</span>
+                <span>{t('正在加载模型、浏览器、敏感数据过滤、运行控制和调试参数。')}</span>
               </div>
             </section>
           ) : (
@@ -1523,18 +1990,54 @@ export function EnvironmentSettings({
                   </div>
                 ) : null}
                 {activeProviderSupportsExtraRequestParameters ? (
-                  <div className="settings-row">
+                  <div className="settings-row settings-extra-parameters-row">
                     <div>
-                      <strong>Extra request parameters (JSON)</strong>
-                      <span>Added to every Chat Completions request. Example: {`{"thinking":{"type":"adaptive"},"service_tier":"priority"}`}. The app keeps model, messages, stream, and tools under its own control.</span>
+                      <strong>{t('额外请求参数')}</strong>
+                      <span>{t('以键值对形式添加到每次 Chat Completions 请求。值支持布尔值、数字、JSON 对象、数组和字符串；model、messages、stream、tools、tool_choice 由应用管理。')}</span>
                     </div>
-                    <TextArea
-                      className="settings-textarea-control"
-                      fullWidth
-                      placeholder={'{\n  "thinking": { "type": "adaptive" },\n  "temperature": 1,\n  "top_p": 0.95,\n  "max_completion_tokens": 4096,\n  "service_tier": "priority"\n}'}
-                      value={activeProviderSettings.extraRequestParameters || ''}
-                      onChange={(event) => updateActiveProviderSettings({ extraRequestParameters: event.target.value })}
-                    />
+                    <div className="settings-extra-parameters-control">
+                      {activeProviderExtraRequestParameterRows.length ? (
+                        <div className="settings-extra-parameters-list">
+                          {activeProviderExtraRequestParameterRows.map((row) => (
+                            <div className="settings-extra-parameter-input-row" key={row.id}>
+                              <AppInput
+                                aria-invalid={activeProviderDuplicateExtraRequestParameterKeys.includes(row.key.trim()) || undefined}
+                                aria-label={t('参数名')}
+                                onChange={(event) => updateActiveProviderExtraRequestParameter(row.id, { key: event.target.value })}
+                                placeholder={t('参数名')}
+                                value={row.key}
+                              />
+                              <AppInput
+                                aria-label={t('参数值')}
+                                onChange={(event) => updateActiveProviderExtraRequestParameter(row.id, { value: event.target.value })}
+                                placeholder={t('参数值，例如 true、0.2、"priority" 或 {"type":"adaptive"}')}
+                                value={row.value}
+                              />
+                              <button
+                                aria-label={t('删除参数')}
+                                className="settings-model-row-button danger"
+                                onClick={() => removeActiveProviderExtraRequestParameter(row.id)}
+                                title={t('删除参数')}
+                                type="button"
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="settings-extra-parameters-empty">{t('暂未添加额外请求参数。')}</span>
+                      )}
+                      {activeProviderDuplicateExtraRequestParameterKeys.length ? (
+                        <span className="settings-extra-parameters-error" role="alert">
+                          {t('额外请求参数名不能重复：{keys}', { keys: activeProviderDuplicateExtraRequestParameterKeys.join(', ') })}
+                        </span>
+                      ) : null}
+                      <button className="ui-button settings-add-parameter-button" onClick={addActiveProviderExtraRequestParameter} type="button">
+                        <Plus size={15} />
+                        {t('添加参数')}
+                      </button>
+                    </div>
                   </div>
                 ) : null}
                   </div>
@@ -1578,6 +2081,7 @@ export function EnvironmentSettings({
               ) : (
                 <div className="empty-state">{t('这个分类暂无配置。')}</div>
               )}
+              {activeTab === 'sensitive-data' ? renderSensitiveDataTestPanel() : null}
             </section>
           ) : null}
             </>

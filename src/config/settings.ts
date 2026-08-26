@@ -1,6 +1,6 @@
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'browser' | 'sensitive-data' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -33,6 +33,15 @@ export type RuntimeEnvDefinition = {
   picker?: 'directory';
   secret?: boolean;
 };
+
+export const defaultGlinerOpenLabelModel = 'fastino/gliner2.5-multi-v1';
+
+export function migrateRuntimeEnvValue(key: string, value: string) {
+  if (key === 'GLINER_MODEL' && value.trim() === 'urchade/gliner_multi-v2.1') {
+    return defaultGlinerOpenLabelModel;
+  }
+  return value;
+}
 
 export function normalizeMiniMaxOpenAIBaseURL(baseURL: string | undefined) {
   const officialAnthropicEndpoint = baseURL?.trim().match(
@@ -205,6 +214,15 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'SQLITE_COMPACTION_MIN_FREE_PAGES', label: 'SQLite 压缩最小空闲页', description: '达到该空闲页数后才允许执行 VACUUM，避免小数据库频繁重写。', tab: 'runtime', defaultValue: '1024', control: 'number', min: 128, max: 100000, step: 128 },
   { key: 'OFFICE_GENERATION_MODE', label: 'Office 文件生成模式', description: 'JavaScript 使用 PptxGenJS、docx、ExcelJS 创建 PPTX/DOCX/XLSX，并由 LibreOffice 转换 PDF；修改现有 Office 文件时仍使用 UNO。', tab: 'runtime', defaultValue: 'javascript', control: 'select', options: [{ label: 'JavaScript Office 库（默认）', value: 'javascript' }, { label: 'LibreOffice UNO', value: 'uno' }, { label: '自动选择', value: 'auto' }] },
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
+  { key: 'AI_SENSITIVE_DATA_FILTER_ENABLED', label: 'AI 敏感数据过滤', description: '调用模型前使用内置 GLiNER2.5 开放标签识别，并由中文 RoBERTa 校正公司/组织边界后替换为占位符；正式安装包和 Docker 镜像默认启用。', tab: 'sensitive-data', defaultValue: 'false', control: 'boolean', options: boolOptions },
+  { key: 'GLINER_SERVICE_URL', label: 'GLiNER 服务地址', description: '正式产物已自动配置为本机内置服务。仅在开发或私有化集群中改为其他可信内网地址。', tab: 'sensitive-data', defaultValue: 'http://127.0.0.1:18001', control: 'text' },
+  { key: 'AI_SENSITIVE_DATA_FILTER_FAILURE_MODE', label: '敏感数据过滤故障策略', description: '关闭模式会在 GLiNER 不可用时阻止 AI 请求；开放模式会继续发送原文，仅建议临时排障使用。', tab: 'sensitive-data', defaultValue: 'closed', control: 'select', options: [{ label: '关闭（阻止请求）', value: 'closed' }, { label: '开放（继续请求）', value: 'open' }] },
+  { key: 'AI_SENSITIVE_DATA_FILTER_TIMEOUT_MS', label: '敏感数据过滤超时', description: '等待 GLiNER 完成单次提示词脱敏的最长时间，单位毫秒。', tab: 'sensitive-data', defaultValue: '15000', control: 'number', min: 1000, max: 120000, step: 1000 },
+  { key: 'AI_SENSITIVE_DATA_FILTER_THRESHOLD', label: 'GLiNER2.5 识别阈值', description: '第一阶段开放标签识别置信度阈值；越低召回率越高，但误报也会增加。', tab: 'sensitive-data', defaultValue: '0.5', control: 'number', min: 0.05, max: 1, step: 0.05 },
+  { key: 'AI_SENSITIVE_DATA_FILTER_LABELS', label: 'GLiNER2.5 敏感实体标签', description: '可选的逗号或换行分隔开放实体标签；留空时使用服务内置的 PII 标签。company/organization 类标签会自动进入中文 RoBERTa 边界校正。', tab: 'sensitive-data', defaultValue: '', control: 'textarea' },
+  { key: 'GLINER_MODEL', label: 'GLiNER2.5 开放标签模型', description: '默认安装包内置 fastino/gliner2.5-multi-v1。这里只支持 GLiNER2.5/GLiNER2 的 AutoExtractor 检查点；修改后需要重新制作正式产物并重启应用。', tab: 'sensitive-data', defaultValue: defaultGlinerOpenLabelModel, control: 'text' },
+  { key: 'GLINER_DEVICE', label: 'GLiNER 运行设备', description: '默认内置 CPU 运行时。CUDA 需要匹配的 NVIDIA 驱动和 CUDA 版 PyTorch，并重新制作正式产物。', tab: 'sensitive-data', defaultValue: 'cpu', control: 'select', options: [{ label: 'CPU', value: 'cpu' }, { label: 'CUDA', value: 'cuda' }] },
+  { key: 'GLINER_BATCH_SIZE', label: 'GLiNER 批量大小', description: '单次推理的批量大小；值越高吞吐量通常越高，但会占用更多 CPU/GPU 内存。修改后需重启应用。', tab: 'sensitive-data', defaultValue: '8', control: 'number', min: 1, max: 128, step: 1 },
   { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求首个响应及普通非流式调用的最长等待时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_TIMEOUT_MS', label: 'Agent 模型请求超时', description: 'Agent Loop 单轮模型请求的最长等待时间；大上下文或长推理模型可能需要数分钟，默认 600000 毫秒。', tab: 'runtime', defaultValue: '600000', control: 'number' },
@@ -247,9 +265,10 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
 export const runtimeEnvKeys = runtimeEnvDefinitions.map((item) => item.key);
 
 export function normalizeRuntimeEnvValue(definition: RuntimeEnvDefinition, value: string) {
-  if (definition.control !== 'number' || (definition.min === undefined && definition.max === undefined)) return value;
-  if (!value.trim()) return definition.defaultValue;
-  const numeric = Number(value);
+  const migratedValue = migrateRuntimeEnvValue(definition.key, value);
+  if (definition.control !== 'number' || (definition.min === undefined && definition.max === undefined)) return migratedValue;
+  if (!migratedValue.trim()) return definition.defaultValue;
+  const numeric = Number(migratedValue);
   if (!Number.isFinite(numeric)) return definition.defaultValue;
   const minimum = definition.min ?? Number.NEGATIVE_INFINITY;
   const maximum = definition.max ?? Number.POSITIVE_INFINITY;

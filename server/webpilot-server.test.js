@@ -14,6 +14,7 @@ const {
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
+  proxyRequestHeaders,
   requireRuntimeDependency,
   runtimeApiRequest,
   unsafeCrossOriginRequest,
@@ -52,6 +53,42 @@ test('replaces identity headers in both normalized and raw request views', () =>
     'x-webpilot-identity-roles', 'user',
     'x-webpilot-identity-proof', 'trusted-proof',
   ]);
+});
+
+test('never injects an undefined identity proof into a proxied request', () => {
+  const request = {
+    headers: {
+      host: 'localhost:3000',
+      'x-webpilot-identity-user-id': 'spoofed',
+      'x-webpilot-identity-proof': 'spoofed-proof',
+    },
+    rawHeaders: [
+      'Host', 'localhost:3000',
+      'X-WebPilot-Identity-User-Id', 'spoofed',
+      'X-WebPilot-Identity-Proof', 'spoofed-proof',
+    ],
+  };
+
+  applyTrustedIdentityHeaders(request, {
+    userId: '1',
+    username: 'admin',
+    roles: ['user'],
+  }, undefined);
+
+  assert.equal(request.headers['x-webpilot-identity-user-id'], undefined);
+  assert.equal(request.headers['x-webpilot-identity-proof'], undefined);
+  assert.deepEqual(request.rawHeaders, ['Host', 'localhost:3000']);
+});
+
+test('drops undefined request header values before API runtime proxying', () => {
+  assert.deepEqual(proxyRequestHeaders({
+    host: 'localhost:3000',
+    accept: '*/*',
+    'x-webpilot-identity-proof': undefined,
+  }, { hostname: '127.0.0.1', port: 41000 }), {
+    host: 'localhost:3000',
+    accept: '*/*',
+  });
 });
 
 test('isolates API routes in the runtime process while keeping shutdown in the UI host', () => {

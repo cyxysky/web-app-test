@@ -5,6 +5,7 @@ import {
   modelProviderDefinition,
   modelProviderDefinitions,
   normalizeMiniMaxOpenAIBaseURL,
+  migrateRuntimeEnvValue,
   runtimeEnvDefinitions,
   runtimeEnvKeys,
 } from '@/config/settings';
@@ -19,12 +20,18 @@ import type {
 } from '@/server/ai/schemas/runtime.schema';
 import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import {
+  normalizeSensitiveDataEvaluationCases,
+  type SensitiveDataEvaluationCase,
+} from '@/lib/sensitive-data-evaluation';
+import {
   deleteSkillRecord,
   readConfigRecord,
+  readRuntimeMeta,
   readSkillById,
   readSkillsByIds,
   readSkills,
   writeConfigRecord,
+  writeRuntimeMeta,
   writeSkillRecord,
   writeSkillRecords,
   writeSkillRecordsQueued,
@@ -34,6 +41,8 @@ type ConfigStoreData = {
   runtimeEnv: RuntimeEnvRecord[];
   modelConfig?: ModelConfigRecord;
 };
+
+const sensitiveDataEvaluationCasesMetaKey = 'sensitive-data-evaluation-cases';
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
@@ -234,7 +243,10 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
 
 function readConfigData(): ConfigStoreData {
   const stored = readConfigRecord() as Partial<ConfigStoreData>;
-  return { runtimeEnv: stored.runtimeEnv || [], modelConfig: stored.modelConfig };
+  return {
+    runtimeEnv: stored.runtimeEnv || [],
+    modelConfig: stored.modelConfig,
+  };
 }
 
 function writeConfigData(data: ConfigStoreData) {
@@ -344,6 +356,20 @@ export const store = {
   listRuntimeEnv() {
     return readConfigData().runtimeEnv;
   },
+  listSensitiveDataEvaluationCases() {
+    const serialized = readRuntimeMeta(sensitiveDataEvaluationCasesMetaKey);
+    if (!serialized) return [];
+    try {
+      return normalizeSensitiveDataEvaluationCases(JSON.parse(serialized));
+    } catch {
+      return [];
+    }
+  },
+  saveSensitiveDataEvaluationCases(cases: SensitiveDataEvaluationCase[]) {
+    const sensitiveDataEvaluationCases = normalizeSensitiveDataEvaluationCases(cases);
+    writeRuntimeMeta(sensitiveDataEvaluationCasesMetaKey, JSON.stringify(sensitiveDataEvaluationCases));
+    return sensitiveDataEvaluationCases;
+  },
   getModelConfig() {
     return normalizeStoredModelConfig(readConfigData().modelConfig);
   },
@@ -400,9 +426,12 @@ export const store = {
     for (const definition of runtimeEnvDefinitions) {
       const item = savedByKey.get(definition.key);
       if (item?.enabled === false) continue;
-      const configuredValue = item?.value ?? definition.defaultValue;
+      const configuredValue = migrateRuntimeEnvValue(
+        definition.key,
+        item?.value ?? process.env[definition.key] ?? definition.defaultValue,
+      );
       const deploymentValue = process.env[definition.key];
-      if (!item && deploymentValue !== undefined) continue;
+      if (!item && deploymentValue !== undefined && configuredValue === deploymentValue) continue;
       if (!configuredValue.trim() && deploymentValue?.trim()) continue;
       process.env[definition.key] = configuredValue;
     }

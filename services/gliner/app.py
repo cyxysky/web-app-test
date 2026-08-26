@@ -1,0 +1,424 @@
+from __future__ import annotations
+
+import hmac
+import os
+import re
+import threading
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Callable, Iterable
+
+import torch
+from fastapi import FastAPI, Header, HTTPException
+from gliner2 import AutoExtractor
+from pydantic import BaseModel, Field
+from transformers import pipeline
+
+from candidate_resolution import Candidate, correct_organization_boundaries, overlaps, select_non_overlapping
+from entity_boundaries import company_label_kind
+
+
+DEFAULT_LABELS = (
+    "person",
+    "phone number",
+    "mobile phone number",
+    "landline phone number",
+    "address",
+    "postal code",
+    "passport number",
+    "email",
+    "email address",
+    "credit card number",
+    "credit card expiration date",
+    "bank account number",
+    "iban",
+    "cvv",
+    "date of birth",
+    "driver's license number",
+    "identity card number",
+    "national id number",
+    "tax identification number",
+    "health insurance number",
+    "medical record number",
+    "ip address",
+    "username",
+)
+
+PLACEHOLDER_PATTERN = re.compile(r"\[SENSITIVE_[A-Z0-9_]+_\d+\]")
+CHINESE_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
+MODEL_NAME = os.getenv("GLINER_MODEL", "fastino/gliner2.5-multi-v1").strip()
+CHINESE_NER_MODEL_NAME = os.getenv(
+    "GLINER_CHINESE_NER_MODEL",
+    "uer/roberta-base-finetuned-cluener2020-chinese",
+).strip()
+DEVICE = os.getenv("GLINER_DEVICE", "").strip() or ("cuda" if torch.cuda.is_available() else "cpu")
+DEFAULT_THRESHOLD = float(os.getenv("GLINER_THRESHOLD", "0.5"))
+CHINESE_NER_THRESHOLD = float(os.getenv("GLINER_CHINESE_NER_THRESHOLD", "0.35"))
+MAX_CHARS_PER_CHUNK = max(200, int(os.getenv("GLINER_MAX_CHARS_PER_CHUNK", "900")))
+CHUNK_OVERLAP = min(MAX_CHARS_PER_CHUNK // 3, max(0, int(os.getenv("GLINER_CHUNK_OVERLAP", "120"))))
+CHINESE_MAX_CHARS_PER_CHUNK = max(
+    100,
+    min(480, int(os.getenv("GLINER_CHINESE_MAX_CHARS_PER_CHUNK", "400"))),
+)
+CHINESE_CHUNK_OVERLAP = min(
+    CHINESE_MAX_CHARS_PER_CHUNK // 3,
+    max(0, int(os.getenv("GLINER_CHINESE_CHUNK_OVERLAP", "64"))),
+)
+MAX_REQUEST_TEXTS = max(1, int(os.getenv("GLINER_MAX_REQUEST_TEXTS", "20000")))
+MAX_REQUEST_CHARS = max(1, int(os.getenv("GLINER_MAX_REQUEST_CHARS", "4000000")))
+INFERENCE_BATCH_SIZE = max(1, int(os.getenv("GLINER_BATCH_SIZE", "8")))
+SERVICE_API_KEY = os.getenv("GLINER_SERVICE_API_KEY", "").strip()
+
+
+def configured_default_labels() -> list[str]:
+    raw = os.getenv("GLINER_ENTITY_LABELS", "").strip()
+    labels = re.split(r"[,\n]", raw) if raw else list(DEFAULT_LABELS)
+    return list(dict.fromkeys(label.strip().lower() for label in labels if label.strip()))
+
+
+class RedactRequest(BaseModel):
+    texts: list[str]
+    labels: list[str] | None = None
+    threshold: float | None = Field(default=None, gt=0, le=1)
+
+
+class RedactionReplacement(BaseModel):
+    textIndex: int
+    start: int
+    end: int
+    label: str
+    placeholder: str
+
+
+class RedactResponse(BaseModel):
+    texts: list[str]
+    entities_detected: int
+    replacements: list[RedactionReplacement]
+
+
+@dataclass(frozen=True)
+class RegexRule:
+    label: str
+    pattern: re.Pattern[str]
+    group: int = 0
+    priority: int = 100
+    validator: Callable[[str], bool] | None = None
+
+
+def valid_ipv4(value: str) -> bool:
+    try:
+        return all(0 <= int(part) <= 255 for part in value.split("."))
+    except ValueError:
+        return False
+
+
+def valid_payment_card(value: str) -> bool:
+    digits = re.sub(r"\D", "", value)
+    if not 13 <= len(digits) <= 19 or len(set(digits)) == 1:
+        return False
+    checksum = 0
+    parity = len(digits) % 2
+    for index, digit in enumerate(map(int, digits)):
+        if index % 2 == parity:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        checksum += digit
+    return checksum % 10 == 0
+
+
+REGEX_RULES = (
+    RegexRule(
+        "private key",
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.DOTALL),
+        priority=130,
+    ),
+    RegexRule(
+        "api key",
+        re.compile(r"(?i)\b(?:api[_ -]?key|access[_ -]?token|password|passwd|pwd|密码)\b\s*[:=：]\s*[\"']?([^\s,;，；\"']{4,})"),
+        group=1,
+        priority=125,
+    ),
+    RegexRule(
+        "access token",
+        re.compile(r"(?<![A-Za-z0-9])(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}|\b(?:ghp|github_pat|xox[baprs])_[A-Za-z0-9_-]{16,}"),
+        priority=125,
+    ),
+    RegexRule(
+        "email address",
+        re.compile(r"(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])"),
+        priority=120,
+    ),
+    RegexRule(
+        "national id number",
+        re.compile(r"(?<!\d)\d{6}(?:18|19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[0-9Xx](?!\d)"),
+        priority=115,
+    ),
+    RegexRule("phone number", re.compile(r"(?<!\d)(?:\+?86[- ]?)?1[3-9]\d{9}(?!\d)"), priority=110),
+    RegexRule(
+        "phone number",
+        re.compile(r"(?<!\d)(?:\+\d{1,3}[- ]?)?(?:\(?\d{2,4}\)?[- ])\d{3,4}[- ]\d{4}(?!\d)"),
+        priority=105,
+    ),
+    RegexRule(
+        "credit card number",
+        re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)"),
+        priority=100,
+        validator=valid_payment_card,
+    ),
+    RegexRule(
+        "ip address",
+        re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])"),
+        priority=100,
+        validator=valid_ipv4,
+    ),
+)
+
+
+def iter_character_chunks(text: str, maximum: int, overlap: int) -> Iterable[tuple[int, str]]:
+    if len(text) <= maximum:
+        yield 0, text
+        return
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + maximum)
+        yield start, text[start:end]
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap)
+
+
+def overlaps_placeholder(start: int, end: int, placeholder_spans: list[tuple[int, int]]) -> bool:
+    return any(overlaps(start, end, placeholder_start, placeholder_end) for placeholder_start, placeholder_end in placeholder_spans)
+
+
+def regex_candidates(text: str, placeholder_spans: list[tuple[int, int]]) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for rule in REGEX_RULES:
+        for match in rule.pattern.finditer(text):
+            start, end = match.span(rule.group)
+            value = match.group(rule.group)
+            if not value or (rule.validator is not None and not rule.validator(value)):
+                continue
+            if overlaps_placeholder(start, end, placeholder_spans):
+                continue
+            candidates.append(Candidate(start, end, rule.label, 1.0, rule.priority))
+    return candidates
+
+
+def gliner2_candidates(
+    texts: list[str],
+    labels: list[str],
+    threshold: float,
+    placeholder_spans_by_text: list[list[tuple[int, int]]],
+) -> list[list[Candidate]]:
+    candidates_by_text: list[list[Candidate]] = [[] for _ in texts]
+    jobs = [
+        (text_index, chunk_start, chunk)
+        for text_index, text in enumerate(texts)
+        for chunk_start, chunk in iter_character_chunks(text, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
+        if chunk.strip()
+    ]
+    for batch_start in range(0, len(jobs), INFERENCE_BATCH_SIZE):
+        batch = jobs[batch_start:batch_start + INFERENCE_BATCH_SIZE]
+        predictions = open_label_model.batch_extract_entities(
+            [chunk for _, _, chunk in batch],
+            labels,
+            threshold=threshold,
+            include_confidence=True,
+            include_spans=True,
+            overlap_policy="allow",
+            batch_size=INFERENCE_BATCH_SIZE,
+        )
+        for (text_index, chunk_start, _), result in zip(batch, predictions, strict=True):
+            text = texts[text_index]
+            entities_by_label = result.get("entities", {}) if isinstance(result, dict) else {}
+            for label, entities in entities_by_label.items():
+                for entity in entities if isinstance(entities, list) else []:
+                    if not isinstance(entity, dict):
+                        continue
+                    start = chunk_start + int(entity.get("start", -1))
+                    end = chunk_start + int(entity.get("end", -1))
+                    score = float(entity.get("confidence", 0.0))
+                    if start < 0 or end <= start or end > len(text) or score < threshold:
+                        continue
+                    if overlaps_placeholder(start, end, placeholder_spans_by_text[text_index]):
+                        continue
+                    candidates_by_text[text_index].append(Candidate(start, end, str(label), score, 10))
+    return candidates_by_text
+
+
+def requested_organization_labels(labels: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for label in labels:
+        kind = company_label_kind(label)
+        if kind and kind not in result:
+            result[kind] = label
+    if "company" in result and "organization" not in result:
+        result["organization"] = result["company"]
+    if "organization" in result and "company" not in result:
+        result["company"] = result["organization"]
+    return result
+
+
+def chinese_roberta_candidates(
+    texts: list[str],
+    labels: list[str],
+    placeholder_spans_by_text: list[list[tuple[int, int]]],
+) -> list[list[Candidate]]:
+    candidates_by_text: list[list[Candidate]] = [[] for _ in texts]
+    label_map = requested_organization_labels(labels)
+    if not label_map:
+        return candidates_by_text
+    jobs = [
+        (text_index, chunk_start, chunk)
+        for text_index, text in enumerate(texts)
+        if CHINESE_TEXT_PATTERN.search(text)
+        for chunk_start, chunk in iter_character_chunks(text, CHINESE_MAX_CHARS_PER_CHUNK, CHINESE_CHUNK_OVERLAP)
+        if chunk.strip()
+    ]
+    for batch_start in range(0, len(jobs), INFERENCE_BATCH_SIZE):
+        batch = jobs[batch_start:batch_start + INFERENCE_BATCH_SIZE]
+        predictions = chinese_boundary_model(
+            [chunk for _, _, chunk in batch],
+            batch_size=INFERENCE_BATCH_SIZE,
+            truncation=True,
+        )
+        for (text_index, chunk_start, chunk), entities in zip(batch, predictions, strict=True):
+            text = texts[text_index]
+            for entity in entities:
+                kind = str(entity.get("entity_group", "")).strip().lower()
+                label = label_map.get(kind)
+                score = float(entity.get("score", 0.0))
+                if not label or score < CHINESE_NER_THRESHOLD:
+                    continue
+                local_start = int(entity.get("start", -1))
+                local_end = int(entity.get("end", -1))
+                if (local_start == 0 and chunk_start > 0) or (
+                    local_end == len(chunk) and chunk_start + len(chunk) < len(text)
+                ):
+                    continue
+                start = chunk_start + local_start
+                end = chunk_start + local_end
+                if start < 0 or end <= start or end > len(text):
+                    continue
+                if overlaps_placeholder(start, end, placeholder_spans_by_text[text_index]):
+                    continue
+                candidates_by_text[text_index].append(Candidate(start, end, label, score, 40))
+    return candidates_by_text
+
+
+def label_token(label: str) -> str:
+    token = re.sub(r"[^A-Z0-9]+", "_", label.upper()).strip("_")
+    return token or "DATA"
+
+
+def redact_texts(
+    texts: list[str],
+    labels: list[str],
+    threshold: float,
+) -> tuple[list[str], int, list[RedactionReplacement]]:
+    placeholders_by_value: dict[str, str] = {}
+    counters: defaultdict[str, int] = defaultdict(int)
+    reserved = {match.group(0) for text in texts for match in PLACEHOLDER_PATTERN.finditer(text)}
+    output: list[str] = []
+    total_entities = 0
+    response_replacements: list[RedactionReplacement] = []
+    placeholder_spans_by_text = [[match.span() for match in PLACEHOLDER_PATTERN.finditer(text)] for text in texts]
+    open_candidates_by_text = gliner2_candidates(texts, labels, threshold, placeholder_spans_by_text)
+    roberta_candidates_by_text = chinese_roberta_candidates(texts, labels, placeholder_spans_by_text)
+
+    for text_index, text in enumerate(texts):
+        candidates = regex_candidates(text, placeholder_spans_by_text[text_index])
+        candidates.extend(correct_organization_boundaries(
+            text,
+            open_candidates_by_text[text_index],
+            roberta_candidates_by_text[text_index],
+        ))
+        selected = select_non_overlapping(candidates)
+        replacements: list[tuple[int, int, str]] = []
+        for candidate in selected:
+            value_key = text[candidate.start:candidate.end].casefold()
+            placeholder = placeholders_by_value.get(value_key)
+            if placeholder is None:
+                token = label_token(candidate.label)
+                while True:
+                    counters[token] += 1
+                    placeholder = f"[SENSITIVE_{token}_{counters[token]}]"
+                    if placeholder not in reserved:
+                        break
+                reserved.add(placeholder)
+                placeholders_by_value[value_key] = placeholder
+            replacements.append((candidate.start, candidate.end, placeholder))
+            response_replacements.append(RedactionReplacement(
+                textIndex=text_index,
+                start=candidate.start,
+                end=candidate.end,
+                label=candidate.label,
+                placeholder=placeholder,
+            ))
+        redacted = text
+        for start, end, placeholder in reversed(replacements):
+            redacted = f"{redacted[:start]}{placeholder}{redacted[end:]}"
+        output.append(redacted)
+        total_entities += len(replacements)
+    return output, total_entities, response_replacements
+
+
+def pipeline_device():
+    normalized = DEVICE.lower()
+    if normalized == "cpu":
+        return -1
+    if normalized.startswith("cuda:"):
+        return int(normalized.split(":", 1)[1])
+    return 0
+
+
+open_label_model = AutoExtractor.from_pretrained(MODEL_NAME, map_location=DEVICE)
+chinese_boundary_model = pipeline(
+    "token-classification",
+    model=CHINESE_NER_MODEL_NAME,
+    tokenizer=CHINESE_NER_MODEL_NAME,
+    aggregation_strategy="simple",
+    device=pipeline_device(),
+)
+model_lock = threading.Lock()
+app = FastAPI(title="WebPilot hybrid sensitive-data filter", docs_url=None, redoc_url=None)
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "pipeline": "gliner2.5-open-label -> chinese-roberta-boundary -> redact",
+        "model": MODEL_NAME,
+        "chineseBoundaryModel": CHINESE_NER_MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
+@app.post("/redact", response_model=RedactResponse)
+def redact(request: RedactRequest, x_api_key: str | None = Header(default=None)):
+    if SERVICE_API_KEY and (x_api_key is None or not hmac.compare_digest(x_api_key, SERVICE_API_KEY)):
+        raise HTTPException(status_code=401, detail="Invalid service API key.")
+    if len(request.texts) > MAX_REQUEST_TEXTS:
+        raise HTTPException(status_code=413, detail="Too many text values in one request.")
+    if sum(len(text) for text in request.texts) > MAX_REQUEST_CHARS:
+        raise HTTPException(status_code=413, detail="Request text is too large.")
+
+    labels = list(dict.fromkeys(
+        label.strip().lower()
+        for label in (request.labels or configured_default_labels())
+        if label.strip()
+    ))
+    if not labels or len(labels) > 64:
+        raise HTTPException(status_code=422, detail="Provide between 1 and 64 entity labels.")
+    threshold = request.threshold if request.threshold is not None else DEFAULT_THRESHOLD
+
+    try:
+        with model_lock, torch.inference_mode():
+            texts, count, replacements = redact_texts(request.texts, labels, threshold)
+    except Exception as error:
+        print(f"Sensitive-data inference failed ({type(error).__name__}).", flush=True)
+        raise HTTPException(status_code=500, detail="Sensitive-data inference failed.") from None
+    return RedactResponse(texts=texts, entities_detected=count, replacements=replacements)

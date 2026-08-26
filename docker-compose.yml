@@ -4,6 +4,8 @@ services:
       context: .
       args:
         WEBPILOT_BASE_PATH: ${WEBPILOT_BASE_PATH:-}
+        GLINER_MODEL: fastino/gliner2.5-multi-v1
+        GLINER_CHINESE_NER_MODEL: uer/roberta-base-finetuned-cluener2020-chinese
     image: webpilot-qa:latest
     ports:
       - "3000:3000"
@@ -19,6 +21,11 @@ services:
       BROWSER_CHAT_PREVIEW_WS_PORT: "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
       WEBPILOT_DEFAULT_USER_ID: "${WEBPILOT_DEFAULT_USER_ID:-1}"
       WEBPILOT_REQUIRE_MOUNT_USER_ID: "${WEBPILOT_REQUIRE_MOUNT_USER_ID:-true}"
+      AI_SENSITIVE_DATA_FILTER_ENABLED: "${AI_SENSITIVE_DATA_FILTER_ENABLED:-true}"
+      AI_SENSITIVE_DATA_FILTER_FAILURE_MODE: "${AI_SENSITIVE_DATA_FILTER_FAILURE_MODE:-closed}"
+      GLINER_RUNTIME_MODE: "local"
+      GLINER_SERVICE_URL: "http://127.0.0.1:18001"
+      GLINER_SERVICE_API_KEY: "${GLINER_SERVICE_API_KEY:-}"
     volumes:
       - ./.data:/app/.data
       - ./artifacts:/app/artifacts

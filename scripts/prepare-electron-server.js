@@ -2,6 +2,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { copyProductionRuntime, copyServerRuntime } = require('./server-package-layout');
+const { assertGlinerRuntime, copyGlinerRuntime } = require('./gliner-runtime-layout');
 
 const root = path.resolve(__dirname, '..');
 const outputRoot = path.join(root, 'dist-desktop');
@@ -17,6 +18,7 @@ fs.rmSync(outputRoot, { recursive: true, force: true });
 const productionPackagePaths = copyProductionRuntime(root, serverOutput);
 copyInto(path.join(root, 'public'), path.join(serverOutput, 'public'));
 const serverRuntimeFiles = copyServerRuntime(root, serverOutput);
+copyGlinerRuntime(path.join(serverOutput, 'gliner-runtime'));
 copyInto(
   path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
   path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
@@ -40,5 +42,6 @@ if (
 ) {
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run npm run build before packaging.');
 }
+assertGlinerRuntime(path.join(serverOutput, 'gliner-runtime'));
 
 console.log(`Prepared desktop server with ${productionPackagePaths.length} package directories and ${serverRuntimeFiles.length} custom server files at ${serverOutput}`);

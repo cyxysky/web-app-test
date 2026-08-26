@@ -3,6 +3,7 @@ import {
   modelListForProvider,
   modelProviderDefinition,
   modelProviderDefinitions,
+  migrateRuntimeEnvValue,
   runtimeEnvDefinitions,
 } from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
@@ -49,7 +50,10 @@ export function readRuntimeSettingsItems() {
   return runtimeEnvDefinitions.map((definition) => {
     const saved = savedByKey.get(definition.key);
     const secret = saved?.secret ?? Boolean(definition.secret);
-    const value = saved?.value ?? definition.defaultValue;
+    const value = migrateRuntimeEnvValue(
+      definition.key,
+      saved?.value ?? process.env[definition.key] ?? definition.defaultValue,
+    );
     return {
       key: definition.key,
       value: secret ? '' : value,

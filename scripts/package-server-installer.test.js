@@ -15,6 +15,13 @@ test('service configuration uses the packaged Node runtime and public port 3000'
   assert.match(xml, /<env name="HOSTNAME" value="0\.0\.0\.0" \/>/);
   assert.match(xml, /<env name="PORT" value="3000" \/>/);
   assert.match(xml, /<env name="APP_DATA_DIR" value="%ProgramData%\\WebPilot\\runtime" \/>/);
+  assert.match(xml, /<env name="AI_SENSITIVE_DATA_FILTER_ENABLED" value="true" \/>/);
+  assert.match(xml, /<env name="AI_SENSITIVE_DATA_FILTER_FAILURE_MODE" value="closed" \/>/);
+  assert.match(xml, /<env name="GLINER_DEVICE" value="cpu" \/>/);
+  assert.match(xml, /<env name="GLINER_RUNTIME_MODE" value="local" \/>/);
+  assert.match(xml, /<env name="GLINER_PYTHON_PATH" value="%BASE%\\server\\gliner-runtime\\python\\python\.exe" \/>/);
+  assert.match(xml, /<env name="GLINER_MODEL_BUNDLE_DIR" value="%BASE%\\server\\gliner-runtime\\models\\gliner2" \/>/);
+  assert.match(xml, /<env name="GLINER_CHINESE_NER_MODEL_BUNDLE_DIR" value="%BASE%\\server\\gliner-runtime\\models\\chinese-roberta" \/>/);
   assert.match(xml, /<onfailure action="restart" delay="10 sec" \/>/);
 });
 

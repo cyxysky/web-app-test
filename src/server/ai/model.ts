@@ -5,6 +5,7 @@ import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
 import { normalizeMiniMaxOpenAIBaseURL } from '@/config/settings';
 import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
+import { filterSensitiveData } from '@/server/ai/sensitive-data-filter';
 
 ensureAiSdkTelemetryRegistered();
 
@@ -134,8 +135,8 @@ function lazyLanguageModel(
     provider,
     modelId,
     supportedUrls: {},
-    doGenerate: async (options) => (await loadModel()).doGenerate(options),
-    doStream: async (options) => (await loadModel()).doStream(options),
+    doGenerate: async (options) => (await loadModel()).doGenerate(await filterSensitiveData(options)),
+    doStream: async (options) => (await loadModel()).doStream(await filterSensitiveData(options)),
   } satisfies GenerateTextModel;
 }
 

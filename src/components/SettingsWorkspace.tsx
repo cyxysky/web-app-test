@@ -10,6 +10,7 @@ import {
   Loader2,
   Lock,
   PanelLeft,
+  ShieldCheck,
   SlidersHorizontal,
   SquareTerminal,
   X,
@@ -35,6 +36,7 @@ import { AppModal } from '@/components/ui/app-modal';
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
   if (tab === 'model') return <Bot size={15} />;
   if (tab === 'browser') return <PanelLeft size={15} />;
+  if (tab === 'sensitive-data') return <ShieldCheck size={15} />;
   if (tab === 'runtime') return <SquareTerminal size={15} />;
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;

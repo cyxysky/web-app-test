@@ -26,6 +26,10 @@ npm-debug.log*
 /dist-desktop/
 /dist-electron/
 /dist-server/
+/dist-gliner-runtime/
+/.venv-gliner/
+**/__pycache__/
+*.py[cod]
 *.tsbuildinfo
 Dockerfile
 docker-compose*.yml

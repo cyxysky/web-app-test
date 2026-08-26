@@ -155,16 +155,30 @@ function applyTrustedIdentityHeaders(request, principal, proof) {
     request.rawHeaders.splice(0, request.rawHeaders.length, ...retained);
   }
   if (!principal) return;
+  const userId = String(principal.userId || '').trim();
+  const username = String(principal.username || '').trim();
+  const roles = Array.isArray(principal.roles) ? principal.roles.map((role) => String(role || '').trim()).filter(Boolean) : [];
+  const trustedProof = typeof proof === 'string' ? proof.trim() : '';
+  if (!userId || !trustedProof) return;
   const values = {
-    'x-webpilot-identity-user-id': principal.userId,
-    'x-webpilot-identity-username': principal.username,
-    'x-webpilot-identity-roles': principal.roles.join(','),
-    'x-webpilot-identity-proof': proof,
+    'x-webpilot-identity-user-id': userId,
+    'x-webpilot-identity-username': username,
+    'x-webpilot-identity-roles': roles.join(','),
+    'x-webpilot-identity-proof': trustedProof,
   };
   for (const [name, value] of Object.entries(values)) {
     request.headers[name] = value;
     if (Array.isArray(request.rawHeaders)) request.rawHeaders.push(name, value);
   }
+}
+
+function proxyRequestHeaders(requestHeaders, target) {
+  const headers = {};
+  for (const [name, value] of Object.entries(requestHeaders || {})) {
+    if (value !== undefined) headers[name] = value;
+  }
+  headers.host = requestHeaders?.host || `${target.hostname}:${target.port}`;
+  return headers;
 }
 
 function runtimeApiRequest(pathname) {
@@ -350,10 +364,8 @@ function createApiRuntimeSupervisor({
 }
 
 function proxyHttpRequest(request, response, target, onUnavailable) {
-  const headers = { ...request.headers };
-  headers.host = request.headers.host || `${target.hostname}:${target.port}`;
   const upstream = http.request({
-    headers,
+    headers: proxyRequestHeaders(request.headers, target),
     hostname: target.hostname,
     method: request.method,
     path: request.url,
@@ -486,6 +498,7 @@ async function main() {
   process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
+  const identityHeaderSecret = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
   const apiRuntimeSupervisor = !runtimeChildMode && process.env.WEBPILOT_SPLIT_RUNTIME !== 'false'
     ? createApiRuntimeSupervisor({ appDir, dev, externalPort: port })
@@ -545,7 +558,7 @@ async function main() {
       if (request.method === 'GET' && pathname === '/browser-chat' && initializeMountedIdentity(request, response, requestUrl)) return;
 
       const principal = internalPrincipal(request, pathname) || requestIdentity(request);
-      applyTrustedIdentityHeaders(request, principal, process.env.WEBPILOT_IDENTITY_HEADER_SECRET);
+      applyTrustedIdentityHeaders(request, principal, identityHeaderSecret);
 
       if (!principal && !publicPath(pathname) && !internalRequestAuthorized(request, pathname)) {
         rejectMissingIdentity(response);
@@ -630,6 +643,7 @@ module.exports = {
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
+  proxyRequestHeaders,
   requireRuntimeDependency,
   runtimeApiRequest,
   stripBasePath,
