@@ -339,3 +339,5 @@ const hiddenRuntimeSkillPolicies = {
 5. 增加测试：按 action 门控、跨模型步骤保留、对象协议和原生工具协议一致、隐藏 Skill 不出现在用户列表。
 
 不建议一次性给所有工具加 Skill。最终保持三个隐藏运行时 Skill 就比较合理：浏览器、文件、子 Agent。
+
+GLiNER
