@@ -2,20 +2,16 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { browserCodeRuntimeSkillId } from './browser-code-runtime-skill';
 import {
-  browserApiRuntimeSkillContent,
-  browserApiRuntimeSkillId,
-} from './browser-api-runtime-skill';
-import {
   fileArtifactRuntimeSkillContent,
   fileArtifactRuntimeSkillId,
 } from './file-artifact-runtime-skill';
 import {
   hiddenRuntimeSkillContent,
-  hiddenRuntimeSkillGateResult,
+  automaticallyLoadHiddenRuntimeSkill,
   hiddenRuntimeSkillIdsReadFromTraces,
-  hiddenRuntimeSkillSummariesForMode,
+  hiddenRuntimeSkillSummaries,
   requiredHiddenRuntimeSkillId,
-  runtimeToolTypesAfterHiddenSkillGate,
+  runtimeToolTypesWithAutomaticSkills,
 } from './hidden-runtime-skills';
 import {
   subagentRuntimeSkillContent,
@@ -23,15 +19,11 @@ import {
 } from './subagent-runtime-skill';
 
 test('hidden runtime policy gates only the configured tool actions', () => {
-  assert.equal(requiredHiddenRuntimeSkillId('browserCode', { code: 'nodeRepl.write(1)' }, 'free'), browserCodeRuntimeSkillId);
-  assert.equal(requiredHiddenRuntimeSkillId('browserCode', { code: 'nodeRepl.write(1)' }, 'restricted'), browserApiRuntimeSkillId);
+  assert.equal(requiredHiddenRuntimeSkillId('browserCode', { code: 'nodeRepl.write(1)' }), browserCodeRuntimeSkillId);
   assert.equal(requiredHiddenRuntimeSkillId('readBrowserState', {}), undefined);
 
-  for (const action of ['plan', 'generate', 'edit', 'render', 'convert', 'jsApi', 'unoApi']) {
+  for (const action of ['list', 'read', 'download', 'plan', 'generate', 'edit', 'render', 'convert', 'jsApi', 'unoApi']) {
     assert.equal(requiredHiddenRuntimeSkillId('file', { action }), fileArtifactRuntimeSkillId);
-  }
-  for (const action of ['list', 'read', 'download']) {
-    assert.equal(requiredHiddenRuntimeSkillId('file', { action }), undefined);
   }
 
   assert.equal(requiredHiddenRuntimeSkillId('fileVisual', { action: 'index' }), fileArtifactRuntimeSkillId);
@@ -40,7 +32,7 @@ test('hidden runtime policy gates only the configured tool actions', () => {
   assert.equal(requiredHiddenRuntimeSkillId('subagent', { action: 'read' }), undefined);
 });
 
-test('successful hidden Skill reads persist across model steps only through the run-scoped set', () => {
+test('explicit and automatic hidden Skill loads share the run-scoped set', () => {
   const traces = [{
     name: 'skill',
     input: { action: 'read', skillId: fileArtifactRuntimeSkillId },
@@ -48,63 +40,39 @@ test('successful hidden Skill reads persist across model steps only through the 
   }];
   const loaded = hiddenRuntimeSkillIdsReadFromTraces(traces);
   assert.deepEqual([...loaded], [fileArtifactRuntimeSkillId]);
-  assert.equal(hiddenRuntimeSkillGateResult('file', { action: 'plan' }, loaded), undefined);
-  assert.ok(hiddenRuntimeSkillGateResult('subagent', { action: 'spawn' }, loaded));
+  assert.equal(automaticallyLoadHiddenRuntimeSkill('file', { action: 'plan' }, loaded), undefined);
+  const subagentLoad = automaticallyLoadHiddenRuntimeSkill('subagent', { action: 'spawn' }, loaded);
+  assert.ok(subagentLoad && !('ok' in subagentLoad));
+  assert.equal(subagentLoad?.loadedRuntimeSkill?.id, subagentRuntimeSkillId);
+  assert.equal(loaded.has(subagentRuntimeSkillId), true);
 
   const newAgentRun = new Set<string>();
-  assert.ok(hiddenRuntimeSkillGateResult('file', { action: 'plan' }, newAgentRun));
+  const fileLoad = automaticallyLoadHiddenRuntimeSkill('file', { action: 'plan' }, newAgentRun);
+  assert.ok(fileLoad && !('ok' in fileLoad));
+  assert.equal(fileLoad?.loadedRuntimeSkill?.id, fileArtifactRuntimeSkillId);
+  assert.equal(fileLoad?.loadedRuntimeSkill?.content, fileArtifactRuntimeSkillContent);
+  assert.equal(newAgentRun.has(fileArtifactRuntimeSkillId), true);
+  assert.equal(automaticallyLoadHiddenRuntimeSkill('file', { action: 'read' }, newAgentRun), undefined);
   assert.deepEqual([...hiddenRuntimeSkillIdsReadFromTraces([{
     ...traces[0],
     result: { ok: false },
   }])], []);
 });
 
-test('all tool protocols receive the same structured prerequisite failure', () => {
-  const result = hiddenRuntimeSkillGateResult('subagent', { action: 'spawn' }, new Set());
-  assert.ok(result);
-  assert.equal(result.ok, false);
-  assert.equal(result.requiredSkillId, subagentRuntimeSkillId);
-  assert.match(result.requiredNextAction || '', /skill action=read/);
-  assert.deepEqual(JSON.parse(result.actual), {
-    ok: false,
-    requiredSkillId: subagentRuntimeSkillId,
-    requiredNextAction: result.requiredNextAction,
-  });
-});
-
-test('browserCode is not advertised until the mode-specific runtime Skill is loaded', () => {
-  const tools = ['readBrowserState', 'skill', 'browserCode', 'file'];
-  assert.deepEqual(runtimeToolTypesAfterHiddenSkillGate(tools, new Set(), 'restricted'), [
-    'readBrowserState', 'skill', 'file',
-  ]);
-  assert.deepEqual(runtimeToolTypesAfterHiddenSkillGate(
-    tools,
-    new Set([browserApiRuntimeSkillId]),
-    'restricted',
-  ), tools);
-  assert.deepEqual(runtimeToolTypesAfterHiddenSkillGate(
-    tools,
-    new Set([browserCodeRuntimeSkillId]),
-    'restricted',
-  ), ['readBrowserState', 'skill', 'file']);
+test('governed tools remain advertised while their Skills load automatically on first call', () => {
+  const tools = ['readBrowserState', 'skill', 'browserCode', 'file', 'fileVisual', 'subagent'];
+  assert.deepEqual(runtimeToolTypesWithAutomaticSkills(tools), tools);
 });
 
 test('hidden built-in Skills are directly readable without entering the user Skill catalog', () => {
-  assert.equal(hiddenRuntimeSkillContent(browserApiRuntimeSkillId), browserApiRuntimeSkillContent);
+  assert.match(hiddenRuntimeSkillContent(browserCodeRuntimeSkillId) || '', /Browser Code Runtime/);
   assert.equal(hiddenRuntimeSkillContent(fileArtifactRuntimeSkillId), fileArtifactRuntimeSkillContent);
   assert.equal(hiddenRuntimeSkillContent(subagentRuntimeSkillId), subagentRuntimeSkillContent);
   assert.equal(hiddenRuntimeSkillContent('user-managed-skill'), undefined);
-  const freeSummaries = hiddenRuntimeSkillSummariesForMode('free');
-  assert.match(freeSummaries, /system-browser-code-runtime/);
-  assert.doesNotMatch(freeSummaries, /system-browser-api-runtime/);
-  assert.match(freeSummaries, /system-file-artifact-runtime/);
-  assert.match(freeSummaries, /system-subagent-runtime/);
-
-  const restrictedSummaries = hiddenRuntimeSkillSummariesForMode('restricted');
-  assert.match(restrictedSummaries, /system-browser-api-runtime/);
-  assert.doesNotMatch(restrictedSummaries, /system-browser-code-runtime/);
-  assert.match(restrictedSummaries, /system-file-artifact-runtime/);
-  assert.match(restrictedSummaries, /system-subagent-runtime/);
+  const summaries = hiddenRuntimeSkillSummaries();
+  assert.match(summaries, /system-browser-code-runtime/);
+  assert.match(summaries, /system-file-artifact-runtime/);
+  assert.match(summaries, /system-subagent-runtime/);
 });
 
 test('file and subagent runtime Skills carry the state, QA, and browser ownership contracts', () => {
@@ -115,7 +83,8 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /sourceDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /renderedDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /UNO and JavaScript modes/);
-  assert.match(fileArtifactRuntimeSkillContent, /transactionally/);
+  assert.match(fileArtifactRuntimeSkillContent, /single editable source buffer/);
+  assert.match(fileArtifactRuntimeSkillContent, /Failure keeps the exact edited source/);
   assert.match(fileArtifactRuntimeSkillContent, /visualQaDigest equals renderedDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /Continue the original document workflow/);
   assert.match(fileArtifactRuntimeSkillContent, /## file API signatures/);

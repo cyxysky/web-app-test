@@ -112,7 +112,7 @@ Minimal management API:
 - `PATCH /api/personal-memory/{id}`
 - `DELETE /api/personal-memory/{id}`
 
-Browser conversations execute restricted Playwright code through `browserCode`, with AX/DOM reads, actionability checks, iframe handling, screenshots, and incremental `domChanges` available inside the same runtime.
+Browser conversations execute Playwright code through `browserCode`, with AX/DOM reads, actionability checks, iframe handling, screenshots, durable conversation state, and incremental `domChanges` available inside the same runtime.
 
 ## Reuse an Existing Browser
 

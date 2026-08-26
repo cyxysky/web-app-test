@@ -21,7 +21,6 @@ let browserContext: BrowserContext;
 let page: Page;
 let cdpEndpoint: string;
 let kernel: BrowserCodeKernel;
-let restrictedKernel: BrowserCodeKernel;
 
 async function availablePort() {
   const server = createServer();
@@ -44,15 +43,10 @@ before(async () => {
   page = await browserContext.newPage();
   await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
   kernel = new BrowserCodeKernel({ protocol: 'cdp', endpoint: cdpEndpoint });
-  restrictedKernel = new BrowserCodeKernel(
-    { protocol: 'cdp', endpoint: cdpEndpoint },
-    { runtimeMode: 'restricted' },
-  );
 });
 
 after(async () => {
   await kernel.close();
-  await restrictedKernel.close();
   await browser.close().catch(() => undefined);
   await browserServer.close().catch(() => undefined);
 });
@@ -75,20 +69,6 @@ async function run(code: string, options: {
     executionId,
     ...options,
   });
-}
-
-async function runRestricted(code: string, options: {
-  attachments?: BrowserCodeAttachmentBinding[];
-  credentials?: BrowserCodeCredentialBinding[];
-} = {}) {
-  const executionId = randomUUID();
-  await page.evaluate((id) => {
-    Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
-      configurable: true,
-      value: id,
-    });
-  }, executionId);
-  return restrictedKernel.execute({ code, executionId, ...options });
 }
 
 test('browserCode sandbox executes ordinary Playwright code directly', async () => {
@@ -524,17 +504,58 @@ test('browserCode auto-filters hidden candidates and permits explicit positional
       backgroundTarget.className = 'background-behind-surface';
       backgroundTarget.textContent = 'Background target';
       backgroundTarget.style.marginTop = '3000px';
+      backgroundTarget.addEventListener('click', () => { document.body.dataset.backgroundClicked = 'true'; });
       document.body.append(foregroundSurface, backgroundTarget);
     });
-    const scrollBeforeCoveredBackgroundAction = await page.evaluate(() => window.scrollY);
     const coveredBackgroundAction = await run(`
       await page.domSnapshot();
       await page.locator('.background-behind-surface').click();
     `);
-    assert.equal(coveredBackgroundAction.ok, false);
-    assert.match(coveredBackgroundAction.error || '', /(active foreground surface|viewport-blocking layer)/i);
-    assert.equal(await page.evaluate(() => window.scrollY), scrollBeforeCoveredBackgroundAction);
+    assert.equal(coveredBackgroundAction.ok, true, coveredBackgroundAction.error);
+    assert.equal(await page.locator('body').getAttribute('data-background-clicked'), 'true');
     await page.locator('.foreground-surface, .background-behind-surface')
+      .evaluateAll((elements) => elements.forEach((element) => element.remove()));
+
+    await page.evaluate(() => {
+      const foregroundSurface = document.createElement('div');
+      foregroundSurface.className = 'portal-trigger-surface';
+      foregroundSurface.setAttribute('role', 'dialog');
+      foregroundSurface.textContent = 'Select trigger surface';
+      Object.assign(foregroundSurface.style, {
+        background: 'white',
+        height: '80px',
+        left: '12px',
+        position: 'fixed',
+        top: '12px',
+        width: '220px',
+        zIndex: '100',
+      });
+      const optionList = document.createElement('ul');
+      optionList.className = 'portal-option-list';
+      Object.assign(optionList.style, {
+        background: 'white',
+        left: '12px',
+        margin: '0',
+        padding: '8px',
+        position: 'fixed',
+        top: '104px',
+        width: '220px',
+        zIndex: '100',
+      });
+      const option = document.createElement('li');
+      option.className = 'portal-sibling-option';
+      option.textContent = 'Portal option';
+      option.addEventListener('click', () => { document.body.dataset.portalOption = 'selected'; });
+      optionList.append(option);
+      document.body.append(foregroundSurface, optionList);
+    });
+    const portalSiblingAction = await run(`
+      await page.domSnapshot();
+      await page.locator('.portal-sibling-option').click();
+    `);
+    assert.equal(portalSiblingAction.ok, true, portalSiblingAction.error);
+    assert.equal(await page.locator('body').getAttribute('data-portal-option'), 'selected');
+    await page.locator('.portal-trigger-surface, .portal-option-list')
       .evaluateAll((elements) => elements.forEach((element) => element.remove()));
 
     const allInvalid = await run(`
@@ -749,163 +770,6 @@ test('browserCode supports non-visual coordinate clicks from exact Locator rect 
   }
 });
 
-test('restricted browserCode exposes browserApi without Playwright runtime objects', async () => {
-  const restrictedUploadDir = mkdtempSync(path.join(os.tmpdir(), 'browser-code-restricted-upload-'));
-  const restrictedUploadPath = path.join(restrictedUploadDir, 'brief.txt');
-  writeFileSync(restrictedUploadPath, 'restricted upload');
-  await page.setContent(`
-    <title>Restricted form</title>
-    <label>Full name<input name="fullName"></label>
-    <label>Department<select><option>Engineering</option><option>Research</option></select></label>
-    <label>Departure date<input name="departureDate" type="date"></label>
-    <label>Pickup time<input name="pickupTime" type="time"></label>
-    <label>Meeting time<input name="meetingTime" type="datetime-local"></label>
-    <label>Billing month<input name="billingMonth" type="month"></label>
-    <label>Delivery week<input name="deliveryWeek" type="week"></label>
-    <label>Theme color<input name="themeColor" type="color"></label>
-    <label>Quantity<input name="quantity" type="number"></label>
-    <label>Volume<input name="volume" type="range" min="0" max="100"></label>
-    <label>Attachment<input type="file"></label>
-    <button onclick="document.body.dataset.saved='yes'">Save</button>
-  `);
-  try {
-    const globals = await runRestricted(`
-      nodeRepl.write({
-        browserApi: typeof browserApi,
-        page: typeof page,
-        context: typeof context,
-        browser: typeof browser,
-        tab: typeof tab,
-        attachmentVault: typeof attachmentVault,
-        credentialVault: typeof credentialVault,
-        apiFunctionConstructorRealm: await browserApi.current.constructor('return typeof process')(),
-        apiResultConstructorRealm: (await browserApi.current()).constructor.constructor('return typeof process')(),
-        nodeReplConstructorRealm: nodeRepl.write.constructor('return typeof process')(),
-        consoleConstructorRealm: console.log.constructor('return typeof process')()
-      });
-    `);
-    assert.equal(globals.ok, true, globals.error);
-    assert.deepEqual(globals.value, {
-      browserApi: 'object',
-      page: 'undefined',
-      context: 'undefined',
-      browser: 'undefined',
-      tab: 'undefined',
-      attachmentVault: 'undefined',
-      credentialVault: 'undefined',
-      apiFunctionConstructorRealm: 'undefined',
-      apiResultConstructorRealm: 'undefined',
-      nodeReplConstructorRealm: 'undefined',
-      consoleConstructorRealm: 'undefined',
-    });
-
-    const state = await runRestricted(`
-      var restrictedCurrent = await browserApi.current();
-      var restrictedSnapshot = await browserApi.snapshot();
-      var restrictedControls = await browserApi.inspect({ limit: 10 });
-      nodeRepl.write({ current: restrictedCurrent, snapshot: restrictedSnapshot, controls: restrictedControls });
-    `);
-    assert.equal(state.ok, true, state.error);
-    assert.equal((state.value as { current: { title: string } }).current.title, 'Restricted form');
-    assert.match((state.value as { snapshot: string }).snapshot, /Full name/);
-    assert.ok((state.value as { controls: { count: number } }).controls.count >= 3);
-
-    const screenshot = await runRestricted(`
-      nodeRepl.write(await browserApi.screenshot({ type:'jpeg', quality:70, fullPage:false }));
-    `);
-    assert.equal(screenshot.ok, true, screenshot.error);
-    assert.equal(screenshot.images?.length, 1);
-    assert.ok(screenshot.elapsedMs < 8_000, `restricted screenshot took ${screenshot.elapsedMs}ms`);
-
-    const guessedCssAction = await runRestricted(`
-      await browserApi.act({ target:{by:'css',selector:'button[aria-label="Close calendar"]'}, action:'click' });
-    `);
-    assert.equal(guessedCssAction.ok, false);
-    assert.match(guessedCssAction.error || '', /EVIDENCE REQUIRED|selector probe/);
-
-    const misplacedFilter = await runRestricted(`
-      await browserApi.act({ target:{by:'role',role:'button',name:'Save'}, filter:{hasText:'Save'}, action:'click' });
-    `);
-    assert.equal(misplacedFilter.ok, false);
-    assert.match(misplacedFilter.error || '', /unsupported field: filter.*target\.filter/i);
-
-    const actions = await runRestricted(`
-      await browserApi.act({ target:{by:'label',text:'Full name',exact:true}, action:'fill', text:'Ada Lovelace' });
-      await browserApi.read({ target:{by:'css',selector:'select'}, operation:'count' });
-      await browserApi.act({ target:{by:'css',selector:'select'}, action:'selectOption', value:{label:'Research'} });
-      await browserApi.act({ target:{by:'label',text:'Departure date',exact:true}, action:'setInputValue', value:'2026-09-05' });
-      await browserApi.act({ target:{by:'label',text:'Pickup time',exact:true}, action:'setInputValue', value:'16:08' });
-      await browserApi.act({ target:{by:'label',text:'Meeting time',exact:true}, action:'setInputValue', value:'2026-09-05T16:08' });
-      await browserApi.act({ target:{by:'label',text:'Billing month',exact:true}, action:'setInputValue', value:'2026-09' });
-      await browserApi.act({ target:{by:'label',text:'Delivery week',exact:true}, action:'setInputValue', value:'2026-W36' });
-      await browserApi.act({ target:{by:'label',text:'Theme color',exact:true}, action:'setInputValue', value:'#336699' });
-      await browserApi.act({ target:{by:'label',text:'Quantity',exact:true}, action:'setInputValue', value:8 });
-      await browserApi.act({ target:{by:'label',text:'Volume',exact:true}, action:'setInputValue', value:75 });
-      var restrictedSaveRect = await browserApi.read({ target:{by:'role',role:'button',name:'Save',exact:true}, operation:'rect' });
-      nodeRepl.write({
-        name: await browserApi.read({ target:{by:'label',text:'Full name',exact:true}, operation:'value' }),
-        department: await browserApi.read({ target:{by:'css',selector:'select'}, operation:'value' }),
-        departureDate: await browserApi.read({ target:{by:'label',text:'Departure date',exact:true}, operation:'value' }),
-        pickupTime: await browserApi.read({ target:{by:'label',text:'Pickup time',exact:true}, operation:'value' }),
-        meetingTime: await browserApi.read({ target:{by:'label',text:'Meeting time',exact:true}, operation:'value' }),
-        billingMonth: await browserApi.read({ target:{by:'label',text:'Billing month',exact:true}, operation:'value' }),
-        deliveryWeek: await browserApi.read({ target:{by:'label',text:'Delivery week',exact:true}, operation:'value' }),
-        themeColor: await browserApi.read({ target:{by:'label',text:'Theme color',exact:true}, operation:'value' }),
-        quantity: await browserApi.read({ target:{by:'label',text:'Quantity',exact:true}, operation:'value' }),
-        volume: await browserApi.read({ target:{by:'label',text:'Volume',exact:true}, operation:'value' }),
-        rect: restrictedSaveRect
-      });
-    `);
-    assert.equal(actions.ok, true, actions.error);
-    assert.equal((actions.value as { name: string }).name, 'Ada Lovelace');
-    assert.equal((actions.value as { department: string }).department, 'Research');
-    assert.equal((actions.value as { departureDate: string }).departureDate, '2026-09-05');
-    assert.equal((actions.value as { pickupTime: string }).pickupTime, '16:08');
-    assert.equal((actions.value as { meetingTime: string }).meetingTime, '2026-09-05T16:08');
-    assert.equal((actions.value as { billingMonth: string }).billingMonth, '2026-09');
-    assert.equal((actions.value as { deliveryWeek: string }).deliveryWeek, '2026-W36');
-    assert.equal((actions.value as { themeColor: string }).themeColor, '#336699');
-    assert.equal((actions.value as { quantity: string }).quantity, '8');
-    assert.equal((actions.value as { volume: string }).volume, '75');
-
-    const uploadPlan = await runRestricted(`
-      var restrictedUploadArgs = {
-        target:{by:'label',text:'Attachment',exact:true},
-        action:'upload',
-        attachmentId:'restricted-attachment'
-      };
-      nodeRepl.write({ prepared:true });
-    `);
-    assert.equal(uploadPlan.ok, true, uploadPlan.error);
-    const uploadAction = await runRestricted(
-      `var restrictedUploadResult = await browserApi.act(restrictedUploadArgs); nodeRepl.write(restrictedUploadResult);`,
-      { attachments: [{ name: 'brief.txt', path: restrictedUploadPath, ref: 'restricted-attachment' }] },
-    );
-    assert.equal(uploadAction.ok, true, uploadAction.error);
-    const uploadValue = (uploadAction.value as { value?: Record<string, unknown> }).value;
-    assert.equal(uploadValue?.uploaded, true);
-    assert.equal(uploadValue?.attachmentId, undefined);
-
-    const coordinateAction = await runRestricted(`
-      await browserApi.pointer({
-        action:'click',
-        x:restrictedSaveRect.x + restrictedSaveRect.width / 2,
-        y:restrictedSaveRect.y + restrictedSaveRect.height / 2
-      });
-      nodeRepl.write(await browserApi.verify({
-        description:'Save action updated the page state',
-        target:{by:'css',selector:'body'},
-        state:'attribute',attribute:'data-saved',equals:'yes'
-      }));
-    `);
-    assert.equal(coordinateAction.ok, true, coordinateAction.error);
-    assert.equal((coordinateAction.value as { ok?: boolean }).ok, true);
-  } finally {
-    rmSync(restrictedUploadDir, { force: true, recursive: true });
-    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
-  }
-});
-
 test('browserCode requires screenshot review in a previous cell and reuses it for multiple clicks', async () => {
   await page.goto('about:blank');
   await page.setContent(`
@@ -1058,14 +922,15 @@ test('browserCode does not scroll the background when a viewport overlay blocks 
       await page.locator('#blocked-offscreen-action').click();
     `);
     assert.equal(blocked.ok, false);
-    assert.match(blocked.error || '', /viewport-blocking layer/i);
+    assert.match(blocked.error || '', /Playwright click trial failed/i);
+    assert.match(blocked.error || '', /intercepts pointer events/i);
     assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
   } finally {
     await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
   }
 });
 
-test('browserCode skips the Playwright trial when a viewport overlay covers a visible target', async () => {
+test('browserCode lets the Playwright trial decide when a viewport overlay covers a visible target', async () => {
   await page.setContent(`
     <style>
       body { margin: 0; min-height: 2200px; }
@@ -1082,16 +947,16 @@ test('browserCode skips the Playwright trial when a viewport overlay covers a vi
       await page.locator('#covered-visible-action').click();
     `);
     assert.equal(blocked.ok, false);
-    assert.match(blocked.error || '', /viewport-blocking layer/i);
-    assert.match(blocked.error || '', /trial skipped to preserve/i);
-    assert.doesNotMatch(blocked.error || '', /trial failed/i);
+    assert.match(blocked.error || '', /intercepts pointer events/i);
+    assert.doesNotMatch(blocked.error || '', /trial skipped to preserve/i);
+    assert.match(blocked.error || '', /trial failed/i);
     assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
   } finally {
     await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
   }
 });
 
-test('browserCode skips scrolling an iframe target when the parent viewport is blocked', async () => {
+test('browserCode runs the Playwright trial for an iframe target when the parent viewport is blocked', async () => {
   await page.setContent(`
     <style>
       body { margin: 0; min-height: 2200px; }
@@ -1109,8 +974,8 @@ test('browserCode skips scrolling an iframe target when the parent viewport is b
     `);
     assert.equal(blocked.ok, false);
     assert.match(blocked.error || '', /iframe#editor-frame/i);
-    assert.match(blocked.error || '', /trial skipped to preserve/i);
-    assert.doesNotMatch(blocked.error || '', /trial failed/i);
+    assert.doesNotMatch(blocked.error || '', /trial skipped to preserve/i);
+    assert.match(blocked.error || '', /trial failed/i);
     assert.equal(await page.evaluate(() => window.scrollY), scrollBefore);
   } finally {
     await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
@@ -1367,6 +1232,66 @@ test('browserCode recycles a persistent kernel after its execution budget', asyn
   }
 });
 
+test('browserCode agent state survives a kernel recycle', async () => {
+  const durableValues = new Map<string, { revision: number; value: unknown }>();
+  const stateKernel = new BrowserCodeKernel(
+    { protocol: 'cdp', endpoint: cdpEndpoint },
+    {
+      maxExecutions: 1,
+      runtimeState: ({ action, input }) => {
+        const record = input as { key?: string; value?: unknown };
+        const key = String(record.key || '');
+        if (action === 'set') {
+          const revision = (durableValues.get(key)?.revision || 0) + 1;
+          durableValues.set(key, { revision, value: record.value });
+          return { key, value: record.value, revision, updatedAt: new Date().toISOString() };
+        }
+        if (action === 'get') {
+          const entry = durableValues.get(key);
+          return entry
+            ? { found: true, key, ...entry, updatedAt: new Date().toISOString() }
+            : { found: false, key };
+        }
+        throw new Error(`Unexpected state action in test: ${action}`);
+      },
+    },
+  );
+  const execute = async (code: string) => {
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    return stateKernel.execute({ code, executionId });
+  };
+
+  try {
+    const saved = await execute(`
+      var temporaryConversationValue = 'kernel-only';
+      nodeRepl.write(await agent.state.set({key:'task.progress',value:{step:3,issueId:'30789'}}));
+    `);
+    assert.equal(saved.ok, true, saved.error);
+    assert.equal(saved.kernelReset?.reason, 'execution-limit');
+
+    const restored = await execute(`
+      nodeRepl.write({
+        temporaryType: typeof temporaryConversationValue,
+        persisted: await agent.state.get({key:'task.progress'})
+      });
+    `);
+    assert.equal(restored.ok, true, restored.error);
+    assert.equal((restored.value as { temporaryType: string }).temporaryType, 'undefined');
+    assert.deepEqual((restored.value as { persisted: { value: unknown } }).persisted.value, {
+      step: 3,
+      issueId: '30789',
+    });
+  } finally {
+    await stateKernel.close();
+  }
+});
+
 test('browserCode truncates oversized return values', async () => {
   const result = await run(`nodeRepl.write('x'.repeat(5_000));`, { maxOutputChars: 1_000 });
   assert.equal(result.ok, true, result.error);
@@ -1588,42 +1513,9 @@ test('browserCode policy allows Playwright force while retaining script-click pr
   );
 });
 
-test('restricted browserCode policy rejects direct runtime objects and accepts browserApi', () => {
-  assert.match(
-    browserCodePolicyViolation(`await page.getByRole('button').click()`, 'restricted') || '',
-    /only browserApi/i,
-  );
-  assert.match(
-    browserCodePolicyViolation(`await browser.tabs.new('https://example.com')`, 'restricted') || '',
-    /only browserApi/i,
-  );
-  assert.equal(
-    browserCodePolicyViolation(`await browserApi.act({target:{by:'role',role:'button',name:'Save'},action:'click'})`, 'restricted'),
-    undefined,
-  );
-  assert.equal(
-    browserCodePolicyViolation(`await browserApi.read({target:{by:'css',selector:'[data-page.context]'},operation:'count'})`, 'restricted'),
-    undefined,
-  );
-  assert.equal(
-    browserCodePolicyViolation(`var clickReturn = await browserApi.act({target:{by:'label',text:'Return'},action:'click'}); nodeRepl.write(clickReturn.tab.url)`, 'restricted'),
-    undefined,
-  );
-  assert.equal(
-    browserCodePolicyViolation(`var tab = await browserApi.current(); nodeRepl.write(tab.url)`, 'restricted'),
-    undefined,
-  );
-  assert.match(
-    browserCodePolicyViolation(`await tab['playwright'].getByRole('button').click()`, 'restricted') || '',
-    /only browserApi/i,
-  );
-});
-
 test('browserCode image-operation detection uses parsed member calls', () => {
-  assert.equal(browserCodeHasImageOperation('await browserApi.screenshot({fullPage:false})'), true);
   assert.equal(browserCodeHasImageOperation('await nodeRepl.emitImage(await page.screenshot())'), true);
-  assert.equal(browserCodeHasImageOperation('const shot = browserApi.screenshot; await shot()'), true);
-  assert.equal(browserCodeHasImageOperation('const { screenshot: shot } = browserApi; await shot()'), true);
+  assert.equal(browserCodeHasImageOperation('await page.screenshot({fullPage:false})'), true);
   assert.equal(browserCodeHasImageOperation('nodeRepl.write({screenshot:"metadata only"})'), false);
   assert.equal(browserCodeHasImageOperation('const screenshot = "plain value"; nodeRepl.write(screenshot)'), false);
 });

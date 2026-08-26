@@ -53,11 +53,9 @@
   display: block;
   max-width: 100%;
   min-height: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
-  padding: 0;
-  scrollbar-gutter: stable;
+  padding: 0 0 16px;
 }
 
 .browser-chat-tool-detail-section {
@@ -203,20 +201,16 @@
 .browser-chat-tool-io-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  min-height: 540px;
+  height: 100%;
+  min-height: 0;
 }
 
 .browser-chat-tool-io-grid .browser-chat-tool-output-panel {
   border-right: 1px solid var(--border);
-  min-height: 540px;
 }
 
 .browser-chat-tool-io-grid .browser-chat-tool-output-panel:last-child {
   border-right: 0;
-}
-
-.browser-chat-tool-screenshots {
-  border-top: 1px solid var(--border);
 }
 
 .browser-chat-tool-output-header {
@@ -384,56 +378,6 @@
   font-size: 13px;
   line-height: 1.6;
   margin: 0;
-}
-
-.browser-chat-tool-shot-grid {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-}
-
-.browser-chat-tool-shot-card {
-  background: transparent;
-  border: 1px solid var(--border);
-  border-radius: var(--app-radius-md);
-  color: inherit;
-  display: grid;
-  gap: 8px;
-  min-width: 0;
-  overflow: hidden;
-  padding: 8px;
-  text-decoration: none;
-}
-
-.browser-chat-tool-shot-card img {
-  aspect-ratio: 16 / 9;
-  background: var(--panel-soft);
-  border-radius: 6px;
-  object-fit: contain;
-  width: 100%;
-}
-
-.browser-chat-tool-shot-card span {
-  display: grid;
-  gap: 4px;
-  min-width: 0;
-}
-
-.browser-chat-tool-shot-card strong {
-  font-size: 12px;
-  line-height: 1.35;
-}
-
-.browser-chat-tool-shot-list li {
-  display: grid;
-  gap: 4px;
-}
-
-.browser-chat-tool-shot-list code {
-  color: var(--muted-strong);
-  font-size: 12px;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
 }
 
 .ui-modal-overlay.browser-chat-log-dialog-overlay {
@@ -1009,12 +953,13 @@
 @media (max-width: 900px) {
   .browser-chat-tool-io-grid {
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
   }
 
   .browser-chat-tool-io-grid .browser-chat-tool-output-panel {
     border-bottom: 1px solid var(--border);
     border-right: 0;
-    min-height: 360px;
+    min-height: 0;
   }
 
   .ui-modal.ui-modal--wide.browser-chat-log-dialog {

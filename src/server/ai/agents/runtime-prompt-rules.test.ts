@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserActionRules, browserChatCodeRules, browserCodeRules, browserContextLine, screenshotObservationRule } from './runtime-prompt-rules';
+import { browserActionRules, browserChatCodeRules, browserCodeRules, screenshotObservationRule } from './runtime-prompt-rules';
 
 function combinedRules(screenshotAvailable: boolean) {
   return [
-    ...browserCodeRules('free'),
-    ...browserActionRules(screenshotAvailable, 'free'),
-    screenshotObservationRule(screenshotAvailable, 'free'),
+    ...browserCodeRules(),
+    ...browserActionRules(screenshotAvailable),
+    screenshotObservationRule(screenshotAvailable),
   ].join('\n');
 }
 
@@ -45,8 +45,8 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /exactly one attachment (?:remains )?at the requested destination/i);
   assert.match(rules, /system-file-artifact-runtime/);
   assert.match(rules, /system-subagent-runtime/);
-  assert.match(rules, /file plan\/generate\/edit\/render\/convert\/jsApi\/unoApi/);
-  assert.match(rules, /file list\/read\/download remain available/);
+  assert.match(rules, /first file or fileVisual call atomically loads/i);
+  assert.match(rules, /loadedRuntimeSkill/);
   assert.doesNotMatch(rules, /expectedRevision/);
   assert.doesNotMatch(rules, /lastSuccessfulRevision/);
   assert.doesNotMatch(rules, /CharHeight/);
@@ -116,17 +116,16 @@ test('screenshot guidance stays inside browserCode', () => {
   assert.doesNotMatch(combinedRules(false), /takeScreenshot/);
   assert.match(combinedRules(false), /browserCode for inspection and browser operations/);
   assert.match(combinedRules(false), /current exact Locator\.boundingBox\(\) rect/);
-  assert.match(browserChatCodeRules(false, 'free').join('\n'), /rect-derived coordinate targeting is supported/i);
-  assert.doesNotMatch(browserChatCodeRules(false, 'free').join('\n'), /coordinate targeting (?:is|are) unavailable/i);
+  assert.match(browserChatCodeRules(false).join('\n'), /rect-derived coordinate targeting is supported/i);
+  assert.doesNotMatch(browserChatCodeRules(false).join('\n'), /coordinate targeting (?:is|are) unavailable/i);
 });
-
 test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
-  const rules = browserChatCodeRules(true, 'free').join('\n');
-  assert.equal(browserChatCodeRules(true, 'free').length, 13);
+  const rules = browserChatCodeRules(true).join('\n');
+  assert.equal(browserChatCodeRules(true).length, 14);
   assert.match(rules, /system-browser-code-runtime/);
   assert.match(rules, /system-file-artifact-runtime/);
   assert.match(rules, /system-subagent-runtime/);
-  assert.match(rules, /runtime rejects browserCode until that read succeeds/i);
+  assert.match(rules, /first browserCode call.*atomically loads/i);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
@@ -173,24 +172,9 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /five-minute validity/i);
   assert.match(rules, /context\.pages/);
   assert.match(rules, /credentialVault\.fill/);
-  assert.match(rules, /file plan\/generate\/edit\/render\/convert\/jsApi\/unoApi/);
-  assert.match(rules, /file list\/read\/download remain available/);
+  assert.match(rules, /first file or fileVisual call atomically loads/i);
+  assert.match(rules, /loadedRuntimeSkill/);
   assert.doesNotMatch(rules, /lastSuccessfulRevision/);
   assert.match(rules, /deterministic batch in one bounded cell/i);
   assert.match(rules, /re-establish and verify the intended editable target and focus/i);
-});
-
-test('restricted browser mode injects only the browserApi Skill and API vocabulary', () => {
-  const rules = browserChatCodeRules(true, 'restricted').join('\n');
-  assert.match(rules, /system-browser-api-runtime/);
-  assert.doesNotMatch(rules, /system-browser-code-runtime/);
-  assert.match(rules, /only browserApi, nodeRepl, and console/i);
-  assert.match(rules, /tab lifecycle, navigation, frames/i);
-  assert.match(rules, /browserApi\.snapshot\/read\/inspect/);
-  assert.match(rules, /multiple later coordinate clicks/i);
-  assert.match(rules, /never silently replace an unavailable value/i);
-  assert.doesNotMatch(rules, /receives the real Playwright page\/context/i);
-  assert.match(browserContextLine('restricted'), /system-browser-api-runtime/);
-  assert.match(screenshotObservationRule(false, 'restricted'), /browserApi\.read/);
-  assert.match(browserActionRules(false, 'restricted').join('\n'), /browserApi\.act/);
 });

@@ -4,8 +4,6 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, Copy, X } from 'lucide-react';
 import { formatToolPayload } from '@/components/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
-import { artifactApiUrl } from '@/lib/artifacts';
-import { browserChatScreenshotIsInternalDocumentPreview } from '@/lib/browser-chat-artifacts';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { AppModal } from '@/components/ui/app-modal';
 
@@ -27,14 +25,6 @@ function toolStatusLabel(tool: BrowserChatToolCall, step: StepExecutionResult) {
   if (step.status === 'blocked') return '已暂停';
   if (step.status === 'passed') return '已完成';
   return '执行中';
-}
-
-function screenshotKindLabel(kind?: string) {
-  if (kind === 'original') return '原始图';
-  if (kind === 'marker') return '标识图';
-  if (kind === 'current' || kind === 'pinned' || kind === 'after') return '操作后';
-  if (kind === 'history') return '操作前';
-  return '截图';
 }
 
 function toolStatusTone(status: string) {
@@ -88,12 +78,13 @@ function ToolOutputViewer({ payload, wrap }: { payload: string; wrap: boolean })
   );
 }
 
-function toolResultPayload(value: unknown) {
-  if (value && typeof value === 'object' && !Array.isArray(value) && 'actual' in value) {
-    const actual = (value as { actual?: unknown }).actual;
-    if (typeof actual === 'string') return actual;
+function rawToolResultPayload(value: unknown) {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
   }
-  return formatToolPayload(value);
 }
 
 function toolInputPayload(tool: BrowserChatToolCall) {
@@ -130,13 +121,10 @@ export function BrowserChatToolDialog({
   const displayedInputPayload = inputPayload || emptyPayloadLabel;
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
-  // The trace retains the structured BrowserActionResult. Show its actual
-  // payload directly so reflection/read output is visible, rather than making
-  // the user hunt through a wrapper object's `actual` field.
-  const resultPayload = toolResultPayload(completeResult);
-  const visibleScreenshots = (detail.tool.screenshots || []).filter((screenshot) => (
-    !browserChatScreenshotIsInternalDocumentPreview(detail.tool.name, screenshot)
-  ));
+  // Diagnostics must expose the exact persisted tool result. In particular,
+  // do not unwrap `actual`: the outer result also carries runtime Skills,
+  // failure classification, screenshots, and trace data.
+  const resultPayload = rawToolResultPayload(completeResult);
 
   useEffect(() => () => {
     if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
@@ -206,19 +194,6 @@ export function BrowserChatToolDialog({
               {hasActualResult ? <ToolOutputViewer payload={resultPayload || emptyPayloadLabel} wrap={wrapOutput} /> : <ToolOutputViewer payload={t('该工具调用没有返回执行结果。')} wrap={wrapOutput} />}
             </section>
           </div>
-
-          {detail.confirmationScreenshotUrl || visibleScreenshots.length ? (
-            <section className="browser-chat-tool-detail-section browser-chat-tool-screenshots">
-              <h3>{t('截图记录')}</h3>
-              <div className="browser-chat-tool-shot-grid">
-                {detail.confirmationScreenshotUrl ? <a className="browser-chat-tool-shot-card" href={detail.confirmationScreenshotUrl} rel="noopener noreferrer" target="_blank"><img alt={t('用户确认时的页面截图')} src={detail.confirmationScreenshotUrl} /><span><strong>{t('操作前确认截图')}</strong><code>{detail.confirmationScreenshotUrl}</code></span></a> : null}
-                {visibleScreenshots.map((shot, index) => {
-                  const url = artifactApiUrl(shot.path);
-                  return <a className="browser-chat-tool-shot-card" href={url || '#'} key={`${shot.path}-${index}-preview`} onClick={(event) => { if (!url) event.preventDefault(); }} rel="noopener noreferrer" target="_blank">{url ? <img alt={shot.title || t(screenshotKindLabel(shot.kind))} src={url} /> : null}<span><strong>{t(screenshotKindLabel(shot.kind))} · {shot.title || t('截图 {index}', { index: index + 1 })}</strong><code>{shot.path}</code></span></a>;
-                })}
-              </div>
-            </section>
-          ) : null}
         </div>
     </AppModal>
   );

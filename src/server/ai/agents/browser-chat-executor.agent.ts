@@ -5,7 +5,7 @@ import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, 
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { aiMaxOutputTokens, aiReasoningEffort, aiRuntimeRequestTimeoutMs, aiStreamTimeouts, aiTelemetry, createAiRequestWatchdog } from '@/server/ai/ai-sdk-runtime';
 import { structuredLog } from '@/server/observability/runtime-observability';
-import { buildCodexObjectPrompt, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
+import { buildCodexObjectPrompt, currentRuntimeTimePromptLine, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import {
   BrowserSession,
   type BrowserActionResult,
@@ -15,7 +15,6 @@ import {
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
-import { resolveBrowserCodeRuntimeMode } from '@/server/browser/browser-code-runtime-mode';
 import { richTextToPlainText } from '@/lib/rich-text';
 import {
   aiSdkEmptyStopRequiresRetry,
@@ -28,9 +27,9 @@ import { fileArtifactRuntimeSkillId } from './file-artifact-runtime-skill';
 import {
   activeBrowserRuntimeSkillId,
   hiddenRuntimeSkillContent,
-  hiddenRuntimeSkillGateResult,
+  automaticallyLoadHiddenRuntimeSkill,
   hiddenRuntimeSkillIdsReadFromTraces,
-  runtimeToolTypesAfterHiddenSkillGate,
+  runtimeToolTypesWithAutomaticSkills,
 } from './hidden-runtime-skills';
 import { subagentRuntimeSkillId } from './subagent-runtime-skill';
 import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
@@ -69,6 +68,7 @@ import {
 } from './runtime-retry-state';
 import {
   classifyRuntimeRetry,
+  isProviderBillingLimitMessage,
   runtimeExecutionDetails,
   runtimeExecutionIdentity,
   runtimeRetryDelayMs,
@@ -349,9 +349,13 @@ function runtimeRetryFromError(error: unknown) {
   const consecutiveFailures = Number(record.consecutiveFailures ?? retryAttempts);
   const consecutiveFailureLimit = Number(record.consecutiveFailureLimit ?? maxRetryAttempts);
   if (!Number.isFinite(consecutiveFailures) || !Number.isFinite(consecutiveFailureLimit)) return undefined;
+  const decision = record.decision && typeof record.decision === 'object' && !Array.isArray(record.decision)
+    ? record.decision as Record<string, unknown>
+    : undefined;
   return {
     consecutiveFailures: Math.max(0, Math.floor(consecutiveFailures)),
     consecutiveFailureLimit: Math.max(1, Math.floor(consecutiveFailureLimit)),
+    retryable: decision?.retryable === true,
   };
 }
 
@@ -416,6 +420,11 @@ function upstreamDisconnectLines(
 function userFacingInfrastructureError(value?: string, context?: { error?: unknown; aiRequest?: AiRequestSnapshot }) {
   const text = value || '';
   const retryInfo = runtimeRetryFromError(context?.error);
+  if (isProviderBillingLimitMessage(text)) {
+    const status = firstErrorValue(context?.error, 'status') ?? firstErrorValue(context?.error, 'statusCode') ?? 429;
+    const reason = trimDebugText(text.split(/\r?\n/, 1)[0] || text, 600);
+    return `上游 AI 服务返回 ${status}：${reason}\n这是套餐或额度耗尽，不会进行无效重试。本轮操作已停止，当前页面状态已保留。`;
+  }
   const upstreamReason = upstreamApiDisconnectReason(text);
   if (upstreamReason) {
     return [
@@ -1101,9 +1110,7 @@ async function executeTracedBrowserAction(input: {
 }
 
 function initialBrowserStateCode() {
-  return resolveBrowserCodeRuntimeMode() === 'restricted'
-    ? 'nodeRepl.write({ tabs: await browserApi.tabs.list(), activePage: await browserApi.current(), pageState: await browserApi.snapshot() })'
-    : 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
+  return 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
 }
 
 async function readCurrentBrowserState(
@@ -1150,9 +1157,8 @@ function makeBrowserTools(
     loadedHiddenRuntimeSkillIds?: Set<string>;
   },
 ) {
-  const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
   const imageInputAvailable = modelSupportsImageInput();
-  const browserRuntimeSkillId = activeBrowserRuntimeSkillId(browserCodeRuntimeMode);
+  const browserRuntimeSkillId = activeBrowserRuntimeSkillId();
   // Models may return independent tool calls together. Execute every call in the response, but
   // serialize them so browser/page state and a document draft cannot be mutated concurrently.
   // This preserves tool-call order without silently dropping work from the same model step.
@@ -1197,8 +1203,11 @@ function makeBrowserTools(
     const run = async () => {
       throwIfStopped(referenceOptions?.abortSignal, referenceOptions?.shouldContinue);
       const actionAfterBrowserStart = async (actionSignal?: AbortSignal, trace?: ToolTrace) => {
-        const runtimeSkillGate = hiddenRuntimeSkillGateResult(name, input, loadedHiddenRuntimeSkillIds);
-        if (runtimeSkillGate) return runtimeSkillGate;
+        const automaticSkill = automaticallyLoadHiddenRuntimeSkill(name, input, loadedHiddenRuntimeSkillIds);
+        if (automaticSkill && 'ok' in automaticSkill) return automaticSkill;
+        const attachAutomaticSkill = (result: BrowserActionResult) => automaticSkill?.loadedRuntimeSkill
+          ? { ...result, loadedRuntimeSkill: automaticSkill.loadedRuntimeSkill }
+          : result;
         if (
           referenceOptions?.browserStatePreflightComplete
           && browserToolBlockedBeforeBrowserState(
@@ -1207,13 +1216,14 @@ function makeBrowserTools(
             runtimeBrowserSessionToolNames,
           )
         ) {
-          return {
+          return attachAutomaticSkill({
             ok: false,
             actual: `Tool ${name} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
-          } satisfies BrowserActionResult;
+          });
         }
         if (runtimeToolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
-        return action(actionSignal, trace);
+        const result = await action(actionSignal, trace);
+        return attachAutomaticSkill(result);
       };
       const traceVisualContext = referenceOptions?.visualContext;
       return executeTracedBrowserAction({
@@ -1265,19 +1275,13 @@ function makeBrowserTools(
       }), execution),
     }),
     browserCode: tool({
-      description: browserCodeRuntimeMode === 'restricted'
-        ? `Execute one bounded JavaScript cell against the live browser through the documented restricted browserApi. Only browserApi, nodeRepl, and console are exposed.${imageInputAvailable ? ' browserApi.screenshot emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use browserApi.read/inspect rect evidence instead.'} Before the first call, read hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires readBrowserState.`
-        : `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} Before the first call in this Agent run, read hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires the readBrowserState preflight.`,
+      description: `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} The persistent agent.state API stores non-secret JSON-safe values across kernel recycling and later conversation turns. The first call automatically loads and returns hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires the readBrowserState preflight.`,
       inputSchema: browserToolInput({
-        code: z.string().min(1).max(40_000).describe(browserCodeRuntimeMode === 'restricted'
-          ? `Ordinary JavaScript cell for the persistent restricted kernel. Use only documented browserApi methods with top-level await; page/context/browser/tab and Playwright objects are absent. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await browserApi.screenshot(...).' : ' Do not call browserApi.screenshot; this model has no image input.'} Prefer top-level var or fresh binding names. No wrapper, module, export, import, or Markdown fence.`
-          : `Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await nodeRepl.emitImage(await page.screenshot(...)).' : ' Do not call screenshot or nodeRepl.emitImage; this model has no image input.'} Prefer top-level var or fresh binding names because bindings persist. Do not write a function wrapper, module, export, or Markdown fences.`),
+        code: z.string().min(1).max(40_000).describe(`Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Save non-secret JSON-safe values needed after recycling or in later turns with agent.state. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await nodeRepl.emitImage(await page.screenshot(...)).' : ' Do not call screenshot or nodeRepl.emitImage; this model has no image input.'} Prefer top-level var or fresh binding names for temporary values. Do not write a function wrapper, module, export, or Markdown fences.`),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
       }, [{
         reason: '读取当前页面地址和标题',
-        code: browserCodeRuntimeMode === 'restricted'
-          ? 'nodeRepl.write(await browserApi.current())'
-          : 'nodeRepl.write({ url: page.url(), title: await page.title() })',
+        code: 'nodeRepl.write({ url: page.url(), title: await page.title() })',
       }]),
       execute: (rawInput, execution) => {
         const input = coerceBrowserChatToolInput('browserCode', rawInput) as typeof rawInput;
@@ -1287,7 +1291,7 @@ function makeBrowserTools(
           if (!imageInputAvailable && browserCodeHasImageOperation(input.code)) {
             return Promise.resolve({
               ok: false,
-              actual: 'Image operation rejected: the selected model is not configured with image input support. Use browserApi.read/inspect and exact rect evidence instead.',
+              actual: 'Image operation rejected: the selected model is not configured with image input support. Use exact Playwright Locator and boundingBox evidence instead.',
             });
           }
           return session.executeBrowserCode({
@@ -1396,7 +1400,7 @@ function makeBrowserTools(
       }, execution),
     }),
     file: tool({
-      description: `List, read, download, convert, create, modify, or render file artifacts in a stable documentId workspace. list/read/download are ungated; plan/generate/edit/render/convert/jsApi/unoApi require hidden Skill ${fileArtifactRuntimeSkillId}.`,
+      description: `List, read, download, convert, create, modify, or render file artifacts in a stable documentId workspace. Every action requires hidden Skill ${fileArtifactRuntimeSkillId} to have been read in a previous model step.`,
       // Keep the provider-facing schema flat. Several OpenAI-compatible
       // gateways mishandle a discriminated union/oneOf and reject a perfectly
       // usable file call before the action-specific implementation can return
@@ -1625,18 +1629,15 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
   const caseSystemPrompt = browserChatSystemPromptForRuntime(rawCaseSystemPrompt);
   const customPrompt = customRuntimePromptFromEnv();
   const screenshotAvailable = modelSupportsImageInput();
-  const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
   return [
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
+    currentRuntimeTimePromptLine(),
     '',
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
-    browserCodeRuntimeMode === 'restricted'
-      ? '- browserCode is the real browser operation mechanism. Use the documented browserApi for navigation, tabs, reads, frames, actions, keyboard/pointer input, uploads, screenshots, waits, surfaces, and verification. page/context/browser/tab and Playwright objects are absent. After readBrowserState, use browserCode for requested live operations unless a real call proves the operation unavailable.'
-      : '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
-    browserCodeRuntimeMode === 'restricted'
-      ? '- Keep tool input limited to exact arguments and a concise semantic reason. Operation results include incremental domChanges; use browserApi.snapshot/read/inspect for explicit current evidence and browserApi.surface for structured popup state.'
-      : '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
+    '- The latest user message is the scope authority. If it explicitly narrows the current turn to one action (for example, "just click Search"), perform and verify only that action, then stop. Do not silently resume a broader goal from an earlier message unless the latest message explicitly asks you to continue it.',
+    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
+    '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- User-role messages beginning with [WebPilot runtime operational context], [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.',
     '- Treat user-specified dates, times, locations, quantities, names, and option values as exact business constraints. Never silently replace an unavailable value with a nearby, rounded, first-suggestion, or default value; preserve the requested value and ask the user or report the blocker.',
@@ -1647,14 +1648,12 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
         ? '- A successful render is only a candidate. Inspect every returned preview and generationDiagnostics for clipping, overlap, hidden text, word/character wrapping, unexpectedly wrapped titles, covered captions, off-canvas content, empty pages, image distortion, broken tables/charts, contrast, and alignment. If a defect exists, read the line-numbered draft, edit its affected line ranges, render again, and inspect the replacement preview. Do not claim full visual verification when a complete screenshot-by-screenshot review was unavailable.'
       : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
     '- PDF is a first-class deliverable, never an unsupported format or a manual-save workaround. UNO can produce it directly; JavaScript mode authors the matching Office intermediate and the local worker converts that exact result to PDF.',
-    ...browserChatCodeRules(screenshotAvailable, browserCodeRuntimeMode),
+    ...browserChatCodeRules(screenshotAvailable),
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     `- Use subagent action=spawn only for independent parallel work and read ${subagentRuntimeSkillId} first. action=read stays ungated; collect one returned UUID per model step in the required order, then integrate results in the parent Agent.`,
     '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
-    browserCodeRuntimeMode === 'restricted'
-      ? '- To upload a registered user attachment, call browserApi.act({target, action:"upload", attachmentId}) with one exact observed file-input target. Never reconstruct bytes or use a path. Verify exactly one attachment at the requested destination.'
-      : '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
+    '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
@@ -2494,11 +2493,7 @@ async function executeRuntimeStep(input: {
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
         : '';
       const browserStateGatePending = requiresBrowserStatePreflight(Boolean(input.browserStatePreflightComplete), traces);
-      const stepAllowedToolTypes = runtimeToolTypesAfterHiddenSkillGate(
-        allowedToolTypes,
-        loadedHiddenRuntimeSkillIds,
-        resolveBrowserCodeRuntimeMode(),
-      );
+      const stepAllowedToolTypes = runtimeToolTypesWithAutomaticSkills(allowedToolTypes);
       const baseSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const activeModelSettings = getModelSettings();
@@ -3562,7 +3557,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         : '';
       const requiredDocumentWorkInstruction = requiredDocumentWork
         ? `[Mandatory Office document completion gate]
-Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The committed workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. A final response is forbidden until the committed source is rendered and any required visual QA is completed.`
+Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The current workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. If validation failed, repair the same saved source; do not render an older revision. A final response is forbidden until the current validated source is rendered and any required visual QA is completed.`
         : '';
       actionResult = await executeRuntimeStep({
         session: input.session,
@@ -3751,7 +3746,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
           await input.onDebug?.({
             phase: 'chat:file-document-completion-required',
             stepIndex,
-            message: 'An Office document has pending committed workflow work; rejecting the final response.',
+            message: 'An Office document has pending source, validation, render, or QA work; rejecting the final response.',
             details: { pendingDocumentWork },
           });
           continue;
@@ -3828,7 +3823,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         await input.onDebug?.({
           phase: 'chat:file-document-completion-required',
           stepIndex,
-          message: 'An Office document has pending committed workflow work; rejecting the final response.',
+          message: 'An Office document has pending source, validation, render, or QA work; rejecting the final response.',
           details: { pendingDocumentWork },
         });
         continue;
@@ -3998,13 +3993,17 @@ async function createRuntimeErrorStep(input: {
 }): Promise<StepExecutionResult> {
   const { stepIndex, error, tools, aiRequest, visualContext } = input;
   const retryInfo = runtimeRetryFromError(error);
+  const retriesExhausted = Boolean(
+    retryInfo?.retryable
+    && retryInfo.consecutiveFailures >= retryInfo.consecutiveFailureLimit,
+  );
 
   return {
     index: stepIndex,
-    action: retryInfo
+    action: retriesExhausted
       ? 'AI request retries were exhausted; stopping this browser-chat turn'
       : 'AI request or response handling failed; stopping this browser-chat turn',
-    expected: retryInfo
+    expected: retriesExhausted
       ? 'The assistant should stop after the request-level retry limit and preserve the latest browser state.'
       : 'The assistant should stop this turn and preserve the latest browser state.',
     actual: userFacingRecoverableRuntimeError(error),
@@ -4389,17 +4388,20 @@ async function executeCodexRuntimeObject(input: {
     onToolTrace,
     onVisualContextChange,
     action: async (_actionSignal, trace) => {
-      const runtimeSkillGate = hiddenRuntimeSkillGateResult(type, normalizedParams, loadedHiddenRuntimeSkillIds);
-      if (runtimeSkillGate) return runtimeSkillGate;
+      const automaticSkill = automaticallyLoadHiddenRuntimeSkill(type, normalizedParams, loadedHiddenRuntimeSkillIds);
+      if (automaticSkill && 'ok' in automaticSkill) return automaticSkill;
+      const attachAutomaticSkill = (result: BrowserActionResult) => automaticSkill?.loadedRuntimeSkill
+        ? { ...result, loadedRuntimeSkill: automaticSkill.loadedRuntimeSkill }
+        : result;
       if (browserToolBlockedBeforeBrowserState(
         type,
         !Boolean(browserStatePreflightComplete),
         runtimeBrowserSessionToolNames,
       )) {
-        return {
+        return attachAutomaticSkill({
           ok: false,
           actual: `Tool ${type} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
-        } satisfies BrowserActionResult;
+        });
       }
       const approval = await requestBrowserToolApproval({
         toolName: type,
@@ -4409,20 +4411,21 @@ async function executeCodexRuntimeObject(input: {
       });
       throwIfStopped(abortSignal, shouldContinue);
       if (approval === 'denied') {
-        return {
+        return attachAutomaticSkill({
           ok: true,
           actual: 'Skipped before execution because the user cancelled this server-approved tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
-        } satisfies BrowserActionResult;
+        });
       }
       if (runtimeToolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
       const result = await runTool(trace?.id);
+      const resultWithSkill = attachAutomaticSkill(result);
       if (approval === 'approved') {
         return {
-          ...result,
-          actual: `用户已确认本次工具调用，现已执行。\n${result.actual}`,
+          ...resultWithSkill,
+          actual: `用户已确认本次工具调用，现已执行。\n${resultWithSkill.actual}`,
         } satisfies BrowserActionResult;
       }
-      return result;
+      return resultWithSkill;
     },
   });
   const imagePaths = result.referenceImagePaths?.length

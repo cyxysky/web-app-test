@@ -4,22 +4,24 @@ export const fileArtifactRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${fileArtifactRuntimeSkillId}</id>`,
   '<title>File Artifact Runtime</title>',
-  '<description>Hidden built-in operating manual shared by file and fileVisual. Read it before authoring, modifying, converting, rendering, API lookup, or visual QA.</description>',
-  '<required>conditional</required>',
+  '<description>Hidden built-in operating manual shared by file and fileVisual. Their first governed call automatically loads and returns it while continuing the operation.</description>',
+  '<required>true</required>',
   '</system_skill>',
 ].join('\n');
 
 export const fileArtifactRuntimeSkillContent = `# File Artifact Runtime
 
-This hidden built-in Skill is authoritative for the file and fileVisual artifact workflow. Read it once in the current Agent run before the first governed file operation.
+This hidden built-in Skill is authoritative for the file and fileVisual artifact workflow. The backend loads it once per Agent run during the first governed file or fileVisual call and returns it in loadedRuntimeSkill while continuing the original operation.
 
-## Governed and ungoverned actions
+## Required sequence
 
-- No runtime-Skill gate: file action=list, action=read, and action=download.
-- Runtime-Skill gate: file action=plan, generate, edit, render, convert, jsApi, and unoApi.
-- Every fileVisual action uses this same Skill. Do not read a second visual-only Skill.
+1. Call file or fileVisual normally.
+2. On the first governed call, inspect loadedRuntimeSkill and the original tool result returned by that same transaction.
+3. Continue the workflow below. Explicit skill action=read remains supported but is not required.
 
-If a governed call is rejected, read this Skill and retry the original tool call. Keep the same documentId or artifactId and follow the returned requiredNextAction; never create a replacement document merely to escape a failed step.
+Every file and fileVisual action uses this same Skill. Do not read a second visual-only Skill. If automatic loading fails, use the complete error and requiredSkillId to restore the missing Skill registration. If the original tool operation fails, use its failureCategory and complete workflow result to correct the input or workflow state. Keep the same documentId or artifactId; never create a replacement document merely to escape a failed step.
+
+The governed file actions are list, read, download, convert, plan, generate, edit, render, jsApi, and unoApi. The governed fileVisual actions are index, read, and report.
 
 ## Host tool boundary and result shape
 
@@ -31,7 +33,6 @@ type FileToolResult = {
   actual: string; // plain text or JSON text; inspect the complete value
   failureCategory?: string;
   requiredSkillId?: string;
-  requiredNextAction?: string;
   referenceImagePath?: string;
   referenceImagePaths?: string[];
 };
@@ -146,9 +147,9 @@ Action requirements:
 - \`convert\`: \`sourceArtifactId\` is the exact Artifact ID of the source Office file.
 - \`plan\`: \`documentId\`, \`fileName\`, and \`documentType\` are required. \`operation\` defaults to \`"create"\`; \`sourceAttachmentId\` is required for \`operation: "modify"\`.
 - \`unoApi\` and \`jsApi\`: call only after plan and only for its returned generation mode, always with the same \`documentId\`.
-- \`generate\`: call exactly once for a planned document. \`program\` must be runnable source for the selected generation mode.
-- \`edit\`: after generation, use one or more structured \`edits\`, one unified \`patch\`, or \`restoreRevision\`. Do not combine these mutation forms and do not send an unversioned whole-program replacement.
-- \`render\`: publishes only the latest completely validated committed source.
+- \`generate\`: call exactly once for a planned document. It creates the single editable source buffer even when validation fails.
+- \`edit\`: after generation, including a failed initial validation, repair the same saved source with structured \`edits\`, one unified \`patch\`, or \`restoreRevision\`. Do not combine these mutation forms and do not send a whole-program replacement.
+- \`render\`: publishes only the current source after that exact source passes validation.
 
 ## file call examples
 
@@ -361,9 +362,9 @@ fileVisual({
 1. Call file action=list before starting or resuming Office/PDF authoring, and reuse an existing documentId when it represents the requested work.
 2. Call action=plan once for that documentId. For an existing attachment, use operation=modify with the exact sourceAttachmentId; for a new file, use operation=create.
 3. Follow the generationMode returned by plan. Call action=unoApi only for an UNO plan or action=jsApi only for a JavaScript plan, always with the planned documentId.
-4. Call action=generate exactly once to commit the initial runnable source. A compact skeleton followed by focused edits is useful, but a complete runnable initial program is valid.
-5. Use action=edit for every later source change. Once source exists, never call generate again.
-6. Call action=render to validate and publish the current committed source.
+4. Call action=generate exactly once to create the single editable source buffer. The source is saved even when validation fails.
+5. Use action=edit for every later source change or validation repair. Once source exists, never call generate again.
+6. Call action=render only after the current source passes validation; render publishes that exact source.
 7. When visual QA is available, use fileVisual index -> read -> report against the exact latest Artifact ID until every page explicitly passes.
 
 Use action=read whenever the current source, fresh line numbers, workflow checkpoint, validation diagnostics, revisions, or digests are needed. Use action=download for an existing URL/path and action=convert to convert an existing Office artifact identified by sourceArtifactId. Read downloaded image artifacts when authoritative pixel dimensions or aspect ratio are needed.
@@ -371,7 +372,7 @@ Use action=read whenever the current source, fresh line numbers, workflow checkp
 ## Identity, revisions, and digests
 
 - documentId is the stable workspace identity. Reuse it across plan, API lookup, generate, read, edit, and render.
-- revision identifies a committed source version. A successful edit creates a new revision; a rejected edit does not.
+- revision identifies a source version that passed validation. Failed source remains in the same editable buffer without creating a revision.
 - sourceDigest identifies the exact current source bytes.
 - validatedSourceDigest identifies the source that passed the complete validation pipeline. render is allowed only when it equals sourceDigest.
 - renderedDigest identifies the source used for the current published artifact.
@@ -387,11 +388,11 @@ The plan result selects the mode; do not choose a different branch afterward.
 - JavaScript: read jsApi for the planned document and use only its cookbook and supported libraries. Keep shared initialization/helpers/final output outside optional units.
 - PDF is supported in both modes. JavaScript mode authors the matching Office intermediate and converts that exact result locally.
 
-## Transactional edits and recovery
+## Editing and recovery
 
 action=edit accepts replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText, a unified patch, or restoreRevision. Do not send an unversioned complete program replacement through edit.
 
-Every edit validates a candidate transactionally. Success commits a revision. Failure rolls the candidate back and returns the last successful revision plus recovery guidance. After a successful edit, use its returned source and digest; after a rejected edit, continue from the unchanged current draft. Read again before line-based edits whenever another edit may have shifted line numbers.
+Every edit updates the one saved working source and validates it. Success creates a validated revision. Failure keeps the exact edited source plus diagnostics and requires another edit; it never restores an older source automatically. Use action=read when fresh line numbers or exact current text are needed. Rendering and final delivery remain blocked while validationStatus is failed.
 
 Large scripts may optionally wrap self-contained page or section bodies in @webpilot-unit markers and use path-scoped read/edit. Unit edits validate an isolated candidate, while final render still validates the complete document.
 

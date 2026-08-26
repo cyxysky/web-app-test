@@ -2,13 +2,14 @@ import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createServer } from 'node:net';
+import { createConnection, createServer } from 'node:net';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
 import {
   resolveBrowserOutputPixelRatio,
   resolveBrowserPreviewImageFormat,
 } from '@/config/browser-output-settings';
 import { browserSessionGroupLabel } from '@/lib/browser-session-group';
+import { executeBrowserCodeRuntimeStateOperation } from '@/server/storage/browser-code-runtime-state';
 import { artifactPath } from '@/server/storage/paths';
 import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence';
 import {
@@ -54,7 +55,6 @@ import {
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
 } from './browser-code-runner';
-import { resolveBrowserCodeRuntimeMode, type BrowserCodeRuntimeMode } from './browser-code-runtime-mode';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 import {
   compactDiagnosticText,
@@ -124,6 +124,8 @@ export type BrowserSessionOptions = {
   browserSurface?: BrowserSessionSurface;
   isMarked?: boolean;
   runId?: string;
+  /** Durable browserCode state scope shared by all kernels for one browser conversation. */
+  browserCodeStateSessionId?: string;
   preferExistingPage?: boolean;
   browserProfileKey?: string;
   debugDevtools?: boolean;
@@ -141,7 +143,7 @@ export type BrowserSessionOptions = {
 };
 
 export type BrowserChildSessionOptions = Pick<BrowserSessionOptions,
-  'actionFrameLimit' | 'isMarked' | 'popupWaitMs' | 'runId' | 'slowMoMs'
+  'actionFrameLimit' | 'browserCodeStateSessionId' | 'isMarked' | 'popupWaitMs' | 'runId' | 'slowMoMs'
 > & {
   /** Keeps the parent's visible page focused after the child page is created. */
   background?: boolean;
@@ -212,12 +214,16 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Hidden runtime Skill automatically loaded before this first governed tool call. */
+  loadedRuntimeSkill?: {
+    id: string;
+    content: string;
+    loadedAutomatically: true;
+  };
   /** Stable runtime failure category used for category-specific recovery guidance. */
   failureCategory?: string;
-  /** Hidden runtime Skill that must be loaded before retrying this tool call. */
+  /** Hidden runtime Skill whose automatic load failed before this tool call. */
   requiredSkillId?: string;
-  /** Concrete recovery action returned for every failed runtime tool operation. */
-  requiredNextAction?: string;
   /** Browser-owned control mirrored into the remote live-preview surface. */
   liveControl?: BrowserLiveNativeControl;
   /** Native select menu mirrored into the remote live-preview surface. */
@@ -1303,7 +1309,9 @@ type SharedBrowserState = {
   idleTimer?: ReturnType<typeof setTimeout>;
   managedProfileDir?: string;
 };
-const sharedBrowserStates = new Map<string, SharedBrowserState>();
+const sharedBrowserStates = ((globalThis as typeof globalThis & {
+  __webPilotSharedBrowserStates?: Map<string, SharedBrowserState>;
+}).__webPilotSharedBrowserStates ??= new Map<string, SharedBrowserState>());
 
 function sharedBrowserStateFor(runtimeKey: string) {
   let state = sharedBrowserStates.get(runtimeKey);
@@ -1426,10 +1434,10 @@ async function connectExistingBrowserOverCdp(input: {
   chromium: BrowserType;
   endpoint: string;
   contextOptions: BrowserContextOptions;
+  timeoutMs?: number;
 }) {
   if (!input.endpoint) return undefined;
-  const browser = await input.chromium.connectOverCDP(input.endpoint, { timeout: 800 }).catch(() => undefined);
-  if (!browser) return undefined;
+  const browser = await input.chromium.connectOverCDP(input.endpoint, { timeout: input.timeoutMs || 800 });
   const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
   return {
     browser,
@@ -1437,6 +1445,102 @@ async function connectExistingBrowserOverCdp(input: {
     context,
     ownership: 'connected' as const,
   };
+}
+
+async function tryConnectExistingBrowserOverCdp(input: Parameters<typeof connectExistingBrowserOverCdp>[0]) {
+  try {
+    return {
+      connection: await connectExistingBrowserOverCdp(input),
+      error: '',
+    };
+  } catch (error) {
+    return {
+      connection: undefined,
+      error: unknownErrorMessage(error).replace(/\s+/g, ' ').trim().slice(0, 2_000),
+    };
+  }
+}
+
+async function tcpEndpointIsListening(endpoint: string) {
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
+  return new Promise<boolean>((resolve) => {
+    const socket = createConnection({ host: url.hostname, port });
+    let settled = false;
+    const finish = (listening: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(listening);
+    };
+    socket.setTimeout(600);
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.once('timeout', () => finish(false));
+  });
+}
+
+async function windowsPersistentChromeDiagnostics(userDataDir: string, port: number) {
+  if (process.platform !== 'win32') return '';
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$diagnosticProfile = [IO.Path]::GetFullPath($env:WEBPILOT_CHROME_DIAGNOSTIC_PROFILE)',
+    '$port = [int]$env:WEBPILOT_CHROME_DIAGNOSTIC_PORT',
+    '$profileProcesses = @(Get-CimInstance Win32_Process | Where-Object {',
+    '  ($_.Name -eq "chrome.exe" -or $_.Name -eq "chromium.exe") -and',
+    '  $_.CommandLine -and $_.CommandLine.IndexOf($diagnosticProfile, [StringComparison]::OrdinalIgnoreCase) -ge 0',
+    '} | ForEach-Object {',
+    '  $match = [regex]::Match($_.CommandLine, "--remote-debugging-port(?:=|\\s+)(\\d+)")',
+    '  [pscustomobject]@{ processId = $_.ProcessId; cdpPort = $(if ($match.Success) { [int]$match.Groups[1].Value } else { $null }) }',
+    '})',
+    '$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object {',
+    '  [pscustomobject]@{ address = $_.LocalAddress; processId = $_.OwningProcess }',
+    '})',
+    '[pscustomobject]@{ profileProcesses = $profileProcesses; expectedPortListeners = $listeners } | ConvertTo-Json -Compress -Depth 4',
+  ].join('\n');
+  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise<string>((resolve) => {
+    const diagnosticProcess = spawn('powershell.exe', [
+      '-NoLogo',
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-EncodedCommand',
+      encodedScript,
+    ], {
+      env: {
+        ...process.env,
+        WEBPILOT_CHROME_DIAGNOSTIC_PORT: String(port),
+        WEBPILOT_CHROME_DIAGNOSTIC_PROFILE: userDataDir,
+      },
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    let output = '';
+    const timer = setTimeout(() => {
+      diagnosticProcess.kill();
+      resolve('');
+    }, 5_000);
+    timer.unref?.();
+    diagnosticProcess.stdout?.on('data', (chunk: Buffer) => {
+      output = `${output}${chunk.toString('utf8')}`.slice(-12_000);
+    });
+    diagnosticProcess.once('error', () => {
+      clearTimeout(timer);
+      resolve('');
+    });
+    diagnosticProcess.once('exit', () => {
+      clearTimeout(timer);
+      resolve(output.trim());
+    });
+  });
 }
 
 function externalChromiumExecutablePath(chromium: BrowserType, launchOptions: LaunchOptions) {
@@ -1455,15 +1559,41 @@ async function connectOrLaunchPersistentBrowserOverCdp(input: {
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
 }) {
-  const existing = await connectExistingBrowserOverCdp({
-    chromium: input.chromium,
-    endpoint: input.endpoint,
-    contextOptions: input.contextOptions,
-  });
+  const connectTimeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_CONNECT_TIMEOUT_MS', 1_200, 500, 10_000);
+  const connectErrors: string[] = [];
+  const connect = async () => {
+    const attempt = await tryConnectExistingBrowserOverCdp({
+      chromium: input.chromium,
+      endpoint: input.endpoint,
+      contextOptions: input.contextOptions,
+      timeoutMs: connectTimeoutMs,
+    });
+    if (attempt.error && connectErrors.at(-1) !== attempt.error) connectErrors.push(attempt.error);
+    return attempt.connection;
+  };
+  const existing = await connect();
   if (existing) return existing;
 
   const port = cdpPortFromEndpoint(input.endpoint);
   if (!port) throw new Error(`Automatic tab-group browser reuse needs a CDP port endpoint, got: ${input.endpoint || '[empty]'}`);
+  const timeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_LAUNCH_TIMEOUT_MS', 15_000, 3_000, 120_000);
+
+  if (await tcpEndpointIsListening(input.endpoint)) {
+    const existingDeadline = Date.now() + timeoutMs;
+    while (Date.now() < existingDeadline) {
+      const connected = await connect();
+      if (connected) return connected;
+      await sleep(250);
+    }
+    const windowsDiagnostics = await windowsPersistentChromeDiagnostics(input.userDataDir, port);
+    throw new Error([
+      `The expected Chrome CDP port ${input.endpoint} is already listening but did not complete a Playwright CDP handshake.`,
+      `profile=${input.userDataDir}`,
+      connectErrors.length ? `cdpConnectErrors=${JSON.stringify(connectErrors.slice(-3))}` : '',
+      windowsDiagnostics ? `chromeProcessDiagnostics=${windowsDiagnostics}` : '',
+      'A second Chrome was not launched because the expected port is already occupied. Inspect the listener process and its remote-debugging configuration.',
+    ].filter(Boolean).join('\n'));
+  }
 
   const executablePath = externalChromiumExecutablePath(input.chromium, input.launchOptions);
   const launchArgs = [
@@ -1472,42 +1602,71 @@ async function connectOrLaunchPersistentBrowserOverCdp(input: {
     `--remote-debugging-port=${port}`,
     '--no-startup-window',
   ];
-  let spawnError: unknown;
-  const child = spawn(executablePath, launchArgs, {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: false,
-  });
+  const launchLogPath = path.join(input.userDataDir, 'chrome-cdp-launch.log');
+  let launchLogOffset = 0;
+  let launchLogHandle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    launchLogHandle = await open(launchLogPath, 'a+');
+    launchLogOffset = (await launchLogHandle.stat()).size;
+    await launchLogHandle.write(`\n[${new Date().toISOString()}] launch endpoint=${input.endpoint}\n`);
+  } catch {
+    await launchLogHandle?.close().catch(() => undefined);
+    launchLogHandle = undefined;
+  }
+
+  let launchError = '';
+  let launchExit = '';
+  let child: ReturnType<typeof spawn>;
+  try {
+    child = spawn(executablePath, launchArgs, {
+      detached: true,
+      stdio: ['ignore', 'ignore', launchLogHandle ? launchLogHandle.fd : 'ignore'],
+      windowsHide: false,
+    });
+  } catch (error) {
+    await launchLogHandle?.close().catch(() => undefined);
+    throw new Error(`Failed to launch test Chrome for tab-group reuse: ${unknownErrorMessage(error)}`);
+  }
+  await launchLogHandle?.close().catch(() => undefined);
   child.once('error', (error) => {
-    spawnError = error;
+    launchError = unknownErrorMessage(error);
+  });
+  child.once('exit', (code, signal) => {
+    launchExit = `code=${code ?? 'none'}, signal=${signal || 'none'}`;
   });
   child.unref();
 
-  const timeoutMs = Math.max(3000, Number(process.env.BROWSER_CDP_LAUNCH_TIMEOUT_MS || 15000));
   const deadline = Date.now() + timeoutMs;
-  let lastConnectError = '';
   while (Date.now() < deadline) {
-    if (spawnError) {
-      throw new Error(`Failed to launch test Chrome for tab-group reuse: ${spawnError instanceof Error ? spawnError.message : String(spawnError)}`);
+    if (!launchError) {
+      const connected = await connect();
+      if (connected) return connected;
     }
-    const connected = await connectExistingBrowserOverCdp({
-      chromium: input.chromium,
-      endpoint: input.endpoint,
-      contextOptions: input.contextOptions,
-    }).catch((error) => {
-      lastConnectError = error instanceof Error ? error.message : String(error);
-      return undefined;
-    });
-    if (connected) return connected;
+    if (launchError) break;
     await sleep(250);
   }
 
+  const [expectedPortListening, windowsDiagnostics, launchLog] = await Promise.all([
+    tcpEndpointIsListening(input.endpoint),
+    windowsPersistentChromeDiagnostics(input.userDataDir, port),
+    readFile(launchLogPath, 'utf8')
+      .then((content) => content.slice(launchLogOffset).trim().slice(-4_000))
+      .catch(() => ''),
+  ]);
   throw new Error([
-    `Failed to connect to test Chrome at ${input.endpoint} after launching it.`,
+    `Failed to connect to persistent test Chrome at ${input.endpoint}.`,
     `profile=${input.userDataDir}`,
     `executable=${executablePath}`,
-    'If an old test Chrome already has this profile open but was launched without the expected CDP port, close that old window once and retry.',
-    lastConnectError ? `lastConnectError=${lastConnectError}` : '',
+    child.pid ? `launchedPid=${child.pid}` : '',
+    launchError ? `launchError=${launchError}` : '',
+    launchExit ? `launchExit=${launchExit}` : '',
+    `expectedPortListening=${expectedPortListening}`,
+    connectErrors.length ? `cdpConnectErrors=${JSON.stringify(connectErrors.slice(-3))}` : '',
+    windowsDiagnostics ? `chromeProcessDiagnostics=${windowsDiagnostics}` : '',
+    launchLog ? `chromeLaunchLog=${launchLog}` : '',
+    expectedPortListening
+      ? 'The expected port is listening but did not complete a Playwright CDP handshake; inspect chromeProcessDiagnostics for a port-owner or stale-process conflict.'
+      : 'No CDP listener appeared before the launch timeout; inspect launchExit and chromeLaunchLog for a profile lock or Chrome startup failure.',
   ].filter(Boolean).join('\n'));
 }
 
@@ -1687,7 +1846,6 @@ export class BrowserSession {
   private browserServer?: BrowserServer;
   private browserCodeConnection?: BrowserCodeConnection;
   private browserCodeKernel?: BrowserCodeKernel;
-  private browserCodeKernelMode?: BrowserCodeRuntimeMode;
   private browserCodeKernelRevision?: number;
   private context?: BrowserContext;
   private page?: Page;
@@ -1830,6 +1988,7 @@ export class BrowserSession {
     const child = new BrowserSession({
       actionFrameLimit: options.actionFrameLimit,
       browserSurface: this.browserSurface,
+      browserCodeStateSessionId: options.browserCodeStateSessionId || this.options.browserCodeStateSessionId,
       isMarked: options.isMarked,
       popupWaitMs: options.popupWaitMs,
       preferExistingPage: false,
@@ -1878,6 +2037,9 @@ export class BrowserSession {
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
+    // A stale browser can restart this instance in place, so turn-scoped tools
+    // keep their BrowserSession identity while it reconnects to the tab group.
+    registerBrowserSession(this);
     const { chromium } = await import('playwright');
     const headless = browserHeadlessEnabled(this.options);
     const isolated = this.options.isolated === true;
@@ -4902,8 +5064,7 @@ export class BrowserSession {
     const code = String(input.code || '');
     if (!code.trim()) return { ok: false, actual: 'browserCode requires non-empty JavaScript.' };
     if (code.length > 40_000) return { ok: false, actual: 'browserCode JavaScript exceeds the 40000 character limit.' };
-    const browserCodeRuntimeMode = resolveBrowserCodeRuntimeMode();
-    const policyViolation = browserCodePolicyViolation(code, browserCodeRuntimeMode);
+    const policyViolation = browserCodePolicyViolation(code);
     if (policyViolation) return { ok: false, actual: policyViolation };
     if (!this.browserCodeConnection) {
       return { ok: false, actual: 'browserCode has no direct Playwright connection for this browser session.' };
@@ -4925,21 +5086,20 @@ export class BrowserSession {
       });
     }, executionId);
 
-    if (
-      this.browserCodeKernel
-      && (
-        this.browserCodeKernelRevision !== BROWSER_CODE_KERNEL_RUNTIME_REVISION
-        || this.browserCodeKernelMode !== browserCodeRuntimeMode
-      )
-    ) {
+    if (this.browserCodeKernel && this.browserCodeKernelRevision !== BROWSER_CODE_KERNEL_RUNTIME_REVISION) {
       await this.browserCodeKernel.close();
       this.browserCodeKernel = undefined;
     }
+    const browserCodeStateSessionId = this.options.browserCodeStateSessionId
+      || this.options.runId
+      || this.pageGroupId;
     const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection, {
-      runtimeMode: browserCodeRuntimeMode,
       sessionGroupId: this.pageGroupId,
+      runtimeState: (operation) => executeBrowserCodeRuntimeStateOperation(
+        browserCodeStateSessionId,
+        operation,
+      ),
     });
-    this.browserCodeKernelMode = browserCodeRuntimeMode;
     this.browserCodeKernelRevision = BROWSER_CODE_KERNEL_RUNTIME_REVISION;
     const executionContext = this.context;
     const pagesBeforeExecution = new Set(executionContext?.pages() || []);
@@ -5091,7 +5251,6 @@ export class BrowserSession {
     let disposeLocalState = false;
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
-    this.browserCodeKernelMode = undefined;
     this.browserCodeKernelRevision = undefined;
     try {
       if (this.childBrowserSessions.size) {
@@ -5156,7 +5315,6 @@ export class BrowserSession {
         this.browserServer = undefined;
         this.browserCodeConnection = undefined;
         this.browserCodeKernel = undefined;
-        this.browserCodeKernelMode = undefined;
         this.browserCodeKernelRevision = undefined;
         this.managedProfileDir = undefined;
         this.ownedPages.clear();

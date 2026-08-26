@@ -1,14 +1,5 @@
 import type { BrowserActionResult } from '@/server/browser/browser-session';
 import {
-  resolveBrowserCodeRuntimeMode,
-  type BrowserCodeRuntimeMode,
-} from '@/server/browser/browser-code-runtime-mode';
-import {
-  browserApiRuntimeSkillContent,
-  browserApiRuntimeSkillId,
-  browserApiRuntimeSkillSummary,
-} from './browser-api-runtime-skill';
-import {
   browserCodeRuntimeSkillContent,
   browserCodeRuntimeSkillId,
   browserCodeRuntimeSkillSummary,
@@ -35,16 +26,6 @@ function actionFromInput(input: unknown) {
   return typeof action === 'string' ? action : undefined;
 }
 
-const governedFileActions = new Set([
-  'plan',
-  'generate',
-  'edit',
-  'render',
-  'convert',
-  'jsApi',
-  'unoApi',
-]);
-
 export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSkillPolicy>> = Object.freeze({
   browserCode: {
     skillId: browserCodeRuntimeSkillId,
@@ -52,7 +33,7 @@ export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSk
   },
   file: {
     skillId: fileArtifactRuntimeSkillId,
-    requires: (input) => governedFileActions.has(actionFromInput(input) || ''),
+    requires: () => true,
   },
   fileVisual: {
     skillId: fileArtifactRuntimeSkillId,
@@ -69,10 +50,6 @@ const hiddenRuntimeSkills = Object.freeze({
     content: browserCodeRuntimeSkillContent,
     summary: browserCodeRuntimeSkillSummary,
   },
-  [browserApiRuntimeSkillId]: {
-    content: browserApiRuntimeSkillContent,
-    summary: browserApiRuntimeSkillSummary,
-  },
   [fileArtifactRuntimeSkillId]: {
     content: fileArtifactRuntimeSkillContent,
     summary: fileArtifactRuntimeSkillSummary,
@@ -83,18 +60,13 @@ const hiddenRuntimeSkills = Object.freeze({
   },
 });
 
-export function activeBrowserRuntimeSkillId(
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  return mode === 'restricted' ? browserApiRuntimeSkillId : browserCodeRuntimeSkillId;
+export function activeBrowserRuntimeSkillId() {
+  return browserCodeRuntimeSkillId;
 }
 
-export function hiddenRuntimeSkillSummariesForMode(
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  const browserSkillId = activeBrowserRuntimeSkillId(mode);
+export function hiddenRuntimeSkillSummaries() {
   return [
-    hiddenRuntimeSkills[browserSkillId].summary,
+    hiddenRuntimeSkills[browserCodeRuntimeSkillId].summary,
     hiddenRuntimeSkills[fileArtifactRuntimeSkillId].summary,
     hiddenRuntimeSkills[subagentRuntimeSkillId].summary,
   ].join('\n');
@@ -107,11 +79,10 @@ export function hiddenRuntimeSkillContent(skillId: string) {
 export function requiredHiddenRuntimeSkillId(
   toolName: string,
   input: unknown,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
 ) {
   const policy = hiddenRuntimeSkillPolicies[toolName];
   if (!policy?.requires(input)) return undefined;
-  return toolName === 'browserCode' ? activeBrowserRuntimeSkillId(mode) : policy.skillId;
+  return policy.skillId;
 }
 
 export function hiddenRuntimeSkillIdsReadFromTraces(traces: ReadonlyArray<{
@@ -132,39 +103,43 @@ export function hiddenRuntimeSkillIdsReadFromTraces(traces: ReadonlyArray<{
   return loaded;
 }
 
-export function hiddenRuntimeSkillGateResult(
+export function automaticallyLoadHiddenRuntimeSkill(
   toolName: string,
   input: unknown,
-  loadedSkillIds: ReadonlySet<string>,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-): BrowserActionResult | undefined {
-  const requiredSkillId = requiredHiddenRuntimeSkillId(toolName, input, mode);
+  loadedSkillIds: Set<string>,
+): Pick<BrowserActionResult, 'loadedRuntimeSkill'> | BrowserActionResult | undefined {
+  const requiredSkillId = requiredHiddenRuntimeSkillId(toolName, input);
   if (!requiredSkillId || loadedSkillIds.has(requiredSkillId)) return undefined;
-  const requiredNextAction = `先通过 skill action=read 读取隐藏运行规范 ${requiredSkillId}，再重新调用原工具。`;
-  return {
-    ok: false,
-    actual: JSON.stringify({
+  const content = hiddenRuntimeSkillContent(requiredSkillId);
+  if (!content) {
+    return {
       ok: false,
+      actual: JSON.stringify({
+        ok: false,
+        error: `Unable to load required hidden runtime Skill ${requiredSkillId}.`,
+        requiredSkillId,
+      }, null, 2),
+      failureCategory: 'skill-load-failed',
       requiredSkillId,
-      requiredNextAction,
-    }, null, 2),
-    requiredSkillId,
-    requiredNextAction,
+    };
+  }
+  loadedSkillIds.add(requiredSkillId);
+  return {
+    loadedRuntimeSkill: {
+      id: requiredSkillId,
+      content,
+      loadedAutomatically: true,
+    },
   };
 }
 
 /**
- * browserCode always requires the active browser runtime Skill, so do not
- * advertise that tool to the model until the read has completed. The
- * execution-time gate remains as a defense for stale/replayed tool calls.
+ * Governed tools stay visible. Their first call in one Agent run atomically
+ * loads and returns the corresponding hidden Skill before executing the
+ * original call, removing the extra model round-trip.
  */
-export function runtimeToolTypesAfterHiddenSkillGate(
+export function runtimeToolTypesWithAutomaticSkills(
   toolTypes: readonly string[],
-  loadedSkillIds: ReadonlySet<string>,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
 ) {
-  const browserSkillId = activeBrowserRuntimeSkillId(mode);
-  return loadedSkillIds.has(browserSkillId)
-    ? [...toolTypes]
-    : toolTypes.filter((toolType) => toolType !== 'browserCode');
+  return [...toolTypes];
 }

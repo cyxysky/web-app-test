@@ -6,7 +6,6 @@ import type {
   BrowserCodeAttachmentBinding,
   BrowserCodeCredentialBinding,
 } from '@/server/browser/browser-code-runner';
-import { resolveBrowserCodeRuntimeMode } from '@/server/browser/browser-code-runtime-mode';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
@@ -3106,6 +3105,7 @@ function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExist
     browserProfileKey,
     ...(process.env.ELECTRON_EMBEDDED_BROWSER === 'true' ? {} : { sharedBrowserRuntimeKey: browserProfileKey }),
     ...browserChatBrowserExecutionOptions(),
+    browserCodeStateSessionId: session.id,
     isMarked: true,
     preferExistingPage,
     runId: session.id,
@@ -3129,9 +3129,12 @@ async function browserForTurnDecision(
   if (session.browser && session.started && !session.browser.isUsable()) {
     assertTurnActive?.();
     appendLog(session, 'browser:stale', '历史对话的浏览器已关闭或页面已失效，正在重新接管本会话。');
+    const staleBrowser = session.browser;
     await session.browser.close({ keepOpen: true }).catch(() => undefined);
     assertTurnActive?.();
-    session.browser = undefined;
+    // Browser tools are created once per model turn and retain this object.
+    // Restart it in place so the current turn also reconnects to the tab group.
+    session.browser = staleBrowser;
     session.started = false;
     session.updatedAt = now();
     persistAndNotify(session.id);
@@ -4911,6 +4914,7 @@ async function createBrowserChatSubagentBrowser(
       const browser = await parentBrowser.forkChildSession({
         ...browserChatBrowserExecutionOptions(),
         background: true,
+        browserCodeStateSessionId: session.id,
         inheritSessionStorage: true,
         isMarked: true,
         runId: `${session.id}_${subagentId}`,
@@ -4935,6 +4939,7 @@ async function createBrowserChatSubagentBrowser(
     sharedBrowserRuntimeKey: browserProfileKey,
     storageState: inheritedStorageState,
     ...browserChatBrowserExecutionOptions(),
+    browserCodeStateSessionId: session.id,
     isMarked: true,
     preferExistingPage: false,
     runId: `${session.id}_${subagentId}`,
@@ -5075,9 +5080,7 @@ async function executeBrowserChatSubagentBatch(input: {
           '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
           browserChatSubagentAuthPrompt(childBrowser.authMode),
           '你运行在独立的子 Agent 页面中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要继续尝试绕过；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          resolveBrowserCodeRuntimeMode() === 'restricted'
-            ? '浏览器检查与操作统一使用 browserCode，只调用已加载 Skill 中记录的 browserApi；不要引用 Playwright page/context/browser/tab，并返回可追溯的结构化证据。'
-            : '浏览器检查与操作统一使用 browserCode，在隔离程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。',
+          '浏览器检查与操作统一使用 browserCode，在隔离程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。需要跨内核或跨轮次保留的非敏感 JSON 数据使用 agent.state。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
           summaryGuidanceChars

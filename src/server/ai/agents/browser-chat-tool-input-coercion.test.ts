@@ -63,17 +63,17 @@ test('drops fields from the retired optimistic revision protocol', () => {
 test('removes accidental outer Markdown or HTML wrappers from browserCode only', () => {
   assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
     reason: '读取标题',
-    code: 'nodeRepl.write(await browserApi.current());</code>',
+    code: 'nodeRepl.write(await page.title());</code>',
   }), {
     reason: '读取标题',
-    code: 'nodeRepl.write(await browserApi.current());',
+    code: 'nodeRepl.write(await page.title());',
   });
   assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
     reason: '读取标题',
-    code: '```js\nnodeRepl.write(await browserApi.current())\n```',
+    code: '```js\nnodeRepl.write(await page.title())\n```',
   }), {
     reason: '读取标题',
-    code: 'nodeRepl.write(await browserApi.current())',
+    code: 'nodeRepl.write(await page.title())',
   });
   assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
     reason: '读取 HTML',

@@ -6485,6 +6485,7 @@ function BrowserChatManagementDialog({
               showTabs={false}
               userId={defaultUserId}
             />
+            <div aria-hidden="true" className="browser-chat-management-bottom-spacer" />
           </div>
         </div>
     </AppModal>

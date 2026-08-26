@@ -680,8 +680,14 @@ function pruneBrowserChatRows(
 }
 
 export function deleteBrowserChatSessionRecordQueued(sessionId: string) {
-  return queueSqliteWrite([{
-    sql: 'DELETE FROM browser_chat_session WHERE id = ?',
-    params: [sessionId],
-  }]);
+  return queueSqliteWrite([
+    {
+      sql: 'DELETE FROM browser_code_runtime_state WHERE session_id = ?',
+      params: [sessionId],
+    },
+    {
+      sql: 'DELETE FROM browser_chat_session WHERE id = ?',
+      params: [sessionId],
+    },
+  ]);
 }

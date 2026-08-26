@@ -379,10 +379,9 @@ function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded:
       : '';
   const timingPayload = isAiResponseLog ? aiLogTimingPayload(payloadDetails, t) : '';
   const errorPayload = isAiFailureLog ? formatToolPayload(parsed) : '';
-  const toolPayload = isToolLifecycleLog ? formatToolPayload({
-    execution: payloadDetails.execution,
-    trace: payloadDetails.trace,
-  }) : '';
+  // Tool lifecycle logs are diagnostics. Render the persisted payload verbatim
+  // instead of selecting only execution/trace or normalizing nested JSON.
+  const toolPayload = isToolLifecycleLog ? log.details : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
   if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
   return (

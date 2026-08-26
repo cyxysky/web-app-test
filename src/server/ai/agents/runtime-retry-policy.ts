@@ -131,6 +131,15 @@ function errorMessage(error: unknown, records: Record<string, unknown>[]) {
   return firstString(records, ['message', 'statusText', 'error']) || String(error || 'Unknown runtime error');
 }
 
+export function isProviderBillingLimitMessage(value: string) {
+  const message = value.trim();
+  if (!message) return false;
+  return /(?:已达到|达到|超过|超出).{0,24}(?:Token Plan|用量|额度|套餐|积分).{0,16}(?:上限|限制)/i.test(message)
+    || /(?:用量|额度|积分).{0,16}(?:已用完|已用尽|不足)/.test(message)
+    || /\b(?:token plan|billing quota|credit balance|credits?|account balance|quota).{0,48}(?:exhausted|exceeded|insufficient|depleted|limit reached)\b/i.test(message)
+    || /\b(?:exhausted|exceeded|insufficient|depleted).{0,32}(?:credits?|quota|balance)\b/i.test(message);
+}
+
 export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): RuntimeRetryDecision {
   const records = errorRecords(error);
   const message = errorMessage(error, records);
@@ -157,7 +166,7 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   if (statusCode === 401 || statusCode === 403 || /\b(api key|authentication|unauthori[sz]ed|forbidden)\b/.test(normalizedMessage)) {
     return { category: 'authentication', reason: `authentication failure${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };
   }
-  if (statusCode === 402 || /\b(insufficient balance|payment required|billing quota)\b/.test(normalizedMessage)) {
+  if (statusCode === 402 || isProviderBillingLimitMessage(message) || /\b(insufficient balance|payment required|billing quota)\b/.test(normalizedMessage)) {
     return { category: 'billing', reason: `provider balance is unavailable${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };
   }
   if (statusCode === 400 || statusCode === 404 || statusCode === 405 || statusCode === 410 || statusCode === 422 || nonRetryableCodes.has(code)) {

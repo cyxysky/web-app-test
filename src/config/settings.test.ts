@@ -105,16 +105,6 @@ test('browser preview exposes H.264 video transport with 2K and 4K encoder setti
 
 });
 
-test('browser code runtime can switch between free code and restricted API modes', () => {
-  const runtimeMode = runtimeEnvDefinition('BROWSER_CODE_RUNTIME_MODE');
-  assert.ok(runtimeMode);
-  assert.equal(runtimeMode.control, 'select');
-  assert.equal(runtimeMode.defaultValue, 'free');
-  assert.deepEqual(runtimeMode.options?.map((option) => option.value), ['free', 'restricted']);
-  assert.equal(normalizeRuntimeEnvValue(runtimeMode, 'restricted'), 'restricted');
-  assert.equal(normalizeRuntimeEnvValue(runtimeMode, 'unknown'), 'unknown');
-});
-
 test('browser viewport size and output quality are configured independently', () => {
   const viewport = runtimeEnvDefinition('BROWSER_VIEWPORT_MODE');
   assert.ok(viewport);

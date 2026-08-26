@@ -72,13 +72,13 @@ test('formats a failed validation as failed instead of validated', () => {
     documentId: 'failed-edit',
     fileName: 'failed.docx',
     validation: 'failed',
-    rolledBack: true,
+    saved: true,
     currentRevision: 2,
     lastSuccessfulRevision: 2,
     error: 'Syntax error',
   }));
   assert.match(formatted || '', /validation failed/i);
-  assert.match(formatted || '', /editRolledBack=true/);
+  assert.match(formatted || '', /workingSourceSaved=true/);
   assert.doesNotMatch(formatted || '', /source validated/i);
 });
 
@@ -453,8 +453,8 @@ test('records source revisions and restores an older revision as a new save', as
   }
 });
 
-test('rolls back a failed edit candidate without advancing the working revision', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-edit-rollback-'));
+test('keeps a failed edit in the single working source and blocks rendering until it is repaired', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-edit-repair-'));
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
   try {
@@ -475,26 +475,50 @@ test('rolls back a failed edit candidate without advancing the working revision'
     });
     assert.equal(failed.ok, false, failed.actual);
     const failure = JSON.parse(failed.actual || '{}') as {
-      rolledBack?: boolean;
       saved?: boolean;
       currentRevision?: number;
       lastSuccessfulRevision?: number;
+      requiredNextAction?: string;
     };
-    assert.equal(failure.rolledBack, true);
-    assert.equal(failure.saved, false);
+    assert.equal(failure.saved, true);
     assert.equal(failure.currentRevision, before.currentRevision);
     assert.equal(failure.lastSuccessfulRevision, before.currentRevision);
+    assert.equal(failure.requiredNextAction, 'edit');
 
     const after = JSON.parse((await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' })).actual || '{}') as {
       currentRevision?: number;
       program?: string;
       sourceDigest?: string;
       revisions?: unknown[];
+      validationStatus?: string;
     };
     assert.equal(after.currentRevision, before.currentRevision);
-    assert.equal(after.sourceDigest, before.sourceDigest);
-    assert.equal(after.program, before.program);
+    assert.notEqual(after.sourceDigest, before.sourceDigest);
+    assert.match(after.program || '', /if \(/);
+    assert.equal(after.validationStatus, 'failed');
     assert.equal(after.revisions?.length, 1);
+    const pendingRepair = await pendingOfficeDocumentWork('chat_test', new Set(['transactional-edit']));
+    assert.equal(pendingRepair[0]?.requiredNextAction, 'edit');
+
+    const blockedRender = await renderFileArtifact({ documentId: 'transactional-edit', runId: 'chat_test' });
+    assert.equal(blockedRender.ok, false, blockedRender.actual);
+    assert.equal(JSON.parse(blockedRender.actual || '{}').requiredNextAction, 'edit');
+
+    const repaired = await editUnoFileArtifact({
+      documentId: 'transactional-edit',
+      edits: [{ kind: 'replaceText', oldText: '    if (', newText: '    cursor = document.Text.createTextCursor()' }],
+      includeVisualVerification: false,
+      runId: 'chat_test',
+    });
+    assert.equal(repaired.ok, true, repaired.actual);
+    const repairedDraft = JSON.parse((await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' })).actual || '{}') as {
+      currentRevision?: number;
+      program?: string;
+      validationStatus?: string;
+    };
+    assert.equal(repairedDraft.currentRevision, 1);
+    assert.equal(repairedDraft.program, before.program);
+    assert.equal(repairedDraft.validationStatus, 'passed');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -689,7 +713,7 @@ test('refuses to run a workspace source that no longer matches its saved source 
   }
 });
 
-test('rejects a draft that does not implement the UNO entrypoint', async () => {
+test('saves a rejected initial source so the model can read and edit it in place', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-reject-'));
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
@@ -702,14 +726,24 @@ test('rejects a draft that does not implement the UNO entrypoint', async () => {
     });
     assert.equal(result.ok, false);
     assert.match(result.actual || '', /must define create_document\(job\)/);
+    const failure = JSON.parse(result.actual || '{}') as { requiredNextAction?: string; saved?: boolean };
+    assert.equal(failure.saved, true);
+    assert.equal(failure.requiredNextAction, 'edit');
     const catalog = await listOfficeDrafts({ runId: 'chat_test' });
     assert.equal(catalog.ok, true, catalog.actual);
-    const catalogEntry = (JSON.parse(catalog.actual || '{}') as { drafts?: Array<{ documentId?: string; sourceDigest?: string | null; state?: string }> })
+    const catalogEntry = (JSON.parse(catalog.actual || '{}') as { drafts?: Array<{ documentId?: string; sourceDigest?: string | null; state?: string; validationStatus?: string }> })
       .drafts?.find((draft) => draft.documentId === 'rejected-program');
-    assert.equal(catalogEntry?.sourceDigest, null);
-    assert.equal(catalogEntry?.state, 'planned');
+    assert.match(catalogEntry?.sourceDigest || '', /^[a-f0-9]{64}$/);
+    assert.equal(catalogEntry?.state, 'authoring');
+    assert.equal(catalogEntry?.validationStatus, 'failed');
+    const readable = JSON.parse((await readUnoDraft({ documentId: 'rejected-program', runId: 'chat_test' })).actual || '{}') as {
+      program?: string;
+      validationStatus?: string;
+    };
+    assert.match(readable.program || '', /wrong_entrypoint/);
+    assert.equal(readable.validationStatus, 'failed');
     const pending = await pendingOfficeDocumentWork('chat_test', new Set(['rejected-program']));
-    assert.equal(pending[0]?.requiredNextAction, 'generate');
+    assert.equal(pending[0]?.requiredNextAction, 'edit');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;

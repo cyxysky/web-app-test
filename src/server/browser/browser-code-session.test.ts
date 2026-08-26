@@ -871,6 +871,28 @@ test('application shutdown closes every registered test browser', async () => {
   }
 });
 
+test('a shared BrowserSession restarts in place and reclaims its existing tab group', async () => {
+  const session = new BrowserSession({
+    headless: true,
+    sharedBrowserRuntimeKey: 'browser-in-place-restart-test',
+    runId: 'browser-in-place-restart-test',
+  });
+  const url = `data:text/html,${encodeURIComponent('<title>Restarted tab group</title><main>kept</main>')}`;
+  try {
+    await session.start();
+    await (Reflect.get(session, 'activePage') as Page).goto(url);
+
+    await session.close({ keepOpen: true });
+    assert.equal(session.isUsable(), false);
+
+    await session.start();
+    assert.equal(session.isUsable(), true);
+    assert.equal(session.currentUrl(), url);
+  } finally {
+    await session.close({ force: true }).catch(() => undefined);
+  }
+});
+
 test('browserCode returns structured dependency failures from the current cell', async (context) => {
   const session = new BrowserSession({ headless: true, isolated: true, runId: 'browser-code-dependency-test' });
   context.after(async () => session.close());

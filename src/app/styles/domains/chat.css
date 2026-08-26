@@ -599,8 +599,7 @@
 .browser-chat-management-body {
   background: var(--panel);
   box-sizing: border-box;
-  padding: 0 24px 24px;
-  scroll-padding-bottom: 24px;
+  padding: 0 24px;
 }
 
 :root[data-theme="dark"] .browser-chat-management-dialog {
@@ -621,10 +620,16 @@
 }
 
 .browser-chat-management-body .browser-chat-settings-pane {
-  height: 100%;
+  height: auto;
   min-height: 100%;
   overflow: visible;
   padding: 0;
+}
+
+.browser-chat-management-bottom-spacer {
+  height: 24px;
+  pointer-events: none;
+  width: 100%;
 }
 
 .browser-chat-management-body .browser-chat-settings-pane:has(.settings-loading-panel) {

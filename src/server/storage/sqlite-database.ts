@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 22;
+const currentSchemaVersion = 23;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -696,6 +696,37 @@ function applyVersionTwentyTwoMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionTwentyThreeMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 23').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS browser_code_runtime_state (
+        session_id TEXT NOT NULL,
+        namespace TEXT NOT NULL DEFAULT 'conversation',
+        key TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        expires_at TEXT,
+        PRIMARY KEY (session_id, namespace, key)
+      );
+      CREATE INDEX IF NOT EXISTS browser_code_runtime_state_expiry_idx
+        ON browser_code_runtime_state(expires_at)
+        WHERE expires_at IS NOT NULL;
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (23, 'browser-code-runtime-state', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
@@ -866,6 +897,20 @@ function initializeSchema(database: DatabaseSync) {
     );
     CREATE INDEX IF NOT EXISTS websocket_ticket_token_idx
       ON websocket_ticket(token_hash, expires_at);
+
+    CREATE TABLE IF NOT EXISTS browser_code_runtime_state (
+      session_id TEXT NOT NULL,
+      namespace TEXT NOT NULL DEFAULT 'conversation',
+      key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      expires_at TEXT,
+      PRIMARY KEY (session_id, namespace, key)
+    );
+    CREATE INDEX IF NOT EXISTS browser_code_runtime_state_expiry_idx
+      ON browser_code_runtime_state(expires_at)
+      WHERE expires_at IS NOT NULL;
   `);
 
   database.prepare(`
@@ -898,6 +943,7 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionTwentyMigration(database);
   applyVersionTwentyOneMigration(database);
   applyVersionTwentyTwoMigration(database);
+  applyVersionTwentyThreeMigration(database);
 }
 
 export function getSqliteDatabase() {

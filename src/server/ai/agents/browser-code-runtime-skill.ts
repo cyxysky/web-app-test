@@ -4,18 +4,18 @@ export const browserCodeRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${browserCodeRuntimeSkillId}</id>`,
   '<title>Browser Code Runtime</title>',
-  '<description>Hidden built-in API reference and operating manual for browserCode. Read it before the first browserCode call in every Agent run.</description>',
+  '<description>Hidden built-in API reference and operating manual for browserCode. The first call automatically loads and returns it while continuing the operation.</description>',
   '<required>true</required>',
   '</system_skill>',
 ].join('\n');
 
 export const browserCodeRuntimeSkillContent = `# Browser Code Runtime
 
-This hidden built-in Skill is the authoritative API reference and operating contract for browserCode. Read it once in the current Agent run before the first browserCode call.
+This hidden built-in Skill is the authoritative API reference and operating contract for browserCode. The backend loads it once per Agent run during the first browserCode call and returns it in loadedRuntimeSkill while continuing the original operation.
 
 ## Required state machine
 
-1. Read this Skill in its own model step:
+1. Call browserCode normally. On the first call, the backend loads and returns this Skill in the same tool transaction. An explicit read remains supported but is not required:
 
 \`\`\`json
 { "action": "read", "skillId": "${browserCodeRuntimeSkillId}", "reason": "读取浏览器代码 API 与运行规范" }
@@ -28,7 +28,7 @@ Provider-neutral call notation: \`skill({ action: "read", skillId: "${browserCod
 4. Use browserCode for bounded read or action cells. A cell may contain multiple dependent operations only when each later target is confirmed by an intervening targeted read.
 5. Verify the requested business outcome with a final read-only cell. Also inspect \`await page.activeSurface()\` and resolve or disclose any unexpected remaining popup.
 
-If the runtime rejects a governed call, follow its \`requiredSkillId\` and \`requiredNextAction\`, preserve the failed code/locator/error, refresh only the evidence that became stale, and continue the same page transaction.
+If the runtime rejects a governed call, preserve its complete error and any \`requiredSkillId\`, refresh only the evidence that became stale, and continue the same page transaction.
 
 ## Host tool boundary
 
@@ -38,13 +38,13 @@ These are model tools, not JavaScript globals:
 - \`readBrowserState({ reason })\` performs the non-mutating browser preflight. Its result is sufficient initial tabs/page/snapshot evidence; do not duplicate it automatically in browserCode.
 - \`browserCode({ reason, code, maxOutputChars? })\` executes one JavaScript cell. \`reason\` is a concise description of the exact read/action; \`code\` is 1-40,000 characters; \`maxOutputChars\`, when supplied, is at least 1,000.
 
-The outer browserCode result is \`{ ok, actual, requiredNextAction?, failureCategory?, dependencyFailures?, referenceImagePaths? }\`. \`actual\` is JSON text containing \`{ ok, result, error, aborted, elapsedMs, finalPage, verification?, domChanges?, images, imageErrors }\`. Parse the tool result semantically: \`domChanges\` is only the incremental journal caused by that cell, not a full snapshot; \`dependencyFailures\` is a once-only queue of recent request failures and HTTP 408/429/5xx observations.
+The outer browserCode result is \`{ ok, actual, failureCategory?, dependencyFailures?, referenceImagePaths? }\`. \`actual\` is JSON text containing \`{ ok, result, error, aborted, elapsedMs, finalPage, verification?, domChanges?, images, imageErrors }\`. Parse the tool result semantically: \`domChanges\` is only the incremental journal caused by that cell, not a full snapshot; \`dependencyFailures\` is a once-only queue of recent request failures and HTTP 408/429/5xx observations. Failed results preserve the complete error and failure classification without generated recovery prose.
 
 ## Cell syntax and result contract
 
 browserCode accepts ordinary JavaScript with top-level await. The bindings \`page\`, \`context\`, \`browser\`, and \`tab\` already exist; do not import Playwright.
 
-- Top-level bindings persist between cells. Prefer \`var\` for reusable bindings or use a fresh name in each cell; redeclaring the same top-level \`let\` or \`const\` can fail.
+- Top-level bindings persist between cells only while the current JavaScript kernel remains alive. Prefer \`var\` for short-lived reusable bindings or use a fresh name in each cell; redeclaring the same top-level \`let\` or \`const\` can fail. Use \`agent.state\` for anything needed after a kernel recycle or in a later turn.
 - Do not wrap the cell in an async function, module, export, IIFE, or Markdown fence.
 - Call \`nodeRepl.write(value): void\` to return compact JSON-safe evidence. Zero writes returns \`null\`; one write returns that value; multiple writes return an array in write order.
 - Call \`await nodeRepl.emitImage(value, options?): Promise<{ bytes, index, mimeType }>\` with a screenshot Buffer, Uint8Array, or base64 image data URL. Supported types are PNG, JPEG, and WebP.
@@ -87,7 +87,47 @@ The names above are examples only. Every locator-defining role, name, text, labe
 - \`browser: BrowserRuntime\` — controlled session and tab lifecycle API.
 - \`await agent.browsers.getDefault(): Promise<BrowserRuntime>\` — returns \`browser\`.
 - \`await agent.browsers.get(id): Promise<BrowserRuntime>\` and \`await agent.browsers.list(): Promise<BrowserRuntime[]>\` — runtime lookup.
+- \`agent.state\` — durable non-secret conversation state described below.
 - \`await browser.documentation(): Promise<string>\` — short runtime-generated capability/timeout summary. This Skill remains the full contract.
+
+### Durable conversation state
+
+Top-level JavaScript bindings are temporary: the kernel can be recycled by age, execution count, memory, watchdog, idle release, or backend restart. Save JSON-safe values needed by later cells, later turns, or child Agents with:
+
+\`\`\`ts
+type RuntimeStateEntry = {
+  key:string; value:unknown; revision:number; updatedAt:string; expiresAt?:string
+};
+
+agent.state.get({key:string}): Promise<
+  | ({found:true} & RuntimeStateEntry)
+  | {found:false;key:string}
+>
+agent.state.set({
+  key:string; value:unknown; expectedRevision?:number; ttlMs?:number
+}): Promise<RuntimeStateEntry>
+agent.state.delete({
+  key:string; expectedRevision?:number
+}): Promise<{deleted:boolean;key:string;revision?:number}>
+agent.state.list({
+  prefix?:string;limit?:number
+} = {}): Promise<{items:RuntimeStateEntry[];count:number;truncated:boolean}>
+agent.state.clear({prefix?:string} = {}): Promise<{deleted:number;prefix:string}>
+\`\`\`
+
+State is stored by the host in SQLite under the current browser conversation. It survives JavaScript-kernel recycling, browser idle release, later conversation turns, and backend restart. The parent Agent and its child Agents share the conversation state, which is deleted with the conversation.
+
+Keys contain 1-120 printable characters. A conversation stores at most 100 keys, 64000 serialized characters per value, and 1000000 serialized characters in total. Values may contain only JSON-safe primitives, arrays, and plain records, with at most 30 nested levels. Optional ttlMs accepts 1000 milliseconds through 30 days. set increments revision; expectedRevision provides optimistic concurrency, where 0 requires a missing key.
+
+Persist only reconstructable task data such as IDs, URLs, selectors, drafts, progress, and verified results. Never store passwords, credential values or references, cookies, authorization headers, access tokens, or other secrets. A restored selector, tab ID, URL, or observation is historical data and must be validated against the live browser before acting.
+
+\`\`\`js
+var savedProgress = await agent.state.set({
+  key: 'task.progress',
+  value: { step: 3, issueId: '30789' },
+});
+nodeRepl.write(savedProgress);
+\`\`\`
 
 ### BrowserRuntime and tabs
 
@@ -128,6 +168,25 @@ nodeRepl.write({ id: wantedTab.id, url: page.url(), title: await page.title() })
 \`\`\`js
 var researchTab = await browser.tabs.new('https://example.com/');
 nodeRepl.write({ id: researchTab.id, url: researchTab.url(), title: await researchTab.title() });
+\`\`\`
+
+### Data collection priority
+
+For read-only collection such as lists, searches, details, counts, and export metadata, prefer the current application's authenticated HTTP API when the exact endpoint and request shape are known from current page or network evidence. API responses are usually more complete, structured, and efficient than collecting the same data row by row from rendered UI.
+
+- Use \`context.request.get/post/...\` for an observed same-origin endpoint. Playwright's BrowserContext request client shares the current browser context's cookies, so do not manually read, copy, inject, log, or return cookies or authorization values.
+- Never guess an endpoint, method, query, body, pagination contract, or response schema. Derive it from current application/network evidence and return only the required JSON-safe fields through \`nodeRepl.write\`.
+- If the API cannot be identified, is unavailable, rejects the request, omits UI-only computed state, or does not provide evidence equivalent to the rendered business state, fall back to Playwright locators and collect the visible interface content.
+- This preference applies to read-only data acquisition. It does not authorize create, update, delete, approval, submission, or other state-changing requests through a backend API; perform those through the observed UI unless the user explicitly requests API mutation and the exact contract is verified.
+- When API data is used to answer a page-state question, validate any material ambiguity against the rendered UI before claiming the final business result.
+
+After \`observedApiUrl\` has been obtained from current evidence:
+
+\`\`\`js
+var apiResponse = await context.request.get(observedApiUrl);
+if (!apiResponse.ok()) throw new Error(\`Observed API returned HTTP \${apiResponse.status()}\`);
+var apiPayload = await apiResponse.json();
+nodeRepl.write({ status: apiResponse.status(), data: apiPayload });
 \`\`\`
 
 ### Inspection extensions on Page
@@ -287,6 +346,14 @@ For a frame locator, determine the owning Page and call that Page's \`setTextSel
 
 ## Images and coordinates
 
+For a vision-capable model, screenshot-to-coordinate interaction is the visual fallback when targeted DOM snapshots, role/text/label locators, frames, and active-surface inspection still cannot expose the intended visible control. Do not keep probing selectors indefinitely. Use this two-step chain:
+
+1. In one read-only browserCode cell, capture the current viewport with \`page.screenshot({ fullPage: false })\`, emit it with \`nodeRepl.emitImage(...)\`, and end the cell without clicking.
+2. In the next model step, inspect that exact screenshot and use \`page.mouse\` or \`tab.cua\` to click the visually identified viewport coordinate. The page, tab, URL, viewport, zoom, scroll position, and visible layout must still match the screenshot.
+3. After the coordinate action, verify the expected DOM, URL, value, surface, or other business-state result. If the screenshot is stale or the target is not visually unambiguous, take a new screenshot instead of guessing.
+
+Prefer DOM/Locator evidence whenever it exists. Screenshot coordinates are a fallback for controls that are genuinely visible but unavailable through usable DOM evidence, such as canvas content, non-semantic graphics, or inaccessible custom rendering.
+
 Emit visual evidence and end the cell:
 
 \`\`\`js
@@ -310,7 +377,7 @@ await page.mouse.click(
 nodeRepl.write({ clickedInsideObservedRect: true });
 \`\`\`
 
-To let a non-visual model inspect the numeric rect before choosing a point, return it in one cell and click in the next; top-level \`var\` preserves the binding:
+To let a non-visual model inspect the numeric rect before choosing a point, return it in one cell and click in the next. A top-level \`var\` preserves the binding only if the kernel remains alive, so reacquire the locator and rect if the result reports \`kernelReset\`:
 
 \`\`\`js
 var chart = page.locator('canvas[data-testid="sales-chart"]');
@@ -345,7 +412,7 @@ nodeRepl.write({ filled: true, origin: new URL(page.url()).origin });
 
 ## Failure recovery
 
-- Preserve the exact failed code, locator, action, and error. Follow the returned category-specific \`requiredNextAction\` once.
+- Preserve the exact failed code, locator, action, and complete error. Use the error and \`failureCategory\` as evidence, then choose the smallest evidence-backed correction.
 - Actionability/zero-match: refresh the target region and active surface, then rebuild the locator from new evidence.
 - Screenshot timeout: switch to DOM/locator/value evidence; do not loop through screenshot variants unless pixels are essential.
 - Execution context destroyed: wait once for a concrete load state/URL, reacquire locators, and avoid evaluate/reload loops.

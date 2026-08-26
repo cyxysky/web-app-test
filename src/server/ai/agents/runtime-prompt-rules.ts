@@ -1,40 +1,19 @@
-import {
-  resolveBrowserCodeRuntimeMode,
-  type BrowserCodeRuntimeMode,
-} from '@/server/browser/browser-code-runtime-mode';
 import { fileArtifactRuntimeSkillId } from './file-artifact-runtime-skill';
 import {
   activeBrowserRuntimeSkillId,
-  hiddenRuntimeSkillSummariesForMode,
+  hiddenRuntimeSkillSummaries,
 } from './hidden-runtime-skills';
 
-export function browserCodeRules(
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  const browserSkillId = activeBrowserRuntimeSkillId(mode);
-  if (mode === 'restricted') {
-    return [
-      hiddenRuntimeSkillSummariesForMode(mode),
-      `- Before the first browserCode call in every Agent run, read hidden Skill ${browserSkillId}. The runtime rejects browserCode until that read succeeds.`,
-      '- browserCode runs persistent top-level-await JavaScript, but restricted mode exposes only browserApi, nodeRepl, and console. Playwright page/context/browser/tab/Locator objects, DOM evaluation, Node globals, files, environment variables, cookies, storage, attachmentVault, credentialVault, and raw credentials are unavailable.',
-      '- Use only API signatures and fields documented by the loaded Skill. browserApi covers tabs, navigation, semantic/structured reads, element actions, frames, popup/navigation/dialog coordination, keyboard, pointer and rect-derived coordinate input, registered uploads, credential fill, screenshots, waits, text selection, form audit, surfaces, and final verification. Results are plain JSON.',
-      '- For every new or resumed browser request, call readBrowserState first and use its current tabs/page/snapshot evidence. Use exact observed locator fields. When evidence is missing or stale, call browserApi.snapshot/read/inspect before acting; never probe with a plausible selector.',
-      '- browserApi rejects unknown fields instead of silently ignoring them: filter/index/within/frame belong inside target. Before a CSS action, resolve that exact current target with browserApi.read operation=count or browserApi.inspect; an action is never a selector probe.',
-      '- A cell may perform multiple bounded operations. Use targeted reads between dependent actions when an earlier result can change later assumptions. Treat every opened nonmodal surface as a transaction and verify it closed before targeting outside it.',
-      '- browserApi.act returns the resulting active-surface summary. Finish or close the current date/time/listbox/popover surface and verify its transition before targeting a background field. After a hidden/actionability failure, never retry the same target with force, focus, or another action; inspect the current surface and rebuild around its visible custom control.',
-      '- Screenshot operations are available only when the selected model setting declares image-input support. A non-visual model must use browserApi.read({operation:"rect"}) or inspect() for one exact actionable target and click inside that rect; never request a screenshot or guess coordinates.',
-      '- Return compact evidence with nodeRepl.write(...). Before claiming completion, make a final read-only business-state check and call browserApi.surface(); successful delivery alone is not proof of success.',
-      `- Before file plan/generate/edit/render/convert/jsApi/unoApi or any fileVisual call, read hidden Skill ${fileArtifactRuntimeSkillId}. file list/read/download remain available without that read.`,
-    ];
-  }
+export function browserCodeRules() {
+  const browserSkillId = activeBrowserRuntimeSkillId();
   return [
-    hiddenRuntimeSkillSummariesForMode(mode),
-    `- Before the first browserCode call in every Agent run, read the hidden built-in Skill ${browserSkillId} with skill action=read. The runtime rejects browserCode until that read succeeds.`,
+    hiddenRuntimeSkillSummaries(),
+    `- The first browserCode call in every Agent run atomically loads the hidden built-in Skill ${browserSkillId}, returns it in loadedRuntimeSkill, and continues the original call. An explicit skill action=read remains optional.`,
     '- browserCode is the real browser inspection and operation tool. It can navigate with page.goto(url), open tabs with browser.tabs.new(url) or browser.tabs.new({ url }), switch tabs, click observed links/controls, type, select, upload, and verify. Never claim these capabilities are unavailable, replace opening a page with file action=download, or ask the user to navigate manually while browserCode is present unless an actual browserCode call proves the requested operation remains unavailable. Put one ordinary JavaScript cell in params.code.',
     '- The code receives the real Playwright page and context objects. Use ordinary Playwright APIs directly.',
     '- At the beginning of every new or resumed user request, before any browser-changing code, run one separate read-only browserCode cell that returns await browser.user.openTabs(), page.url(), await page.title(), and enough current evidence chosen by the model through page.domSnapshot() or targeted Playwright/DOM reads. openTabs includes active-tab and tab-group metadata. Reuse the correct existing session group and tab; never assume that the previously active page, URL, or mounted UI is still current.',
-    '- The JavaScript kernel persists for the browser session. Write top-level statements and top-level await; do not wrap the code in a function or module.',
-    '- Use top-level var for reusable bindings or choose fresh names because bindings persist across calls. Emit the result with nodeRepl.write(<JSON-serializable value>).',
+    '- The JavaScript kernel persists for the browser session but may be recycled by age, execution, heap, RSS, watchdog, or backend restart limits. Write top-level statements and top-level await; do not wrap the code in a function or module.',
+    '- Use top-level var for temporary reusable bindings or choose fresh names because bindings persist across calls. Save non-secret JSON-safe values needed after kernel recycling or in later turns with agent.state. Emit the result with nodeRepl.write(<JSON-serializable value>).',
     '- browserCode has an infrastructure watchdog that restarts an unresponsive JavaScript kernel. Keep each cell bounded. Playwright locator/action operations default to 5000ms and navigation defaults to 30000ms, so a missing target returns control without destroying persistent bindings. Use an explicit per-operation timeout only when the page has a known longer transition.',
     '- page.domSnapshot() is an explicit read API that returns one string containing [page-state] with the full surfaces set, parallel topSurfaceIds, the active surfaceStack, and a Playwright AX tree scoped to the most recently active top-level surface by default. Surface metadata is informational evidence of likely overlays, not an action restriction. Never read .surfaces, .topSurfaceIds, or .surfaceStack from that string; use await page.activeSurface() when structured surface fields are needed. Pass { scope: "all" } only when background context is required. It is never generated automatically after an operation.',
     '- Every browserCode result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous browserCode result, including failures completed between cells; inspect and act on it before continuing. After an operation, navigation, or tab change, browserCode also returns actual.finalPage and actual.domChanges, but never an automatic axTree or a separate console payload. Page console errors are reported once in domChanges.extra.errors. Use nodeRepl.write(...), not console.log, to return a code result. domChanges is the direct incremental DOM journal caused by that cell: added/updated/removed contain rendered actionable records, extra contains mounted non-actionable records plus errors and validationErrors, and overflow reports an incomplete delta. It is not a full-page snapshot. Pure successful read cells add no automatic DOM content.',
@@ -44,43 +23,21 @@ export function browserCodeRules(
     '- The code runtime also exposes browser/tab: browser.tabs.list()/new()/use()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, and tab.use(). browser.tabs.use(tab) and tab.use() switch the global page/tab binding. browser.user.openTabs() returns only tabs owned by the current conversation group, including tab id, active state, URL, title, groupId, and groupTitle; ungrouped and other-group tabs are excluded. These are JavaScript APIs inside the same browserCode tool.',
     '- Every session Playwright Page exposes setTextSelection. For precise text editing in an input, textarea, or contenteditable, including frame locators, call await targetPage.setTextSelection(locator, selection) on the Page that owns the locator. Use { start: { afterText | beforeText | offset, occurrence? } } for a caret, { exactText, occurrence? } or { start, end } for a range, then use targetPage.keyboard.insertText()/press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Verify the resulting value/text afterward.',
     '- DOM code belongs inside page.evaluate. The surrounding JavaScript module runs in an isolated Node process.',
-    `- Before file plan/generate/edit/render/convert/jsApi/unoApi or any fileVisual call, read hidden Skill ${fileArtifactRuntimeSkillId}. file list/read/download remain available without that read.`,
+    `- The first file or fileVisual call atomically loads hidden Skill ${fileArtifactRuntimeSkillId}, returns it in loadedRuntimeSkill, and continues the original call.`,
     '- file action=read preserves the original registered attachment and derives semantic text/Office structure plus visual pages on demand. On the first content read, omit pages; request later 1-based pages explicitly.',
     '- User attachments are already registered by attachmentId. For an upload-only request, do not call file and do not reconstruct bytes, base64, Blob, File, or Buffer. Place and verify the editor caret first when needed, then call attachmentVault.setInputFiles(exactFileInputLocator, attachmentId); direct Locator/Page.setInputFiles(), FileChooser.setFiles(), and local paths are forbidden. Verify exactly one attachment remains at the requested destination.',
     '- Do not import modules or access Node globals, local files, environment variables, cookies, browser storage, or raw credential values. When the prompt supplies a credential reference, use only await credentialVault.fill(locator, ref); never read the filled field value or write credentials/references to outputs or logs.',
   ];
 }
 
-export function browserChatCodeRules(
-  screenshotAvailable = true,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  const browserSkillId = activeBrowserRuntimeSkillId(mode);
-  if (mode === 'restricted') {
-    return [
-      hiddenRuntimeSkillSummariesForMode(mode),
-      `- Before the first browserCode call in every Agent run, read hidden Skill ${browserSkillId} in a separate model step. Then call readBrowserState before browserCode for every new or resumed browser request.`,
-      '- When a tool returns invalid input or schema validation, use the exact error path/type/constraint to correct the next call. Never repeat unchanged invalid arguments.',
-      '- browserCode restricted mode exposes a persistent JavaScript kernel with only browserApi, nodeRepl, and console. Do not reference Playwright page/context/browser/tab/Locator, evaluate/DOM APIs, Node globals, files, environment variables, cookies, storage, attachmentVault, credentialVault, or undocumented members.',
-      '- The loaded Skill is the complete API contract. browserApi supports current page and tab lifecycle, navigation, frames, snapshots, targeted inspect/read, every permitted element action, popup/navigation/dialog coordination, keyboard, pointer, registered uploads, trusted credential fill, text selection, screenshots, waits, form audit, surface inspection, and verification. Results are plain JSON; emit compact evidence with nodeRepl.write(...).',
-      '- Use readBrowserState as the initial observation. Every locator field must be copied exactly from the latest explicit evidence or direct domChanges. If a role/name/text/test id/id/CSS/label/placeholder is absent or stale, call browserApi.snapshot/read/inspect first; never probe with a plausible selector.',
-      '- browserApi rejects unknown fields instead of silently ignoring them: filter/index/within/frame belong inside target. Resolve an exact CSS target with browserApi.read operation=count or browserApi.inspect before using it in an action.',
-      '- Multiple bounded operations may run in one cell. Insert a targeted read before a dependent action when an earlier action can change the target assumptions. Treat a newly opened nonmodal surface as one transaction; verify it closed with browserApi.surface() before targeting outside it.',
-      '- Normal runtime visibility/actionability and uniqueness checks still apply. After a zero count, ambiguity, timeout, or actionability failure, preserve the actual target/error, refresh evidence, and refine it. Do not use script clicks, DOM mutation, or guessed coordinates.',
-      '- browserApi.act returns the resulting active-surface summary. Finish or close the current date/time/listbox/popover surface before targeting a background field. Never retry the same hidden target with force, focus, or a different action; inspect and use the visible custom control.',
-      screenshotAvailable
-        ? '- Emit a viewport image with await browserApi.screenshot() and end the cell. After the model inspects it, the same fresh image may authorize multiple later coordinate clicks while geometry and five-minute validity remain unchanged. Full-page images are read-only. Rect-derived clicks are also supported.'
-        : '- Image input is unavailable. Resolve one exact visible actionable target with browserApi.read({operation:"rect"}) or browserApi.inspect(), then use browserApi.pointer() only for a point inside that current rect. Never guess x/y.',
-      '- Inspect each result, dependencyFailures, and incremental domChanges. User-specified dates, times, locations, quantities, names, and option values are exact constraints: never silently replace an unavailable value with a nearby or default value. Preserve the requested value and ask or report the blocker. Before claiming completion, verify the business result with browserApi.read/inspect/verify and check browserApi.surface(); resolve unexpected residual surfaces.',
-      '- In the final answer, mention only unresolved failures that materially limit the outcome; omit recovered low-level failures and process logs.',
-      `- Before file plan/generate/edit/render/convert/jsApi/unoApi or any fileVisual call, read hidden Skill ${fileArtifactRuntimeSkillId}. file list/read/download remain available without that read.`,
-    ];
-  }
+export function browserChatCodeRules(screenshotAvailable = true) {
+  const browserSkillId = activeBrowserRuntimeSkillId();
   return [
-    hiddenRuntimeSkillSummariesForMode(mode),
-    `- Before the first browserCode call in every Agent run, read the hidden built-in Skill ${browserSkillId} with skill action=read in a separate model step. The runtime rejects browserCode until that read succeeds. Then call readBrowserState before browserCode for every new or resumed browser request.`,
+    hiddenRuntimeSkillSummaries(),
+    `- The first browserCode call in every Agent run atomically loads the hidden built-in Skill ${browserSkillId}, returns it in loadedRuntimeSkill, and continues the call. Call readBrowserState first for every new or resumed browser request.`,
     '- When a tool call returns an invalid-input, JSON parsing, or schema-validation error, read the complete tool error before continuing. Use its exact field path, received value/type, expected type/constraint, and the original input to construct a corrected call in the next model step. Call the tool again with corrected parameters; never repeat the unchanged invalid arguments and never reduce the failure to a generic “tool parameter parsing failed” summary.',
     '- Use browserCode for live inspection and operation. It receives the real Playwright page/context and a persistent top-level-await JavaScript kernel: keep cells bounded, use top-level var or fresh names, and return compact evidence with nodeRepl.write(...). Once repeated rows or fields are exactly observed, update the deterministic batch in one bounded cell instead of spending one model cycle per item; wait for concrete DOM/navigation state instead of routine fixed waitForTimeout delays.',
+    '- Top-level bindings are temporary and disappear when the kernel is recycled. Save non-secret JSON-safe values needed by later cells, later turns, or child Agents with agent.state; it survives kernel recycling, idle release, backend restart, and conversation continuation.',
     '- The successful readBrowserState result is the required initial read-only observation for a new or resumed browser request: it already contains browser.user.openTabs(), the active tab/group, URL/title, and a current page snapshot. Use that evidence directly for the first browserCode action instead of spending another model step reproducing the same inventory. Run a targeted read-only browserCode cell only when the exact locator/frame/surface evidence needed for the next action is missing or has become stale.',
     '- Every browserCode result may include dependencyFailures, a once-only queue of request failures plus HTTP 408/429/5xx observed since the previous result, including failures completed between cells; inspect it before continuing. Operation/navigation/tab-change results also include actual.finalPage and direct incremental domChanges in actual.domChanges, but never an automatic axTree or a separate console payload. Page console errors appear once in domChanges.extra.errors. Use nodeRepl.write(...), not console.log, to return a code result. domChanges added/updated/removed describe only changes caused by that cell; extra carries mounted non-actionable changes and diagnostics; it is not a full snapshot. page.domSnapshot() returns one string containing surfaces/topSurfaceIds/surfaceStack plus an active-surface-scoped AX tree by default; never access surface properties on that string, and use await page.activeSurface() for structured surface fields. Pass { scope: "all" } only for background context. Keep DOM-only code inside page.evaluate, and do not access Node globals, files, environment variables, cookies, or browser storage.',
     '- Use exact tags, attributes, hierarchy, editability, mounted structure, surfaces, topSurfaceIds, and surfaceStack from the latest explicit read or domChanges to decide locators. Before every element action, every locator-defining role, name, text, test id, id, href, label, placeholder, or other attribute must appear verbatim in that latest evidence. If it does not, run a targeted read-only inspection first; never try a plausible selector as a probe. An explicit ARIA role overrides the native tag for role locators. Surface data is informational evidence of likely overlays, never an action permission boundary. Multiple IDs in topSurfaceIds are parallel visible candidates; parentId/depth and surfaceStack describe likely nesting, and visual overlap alone does not. Treat a newly opened nonmodal surface as a bounded transaction: before targeting outside it, verify that it closed; otherwise close it with an observed Done/Close control, its observed trigger, or Escape, and verify the transition with page.activeSurface(). Never translate or invent a selector and never infer a control type or interaction sequence from labels, appearance, or prior experience. Multiple bounded operations may run in the same cell, but use targeted Playwright reads before a dependent operation when an earlier action can change its target assumptions. For credentialVault.fill and every Playwright Locator/Page element action, choose a stable parent by data-testid, stable data-*, unique exact href/name, or another returned attribute. Page/Locator factories automatically remove hidden and zero-rectangle matches before count() or positional selection. Runtime applies target-style and hit-test checks followed by an action-specific Playwright trial to every remaining candidate; the Playwright trial result is authoritative for pointer actionability, while the custom hit test is supplemental diagnostics. It operates only when exactly one candidate passes all stages. An ancestor pointer-events:none alone does not reject a target. first(), last(), and nth() are allowed and their selected locator still receives the same runtime validation.',
@@ -91,27 +48,11 @@ export function browserChatCodeRules(
       ? '- For a Playwright-indescribable visual control, emit a fresh viewport image with nodeRepl.emitImage(await page.screenshot({fullPage:false})) and end the cell. After the model sees it, the image may support multiple coordinate/CUA clicks in later cells while the document, URL, viewport, zoom, scroll position, and five-minute validity remain unchanged. Full-page images are read-only.'
       : '- Image input is unavailable, but rect-derived coordinate targeting is supported. From exact current DOM/Playwright evidence, resolve one unique visible actionable Locator, call const rect = await locator.boundingBox(), require a non-null rect, and click a point inside it with page.mouse.click or tab.cua.click. The rect may be obtained and used in the same cell or returned and reused in a later cell while page geometry remains unchanged. Never guess x/y.',
     '- For tabs/windows, use context.pages() or the available browser.tabs/browser.user/tab.playwright/tab.cua APIs. browser.user.openTabs() exposes active and group metadata for continuation. When given a credential reference, use credentialVault.fill(locator, ref) only; never read or output credential values or references.',
-    `- Before file plan/generate/edit/render/convert/jsApi/unoApi or any fileVisual call, read hidden Skill ${fileArtifactRuntimeSkillId}. file list/read/download remain available without that read.`,
+    `- The first file or fileVisual call atomically loads hidden Skill ${fileArtifactRuntimeSkillId}, returns it in loadedRuntimeSkill, and continues the original call.`,
   ];
 }
 
-export function browserActionRules(
-  screenshotAvailable = true,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  if (mode === 'restricted') {
-    return [
-      '- Before actions, use exact evidence already inspected through readBrowserState or browserApi.snapshot/read/inspect. Every LocatorTarget field must appear verbatim in current evidence; otherwise read first.',
-      '- Use browserApi.act for semantic element actions. It supports click/dblclick/hover/tap/focus/blur/fill/clear/type/press/check/uncheck/selectOption/setInputValue/scrollIntoView/dragTo/upload/credentialFill plus navigation, popup, and dialog coordination. setInputValue handles visible native date/time/datetime-local/month/week/color/range/number/text inputs, textarea, and select using exact browser value formats.',
-      '- browserApi rejects unknown fields. Put filter/index/within/frame inside target, and resolve an exact CSS target with browserApi.read operation=count or browserApi.inspect before using it in an action.',
-      '- Runtime requires one rendered actionable target. If count is zero or ambiguous, preserve the target/count/error, refresh evidence, and refine LocatorTarget. Positional index is allowed only for an intentional observed choice.',
-      '- Use browserApi.keyboard for focused keyboard input, browserApi.setTextSelection for precise editing, and browserApi.pointer only with fresh screenshot or exact rect evidence. Never use DOM mutation or guessed coordinates.',
-      '- A cell may contain multiple bounded actions; use targeted reads between dependent operations. browserApi.act returns the resulting surface summary. Verify newly opened surfaces are closed before leaving them, never retry a hidden target with force/focus/another action, and finish with a read-only business check plus browserApi.surface().',
-      screenshotAvailable
-        ? '- browserApi.screenshot() emits a model-visible image. End that cell before coordinate actions; one fresh viewport image may support multiple later clicks while geometry remains valid.'
-        : '- Do not request screenshots. Get an exact non-null rect through browserApi.read/inspect and click only inside it with browserApi.pointer().',
-    ];
-  }
+export function browserActionRules(screenshotAvailable = true) {
   return [
     '- Before a bounded sequence of clicks, hovers, fills, presses, selections, drags, credential fills, or other state-changing element actions, use exact evidence that the model already inspected in a preceding explicit page.domSnapshot()/targeted read or in direct incremental domChanges. Every locator-defining role, name, text, test id, id, href, label, placeholder, or other attribute must appear verbatim in that evidence; if it does not, read first instead of trying a plausible selector. Multiple operations may run in one cell; use targeted Playwright reads before a dependent operation when an earlier action can change target assumptions.',
     '- Use exact current tags, attributes, hierarchy, editability, and mounted structure with targeted Playwright or read-only DOM inspection. Never translate or invent labels/selectors, and never infer control type, interaction sequence, or completion state from a label, appearance, or prior experience. Identify a stable parent using data-testid, stable data-*, a unique exact href/name, or another exact returned attribute. Page/Locator factories remove hidden and zero-rectangle matches from the rendered set before count() or positional selection. Every action then applies full actionability to the remaining candidates and proceeds only when exactly one candidate passes; otherwise narrow the locator.',
@@ -128,21 +69,11 @@ export function browserActionRules(
   ];
 }
 
-export function browserContextLine(
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  return `No page state is preloaded. Before browserCode, read hidden Skill ${activeBrowserRuntimeSkillId(mode)}, then call readBrowserState to inspect existing tabs/groups, the active page identity, and current page evidence before changing the browser.`;
+export function browserContextLine() {
+  return `No page state is preloaded. Call readBrowserState to inspect existing tabs/groups, the active page identity, and current page evidence before changing the browser. The first browserCode call automatically loads and returns hidden Skill ${activeBrowserRuntimeSkillId()} while continuing the call.`;
 }
 
-export function screenshotObservationRule(
-  screenshotAvailable = true,
-  mode: BrowserCodeRuntimeMode = resolveBrowserCodeRuntimeMode(),
-) {
-  if (mode === 'restricted') {
-    return screenshotAvailable
-      ? '- No screenshot is automatic. Emit a model-visible image with await browserApi.screenshot({ fullPage:false }) and end the cell; after inspection it may authorize multiple later coordinate clicks while geometry remains valid.'
-      : '- No image observation is available. Coordinate clicks require a current rect from browserApi.read({operation:"rect"}) or browserApi.inspect(), followed by browserApi.pointer() inside that rect.';
-  }
+export function screenshotObservationRule(screenshotAvailable = true) {
   return screenshotAvailable
     ? '- Final page identity is attached automatically. Actual browser operations, navigation, and tab changes also attach direct incremental domChanges; page console errors appear once in domChanges.extra.errors, with no separate console payload. Results never include an automatic axTree, and pure successful reads attach no automatic DOM content. No screenshot is attached automatically. When AX, DOM, or pixel evidence is necessary, write the corresponding read explicitly in browserCode; emit pixels with await nodeRepl.emitImage(await page.screenshot({ fullPage: false })) so the image becomes visible to the model in the next model step.'
     : '- No image observation is available. Use browserCode for inspection and browser operations; coordinate clicks remain available only from a current exact Locator.boundingBox() rect.';

@@ -57,6 +57,18 @@ test('runtime retry accepts SDK error and other finish states', () => {
   });
 });
 
+test('runtime retry does not retry exhausted provider plans reported as HTTP 429', () => {
+  assert.deepEqual(classifyRuntimeRetry(Object.assign(
+    new Error('已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)'),
+    { statusCode: 429 },
+  )), {
+    category: 'billing',
+    reason: 'provider balance is unavailable (429)',
+    retryable: false,
+    statusCode: 429,
+  });
+});
+
 test('private tool protocol gets exactly one retry opportunity', () => {
   const first = Object.assign(new Error('private protocol'), {
     name: 'AI_PrivateToolProtocolError',

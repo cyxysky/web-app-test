@@ -11,7 +11,7 @@ export const subagentRuntimeSkillSummary = [
 
 export const subagentRuntimeSkillContent = `# Subagent Runtime
 
-This hidden built-in Skill is authoritative for subagent action=spawn. Read it once in the current Agent run before spawning children. subagent action=read is deliberately not gated, so pending results can always be collected.
+This hidden built-in Skill is authoritative for subagent action=spawn. The first spawn in an Agent run automatically loads and returns it while continuing the original spawn. subagent action=read is deliberately ungated, so pending results can always be collected.
 
 ## Host tool boundary and API signatures
 
@@ -48,7 +48,6 @@ type SubagentToolResult = {
   actual: string; // JSON text; inspect and preserve UUID order
   failureCategory?: string;
   requiredSkillId?: string;
-  requiredNextAction?: string;
 };
 
 declare function subagent(input: SubagentInput): Promise<SubagentToolResult>;

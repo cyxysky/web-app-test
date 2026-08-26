@@ -170,7 +170,7 @@ type ArtifactToolPayload = {
   cacheHit?: boolean;
   validation?: string;
   validationStatus?: string;
-  rolledBack?: boolean;
+  saved?: boolean;
   currentRevision?: number | null;
   lastSuccessfulRevision?: number | null;
   error?: string;
@@ -501,13 +501,13 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'javascript'}; sourceCharacters=${payload.sourceCharacters || 0}`;
     }
     if (payload.kind === 'uno-draft-validation') {
-      if (payload.validation === 'failed' || payload.validationStatus === 'failed' || payload.rolledBack) {
-        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; editRolledBack=${payload.rolledBack === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
+      if (payload.validation === 'failed' || payload.validationStatus === 'failed') {
+        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
       }
       return `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`;
     }
     if (payload.kind === 'office-source-unit-validation' && payload.validation === 'failed') {
-      return `Office source-unit validation failed: Document ID: ${payload.documentId}; editRolledBack=${payload.rolledBack === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
+      return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
@@ -1095,6 +1095,8 @@ export type OfficeDraftCatalogEntry = {
   generator: 'javascript' | 'uno';
   revision: number | null;
   sourceDigest: string | null;
+  validatedSourceDigest: string | null;
+  validationStatus: OfficeDocumentDraft['validationStatus'] | null;
   renderedDigest: string | null;
   visualQaDigest: string | null;
   state: NonNullable<OfficeDocumentDraft['workflow']>['state'];
@@ -1125,6 +1127,8 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         generator: draft.generator || 'javascript',
         revision: draft.currentRevision || null,
         sourceDigest: draft.sourceDigest || null,
+        validatedSourceDigest: draft.validatedSourceDigest || null,
+        validationStatus: draft.validationStatus || null,
         renderedDigest: draft.renderedDigest || draft.renderedSourceDigest || null,
         visualQaDigest: draft.visualQaDigest || null,
         state: draft.workflow?.state || (draft.program ? 'authoring' : 'planned'),
@@ -1152,7 +1156,7 @@ export async function officeDraftCatalogForPrompt(runId: string | undefined) {
   return [
     '[Current Office draft catalog - trusted runtime metadata]',
     'Resume an existing logical document with its exact documentId. Do not guess an ID or create a replacement unless the user explicitly requests a new document.',
-    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | revision=${draft.revision ?? 'none'} | state=${draft.state} | sourceDigest=${draft.sourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | updatedAt=${draft.updatedAt}`),
+    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | revision=${draft.revision ?? 'none'} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | updatedAt=${draft.updatedAt}`),
   ].join('\n');
 }
 
@@ -1163,9 +1167,10 @@ export async function pendingOfficeDocumentWork(
 ) {
   const catalog = await listOfficeDraftCatalog(runId);
   return catalog.filter((draft) => documentIds.has(draft.documentId)).reduce<Array<OfficeDraftCatalogEntry & {
-    requiredNextAction: 'generate' | 'render' | 'fileVisual';
+    requiredNextAction: 'edit' | 'generate' | 'render' | 'fileVisual';
   }>>((pending, draft) => {
     if (!draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'generate' });
+    else if (draft.validationStatus === 'failed') pending.push({ ...draft, requiredNextAction: 'edit' });
     else if (draft.renderedDigest !== draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'render' });
     else if (draft.state === 'qa-pending' && options.requireVisualQa !== false) {
       pending.push({ ...draft, requiredNextAction: 'fileVisual' });
@@ -1235,18 +1240,11 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   await writeDraftWorkspace(runId, draft);
 }
 
-async function restoreDraftSnapshot(
-  runId: string | undefined,
-  snapshot: OfficeDocumentDraft,
-  rejectedDraft: OfficeDocumentDraft,
-) {
-  const keep = new Set((snapshot.revisions || []).map((revision) => revision.sourceFileName));
-  const rejectedOnly = (rejectedDraft.revisions || []).filter((revision) => !keep.has(revision.sourceFileName));
-  await Promise.all(rejectedOnly.map((revision) => unlink(path.join(
-    draftRevisionDirectory(runId, snapshot.documentId),
-    path.basename(revision.sourceFileName),
-  )).catch(() => undefined)));
-  await writeDraftWorkspace(runId, structuredClone(snapshot));
+/** Save the one editable source buffer without creating a validated revision. */
+async function saveWorkingDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
+  draft.updatedAt = new Date().toISOString();
+  draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
+  await writeDraftWorkspace(runId, draft);
 }
 
 function invalidateActiveVisualQa(draft: OfficeDocumentDraft) {
@@ -1953,6 +1951,13 @@ async function validateDraft(input: {
     };
   } catch (error) {
     const source = input.draft.program || '';
+    const validationError = error instanceof Error ? error.message : String(error);
+    let saveError: string | undefined;
+    try {
+      await saveWorkingDraft(input.runId, input.draft);
+    } catch (workingSaveError) {
+      saveError = workingSaveError instanceof Error ? workingSaveError.message : String(workingSaveError);
+    }
     return {
       ok: false,
       actual: JSON.stringify({
@@ -1961,16 +1966,18 @@ async function validateDraft(input: {
         fileName: input.draft.fileName,
         generator: input.draft.generator || 'javascript',
         changed: input.documentChanged || false,
-        saved: false,
+        saved: !saveError,
         sourceDigest: sourceDigest(source),
         sourceCharacters: source.length,
         currentRevision: input.draft.currentRevision || null,
         validatedRevision: input.draft.validatedRevision || null,
+        lastSuccessfulRevision: input.draft.validatedRevision || input.draft.currentRevision || null,
         lineCount: draftSourceLineCount(source),
         validation: 'failed',
-        requiredNextAction: 'read',
+        requiredNextAction: 'edit',
         diagnostics: input.draft.validationDiagnostics || [],
-        error: error instanceof Error ? error.message : String(error),
+        error: saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError,
+        workflow: input.draft.workflow,
       }),
     };
   }
@@ -2077,6 +2084,12 @@ async function validateDraftSourceUnit(input: {
     input.draft.validationDiagnostics = (diagnostics || [{ message: error instanceof Error ? error.message : String(error), severity: 'error' as const }])
       .map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath }));
     input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) };
+    let saveError: string | undefined;
+    try {
+      await saveWorkingDraft(input.runId, input.draft);
+    } catch (workingSaveError) {
+      saveError = workingSaveError instanceof Error ? workingSaveError.message : String(workingSaveError);
+    }
     return {
       ok: false,
       actual: JSON.stringify({
@@ -2084,10 +2097,17 @@ async function validateDraftSourceUnit(input: {
         documentId: input.draft.documentId,
         sourceUnitPath: input.sourceUnitPath,
         validation: 'failed',
-        saved: false,
+        saved: !saveError,
         renderable: false,
+        sourceDigest: sourceDigest(input.draft.program || ''),
+        currentRevision: input.draft.currentRevision || null,
+        lastSuccessfulRevision: input.draft.validatedRevision || input.draft.currentRevision || null,
+        requiredNextAction: 'edit',
         diagnostics: input.draft.validationDiagnostics,
-        error: error instanceof Error ? error.message : String(error),
+        error: saveError
+          ? `${error instanceof Error ? error.message : String(error)}\nWorking source save failed: ${saveError}`
+          : error instanceof Error ? error.message : String(error),
+        workflow: input.draft.workflow,
       }),
     };
   } finally {
@@ -2110,6 +2130,23 @@ async function renderDraft(input: {
 }): Promise<BrowserActionResult> {
   let publishCandidatePath: string | undefined;
   try {
+    const workingDigest = sourceDigest(input.draft.program || '');
+    if (input.draft.validationStatus === 'failed') {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'office-render-blocked',
+          documentId: input.draft.documentId,
+          sourceDigest: workingDigest,
+          validatedSourceDigest: input.draft.validatedSourceDigest || null,
+          validationStatus: input.draft.validationStatus,
+          diagnostics: input.draft.validationDiagnostics || [],
+          requiredNextAction: 'edit',
+          error: 'The current working source failed validation. Continue editing this same source before rendering.',
+          workflow: input.draft.workflow,
+        }),
+      };
+    }
     const candidate = await prepareValidatedDraft(input);
     const digest = sourceDigest(input.draft.program || '');
     if (input.draft.validatedSourceDigest !== digest || input.draft.validationStatus !== 'passed') {
@@ -2342,8 +2379,8 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     draft.validationStatus = 'pending';
     draft.validationDiagnostics = [];
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-    // Generation is a candidate transaction. A failed first program leaves the
-    // committed draft in its planned state so a retry starts from clean data.
+    // Generation initializes the single editable source buffer. Validation
+    // failures keep this source saved so later edits can repair it in place.
     return validateDraft({ ...input, draft, documentChanged: true });
   } catch (error) {
     return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -2419,15 +2456,12 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     draft.validationDiagnostics = [];
     invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-    // Validate a candidate transactionally. A rejected edit must not poison
-    // the next edit with broken syntax or stale line coordinates.
+    // The current source is the editor buffer. Validation failures keep that
+    // exact buffer and diagnostics so the next edit can repair it in place.
     const validationResult = await (requestedUnit
       ? validateDraftSourceUnit({ ...input, draft, sourceUnitPath: requestedUnit.path })
       : validateDraft({ ...input, draft, documentChanged: true }));
     if (!validationResult.ok) {
-      const rejectedSourceDigest = sourceDigest(draft.program || '');
-      const rejectedDiagnostics = draft.validationDiagnostics || [];
-      await restoreDraftSnapshot(input.runId, persistedDraft, draft);
       let failure: Record<string, unknown> = {};
       try {
         failure = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
@@ -2438,21 +2472,17 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
         ok: false,
         actual: JSON.stringify({
           ...failure,
-          changed: false,
-          candidateChanged: true,
-          saved: false,
-          rolledBack: true,
-          rejectedSourceDigest,
-          rejectedRevision: null,
-          sourceDigest: sourceDigest(persistedDraft.program || ''),
-          sourceCharacters: persistedDraft.program?.length || 0,
-          currentRevision: persistedDraft.currentRevision || null,
+          changed: true,
+          saved: failure.saved === true,
+          sourceDigest: sourceDigest(draft.program || ''),
+          sourceCharacters: draft.program?.length || 0,
+          currentRevision: draft.currentRevision || null,
           lastSuccessfulRevision: persistedDraft.validatedRevision || persistedDraft.currentRevision || null,
-          diagnostics: failure.diagnostics || rejectedDiagnostics,
+          diagnostics: failure.diagnostics || draft.validationDiagnostics || [],
           validation: 'failed',
           requiredNextAction: 'edit',
-          recoverySuggestion: 'The rejected candidate was rolled back. Continue from the current draft with a smaller focused edit; call action=read only if you need fresh line numbers, or use restoreRevision from the returned revision history.',
-          workflow: persistedDraft.workflow,
+          recoverySuggestion: 'The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation.',
+          workflow: draft.workflow,
         }),
       };
     }

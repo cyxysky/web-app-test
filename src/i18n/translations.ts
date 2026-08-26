@@ -212,7 +212,6 @@ const en: Record<string, string> = {
   '用户浏览器空闲回收时间': 'User browser idle timeout',
   '同一用户没有运行中的对话和实时预览后，等待该时长关闭其测试浏览器，单位毫秒；默认 3 分钟。': 'Close a user’s test browser after this idle period with no active chat or live preview, in milliseconds. The default is 3 minutes.',
   '浏览器代码运行模式': 'Browser code runtime mode',
-  '自由代码模式向模型暴露完整 Playwright page/context/browser；受限 API 模式只暴露文档化的 browserApi，并返回普通 JSON。切换后会自动重建代码内核。': 'Free code mode exposes the full Playwright page/context/browser APIs to the model. Restricted API mode exposes only the documented browserApi and plain JSON results. Switching modes automatically rebuilds the code kernel.',
   '自由代码模式': 'Free code mode',
   '受限 API 模式': 'Restricted API mode',
   '浏览器控制模式': 'Browser control mode',
