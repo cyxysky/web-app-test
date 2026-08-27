@@ -29,6 +29,19 @@ ORGANIZATION_LABEL_TOKENS = {
     "组织名称",
 }
 
+PERSON_LABEL_TOKENS = {
+    "contactperson",
+    "fullname",
+    "name",
+    "personalname",
+    "person",
+    "personname",
+    "人员姓名",
+    "人名",
+    "姓名",
+    "联系人",
+}
+
 COMPANY_SUFFIX_PATTERN = re.compile(
     r"有限责任公司|股份有限公司|集团有限公司|控股有限公司|有限公司|集团公司|"
     r"分公司|总公司|公司|集团|银行|大学|学院|医院|研究院|研究所|事务所|"
@@ -62,6 +75,29 @@ def company_label_kind(label: str) -> str | None:
     if token in ORGANIZATION_LABEL_TOKENS:
         return "organization"
     return None
+
+
+def chinese_boundary_label_kind(label: str) -> str | None:
+    company_kind = company_label_kind(label)
+    if company_kind:
+        return company_kind
+    token = re.sub(r"[\s_-]+", "", label).casefold()
+    if token in PERSON_LABEL_TOKENS:
+        return "name"
+    return None
+
+
+def requested_chinese_boundary_labels(labels: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for label in labels:
+        kind = chinese_boundary_label_kind(label)
+        if kind and kind not in result:
+            result[kind] = label
+    if "company" in result and "organization" not in result:
+        result["organization"] = result["company"]
+    if "organization" in result and "company" not in result:
+        result["company"] = result["organization"]
+    return result
 
 
 def is_company_label(label: str) -> bool:

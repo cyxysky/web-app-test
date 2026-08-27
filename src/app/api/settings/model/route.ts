@@ -85,6 +85,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
       return typeof imageInput === 'boolean' ? [[modelId, { imageInput }]] : [];
     }));
     result[definition.value] = {
+      displayName: typeof item.displayName === 'string' ? item.displayName.trim().slice(0, 80) : '',
       enabled: item.enabled === true,
       defaultModel: model,
       model,

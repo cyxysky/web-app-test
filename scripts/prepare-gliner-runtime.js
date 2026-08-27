@@ -16,8 +16,9 @@ const requirementsPath = path.join(root, 'services', 'gliner', 'requirements.txt
 const serviceAppPath = path.join(root, 'services', 'gliner', 'app.py');
 const serviceBoundariesPath = path.join(root, 'services', 'gliner', 'entity_boundaries.py');
 const serviceCandidateResolutionPath = path.join(root, 'services', 'gliner', 'candidate_resolution.py');
+const serviceDeterministicSpansPath = path.join(root, 'services', 'gliner', 'deterministic_spans.py');
 const defaultVirtualPython = path.join(root, '.venv-gliner', 'Scripts', 'python.exe');
-const bundleFormatVersion = 2;
+const bundleFormatVersion = 3;
 
 loadEnvConfig(root, false);
 
@@ -74,7 +75,9 @@ function bundleFingerprint(input) {
     .update(fs.readFileSync(serviceAppPath))
     .update(fs.readFileSync(serviceBoundariesPath))
     .update(fs.readFileSync(serviceCandidateResolutionPath))
+    .update(fs.readFileSync(serviceDeterministicSpansPath))
     .update(input.modelName)
+    .update(input.piiModelName)
     .update(input.chineseNerModelName)
     .update(input.pythonVersion)
     .digest('hex');
@@ -122,7 +125,10 @@ function main() {
   const chineseNerModelName = String(
     process.env.GLINER_CHINESE_NER_MODEL || 'uer/roberta-base-finetuned-cluener2020-chinese',
   ).trim();
-  const fingerprint = bundleFingerprint({ modelName, chineseNerModelName, pythonVersion: python.version });
+  const piiModelName = String(
+    process.env.GLINER_PII_MODEL || 'LiquidAI/LFM2.5-Encoder-350M-PII-Detector',
+  ).trim();
+  const fingerprint = bundleFingerprint({ modelName, piiModelName, chineseNerModelName, pythonVersion: python.version });
   if (currentBundleMatches(fingerprint)) {
     console.log(`Reusing bundled GLiNER runtime: ${preparedGlinerRuntimeRoot}`);
     return;
@@ -137,6 +143,7 @@ function main() {
   const serviceRoot = path.join(stagingRoot, 'service');
   const modelRoot = path.join(stagingRoot, 'models', 'gliner2');
   const chineseNerModelRoot = path.join(stagingRoot, 'models', 'chinese-roberta');
+  const piiModelRoot = path.join(stagingRoot, 'models', 'liquid-pii');
 
   console.log(`Copying Python ${python.version} runtime from ${python.basePrefix}`);
   copyPythonRuntime(python.basePrefix, bundledPythonRoot);
@@ -152,6 +159,7 @@ function main() {
   fs.cpSync(serviceAppPath, path.join(serviceRoot, 'app.py'));
   fs.cpSync(serviceBoundariesPath, path.join(serviceRoot, 'entity_boundaries.py'));
   fs.cpSync(serviceCandidateResolutionPath, path.join(serviceRoot, 'candidate_resolution.py'));
+  fs.cpSync(serviceDeterministicSpansPath, path.join(serviceRoot, 'deterministic_spans.py'));
   fs.cpSync(requirementsPath, path.join(serviceRoot, 'requirements.txt'));
 
   console.log(`Downloading GLiNER model ${modelName} into the application runtime.`);
@@ -174,16 +182,29 @@ function main() {
     env: { HF_HUB_DISABLE_SYMLINKS_WARNING: '1' },
   });
 
-  console.log('Validating the self-contained Python, GLiNER2.5, and Chinese RoBERTa models.');
+  console.log(`Downloading LiquidAI PII model ${piiModelName} into the application runtime.`);
+  run(sourcePython, ['-c', [
+    'import sys',
+    'sys.path.insert(0, sys.argv[1])',
+    'from huggingface_hub import snapshot_download',
+    'snapshot_download(repo_id=sys.argv[2], local_dir=sys.argv[3])',
+  ].join('\n'), sitePackages, piiModelName, piiModelRoot], {
+    env: { HF_HUB_DISABLE_SYMLINKS_WARNING: '1' },
+  });
+
+  console.log('Validating the self-contained Python, GLiNER2.5, LiquidAI PII, and Chinese RoBERTa models.');
   run(bundledPython, ['-c', [
     'import sys',
     'from gliner2 import AutoExtractor',
-    'from transformers import AutoModelForTokenClassification, AutoTokenizer',
+    'from tokenizers import Tokenizer',
+    'from transformers import AutoModelForTokenClassification, AutoTokenizer, PreTrainedTokenizerFast',
     'model = AutoExtractor.from_pretrained(sys.argv[1], map_location="cpu")',
     'AutoTokenizer.from_pretrained(sys.argv[2], local_files_only=True)',
     'AutoModelForTokenClassification.from_pretrained(sys.argv[2], local_files_only=True)',
+    'PreTrainedTokenizerFast(tokenizer_object=Tokenizer.from_file(sys.argv[3] + "/tokenizer.json"), bos_token="<|startoftext|>", eos_token="<|im_end|>", pad_token="<|pad|>", mask_token="<|mask|>", model_input_names=["input_ids", "attention_mask"])',
+    'AutoModelForTokenClassification.from_pretrained(sys.argv[3], local_files_only=True, trust_remote_code=True)',
     'print(type(model).__name__)',
-  ].join('\n'), modelRoot, chineseNerModelRoot], {
+  ].join('\n'), modelRoot, chineseNerModelRoot, piiModelRoot], {
     env: {
       HF_HUB_OFFLINE: '1',
       TRANSFORMERS_OFFLINE: '1',
@@ -196,6 +217,7 @@ function main() {
     fingerprint,
     chineseNerModelName,
     modelName,
+    piiModelName,
     platform: 'win32-x64',
     pythonVersion: python.version,
   }, null, 2), 'utf8');

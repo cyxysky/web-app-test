@@ -18,6 +18,7 @@ WORKDIR /app
 
 ARG GLINER_MODEL=fastino/gliner2.5-multi-v1
 ARG GLINER_CHINESE_NER_MODEL=uer/roberta-base-finetuned-cluener2020-chinese
+ARG GLINER_PII_MODEL=LiquidAI/LFM2.5-Encoder-350M-PII-Detector
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libreoffice-nogui fonts-noto-cjk python3 python3-venv \
@@ -30,11 +31,14 @@ RUN python3 -m venv /opt/webpilot-gliner/python \
 COPY services/gliner/app.py /opt/webpilot-gliner/service/app.py
 COPY services/gliner/candidate_resolution.py /opt/webpilot-gliner/service/candidate_resolution.py
 COPY services/gliner/entity_boundaries.py /opt/webpilot-gliner/service/entity_boundaries.py
+COPY services/gliner/deterministic_spans.py /opt/webpilot-gliner/service/deterministic_spans.py
 ENV GLINER_BUNDLED_MODEL_NAME=${GLINER_MODEL}
 ENV GLINER_BUNDLED_CHINESE_NER_MODEL_NAME=${GLINER_CHINESE_NER_MODEL}
+ENV GLINER_BUNDLED_PII_MODEL_NAME=${GLINER_PII_MODEL}
 ENV GLINER_MODEL=${GLINER_MODEL}
 ENV GLINER_CHINESE_NER_MODEL=${GLINER_CHINESE_NER_MODEL}
-RUN /opt/webpilot-gliner/python/bin/python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['GLINER_BUNDLED_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/gliner2'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_CHINESE_NER_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/chinese-roberta')"
+ENV GLINER_PII_MODEL=${GLINER_PII_MODEL}
+RUN /opt/webpilot-gliner/python/bin/python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['GLINER_BUNDLED_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/gliner2'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_CHINESE_NER_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/chinese-roberta'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_PII_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/liquid-pii')"
 
 ENV NODE_ENV=production
 ENV PORT=3000
@@ -53,6 +57,7 @@ ENV GLINER_PYTHON_PATH=/opt/webpilot-gliner/python/bin/python
 ENV GLINER_SERVICE_DIR=/opt/webpilot-gliner/service
 ENV GLINER_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/gliner2
 ENV GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/chinese-roberta
+ENV GLINER_PII_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/liquid-pii
 ENV GLINER_DEVICE=cpu
 ENV GLINER_BATCH_SIZE=8
 

@@ -1,9 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { TextArea } from '@heroui/react';
 import Link from 'next/link';
-import { ArrowLeft, FolderOpen, ImageIcon, KeyRound, Loader2, PencilLine, Plus, RefreshCw, Save, Trash2, X } from 'lucide-react';
+import { AlertCircle, ArrowLeft, BadgeDollarSign, Building2, ChevronDown, CircleCheck, Copy, FileKey2, FileText, FolderOpen, ImageIcon, KeyRound, Loader2, MapPin, Maximize2, PencilLine, Phone, PlayCircle, Plus, RefreshCw, Save, Search, Trash2, UserRound, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
@@ -13,6 +13,7 @@ import {
   modelProviderDefinitions,
   modelProviderDefinition,
   runtimeEnvDefinition,
+  uniqueModelIds,
   type SettingsTab,
 } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -26,6 +27,7 @@ import { readApiJson } from '@/lib/api-client';
 import { LoginAccountModal, type LoginAccountMetadata } from '@/components/LoginAccountModal';
 import { DataTransferButtons } from '@/components/DataTransferButtons';
 import { ManagementDataTable } from '@/components/ManagementDataTable';
+import { ModelBrandIcon } from '@/components/ModelBrandIcon';
 import { AppInput } from '@/components/ui/app-input';
 import { AppModal } from '@/components/ui/app-modal';
 import { ColorPickerField } from '@/components/ui/color-picker-field';
@@ -144,6 +146,74 @@ type SensitiveDataEvaluationRun = {
   results: SensitiveDataEvaluationCaseResult[];
 };
 
+type VisibleEnvSetting = {
+  item: EnvRow;
+  index: number;
+  definition: ReturnType<typeof runtimeEnvDefinition>;
+};
+
+function SettingsGroupCard({
+  children,
+  className = '',
+  initiallyOpen = true,
+  title,
+}: {
+  children: ReactNode;
+  className?: string;
+  initiallyOpen?: boolean;
+  title: string;
+}) {
+  const [expanded, setExpanded] = useState(initiallyOpen);
+  return (
+    <div className={`settings-group-card${expanded ? ' is-expanded' : ''}${className ? ` ${className}` : ''}`}>
+      <button
+        aria-expanded={expanded}
+        className="settings-group-card-head"
+        onClick={() => setExpanded((current) => !current)}
+        type="button"
+      >
+        <h3>{title}</h3>
+        <ChevronDown aria-hidden="true" size={17} />
+      </button>
+      {expanded ? <div className="settings-group-card-body">{children}</div> : null}
+    </div>
+  );
+}
+
+function runtimeSettingGroup(tab: SettingsTab, key: string) {
+  if (tab === 'browser') {
+    if (/^BROWSER_(?:PREVIEW|SCREENCAST|OUTPUT)/.test(key)) return '实时预览';
+    if (/^(?:ELECTRON_|HEADLESS_|BROWSER_(?:PROFILE|USER_BROWSER|VIEWPORT))/.test(key)) return '浏览器实例';
+    return '导航与诊断';
+  }
+  if (tab === 'sensitive-data') {
+    if (/^AI_SENSITIVE_DATA_FILTER_/.test(key)) return '脱敏策略';
+    if (/^GLINER_(?:MODEL|PII_MODEL)$/.test(key)) return '脱敏模型';
+    return '推理服务';
+  }
+  if (tab === 'runtime') {
+    if (/^(?:SQLITE_|OFFICE_)/.test(key)) return '数据与文件';
+    if (/^AI_SUBAGENT_/.test(key)) return '子 Agent';
+    if (/^BROWSER_CHAT_/.test(key)) return '对话运行';
+    if (/^AI_PERSONAL_MEMORY_/.test(key)) return '个性化记忆';
+    if (/^AI_(?:CONTEXT|GLM_CONTEXT|IMAGE_CONTEXT|VISUAL_)/.test(key)) return '上下文管理';
+    return 'Agent 运行';
+  }
+  if (tab === 'debug') return key.startsWith('CODEX_') ? 'Codex CLI' : '调试与追踪';
+  return '配置';
+}
+
+function groupVisibleEnvSettings(tab: SettingsTab, settings: VisibleEnvSetting[]) {
+  const groups = new Map<string, VisibleEnvSetting[]>();
+  for (const setting of settings) {
+    const title = runtimeSettingGroup(tab, setting.item.key);
+    const group = groups.get(title) || [];
+    group.push(setting);
+    groups.set(title, group);
+  }
+  return [...groups.entries()].map(([title, items]) => ({ title, items }));
+}
+
 type SystemBridge = {
   cancelDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   chooseDownloadDirectory?: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
@@ -235,6 +305,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, { ...current, models });
     providers[definition.value] = {
+      displayName: current?.displayName || '',
       enabled: current?.enabled === true,
       defaultModel: model,
       model,
@@ -257,6 +328,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
 function providerSettings(config: ModelConfig, provider: ModelProvider) {
   const definition = modelProviderDefinition(provider);
   return config.providers[provider] || {
+    displayName: '',
     enabled: false,
     defaultModel: definition.defaultModel,
     model: definition.defaultModel,
@@ -303,10 +375,89 @@ function sensitiveDataEvaluationPayload(cases: SensitiveDataEvaluationDraft[]): 
 }
 
 function draftModelRows(definition: ReturnType<typeof modelProviderDefinition>, settings: ModelProviderSettings) {
-  const rows = Array.isArray(settings.models) && settings.models.length
+  return Array.isArray(settings.models) && settings.models.length
     ? settings.models
-    : [settings.defaultModel || settings.model || definition.defaultModel];
-  return rows.length ? rows : [definition.defaultModel];
+    : uniqueModelIds([settings.defaultModel, settings.model]).filter((model) => !(
+      definition.value.startsWith('openai-compatible')
+      && model === 'custom-model'
+    ));
+}
+
+type SensitiveValueGroupId = 'organization' | 'project' | 'person' | 'contact' | 'identity' | 'finance' | 'address' | 'security' | 'other';
+
+const sensitiveValueGroupOrder: Array<{ id: SensitiveValueGroupId; label: string }> = [
+  { id: 'organization', label: '组织机构' },
+  { id: 'project', label: '合同与项目' },
+  { id: 'person', label: '人员信息' },
+  { id: 'contact', label: '联系方式' },
+  { id: 'identity', label: '身份与证件' },
+  { id: 'finance', label: '财务与账户' },
+  { id: 'address', label: '地址信息' },
+  { id: 'security', label: '安全凭据' },
+  { id: 'other', label: '其他信息' },
+];
+
+function sensitiveValueGroup(text: string, value: string): SensitiveValueGroupId {
+  const index = text.indexOf(value);
+  const before = index >= 0 ? text.slice(0, index) : '';
+  const clauseStart = Math.max(before.lastIndexOf('；'), before.lastIndexOf('。'), before.lastIndexOf('\n'), before.lastIndexOf('，'));
+  const context = index >= 0 ? `${before.slice(clauseStart + 1)}${value}` : value;
+  if (/API|Key|令牌|密钥|token|ghp_|AKIA|密码|服务器IP|公网IP/i.test(context)) return 'security';
+  if (/地址|办公地|交付地|邮寄地/.test(context)) return 'address';
+  if (/身份证|护照|出生日期|实名|证件/.test(context)) return 'identity';
+  if (/银行账号|账户|账号|金额|薪|预算|回款|人民币|万元|亿元|K\/月|元\/月|元\/年|￥|¥/.test(context)) return 'finance';
+  if (/合同|项目|编号|编码|代号/.test(context)) return 'project';
+  if (/负责人|联系人|审批人|职位|岗位|工号|用户名|员工|研发|工程师|总监|财务官/.test(context)) return 'person';
+  if (/客户|供应商|实施方|相对方|公司|产品|平台|系统|医疗|零售|智造/.test(context)) return 'organization';
+  if (/邮箱|电话|手机|@/.test(context)) return 'contact';
+  return 'other';
+}
+
+function groupedSensitiveValues(text: string, values: string[]) {
+  const groups = new Map<SensitiveValueGroupId, string[]>();
+  for (const value of values) {
+    const group = sensitiveValueGroup(text, value);
+    groups.set(group, [...(groups.get(group) || []), value]);
+  }
+  return sensitiveValueGroupOrder.flatMap((group) => {
+    const items = groups.get(group.id) || [];
+    return items.length ? [{ ...group, items }] : [];
+  });
+}
+
+function highlightedSensitiveText(text: string, values: string[]): ReactNode[] {
+  const matches = values
+    .flatMap((value) => {
+      const start = text.indexOf(value);
+      return start >= 0 ? [{ start, end: start + value.length, value }] : [];
+    })
+    .sort((a, b) => a.start - b.start || b.end - a.end)
+    .filter((match, index, matches) => index === 0 || match.start >= matches[index - 1].end);
+  if (!matches.length) return [text];
+  const output: ReactNode[] = [];
+  let cursor = 0;
+  for (const match of matches) {
+    if (match.start > cursor) output.push(text.slice(cursor, match.start));
+    output.push(<mark key={`${match.start}:${match.value}`}>{text.slice(match.start, match.end)}</mark>);
+    cursor = match.end;
+  }
+  if (cursor < text.length) output.push(text.slice(cursor));
+  return output;
+}
+
+function SensitiveValueGroupIcon({ id }: { id: SensitiveValueGroupId }) {
+  const props = { 'aria-hidden': true, size: 16, strokeWidth: 1.9 } as const;
+  if (id === 'organization') return <Building2 {...props} />;
+  if (id === 'project') return <FileText {...props} />;
+  if (id === 'person') return <UserRound {...props} />;
+  if (id === 'contact') return <Phone {...props} />;
+  if (id === 'finance') return <BadgeDollarSign {...props} />;
+  if (id === 'address') return <MapPin {...props} />;
+  return <FileKey2 {...props} />;
+}
+
+function evaluationCaseDisplayName(name: string, index: number) {
+  return name.trim().replace(/^综合业务场景\s*[·・]\s*/, '') || `用例 ${index + 1}`;
 }
 
 function isSecret(item: EnvRow) {
@@ -375,6 +526,12 @@ export function EnvironmentSettings({
   const [testingSensitiveData, setTestingSensitiveData] = useState(false);
   const [sensitiveDataEvaluationCases, setSensitiveDataEvaluationCases] = useState<SensitiveDataEvaluationDraft[]>([]);
   const [sensitiveDataEvaluationRun, setSensitiveDataEvaluationRun] = useState<SensitiveDataEvaluationRun | null>(null);
+  const [selectedSensitiveDataEvaluationCaseId, setSelectedSensitiveDataEvaluationCaseId] = useState('');
+  const [sensitiveDataEvaluationSearch, setSensitiveDataEvaluationSearch] = useState('');
+  const [sensitiveDataEvaluationPanelTab, setSensitiveDataEvaluationPanelTab] = useState<'expected' | 'result'>('expected');
+  const [sensitiveDataEvaluationExpanded, setSensitiveDataEvaluationExpanded] = useState(false);
+  const [sensitiveDataEvaluationNewExpectedValue, setSensitiveDataEvaluationNewExpectedValue] = useState('');
+  const [collapsedSensitiveDataGroups, setCollapsedSensitiveDataGroups] = useState<Set<string>>(() => new Set());
   const [sensitiveDataEvaluationError, setSensitiveDataEvaluationError] = useState('');
   const [sensitiveDataEvaluationLoaded, setSensitiveDataEvaluationLoaded] = useState(false);
   const [loadingSensitiveDataEvaluation, setLoadingSensitiveDataEvaluation] = useState(false);
@@ -434,7 +591,9 @@ export function EnvironmentSettings({
         });
         const data = await readApiJson<{ cases?: SensitiveDataEvaluationCase[] }>(response, '读取脱敏评测集失败');
         if (controller.signal.aborted) return;
-        setSensitiveDataEvaluationCases(sensitiveDataEvaluationDrafts(data.cases));
+        const drafts = sensitiveDataEvaluationDrafts(data.cases);
+        setSensitiveDataEvaluationCases(drafts);
+        setSelectedSensitiveDataEvaluationCaseId((current) => drafts.some((item) => item.id === current) ? current : drafts[0]?.id || '');
         setSensitiveDataEvaluationLoaded(true);
       } catch (error) {
         if (controller.signal.aborted) return;
@@ -551,15 +710,10 @@ export function EnvironmentSettings({
   }
 
   function addSensitiveDataEvaluationCase() {
-    setSensitiveDataEvaluationCases((current) => [
-      ...current,
-      {
-        id: `evaluation:${Date.now()}:${sensitiveDataEvaluationIdRef.current++}`,
-        name: '',
-        text: '',
-        expectedValuesText: '',
-      },
-    ]);
+    const id = `evaluation:${Date.now()}:${sensitiveDataEvaluationIdRef.current++}`;
+    setSensitiveDataEvaluationCases((current) => [...current, { id, name: '', text: '', expectedValuesText: '' }]);
+    setSelectedSensitiveDataEvaluationCaseId(id);
+    setSensitiveDataEvaluationPanelTab('expected');
     setSensitiveDataEvaluationRun(null);
     setSensitiveDataEvaluationError('');
   }
@@ -571,9 +725,70 @@ export function EnvironmentSettings({
   }
 
   function removeSensitiveDataEvaluationCase(id: string) {
-    setSensitiveDataEvaluationCases((current) => current.filter((item) => item.id !== id));
+    setSensitiveDataEvaluationCases((current) => {
+      const next = current.filter((item) => item.id !== id);
+      setSelectedSensitiveDataEvaluationCaseId((selected) => selected === id ? next[0]?.id || '' : selected);
+      return next;
+    });
     setSensitiveDataEvaluationRun(null);
     setSensitiveDataEvaluationError('');
+  }
+
+  function addOpenAICompatibleProvider() {
+    const compatibleProviders: ModelProvider[] = ['openai-compatible', 'openai-compatible-2', 'openai-compatible-3'];
+    setModelDraft((current) => {
+      const next = createModelConfig(current);
+      const provider = compatibleProviders.find((candidate) => {
+        const settings = providerSettings(next, candidate);
+        return !settings.enabled
+          && !settings.displayName?.trim()
+          && !settings.apiKey
+          && !settings.hasApiKey
+          && !settings.baseURL;
+      });
+      if (!provider) return next;
+      const sequence = compatibleProviders.indexOf(provider) + 1;
+      return {
+        ...next,
+        provider,
+        providers: {
+          ...next.providers,
+          [provider]: {
+            ...providerSettings(next, provider),
+            displayName: `OpenAI 兼容供应商 ${sequence}`,
+            enabled: true,
+          },
+        },
+      };
+    });
+  }
+
+  function addSensitiveDataEvaluationExpectedValue(caseId: string) {
+    const value = sensitiveDataEvaluationNewExpectedValue.trim();
+    if (!value) return;
+    const target = sensitiveDataEvaluationCases.find((item) => item.id === caseId);
+    if (!target) return;
+    const values = target.expectedValuesText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+    if (!values.includes(value)) values.push(value);
+    updateSensitiveDataEvaluationCase(caseId, { expectedValuesText: values.join('\n') });
+    setSensitiveDataEvaluationNewExpectedValue('');
+  }
+
+  function removeSensitiveDataEvaluationExpectedValue(caseId: string, value: string) {
+    const target = sensitiveDataEvaluationCases.find((item) => item.id === caseId);
+    if (!target) return;
+    const values = target.expectedValuesText.split(/\r?\n/).map((item) => item.trim()).filter((item) => item && item !== value);
+    updateSensitiveDataEvaluationCase(caseId, { expectedValuesText: values.join('\n') });
+  }
+
+  function toggleSensitiveDataEvaluationGroup(caseId: string, groupId: string) {
+    const key = `${caseId}:${groupId}`;
+    setCollapsedSensitiveDataGroups((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
   }
 
   function validSensitiveDataEvaluationPayload() {
@@ -597,7 +812,9 @@ export function EnvironmentSettings({
         body: JSON.stringify({ cases }),
       });
       const data = await readApiJson<{ cases?: SensitiveDataEvaluationCase[] }>(response, t('保存脱敏评测集失败'));
-      setSensitiveDataEvaluationCases(sensitiveDataEvaluationDrafts(data.cases));
+      const drafts = sensitiveDataEvaluationDrafts(data.cases);
+      setSensitiveDataEvaluationCases(drafts);
+      setSelectedSensitiveDataEvaluationCaseId((current) => drafts.some((item) => item.id === current) ? current : drafts[0]?.id || '');
       setSensitiveDataEvaluationLoaded(true);
     } catch (error) {
       setSensitiveDataEvaluationError(error instanceof Error ? t(error.message) : t('保存脱敏评测集失败'));
@@ -677,10 +894,10 @@ export function EnvironmentSettings({
         providers: { ...current.providers },
       };
       const provider = next.provider;
-      const definition = modelProviderDefinition(provider);
       const currentSettings = providerSettings(next, provider);
-      const fallbackModel = defaultModel || currentSettings.defaultModel || currentSettings.model || definition.defaultModel;
       const normalizedModels = models.map((item) => item.trim()).filter(Boolean);
+      const requestedModel = defaultModel || currentSettings.defaultModel || currentSettings.model || '';
+      const fallbackModel = normalizedModels.includes(requestedModel) ? requestedModel : normalizedModels[0] || '';
       return {
         ...next,
         providers: {
@@ -706,9 +923,9 @@ export function EnvironmentSettings({
     const previous = rows[index];
     rows[index] = value;
     const trimmedRows = rows.map((item) => item.trim()).filter(Boolean);
-    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
+    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || '';
     const nextDefault = previous === currentDefault || !trimmedRows.includes(currentDefault)
-      ? value.trim() || trimmedRows[0] || activeProviderOption.defaultModel
+      ? value.trim() || trimmedRows[0] || ''
       : currentDefault;
     const nextCapabilities = { ...(activeProviderSettings.modelCapabilities || {}) };
     const previousCapability = nextCapabilities[previous]
@@ -724,13 +941,13 @@ export function EnvironmentSettings({
 
   function removeActiveProviderModel(index: number) {
     const rows = draftModelRows(activeProviderOption, activeProviderSettings);
-    if (rows.length <= 1) return;
+    if (!rows.length) return;
     const removed = rows[index];
     const nextRows = rows.filter((_, itemIndex) => itemIndex !== index);
     const remaining = nextRows.map((item) => item.trim()).filter(Boolean);
-    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
+    const currentDefault = activeProviderSettings.defaultModel || activeProviderSettings.model || '';
     const nextDefault = removed === currentDefault || !remaining.includes(currentDefault)
-      ? remaining[0] || activeProviderOption.defaultModel
+      ? remaining[0] || ''
       : currentDefault;
     const nextCapabilities = { ...(activeProviderSettings.modelCapabilities || {}) };
     delete nextCapabilities[removed];
@@ -992,6 +1209,24 @@ export function EnvironmentSettings({
 
   function renderSensitiveDataTestPanel() {
     const evaluationResults = new Map((sensitiveDataEvaluationRun?.results || []).map((item) => [item.id, item]));
+    const selectedEvaluationCase = sensitiveDataEvaluationCases.find((item) => item.id === selectedSensitiveDataEvaluationCaseId)
+      || sensitiveDataEvaluationCases[0];
+    const selectedEvaluationIndex = selectedEvaluationCase
+      ? sensitiveDataEvaluationCases.findIndex((item) => item.id === selectedEvaluationCase.id)
+      : -1;
+    const selectedEvaluationValues = selectedEvaluationCase
+      ? selectedEvaluationCase.expectedValuesText.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
+      : [];
+    const selectedEvaluationGroups = selectedEvaluationCase
+      ? groupedSensitiveValues(selectedEvaluationCase.text, selectedEvaluationValues)
+      : [];
+    const selectedEvaluationResult = selectedEvaluationCase ? evaluationResults.get(selectedEvaluationCase.id) : undefined;
+    const selectedEvaluationRecall = selectedEvaluationValues.length
+      ? Math.round(((selectedEvaluationValues.length - (selectedEvaluationResult?.missingValues.length || 0)) / selectedEvaluationValues.length) * 100)
+      : 0;
+    const visibleEvaluationCases = sensitiveDataEvaluationCases.filter((item, index) => (
+      evaluationCaseDisplayName(item.name, index).toLocaleLowerCase().includes(sensitiveDataEvaluationSearch.trim().toLocaleLowerCase())
+    ));
     return (
       <div className="settings-sensitive-data-test">
         <div className="settings-sensitive-data-test-head">
@@ -1056,117 +1291,125 @@ export function EnvironmentSettings({
             )}
           </div>
         ) : null}
-        <div className="settings-sensitive-data-evaluation">
-          <div className="settings-sensitive-data-evaluation-head">
-            <div>
+        <div className={`settings-sensitive-data-evaluation-workbench${sensitiveDataEvaluationExpanded ? ' is-expanded' : ''}`}>
+          <header className="evaluation-workbench-head">
+            <div className="evaluation-workbench-title">
               <h3>{t('脱敏评测集')}</h3>
               <span>{t('配置可复用用例并批量评测。每个预期敏感原文单独占一行，系统按原文精确匹配统计通过率、精确率和召回率。')}</span>
             </div>
-            <div className="settings-sensitive-data-evaluation-actions">
-              <button
-                className="ui-button"
-                disabled={savingSensitiveDataEvaluation || loadingSensitiveDataEvaluation}
-                onClick={saveSensitiveDataEvaluationCases}
-                type="button"
-              >
-                {savingSensitiveDataEvaluation ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
+            <div className="evaluation-workbench-actions">
+              <button disabled={savingSensitiveDataEvaluation || loadingSensitiveDataEvaluation} onClick={saveSensitiveDataEvaluationCases} type="button">
+                {savingSensitiveDataEvaluation ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
                 {t('保存评测集')}
               </button>
-              <button
-                className="ui-button ui-button--primary"
-                disabled={runningSensitiveDataEvaluation || loadingSensitiveDataEvaluation || !sensitiveDataEvaluationCases.length}
-                onClick={runSensitiveDataEvaluation}
-                type="button"
-              >
-                {runningSensitiveDataEvaluation ? <Loader2 className="spin" size={15} /> : null}
+              <button disabled={runningSensitiveDataEvaluation || loadingSensitiveDataEvaluation || !sensitiveDataEvaluationCases.length} onClick={runSensitiveDataEvaluation} type="button">
+                {runningSensitiveDataEvaluation ? <Loader2 className="spin" size={16} /> : <PlayCircle size={16} />}
                 {t(runningSensitiveDataEvaluation ? '正在评测' : '运行评测')}
               </button>
-              <button className="ui-button" onClick={addSensitiveDataEvaluationCase} type="button">
-                <Plus size={15} />
+              <button className="primary" data-slot="evaluation-primary-action" onClick={addSensitiveDataEvaluationCase} type="button">
+                <Plus size={17} />
                 {t('新增用例')}
               </button>
             </div>
-          </div>
-          <div className="settings-sensitive-data-evaluation-note">
-            {t('评测集会保存在本机配置数据库中，请只使用合成测试数据，不要保存真实密码、令牌或个人隐私。')}
-          </div>
-          {sensitiveDataEvaluationError ? (
-            <div className="settings-sensitive-data-test-error" role="alert">{sensitiveDataEvaluationError}</div>
-          ) : null}
-          {sensitiveDataEvaluationRun ? (
-            <div className="settings-sensitive-data-evaluation-summary" aria-live="polite">
-              <div><strong>{sensitiveDataEvaluationRun.summary.passed}/{sensitiveDataEvaluationRun.summary.total}</strong><span>{t('通过用例')}</span></div>
-              <div><strong>{Math.round(sensitiveDataEvaluationRun.summary.precision * 100)}%</strong><span>{t('精确率')}</span></div>
-              <div><strong>{Math.round(sensitiveDataEvaluationRun.summary.recall * 100)}%</strong><span>{t('召回率')}</span></div>
-            </div>
-          ) : null}
+          </header>
+          {sensitiveDataEvaluationError ? <div className="settings-sensitive-data-test-error" role="alert">{sensitiveDataEvaluationError}</div> : null}
           {loadingSensitiveDataEvaluation ? (
             <div className="settings-sensitive-data-test-empty"><Loader2 className="spin" size={16} /> {t('正在读取评测集')}</div>
-          ) : sensitiveDataEvaluationCases.length ? (
-            <div className="settings-sensitive-data-evaluation-list">
-              {sensitiveDataEvaluationCases.map((item, index) => {
-                const result = evaluationResults.get(item.id);
-                return (
-                  <article className="settings-sensitive-data-evaluation-case" key={item.id}>
-                    <div className="settings-sensitive-data-evaluation-case-head">
-                      <AppInput
-                        aria-label={t('用例名称')}
-                        onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { name: event.target.value })}
-                        placeholder={t('用例 {index}', { index: index + 1 })}
-                        value={item.name}
-                      />
-                      {result ? (
-                        <span className={`settings-sensitive-data-evaluation-status ${result.passed ? 'passed' : 'failed'}`}>
-                          {t(result.passed ? '通过' : '未通过')}
-                        </span>
-                      ) : null}
-                      <button
-                        aria-label={t('删除用例')}
-                        className="ui-button ui-button--icon"
-                        onClick={() => removeSensitiveDataEvaluationCase(item.id)}
-                        type="button"
-                      >
-                        <Trash2 size={15} />
-                      </button>
-                    </div>
-                    <div className="settings-sensitive-data-evaluation-case-grid">
-                      <label className="settings-sensitive-data-test-field">
-                        <strong>{t('评测文本')}</strong>
-                        <TextArea
-                          className="settings-sensitive-data-evaluation-textarea"
-                          fullWidth
-                          onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { text: event.target.value })}
-                          placeholder={t('输入包含合成敏感数据的测试文本。')}
-                          value={item.text}
-                        />
-                      </label>
-                      <label className="settings-sensitive-data-test-field">
-                        <strong>{t('预期敏感原文（每行一项）')}</strong>
-                        <TextArea
-                          className="settings-sensitive-data-evaluation-textarea"
-                          fullWidth
-                          onChange={(event) => updateSensitiveDataEvaluationCase(item.id, { expectedValuesText: event.target.value })}
-                          placeholder={t('例如：\nzhangsan@example.com\n13800138000')}
-                          value={item.expectedValuesText}
-                        />
-                      </label>
-                    </div>
-                    {result ? (
-                      <div className="settings-sensitive-data-evaluation-result">
-                        <div>
-                          <strong>{t('脱敏结果')}</strong>
-                          <pre>{result.text}</pre>
-                        </div>
-                        <div className="settings-sensitive-data-evaluation-findings">
-                          <span><strong>{t('已检测')}</strong>{result.detectedValues.length ? result.detectedValues.join(' · ') : t('无')}</span>
-                          {result.missingValues.length ? <span className="missing"><strong>{t('漏检')}</strong>{result.missingValues.join(' · ')}</span> : null}
-                          {result.unexpectedValues.length ? <span className="unexpected"><strong>{t('误报')}</strong>{result.unexpectedValues.join(' · ')}</span> : null}
-                        </div>
+          ) : selectedEvaluationCase ? (
+            <div className="evaluation-workbench-shell">
+              <aside className="evaluation-case-sidebar">
+                <div className="evaluation-case-sidebar-head">
+                  <strong>{t('用例列表')}</strong>
+                  <div>
+                    <button aria-label={t('新增用例')} onClick={addSensitiveDataEvaluationCase} type="button"><Plus size={18} /></button>
+                  </div>
+                </div>
+                <label className="evaluation-case-search">
+                  <Search aria-hidden="true" size={16} />
+                  <input onChange={(event) => setSensitiveDataEvaluationSearch(event.target.value)} placeholder={t('搜索用例')} value={sensitiveDataEvaluationSearch} />
+                </label>
+                <div className="evaluation-case-list">
+                  {visibleEvaluationCases.map((item) => {
+                    const index = sensitiveDataEvaluationCases.findIndex((entry) => entry.id === item.id);
+                    const result = evaluationResults.get(item.id);
+                    const count = item.expectedValuesText.split(/\r?\n/).filter((value) => value.trim()).length;
+                    return (
+                      <div className={`evaluation-case-row${item.id === selectedEvaluationCase.id ? ' is-active' : ''}`} key={item.id}>
+                        <button className="evaluation-case-select" onClick={() => setSelectedSensitiveDataEvaluationCaseId(item.id)} type="button">
+                          <span className="case-index">{String(index + 1).padStart(2, '0')}</span>
+                          <span className="case-name">{evaluationCaseDisplayName(item.name, index)}</span>
+                          {result ? result.passed ? <CircleCheck className="case-pass" size={15} /> : <AlertCircle className="case-fail" size={15} /> : <span className="case-pending" />}
+                          <span className="case-count">{count}</span>
+                        </button>
+                        <button className="evaluation-case-delete" aria-label={t('删除用例')} onClick={() => removeSensitiveDataEvaluationCase(item.id)} title={t('删除用例')} type="button"><Trash2 size={14} /></button>
                       </div>
-                    ) : null}
-                  </article>
-                );
-              })}
+                    );
+                  })}
+                </div>
+              </aside>
+              <section className="evaluation-editor-pane">
+                <div className="evaluation-editor-toolbar">
+                  <input aria-label={t('用例名称')} className="evaluation-case-name-input" onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { name: event.target.value })} value={evaluationCaseDisplayName(selectedEvaluationCase.name, selectedEvaluationIndex)} />
+                  <div>
+                    <button aria-label={t('复制')} onClick={() => void navigator.clipboard?.writeText(selectedEvaluationCase.text)} type="button"><Copy size={16} /></button>
+                    <button aria-label={t('全屏')} onClick={() => setSensitiveDataEvaluationExpanded((current) => !current)} type="button"><Maximize2 size={16} /></button>
+                  </div>
+                </div>
+                <div className="evaluation-text-editor">
+                  <div className="evaluation-line-numbers" aria-hidden="true">
+                    {Array.from({ length: Math.max(15, selectedEvaluationCase.text.split('\n').length) }, (_, index) => <span key={index}>{index + 1}</span>)}
+                  </div>
+                  <div className="evaluation-editor-content">
+                    <pre aria-hidden="true">{highlightedSensitiveText(selectedEvaluationCase.text, selectedEvaluationValues)}</pre>
+                    <textarea onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { text: event.target.value })} placeholder={t('输入包含合成敏感数据的测试文本。')} spellCheck={false} value={selectedEvaluationCase.text} />
+                  </div>
+                </div>
+              </section>
+              <aside className="evaluation-inspector-pane">
+                <div className="evaluation-inspector-tabs">
+                  <button className={sensitiveDataEvaluationPanelTab === 'expected' ? 'is-active' : ''} onClick={() => setSensitiveDataEvaluationPanelTab('expected')} type="button">{t('预期敏感原文')}</button>
+                  <button className={sensitiveDataEvaluationPanelTab === 'result' ? 'is-active' : ''} onClick={() => setSensitiveDataEvaluationPanelTab('result')} type="button">{t('检测结果')}</button>
+                </div>
+                {sensitiveDataEvaluationPanelTab === 'expected' ? (
+                  <div className="evaluation-inspector-content">
+                    <form className="evaluation-expected-add" onSubmit={(event) => { event.preventDefault(); addSensitiveDataEvaluationExpectedValue(selectedEvaluationCase.id); }}>
+                      <input aria-label={t('预期敏感原文')} onChange={(event) => setSensitiveDataEvaluationNewExpectedValue(event.target.value)} placeholder={t('输入预期敏感原文')} value={sensitiveDataEvaluationNewExpectedValue} />
+                      <button disabled={!sensitiveDataEvaluationNewExpectedValue.trim()} type="submit"><Plus size={15} />{t('添加')}</button>
+                    </form>
+                    <p className="evaluation-expected-help">{t('预期敏感原文是评测标准答案，用于计算漏检、误报、精确率和召回率。')}</p>
+                    <div className="evaluation-inspector-count">{t('共 {count} 项', { count: selectedEvaluationValues.length })}</div>
+                    {selectedEvaluationGroups.map((group) => {
+                      const collapsed = collapsedSensitiveDataGroups.has(`${selectedEvaluationCase.id}:${group.id}`);
+                      return (
+                        <section className={`evaluation-value-group group-${group.id}${collapsed ? ' is-collapsed' : ''}`} key={group.id}>
+                          <button className="evaluation-value-group-head" onClick={() => toggleSensitiveDataEvaluationGroup(selectedEvaluationCase.id, group.id)} type="button"><SensitiveValueGroupIcon id={group.id} /><strong>{group.label}</strong><span>{group.items.length}</span><ChevronDown size={15} /></button>
+                          {collapsed ? null : (
+                            <div className="evaluation-value-chips">
+                              {group.items.map((value) => <span key={value}>{value}<button aria-label={t('删除 {value}', { value })} onClick={() => removeSensitiveDataEvaluationExpectedValue(selectedEvaluationCase.id, value)} type="button"><X size={12} /></button></span>)}
+                            </div>
+                          )}
+                        </section>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="evaluation-result-panel">
+                    {selectedEvaluationResult ? (
+                      <>
+                        <pre>{selectedEvaluationResult.text}</pre>
+                        <div className="result-finding result-missing"><strong>{t('漏检')}</strong>{selectedEvaluationResult.missingValues.length ? selectedEvaluationResult.missingValues.map((value) => <span key={value}>{value}</span>) : <em>{t('无')}</em>}</div>
+                        <div className="result-finding result-unexpected"><strong>{t('误报')}</strong>{selectedEvaluationResult.unexpectedValues.length ? selectedEvaluationResult.unexpectedValues.map((value) => <span key={value}>{value}</span>) : <em>{t('无')}</em>}</div>
+                      </>
+                    ) : <div className="evaluation-result-empty">{t('运行评测后查看检测结果。')}</div>}
+                  </div>
+                )}
+              </aside>
+              <footer className="evaluation-status-bar" aria-live="polite">
+                <span className="detected"><CircleCheck size={15} />{t('已检测')} <strong>{selectedEvaluationResult?.detectedValues.length || 0}</strong></span>
+                <span className="missing"><AlertCircle size={15} />{t('漏检')} <strong>{selectedEvaluationResult?.missingValues.length || 0}</strong></span>
+                <span className="unexpected"><AlertCircle size={15} />{t('误报')} <strong>{selectedEvaluationResult?.unexpectedValues.length || 0}</strong></span>
+                <span>{t('召回率')} <strong>{selectedEvaluationResult ? `${selectedEvaluationRecall}%` : '—'}</strong></span>
+              </footer>
             </div>
           ) : (
             <div className="settings-sensitive-data-test-empty">{t('暂无评测用例，点击“新增用例”开始配置。')}</div>
@@ -1205,6 +1448,7 @@ export function EnvironmentSettings({
       return (
         <div className="settings-prompt-control">
           <TextArea
+            className="settings-textarea-control"
             fullWidth
             placeholder={t('未设置')}
             value={item.value}
@@ -1734,7 +1978,6 @@ export function EnvironmentSettings({
   const activeProviderOption = modelProviderDefinition(activeProvider);
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
   const activeProviderModels = draftModelRows(activeProviderOption, activeProviderSettings);
-  const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || activeProviderOption.defaultModel;
   const activeProviderEnabled = activeProviderSettings.enabled === true;
   const activeProviderSupportsExtraRequestParameters = activeProvider === 'minimax' || activeProvider.startsWith('openai-compatible');
   const activeProviderExtraRequestParameterRows = extraRequestParameterRows[activeProvider] || [];
@@ -1742,6 +1985,7 @@ export function EnvironmentSettings({
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
     .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
+  const visibleEnvGroups = groupVisibleEnvSettings(activeTab, visibleEnvItems);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -1788,7 +2032,7 @@ export function EnvironmentSettings({
                   <span>{t('选择界面显示语言。')}</span>
                 </div>
               </div>
-              <div className="settings-card">
+              <SettingsGroupCard title={t('基础设置')}>
                 <div className="settings-row">
                   <div>
                     <strong>{t('界面语言')}</strong>
@@ -1830,7 +2074,7 @@ export function EnvironmentSettings({
                     />
                   </div>
                 </div>
-              </div>
+              </SettingsGroupCard>
             </section>
           ) : null}
 
@@ -1854,23 +2098,33 @@ export function EnvironmentSettings({
                   </button>
                 </div>
               </div>
-              <div className="settings-card settings-model-card">
-                <div className="settings-model-group">
-                  <h3>{t('基础')}</h3>
-                  <div className="settings-model-group-body">
+              <div className="settings-group-stack settings-model-card">
+                <SettingsGroupCard className="settings-model-group" title={t('基础信息')}>
                 <div className="settings-row">
                   <div>
-                    <strong>{t('默认服务商')}</strong>
-                    <span>{t('选择默认使用的 AI 模型服务提供商。')}</span>
+                    <strong>{t('模型供应商')}</strong>
+                    <span>{t('选择要查看和编辑的模型服务供应商。')}</span>
                   </div>
                   <CustomSelect
                     className="settings-control"
                     value={activeProvider}
                     onChange={(nextValue) => selectProvider(nextValue as ModelProvider)}
                     options={modelProviderDefinitions.map((provider) => ({
-                      label: t(provider.label),
+                      label: editingModelConfig.providers?.[provider.value]?.displayName?.trim() || t(provider.label),
                       value: provider.value,
                     }))}
+                  />
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>{t('供应商名称')}</strong>
+                    <span>{t('用于模型选择器中的分组名称，可按实际接入服务自由修改。')}</span>
+                  </div>
+                  <AppInput
+                    maxLength={80}
+                    onChange={(event) => updateActiveProviderSettings({ displayName: event.target.value })}
+                    placeholder={t(activeProviderOption.label)}
+                    value={activeProviderSettings.displayName || ''}
                   />
                 </div>
                 <div className="settings-row">
@@ -1889,29 +2143,18 @@ export function EnvironmentSettings({
                     <span />
                   </button>
                 </div>
-                <div className="settings-row">
+                <div className="settings-row settings-add-compatible-provider-row">
                   <div>
-                    <strong>{t('默认模型')}</strong>
-                    <span>{t('从当前服务商配置的模型列表中选择默认模型。')}</span>
+                    <strong>{t('OpenAI 兼容 API')}</strong>
+                    <span>{t('新增一个可独立配置名称、Base URL、访问密钥和模型列表的供应商。')}</span>
                   </div>
-                  <CustomSelect
-                    className="settings-control"
-                    disabled={!activeProviderEnabled}
-                    value={activeProviderDefaultModel}
-                    onChange={(nextModel) => updateActiveProviderSettings({ defaultModel: nextModel, model: nextModel })}
-                    options={modelListForProvider(activeProviderOption, activeProviderSettings).map((model) => ({
-                      label: model,
-                      value: model,
-                    }))}
-                    searchable
-                    searchPlaceholder={t('搜索模型')}
-                  />
+                  <button className="ui-button" onClick={addOpenAICompatibleProvider} type="button">
+                    <Plus size={15} />
+                    {t('添加兼容供应商')}
+                  </button>
                 </div>
-                  </div>
-                </div>
-                <div className="settings-model-group">
-                  <h3>{t('模型列表')}</h3>
-                  <div className="settings-model-group-body">
+                </SettingsGroupCard>
+                <SettingsGroupCard className="settings-model-group" title={t('模型列表')}>
                 <div className="settings-row settings-model-list-row">
                   <div>
                     <span>{t('一个服务商可以维护多个模型，运行时可在下拉框里按服务商分组选择。')}</span>
@@ -1921,9 +2164,10 @@ export function EnvironmentSettings({
                       <div className="settings-model-input-row" key={`${activeProvider}-${index}`}>
                         <AppInput
                           disabled={!activeProviderEnabled}
+                          prefix={<span className="settings-model-icon"><ModelBrandIcon model={model} provider={activeProvider} /></span>}
                           value={model}
                           onChange={(event) => updateActiveProviderModel(index, event.target.value)}
-                          placeholder={activeProviderOption.defaultModel}
+                          placeholder={t('模型名称')}
                           suffix={(
                             <button
                               aria-label={t('图片输入')}
@@ -1941,9 +2185,9 @@ export function EnvironmentSettings({
                         <button
                           aria-label={t('删除模型')}
                           className="settings-model-row-button danger"
-                          disabled={!activeProviderEnabled || activeProviderModels.length <= 1}
+                          disabled={!activeProviderEnabled}
                           onClick={() => removeActiveProviderModel(index)}
-                          title={activeProviderModels.length <= 1 ? t('至少保留一个模型') : t('删除模型')}
+                          title={t('删除模型')}
                           type="button"
                         >
                           <Trash2 size={15} />
@@ -1956,11 +2200,8 @@ export function EnvironmentSettings({
                     </button>
                   </div>
                 </div>
-                  </div>
-                </div>
-                <div className="settings-model-group">
-                  <h3>{t('连接')}</h3>
-                  <div className="settings-model-group-body">
+                </SettingsGroupCard>
+                <SettingsGroupCard className="settings-model-group" initiallyOpen={false} title={t('连接配置')}>
                 <div className="settings-row">
                   <div>
                     <strong>{t('访问密钥')}</strong>
@@ -2040,8 +2281,7 @@ export function EnvironmentSettings({
                     </div>
                   </div>
                 ) : null}
-                  </div>
-                </div>
+                </SettingsGroupCard>
               </div>
             </section>
           ) : null}
@@ -2065,17 +2305,21 @@ export function EnvironmentSettings({
                 </button>
               </div>
               {visibleEnvItems.length ? (
-                <div className="settings-card">
-                  {visibleEnvItems.map(({ item, index, definition }) => (
-                    <div className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}`} key={item.key}>
-                      <div className="env-name" title={item.key}>
-                        <strong>{definition?.label ? t(definition.label) : item.key}</strong>
-                        <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
-                      </div>
-                      <div className="settings-row-control">
-                        {renderRuntimeControl(item, index)}
-                      </div>
-                    </div>
+                <div className="settings-group-stack">
+                  {visibleEnvGroups.map((group, groupIndex) => (
+                    <SettingsGroupCard initiallyOpen={groupIndex < 2} key={group.title} title={t(group.title)}>
+                      {group.items.map(({ item, index, definition }) => (
+                        <div className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}`} key={item.key}>
+                          <div className="env-name" title={item.key}>
+                            <strong>{definition?.label ? t(definition.label) : item.key}</strong>
+                            <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
+                          </div>
+                          <div className="settings-row-control">
+                            {renderRuntimeControl(item, index)}
+                          </div>
+                        </div>
+                      ))}
+                    </SettingsGroupCard>
                   ))}
                 </div>
               ) : (

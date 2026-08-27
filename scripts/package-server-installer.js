@@ -50,6 +50,7 @@ function createServiceXml() {
     GLINER_DEVICE: 'cpu',
     GLINER_MODEL_BUNDLE_DIR: '%BASE%\\server\\gliner-runtime\\models\\gliner2',
     GLINER_CHINESE_NER_MODEL_BUNDLE_DIR: '%BASE%\\server\\gliner-runtime\\models\\chinese-roberta',
+    GLINER_PII_MODEL_BUNDLE_DIR: '%BASE%\\server\\gliner-runtime\\models\\liquid-pii',
     GLINER_PYTHON_PATH: '%BASE%\\server\\gliner-runtime\\python\\python.exe',
     GLINER_RUNTIME_MODE: 'local',
     GLINER_SERVICE_DIR: '%BASE%\\server\\gliner-runtime\\service',
@@ -218,8 +219,11 @@ function requiredServerPackageEntries(packageRoot = distributionRoot) {
     path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'app.py'),
     path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'candidate_resolution.py'),
     path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'entity_boundaries.py'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'service', 'deterministic_spans.py'),
     path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'gliner2', 'config.json'),
     path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'chinese-roberta', 'config.json'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'liquid-pii', 'config.json'),
+    path.join(packageRoot, 'server', 'gliner-runtime', 'models', 'liquid-pii', 'pii_hybrid_decode.py'),
   ];
 }
 

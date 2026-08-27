@@ -3578,15 +3578,8 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   .browser-chat-context-progress > span { transition: none; }
 }
 
-/* Keep the conversation card distinct from its theme-aware workspace canvas. */
 .browser-chat-conversation-layout {
-  --browser-chat-card-background: #ffffff;
-  --browser-chat-shell-background:
-    radial-gradient(900px 430px at 50% 4%, rgba(255, 255, 255, 0.24), transparent 77%),
-    radial-gradient(700px 250px at 18% 66%, rgba(119, 96, 244, 0.025), transparent 74%),
-    radial-gradient(700px 250px at 83% 66%, rgba(58, 200, 205, 0.024), transparent 74%),
-    linear-gradient(180deg, #f7f8fa 0%, #f6f6fa 48%, #f5f6fa 100%);
-  background: var(--browser-chat-shell-background);
+  background: var(--background);
 }
 
 .browser-chat-conversation-layout > .browser-chat-sidebar {
@@ -3594,20 +3587,11 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-conversation-layout > .browser-chat-main {
-  background: var(--browser-chat-card-background);
+  background: var(--background);
 }
 
 .browser-chat-conversation-layout > .browser-chat-main > .browser-chat-chat-pane:not(.embedded-chat) {
   background: transparent;
-}
-
-:root[data-theme="dark"] .browser-chat-conversation-layout {
-  --browser-chat-card-background: #15171b;
-  --browser-chat-shell-background:
-    radial-gradient(900px 430px at 50% 4%, rgba(255, 255, 255, 0.045), transparent 77%),
-    radial-gradient(700px 250px at 18% 66%, rgba(119, 96, 244, 0.05), transparent 74%),
-    radial-gradient(700px 250px at 83% 66%, rgba(58, 200, 205, 0.04), transparent 74%),
-    linear-gradient(180deg, #101217 0%, #0c0e12 48%, #090a0d 100%);
 }
 
 :root[data-theme="dark"] .browser-chat-conversation-layout > .browser-chat-sidebar {

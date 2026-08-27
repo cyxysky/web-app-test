@@ -155,6 +155,65 @@
   white-space: nowrap;
 }
 
+.settings-group-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.settings-group-card {
+  background: color-mix(in srgb, var(--surface) 97%, var(--foreground));
+  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 16px;
+  box-shadow: 0 8px 26px color-mix(in srgb, #0f172a 5%, transparent);
+  min-width: 0;
+}
+
+.settings-group-card-head {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  justify-content: space-between;
+  min-height: 52px;
+  padding: 0 16px;
+  text-align: left;
+  width: 100%;
+}
+
+.settings-group-card-head h3 {
+  color: inherit;
+  font-size: 14px;
+  font-weight: 720;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.settings-group-card-head svg {
+  color: var(--muted);
+  transition: transform 160ms ease;
+}
+
+.settings-group-card.is-expanded .settings-group-card-head svg {
+  transform: rotate(180deg);
+}
+
+.settings-group-card-body {
+  border-top: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
+  display: grid;
+  padding: 0 16px;
+}
+
+.settings-group-card-body > .settings-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+}
+
+.settings-group-card-body > .settings-row:last-child {
+  border-bottom: 0;
+}
+
 .settings-workspace .input:not([data-slot], [data-slot] *) {
   background: #ffffff;
   border-color: var(--border);
@@ -227,6 +286,44 @@
   display: grid;
   gap: 8px;
   grid-template-columns: minmax(0, 1fr) 38px;
+}
+
+.settings-model-icon {
+  align-items: center;
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--border) 74%, transparent);
+  border-radius: 7px;
+  color: var(--muted-strong);
+  display: inline-flex;
+  height: 24px;
+  justify-content: center;
+  width: 24px;
+}
+
+.model-brand-icon-images {
+  display: inline-grid;
+  height: 17px;
+  place-items: center;
+  width: 17px;
+}
+
+.model-brand-icon-images img {
+  grid-area: 1 / 1;
+  height: 17px;
+  object-fit: contain;
+  width: 17px;
+}
+
+.model-brand-icon-dark {
+  display: none;
+}
+
+:root[data-theme="dark"] .model-brand-icon-light {
+  display: none;
+}
+
+:root[data-theme="dark"] .model-brand-icon-dark {
+  display: block;
 }
 
 .settings-model-capability-button {
@@ -326,7 +423,7 @@
 
 .settings-textarea-control {
   line-height: 1.5;
-  min-height: 150px;
+  min-height: 220px;
   resize: vertical;
 }
 
@@ -434,7 +531,7 @@
 
 .settings-sensitive-data-test-input,
 .settings-sensitive-data-test-input [data-slot="textarea"] {
-  min-height: 150px;
+  min-height: 220px;
 }
 
 .settings-sensitive-data-test-output {
@@ -657,7 +754,7 @@
 
 .settings-sensitive-data-evaluation-textarea,
 .settings-sensitive-data-evaluation-textarea [data-slot="textarea"] {
-  min-height: 112px;
+  min-height: 240px;
 }
 
 .settings-sensitive-data-evaluation-result {
@@ -692,28 +789,678 @@
 }
 
 .settings-sensitive-data-evaluation-findings {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-sensitive-data-evaluation-findings .finding-group {
+  align-items: start;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.settings-sensitive-data-evaluation-findings .finding-group > strong {
+  line-height: 24px;
+  white-space: nowrap;
+}
+
+.settings-sensitive-data-evaluation-findings .finding-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.settings-sensitive-data-evaluation-findings .finding-tag {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 2px 8px;
+}
+
+.settings-sensitive-data-evaluation-findings .missing .finding-tag,
+.settings-sensitive-data-evaluation-findings .unexpected .finding-tag {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  border-color: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
+}
+
+.settings-sensitive-data-evaluation-workbench {
+  background: var(--surface, #fff);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--foreground);
+  min-width: 0;
+  overflow: hidden;
+  margin-left: 0;
+  width: 100%;
+}
+
+.settings-sensitive-data-evaluation-workbench.is-expanded {
+  background: var(--surface, #fff);
+  border-radius: 10px;
+  inset: 12px;
+  position: fixed;
+  z-index: 1200;
+}
+
+.evaluation-workbench-head {
+  align-items: center;
+  background: var(--surface, #fff);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  min-height: 72px;
+  padding: 12px 18px;
+}
+
+.evaluation-workbench-title {
+  align-items: baseline;
+  display: flex;
+  gap: 24px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.evaluation-workbench-title h3 {
+  color: var(--foreground);
+  flex: 0 0 auto;
+  font-size: 22px;
+  letter-spacing: -0.025em;
+  margin: 0;
+}
+
+.evaluation-workbench-title span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-workbench-actions {
+  align-items: center;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.evaluation-workbench-actions button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--foreground);
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 13px;
+  font-weight: 600;
+  gap: 7px;
+  height: 38px;
+  padding: 0 11px;
+}
+
+.evaluation-workbench-actions button:hover {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+
+.evaluation-workbench-actions button.primary {
+  background: var(--accent-strong) !important;
+  color: #fff !important;
+  padding-inline: 15px;
+}
+
+.evaluation-workbench-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.evaluation-workbench-shell {
+  display: grid;
+  grid-template-columns: minmax(185px, 20%) minmax(390px, 1fr) minmax(310px, 29%);
+  grid-template-rows: minmax(610px, 1fr) 46px;
+  height: min(760px, calc(100vh - 120px));
+  min-height: 650px;
+  min-width: 0;
+}
+
+.settings-sensitive-data-evaluation-workbench.is-expanded .evaluation-workbench-shell {
+  height: calc(100vh - 110px);
+}
+
+.evaluation-case-sidebar {
+  background: color-mix(in srgb, var(--surface) 98%, var(--foreground));
+  border-right: 1px solid var(--border);
+  display: grid;
+  grid-row: 1;
+  grid-template-rows: 54px auto minmax(0, 1fr);
+  min-width: 0;
+}
+
+.evaluation-case-sidebar-head {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 16px;
+}
+
+.evaluation-case-sidebar-head strong {
+  font-size: 14px;
+}
+
+.evaluation-case-sidebar-head > div,
+.evaluation-editor-toolbar > div {
+  align-items: center;
+  display: flex;
+  gap: 2px;
+}
+
+.evaluation-case-sidebar button,
+.evaluation-editor-pane button,
+.evaluation-inspector-pane button {
+  color: inherit;
+}
+
+.evaluation-case-sidebar-head button,
+.evaluation-editor-toolbar button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.evaluation-case-sidebar-head button:hover,
+.evaluation-editor-toolbar button:hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+}
+
+.evaluation-case-search {
+  align-items: center;
+  background: var(--control-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  display: flex;
+  gap: 8px;
+  height: 36px;
+  margin: 0 14px 14px;
+  padding: 0 10px;
+}
+
+.evaluation-case-search input {
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 12px;
+  min-width: 0;
+  outline: none;
+  width: 100%;
+}
+
+.evaluation-case-list {
+  overflow: auto;
+  padding: 0 10px;
+}
+
+.evaluation-case-row {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  min-height: 48px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.evaluation-case-row + .evaluation-case-row {
+  margin-top: 2px;
+}
+
+.evaluation-case-row.is-active {
+  background: color-mix(in srgb, var(--accent-soft) 68%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent-strong) 14%, var(--border));
+}
+
+.evaluation-case-select {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 26px minmax(0, 1fr) 16px 20px;
+  min-height: 46px;
+  padding: 7px 4px 7px 9px;
+  text-align: left;
+}
+
+.evaluation-case-delete {
+  align-items: center;
+  align-self: stretch;
+  background: transparent;
+  border: 0;
+  color: var(--muted) !important;
+  cursor: pointer;
+  display: inline-flex;
+  justify-content: center;
+}
+
+.evaluation-case-delete:hover {
+  background: color-mix(in srgb, var(--danger) 7%, transparent);
+  color: var(--danger) !important;
+}
+
+.evaluation-case-list .case-index,
+.evaluation-case-list .case-count {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evaluation-case-list .case-name {
+  font-size: 13px;
+  font-weight: 580;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evaluation-case-list .case-pass { color: #059669; }
+.evaluation-case-list .case-fail { color: var(--danger); }
+.evaluation-case-list .case-pending {
+  background: color-mix(in srgb, var(--muted) 42%, transparent);
+  border-radius: 50%;
+  height: 7px;
+  justify-self: center;
+  width: 7px;
+}
+
+.evaluation-editor-pane {
+  border-right: 1px solid var(--border);
+  display: grid;
+  grid-row: 1;
+  grid-template-rows: 52px minmax(0, 1fr);
+  min-width: 0;
+}
+
+.evaluation-case-name-input {
+  background: transparent;
+  border: 0;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 680;
+  min-width: 0;
+  outline: none;
+  width: min(360px, calc(100% - 80px));
+}
+
+.evaluation-editor-toolbar {
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  padding: 0 17px;
+}
+
+.evaluation-editor-toolbar strong {
+  font-size: 13px;
+}
+
+.evaluation-text-editor {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.evaluation-line-numbers {
+  border-right: 1px solid var(--border);
+  color: color-mix(in srgb, var(--muted) 78%, transparent);
+  display: grid;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 12px;
+  grid-auto-rows: 36px;
+  line-height: 36px;
+  overflow: hidden;
+  padding-top: 16px;
+  text-align: center;
+}
+
+.evaluation-editor-content {
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.evaluation-editor-content pre,
+.evaluation-editor-content textarea {
+  border: 0;
+  box-sizing: border-box;
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
+  font-size: 13px;
+  inset: 0;
+  line-height: 36px;
+  margin: 0;
+  overflow: auto;
+  padding: 16px 20px 40px;
+  position: absolute;
+  resize: none;
+  tab-size: 2;
+  white-space: pre-wrap;
+  width: 100%;
+}
+
+.evaluation-editor-content pre {
+  color: transparent;
+  overflow: hidden;
+  pointer-events: none;
+  word-break: break-word;
+}
+
+.evaluation-editor-content pre mark {
+  background: transparent;
+  border-bottom: 2px solid color-mix(in srgb, var(--accent-strong) 58%, transparent);
+  color: transparent;
+}
+
+.evaluation-editor-content textarea {
+  background: transparent;
+  color: var(--foreground);
+  outline: none;
+  word-break: break-word;
+}
+
+.evaluation-inspector-pane {
+  display: grid;
+  grid-row: 1;
+  grid-template-rows: 52px minmax(0, 1fr);
+  min-width: 0;
+  overflow: hidden;
+}
+
+.evaluation-inspector-tabs {
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 12px;
+  padding: 0 18px;
+}
+
+.evaluation-inspector-tabs button {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 650;
+  padding: 0 2px;
+}
+
+.evaluation-inspector-tabs button.is-active {
+  border-bottom-color: var(--accent-strong);
+  color: var(--accent-strong);
+}
+
+.evaluation-inspector-content,
+.evaluation-result-panel {
+  min-height: 0;
+  overflow: auto;
+}
+
+.evaluation-inspector-count {
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+  padding: 14px 18px;
+}
+
+.evaluation-expected-add {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 14px 18px 8px;
+}
+
+.evaluation-expected-add input {
+  background: var(--control-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--foreground);
+  font: inherit;
+  font-size: 12px;
+  height: 34px;
+  min-width: 0;
+  outline: none;
+  padding: 0 10px;
+}
+
+.evaluation-expected-add input:focus {
+  border-color: var(--accent-strong);
+}
+
+.evaluation-expected-add button {
+  align-items: center;
+  background: var(--accent-strong);
+  border: 0;
+  border-radius: 7px;
+  color: #fff !important;
+  cursor: pointer;
+  display: inline-flex;
+  font-size: 12px;
+  gap: 4px;
+  padding: 0 11px;
+}
+
+.evaluation-expected-add button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.evaluation-expected-help {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  margin: 0;
+  padding: 0 18px 10px;
+}
+
+.evaluation-value-group {
+  border-bottom: 1px solid var(--border);
+  padding: 0 18px 13px;
+}
+
+.evaluation-value-group-head {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 18px auto 1fr 16px;
+  min-height: 44px;
+  padding: 0;
+  text-align: left;
+  width: 100%;
+}
+
+.evaluation-value-group-head strong {
+  font-size: 13px;
+}
+
+.evaluation-value-group-head span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.evaluation-value-group-head > svg:last-child {
+  transition: transform 160ms ease;
+}
+
+.evaluation-value-group.is-collapsed .evaluation-value-group-head > svg:last-child {
+  transform: rotate(-90deg);
+}
+
+.group-organization .evaluation-value-group-head { color: #6366f1; }
+.group-project .evaluation-value-group-head { color: #0891b2; }
+.group-person .evaluation-value-group-head { color: #3b82f6; }
+.group-contact .evaluation-value-group-head { color: #0891b2; }
+.group-identity .evaluation-value-group-head { color: #2563eb; }
+.group-finance .evaluation-value-group-head { color: #ea580c; }
+.group-address .evaluation-value-group-head { color: #ef4444; }
+.group-security .evaluation-value-group-head { color: #7c3aed; }
+
+.evaluation-value-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 7px;
 }
 
-.settings-sensitive-data-evaluation-findings span {
-  background: color-mix(in srgb, var(--foreground) 5%, transparent);
-  border-radius: 8px;
-  color: var(--muted);
-  font-size: 12px;
+.evaluation-value-chips span,
+.result-finding span {
+  background: var(--control-bg, #fff);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--foreground);
+  font-size: 11px;
+  line-height: 1.35;
+  max-width: 100%;
   overflow-wrap: anywhere;
   padding: 6px 8px;
 }
 
-.settings-sensitive-data-evaluation-findings span strong {
-  margin-right: 6px;
+.evaluation-value-chips span {
+  align-items: center;
+  display: inline-flex;
+  gap: 5px;
 }
 
-.settings-sensitive-data-evaluation-findings .missing,
-.settings-sensitive-data-evaluation-findings .unexpected {
+.evaluation-value-chips span button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  justify-content: center;
+  margin: -3px -4px -3px 0;
+  padding: 3px;
+}
+
+.evaluation-value-chips span button:hover {
   background: color-mix(in srgb, var(--danger) 8%, transparent);
   color: var(--danger);
+}
+
+.evaluation-result-panel {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+}
+
+.evaluation-result-panel > pre {
+  background: color-mix(in srgb, var(--foreground) 3%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 11px;
+  line-height: 1.6;
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding: 11px;
+  white-space: pre-wrap;
+}
+
+.result-finding {
+  align-items: start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.result-finding strong {
+  font-size: 12px;
+  line-height: 29px;
+}
+
+.result-finding em,
+.evaluation-result-empty {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.evaluation-status-bar {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: grid;
+  font-size: 12px;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 0 20px;
+}
+
+.evaluation-status-bar span {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+}
+
+.evaluation-status-bar strong {
+  color: var(--foreground);
+  font-size: 13px;
+}
+
+.evaluation-status-bar .detected svg { color: #059669; }
+.evaluation-status-bar .missing svg { color: #f59e0b; }
+.evaluation-status-bar .unexpected svg { color: var(--danger); }
+
+@media (max-width: 1080px) {
+  .evaluation-workbench-title span { display: none; }
+  .evaluation-workbench-shell {
+    grid-template-columns: 190px minmax(380px, 1fr) minmax(300px, 38%);
+    overflow-x: auto;
+  }
+}
+
+@media (max-width: 760px) {
+  .evaluation-workbench-head,
+  .evaluation-workbench-title { align-items: flex-start; flex-direction: column; }
+  .evaluation-workbench-title { gap: 4px; }
+  .evaluation-workbench-title span { display: block; white-space: normal; }
+  .evaluation-workbench-actions { width: 100%; }
+  .evaluation-workbench-shell {
+    display: flex;
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+  .evaluation-case-sidebar { min-height: 240px; }
+  .evaluation-editor-pane { min-height: 620px; }
+  .evaluation-inspector-pane { min-height: 480px; }
+  .evaluation-status-bar {
+    flex: 0 0 54px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: 4px;
+  }
 }
 
 .env-name {

@@ -1,10 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import {
   compareSensitiveDataEvaluationValues,
+  DEFAULT_SENSITIVE_DATA_EVALUATION_CASES,
   normalizeSensitiveDataEvaluationCases,
 } from './sensitive-data-evaluation';
 
 describe('sensitive data evaluation helpers', () => {
+  it('provides three realistic mixed scenarios with at least ten sensitive values each', () => {
+    expect(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES).toHaveLength(3);
+    for (const item of DEFAULT_SENSITIVE_DATA_EVALUATION_CASES) {
+      expect(item.text.split('\n').length).toBeGreaterThanOrEqual(8);
+      expect(item.expectedValues.length).toBeGreaterThanOrEqual(10);
+      expect(item.expectedValues).toHaveLength(21);
+      for (const value of item.expectedValues) expect(item.text).toContain(value);
+    }
+  });
+
   it('normalizes cases and removes duplicate expected values', () => {
     expect(normalizeSensitiveDataEvaluationCases([
       {

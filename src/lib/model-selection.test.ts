@@ -82,3 +82,19 @@ test('modelSelectionDiagnosticLabel includes current and default model source', 
   assert.match(label, /deepseek-v4-pro/);
   assert.match(label, /自选模型/);
 });
+
+test('custom provider display name is used by model options and diagnostics', () => {
+  const renamedConfig: RuntimeModelConfig = {
+    ...config,
+    providers: {
+      deepseek: { ...config.providers.deepseek!, displayName: '企业模型网关' },
+    },
+  };
+
+  const options = modelSelectionOptionsForConfig(renamedConfig);
+  const label = modelSelectionDiagnosticLabel(renamedConfig, { provider: 'deepseek' });
+
+  assert.equal(options[0]?.group, '企业模型网关');
+  assert.match(options[0]?.selectedLabel || '', /^企业模型网关 - /);
+  assert.match(label, /提供商：企业模型网关/);
+});

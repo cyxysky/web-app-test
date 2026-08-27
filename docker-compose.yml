@@ -6,6 +6,7 @@ services:
         WEBPILOT_BASE_PATH: ${WEBPILOT_BASE_PATH:-}
         GLINER_MODEL: fastino/gliner2.5-multi-v1
         GLINER_CHINESE_NER_MODEL: uer/roberta-base-finetuned-cluener2020-chinese
+        GLINER_PII_MODEL: LiquidAI/LFM2.5-Encoder-350M-PII-Detector
     image: webpilot-qa:latest
     ports:
       - "3000:3000"

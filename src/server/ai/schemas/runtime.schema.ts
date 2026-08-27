@@ -241,6 +241,7 @@ export type ModelProvider =
   | 'xai';
 
 export type ModelProviderSettings = {
+  displayName?: string;
   enabled?: boolean;
   defaultModel?: string;
   model: string;

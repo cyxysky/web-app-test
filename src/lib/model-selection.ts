@@ -123,9 +123,10 @@ export function modelSelectionDiagnosticLabel(
   if (config && !enabledModelProviders(config).length) return '尚未启用模型服务商';
   const selection = resolveRuntimeModelSelection(config, input);
   const provider = modelProviderDefinition(selection.provider);
+  const providerLabel = config?.providers?.[selection.provider]?.displayName?.trim() || provider.label;
   const defaultModel = defaultModelForConfig(config, selection.provider);
   const source = selection.model === defaultModel ? '当前使用默认模型' : '当前使用自选模型';
-  return `提供商：${provider.label}\n模型：${selection.model}\n默认模型：${defaultModel}\n来源：${source}`;
+  return `提供商：${providerLabel}\n模型：${selection.model}\n默认模型：${defaultModel}\n来源：${source}`;
 }
 
 export function modelSelectionOptionsForConfig(config: RuntimeModelConfig | null | undefined): RuntimeModelOption[] {
@@ -133,10 +134,11 @@ export function modelSelectionOptionsForConfig(config: RuntimeModelConfig | null
   return modelProviderDefinitions.flatMap((provider) => {
     if (!isModelProviderEnabled(config, provider.value)) return [];
     const models = modelsForProvider(config, provider.value);
+    const providerLabel = config.providers?.[provider.value]?.displayName?.trim() || provider.label;
     return models.map((model) => ({
-      group: provider.label,
+      group: providerLabel,
       label: model,
-      selectedLabel: `${provider.label} - ${model}`,
+      selectedLabel: `${providerLabel} - ${model}`,
       value: modelSelectionValue(provider.value, model),
     }));
   });

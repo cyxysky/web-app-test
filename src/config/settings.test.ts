@@ -8,20 +8,11 @@ import {
   runtimeEnvDefinition,
 } from './settings';
 
-test('MiniMax exposes its official AI SDK endpoint and language models', () => {
+test('MiniMax exposes its official AI SDK endpoint without injecting models', () => {
   const definition = modelProviderDefinition('minimax');
   assert.equal(definition.defaultModel, 'minimax-m3');
   assert.equal(definition.defaultBaseURL, 'https://api.minimax.io/v1');
-  assert.deepEqual(modelListForProvider(definition), [
-    'minimax-m3',
-    'minimax-m2.7',
-    'minimax-m2.7-highspeed',
-    'minimax-m2.5',
-    'minimax-m2.5-highspeed',
-    'minimax-m2.1',
-    'minimax-m2.1-highspeed',
-    'minimax-m2',
-  ]);
+  assert.deepEqual(modelListForProvider(definition), []);
 });
 
 test('custom OpenAI-compatible APIs have a dedicated provider entry', () => {
@@ -45,6 +36,16 @@ test('exposes three independently configurable OpenAI-compatible providers', () 
   ]);
   assert.ok(providers.every((provider) => provider.defaultModel === 'custom-model'));
   assert.ok(providers.every((provider) => provider.baseUrlLabel));
+  assert.ok(providers.every((provider) => modelListForProvider(provider).length === 0));
+});
+
+test('does not retain the old synthetic custom-model placeholder', () => {
+  const definition = modelProviderDefinition('openai-compatible');
+  assert.deepEqual(modelListForProvider(definition, {
+    models: ['deepseek-v4-flash', 'custom-model', 'minimax-m3'],
+    defaultModel: 'custom-model',
+    model: 'custom-model',
+  }), ['deepseek-v4-flash', 'minimax-m3']);
 });
 
 test('MiniMax migrates saved official Anthropic endpoints to OpenAI endpoints', () => {

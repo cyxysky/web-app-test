@@ -7,15 +7,54 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from candidate_resolution import Candidate, correct_organization_boundaries, select_non_overlapping  # noqa: E402
-from entity_boundaries import company_label_kind, refine_company_candidate_spans  # noqa: E402
+from candidate_resolution import (  # noqa: E402
+    Candidate,
+    candidates_from_chunk_predictions,
+    correct_chinese_entity_boundaries,
+    select_non_overlapping,
+)
+from entity_boundaries import (  # noqa: E402
+    chinese_boundary_label_kind,
+    company_label_kind,
+    refine_company_candidate_spans,
+    requested_chinese_boundary_labels,
+)
 
 
-class CompanyCandidateBoundaryTests(unittest.TestCase):
+class ChineseEntityBoundaryTests(unittest.TestCase):
+    def test_chunk_end_prediction_uses_the_indexed_original_text(self):
+        texts = ["unrelated", "Alice suffix"]
+        self.assertEqual(
+            candidates_from_chunk_predictions(
+                texts,
+                1,
+                0,
+                "Alice",
+                [{"start": 0, "end": 5, "type": "identity.person_name"}],
+                {"identity.person_name": "person"},
+                [],
+                50,
+            ),
+            [],
+        )
+
     def test_classifies_open_company_and_organization_labels(self):
         self.assertEqual(company_label_kind("companyName"), "company")
         self.assertEqual(company_label_kind("organization name"), "organization")
         self.assertIsNone(company_label_kind("service"))
+
+    def test_classifies_person_labels_for_chinese_boundary_correction(self):
+        self.assertEqual(chinese_boundary_label_kind("name"), "name")
+        self.assertEqual(chinese_boundary_label_kind("full name"), "name")
+        self.assertEqual(chinese_boundary_label_kind("person"), "name")
+        self.assertEqual(chinese_boundary_label_kind("姓名"), "name")
+        self.assertIsNone(chinese_boundary_label_kind("product"))
+
+    def test_maps_requested_labels_to_roberta_entity_groups(self):
+        self.assertEqual(
+            requested_chinese_boundary_labels(["name", "company"]),
+            {"name": "name", "company": "company", "organization": "company"},
+        )
 
     def test_splits_two_companies_joined_by_a_relationship_word(self):
         text = "中科科技有限公司向华为技术有限公司提供 ACA 云服务。"
@@ -49,7 +88,7 @@ class CompanyCandidateBoundaryTests(unittest.TestCase):
             Candidate(0, 8, "company", 0.96, 40),
             Candidate(9, 17, "company", 0.95, 40),
         ]
-        corrected = correct_organization_boundaries(text, open_candidates, roberta_candidates)
+        corrected = correct_chinese_entity_boundaries(text, open_candidates, roberta_candidates)
         selected = select_non_overlapping(corrected)
         self.assertEqual([text[item.start:item.end] for item in selected], [
             "中科科技有限公司",
@@ -58,7 +97,7 @@ class CompanyCandidateBoundaryTests(unittest.TestCase):
 
     def test_suffix_fallback_keeps_an_organization_missed_by_roberta(self):
         text = "中科科技有限公司向华为技术有限公司提供"
-        corrected = correct_organization_boundaries(
+        corrected = correct_chinese_entity_boundaries(
             text,
             [Candidate(0, len(text), "company", 0.8, 10)],
             [Candidate(0, 8, "company", 0.96, 40)],
@@ -68,6 +107,15 @@ class CompanyCandidateBoundaryTests(unittest.TestCase):
             "中科科技有限公司",
             "华为技术有限公司",
         ])
+
+    def test_roberta_name_boundary_replaces_merged_gliner_name(self):
+        text = "例如：陈劲帆的邮箱是 zhangsan@example.com。"
+        name_start = text.index("陈劲帆")
+        open_candidates = [Candidate(name_start, text.index(" "), "name", 0.91, 10)]
+        roberta_candidates = [Candidate(name_start, name_start + len("陈劲帆"), "name", 0.99, 40)]
+        corrected = correct_chinese_entity_boundaries(text, open_candidates, roberta_candidates)
+        selected = select_non_overlapping(corrected)
+        self.assertEqual([text[item.start:item.end] for item in selected], ["陈劲帆"])
 
 
 if __name__ == "__main__":

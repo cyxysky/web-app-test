@@ -13,6 +13,7 @@ const sensitiveDataSettingKeys = [
   'AI_SENSITIVE_DATA_FILTER_THRESHOLD',
   'AI_SENSITIVE_DATA_FILTER_LABELS',
   'GLINER_MODEL',
+  'GLINER_PII_MODEL',
   'GLINER_DEVICE',
   'GLINER_BATCH_SIZE',
 ];
@@ -35,5 +36,10 @@ describe('sensitive-data settings tab', () => {
     expect(definition).toBeDefined();
     expect(normalizeRuntimeEnvValue(definition!, 'urchade/gliner_multi-v2.1'))
       .toBe('fastino/gliner2.5-multi-v1');
+  });
+
+  it('uses the LiquidAI PII detector as the fixed-label companion model', () => {
+    const definition = runtimeEnvDefinitions.find((item) => item.key === 'GLINER_PII_MODEL');
+    expect(definition?.defaultValue).toBe('LiquidAI/LFM2.5-Encoder-350M-PII-Detector');
   });
 });

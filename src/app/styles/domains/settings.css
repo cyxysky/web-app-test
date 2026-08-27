@@ -520,34 +520,30 @@
   padding-inline: 18px;
 }
 
-.browser-chat-settings-pane .settings-card.settings-model-card {
-  background: transparent;
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
-  overflow: visible;
-}
-
-.browser-chat-settings-pane .settings-model-group {
-  border-top: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
-  padding: 26px 0 18px;
-}
-
-.browser-chat-settings-pane .settings-model-group:first-child {
-  border-top: 0;
-  padding-top: 0;
-}
-
-.browser-chat-settings-pane .settings-model-group > h3 {
-  color: var(--foreground);
-  font-size: 16px;
-  font-weight: 650;
-  letter-spacing: -0.015em;
-  margin: 0 0 8px;
-}
-
-.browser-chat-settings-pane .settings-model-group-body {
+.browser-chat-settings-pane .settings-group-stack {
   display: grid;
+  gap: 12px;
+}
+
+.browser-chat-settings-pane .settings-group-card {
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 16px;
+  box-shadow: 0 8px 28px color-mix(in srgb, #0f172a 5%, transparent);
+}
+
+.browser-chat-settings-pane .settings-group-card-head {
+  min-height: 54px;
+  padding-inline: 18px;
+}
+
+.browser-chat-settings-pane .settings-group-card-head h3 {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.browser-chat-settings-pane .settings-group-card-body {
+  padding-inline: 18px;
 }
 
 .browser-chat-settings-pane .settings-model-group .settings-row,
@@ -584,6 +580,11 @@
   line-height: 1.55;
 }
 
+.browser-chat-settings-pane .settings-model-group .settings-model-icon {
+  color: var(--muted-strong);
+  font-size: 0;
+}
+
 .browser-chat-settings-pane .settings-model-group .custom-select.settings-control,
 .browser-chat-settings-pane .settings-model-group .input:not([data-slot], [data-slot] *),
 .browser-chat-settings-pane .settings-model-group .textarea:not([data-slot], [data-slot] *) {
@@ -608,10 +609,6 @@
 .browser-chat-settings-pane .settings-model-group .settings-add-model-button {
   justify-self: center;
   width: max-content;
-}
-
-.browser-chat-settings-pane .settings-model-group .settings-textarea-control {
-  min-height: 154px;
 }
 
 @container settings-pane (max-width: 760px) {

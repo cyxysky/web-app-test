@@ -21,7 +21,7 @@ export type SensitiveDataRedactionResult = {
   replacements: GlinerReplacement[];
 };
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 const PLACEHOLDER_PATTERN = /^\[SENSITIVE_[A-Z0-9_]+_\d+\]$/;
 let lastFailOpenWarningAt = 0;
 
@@ -127,7 +127,7 @@ function failOpen() {
 
 function requestTimeoutMs() {
   const configured = Number(process.env.AI_SENSITIVE_DATA_FILTER_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
-  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 120_000) : DEFAULT_TIMEOUT_MS;
+  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 600_000) : DEFAULT_TIMEOUT_MS;
 }
 
 function configuredLabels() {

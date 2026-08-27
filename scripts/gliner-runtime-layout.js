@@ -12,8 +12,11 @@ function requiredGlinerRuntimeEntries(runtimeRoot = preparedGlinerRuntimeRoot) {
     path.join(runtimeRoot, 'service', 'app.py'),
     path.join(runtimeRoot, 'service', 'candidate_resolution.py'),
     path.join(runtimeRoot, 'service', 'entity_boundaries.py'),
+    path.join(runtimeRoot, 'service', 'deterministic_spans.py'),
     path.join(runtimeRoot, 'models', 'gliner2', 'config.json'),
     path.join(runtimeRoot, 'models', 'chinese-roberta', 'config.json'),
+    path.join(runtimeRoot, 'models', 'liquid-pii', 'config.json'),
+    path.join(runtimeRoot, 'models', 'liquid-pii', 'pii_hybrid_decode.py'),
   ];
 }
 

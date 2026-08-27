@@ -1,8 +1,11 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   bundledGlinerRuntimeDirectories,
   localGlinerPythonCandidates,
+  localGlinerServiceRevision,
   localGlinerServiceDirectories,
   normalizedGlinerModelName,
   normalizedGlinerRuntimeMode,
@@ -28,5 +31,19 @@ describe('local GLiNER runtime configuration', () => {
     expect(localGlinerServiceDirectories(projectRoot, serviceDirectory)[0]).toBe(serviceDirectory);
     expect(localGlinerPythonCandidates(projectRoot, pythonPath)[0]).toBe(pythonPath);
     expect(bundledGlinerRuntimeDirectories(projectRoot)[0]).toBe(path.join(projectRoot, 'gliner-runtime'));
+  });
+
+  it('changes the service revision when a detector source changes', () => {
+    const serviceDirectory = mkdtempSync(path.join(tmpdir(), 'gliner-revision-'));
+    try {
+      for (const filename of ['app.py', 'candidate_resolution.py', 'entity_boundaries.py', 'deterministic_spans.py']) {
+        writeFileSync(path.join(serviceDirectory, filename), filename);
+      }
+      const before = localGlinerServiceRevision(serviceDirectory);
+      writeFileSync(path.join(serviceDirectory, 'deterministic_spans.py'), 'updated detector');
+      expect(localGlinerServiceRevision(serviceDirectory)).not.toBe(before);
+    } finally {
+      rmSync(serviceDirectory, { force: true, recursive: true });
+    }
   });
 });

@@ -20,6 +20,7 @@ import type {
 } from '@/server/ai/schemas/runtime.schema';
 import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import {
+  DEFAULT_SENSITIVE_DATA_EVALUATION_CASES,
   normalizeSensitiveDataEvaluationCases,
   type SensitiveDataEvaluationCase,
 } from '@/lib/sensitive-data-evaluation';
@@ -133,6 +134,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
   const models = modelListForProvider(definition);
   const model = defaultModelForProvider(definition);
   return {
+    displayName: '',
     enabled: false,
     defaultModel: model,
     model,
@@ -358,11 +360,17 @@ export const store = {
   },
   listSensitiveDataEvaluationCases() {
     const serialized = readRuntimeMeta(sensitiveDataEvaluationCasesMetaKey);
-    if (!serialized) return [];
+    if (!serialized) return normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
     try {
-      return normalizeSensitiveDataEvaluationCases(JSON.parse(serialized));
+      const storedCases = normalizeSensitiveDataEvaluationCases(JSON.parse(serialized));
+      if (storedCases.some((item) => item.id === 'default-person-name-1')) {
+        return normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
+      }
+      return storedCases.length
+        ? storedCases
+        : normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
     } catch {
-      return [];
+      return normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
     }
   },
   saveSensitiveDataEvaluationCases(cases: SensitiveDataEvaluationCase[]) {

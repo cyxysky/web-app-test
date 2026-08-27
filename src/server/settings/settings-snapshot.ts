@@ -15,6 +15,7 @@ function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings
   const models = modelListForProvider(definition);
   const model = defaultModelForProvider(definition);
   return {
+    displayName: '',
     enabled: false,
     defaultModel: model,
     model,
