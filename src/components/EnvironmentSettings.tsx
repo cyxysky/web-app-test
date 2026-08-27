@@ -2109,10 +2109,16 @@ export function EnvironmentSettings({
                     className="settings-control"
                     value={activeProvider}
                     onChange={(nextValue) => selectProvider(nextValue as ModelProvider)}
-                    options={modelProviderDefinitions.map((provider) => ({
-                      label: editingModelConfig.providers?.[provider.value]?.displayName?.trim() || t(provider.label),
-                      value: provider.value,
-                    }))}
+                    options={modelProviderDefinitions
+                      .filter((provider) => {
+                        if (provider.value !== 'openai-compatible-2' && provider.value !== 'openai-compatible-3') return true;
+                        const settings = editingModelConfig.providers?.[provider.value];
+                        return Boolean(settings?.enabled || settings?.displayName?.trim() || settings?.apiKey || settings?.hasApiKey || settings?.baseURL);
+                      })
+                      .map((provider) => ({
+                        label: editingModelConfig.providers?.[provider.value]?.displayName?.trim() || t(provider.label),
+                        value: provider.value,
+                      }))}
                   />
                 </div>
                 <div className="settings-row">
