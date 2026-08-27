@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { TextArea } from '@heroui/react';
 import Link from 'next/link';
-import { AlertCircle, ArrowLeft, BadgeDollarSign, Building2, ChevronDown, CircleCheck, Copy, FileKey2, FileText, FolderOpen, ImageIcon, KeyRound, Loader2, MapPin, Maximize2, PencilLine, Phone, PlayCircle, Plus, RefreshCw, Save, Search, Trash2, UserRound, X } from 'lucide-react';
+import { AlertCircle, ArrowLeft, ChevronDown, CircleCheck, Copy, FolderOpen, ImageIcon, KeyRound, Loader2, Maximize2, PencilLine, PlayCircle, Plus, RefreshCw, Save, Search, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
@@ -47,6 +47,7 @@ import {
   type ExtraRequestParameterPair,
 } from '@/lib/extra-request-parameters';
 import type { SensitiveDataEvaluationCase } from '@/lib/sensitive-data-evaluation';
+import { WorkspaceSidebarArchiveRow } from '@/components/WorkspaceSidebarArchive';
 
 export {
   environmentSettingsTabs,
@@ -130,7 +131,9 @@ type SensitiveDataEvaluationCaseResult = {
   id: string;
   passed: boolean;
   text: string;
+  replacements: SensitiveDataTestReplacement[];
   detectedValues: string[];
+  matchedValues: string[];
   missingValues: string[];
   unexpectedValues: string[];
 };
@@ -383,53 +386,27 @@ function draftModelRows(definition: ReturnType<typeof modelProviderDefinition>, 
     ));
 }
 
-type SensitiveValueGroupId = 'organization' | 'project' | 'person' | 'contact' | 'identity' | 'finance' | 'address' | 'security' | 'other';
+type SensitiveEvaluationTagStatus = 'pending' | 'matched' | 'missing' | 'unexpected';
 
-const sensitiveValueGroupOrder: Array<{ id: SensitiveValueGroupId; label: string }> = [
-  { id: 'organization', label: '组织机构' },
-  { id: 'project', label: '合同与项目' },
-  { id: 'person', label: '人员信息' },
-  { id: 'contact', label: '联系方式' },
-  { id: 'identity', label: '身份与证件' },
-  { id: 'finance', label: '财务与账户' },
-  { id: 'address', label: '地址信息' },
-  { id: 'security', label: '安全凭据' },
-  { id: 'other', label: '其他信息' },
-];
-
-function sensitiveValueGroup(text: string, value: string): SensitiveValueGroupId {
-  const index = text.indexOf(value);
-  const before = index >= 0 ? text.slice(0, index) : '';
-  const clauseStart = Math.max(before.lastIndexOf('；'), before.lastIndexOf('。'), before.lastIndexOf('\n'), before.lastIndexOf('，'));
-  const context = index >= 0 ? `${before.slice(clauseStart + 1)}${value}` : value;
-  if (/API|Key|令牌|密钥|token|ghp_|AKIA|密码|服务器IP|公网IP/i.test(context)) return 'security';
-  if (/地址|办公地|交付地|邮寄地/.test(context)) return 'address';
-  if (/身份证|护照|出生日期|实名|证件/.test(context)) return 'identity';
-  if (/银行账号|账户|账号|金额|薪|预算|回款|人民币|万元|亿元|K\/月|元\/月|元\/年|￥|¥/.test(context)) return 'finance';
-  if (/合同|项目|编号|编码|代号/.test(context)) return 'project';
-  if (/负责人|联系人|审批人|职位|岗位|工号|用户名|员工|研发|工程师|总监|财务官/.test(context)) return 'person';
-  if (/客户|供应商|实施方|相对方|公司|产品|平台|系统|医疗|零售|智造/.test(context)) return 'organization';
-  if (/邮箱|电话|手机|@/.test(context)) return 'contact';
-  return 'other';
+function canonicalSensitiveValue(value: string) {
+  return value.normalize('NFKC').trim().toLocaleLowerCase();
 }
 
-function groupedSensitiveValues(text: string, values: string[]) {
-  const groups = new Map<SensitiveValueGroupId, string[]>();
-  for (const value of values) {
-    const group = sensitiveValueGroup(text, value);
-    groups.set(group, [...(groups.get(group) || []), value]);
-  }
-  return sensitiveValueGroupOrder.flatMap((group) => {
-    const items = groups.get(group.id) || [];
-    return items.length ? [{ ...group, items }] : [];
-  });
-}
-
-function highlightedSensitiveText(text: string, values: string[]): ReactNode[] {
+function highlightedSensitiveText(
+  text: string,
+  values: string[],
+): ReactNode[] {
   const matches = values
     .flatMap((value) => {
-      const start = text.indexOf(value);
-      return start >= 0 ? [{ start, end: start + value.length, value }] : [];
+      const occurrences: Array<{ start: number; end: number; value: string }> = [];
+      let cursor = 0;
+      while (value && cursor < text.length) {
+        const start = text.indexOf(value, cursor);
+        if (start < 0) break;
+        occurrences.push({ start, end: start + value.length, value });
+        cursor = start + value.length;
+      }
+      return occurrences;
     })
     .sort((a, b) => a.start - b.start || b.end - a.end)
     .filter((match, index, matches) => index === 0 || match.start >= matches[index - 1].end);
@@ -438,22 +415,27 @@ function highlightedSensitiveText(text: string, values: string[]): ReactNode[] {
   let cursor = 0;
   for (const match of matches) {
     if (match.start > cursor) output.push(text.slice(cursor, match.start));
-    output.push(<mark key={`${match.start}:${match.value}`}>{text.slice(match.start, match.end)}</mark>);
+    output.push(
+      <mark key={`${match.start}:${match.value}`}>
+        {text.slice(match.start, match.end)}
+      </mark>,
+    );
     cursor = match.end;
   }
   if (cursor < text.length) output.push(text.slice(cursor));
   return output;
 }
 
-function SensitiveValueGroupIcon({ id }: { id: SensitiveValueGroupId }) {
-  const props = { 'aria-hidden': true, size: 16, strokeWidth: 1.9 } as const;
-  if (id === 'organization') return <Building2 {...props} />;
-  if (id === 'project') return <FileText {...props} />;
-  if (id === 'person') return <UserRound {...props} />;
-  if (id === 'contact') return <Phone {...props} />;
-  if (id === 'finance') return <BadgeDollarSign {...props} />;
-  if (id === 'address') return <MapPin {...props} />;
-  return <FileKey2 {...props} />;
+function sensitiveEvaluationTagStatus(
+  value: string,
+  result?: SensitiveDataEvaluationCaseResult,
+): SensitiveEvaluationTagStatus {
+  if (!result) return 'pending';
+  const key = canonicalSensitiveValue(value);
+  if (result.unexpectedValues.some((item) => canonicalSensitiveValue(item) === key)) return 'unexpected';
+  if (result.missingValues.some((item) => canonicalSensitiveValue(item) === key)) return 'missing';
+  if (result.matchedValues.some((item) => canonicalSensitiveValue(item) === key)) return 'matched';
+  return 'pending';
 }
 
 function evaluationCaseDisplayName(name: string, index: number) {
@@ -528,10 +510,8 @@ export function EnvironmentSettings({
   const [sensitiveDataEvaluationRun, setSensitiveDataEvaluationRun] = useState<SensitiveDataEvaluationRun | null>(null);
   const [selectedSensitiveDataEvaluationCaseId, setSelectedSensitiveDataEvaluationCaseId] = useState('');
   const [sensitiveDataEvaluationSearch, setSensitiveDataEvaluationSearch] = useState('');
-  const [sensitiveDataEvaluationPanelTab, setSensitiveDataEvaluationPanelTab] = useState<'expected' | 'result'>('expected');
   const [sensitiveDataEvaluationExpanded, setSensitiveDataEvaluationExpanded] = useState(false);
   const [sensitiveDataEvaluationNewExpectedValue, setSensitiveDataEvaluationNewExpectedValue] = useState('');
-  const [collapsedSensitiveDataGroups, setCollapsedSensitiveDataGroups] = useState<Set<string>>(() => new Set());
   const [sensitiveDataEvaluationError, setSensitiveDataEvaluationError] = useState('');
   const [sensitiveDataEvaluationLoaded, setSensitiveDataEvaluationLoaded] = useState(false);
   const [loadingSensitiveDataEvaluation, setLoadingSensitiveDataEvaluation] = useState(false);
@@ -711,9 +691,13 @@ export function EnvironmentSettings({
 
   function addSensitiveDataEvaluationCase() {
     const id = `evaluation:${Date.now()}:${sensitiveDataEvaluationIdRef.current++}`;
-    setSensitiveDataEvaluationCases((current) => [...current, { id, name: '', text: '', expectedValuesText: '' }]);
+    setSensitiveDataEvaluationCases((current) => [...current, {
+      id,
+      name: '',
+      text: '',
+      expectedValuesText: '',
+    }]);
     setSelectedSensitiveDataEvaluationCaseId(id);
-    setSensitiveDataEvaluationPanelTab('expected');
     setSensitiveDataEvaluationRun(null);
     setSensitiveDataEvaluationError('');
   }
@@ -769,8 +753,11 @@ export function EnvironmentSettings({
     const target = sensitiveDataEvaluationCases.find((item) => item.id === caseId);
     if (!target) return;
     const values = target.expectedValuesText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-    if (!values.includes(value)) values.push(value);
-    updateSensitiveDataEvaluationCase(caseId, { expectedValuesText: values.join('\n') });
+    const valueKey = canonicalSensitiveValue(value);
+    if (!values.some((item) => canonicalSensitiveValue(item) === valueKey)) values.push(value);
+    updateSensitiveDataEvaluationCase(caseId, {
+      expectedValuesText: values.join('\n'),
+    });
     setSensitiveDataEvaluationNewExpectedValue('');
   }
 
@@ -779,16 +766,6 @@ export function EnvironmentSettings({
     if (!target) return;
     const values = target.expectedValuesText.split(/\r?\n/).map((item) => item.trim()).filter((item) => item && item !== value);
     updateSensitiveDataEvaluationCase(caseId, { expectedValuesText: values.join('\n') });
-  }
-
-  function toggleSensitiveDataEvaluationGroup(caseId: string, groupId: string) {
-    const key = `${caseId}:${groupId}`;
-    setCollapsedSensitiveDataGroups((current) => {
-      const next = new Set(current);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
   }
 
   function validSensitiveDataEvaluationPayload() {
@@ -1217,10 +1194,14 @@ export function EnvironmentSettings({
     const selectedEvaluationValues = selectedEvaluationCase
       ? selectedEvaluationCase.expectedValuesText.split(/\r?\n/).map((value) => value.trim()).filter(Boolean)
       : [];
-    const selectedEvaluationGroups = selectedEvaluationCase
-      ? groupedSensitiveValues(selectedEvaluationCase.text, selectedEvaluationValues)
-      : [];
     const selectedEvaluationResult = selectedEvaluationCase ? evaluationResults.get(selectedEvaluationCase.id) : undefined;
+    const selectedEvaluationValueKeys = new Set(selectedEvaluationValues.map(canonicalSensitiveValue));
+    const selectedEvaluationDisplayValues = [
+      ...selectedEvaluationValues,
+      ...(selectedEvaluationResult?.unexpectedValues || []).filter((value) => (
+        !selectedEvaluationValueKeys.has(canonicalSensitiveValue(value))
+      )),
+    ];
     const selectedEvaluationRecall = selectedEvaluationValues.length
       ? Math.round(((selectedEvaluationValues.length - (selectedEvaluationResult?.missingValues.length || 0)) / selectedEvaluationValues.length) * 100)
       : 0;
@@ -1228,7 +1209,8 @@ export function EnvironmentSettings({
       evaluationCaseDisplayName(item.name, index).toLocaleLowerCase().includes(sensitiveDataEvaluationSearch.trim().toLocaleLowerCase())
     ));
     return (
-      <div className="settings-sensitive-data-test">
+      <div className="settings-sensitive-data-tools">
+        <section className="settings-sensitive-data-test">
         <div className="settings-sensitive-data-test-head">
           <div>
             <h3>{t('敏感数据过滤测试')}</h3>
@@ -1291,7 +1273,8 @@ export function EnvironmentSettings({
             )}
           </div>
         ) : null}
-        <div className={`settings-sensitive-data-evaluation-workbench${sensitiveDataEvaluationExpanded ? ' is-expanded' : ''}`}>
+        </section>
+        <section className={`settings-sensitive-data-evaluation-workbench${sensitiveDataEvaluationExpanded ? ' is-expanded' : ''}`}>
           <header className="evaluation-workbench-head">
             <div className="evaluation-workbench-title">
               <h3>{t('脱敏评测集')}</h3>
@@ -1318,31 +1301,50 @@ export function EnvironmentSettings({
           ) : selectedEvaluationCase ? (
             <div className="evaluation-workbench-shell">
               <aside className="evaluation-case-sidebar">
-                <div className="evaluation-case-sidebar-head">
-                  <strong>{t('用例列表')}</strong>
-                  <div>
-                    <button aria-label={t('新增用例')} onClick={addSensitiveDataEvaluationCase} type="button"><Plus size={18} /></button>
-                  </div>
+                <div className="evaluation-case-toolbar">
+                  <label className="evaluation-case-search">
+                    <Search aria-hidden="true" size={18} />
+                    <input onChange={(event) => setSensitiveDataEvaluationSearch(event.target.value)} placeholder={t('搜索用例')} value={sensitiveDataEvaluationSearch} />
+                  </label>
+                  <button aria-label={t('新增用例')} className="evaluation-case-create" onClick={addSensitiveDataEvaluationCase} type="button"><Plus size={20} /></button>
                 </div>
-                <label className="evaluation-case-search">
-                  <Search aria-hidden="true" size={16} />
-                  <input onChange={(event) => setSensitiveDataEvaluationSearch(event.target.value)} placeholder={t('搜索用例')} value={sensitiveDataEvaluationSearch} />
-                </label>
-                <div className="evaluation-case-list">
+                <div className="evaluation-case-list browser-chat-conversation-history">
                   {visibleEvaluationCases.map((item) => {
                     const index = sensitiveDataEvaluationCases.findIndex((entry) => entry.id === item.id);
                     const result = evaluationResults.get(item.id);
                     const count = item.expectedValuesText.split(/\r?\n/).filter((value) => value.trim()).length;
                     return (
-                      <div className={`evaluation-case-row${item.id === selectedEvaluationCase.id ? ' is-active' : ''}`} key={item.id}>
-                        <button className="evaluation-case-select" onClick={() => setSelectedSensitiveDataEvaluationCaseId(item.id)} type="button">
-                          <span className="case-index">{String(index + 1).padStart(2, '0')}</span>
-                          <span className="case-name">{evaluationCaseDisplayName(item.name, index)}</span>
-                          {result ? result.passed ? <CircleCheck className="case-pass" size={15} /> : <AlertCircle className="case-fail" size={15} /> : <span className="case-pending" />}
-                          <span className="case-count">{count}</span>
-                        </button>
-                        <button className="evaluation-case-delete" aria-label={t('删除用例')} onClick={() => removeSensitiveDataEvaluationCase(item.id)} title={t('删除用例')} type="button"><Trash2 size={14} /></button>
-                      </div>
+                      <WorkspaceSidebarArchiveRow
+                        active={item.id === selectedEvaluationCase.id}
+                        ariaLabel={evaluationCaseDisplayName(item.name, index)}
+                        collapsed={false}
+                        collapsedIcon={null}
+                        expandedAction={(
+                          <button
+                            aria-label={t('删除用例')}
+                            className="evaluation-case-delete workspace-sidebar-archive-row-delete"
+                            onClick={() => removeSensitiveDataEvaluationCase(item.id)}
+                            title={t('删除用例')}
+                            type="button"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        )}
+                        expandedIcon={<span className="case-index">{String(index + 1).padStart(2, '0')}</span>}
+                        key={item.id}
+                        meta={(
+                          <span className="evaluation-case-row-meta">
+                            {result
+                              ? result.passed
+                                ? <CircleCheck className="case-pass" size={13} />
+                                : <AlertCircle className="case-fail" size={13} />
+                              : <span className="case-pending" />}
+                            <span className="case-count">{count}</span>
+                          </span>
+                        )}
+                        onOpen={() => setSelectedSensitiveDataEvaluationCaseId(item.id)}
+                        title={evaluationCaseDisplayName(item.name, index)}
+                      />
                     );
                   })}
                 </div>
@@ -1357,55 +1359,63 @@ export function EnvironmentSettings({
                 </div>
                 <div className="evaluation-text-editor">
                   <div className="evaluation-line-numbers" aria-hidden="true">
-                    {Array.from({ length: Math.max(15, selectedEvaluationCase.text.split('\n').length) }, (_, index) => <span key={index}>{index + 1}</span>)}
+                    {Array.from({ length: Math.max(1, selectedEvaluationCase.text.split(/\r?\n/).length) }, (_, index) => <span key={index}>{index + 1}</span>)}
                   </div>
                   <div className="evaluation-editor-content">
                     <pre aria-hidden="true">{highlightedSensitiveText(selectedEvaluationCase.text, selectedEvaluationValues)}</pre>
-                    <textarea onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { text: event.target.value })} placeholder={t('输入包含合成敏感数据的测试文本。')} spellCheck={false} value={selectedEvaluationCase.text} />
+                    <textarea
+                      onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { text: event.target.value })}
+                      onScroll={(event) => {
+                        const textarea = event.currentTarget;
+                        const preview = textarea.previousElementSibling as HTMLElement | null;
+                        const lineNumbers = textarea.parentElement?.previousElementSibling as HTMLElement | null;
+                        if (preview) {
+                          preview.scrollLeft = textarea.scrollLeft;
+                          preview.scrollTop = textarea.scrollTop;
+                        }
+                        if (lineNumbers) lineNumbers.scrollTop = textarea.scrollTop;
+                      }}
+                      placeholder={t('输入包含合成敏感数据的测试文本。')}
+                      spellCheck={false}
+                      value={selectedEvaluationCase.text}
+                      wrap="off"
+                    />
                   </div>
                 </div>
               </section>
               <aside className="evaluation-inspector-pane">
-                <div className="evaluation-inspector-tabs">
-                  <button className={sensitiveDataEvaluationPanelTab === 'expected' ? 'is-active' : ''} onClick={() => setSensitiveDataEvaluationPanelTab('expected')} type="button">{t('预期敏感原文')}</button>
-                  <button className={sensitiveDataEvaluationPanelTab === 'result' ? 'is-active' : ''} onClick={() => setSensitiveDataEvaluationPanelTab('result')} type="button">{t('检测结果')}</button>
-                </div>
-                {sensitiveDataEvaluationPanelTab === 'expected' ? (
-                  <div className="evaluation-inspector-content">
+                <div className="evaluation-inspector-head"><strong>{t('预期敏感原文')}</strong></div>
+                <div className="evaluation-inspector-content">
                     <form className="evaluation-expected-add" onSubmit={(event) => { event.preventDefault(); addSensitiveDataEvaluationExpectedValue(selectedEvaluationCase.id); }}>
                       <input aria-label={t('预期敏感原文')} onChange={(event) => setSensitiveDataEvaluationNewExpectedValue(event.target.value)} placeholder={t('输入预期敏感原文')} value={sensitiveDataEvaluationNewExpectedValue} />
-                      <button disabled={!sensitiveDataEvaluationNewExpectedValue.trim()} type="submit"><Plus size={15} />{t('添加')}</button>
+                      <button className="ui-button ui-button--primary" disabled={!sensitiveDataEvaluationNewExpectedValue.trim()} type="submit"><Plus size={15} />{t('添加')}</button>
                     </form>
                     <p className="evaluation-expected-help">{t('预期敏感原文是评测标准答案，用于计算漏检、误报、精确率和召回率。')}</p>
                     <div className="evaluation-inspector-count">{t('共 {count} 项', { count: selectedEvaluationValues.length })}</div>
-                    {selectedEvaluationGroups.map((group) => {
-                      const collapsed = collapsedSensitiveDataGroups.has(`${selectedEvaluationCase.id}:${group.id}`);
-                      return (
-                        <section className={`evaluation-value-group group-${group.id}${collapsed ? ' is-collapsed' : ''}`} key={group.id}>
-                          <button className="evaluation-value-group-head" onClick={() => toggleSensitiveDataEvaluationGroup(selectedEvaluationCase.id, group.id)} type="button"><SensitiveValueGroupIcon id={group.id} /><strong>{group.label}</strong><span>{group.items.length}</span><ChevronDown size={15} /></button>
-                          {collapsed ? null : (
-                            <div className="evaluation-value-chips">
-                              {group.items.map((value) => <span key={value}>{value}<button aria-label={t('删除 {value}', { value })} onClick={() => removeSensitiveDataEvaluationExpectedValue(selectedEvaluationCase.id, value)} type="button"><X size={12} /></button></span>)}
-                            </div>
-                          )}
-                        </section>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <div className="evaluation-result-panel">
-                    {selectedEvaluationResult ? (
-                      <>
-                        <pre>{selectedEvaluationResult.text}</pre>
-                        <div className="result-finding result-missing"><strong>{t('漏检')}</strong>{selectedEvaluationResult.missingValues.length ? selectedEvaluationResult.missingValues.map((value) => <span key={value}>{value}</span>) : <em>{t('无')}</em>}</div>
-                        <div className="result-finding result-unexpected"><strong>{t('误报')}</strong>{selectedEvaluationResult.unexpectedValues.length ? selectedEvaluationResult.unexpectedValues.map((value) => <span key={value}>{value}</span>) : <em>{t('无')}</em>}</div>
-                      </>
-                    ) : <div className="evaluation-result-empty">{t('运行评测后查看检测结果。')}</div>}
-                  </div>
-                )}
+                    <div className="evaluation-value-chips evaluation-value-list">
+                      {selectedEvaluationDisplayValues.map((value) => {
+                        const status = sensitiveEvaluationTagStatus(value, selectedEvaluationResult);
+                        const statusLabel = status === 'matched'
+                          ? '正确'
+                          : status === 'missing'
+                            ? '漏检'
+                            : status === 'unexpected'
+                              ? '误报'
+                              : '';
+                        return (
+                          <span className={`is-${status}`} key={value} title={statusLabel ? t(statusLabel) : undefined}>
+                            {status === 'matched' ? <CircleCheck aria-hidden="true" size={12} /> : null}
+                            {status === 'missing' || status === 'unexpected' ? <AlertCircle aria-hidden="true" size={12} /> : null}
+                            {value}
+                            {status !== 'unexpected' ? <button aria-label={t('删除 {value}', { value })} onClick={() => removeSensitiveDataEvaluationExpectedValue(selectedEvaluationCase.id, value)} type="button"><X size={12} /></button> : null}
+                          </span>
+                        );
+                      })}
+                    </div>
+                </div>
               </aside>
               <footer className="evaluation-status-bar" aria-live="polite">
-                <span className="detected"><CircleCheck size={15} />{t('已检测')} <strong>{selectedEvaluationResult?.detectedValues.length || 0}</strong></span>
+                <span className="detected"><CircleCheck size={15} />{t('正确')} <strong>{selectedEvaluationResult?.matchedValues.length || 0}</strong></span>
                 <span className="missing"><AlertCircle size={15} />{t('漏检')} <strong>{selectedEvaluationResult?.missingValues.length || 0}</strong></span>
                 <span className="unexpected"><AlertCircle size={15} />{t('误报')} <strong>{selectedEvaluationResult?.unexpectedValues.length || 0}</strong></span>
                 <span>{t('召回率')} <strong>{selectedEvaluationResult ? `${selectedEvaluationRecall}%` : '—'}</strong></span>
@@ -1414,7 +1424,7 @@ export function EnvironmentSettings({
           ) : (
             <div className="settings-sensitive-data-test-empty">{t('暂无评测用例，点击“新增用例”开始配置。')}</div>
           )}
-        </div>
+        </section>
       </div>
     );
   }

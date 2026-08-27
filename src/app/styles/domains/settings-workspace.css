@@ -39,7 +39,7 @@
     justify-content: flex-start;
     min-height: 30px;
     min-width: 0;
-    padding: 0 10px 0 12px;
+    padding: 0 8px;
     position: relative;
     text-align: left;
     transition: background-color var(--motion-fast) ease, color var(--motion-fast) ease;
@@ -53,13 +53,21 @@
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active,
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active:hover {
-    background: var(--sidebar-active);
-    box-shadow: none;
+    background: transparent !important;
+    box-shadow: none !important;
     color: var(--foreground);
+    font-weight: 600;
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active::before {
-    content: none;
+    background: var(--accent-strong);
+    border-radius: 999px;
+    bottom: 7px;
+    content: "";
+    left: 0;
+    position: absolute;
+    top: 7px;
+    width: 2px;
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button > svg:not(.browser-chat-settings-tab-lock) {
@@ -72,7 +80,7 @@
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active > svg:not(.browser-chat-settings-tab-lock) {
-    color: var(--foreground);
+    color: var(--accent-strong);
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button > span {

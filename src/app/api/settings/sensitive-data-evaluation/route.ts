@@ -88,6 +88,7 @@ export async function POST(request: NextRequest) {
         text: redaction.texts[textIndex] || '',
         replacements,
         detectedValues,
+        matchedValues: comparison.matchedValues,
         missingValues: comparison.missingValues,
         unexpectedValues: comparison.unexpectedValues,
       };

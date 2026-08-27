@@ -78,7 +78,7 @@ import {
 } from './runtime-retry-policy';
 
 import {
-  browserToolBlockedBeforeBrowserState,
+  browserToolPrerequisiteNames,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
   runtimeBrowserSessionToolNames,
@@ -1126,6 +1126,51 @@ async function readCurrentBrowserState(
   });
 }
 
+async function bundledBrowserToolPrerequisiteResults(input: {
+  toolName: string;
+  preflightPending: boolean;
+  session: BrowserSession;
+  runId?: string;
+  stepIndex?: number;
+  abortSignal?: AbortSignal;
+  ensureBrowserStarted?: () => Promise<void>;
+}) {
+  const prerequisiteNames = browserToolPrerequisiteNames(
+    input.toolName,
+    input.preflightPending,
+    runtimeBrowserSessionToolNames,
+  );
+  const results: NonNullable<BrowserActionResult['prerequisiteResults']> = [];
+
+  for (const prerequisiteName of prerequisiteNames) {
+    if (prerequisiteName !== 'readBrowserState') continue;
+    await input.ensureBrowserStarted?.();
+    results.push({
+      toolName: prerequisiteName,
+      result: await readCurrentBrowserState(input.session, {
+        runId: input.runId,
+        stepIndex: input.stepIndex,
+        abortSignal: input.abortSignal,
+      }),
+    });
+  }
+  return results;
+}
+
+function attachPrerequisiteResults(
+  result: BrowserActionResult,
+  prerequisiteResults: NonNullable<BrowserActionResult['prerequisiteResults']>,
+) {
+  if (!prerequisiteResults.length) return result;
+  return {
+    ...result,
+    prerequisiteResults: [
+      ...prerequisiteResults,
+      ...(result.prerequisiteResults || []),
+    ],
+  } satisfies BrowserActionResult;
+}
+
 function makeBrowserTools(
   session: BrowserSession,
   traces: ToolTrace[],
@@ -1208,22 +1253,20 @@ function makeBrowserTools(
         const attachAutomaticSkill = (result: BrowserActionResult) => automaticSkill?.loadedRuntimeSkill
           ? { ...result, loadedRuntimeSkill: automaticSkill.loadedRuntimeSkill }
           : result;
-        if (
-          referenceOptions?.browserStatePreflightComplete
-          && browserToolBlockedBeforeBrowserState(
-            name,
-            !referenceOptions.browserStatePreflightComplete(),
-            runtimeBrowserSessionToolNames,
-          )
-        ) {
-          return attachAutomaticSkill({
-            ok: false,
-            actual: `Tool ${name} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
-          });
-        }
+        const prerequisiteResults = await bundledBrowserToolPrerequisiteResults({
+          toolName: name,
+          preflightPending: referenceOptions?.browserStatePreflightComplete
+            ? !referenceOptions.browserStatePreflightComplete()
+            : false,
+          session,
+          runId: referenceOptions?.runId,
+          stepIndex: referenceOptions?.stepIndex,
+          abortSignal: actionSignal,
+          ensureBrowserStarted: referenceOptions?.ensureBrowserStarted,
+        });
         if (runtimeToolRequiresBrowserSession(name)) await referenceOptions?.ensureBrowserStarted?.();
         const result = await action(actionSignal, trace);
-        return attachAutomaticSkill(result);
+        return attachAutomaticSkill(attachPrerequisiteResults(result, prerequisiteResults));
       };
       const traceVisualContext = referenceOptions?.visualContext;
       return executeTracedBrowserAction({
@@ -1266,7 +1309,7 @@ function makeBrowserTools(
 
   const sharedTools = {
     readBrowserState: tool({
-      description: 'When a request needs live browser evidence or browser interaction, this must be its first browser tool. It reads the current conversation tab group, all tabs in that group, the active page URL/title, and the current page state without changing the browser. Do not call it for a request that can be answered without the live browser.',
+      description: 'Explicitly read the current conversation tab group, all tabs in that group, the active page URL/title, and current page state without changing the browser. If another browser tool needs this prerequisite, the execution layer reads it internally, includes its complete result in prerequisiteResults, and then executes the originally requested tool in the same call. Use this explicit tool only when the state itself is the requested result.',
       inputSchema: browserToolInput({}, [{ reason: '读取当前会话浏览器状态' }]),
       execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, {
         runId: referenceOptions?.runId,
@@ -1275,7 +1318,7 @@ function makeBrowserTools(
       }), execution),
     }),
     browserCode: tool({
-      description: `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} The persistent agent.state API stores non-secret JSON-safe values across kernel recycling and later conversation turns. The first call automatically loads and returns hidden Skill ${browserRuntimeSkillId}; browser-changing work also requires the readBrowserState preflight.`,
+      description: `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} The persistent agent.state API stores non-secret JSON-safe values across kernel recycling and later conversation turns. The first call automatically loads hidden Skill ${browserRuntimeSkillId}. If live browser state has not yet been read, the execution layer reads it first, returns that result in prerequisiteResults, and still executes the supplied code in this same tool call.`,
       inputSchema: browserToolInput({
         code: z.string().min(1).max(40_000).describe(`Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Save non-secret JSON-safe values needed after recycling or in later turns with agent.state. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await nodeRepl.emitImage(await page.screenshot(...)).' : ' Do not call screenshot or nodeRepl.emitImage; this model has no image input.'} Prefer top-level var or fresh binding names for temporary values. Do not write a function wrapper, module, export, or Markdown fences.`),
         maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
@@ -1634,9 +1677,9 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     currentRuntimeTimePromptLine(),
     '',
     'Operating rules:',
-    '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When the request does need browser evidence or browser interaction, readBrowserState must be the first browser tool of the new or resumed request; use its current tab-group, active-page, and page-state evidence before choosing another browser tool. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
+    '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When browser evidence or interaction is needed, call the relevant browser tool directly. The execution layer runs any pending prerequisite tools first, then runs the requested tool, and returns every prerequisite result in prerequisiteResults alongside the requested tool result in one tool response. Do not issue separate prerequisite tool calls unless their result alone is desired. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
     '- The latest user message is the scope authority. If it explicitly narrows the current turn to one action (for example, "just click Search"), perform and verify only that action, then stop. Do not silently resume a broader goal from an earlier message unless the latest message explicitly asks you to continue it.',
-    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. After readBrowserState, use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
+    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. Use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. A pending readBrowserState prerequisite is executed internally and returned in prerequisiteResults while the requested browserCode still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     '- User-role messages beginning with [WebPilot runtime operational context], [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.',
@@ -3631,7 +3674,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       ensureActive();
       contextCompression = actionResult.contextCompression || contextCompression;
       activeContinuationSummary = actionResult.contextCompression?.continuationSummary || activeContinuationSummary;
-      browserStatePreflightComplete ||= actionResult.traces.some((trace) => trace.name === 'readBrowserState' && Boolean(trace.result));
+      browserStatePreflightComplete ||= !requiresBrowserStatePreflight(false, actionResult.traces);
       for (const trace of actionResult.traces) {
         const toolInput = splitToolInputAndReason(trace.input).input;
         if (trace.name === 'file' && typeof toolInput.documentId === 'string' && toolInput.documentId) {
@@ -4387,22 +4430,21 @@ async function executeCodexRuntimeObject(input: {
     shouldContinue,
     onToolTrace,
     onVisualContextChange,
-    action: async (_actionSignal, trace) => {
+    action: async (actionSignal, trace) => {
       const automaticSkill = automaticallyLoadHiddenRuntimeSkill(type, normalizedParams, loadedHiddenRuntimeSkillIds);
       if (automaticSkill && 'ok' in automaticSkill) return automaticSkill;
       const attachAutomaticSkill = (result: BrowserActionResult) => automaticSkill?.loadedRuntimeSkill
         ? { ...result, loadedRuntimeSkill: automaticSkill.loadedRuntimeSkill }
         : result;
-      if (browserToolBlockedBeforeBrowserState(
-        type,
-        !Boolean(browserStatePreflightComplete),
-        runtimeBrowserSessionToolNames,
-      )) {
-        return attachAutomaticSkill({
-          ok: false,
-          actual: `Tool ${type} was not executed. Call readBrowserState in a separate model step first, then retry using the returned live browser state.`,
-        });
-      }
+      const prerequisiteResults = await bundledBrowserToolPrerequisiteResults({
+        toolName: type,
+        preflightPending: !Boolean(browserStatePreflightComplete),
+        session,
+        runId,
+        stepIndex,
+        abortSignal: actionSignal,
+        ensureBrowserStarted,
+      });
       const approval = await requestBrowserToolApproval({
         toolName: type,
         toolInput: normalizedParams,
@@ -4411,14 +4453,14 @@ async function executeCodexRuntimeObject(input: {
       });
       throwIfStopped(abortSignal, shouldContinue);
       if (approval === 'denied') {
-        return attachAutomaticSkill({
+        return attachAutomaticSkill(attachPrerequisiteResults({
           ok: true,
           actual: 'Skipped before execution because the user cancelled this server-approved tool call. Do not retry the same operation in this turn unless the user explicitly asks again.',
-        });
+        }, prerequisiteResults));
       }
       if (runtimeToolRequiresBrowserSession(type)) await ensureBrowserStarted?.();
       const result = await runTool(trace?.id);
-      const resultWithSkill = attachAutomaticSkill(result);
+      const resultWithSkill = attachAutomaticSkill(attachPrerequisiteResults(result, prerequisiteResults));
       if (approval === 'approved') {
         return {
           ...resultWithSkill,

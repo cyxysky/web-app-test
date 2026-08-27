@@ -33,6 +33,26 @@ describe('sensitive data evaluation helpers', () => {
     }]);
   });
 
+  it('keeps expected values as raw tags and drops legacy type metadata', () => {
+    expect(normalizeSensitiveDataEvaluationCases([{
+      id: 'typed-values',
+      name: 'Typed values',
+      text: 'Contact a@example.com from Example Ltd.',
+      expectedValues: ['a@example.com', 'Example Ltd.'],
+      expectedValueTypes: {
+        ' A@EXAMPLE.COM ': 'contact',
+        'Example Ltd.': 'organization',
+        orphan: 'person',
+        invalid: 'not-a-type',
+      },
+    }])).toEqual([{
+      id: 'typed-values',
+      name: 'Typed values',
+      text: 'Contact a@example.com from Example Ltd.',
+      expectedValues: ['a@example.com', 'Example Ltd.'],
+    }]);
+  });
+
   it('reports matched, missing, and unexpected values', () => {
     expect(compareSensitiveDataEvaluationValues(
       ['a@example.com', '13800138000'],

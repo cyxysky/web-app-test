@@ -7,6 +7,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
 import { WebPilotHelpCenter } from '@/components/WebPilotHelpCenter';
 import { AnimatedThemeToggler } from '@/components/ui/animated-theme-toggler';
+import { AuroraText } from '@/components/ui/aurora-text';
 
 type WorkspaceSidebarProps = {
   children: ReactNode;
@@ -38,7 +39,6 @@ export function WorkspaceModeTabs({
   aiOperationsLabel,
   ariaLabel,
   automationLabel,
-  collapsed,
   conversationLabel,
   settingsLabel,
   showAiOperations = false,
@@ -109,9 +109,9 @@ export function WorkspaceSidebar({
   return (
     <aside className={className ? `browser-chat-sidebar ${className}` : 'browser-chat-sidebar'}>
       <div className="browser-chat-brand">
-        <strong>
-          <span aria-hidden="true" className="browser-chat-brand-mark">D</span>
-          <span>DOMP WebPilot</span>
+        <strong className="browser-chat-brand-title">
+          <AuroraText className="browser-chat-brand-aurora" speed={1.2}>DOMP</AuroraText>
+          <span>WebPilot</span>
         </strong>
         <button
           aria-label={collapseLabel}

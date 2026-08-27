@@ -861,6 +861,14 @@ a:not([data-slot], [data-slot] *) {
   opacity: 0.48;
 }
 
+.ui-button--primary:disabled {
+  background: var(--panel-warm);
+  border-color: var(--border);
+  box-shadow: none;
+  color: var(--muted);
+  opacity: 1;
+}
+
 :where(.ui-icon-button, .settings-model-row-button, .browser-chat-embedded-tool-button, .browser-chat-embedded-tab-close) {
   align-items: center;
   background: transparent;

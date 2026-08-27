@@ -17,7 +17,8 @@ ARABIC_NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?"
 CHINESE_NUMBER = r"[零〇一二两三四五六七八九十百千万亿壹贰叁肆伍陆柒捌玖拾佰仟萬億]+"
 CURRENCY_PREFIX = r"(?:人民币|RMB|CNY|USD|EUR|GBP|JPY|HKD|AUD|CAD|￥|¥|\$|€|£)"
 CURRENCY_SUFFIX = r"(?:人民币|元|块钱?|美元|美金|欧元|英镑|日元|港元|澳元|加元)"
-MAGNITUDE = r"(?:百|千|万|亿|[KkMmWw])"
+MAGNITUDE = r"(?:百|千|万|萬|亿|億|[KkMmWw])"
+COLLOQUIAL_MONEY_MAGNITUDE = r"(?:万|萬|亿|億|[Ww])"
 PERIOD_SUFFIX = r"(?:\s*(?:/|每)\s*(?:月|年|天|小时))?"
 
 PREFIXED_AMOUNT_PATTERN = re.compile(
@@ -32,6 +33,10 @@ MAGNITUDE_AMOUNT_PATTERN = re.compile(
     rf"(?<![A-Za-z0-9_+/-]){ARABIC_NUMBER}\s*{MAGNITUDE}{PERIOD_SUFFIX}(?![A-Za-z0-9_+/-])",
     re.IGNORECASE,
 )
+COLLOQUIAL_AMOUNT_PATTERN = re.compile(
+    rf"(?<![A-Za-z0-9_+/-]){ARABIC_NUMBER}\s*{COLLOQUIAL_MONEY_MAGNITUDE}{PERIOD_SUFFIX}(?![A-Za-z0-9_+/-])",
+    re.IGNORECASE,
+)
 CONTEXT_NUMBER_PATTERN = re.compile(
     rf"(?<![A-Za-z0-9_+/-]){ARABIC_NUMBER}\s*{MAGNITUDE}?{PERIOD_SUFFIX}(?![A-Za-z0-9_+/-])",
     re.IGNORECASE,
@@ -42,7 +47,9 @@ AMOUNT_CONTEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 NON_AMOUNT_FOLLOW_PATTERN = re.compile(
-    r"^(?:人|次|件|台|个|套|条|字符|公里|千米|米|秒|分钟|小时|天|年|月|份|页|章|期|号)"
+    r"^(?:人次|人口|用户|粉丝|播放|阅读|访问|销量|订单|工单|"
+    r"人|名|家|户|次|件|台|个|套|条|辆|本|枚|张|吨|股|单|笔|倍|"
+    r"字符|公里|千米|米|秒|分钟|小时|天|年|月|份|页|章|期|号)"
 )
 PHONE_LIKE_PATTERN = re.compile(
     r"(?<!\d)(?:\+?\d{1,3}[- ]?)?(?:1[3-9]\d{9}|\(?\d{2,4}\)?[- ]\d{3,4}[- ]\d{4})(?!\d)"
@@ -139,6 +146,7 @@ def amount_spans(text: str) -> list[DeterministicSpan]:
     for priority, pattern, requires_context in (
         (122, PREFIXED_AMOUNT_PATTERN, False),
         (121, SUFFIXED_AMOUNT_PATTERN, False),
+        (120, COLLOQUIAL_AMOUNT_PATTERN, False),
         (120, MAGNITUDE_AMOUNT_PATTERN, True),
         (104, CONTEXT_NUMBER_PATTERN, True),
     ):
@@ -206,9 +214,9 @@ def canonical_money_value(value: str) -> str:
         amount = Decimal(number)
         tail = compact[number_match.end():]
         scale = Decimal(1)
-        if tail.startswith(("亿",)):
+        if tail.startswith(("亿", "億")):
             scale = Decimal(100_000_000)
-        elif tail.startswith(("万", "w")):
+        elif tail.startswith(("万", "萬", "w")):
             scale = Decimal(10_000)
         elif tail.startswith(("千", "k")):
             scale = Decimal(1_000)

@@ -46,6 +46,7 @@ const en: Record<string, string> = {
   '按域名': 'By domain',
   '域名': 'Domain',
   '类型': 'Type',
+  '正确': 'Correct',
   '适用范围': 'Scope',
   '共享范围': 'Sharing',
   '操作': 'Actions',

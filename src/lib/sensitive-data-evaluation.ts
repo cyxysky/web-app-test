@@ -165,11 +165,12 @@ export function normalizeSensitiveDataEvaluationCases(input: unknown): Sensitive
     let suffix = 2;
     while (seenIds.has(id)) id = `${baseId}-${suffix++}`;
     seenIds.add(id);
+    const expectedValues = uniqueValues(Array.isArray(record.expectedValues) ? record.expectedValues : []);
     output.push({
       id,
       name: String(record.name || '').trim().slice(0, 200),
       text,
-      expectedValues: uniqueValues(Array.isArray(record.expectedValues) ? record.expectedValues : []),
+      expectedValues,
     });
     if (output.length >= SENSITIVE_DATA_EVALUATION_CASE_LIMIT) break;
   }

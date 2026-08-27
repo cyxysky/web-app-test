@@ -25,22 +25,34 @@
 
 .ai-operations-sidebar-current {
   align-items: center;
-  background: var(--sidebar-active);
-  border-radius: 8px;
+  background: transparent;
+  border-radius: 5px;
+  box-shadow: none;
   color: var(--foreground);
   display: flex;
   font-size: 13px;
-  font-weight: 540;
+  font-weight: 600;
   gap: 8px;
-  height: 38px;
-  min-height: 38px;
-  padding: 0 9px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0 8px;
   position: relative;
+}
+
+.ai-operations-sidebar-current::before {
+  background: var(--accent-strong);
+  border-radius: 999px;
+  bottom: 7px;
+  content: "";
+  left: 0;
+  position: absolute;
+  top: 7px;
+  width: 2px;
 }
 
 .ai-operations-sidebar-current-icon {
   align-items: center;
-  color: var(--foreground);
+  color: var(--accent-strong);
   display: inline-flex;
   flex: 0 0 18px;
   justify-content: center;
@@ -512,88 +524,14 @@
   padding: 4px 16px 10px;
 }
 
-.ai-operations-table-wrap {
-  overflow: auto;
-}
-
-.ai-operations-data-table table {
-  font-size: 11px;
-  width: 100%;
-}
-
-.ai-operations-data-table th {
-  background: color-mix(in srgb, var(--panel-soft) 70%, transparent);
-  color: var(--muted);
-  font-size: 9.5px;
-  font-weight: 600;
-  letter-spacing: 0.035em;
-  padding: 8px 12px;
-  position: sticky;
-  text-align: left;
-  top: 0;
-  white-space: nowrap;
-  z-index: 1;
-}
-
-.ai-operations-data-table td {
-  color: var(--muted-strong);
-  font-variant-numeric: tabular-nums;
-  padding: 10px 12px;
-  vertical-align: middle;
-  white-space: nowrap;
-}
-
-.ai-operations-data-table tbody tr:hover td {
-  background: var(--app-surface-hover);
-}
-
-.ai-operations-data-table td:first-child {
-  max-width: 310px;
-  white-space: normal;
-}
-
-.ai-operations-data-table a,
-.ai-operations-data-table strong {
-  color: var(--foreground);
-  display: block;
-  font-weight: 590;
-  overflow: hidden;
-  text-decoration: none;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ai-operations-data-table a:hover {
-  color: var(--accent-strong);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-.ai-operations-data-table td small {
-  color: var(--muted);
-  display: block;
-  font-size: 9.5px;
-  margin-top: 3px;
-  max-width: 310px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.ai-operations-data-table .ai-operations-token-usage strong {
-  font-variant-numeric: tabular-nums;
-}
-
-.ai-operations-data-table .ai-operations-token-usage small {
-  margin-top: 2px;
-}
-
 .ai-operations-status {
   border-radius: 999px;
   display: inline-flex;
   font-size: 9.5px;
   font-weight: 620;
   padding: 3px 7px;
+  white-space: nowrap;
+  word-break: keep-all;
 }
 
 .ai-operations-status.is-failed,

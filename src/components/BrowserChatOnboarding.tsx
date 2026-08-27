@@ -22,6 +22,7 @@ import { useI18n } from '@/i18n/I18nProvider';
 import type { WebPilotOnboardingReadiness, WebPilotOnboardingState, WebPilotOnboardingStep } from '@/lib/onboarding';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { TextAnimate } from '@/components/ui/text-animate';
 
 type OnboardingPayload = {
   readiness: WebPilotOnboardingReadiness;
@@ -365,9 +366,15 @@ export function BrowserChatOnboarding({
     return (
       <section className="browser-chat-empty-start" aria-label={t('开始新对话')}>
         <div className="browser-chat-empty-heading">
-          <span>DOMP WEBPILOT</span>
-          <h1>{t('今天想让浏览器帮你做什么？')}</h1>
-          <p>{t('描述目标，剩下的交给我。')}</p>
+          <TextAnimate animation="blurIn" as="span" by="character" duration={0.48} once>
+            DOMP WEBPILOT
+          </TextAnimate>
+          <TextAnimate animation="blurInUp" as="h1" by="character" delay={0.1} duration={0.72} once>
+            {t('今天想让浏览器帮你做什么？')}
+          </TextAnimate>
+          <TextAnimate animation="fadeIn" as="p" by="character" delay={0.24} duration={0.52} once>
+            {t('描述目标，剩下的交给我。')}
+          </TextAnimate>
         </div>
       </section>
     );

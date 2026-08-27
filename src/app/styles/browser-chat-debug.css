@@ -50,12 +50,22 @@
 }
 
 .browser-chat-tool-modal-body {
-  display: block;
+  display: flex;
+  flex-direction: column;
   max-width: 100%;
   min-height: 0;
   overflow: hidden;
   overscroll-behavior: contain;
   padding: 0 0 16px;
+}
+
+.browser-chat-tool-failure-summary {
+  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, var(--border));
+  color: var(--foreground);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 11px 24px;
 }
 
 .browser-chat-tool-detail-section {
@@ -200,8 +210,9 @@
 
 .browser-chat-tool-io-grid {
   display: grid;
+  flex: 1 1 auto;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  height: 100%;
+  height: auto;
   min-height: 0;
 }
 

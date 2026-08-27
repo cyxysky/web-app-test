@@ -214,6 +214,11 @@ export type BrowserPageObservation = {
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Results from prerequisite tools executed inside this same model tool call, in execution order. */
+  prerequisiteResults?: Array<{
+    toolName: string;
+    result: BrowserActionResult;
+  }>;
   /** Hidden runtime Skill automatically loaded before this first governed tool call. */
   loadedRuntimeSkill?: {
     id: string;

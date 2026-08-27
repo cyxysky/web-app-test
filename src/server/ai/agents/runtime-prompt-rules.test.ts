@@ -130,9 +130,9 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /never an automatic axTree/);
-  assert.match(rules, /successful readBrowserState result is the required initial read-only observation/i);
+  assert.match(rules, /bundled prerequisiteResults entry supplies browser\.user\.openTabs/i);
   assert.match(rules, /browser\.user\.openTabs/);
-  assert.match(rules, /instead of spending another model step reproducing the same inventory/i);
+  assert.match(rules, /requested browserCode still executes and returns its own result in the same response/i);
   assert.match(rules, /targeted read-only browserCode cell only when/i);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /not a full snapshot/);

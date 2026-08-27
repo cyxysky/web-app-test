@@ -125,6 +125,23 @@ test('does not turn spaced GFM table delimiters into horizontal rules', () => {
   assert.doesNotMatch(html, /<hr/);
 });
 
+test('keeps empty trailing table cells without creating phantom rows', () => {
+  const markdown = [
+    '| 指标 | 数值 | 备注 |',
+    '| --- | --- | --- |',
+    '| 距 900 元空间 | +109.4% | |',
+    '| 距 980 元空间 | +128% | |',
+  ].join('\n');
+  const normalized = normalizeBrowserChatMarkdown(markdown);
+  const html = renderToStaticMarkup(createElement(ReactMarkdown, {
+    remarkPlugins: [remarkGfm],
+  }, normalized));
+
+  assert.equal(normalized, markdown);
+  assert.equal((html.match(/<tr>/g) || []).length, 3);
+  assert.equal((html.match(/<td>/g) || []).length, 6);
+});
+
 test('repairs full-width list rows and a Markdown heading stuck to the next table header', () => {
   const markdown = [
     '#### 主区域 - 列表展示**列表字段（带过滤与排序 ↕）**：',

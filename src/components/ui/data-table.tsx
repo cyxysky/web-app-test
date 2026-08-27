@@ -38,10 +38,13 @@ function compareValues(
 export function DataTable<T>({
   className,
   columns,
+  compact = false,
   data,
   emptyText,
   getRowId,
+  minWidth,
   renderExpandedRow,
+  rowClassName,
 }: {
   className?: string;
   columns: DataTableColumn<T>[];
@@ -80,26 +83,28 @@ export function DataTable<T>({
   }), [getRowId, renderExpandedRow, sortedData]);
 
   return (
-    <Table className={className}>
+    <Table className={['app-data-table', compact ? 'is-compact' : '', className || ''].filter(Boolean).join(' ')}>
       <Table.ScrollContainer>
         <Table.Content
           aria-label="Data table"
           onSortChange={setSortDescriptor}
           sortDescriptor={sortDescriptor}
+          style={minWidth ? { minWidth } : undefined}
         >
           <Table.Header>
             {columns.map((column, index) => (
               <Table.Column
                 allowsSorting={column.sortable !== false && Boolean(column.accessor)}
+                className={column.className}
                 id={column.id}
                 isRowHeader={index === 0}
                 key={column.id}
               >
                 {({ sortDirection }) => column.sortable !== false && column.accessor ? (
                   <Table.SortableColumnHeader sortDirection={sortDirection}>
-                    {column.header}
+                    <span className="app-data-table-header-label">{column.header}</span>
                   </Table.SortableColumnHeader>
-                ) : <span>{column.header}</span>}
+                ) : <span className="app-data-table-header-label">{column.header}</span>}
               </Table.Column>
             ))}
           </Table.Header>
@@ -113,9 +118,9 @@ export function DataTable<T>({
                 <Table.Cell colSpan={columns.length}>{row.content}</Table.Cell>
               </Table.Row>
             ) : (
-              <Table.Row id={row.id}>
+              <Table.Row className={rowClassName?.(row.item)} id={row.id}>
                 {columns.map((column) => (
-                  <Table.Cell key={column.id}>{column.cell(row.item)}</Table.Cell>
+                  <Table.Cell className={column.className} key={column.id}>{column.cell(row.item)}</Table.Cell>
                 ))}
               </Table.Row>
             )}

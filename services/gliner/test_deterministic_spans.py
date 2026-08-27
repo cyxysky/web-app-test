@@ -24,12 +24,20 @@ class DeterministicAmountTests(unittest.TestCase):
         self.assertEqual(self.detected("预算约3.5亿元"), ["3.5亿元"])
         self.assertEqual(self.detected("合同额为2000万"), ["2000万"])
 
+    def test_recognizes_standalone_colloquial_money_units(self):
+        self.assertEqual(self.detected("1000万"), ["1000万"])
+        self.assertEqual(self.detected("1000w"), ["1000w"])
+        self.assertEqual(self.detected("报价：1.5W"), ["1.5W"])
+        self.assertEqual(self.detected("一口价1000萬"), ["1000萬"])
+
     def test_recognizes_salary_context_without_a_currency_word(self):
         self.assertEqual(self.detected("该岗位月薪18500"), ["18500"])
         self.assertEqual(self.detected("薪资税前30K/月"), ["30K/月"])
 
     def test_rejects_non_money_counts(self):
         self.assertEqual(self.detected("本月服务2000万人次，共处理500件工单"), [])
+        self.assertEqual(self.detected("账号有1000万用户，博主有1000w粉丝"), [])
+        self.assertEqual(self.detected("全国共有1000万家门店"), [])
         self.assertEqual(self.detected("版本号是3.5，部署500台设备"), [])
         self.assertEqual(self.detected("项目编号PRJ-2026-0815，合同金额500元"), ["500元"])
         self.assertEqual(self.detected("目标年薪45万元，电话021-6123-4567"), ["45万元"])
@@ -37,6 +45,8 @@ class DeterministicAmountTests(unittest.TestCase):
     def test_normalizes_equivalent_currency_spellings(self):
         self.assertEqual(canonical_money_value("￥500"), canonical_money_value("500元"))
         self.assertEqual(canonical_money_value("2000万"), canonical_money_value("2000万元"))
+        self.assertEqual(canonical_money_value("1000万"), canonical_money_value("1000w"))
+        self.assertEqual(canonical_money_value("1000万"), canonical_money_value("1000萬"))
 
     def test_extracts_contextual_business_identifiers(self):
         samples = {

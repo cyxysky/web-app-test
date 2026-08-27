@@ -11,7 +11,8 @@ test('hidden browserCode runtime Skill documents the complete required operating
   assert.match(browserCodeRuntimeSkillSummary, /<system_skill>/);
   assert.match(browserCodeRuntimeSkillSummary, /<required>true<\/required>/);
   assert.match(browserCodeRuntimeSkillContent, /skill\(\{ action: "read"/);
-  assert.match(browserCodeRuntimeSkillContent, /Call `readBrowserState` in a separate model step/);
+  assert.match(browserCodeRuntimeSkillContent, /includes its complete result in `prerequisiteResults`/);
+  assert.match(browserCodeRuntimeSkillContent, /still executes the supplied browserCode in the same tool call/);
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\("https:\/\/example\.com\/"\)/);
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\(\{ url: "https:\/\/example\.com\/" \}\)/);
   assert.match(browserCodeRuntimeSkillContent, /page\.activeSurface\(\)/);

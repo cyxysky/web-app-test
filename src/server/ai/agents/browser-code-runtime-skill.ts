@@ -23,8 +23,8 @@ This hidden built-in Skill is the authoritative API reference and operating cont
 
 Provider-neutral call notation: \`skill({ action: "read", skillId: "${browserCodeRuntimeSkillId}" })\`.
 
-2. Call \`readBrowserState\` in a separate model step for every new or resumed browser request. It returns the current conversation-owned tabs, selected URL/title, and a current page snapshot.
-3. Inspect and use that result as the initial read-only observation. Do not repeat the same tabs/URL/title/snapshot inventory in another browserCode cell. Add a targeted read only when an exact locator, frame, or surface fact needed for the next action is absent or stale.
+2. Call \`browserCode\` directly for every new or resumed browser request. When live-state preflight is pending, the execution layer runs \`readBrowserState\` internally, includes its complete result in \`prerequisiteResults\`, and still executes the supplied browserCode in the same tool call. Call \`readBrowserState\` explicitly only when its snapshot is itself the desired result.
+3. Inspect the bundled prerequisite result and the requested browserCode result together. Do not repeat the same tabs/URL/title/snapshot inventory in another browserCode cell. Add a targeted read only when an exact locator, frame, or surface fact needed for the next action is absent or stale.
 4. Use browserCode for bounded read or action cells. A cell may contain multiple dependent operations only when each later target is confirmed by an intervening targeted read.
 5. Verify the requested business outcome with a final read-only cell. Also inspect \`await page.activeSurface()\` and resolve or disclose any unexpected remaining popup.
 
@@ -35,7 +35,7 @@ If the runtime rejects a governed call, preserve its complete error and any \`re
 These are model tools, not JavaScript globals:
 
 - \`skill({ action: "read", skillId, reason })\` loads one exact Skill for the current Agent run.
-- \`readBrowserState({ reason })\` performs the non-mutating browser preflight. Its result is sufficient initial tabs/page/snapshot evidence; do not duplicate it automatically in browserCode.
+- \`readBrowserState({ reason })\` explicitly returns the non-mutating browser preflight. When another browser tool needs it, the host executes it internally, appends its complete result to \`prerequisiteResults\`, and then executes the requested tool; use the explicit tool only when the snapshot is the requested output.
 - \`browserCode({ reason, code, maxOutputChars? })\` executes one JavaScript cell. \`reason\` is a concise description of the exact read/action; \`code\` is 1-40,000 characters; \`maxOutputChars\`, when supplied, is at least 1,000.
 
 The outer browserCode result is \`{ ok, actual, failureCategory?, dependencyFailures?, referenceImagePaths? }\`. \`actual\` is JSON text containing \`{ ok, result, error, aborted, elapsedMs, finalPage, verification?, domChanges?, images, imageErrors }\`. Parse the tool result semantically: \`domChanges\` is only the incremental journal caused by that cell, not a full snapshot; \`dependencyFailures\` is a once-only queue of recent request failures and HTTP 408/429/5xx observations. Failed results preserve the complete error and failure classification without generated recovery prose.

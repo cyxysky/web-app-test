@@ -129,7 +129,10 @@ import {
   parseBrowserChatRealtimePatch,
 } from '@/components/browser-chat-realtime-model';
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
-import { browserChatToolValidationSummary } from '@/components/browser-chat-tool-error';
+import {
+  browserChatToolFailureSummary,
+  browserChatToolValidationSummary,
+} from '@/components/browser-chat-tool-error';
 import {
   browserChatFileToolPresentation,
   type BrowserChatFileToolPresentationKey,
@@ -2972,7 +2975,9 @@ function browserChatArtifactFileIcon(fileName: string, openUrl: string) {
       ? { name: 'Word', src: '/file-icons/word.svg' }
       : /^(?:XLS|XLSX|XLSM|XLSB|CSV|ODS)$/i.test(extension)
         ? { name: 'Excel', src: '/file-icons/excel.svg' }
-        : undefined;
+        : /^PDF$/i.test(extension)
+          ? { name: 'PDF', src: '/file-icons/pdf.svg' }
+          : undefined;
   if (!icon) return <FileText size={20} />;
   return (
     <img
@@ -3484,9 +3489,12 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     <>
       {toolCalls.map(({ tool, toolIndex }) => {
         const label = browserChatToolLabel(tool.name, tool.input, t);
+        const failureMeta = tool.ok === false
+          ? browserChatToolFailureSummary(tool.rawResult ?? tool.error ?? tool.result)
+          : undefined;
         const meta = tool.invalid
           ? browserChatToolValidationSummary(tool.error || tool.result)
-          : compactText(tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
+          : compactText(failureMeta || tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
         const presentation = browserChatToolPresentation(tool, step, running);
         const { isActive: isActiveTool, stateClass, status } = presentation;
@@ -3644,9 +3652,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const { tool, toolDetail } = entry;
         const executedTool = toolDetail.tool;
         const label = browserChatToolLabel(executedTool.name, executedTool.input, t);
+        const failureMeta = executedTool.ok === false
+          ? browserChatToolFailureSummary(executedTool.rawResult ?? executedTool.error ?? executedTool.result)
+          : undefined;
         const meta = executedTool.invalid
           ? browserChatToolValidationSummary(executedTool.error || executedTool.result)
-          : executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
+          : failureMeta || executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
         const presentation = browserChatToolPresentation(executedTool, toolDetail.step, running);
         const { isActive, stateClass, status } = presentation;
         const pendingConfirmation = pendingConfirmationForTool({
@@ -11317,6 +11328,8 @@ export function BrowserChatWorkspace({
       {messageGenerationDialog ? (
         <AppModal
           ariaLabelledBy="browser-chat-message-generation-title"
+          backdropClassName="ui-modal-overlay browser-chat-message-generation-overlay"
+          dialogClassName="ui-modal ui-modal--form browser-chat-message-generation-dialog"
           dismissable={!messageGenerationSubmitting}
           keyboardDismissable={!messageGenerationSubmitting}
           onClose={closeMessageGenerationDialog}

@@ -145,6 +145,16 @@ body {
   outline-offset: 2px;
 }
 
+.app-data-table-header-label {
+  display: inline-block;
+  white-space: nowrap;
+  word-break: keep-all;
+}
+
+.app-data-table.is-compact :is(.table__column, .table__cell) {
+  padding-block: 9px;
+}
+
 /* Controls */
 .ui-button,
 .ui-icon-button {
@@ -263,8 +273,8 @@ html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send, .brow
   box-shadow: none !important;
 }
 
-/* Icon-led actions stay chromeless even when they also include a text label. */
-html .ui-button:has(> svg):not(.ui-modal-footer .ui-button) {
+/* Non-primary icon-led actions stay chromeless even when they include a label. */
+html .ui-button:has(> svg):not(.ui-button--primary, .ui-modal-footer .ui-button) {
   background: transparent !important;
   border: 0 !important;
   box-shadow: none !important;
@@ -275,23 +285,15 @@ html .ui-button--neutral:has(> svg):not(.ui-modal-footer .ui-button) {
   color: var(--foreground) !important;
 }
 
-html .ui-button--primary:has(> svg):not(.ui-modal-footer .ui-button) {
-  color: var(--accent-strong) !important;
-}
-
 html .ui-button--danger:has(> svg):not(.ui-modal-footer .ui-button) {
   color: var(--danger) !important;
 }
 
-html .ui-button:has(> svg):not(.ui-modal-footer .ui-button):not(:disabled):hover,
-html .ui-button:has(> svg):not(.ui-modal-footer .ui-button):not(:disabled):active {
+html .ui-button:has(> svg):not(.ui-button--primary, .ui-modal-footer .ui-button):not(:disabled):hover,
+html .ui-button:has(> svg):not(.ui-button--primary, .ui-modal-footer .ui-button):not(:disabled):active {
   background: transparent !important;
   border: 0 !important;
   box-shadow: none !important;
-}
-
-html .ui-button--primary:has(> svg):not(.ui-modal-footer .ui-button):not(:disabled):hover {
-  color: var(--accent-hover) !important;
 }
 
 html :is(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-chat-embedded-tab-close):not(:disabled):hover {

@@ -6,7 +6,7 @@ function restoreCollapsedMarkdownBlocks(value: string) {
       return before.endsWith('|') && after.startsWith('|') ? match : '\n\n---\n\n';
     })
     .replace(/([^\n|])[ \t]+(?=#{1,6}[ \t]+[^|\n])/g, '$1\n\n')
-    .replace(/\|[ \t]+\|/g, '|\n|')
+    .replace(/^.*\|[ \t]+\|[ \t]*:?-{3,}.*$/gm, (line) => line.replace(/\|[ \t]+\|/g, '|\n|'))
     .replace(/(^|\n)([^\n|]*\S)[ \t]+(?=\|[^\n]+\|\n\|[ \t]*:?-{3,})/g, '$1$2\n\n')
     .replace(/(^|\n)(\*\*[^*\n]{1,120}\*\*)[ \t]*(?=\|[^\n]+\|\n\|[ \t]*:?-{3,})/g, '$1$2\n\n')
     .replace(/(^|\n)(#{1,6}[ \t]+[^|\n]+?)(\|[^\n]+\|)\n(?=\|[ \t]*:?-{3,})/g, '$1$2\n\n$3\n')

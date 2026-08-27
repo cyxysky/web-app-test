@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  browserToolBlockedBeforeBrowserState,
+  browserToolPrerequisiteNames,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
   runtimeBrowserSessionToolNames,
@@ -52,16 +52,26 @@ test('browser state gate remains pending until the browser preflight has been at
   assert.equal(requiresBrowserStatePreflight(false, []), true);
   assert.equal(requiresBrowserStatePreflight(false, [{ name: 'browserCode', result: { ok: true } }]), true);
   assert.equal(requiresBrowserStatePreflight(false, [{ name: 'readBrowserState', result: { ok: false } }]), false);
+  assert.equal(requiresBrowserStatePreflight(false, [{
+    name: 'browserCode',
+    result: {
+      ok: true,
+      prerequisiteResults: [{
+        toolName: 'readBrowserState',
+        result: { ok: true, actual: 'live state' },
+      }],
+    },
+  }]), false);
   assert.equal(requiresBrowserStatePreflight(true, []), false);
 });
 
-test('browser state gate blocks execution without hiding tool schemas', () => {
-  assert.equal(browserToolBlockedBeforeBrowserState('readBrowserState', true, runtimeBrowserSessionToolNames), false);
-  assert.equal(browserToolBlockedBeforeBrowserState('browserCode', true, runtimeBrowserSessionToolNames), true);
-  assert.equal(browserToolBlockedBeforeBrowserState('waitForHumanVerification', true, runtimeBrowserSessionToolNames), true);
-  assert.equal(browserToolBlockedBeforeBrowserState('subagent', true, runtimeBrowserSessionToolNames), false);
-  assert.equal(browserToolBlockedBeforeBrowserState('file', true, runtimeBrowserSessionToolNames), false);
-  assert.equal(browserToolBlockedBeforeBrowserState('browserCode', false, runtimeBrowserSessionToolNames), false);
+test('browser tools declare bundled prerequisites while live state is pending', () => {
+  assert.deepEqual(browserToolPrerequisiteNames('readBrowserState', true, runtimeBrowserSessionToolNames), []);
+  assert.deepEqual(browserToolPrerequisiteNames('browserCode', true, runtimeBrowserSessionToolNames), ['readBrowserState']);
+  assert.deepEqual(browserToolPrerequisiteNames('waitForHumanVerification', true, runtimeBrowserSessionToolNames), ['readBrowserState']);
+  assert.deepEqual(browserToolPrerequisiteNames('subagent', true, runtimeBrowserSessionToolNames), []);
+  assert.deepEqual(browserToolPrerequisiteNames('file', true, runtimeBrowserSessionToolNames), []);
+  assert.deepEqual(browserToolPrerequisiteNames('browserCode', false, runtimeBrowserSessionToolNames), []);
 });
 
 test('direct main-browser tools use the generic session-start hook', () => {

@@ -122,66 +122,68 @@ export function WorkspaceHistoryList<T>({
   }, [listRef]);
 
   return (
-    <ol
-      aria-busy={ariaBusy}
-      className={`workspace-history-list${className ? ` ${className}` : ''}`}
-      onScroll={onScroll}
-      ref={assignListRef}
-    >
-      {groups.map((group) => {
-        const collapsed = compactGroupHeaders && collapsedGroupKeys.has(group.key);
-        return (
-          <li className="browser-chat-history-date-group workspace-sidebar-archive-date-group" key={group.key}>
-            {compactGroupHeaders ? (
-              <button
-                aria-expanded={!collapsed}
-                className="workspace-sidebar-archive-date-toggle"
-                onClick={() => setCollapsedGroupKeys((current) => {
-                  const next = new Set(current);
-                  if (next.has(group.key)) next.delete(group.key);
-                  else next.add(group.key);
-                  return next;
-                })}
-                type="button"
-              >
-                <span aria-hidden="true" className="workspace-sidebar-archive-date-chevron">
-                  <ChevronDown className={collapsed ? 'is-collapsed' : undefined} size={12} />
-                </span>
+    <>
+      <ol
+        aria-busy={ariaBusy}
+        className={`workspace-history-list${className ? ` ${className}` : ''}`}
+        onScroll={onScroll}
+        ref={assignListRef}
+      >
+        {groups.map((group) => {
+          const collapsed = compactGroupHeaders && collapsedGroupKeys.has(group.key);
+          return (
+            <li className="browser-chat-history-date-group workspace-sidebar-archive-date-group" key={group.key}>
+              {compactGroupHeaders ? (
+                <button
+                  aria-expanded={!collapsed}
+                  className="workspace-sidebar-archive-date-toggle"
+                  onClick={() => setCollapsedGroupKeys((current) => {
+                    const next = new Set(current);
+                    if (next.has(group.key)) next.delete(group.key);
+                    else next.add(group.key);
+                    return next;
+                  })}
+                  type="button"
+                >
+                  <span aria-hidden="true" className="workspace-sidebar-archive-date-chevron">
+                    <ChevronDown className={collapsed ? 'is-collapsed' : undefined} size={12} />
+                  </span>
+                  <time
+                    aria-label={group.ariaLabel}
+                    dateTime={group.key === 'unknown' ? undefined : group.key}
+                  >
+                    {compactWorkspaceHistoryLabel(group.key, language)}
+                  </time>
+                  <span className="workspace-sidebar-archive-date-count">{group.items.length}</span>
+                </button>
+              ) : (
                 <time
                   aria-label={group.ariaLabel}
+                  className="browser-chat-history-date-label workspace-sidebar-archive-date-label"
                   dateTime={group.key === 'unknown' ? undefined : group.key}
                 >
-                  {compactWorkspaceHistoryLabel(group.key, language)}
+                  <strong>{group.day}</strong>
+                  <span>{group.month}</span>
                 </time>
-                <span className="workspace-sidebar-archive-date-count">{group.items.length}</span>
-              </button>
-            ) : (
-              <time
-                aria-label={group.ariaLabel}
-                className="browser-chat-history-date-label workspace-sidebar-archive-date-label"
-                dateTime={group.key === 'unknown' ? undefined : group.key}
+              )}
+              <div
+                aria-hidden={collapsed}
+                className={`workspace-sidebar-archive-date-body${collapsed ? ' is-collapsed' : ''}`}
+                inert={collapsed ? true : undefined}
               >
-                <strong>{group.day}</strong>
-                <span>{group.month}</span>
-              </time>
-            )}
-            <div
-              aria-hidden={collapsed}
-              className={`workspace-sidebar-archive-date-body${collapsed ? ' is-collapsed' : ''}`}
-              inert={collapsed ? true : undefined}
-            >
-              <ol
-                aria-label={group.ariaLabel}
-                className="browser-chat-history-date-items workspace-sidebar-archive-date-items"
-              >
-                {group.items.map((item) => <li key={getKey(item)}>{renderItem(item)}</li>)}
-              </ol>
-            </div>
-          </li>
-        );
-      })}
-      {footer}
-    </ol>
+                <ol
+                  aria-label={group.ariaLabel}
+                  className="browser-chat-history-date-items workspace-sidebar-archive-date-items"
+                >
+                  {group.items.map((item) => <li key={getKey(item)}>{renderItem(item)}</li>)}
+                </ol>
+              </div>
+            </li>
+          );
+        })}
+        {footer}
+      </ol>
+    </>
   );
 }
 

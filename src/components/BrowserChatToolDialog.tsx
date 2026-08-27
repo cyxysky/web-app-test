@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, Copy, X } from 'lucide-react';
 import { formatToolPayload } from '@/components/browser-chat-format';
+import { browserChatToolFailureSummary } from '@/components/browser-chat-tool-error';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { AppModal } from '@/components/ui/app-modal';
@@ -125,6 +126,9 @@ export function BrowserChatToolDialog({
   // do not unwrap `actual`: the outer result also carries runtime Skills,
   // failure classification, screenshots, and trace data.
   const resultPayload = rawToolResultPayload(completeResult);
+  const failureSummary = status === '失败'
+    ? browserChatToolFailureSummary(completeResult)
+    : undefined;
 
   useEffect(() => () => {
     if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
@@ -168,6 +172,7 @@ export function BrowserChatToolDialog({
         </header>
 
         <div className="ui-modal-body browser-chat-tool-modal-body">
+          {failureSummary ? <div className="browser-chat-tool-failure-summary" role="alert">{failureSummary}</div> : null}
           <div className="browser-chat-tool-io-grid">
             <section className="browser-chat-tool-output-panel">
               <header className="browser-chat-tool-output-header">

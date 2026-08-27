@@ -410,11 +410,10 @@ export function AiOperationsWorkspace({
               </header>
               {data.incidents.length ? (
                 <DataTable<AiOperationsDashboardData['incidents'][number]>
-                  className="ai-operations-data-table"
                   columns={[
                     {
                       accessor: (item) => item.title,
-                      cell: (item) => <>{item.href ? <Link href={item.href}>{item.title}</Link> : <strong>{item.title}</strong>}<small title={item.reason}>{item.reason}</small></>,
+                      cell: (item) => <>{item.href ? <Link href={item.href}>{item.title}</Link> : <strong>{item.title}</strong>}<br /><small title={item.reason}>{item.reason}</small></>,
                       header: t('任务'),
                       id: 'task',
                     },
@@ -453,13 +452,12 @@ export function AiOperationsWorkspace({
               <header className="ai-operations-panel-header"><div><h2>{t('用户使用情况')}</h2><p>{t('按用户统计任务量和执行结果')}</p></div></header>
               {data.users.length ? (
                 <DataTable<AiOperationsDashboardData['users'][number]>
-                  className="ai-operations-data-table"
                   columns={[
                     { accessor: (item) => item.userId, cell: (item) => <strong>{item.userId}</strong>, header: t('用户'), id: 'user' },
                     { accessor: (item) => item.totalTasks, cell: (item) => item.totalTasks, header: t('任务'), id: 'tasks' },
                     {
                       accessor: (item) => item.totalTokens,
-                      cell: (item) => <span className="ai-operations-token-usage"><strong>{compactNumber(item.totalTokens)}</strong><small>输入 {compactNumber(item.inputTokens)} · 输出 {compactNumber(item.outputTokens)}</small></span>,
+                      cell: (item) => <><strong>{compactNumber(item.totalTokens)}</strong><br /><small>输入 {compactNumber(item.inputTokens)} · 输出 {compactNumber(item.outputTokens)}</small></>,
                       header: t('Token 用量'),
                       id: 'tokens',
                     },
@@ -481,9 +479,8 @@ export function AiOperationsWorkspace({
               <header className="ai-operations-panel-header"><div><h2>{t('模型使用情况')}</h2><p>{t('历史任务与当前服务进程 Token 指标')}</p></div></header>
               {data.models.length ? (
                 <DataTable<AiOperationsDashboardData['models'][number]>
-                  className="ai-operations-data-table"
                   columns={[
-                    { accessor: (item) => item.model, cell: (item) => <><strong>{item.model}</strong><small>{item.provider}</small></>, header: t('模型'), id: 'model' },
+                    { accessor: (item) => item.model, cell: (item) => <><strong>{item.model}</strong><br /><small>{item.provider}</small></>, header: t('模型'), id: 'model' },
                     { accessor: (item) => item.taskCount, cell: (item) => item.taskCount, header: t('任务'), id: 'tasks' },
                     { accessor: (item) => item.calls, cell: (item) => compactNumber(item.calls), header: t('调用'), id: 'calls' },
                     { accessor: (item) => item.inputTokens, cell: (item) => compactNumber(item.inputTokens), header: t('输入 Token'), id: 'input' },
