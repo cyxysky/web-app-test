@@ -248,7 +248,7 @@ export function BrowserChatOnboarding({
       return (
         <>
           <ul className="browser-chat-onboarding-facts">
-            <li><Check size={15} /><span>{t('账号按域名保存，只有匹配站点才能使用。')}</span></li>
+            <li><Check size={15} /><span>{t('账号可跨站点使用；默认站点只用于识别账号和提供登录地址。')}</span></li>
             <li><Check size={15} /><span>{t('密码只在后台解密，并通过短期安全引用填入页面；模型看不到密码明文。')}</span></li>
             <li><Check size={15} /><span>{t('验证码、扫码和二次认证仍需要你在浏览器中完成。')}</span></li>
           </ul>

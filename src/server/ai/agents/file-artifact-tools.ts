@@ -175,6 +175,18 @@ type ArtifactToolPayload = {
   currentRevision?: number | null;
   lastSuccessfulRevision?: number | null;
   error?: string;
+  automaticValidation?: {
+    formatChecks?: unknown;
+    issues?: Array<{ code?: string; message?: string; severity?: string }>;
+    passed?: boolean;
+  };
+  visualVerification?: {
+    gateStatus?: string;
+    imageCount?: number;
+    pageCount?: number;
+    renderedPages?: number[];
+    status?: string;
+  };
 };
 
 export type FileArtifactToolResult = {
@@ -486,6 +498,34 @@ function artifactResultPayload(input: {
   };
 }
 
+function compactAutomaticValidation(payload: ArtifactToolPayload) {
+  const validation = payload.automaticValidation;
+  if (!validation) return '';
+  const issues = Array.isArray(validation.issues)
+    ? validation.issues.slice(0, 12).map((issue) => {
+        const identity = [issue.severity, issue.code].filter(Boolean).join(':') || 'issue';
+        const message = String(issue.message || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+        return message ? `${identity}=${message}` : identity;
+      })
+    : [];
+  return [
+    `Automatic validation passed=${validation.passed === true}`,
+    validation.formatChecks === undefined ? '' : `formatChecks=${JSON.stringify(validation.formatChecks)}`,
+    `issues=${issues.length ? issues.join(' | ') : 'none'}`,
+  ].filter(Boolean).join('; ');
+}
+
+function compactVisualVerification(payload: ArtifactToolPayload) {
+  const verification = payload.visualVerification;
+  if (!verification) return '';
+  return [
+    `Visual QA=${verification.gateStatus || verification.status || 'unknown'}`,
+    typeof verification.pageCount === 'number' ? `pageCount=${verification.pageCount}` : '',
+    typeof verification.imageCount === 'number' ? `imageCount=${verification.imageCount}` : '',
+    Array.isArray(verification.renderedPages) ? `renderedPages=${verification.renderedPages.join(',')}` : '',
+  ].filter(Boolean).join('; ');
+}
+
 export function formatFileArtifactResult(toolName: string, actual?: string) {
   if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
@@ -505,7 +545,10 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       if (payload.validation === 'failed' || payload.validationStatus === 'failed') {
         return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
       }
-      return `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`;
+      return [
+        `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`,
+        compactAutomaticValidation(payload),
+      ].filter(Boolean).join('; ');
     }
     if (payload.kind === 'office-source-unit-validation' && payload.validation === 'failed') {
       return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
@@ -527,6 +570,8 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       targetLine,
       payload.url && payload.url !== target ? `Open: ${payload.url}` : '',
       typeof payload.bytes === 'number' ? `size=${payload.bytes} bytes` : '',
+      compactAutomaticValidation(payload),
+      compactVisualVerification(payload),
     ].filter(Boolean).join('; ');
   } catch {
     return actual;
@@ -3046,6 +3091,22 @@ function artifactMarkdownUrl(value: string) {
   }
 }
 
+function artifactIdFromMarkdownUrl(value: string) {
+  try {
+    const url = new URL(value, 'http://webpilot.local');
+    const marker = '/api/artifacts/';
+    const markerIndex = url.pathname.indexOf(marker);
+    if (markerIndex < 0) return undefined;
+    return url.pathname
+      .slice(markerIndex + marker.length)
+      .split('/')
+      .map((segment) => decodeURIComponent(segment))
+      .join('/');
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizedMarkdownLinkLabel(value: string) {
   return value
     .replace(/\\([\[\]\\])/g, '$1')
@@ -3059,10 +3120,15 @@ function repairArtifactDownloadLinks(reply: string, downloads: FileArtifactDownl
     if (imagePrefix || !artifactMarkdownUrl(href)) return full;
     const normalizedLabel = normalizedMarkdownLinkLabel(label);
     const exactUrl = downloads.find((item) => item.downloadUrl === href);
+    const hrefArtifactId = artifactIdFromMarkdownUrl(href);
+    const exactArtifact = hrefArtifactId
+      ? downloads.find((item) => item.artifactId === hrefArtifactId)
+      : undefined;
     const labelMatches = downloads.filter((item) => (
       normalizedLabel === item.fileName || normalizedLabel.endsWith(item.fileName)
     ));
     const verified = exactUrl
+      || exactArtifact
       || (labelMatches.length === 1 ? labelMatches[0] : undefined)
       || (downloads.length === 1 ? downloads[0] : undefined);
     if (!verified) return full;

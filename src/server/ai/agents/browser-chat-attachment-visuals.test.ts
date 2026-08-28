@@ -38,6 +38,10 @@ def create_document(job):
     assert.deepEqual(result.renderedPages, [2]);
     assert.equal((await readFile(result.imagePaths[0])).subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
 
+    await renderBrowserChatAttachmentVisuals({ absolutePath: sourcePath, buffer: generated.buffer, extension: '.pdf', name: 'source.pdf', pages: [1], previewRoot: path.join(root, 'previews') });
+    const cachedSecondPage = await renderBrowserChatAttachmentVisuals({ absolutePath: sourcePath, buffer: generated.buffer, extension: '.pdf', name: 'source.pdf', pages: [2], previewRoot: path.join(root, 'previews') });
+    assert.deepEqual(cachedSecondPage.automaticChecks?.map((check) => check.pageNumber), [2]);
+
     const attachment = {
       id: 'artifact-1',
       kind: 'file' as const,

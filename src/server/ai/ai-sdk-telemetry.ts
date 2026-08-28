@@ -71,6 +71,14 @@ const runtimeTelemetry: Telemetry = {
       setMetricGauge('ai_sdk_output_tokens_per_second', event.performance.outputTokensPerSecond, labels);
     }
     addTokenMetric('ai_sdk_input_tokens_total', event.usage.inputTokens, labels);
+    addTokenMetric('ai_sdk_input_no_cache_tokens_total', event.usage.inputTokenDetails.noCacheTokens, labels);
+    addTokenMetric('ai_sdk_input_cache_read_tokens_total', event.usage.inputTokenDetails.cacheReadTokens, labels);
+    addTokenMetric('ai_sdk_input_cache_write_tokens_total', event.usage.inputTokenDetails.cacheWriteTokens, labels);
+    const cacheReadTokens = event.usage.inputTokenDetails.cacheReadTokens;
+    const inputTokens = event.usage.inputTokens;
+    if (typeof cacheReadTokens === 'number' && typeof inputTokens === 'number' && inputTokens > 0) {
+      setMetricGauge('ai_sdk_prompt_cache_hit_ratio', cacheReadTokens / inputTokens, labels);
+    }
     addTokenMetric('ai_sdk_output_tokens_total', event.usage.outputTokens, labels);
     addTokenMetric('ai_sdk_total_tokens_total', event.usage.totalTokens, labels);
     incrementMetric('ai_sdk_model_calls_total', { ...labels, finishReason: event.finishReason });

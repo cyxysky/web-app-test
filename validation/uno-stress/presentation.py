@@ -48,7 +48,9 @@ def create_document(job):
     # @webpilot-unit pages/slide-02
     page = deck.add_slide('slide-02')
     deck.add_text('slide-02/title', page, '多语言文本与富文本属性必须稳定', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)
-    rich = _expert_text(expert, document, page, 'slide-02/rich-text', '中文 English العربية Русский\n粗体 · 斜体 · 下划线 · 字距', 1700, 3300, 23800, 4200, 22)
+    # Non-breaking spaces keep visible separation around the right-to-left run
+    # without relying on directional controls that PowerPoint renders as glyphs.
+    rich = _expert_text(expert, document, page, 'slide-02/rich-text', '中文 English\u00a0العربية\u00a0Русский\n粗体 · 斜体 · 下划线 · 字距', 1700, 3300, 23800, 4200, 22)
     cursor = rich.Text.createTextCursor()
     cursor.gotoStart(False)
     cursor.goRight(2, True)

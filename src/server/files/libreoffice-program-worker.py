@@ -1383,7 +1383,9 @@ def verify_word_layout(component, element_map=None):
                 continue
             text_shape_count += 1
             tolerance = 100
-            if x < -tolerance or y < -tolerance or x + width > page_width + tolerance or y + height > page_height + tolerance:
+            # Writer exposes positions for paragraph/character-anchored objects relative
+            # to their anchor. Only AT_PAGE positions use absolute page coordinates.
+            if 'AT_PAGE' in anchor_type and (x < -tolerance or y < -tolerance or x + width > page_width + tolerance or y + height > page_height + tolerance):
                 issues.append(map_issue({
                     'severity': 'warning', 'type': 'drawing_text_out_of_page', 'element': index + 1,
                     'description': f'Drawing text object bounds x={x}, y={y}, width={width}, height={height} extend beyond page size {page_width}x{page_height}; confirm the bleed or crop is intentional.',

@@ -99,6 +99,7 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
+import { ModelBrandIcon } from '@/components/ModelBrandIcon';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { AppModal } from '@/components/ui/app-modal';
 import { AppInput } from '@/components/ui/app-input';
@@ -151,6 +152,7 @@ import {
 } from '@/components/WorkspaceSidebarArchive';
 import { WorkspaceOverflowMenu } from '@/components/WorkspaceOverflowMenu';
 import { BrowserChatOnboarding } from '@/components/BrowserChatOnboarding';
+import { BrowserChatRuntimeStateControl } from '@/components/BrowserChatRuntimeStateControl';
 import { BeautifulLoadingState } from '@/components/BeautifulLoadingState';
 import { useFilePreview } from '@/components/FilePreviewProvider';
 import {
@@ -5728,10 +5730,14 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
   const [dismissedSlashDraft, setDismissedSlashDraft] = useState('');
   const [activeSkillIndex, setActiveSkillIndex] = useState(0);
   const attachmentsById = useMemo(() => new Map(attachments.map((attachment) => [attachment.id, attachment])), [attachments]);
-  const compactModelSelectionOptions = useMemo(() => modelSelectionOptions.map((option) => ({
-    ...option,
-    selectedLabel: option.label.toLocaleLowerCase(),
-  })), [modelSelectionOptions]);
+  const compactModelSelectionOptions = useMemo(() => modelSelectionOptions.map((option) => {
+    const selection = parseModelSelectionValue(option.value);
+    return {
+      ...option,
+      icon: <ModelBrandIcon model={selection.model} provider={selection.provider} />,
+      selectedLabel: option.label.toLocaleLowerCase(),
+    };
+  }), [modelSelectionOptions]);
 
   useEffect(() => {
     setDraft('');
@@ -11023,17 +11029,19 @@ export function BrowserChatWorkspace({
             <span>{t('实时界面')}</span>
           </button>
         ) : null}
-        <button
-          aria-label={t('结束会话并关闭浏览器')}
-          className="browser-chat-conversation-direct-action is-danger"
-          disabled={session.status === 'closed' || currentBusy}
-          onClick={closeSession}
-          title={t('结束会话并关闭浏览器')}
-          type="button"
-        >
-          <Power aria-hidden="true" size={17} />
-          <span>{t('关闭浏览器')}</span>
-        </button>
+        <BrowserChatRuntimeStateControl active={currentBusy} sessionId={session.id}>
+          <button
+            aria-label={t('结束会话并关闭浏览器')}
+            className="browser-chat-conversation-direct-action is-danger"
+            disabled={session.status === 'closed' || currentBusy}
+            onClick={closeSession}
+            title={t('结束会话并关闭浏览器')}
+            type="button"
+          >
+            <Power aria-hidden="true" size={17} />
+            <span>{t('关闭浏览器')}</span>
+          </button>
+        </BrowserChatRuntimeStateControl>
         {!webPreviewRuntime ? (
           <WorkspaceOverflowMenu
             className="browser-chat-conversation-more"

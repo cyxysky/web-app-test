@@ -1270,7 +1270,7 @@ test('browserCode agent state survives a kernel recycle', async () => {
   try {
     const saved = await execute(`
       var temporaryConversationValue = 'kernel-only';
-      nodeRepl.write(await agent.state.set({key:'task.progress',value:{step:3,issueId:'30789'}}));
+      nodeRepl.write(await agent.state.set('task.progress',{step:3,issueId:'30789'}));
     `);
     assert.equal(saved.ok, true, saved.error);
     assert.equal(saved.kernelReset?.reason, 'execution-limit');
@@ -1278,7 +1278,7 @@ test('browserCode agent state survives a kernel recycle', async () => {
     const restored = await execute(`
       nodeRepl.write({
         temporaryType: typeof temporaryConversationValue,
-        persisted: await agent.state.get({key:'task.progress'})
+        persisted: await agent.state.get('task.progress')
       });
     `);
     assert.equal(restored.ok, true, restored.error);
@@ -1287,6 +1287,12 @@ test('browserCode agent state survives a kernel recycle', async () => {
       step: 3,
       issueId: '30789',
     });
+
+    const objectForm = await execute(`
+      nodeRepl.write(await agent.state.set({key:'task.object-form',value:'still-supported'}));
+    `);
+    assert.equal(objectForm.ok, true, objectForm.error);
+    assert.equal((objectForm.value as { value: unknown }).value, 'still-supported');
   } finally {
     await stateKernel.close();
   }
@@ -1485,6 +1491,15 @@ test('browserCode fills credential references only on an allowed origin without 
     assert.match(rejected.error || '', /not allowed for http:\/\/credential\.test/);
     assert.equal(await page.locator('label input[name="password"]').inputValue(), '');
     assert.doesNotMatch(JSON.stringify(rejected), new RegExp(secret));
+
+    const unrestricted = await run(`
+      await credentialVault.fill(page.locator('label input[name="password"]'), 'unrestricted-ref');
+    `, {
+      credentials: [{ ref: 'unrestricted-ref', value: secret, allowedOrigins: [] }],
+    });
+    assert.equal(unrestricted.ok, true, unrestricted.error);
+    assert.equal(await page.locator('label input[name="password"]').inputValue(), secret);
+    assert.doesNotMatch(JSON.stringify(unrestricted), new RegExp(secret));
   } finally {
     await page.goto('about:blank');
     await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');

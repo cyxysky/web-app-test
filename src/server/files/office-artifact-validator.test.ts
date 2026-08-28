@@ -20,6 +20,9 @@ test('validates the final OOXML package independently from its authoring engine'
     assert.deepEqual(result.requestedFonts, ['Arial']);
     assert.ok(Array.isArray(result.media));
     assert.ok(result.platform.length > 0);
+    assert.deepEqual(result.formatChecks, {
+      presentation: { chartCount: 0, imageCount: 0, slideCount: 1, tableCount: 0 },
+    });
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -127,7 +130,7 @@ test('rejects XLSX workbooks without worksheets', async () => {
   }
 });
 
-test('does not apply UNO-only format checks to JavaScript basic validation', async () => {
+test('applies OOXML structure checks to JavaScript basic validation', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-xlsx-basic-'));
   const target = path.join(directory, 'empty.xlsx');
   try {
@@ -135,8 +138,35 @@ test('does not apply UNO-only format checks to JavaScript basic validation', asy
     zip.file('xl/workbook.xml', '<workbook/>');
     await writeFile(target, await zip.generateAsync({ type: 'nodebuffer' }));
     const result = await validateOfficeArtifact({ absolutePath: target, extension: '.xlsx', validationProfile: 'basic' });
-    assert.equal(result.passed, true);
-    assert.equal(result.issues.some((issue) => issue.code === 'XLSX_NO_WORKSHEETS'), false);
+    assert.equal(result.passed, false);
+    assert.equal(result.issues.some((issue) => issue.code === 'XLSX_NO_WORKSHEETS'), true);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test('rejects visible XLSX error cells and reports deterministic workbook counts in basic mode', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-xlsx-errors-'));
+  const target = path.join(directory, 'errors.xlsx');
+  try {
+    const zip = new JSZip();
+    zip.file('xl/workbook.xml', '<workbook><sheets><sheet name="Edge Cases"/></sheets></workbook>');
+    zip.file('xl/worksheets/sheet1.xml', [
+      '<worksheet><dimension ref="A1:B2"/><sheetData><row r="1">',
+      '<c r="A1"><f>1+1</f><v>2</v></c>',
+      '<c r="B1" t="e"><f>1/0</f><v>#VALUE!</v></c>',
+      '</row></sheetData></worksheet>',
+    ].join(''));
+    zip.file('xl/charts/chart1.xml', '<chart/>');
+    await writeFile(target, await zip.generateAsync({ type: 'nodebuffer' }));
+
+    const result = await validateOfficeArtifact({ absolutePath: target, extension: '.xlsx', validationProfile: 'basic' });
+
+    assert.equal(result.passed, false);
+    assert.ok(result.issues.some((issue) => issue.code === 'XLSX_FORMULA_ERROR_LITERAL'));
+    assert.deepEqual(result.formatChecks, {
+      spreadsheet: { chartCount: 1, errorCellCount: 1, formulaCount: 2, imageCount: 0, worksheetCount: 1 },
+    });
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

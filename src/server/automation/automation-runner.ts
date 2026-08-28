@@ -144,23 +144,18 @@ function credentialContextForCase(automationCase: AutomationCaseRecord): Automat
     ? activeAccounts.filter((account) => account.domain === target.hostname.toLowerCase())
     : [];
   const mentionedAccounts = activeAccounts.filter((account) => instructionMentionsAccount(automationCase.instruction, account));
-  const mentionedDomainAccounts = domainAccounts.filter((account) => instructionMentionsAccount(automationCase.instruction, account));
-  const account = mentionedDomainAccounts.length === 1
-    ? mentionedDomainAccounts[0]
+  const account = mentionedAccounts.length === 1
+    ? mentionedAccounts[0]
     : domainAccounts.length === 1
       ? domainAccounts[0]
-      : mentionedAccounts.length === 1
-        ? mentionedAccounts[0]
+      : activeAccounts.length === 1
+        ? activeAccounts[0]
         : undefined;
   if (!account) return { bindings: [], operationalContext: '' };
 
   const resolved = resolveLoginAccountCredentialById(account.id, automationCase.userId);
   if (!resolved) return { bindings: [], operationalContext: '' };
-  const allowedOrigins = Array.from(new Set([
-    target?.origin,
-    httpUrl(account.loginUrl)?.origin,
-  ].filter((origin): origin is string => Boolean(origin))));
-  if (!allowedOrigins.length) return { bindings: [], operationalContext: '' };
+  const allowedOrigins: string[] = [];
 
   const token = randomUUID();
   const usernameRef = `credential_${token}_username`;
@@ -178,10 +173,10 @@ function credentialContextForCase(automationCase: AutomationCaseRecord): Automat
     bindings,
     operationalContext: [
       '[后台已匹配的安全账号引用]',
-      `- ${allowedOrigins.join('、')} / ${account.username}`,
+      `- 默认站点 ${account.domain} / ${account.username} / 任意 HTTP(S) 页面可用`,
       `  用户名：await credentialVault.fill(page.getByLabel('用户名'), "${usernameRef}")`,
       `  密码：await credentialVault.fill(page.getByLabel('密码'), "${passwordRef}")`,
-      'credentialVault.fill 只会将凭据写入上述 origin 的真实 Playwright Locator。不得读取、输出或记录凭据明文；验证码、OTP、扫码或二次认证必须报告 blocked。',
+      'credentialVault.fill 只会将凭据写入当前浏览器会话中的真实 Playwright Locator；默认站点不限制使用域名。不得读取、输出或记录凭据明文；验证码、OTP、扫码或二次认证必须报告 blocked。',
     ].join('\n'),
   };
 }

@@ -106,13 +106,21 @@ agent.state.get({key:string}): Promise<
 agent.state.set({
   key:string; value:unknown; expectedRevision?:number; ttlMs?:number
 }): Promise<RuntimeStateEntry>
+agent.state.set(key:string, value:unknown, options?:{
+  expectedRevision?:number; ttlMs?:number
+}): Promise<RuntimeStateEntry>
 agent.state.delete({
   key:string; expectedRevision?:number
+}): Promise<{deleted:boolean;key:string;revision?:number}>
+agent.state.delete(key:string, options?:{
+  expectedRevision?:number
 }): Promise<{deleted:boolean;key:string;revision?:number}>
 agent.state.list({
   prefix?:string;limit?:number
 } = {}): Promise<{items:RuntimeStateEntry[];count:number;truncated:boolean}>
 agent.state.clear({prefix?:string} = {}): Promise<{deleted:number;prefix:string}>
+
+get/delete also accept a key string, while list/clear also accept a prefix string. Object input remains the canonical form; the string overloads are safe convenience forms for ordinary browserCode cells.
 \`\`\`
 
 State is stored by the host in SQLite under the current browser conversation. It survives JavaScript-kernel recycling, browser idle release, later conversation turns, and backend restart. The parent Agent and its child Agents share the conversation state, which is deleted with the conversation.

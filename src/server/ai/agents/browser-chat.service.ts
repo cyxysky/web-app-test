@@ -167,7 +167,6 @@ import { enabledModelProviders, normalizeModelProvider, resolveRuntimeModelSelec
 import {
   listLoginAccounts,
   resolveLoginAccountCredentialById,
-  type LoginAccountMetadata,
 } from '@/server/credentials/login-account-vault';
 
 export type { BrowserChatAttachment } from '@/server/ai/agents/browser-chat-attachments';
@@ -1500,114 +1499,51 @@ async function readFileForSession(
     : result;
 }
 
-type BrowserChatResourceSeed = {
-  kind: 'url' | 'axure' | 'tab' | 'file' | 'image' | 'other';
-  title: string;
-  url?: string;
-};
-
 type BrowserChatCredentialDescriptor = {
   accountId: string;
+  defaultDomain: string;
   label: string;
-  origins: string[];
+  loginUrl: string;
   username: string;
   usernameRef: string;
   passwordRef: string;
 };
 
-function browserChatResourceKind(title: string, url?: string): BrowserChatResourceSeed['kind'] {
-  const value = `${title}\n${url || ''}`.toLowerCase();
-  if (value.includes('axure') || value.includes('axshare.com') || /\/start\.html(?:$|[?#])/i.test(value)) return 'axure';
-  if (/\.(?:png|jpe?g|gif|webp|bmp|svg)(?:$|[?#])/i.test(value)) return 'image';
-  return url ? 'url' : 'other';
-}
-
-function httpOrigin(value?: string) {
-  if (!value) return '';
-  try {
-    const url = new URL(value);
-    return ['http:', 'https:'].includes(url.protocol) ? url.origin : '';
-  } catch {
-    return '';
-  }
-}
-
-function loginAccountMentionScore(instruction: string, account: LoginAccountMetadata) {
-  const normalized = instruction.toLowerCase();
-  let score = 0;
-  if (account.label && normalized.includes(account.label.toLowerCase())) score += 16;
-  if (account.username && normalized.includes(account.username.toLowerCase())) score += 12;
-  if (account.loginUrl && normalized.includes(account.loginUrl.toLowerCase())) score += 8;
-  if (account.domain && normalized.includes(account.domain.toLowerCase())) score += 4;
-  return score;
-}
-
-function mentionedLoginAccounts(instruction: string, accounts: LoginAccountMetadata[]) {
-  const scored = accounts
-    .map((account) => ({ account, score: loginAccountMentionScore(instruction, account) }))
-    .filter((item) => item.score > 0);
-  if (!scored.length) return [];
-  const highestScore = Math.max(...scored.map((item) => item.score));
-  const strongest = scored.filter((item) => item.score === highestScore);
-  if (highestScore <= 4 && strongest.length > 1) return [];
-  return strongest.map((item) => item.account);
-}
-
 function browserChatCredentialContext(
   session: BrowserChatSessionRecord,
-  seeds: BrowserChatResourceSeed[],
-  instruction: string,
+  references: Map<string, { passwordRef: string; usernameRef: string }>,
 ) {
-  const matches = new Map<string, { account: LoginAccountMetadata; origins: Set<string> }>();
-  const addAccount = (account: LoginAccountMetadata, origins: string[]) => {
-    const allowedOrigins = origins.filter(Boolean);
-    if (!allowedOrigins.length) return;
-    const existing = matches.get(account.id);
-    if (existing) {
-      allowedOrigins.forEach((origin) => existing.origins.add(origin));
-      return;
-    }
-    matches.set(account.id, { account, origins: new Set(allowedOrigins) });
-  };
-
-  for (const seed of seeds) {
-    if (!seed.url) continue;
-    let url: URL;
-    try {
-      url = new URL(seed.url);
-    } catch {
-      continue;
-    }
-    if (!['http:', 'https:'].includes(url.protocol)) continue;
-    const accounts = listLoginAccounts({ userId: session.userId, domain: url.hostname })
-      .filter((account) => account.status === 'active' && account.hasPassword);
-    const mentioned = mentionedLoginAccounts(instruction, accounts);
-    const selected = mentioned.length ? mentioned : accounts.length === 1 ? accounts : [];
-    selected.forEach((account) => addAccount(account, [url.origin, httpOrigin(account.loginUrl)]));
-  }
-
-  const globallyMentionedAccounts = mentionedLoginAccounts(
-    instruction,
-    listLoginAccounts({ userId: session.userId })
-      .filter((account) => account.status === 'active' && account.hasPassword),
-  );
-  for (const account of globallyMentionedAccounts) {
-    addAccount(account, [httpOrigin(account.loginUrl)]);
-  }
-
   const credentials: BrowserChatCredentialDescriptor[] = [];
   const bindings: BrowserCodeCredentialBinding[] = [];
-  for (const { account, origins } of matches.values()) {
-    const credential = resolveLoginAccountCredentialById(account.id, session.userId);
+  const accounts = listLoginAccounts({ userId: session.userId })
+    .filter((account) => account.status === 'active' && account.hasPassword);
+  for (const account of accounts) {
+    // Provisioning a binding only makes the account available to browserCode; it
+    // is not evidence that the page actually consumed the credential.
+    const credential = resolveLoginAccountCredentialById(account.id, session.userId, { trackUsage: false });
     if (!credential) continue;
-    const token = randomUUID();
-    const usernameRef = `credential_${token}_username`;
-    const passwordRef = `credential_${token}_password`;
-    const allowedOrigins = Array.from(origins);
-    credentials.push({ accountId: account.id, label: account.label, origins: allowedOrigins, username: account.username, usernameRef, passwordRef });
+    let refs = references.get(account.id);
+    if (!refs) {
+      const token = randomUUID();
+      refs = {
+        usernameRef: `credential_${token}_username`,
+        passwordRef: `credential_${token}_password`,
+      };
+      references.set(account.id, refs);
+    }
+    const { usernameRef, passwordRef } = refs;
+    credentials.push({
+      accountId: account.id,
+      defaultDomain: account.domain,
+      label: account.label,
+      loginUrl: account.loginUrl,
+      username: account.username,
+      usernameRef,
+      passwordRef,
+    });
     bindings.push(
-      { ref: usernameRef, value: account.username, allowedOrigins },
-      { ref: passwordRef, value: credential.password, allowedOrigins },
+      { ref: usernameRef, value: account.username, allowedOrigins: [] },
+      { ref: passwordRef, value: credential.password, allowedOrigins: [] },
     );
   }
   return { credentials, bindings };
@@ -1620,13 +1556,15 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
     ...credentials.map((item) => [
       `<account id="${item.accountId}">`,
       `  Name: ${item.label}`,
-      `  Origins: ${item.origins.join('、')}`,
+      `  Default site: ${item.defaultDomain}`,
+      `  Login URL: ${item.loginUrl}`,
+      '  Scope: 任意 HTTP(S) 页面',
       `  Username: ${item.username}`,
       `  用户名：await credentialVault.fill(page.getByLabel('用户名'), "${item.usernameRef}")`,
       `  密码：await credentialVault.fill(page.getByLabel('密码'), "${item.passwordRef}")`,
       '</account>',
     ].join('\n')),
-    'credentialVault.fill 只会把对应值写入真实 Playwright Locator，并且只允许上述 origin；它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
+    'credentialVault.fill 只会把对应值写入当前浏览器会话中的真实 Playwright Locator；保存的默认站点仅用于识别账号和提供登录地址，不限制账号在哪个 HTTP(S) 站点使用。它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
   ].join('\n');
 }
 
@@ -1641,6 +1579,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   historicalSteps?: StepExecutionResult[];
 }) {
   const loadedSkills = new Map<string, SkillRecord>();
+  const credentialReferences = new Map<string, { passwordRef: string; usernameRef: string }>();
   const usedMemoryIds = input.usedMemoryIds || new Set<string>();
   const explicitlySelectedSkillIds = new Set((input.explicitlySelectedSkills || []).map((skill) => skill.id));
   const query = [input.text, input.modelText, input.session.title].filter(Boolean).join('\n');
@@ -1673,15 +1612,9 @@ async function createBrowserChatRuntimeOperationalContext(input: {
       markPersonalMemoryItemsUsed(unusedMemoryIds);
       unusedMemoryIds.forEach((memoryId) => usedMemoryIds.add(memoryId));
     }
-    const credentialUrl = httpOrigin(currentUrl) ? currentUrl : input.session.targetUrl;
     const credentials = browserChatCredentialContext(
       input.session,
-      credentialUrl ? [{
-        kind: browserChatResourceKind(credentialUrl, credentialUrl),
-        title: '当前页面',
-        url: credentialUrl,
-      }] : [],
-      input.modelText,
+      credentialReferences,
     );
     const officeDraftCatalog = await officeDraftCatalogForPrompt(input.session.id);
     return {

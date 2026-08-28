@@ -80,7 +80,7 @@ export function LoginAccountModal({
   async function save() {
     const normalizedDomain = loginAccountDomain(domain || loginUrl);
     if (!normalizedDomain || !username.trim() || (!editing && !password)) {
-      setError(t('请填写域名、用户名和密码。'));
+      setError(t('请填写默认站点、用户名和密码。'));
       return;
     }
     setSaving(true);
@@ -128,7 +128,7 @@ export function LoginAccountModal({
             <span className="ui-modal-heading-icon login-account-modal-icon" aria-hidden="true"><ShieldCheck size={18} /></span>
             <div className="ui-modal-heading-copy">
               <h2 className="ui-modal-title" id="login-account-modal-title">{t(editing ? '编辑登录账号' : '新增登录账号')}</h2>
-              <p className="ui-modal-subtitle">{t('按域名保存，目标测试会自动匹配并通过安全引用登录')}</p>
+              <p className="ui-modal-subtitle">{t('账号可用于任意站点；默认站点仅用于识别账号和提供登录地址')}</p>
             </div>
           </div>
           <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={saving} onClick={onClose} type="button">
@@ -142,7 +142,7 @@ export function LoginAccountModal({
             <AppInput disabled={saving} onChange={(event) => setLabel(event.target.value)} placeholder={t('例如：测试环境管理员')} value={label} />
           </label>
           <label>
-            <span>{t('域名')}</span>
+            <span>{t('默认站点')}</span>
             <AppInput disabled={saving} onChange={(event) => setDomain(event.target.value)} placeholder="app.example.com" value={domain} />
           </label>
           <label className="wide">
@@ -168,7 +168,7 @@ export function LoginAccountModal({
           </div>
           <div className="login-account-security-note wide">
             <KeyRound aria-hidden="true" size={14} />
-            <span>{t('密码加密保存在本机后台；规划模型只会看到域名和用户名，登录时只使用短期安全引用。')}</span>
+            <span>{t('密码加密保存在本机后台；规划模型只会看到默认站点和用户名，登录时只使用短期安全引用。')}</span>
           </div>
           {error ? <p className="login-account-modal-error wide" role="alert">{t(error)}</p> : null}
         </div>

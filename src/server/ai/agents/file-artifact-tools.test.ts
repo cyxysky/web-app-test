@@ -17,11 +17,49 @@ import {
   planFileArtifact,
   readUnoDraft,
   recordOfficeVisualQaProgress,
+  repairFileArtifactDownloadLinks,
   renderFileArtifact,
   syncDocumentAssets,
   verifyCurrentUnoRenderedArtifact,
 } from './file-artifact-tools';
 import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
+
+test('repairs artifact links by artifact ID without trusting the model hostname or link label', () => {
+  const tools = [
+    {
+      name: 'file',
+      result: {
+        ok: true,
+        actual: JSON.stringify({
+          artifactId: 'generated/chat_test/report.docx',
+          fileName: 'report.docx',
+          downloadUrl: '/webpilot/api/artifacts/generated/chat_test/report.docx?download=1',
+        }),
+      },
+    },
+    {
+      name: 'file',
+      result: {
+        ok: true,
+        actual: JSON.stringify({
+          artifactId: 'generated/chat_test/deck.pptx',
+          fileName: 'deck.pptx',
+          downloadUrl: '/webpilot/api/artifacts/generated/chat_test/deck.pptx?download=1',
+        }),
+      },
+    },
+  ];
+
+  const repaired = repairFileArtifactDownloadLinks([
+    '[下载](https://chat_test/api/artifacts/generated/chat_test/report.docx?download=1)',
+    '[下载](https://invalid.test/api/artifacts/generated/chat_test/deck.pptx?download=1)',
+  ].join('\n'), tools);
+
+  assert.equal(repaired, [
+    '[下载](/webpilot/api/artifacts/generated/chat_test/report.docx?download=1)',
+    '[下载](/webpilot/api/artifacts/generated/chat_test/deck.pptx?download=1)',
+  ].join('\n'));
+});
 
 const wordProgram = `
 def create_document(job):
@@ -81,6 +119,27 @@ test('formats a failed validation as failed instead of validated', () => {
   assert.match(formatted || '', /validation failed/i);
   assert.match(formatted || '', /workingSourceSaved=true/);
   assert.doesNotMatch(formatted || '', /source validated/i);
+});
+
+test('keeps structural counts and visual gate status in the model-facing artifact summary', () => {
+  const formatted = formatFileArtifactResult('file', JSON.stringify({
+    kind: 'generated',
+    artifactId: 'generated/chat_test/workbook.xlsx',
+    fileName: 'workbook.xlsx',
+    downloadUrl: '/webpilot/api/artifacts/generated/chat_test/workbook.xlsx?download=1',
+    automaticValidation: {
+      passed: false,
+      formatChecks: { spreadsheet: { chartCount: 0, errorCellCount: 1, formulaCount: 12, worksheetCount: 3 } },
+      issues: [{ severity: 'error', code: 'XLSX_FORMULA_ERROR_LITERAL', message: 'sheet3.xml contains one visible error cell.' }],
+    },
+    visualVerification: { gateStatus: 'pending-model-review', imageCount: 3, pageCount: 3, renderedPages: [1, 2, 3] },
+  }));
+
+  assert.match(formatted || '', /Automatic validation passed=false/);
+  assert.match(formatted || '', /"chartCount":0/);
+  assert.match(formatted || '', /XLSX_FORMULA_ERROR_LITERAL/);
+  assert.match(formatted || '', /Visual QA=pending-model-review/);
+  assert.match(formatted || '', /pageCount=3/);
 });
 
 test('deduplicates concurrent downloads and reuses the per-run URL cache', async () => {

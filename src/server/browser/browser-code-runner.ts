@@ -1436,7 +1436,7 @@ function browserCodeKernelMain() {
       } catch {
         throw new Error('credentialVault.fill() requires the target page to have an http(s) origin.');
       }
-      if (!credential.allowedOrigins.includes(origin)) {
+      if (credential.allowedOrigins.length > 0 && !credential.allowedOrigins.includes(origin)) {
         throw new Error(`The requested credential reference is not allowed for ${origin}.`);
       }
       if (!nativeFrameLocator || !nativeLocatorFill) {
@@ -2542,12 +2542,26 @@ function browserCodeKernelMain() {
     }),
   });
 
+  const stateKeyInput = (input: unknown) => typeof input === 'string' ? { key: input } : input;
+  const statePrefixInput = (input: unknown) => typeof input === 'string' ? { prefix: input } : input;
   const conversationStateRuntime = Object.freeze({
-    get: (input: unknown) => requestRuntimeStateOperation('get', input),
-    set: (input: unknown) => requestRuntimeStateOperation('set', input),
-    delete: (input: unknown) => requestRuntimeStateOperation('delete', input),
-    list: (input: unknown = {}) => requestRuntimeStateOperation('list', input),
-    clear: (input: unknown = {}) => requestRuntimeStateOperation('clear', input),
+    get: (input: unknown) => requestRuntimeStateOperation('get', stateKeyInput(input)),
+    set: (input: unknown, value?: unknown, options?: unknown) => {
+      if (typeof input !== 'string') return requestRuntimeStateOperation('set', input);
+      const optionRecord = options && typeof options === 'object' && !Array.isArray(options)
+        ? options as Record<string, unknown>
+        : {};
+      return requestRuntimeStateOperation('set', { ...optionRecord, key: input, value });
+    },
+    delete: (input: unknown, options?: unknown) => {
+      if (typeof input !== 'string') return requestRuntimeStateOperation('delete', input);
+      const optionRecord = options && typeof options === 'object' && !Array.isArray(options)
+        ? options as Record<string, unknown>
+        : {};
+      return requestRuntimeStateOperation('delete', { ...optionRecord, key: input });
+    },
+    list: (input: unknown = {}) => requestRuntimeStateOperation('list', statePrefixInput(input)),
+    clear: (input: unknown = {}) => requestRuntimeStateOperation('clear', statePrefixInput(input)),
   });
 
   const agentRuntime = Object.freeze({

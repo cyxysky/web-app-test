@@ -176,6 +176,238 @@
   opacity: 0.42;
 }
 
+.browser-chat-runtime-state-anchor {
+  align-items: center;
+  display: inline-flex;
+  position: relative;
+}
+
+.browser-chat-runtime-state-bubble {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 50%;
+  box-shadow: none;
+  box-sizing: border-box;
+  color: var(--foreground);
+  cursor: pointer;
+  display: inline-flex;
+  height: 48px;
+  justify-content: center;
+  padding: 0;
+  position: absolute;
+  right: 50%;
+  top: calc(100% + 14px);
+  transform: translateX(50%);
+  transition: background-color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+  width: 48px;
+  z-index: 42;
+}
+
+.browser-chat-runtime-state-bubble::before {
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--foreground) 14%, var(--panel));
+  border-radius: 50%;
+  box-shadow: 0 7px 20px rgba(31, 41, 55, 0.14);
+  box-sizing: border-box;
+  content: '';
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
+}
+
+.browser-chat-runtime-state-bubble-icon {
+  fill: none;
+  height: 23px;
+  position: relative;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.2;
+  width: 23px;
+  z-index: 1;
+}
+
+.browser-chat-runtime-state-bubble:hover,
+.browser-chat-runtime-state-bubble.is-open {
+  transform: translateX(50%) scale(1.03);
+}
+
+.browser-chat-runtime-state-bubble:hover::before,
+.browser-chat-runtime-state-bubble.is-open::before {
+  background: color-mix(in srgb, var(--foreground) 3%, var(--panel));
+  border-color: color-mix(in srgb, var(--foreground) 20%, var(--panel));
+  box-shadow: 0 9px 24px rgba(31, 41, 55, 0.18);
+}
+
+.browser-chat-runtime-state-card {
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--border) 36%, transparent);
+  border-radius: 14px;
+  box-shadow: 0 10px 32px rgba(26, 35, 52, 0.14);
+  color: var(--foreground);
+  overflow: hidden;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 72px);
+  width: min(520px, calc(100vw - 32px));
+  z-index: 41;
+}
+
+.browser-chat-runtime-state-card > header {
+  align-items: flex-start;
+  display: flex;
+  gap: 16px;
+  min-height: 92px;
+  padding: 25px 22px 14px 30px;
+}
+
+.browser-chat-runtime-state-card-heading {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.browser-chat-runtime-state-card-title {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
+.browser-chat-runtime-state-card-marker {
+  background: var(--accent-strong);
+  border-radius: 50%;
+  flex: 0 0 auto;
+  height: 6px;
+  width: 6px;
+}
+
+.browser-chat-runtime-state-card > header strong {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.browser-chat-runtime-state-card-heading > span {
+  color: var(--muted);
+  font-size: 13px;
+  padding-left: 18px;
+}
+
+.browser-chat-runtime-state-card-actions {
+  display: inline-flex;
+  gap: 5px;
+  margin-left: auto;
+  margin-top: -9px;
+}
+
+.browser-chat-runtime-state-card-actions button,
+.browser-chat-runtime-state-item-heading button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--muted-strong);
+  cursor: pointer;
+  display: inline-flex;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  width: 28px;
+}
+
+.browser-chat-runtime-state-card-actions button:hover,
+.browser-chat-runtime-state-item-heading button:hover {
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--foreground);
+}
+
+.browser-chat-runtime-state-card-actions button:last-child {
+  color: var(--muted);
+  height: 38px;
+  width: 38px;
+}
+
+.browser-chat-runtime-state-card-actions button:last-child svg {
+  height: 25px;
+  width: 25px;
+}
+
+.browser-chat-runtime-state-card-actions button:first-child,
+.browser-chat-runtime-state-item-heading button.is-copied {
+  color: var(--accent-strong);
+}
+
+.browser-chat-runtime-state-loading,
+.browser-chat-runtime-state-error {
+  align-items: center;
+  display: flex;
+  font-size: 11px;
+  gap: 6px;
+  margin: 0;
+  padding: 0 30px 8px;
+}
+
+.browser-chat-runtime-state-loading {
+  color: var(--muted);
+}
+
+.browser-chat-runtime-state-error {
+  color: var(--danger);
+}
+
+.browser-chat-runtime-state-list {
+  display: grid;
+  gap: 14px;
+  max-height: min(500px, calc(100vh - 180px));
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 8px 30px 30px;
+}
+
+.browser-chat-runtime-state-item {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  min-width: 0;
+}
+
+.browser-chat-runtime-state-item-heading {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 0 7px;
+}
+
+.browser-chat-runtime-state-item-heading code {
+  color: var(--foreground);
+  flex: 1 1 auto;
+  font-size: 14px;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-chat-runtime-state-item pre {
+  background: color-mix(in srgb, var(--panel-soft) 92%, var(--background));
+  border: 0;
+  border-radius: 11px;
+  color: var(--muted-strong);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+  max-height: 138px;
+  min-height: 48px;
+  overflow: auto;
+  padding: 13px 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .browser-chat-conversation-more .browser-chat-overflow-trigger {
   height: 32px;
   min-height: 32px;
@@ -420,7 +652,10 @@
 }
 
 .browser-chat-markdown-table-scroll .table__scroll-container {
+  max-height: min(68dvh, 640px);
   max-width: 100%;
+  overflow: auto;
+  scrollbar-gutter: stable;
 }
 
 .browser-chat-markdown-table-scroll .table__content {
@@ -440,7 +675,11 @@
 }
 
 .browser-chat-markdown-table-scroll .table__column {
+  background: var(--surface-secondary);
+  position: sticky;
+  top: 0;
   white-space: nowrap;
+  z-index: 2;
 }
 
 .browser-chat-process-summary {

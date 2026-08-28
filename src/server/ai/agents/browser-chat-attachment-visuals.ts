@@ -84,7 +84,23 @@ async function existingCache(directory: string, requestedPages: unknown) {
 }
 
 async function writeManifest(directory: string, manifest: VisualCacheManifest) {
-  await writeFile(path.join(directory, 'manifest.json'), JSON.stringify(manifest), 'utf8');
+  const manifestPath = path.join(directory, 'manifest.json');
+  let previous: VisualCacheManifest | undefined;
+  try {
+    previous = JSON.parse(await readFile(manifestPath, 'utf8')) as VisualCacheManifest;
+  } catch {
+    // A missing or invalid manifest is replaced by the current render result.
+  }
+  const compatiblePrevious = previous?.renderer === manifest.renderer ? previous : undefined;
+  const checksByPage = new Map<number, NonNullable<VisualCacheManifest['automaticChecks']>[number]>();
+  for (const check of compatiblePrevious?.automaticChecks || []) checksByPage.set(check.pageNumber, check);
+  for (const check of manifest.automaticChecks || []) checksByPage.set(check.pageNumber, check);
+  const automaticChecks = [...checksByPage.values()].sort((left, right) => left.pageNumber - right.pageNumber);
+  await writeFile(manifestPath, JSON.stringify({
+    ...compatiblePrevious,
+    ...manifest,
+    ...(automaticChecks.length > 0 ? { automaticChecks } : {}),
+  } satisfies VisualCacheManifest), 'utf8');
 }
 
 async function renderPdfPages(buffer: Buffer, directory: string, requestedPages: unknown, renderer: 'libreoffice-pdf' | 'pdf') {

@@ -1851,7 +1851,7 @@ export function EnvironmentSettings({
         {showSectionTitles ? <div className="settings-section-head">
           <div>
             <h2>{t('登录账号')}</h2>
-            <span>{t('{count} 个按域名保存的账号；密码只在后台解密并通过短期安全引用使用', { count: loginAccounts.length })}</span>
+            <span>{t('{count} 个可跨站点使用的账号；密码只在后台解密并通过短期安全引用使用', { count: loginAccounts.length })}</span>
           </div>
           {accountActions}
         </div> : null}
@@ -1881,7 +1881,7 @@ export function EnvironmentSettings({
               },
               {
                 key: 'domain',
-                label: t('域名'),
+                label: t('默认站点'),
                 filter: { getValue: (account) => [account.domain, account.loginUrl || ''], type: 'text' },
                 render: (account) => <span>{account.domain}</span>,
               },

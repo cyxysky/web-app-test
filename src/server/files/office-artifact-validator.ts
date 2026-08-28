@@ -163,9 +163,11 @@ async function validatePresentationPackage(zip: JSZip, issues: OfficeArtifactIss
         }, elementMap, objectName));
       }
     }
-    for (const name of [...xml.matchAll(/\bname="(wp_[^"]+)"/g)].map((match) => match[1])) {
-      const mapped = elementMap.find((entry) => entry.artifactName === name);
-      if (!mapped) issues.push({ code: 'PPTX_UNMAPPED_GENERATED_OBJECT', message: `${name} is embedded in ${slide.name} but absent from the source element map.`, severity: 'error', target: slide.name });
+    if (requireElementIds) {
+      for (const name of [...xml.matchAll(/\bname="(wp_[^"]+)"/g)].map((match) => match[1])) {
+        const mapped = elementMap.find((entry) => entry.artifactName === name);
+        if (!mapped) issues.push({ code: 'PPTX_UNMAPPED_GENERATED_OBJECT', message: `${name} is embedded in ${slide.name} but absent from the source element map.`, severity: 'error', target: slide.name });
+      }
     }
   }
   const charts = Object.values(zip.files).filter((entry) => !entry.dir && /^ppt\/charts\/chart\d+\.xml$/i.test(entry.name));
@@ -200,14 +202,65 @@ async function validateSpreadsheetPackage(zip: JSZip, issues: OfficeArtifactIssu
   const worksheets = Object.values(zip.files).filter((entry) => !entry.dir && /^xl\/worksheets\/sheet\d+\.xml$/i.test(entry.name));
   for (const worksheet of worksheets) {
     const xml = await worksheet.async('string');
-    if (/<f\b[^>]*>[\s\S]*?#(?:REF|VALUE|NAME|DIV\/0|N\/A|NUM|NULL)!/i.test(xml)) {
-      issues.push({ code: 'XLSX_FORMULA_ERROR_LITERAL', message: `${worksheet.name} contains a formula error literal.`, severity: 'error', target: worksheet.name });
+    const errorCells = [...xml.matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/gi)].filter((match) => (
+      /\bt="e"/i.test(match[1] || '')
+      && /<v>\s*#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A|GETTING_DATA|SPILL!|CALC!|FIELD!|BLOCKED!|UNKNOWN!|CONNECT!)\s*<\/v>/i.test(match[2] || '')
+    ));
+    if (errorCells.length) {
+      issues.push({ code: 'XLSX_FORMULA_ERROR_LITERAL', message: `${worksheet.name} contains ${errorCells.length} visible spreadsheet error cell(s).`, severity: 'error', target: worksheet.name });
     }
     const dimensions = [...xml.matchAll(/<dimension\b[^>]*\bref="([^"]+)"/gi)].map((match) => match[1]);
     if (dimensions.some((value) => !/^\$?[A-Z]{1,3}\$?\d+(?::\$?[A-Z]{1,3}\$?\d+)?$/.test(value))) {
       issues.push({ code: 'XLSX_DIMENSION_INVALID', message: `${worksheet.name} contains an invalid used-range dimension.`, severity: 'error', target: worksheet.name });
     }
   }
+}
+
+async function officePackageFormatChecks(zip: JSZip, extension: string) {
+  const fileNames = Object.values(zip.files).filter((entry) => !entry.dir).map((entry) => entry.name);
+  if (extension === '.pptx') {
+    const slides = Object.values(zip.files).filter((entry) => !entry.dir && /^ppt\/slides\/slide\d+\.xml$/i.test(entry.name));
+    const slideXml = await Promise.all(slides.map((entry) => entry.async('string')));
+    return {
+      presentation: {
+        chartCount: fileNames.filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name)).length,
+        imageCount: fileNames.filter((name) => name.startsWith('ppt/media/')).length,
+        slideCount: slides.length,
+        tableCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:tbl\b/gi) || []).length, 0),
+      },
+    };
+  }
+  if (extension === '.docx') {
+    const documentXml = await zip.file('word/document.xml')?.async('string') || '';
+    return {
+      word: {
+        chartCount: fileNames.filter((name) => /^word\/charts\/chart\d+\.xml$/i.test(name)).length,
+        floatingObjectCount: (documentXml.match(/<wp:anchor\b/gi) || []).length,
+        imageCount: fileNames.filter((name) => name.startsWith('word/media/')).length,
+        inlineObjectCount: (documentXml.match(/<wp:inline\b/gi) || []).length,
+        paragraphCount: (documentXml.match(/<w:p\b/gi) || []).length,
+        tableCount: (documentXml.match(/<w:tbl\b/gi) || []).length,
+      },
+    };
+  }
+  if (extension === '.xlsx') {
+    const worksheets = Object.values(zip.files).filter((entry) => !entry.dir && /^xl\/worksheets\/sheet\d+\.xml$/i.test(entry.name));
+    const worksheetXml = await Promise.all(worksheets.map((entry) => entry.async('string')));
+    const formulaCount = worksheetXml.reduce((count, xml) => count + (xml.match(/<f\b/gi) || []).length, 0);
+    const errorCellCount = worksheetXml.reduce((count, xml) => count + [...xml.matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/gi)].filter((match) => (
+      /\bt="e"/i.test(match[1] || '') && /<v>\s*#[^<]+<\/v>/i.test(match[2] || '')
+    )).length, 0);
+    return {
+      spreadsheet: {
+        chartCount: fileNames.filter((name) => /^xl\/charts\/chart\d+\.xml$/i.test(name)).length,
+        errorCellCount,
+        formulaCount,
+        imageCount: fileNames.filter((name) => name.startsWith('xl/media/')).length,
+        worksheetCount: worksheets.length,
+      },
+    };
+  }
+  return { package: { partCount: fileNames.length } };
 }
 
 async function validatePdf(absolutePath: string, issues: OfficeArtifactIssue[]) {
@@ -241,9 +294,6 @@ export async function validateOfficeArtifact(input: {
   const extension = input.extension.toLowerCase();
   const elementMap = input.elementMap || [];
   if (extension === '.pdf') {
-    if (input.validationProfile !== 'uno-strict') {
-      return { issues, passed: true, requestedFonts: [], missingFonts: [], media: [], platform: process.platform };
-    }
     const pdf = await validatePdf(input.absolutePath, issues);
     return { issues, passed: !issues.some((issue) => issue.severity === 'error'), requestedFonts: [], missingFonts: [], media: [], platform: process.platform, formatChecks: { pdf } };
   }
@@ -275,11 +325,11 @@ export async function validateOfficeArtifact(input: {
     }
   }
   const strictUnoValidation = input.validationProfile === 'uno-strict';
-  if (strictUnoValidation) await validateRelationships(zip, issues);
-  if (strictUnoValidation && extension === '.pptx') await validatePresentationPackage(zip, issues, elementMap, Boolean(input.requireElementIds));
-  if (strictUnoValidation && extension === '.docx') await validateWordPackage(zip, issues, elementMap);
-  if (strictUnoValidation && extension === '.xlsx') await validateSpreadsheetPackage(zip, issues);
-  if (strictUnoValidation && extension === '.docx') {
+  await validateRelationships(zip, issues);
+  if (extension === '.pptx') await validatePresentationPackage(zip, issues, elementMap, strictUnoValidation && Boolean(input.requireElementIds));
+  if (extension === '.docx') await validateWordPackage(zip, issues, elementMap);
+  if (extension === '.xlsx') await validateSpreadsheetPackage(zip, issues);
+  if (extension === '.docx') {
     const documentXml = await zip.file('word/document.xml')?.async('string') || '';
     const floatingObjectCount = (documentXml.match(/<wp:anchor\b/g) || []).length;
     const textFrameCount = (documentXml.match(/<w:framePr\b/g) || []).length;
@@ -352,6 +402,7 @@ export async function validateOfficeArtifact(input: {
     missingFonts,
     media,
     platform: process.platform,
+    formatChecks: await officePackageFormatChecks(zip, extension),
   };
 }
 

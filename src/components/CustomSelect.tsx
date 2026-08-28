@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Check, ChevronDown, Search } from 'lucide-react';
 import { FloatingLayer } from '@/components/FloatingLayer';
 import { useI18n } from '@/i18n/I18nProvider';
@@ -9,6 +9,7 @@ export type CustomSelectOption = {
   description?: string;
   disabled?: boolean;
   group?: string;
+  icon?: ReactNode;
   label: string;
   selectedLabel?: string;
   value: string;
@@ -180,7 +181,10 @@ export function CustomSelect({
         title={title}
         type="button"
       >
-        <div>{selectedOption?.selectedLabel || selectedOption?.label || value}</div>
+        <div className="custom-select-button-content">
+          {selectedOption?.icon ? <span className="custom-select-icon">{selectedOption.icon}</span> : null}
+          <span className="custom-select-button-label">{selectedOption?.selectedLabel || selectedOption?.label || value}</span>
+        </div>
         <ChevronDown className={open ? 'open' : undefined} size={16} />
       </button>
       <FloatingLayer
@@ -229,9 +233,12 @@ export function CustomSelect({
                     role="option"
                     type="button"
                   >
-                    <span>
-                      <b>{option.label}</b>
-                      {option.description ? <small>{option.description}</small> : null}
+                    <span className={`custom-select-option-content${option.icon ? ' has-icon' : ''}`}>
+                      {option.icon ? <span className="custom-select-icon">{option.icon}</span> : null}
+                      <span className="custom-select-option-copy">
+                        <b>{option.label}</b>
+                        {option.description ? <small>{option.description}</small> : null}
+                      </span>
                     </span>
                     {option.value === value ? <Check size={15} /> : null}
                   </button>

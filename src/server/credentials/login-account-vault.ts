@@ -700,9 +700,17 @@ export function deleteLoginAccount(id: string, userId?: unknown) {
   return Number(result.changes) > 0;
 }
 
-function resolveCredentialRow(row: LoginAccountRow): LoginAccountCredential | undefined {
+type ResolveCredentialOptions = { trackUsage?: boolean };
+
+function resolveCredentialRow(row: LoginAccountRow, options: ResolveCredentialOptions = {}): LoginAccountCredential | undefined {
   if (row.status !== 'active') return undefined;
   const password = decryptPassword(row);
+  if (options.trackUsage === false) {
+    return {
+      account: metadataFromRow({ ...row, has_password: 1 }),
+      password,
+    };
+  }
   const timestamp = now();
   getSqliteDatabase().prepare(`
     UPDATE login_account
@@ -720,10 +728,10 @@ function resolveCredentialRow(row: LoginAccountRow): LoginAccountCredential | un
   };
 }
 
-export function resolveLoginAccountCredentialById(id: string, userId?: unknown) {
+export function resolveLoginAccountCredentialById(id: string, userId?: unknown, options: ResolveCredentialOptions = {}) {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
   const row = fullRowById(id.trim(), normalizedUserId);
-  return row ? resolveCredentialRow(row) : undefined;
+  return row ? resolveCredentialRow(row, options) : undefined;
 }
 
 export function resolveLoginAccountCredential(input: {

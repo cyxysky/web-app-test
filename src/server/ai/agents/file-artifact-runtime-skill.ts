@@ -424,6 +424,8 @@ Large scripts may optionally wrap self-contained page or section bodies in @webp
 
 render publishes only the current validated source. A preview produced during validation and any sampled page are diagnostics, not full QA.
 
+Treat automaticValidation.formatChecks as the authoritative structural counts for slides or sheets, native charts, formulas, embedded images, Word tables, and drawing objects. Compare those counts and every validation issue with the user's requested coverage before final delivery. Visual QA certifies only the reviewed page layout; it does not prove semantic feature coverage. If a required capability is absent, has a zero count, is unsupported, failed validation, or was not verified, report that exact limitation and do not say the artifact or suite fully passed. Copy each final downloadUrl verbatim from its successful current-session result; never build or absolutize a URL from an Artifact ID, session ID, host name, or file name.
+
 For a vision-capable model, fileVisual is a mandatory delivery gate:
 
 1. Call index with the exact latest Artifact ID.

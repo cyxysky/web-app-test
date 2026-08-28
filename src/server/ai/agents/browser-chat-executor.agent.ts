@@ -58,6 +58,12 @@ import {
   type UnoDraftLineEdit,
 } from './file-artifact-tools';
 import { browserChatCodeRules } from './runtime-prompt-rules';
+import {
+  appendRuntimePromptCacheMetadata,
+  isRuntimePromptCacheMetadataMessage,
+  runtimeCurrentTimeMarker,
+  runtimeOperationalContextMarker,
+} from './runtime-prompt-cache';
 import { readScreenshotForAi } from './browser-chat-image-input';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
 import {
@@ -1674,7 +1680,6 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
   const screenshotAvailable = modelSupportsImageInput();
   return [
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
-    currentRuntimeTimePromptLine(),
     '',
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When browser evidence or interaction is needed, call the relevant browser tool directly. The execution layer runs any pending prerequisite tools first, then runs the requested tool, and returns every prerequisite result in prerequisiteResults alongside the requested tool result in one tool response. Do not issue separate prerequisite tool calls unless their result alone is desired. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
@@ -1682,9 +1687,11 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. Use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. A pending readBrowserState prerequisite is executed internally and returned in prerequisiteResults while the requested browserCode still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
-    '- User-role messages beginning with [WebPilot runtime operational context], [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.',
+    `- User-role messages beginning with ${runtimeOperationalContextMarker}, ${runtimeCurrentTimeMarker}, [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. The newest runtime snapshot supersedes older snapshots. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.`,
     '- Treat user-specified dates, times, locations, quantities, names, and option values as exact business constraints. Never silently replace an unavailable value with a nearby, rounded, first-suggestion, or default value; preserve the requested value and ask the user or report the blocker.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- Copy every delivered Artifact downloadUrl exactly from the successful tool result. Never construct, absolutize, repair, or infer an Artifact URL from a sessionId, artifactId, hostname, or file name, and never call a URL an absolute filesystem path. Before finalizing Office/PDF work, reconcile the original requirements with automaticValidation.formatChecks, validation issues, and visual-QA scope. Visual QA proves page layout only; it does not prove requested native charts, formulas, images, comments, footnotes, or other semantic features. A missing, zero-count, unsupported, failed, or unverified required feature must be reported as a limitation, never as fully passed.',
+    '- If agent.state tracks task stage, coverage, status, issues, or artifacts, update those records before the final answer so no pending/generated/failed field contradicts a complete claim. Do not set an overall complete/passed state while any required item remains pending, unsupported, failed, or unverified unless the user explicitly accepted a partial result.',
     screenshotAvailable && input.fileVisualAvailable
       ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
       : screenshotAvailable
@@ -2181,6 +2188,7 @@ async function executeRuntimeStep(input: {
       ].join('\n')
     : '';
   const prompt = runtimePrompt({ runtimeRecord, fileVisualAvailable: Boolean(input.readFileVisuals) });
+  const runtimeTimeLine = currentRuntimeTimePromptLine();
   let activeOperationalContext = input.operationalContext || '';
   let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
@@ -2254,10 +2262,16 @@ async function executeRuntimeStep(input: {
       imagePaths: string[];
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
+    const queuedReferenceImageKeys = new Set<string>();
+    const reportedDocumentVisualSources = new Set<string>();
     const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
       const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('fileVisual:read');
+      const referenceKey = `${source}\u0000${path}`;
+      if (queuedReferenceImageKeys.has(referenceKey)) return;
+      queuedReferenceImageKeys.add(referenceKey);
       if (!modelSupportsImageInput()) {
-        if (documentVisualQa) {
+        if (documentVisualQa && !reportedDocumentVisualSources.has(source)) {
+          reportedDocumentVisualSources.add(source);
           void onAttemptDebug?.({
             phase: 'ai:document-visual-qa:unavailable',
             stepIndex,
@@ -2267,15 +2281,16 @@ async function executeRuntimeStep(input: {
         }
         return;
       }
-      pendingObservationMessages.push({
-        text: documentVisualQa
-          ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect it before finalizing. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, and content outside the page. Continue calling fileVisual action=read until every indexed screenshot has been inspected. If a defect exists, read the draft and use focused file action=edit startLine/endLine edits, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
-          : source === 'file:read'
-            ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
-            : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.',
-        imagePaths: [path],
-      });
-      if (documentVisualQa) {
+      const text = documentVisualQa
+        ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect it before finalizing. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, and content outside the page. Continue calling fileVisual action=read until every indexed screenshot has been inspected. If a defect exists, read the draft and use focused file action=edit startLine/endLine edits, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
+        : source === 'file:read'
+          ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
+          : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';
+      const existingObservation = pendingObservationMessages.find((observation) => observation.text === text);
+      if (existingObservation) existingObservation.imagePaths.push(path);
+      else pendingObservationMessages.push({ text, imagePaths: [path] });
+      if (documentVisualQa && !reportedDocumentVisualSources.has(source)) {
+        reportedDocumentVisualSources.add(source);
         void onAttemptDebug?.({
           phase: 'ai:document-visual-qa:queued',
           stepIndex,
@@ -2285,7 +2300,6 @@ async function executeRuntimeStep(input: {
       }
     };
     const continuationDirectiveMarker = '[WebPilot continuation directive]';
-    const runtimeOperationalContextMarker = '[WebPilot runtime operational context]';
     const durableContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
     const historyMessages = ensureRuntimeContinuationSummaryMessage(
       [...(input.conversation || [])] as RuntimeModelMessage[],
@@ -2421,13 +2435,7 @@ async function executeRuntimeStep(input: {
       return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
     }
 
-    function withoutRuntimeOperationalContext(messages: RuntimeModelMessage[]) {
-      return messages.filter((message) => (
-        !textFromUnknown(message.content).startsWith(runtimeOperationalContextMarker)
-      ));
-    }
-
-    function runtimeOperationalContextSystemSection(requiredSubagentDirective: string) {
+    function runtimeOperationalContextText(requiredSubagentDirective: string) {
       const sections = [
         activeOperationalContext
           ? `Relevant Skill summaries, memory, and secure capabilities supplied by the runtime:\n${activeOperationalContext}`
@@ -2437,8 +2445,7 @@ async function executeRuntimeStep(input: {
       ].filter(Boolean);
       if (!sections.length) return '';
       return [
-        runtimeOperationalContextMarker,
-        'This runtime metadata is system context, not a user message. Use it silently and never quote or summarize it to the user.',
+        'Use this runtime context silently and never quote or summarize it to the user.',
         ...sections,
       ].join('\n\n');
     }
@@ -2559,9 +2566,7 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
-      const sourceMessages = withoutRuntimeOperationalContext(
-        previousMessages?.length ? [...previousMessages] : [...initialMessages],
-      );
+      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
       let unsummarizedMessages = compactedModelContext?.length
         ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
@@ -2574,8 +2579,14 @@ async function executeRuntimeStep(input: {
         messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
       }
 
-      const operationalContextSystemSection = runtimeOperationalContextSystemSection(requiredSubagentDirective);
-      requestSystemPrompt = [baseSystemPrompt, operationalContextSystemSection].filter(Boolean).join('\n\n');
+      const operationalContext = runtimeOperationalContextText(requiredSubagentDirective);
+      requestSystemPrompt = baseSystemPrompt;
+      const runtimeMetadata = appendRuntimePromptCacheMetadata({
+        messages: messagesToSend,
+        operationalContext,
+        currentTimeLine: runtimeTimeLine,
+      });
+      messagesToSend = runtimeMetadata.messages;
       let requestMessages = [...messagesToSend];
       let attachedImagePaths = [...messageImagePaths];
       let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
@@ -2586,10 +2597,12 @@ async function executeRuntimeStep(input: {
         const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
         const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
         const baseStats = modelMessagesTextAndImageStats(
-          sanitizeModelInputForStats(requestSystemPrompt, [], []),
+          sanitizeModelInputForStats(requestSystemPrompt, runtimeMetadata.metadataMessages, []),
           codexMode ? undefined : nativeToolsRef.current,
         );
         const summarySourceMessages = messagesToSend.filter((message) => (
+          !isRuntimePromptCacheMetadataMessage(message)
+          &&
           !textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
           && !isRedundantOriginalGoalMessage(message)
         ));
@@ -2676,13 +2689,24 @@ async function executeRuntimeStep(input: {
           requestMessages = [...messagesToSend];
           afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
+        const compressedRuntimeMetadata = appendRuntimePromptCacheMetadata({
+          messages: messagesToSend,
+          operationalContext,
+          currentTimeLine: runtimeTimeLine,
+        });
+        messagesToSend = compressedRuntimeMetadata.messages;
+        requestMessages = [...messagesToSend];
+        afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
+        const retainedMessageCount = Math.max(0, messagesToSend.filter((message) => (
+          !isRuntimePromptCacheMetadataMessage(message)
+        )).length - 1);
         modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
         latestContextCompression = {
           compressedAt: new Date().toISOString(),
           continuationSummary: summary,
           estimatedTokensBefore: messageStats.estimatedTotalTokens,
           estimatedTokensAfter: afterStats.estimatedTotalTokens,
-          retainedMessageCount: messagesToSend.length - 1,
+          retainedMessageCount,
           summarizedMessageCount: summarySourceMessages.length,
           targetCeilingTokens,
           targetFloorTokens,
@@ -2706,7 +2730,7 @@ async function executeRuntimeStep(input: {
           unsummarizedMessageCount: unsummarizedMessages.length,
           targetFloorTokens,
           targetCeilingTokens,
-          retainedMessageCount: messagesToSend.length - 1,
+          retainedMessageCount,
           thresholdTokens,
         };
         await onAttemptDebug?.({
@@ -2745,7 +2769,7 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-system-and-conversation-prefix', runtimeOperationalContextCharacters: operationalContextSystemSection.length, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-tools-system-and-conversation-prefix', runtimeOperationalContextCharacters: runtimeMetadata.operationalContextCharacters, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       lastAiRequest = aiRequest;
       const hiddenSkillGateActive = stepAllowedToolTypes.length !== allowedToolTypes.length;
       const activeTools = browserStateGatePending || hiddenSkillGateActive
@@ -2930,6 +2954,7 @@ async function executeRuntimeStep(input: {
       ...allowedExternalTools,
     };
     const toolsForRequest = nativeToolsRef.current;
+    const stableToolOrder = Object.keys(toolsForRequest).sort() as Array<keyof typeof toolsForRequest>;
     const repairToolCall: ToolCallRepairFunction<typeof toolsForRequest> = async ({ toolCall }) => {
       const repairedInput = repairBrowserChatToolCallInput(toolCall.toolName, toolCall.input);
       return repairedInput ? { ...toolCall, input: repairedInput } : null;
@@ -3103,6 +3128,7 @@ async function executeRuntimeStep(input: {
       const agentSettings = {
         model: getModel(),
         tools: toolsForRequest,
+        toolOrder: stableToolOrder,
         runtimeContext,
         stopWhen,
         prepareStep: prepareAgentStep,

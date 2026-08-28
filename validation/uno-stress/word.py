@@ -92,6 +92,9 @@ def create_document(job):
     layout.add_page_break('page-break-04')
     layout.add_heading('section-05/title', '5. 图片、脚注和批注', level=1, color=0x0B2545)
     layout.add_inline_image('section-05/image', '__ASSET__', width=12500)
+    image_cursor = document.Text.createTextCursor()
+    image_cursor.gotoEnd(False)
+    document.Text.insertControlCharacter(image_cursor, uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK'), False)
     layout.add_paragraph('section-05/image-caption', '图 1：用于验证内联图片、比例和分页。', font_size=9, italic=True, color=0x64748B, align='CENTER', space_after=260)
     _append_footnote_and_annotation(expert, document)
     # @webpilot-endunit
@@ -117,12 +120,13 @@ def create_document(job):
     shape_size.Width, shape_size.Height = 5000, 2600
     shape.Position, shape.Size = position, shape_size
     shape.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AT_PAGE')
-    shape.AnchorPageNo = 6
+    # Writer's AT_PAGE anchor index is zero-based; index 5 targets visible page 6.
+    shape.AnchorPageNo = 5
     shape.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')
     shape.FillColor = 0xDCEAF7
     shape.LineColor = 0x2563EB
     draw_page.add(shape)
-    expert.tag(shape, 'section-06/drawing-shape', 'shape', {'section': 6})
+    expert.tag(shape, 'section-06/drawing-shape', 'shape', {'section': 6, 'page': 6})
     layout.add_paragraph('section-06/outro', '绘图对象应保持在页面可用区域内，并且不遮挡上方文本框。', font_size=11, space_before=3200, space_after=180)
     # @webpilot-endunit
 
