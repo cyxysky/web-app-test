@@ -14,7 +14,8 @@ import {
 } from './document-artifact-generators';
 import { inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
 import { convertOfficeFile } from '@/server/files/libreoffice';
-import { validateOfficeArtifact } from '@/server/files/office-artifact-validator';
+import { validateOfficeArtifact, type OfficeElementMapEntry } from '@/server/files/office-artifact-validator';
+import { validateOfficeRendererMatrix } from '@/server/files/office-render-validation';
 import { analyzeOfficeProgram, type OfficeProgramDiagnostic } from '@/server/files/office-program-analysis';
 import type {
   OfficeDocumentDraft,
@@ -39,7 +40,7 @@ const downloadDomainQueues = new Map<string, Promise<void>>();
 const downloadDomainCooldowns = new Map<string, number>();
 const DRAFT_LOCK_WAIT_MS = 120_000;
 const STALE_DRAFT_LOCK_MS = 10 * 60_000;
-const OFFICE_PIPELINE_VERSION = 'office-pipeline-v4-units-preflight-recovery';
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v6-uno-strict-validation';
 
 type DownloadArtifactInput = {
   runId?: string;
@@ -1708,7 +1709,9 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
 type ValidatedDraftCandidate = {
   assets: DocumentAsset[];
   cacheHit: boolean;
-  validation: Awaited<ReturnType<typeof validateOfficeArtifact>>;
+  validation: Awaited<ReturnType<typeof validateOfficeArtifact>> & {
+    rendererMatrix?: Awaited<ReturnType<typeof validateOfficeRendererMatrix>>;
+  };
   generated: {
     bytes: number;
     diagnostics?: unknown;
@@ -1717,6 +1720,41 @@ type ValidatedDraftCandidate = {
     previewPath?: string;
   };
 };
+
+function generatedElementMap(diagnostics: unknown): OfficeElementMapEntry[] {
+  if (!diagnostics || typeof diagnostics !== 'object') return [];
+  const candidate = (diagnostics as { elementMap?: unknown }).elementMap;
+  if (!Array.isArray(candidate)) return [];
+  return candidate.filter((entry): entry is OfficeElementMapEntry => Boolean(
+    entry && typeof entry === 'object' && typeof (entry as { elementId?: unknown }).elementId === 'string',
+  ));
+}
+
+function generatedVerificationIssues(diagnostics: unknown) {
+  if (!diagnostics || typeof diagnostics !== 'object') return [];
+  const verification = (diagnostics as { verification?: unknown }).verification;
+  if (!verification || typeof verification !== 'object') return [];
+  const issues = (verification as { issues?: unknown }).issues;
+  if (!Array.isArray(issues)) return [];
+  return issues.filter((issue): issue is {
+    column?: number;
+    elementId?: string;
+    line?: number;
+    locator?: Record<string, unknown>;
+    description: string;
+    severity: 'error' | 'warning';
+    type: string;
+  } => Boolean(issue && typeof issue === 'object' && typeof (issue as { description?: unknown }).description === 'string'))
+    .map((issue) => ({
+      code: `RUNTIME_${String(issue.type || 'LAYOUT').toUpperCase()}`,
+      column: issue.column,
+      elementId: issue.elementId,
+      line: issue.line,
+      locator: issue.locator,
+      message: issue.description,
+      severity: issue.severity === 'error' ? 'error' as const : 'warning' as const,
+    }));
+}
 
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
   const digest = sourceDigest(draft.program || '');
@@ -1728,6 +1766,7 @@ function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDr
     artifactPath: `${base}${extension}`,
     metadataPath: `${base}.json`,
     previewPath: `${base}.preview.pdf`,
+    microsoftPreviewPath: `${base}.microsoft.preview.pdf`,
   };
 }
 
@@ -1760,7 +1799,7 @@ async function prepareValidatedDraftLegacy(input: {
   const extension = path.extname(input.draft.fileName).toLowerCase();
   const cache = validationCachePaths(input.runId, input.draft, extension);
   try {
-    const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as { assetFingerprint?: string };
+    const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as { assetFingerprint?: string; diagnostics?: unknown };
     if (metadata.assetFingerprint === assetFingerprint) {
       const artifactMetadata = await stat(cache.artifactPath);
       const previewMetadata = await stat(cache.previewPath).catch(() => undefined);
@@ -1772,6 +1811,7 @@ async function prepareValidatedDraftLegacy(input: {
           extension,
           outputPath: cache.artifactPath,
           previewPath: previewMetadata?.isFile() ? cache.previewPath : undefined,
+          diagnostics: metadata.diagnostics,
         },
       };
     }
@@ -1796,7 +1836,7 @@ async function prepareValidatedDraftLegacy(input: {
       abortSignal: input.abortSignal,
       onProgress: input.onProgress,
     });
-    await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint }), 'utf8');
+    await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint, diagnostics: generated.diagnostics }), 'utf8');
     return { assets, cacheHit: false, generated };
   } finally {
     await unlink(candidateSourcePath).catch(() => undefined);
@@ -1834,9 +1874,14 @@ async function prepareValidatedDraft(input: {
     }
     let candidate = await prepareValidatedDraftLegacy(input);
     await input.onProgress?.({ phase: 'artifact-validation', message: '正在执行统一 Office、字体和嵌入图片检查' });
-    let validation = await validateOfficeArtifact({
+    const unoStrict = input.draft.generator === 'uno';
+    const elementMap = unoStrict ? generatedElementMap(candidate.generated.diagnostics) : [];
+    let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
       absolutePath: candidate.generated.outputPath,
+      elementMap: unoStrict ? elementMap : undefined,
       extension: candidate.generated.extension,
+      requireElementIds: unoStrict && input.draft.operation !== 'modify',
+      validationProfile: unoStrict ? 'uno-strict' : 'basic',
     });
     if (!validation.passed && candidate.cacheHit) {
       const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
@@ -1844,11 +1889,15 @@ async function prepareValidatedDraft(input: {
         unlink(cache.artifactPath).catch(() => undefined),
         unlink(cache.metadataPath).catch(() => undefined),
         unlink(cache.previewPath).catch(() => undefined),
+        unlink(cache.microsoftPreviewPath).catch(() => undefined),
       ]);
       candidate = await prepareValidatedDraftLegacy(input);
       validation = await validateOfficeArtifact({
         absolutePath: candidate.generated.outputPath,
+        elementMap: unoStrict ? generatedElementMap(candidate.generated.diagnostics) : undefined,
         extension: candidate.generated.extension,
+        requireElementIds: unoStrict && input.draft.operation !== 'modify',
+        validationProfile: unoStrict ? 'uno-strict' : 'basic',
       });
     }
     if (!validation.passed) {
@@ -1859,12 +1908,62 @@ async function prepareValidatedDraft(input: {
       Object.assign(error, { diagnostics: validation.issues });
       throw error;
     }
+    const runtimeIssues = unoStrict ? generatedVerificationIssues(candidate.generated.diagnostics) : [];
+    validation = {
+      ...validation,
+      issues: [...validation.issues, ...runtimeIssues],
+      passed: validation.passed && !runtimeIssues.some((issue) => issue.severity === 'error'),
+    };
+    if (!validation.passed) {
+      const error = new Error(runtimeIssues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
+      Object.assign(error, { diagnostics: runtimeIssues });
+      throw error;
+    }
+    let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
+    if (unoStrict) {
+      await input.onProgress?.({ phase: 'renderer-validation', message: '正在通过 LibreOffice 和 Microsoft Office 验证渲染结果' });
+      const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
+      rendererMatrix = await validateOfficeRendererMatrix({
+        absolutePath: candidate.generated.outputPath,
+        extension: candidate.generated.extension,
+        libreOfficePdfPath: candidate.generated.previewPath,
+        microsoftPdfPath: cache.microsoftPreviewPath,
+      });
+      validation = {
+        ...validation,
+        issues: [...validation.issues, ...rendererMatrix.issues],
+        passed: validation.passed && rendererMatrix.passed,
+        rendererMatrix,
+      };
+      if (!validation.passed) {
+        const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
+        Object.assign(error, { diagnostics: validation.issues });
+        throw error;
+      }
+    }
     input.draft.validationStatus = 'passed';
     input.draft.validatedSourceDigest = sourceDigest(input.draft.program);
     input.draft.validationDiagnostics = [
       ...staticDiagnostics,
-      ...validation.issues.map((issue) => ({ code: issue.code, message: issue.message, severity: issue.severity })),
+      ...validation.issues.map((issue) => {
+        const unit = issue.line
+          ? parsedUnits.find((candidate) => issue.line! >= candidate.startLine && issue.line! <= candidate.endLine)
+          : undefined;
+        return unit ? { ...issue, unitPath: unit.path } : issue;
+      }),
     ];
+    if (unoStrict) {
+      input.draft.elementMap = generatedElementMap(candidate.generated.diagnostics).map((element) => {
+        const unit = element.line
+          ? parsedUnits.find((candidate) => element.line! >= candidate.startLine && element.line! <= candidate.endLine)
+          : undefined;
+        return unit ? { ...element, unitPath: unit.path } : element;
+      });
+      if (rendererMatrix) input.draft.rendererValidation = rendererMatrix;
+    } else {
+      delete input.draft.elementMap;
+      delete input.draft.rendererValidation;
+    }
     synchronizeSourceUnits(input.draft, 'passed');
     input.draft.workflow = { state: 'render-ready', checkpointAt: new Date().toISOString() };
     await saveDraft(input.runId, input.draft);
@@ -1939,6 +2038,8 @@ async function validateDraft(input: {
         workflow: input.draft.workflow,
         qualityGate: {
           structural: true,
+          renderers: candidate.validation.rendererMatrix?.renderers,
+          microsoftOfficePolicy: candidate.validation.rendererMatrix?.policy,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
@@ -1998,6 +2099,7 @@ async function validateDraftSourceUnit(input: {
   const sourcePath = path.join(directory, `.unit-${suffix}${input.draft.generator === 'javascript' ? '.mjs' : '.py'}`);
   const outputPath = path.join(directory, `.unit-${suffix}${extension}`);
   const previewPath = path.join(directory, `.unit-${suffix}.preview.pdf`);
+  const microsoftPreviewPath = path.join(directory, `.unit-${suffix}.microsoft.preview.pdf`);
   try {
     if (!input.draft.program) throw new Error('The Office draft has no working source.');
     const unit = parseSourceUnits(input.draft.program).find((candidate) => candidate.path === input.sourceUnitPath);
@@ -2025,11 +2127,50 @@ async function validateDraftSourceUnit(input: {
       abortSignal: input.abortSignal,
       onProgress: input.onProgress,
     });
-    const validation = await validateOfficeArtifact({ absolutePath: generated.outputPath, extension: generated.extension });
+    const unoStrict = input.draft.generator === 'uno';
+    const elementMap = unoStrict ? generatedElementMap(generated.diagnostics) : [];
+    let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
+      absolutePath: generated.outputPath,
+      elementMap: unoStrict ? elementMap : undefined,
+      extension: generated.extension,
+      requireElementIds: unoStrict && input.draft.operation !== 'modify',
+      validationProfile: unoStrict ? 'uno-strict' : 'basic',
+    });
     if (!validation.passed) {
       const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
       Object.assign(error, { diagnostics: validation.issues });
       throw error;
+    }
+    const runtimeIssues = unoStrict ? generatedVerificationIssues(generated.diagnostics) : [];
+    validation = {
+      ...validation,
+      issues: [...validation.issues, ...runtimeIssues],
+      passed: validation.passed && !runtimeIssues.some((issue) => issue.severity === 'error'),
+    };
+    if (!validation.passed) {
+      const error = new Error(runtimeIssues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
+      Object.assign(error, { diagnostics: runtimeIssues });
+      throw error;
+    }
+    let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
+    if (unoStrict) {
+      rendererMatrix = await validateOfficeRendererMatrix({
+        absolutePath: generated.outputPath,
+        extension: generated.extension,
+        libreOfficePdfPath: generated.previewPath,
+        microsoftPdfPath: microsoftPreviewPath,
+      });
+      validation = {
+        ...validation,
+        issues: [...validation.issues, ...rendererMatrix.issues],
+        passed: validation.passed && rendererMatrix.passed,
+        rendererMatrix,
+      };
+      if (!validation.passed) {
+        const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
+        Object.assign(error, { diagnostics: validation.issues });
+        throw error;
+      }
     }
     const needsVisuals = Boolean(input.includeVisualVerification && generated.previewPath);
     const visualVerification = needsVisuals
@@ -2050,8 +2191,15 @@ async function validateDraftSourceUnit(input: {
     input.draft.validationStatus = 'pending';
     input.draft.validationDiagnostics = [
       ...staticAnalysis.diagnostics.map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath })),
-      ...validation.issues.map((issue) => ({ code: issue.code, message: issue.message, severity: issue.severity, unitPath: input.sourceUnitPath })),
+      ...validation.issues.map((issue) => ({ ...issue, unitPath: input.sourceUnitPath })),
     ];
+    if (unoStrict) {
+      input.draft.elementMap = elementMap;
+      if (rendererMatrix) input.draft.rendererValidation = rendererMatrix;
+    } else {
+      delete input.draft.elementMap;
+      delete input.draft.rendererValidation;
+    }
     input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
     await saveDraft(input.runId, input.draft);
     return {
@@ -2115,6 +2263,7 @@ async function validateDraftSourceUnit(input: {
       unlink(sourcePath).catch(() => undefined),
       unlink(outputPath).catch(() => undefined),
       unlink(previewPath).catch(() => undefined),
+      unlink(microsoftPreviewPath).catch(() => undefined),
     ]);
   }
 }
@@ -2230,6 +2379,8 @@ async function renderDraft(input: {
         workflow: input.draft.workflow,
         qualityGate: {
           structural: true,
+          renderers: candidate.validation.rendererMatrix?.renderers,
+          microsoftOfficePolicy: candidate.validation.rendererMatrix?.policy,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
@@ -2342,7 +2493,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       sourceCharacters: 0,
       workflow: draft.workflow,
       instruction: draft.operation === 'modify'
-        ? `Open the existing file with job.open_document(${JSON.stringify(draft.sourceDocument?.assetName)}), edit that component in place, and save it to job.output_url. Do not recreate the document.`
+        ? `Open the existing file through the matching stable facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. If the facade cannot express the requested edit, use job.expert(reason).open_document(...) and tag every newly created raw object. Do not recreate the document.`
         : undefined,
     }) };
   } catch (error) {
@@ -2630,7 +2781,8 @@ export async function recordOfficeVisualQaProgress(input: {
         && Array.from({ length: pageCount }, (_, index) => index + 1).every((page) => draft.visualQaSeenPages?.includes(page));
       const reviews = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
       const completePassingReview = pageCount > 0
-        && Array.from({ length: pageCount }, (_, index) => reviews.get(index + 1)?.status === 'passed');
+        && Array.from({ length: pageCount }, (_, index) => index + 1)
+          .every((pageNumber) => reviews.get(pageNumber)?.status === 'passed');
       draft.visualQaDigest = completeCoverage && completePassingReview ? identity.renderedDigest : undefined;
       draft.workflow = {
         state: draft.visualQaDigest === identity.renderedDigest ? 'completed' : 'qa-pending',

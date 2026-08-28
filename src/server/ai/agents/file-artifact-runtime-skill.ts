@@ -47,7 +47,7 @@ Do not guess a returned id or digest. Copy \`documentId\`, \`artifactId\`, \`sou
 
 \`\`\`ts
 type DocumentType = "word" | "spreadsheet" | "presentation";
-type ApiTarget = "all" | "document" | "page" | "text" | "sheet" | "cell" | "shape";
+type ApiTarget = "all" | "document" | "page" | "text" | "cursor" | "sheet" | "cell" | "shape" | "table" | "table-column" | "table-row" | "chart" | "chart-data";
 
 type FileInput =
   | { action: "list"; reason?: string }
@@ -150,6 +150,30 @@ Action requirements:
 - \`generate\`: call exactly once for a planned document. It creates the single editable source buffer even when validation fails.
 - \`edit\`: after generation, including a failed initial validation, repair the same saved source with structured \`edits\`, one unified \`patch\`, or \`restoreRevision\`. Do not combine these mutation forms and do not send a whole-program replacement.
 - \`render\`: publishes only the current source after that exact source passes validation.
+
+## JavaScript presentation visualization choices
+
+For JavaScript presentation drafts that use PptxGenJS:
+
+- Prefer \`slide.addChart()\` for standard column charts, horizontal bar charts, and doughnut charts. In PptxGenJS, use the bar chart type with \`barDir: "col"\` for columns, \`barDir: "bar"\` for horizontal bars, and the doughnut chart type for rings.
+- Prefer \`slide.addTable()\` for standard tables.
+- Use \`slide.addShape()\` to construct KPI progress bars, mini charts, and special infographics whose appearance cannot be represented adequately by a native chart or table.
+- Do not replace a standard native chart or table with manually positioned shapes merely for styling. A shape-based replacement is appropriate only when the requested visual is intentionally infographic-like or visual QA proves that the native object cannot produce the required result.
+
+## UNO Writer authoring model
+
+UNO Writer keeps the complete LibreOffice API available. Do not tell the user that an Office feature is unavailable merely because the high-level facade does not expose it.
+
+The stable facade, element mapping, expert-mode audit, high-risk static checks, format-specific deterministic checks, and dual-renderer matrix in this section apply only to UNO drafts. JavaScript drafts continue to use \`job.PptxGenJS\`, \`job.docx\`, and \`job.ExcelJS\` directly with their existing validation flow.
+
+- For new documents, use \`job.writer(elementId)\`, \`job.presentation(elementId)\`, or \`job.spreadsheet(elementId)\` by default. The stable facade covers ordinary flow content and bounded page, slide, and cell layout.
+- Every generated page, paragraph, heading, list, table, chart, image, shape, worksheet, range, and cell must have a stable \`elementId\`. Reuse the same ID when repairing that logical element.
+- If the stable facade cannot express a required Office feature, declare \`expert = job.expert("concrete reason")\`. Use the raw UNO handles exposed by that expert object and call \`expert.tag(target, elementId, kind, locator)\` for each raw UNO object.
+- Expert mode preserves full Office capability, but it is explicit and auditable. Direct \`layout.raw\`, \`job.new_document()\`, and untagged raw UNO objects are rejected before execution.
+- Keep ordinary text, tables, and images in flow layout unless the requested appearance genuinely needs floating placement. When using a floating frame, shape, image, or embedded chart, assign its anchor, wrapping, size, and position deliberately and inspect every affected rendered page.
+- Output validation may report floating objects, positioned text frames, or exact-height table rows as visual-review risks. These warnings preserve advanced authoring freedom; they are not permission to skip visual QA. Fix unintended clipping or overlap in the same source, while retaining intentional freeform composition.
+- Deterministic validation runs before visual QA: format-specific package checks, LibreOffice rendering, then Microsoft Office rendering. Microsoft Office validation is required by default; an unavailable renderer blocks delivery and is never described as passed. Set \`MICROSOFT_OFFICE_VALIDATION=if-available\` only for an environment where LibreOffice-only delivery is intentionally accepted.
+- Never use a successful reopen or a structurally valid package as proof that pagination is visually correct. Complete the current-artifact page review only after all deterministic gates have passed.
 
 ## file call examples
 

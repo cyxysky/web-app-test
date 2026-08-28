@@ -58,6 +58,8 @@ function pythonSupportsUno(executable: string, libreOfficeProgramDirectory: stri
         ...process.env,
         PATH: [libreOfficeProgramDirectory, process.env.PATH].filter(Boolean).join(path.delimiter),
         PYTHONPATH: [libreOfficeProgramDirectory, existingPythonPath].filter(Boolean).join(path.delimiter),
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
       },
       timeout: 5_000,
       windowsHide: true,

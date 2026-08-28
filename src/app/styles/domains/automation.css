@@ -1150,9 +1150,13 @@
   line-height: 18px;
 }
 
+.automation-run-list .workspace-sidebar-archive-date-body {
+  grid-column: 2;
+  min-width: 0;
+}
+
 .automation-run-list .workspace-sidebar-archive-date-items {
   display: grid;
-  grid-column: 2;
   list-style: none;
   margin: 0;
   min-width: 0;

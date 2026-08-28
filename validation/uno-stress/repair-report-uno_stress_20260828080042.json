@@ -1,0 +1,153 @@
+{
+  "runId": "uno_stress_20260828080042",
+  "cases": [
+    {
+      "documentId": "uno-stress-presentation",
+      "edited": {
+        "ok": false,
+        "payload": {
+          "kind": "uno-draft-validation",
+          "documentId": "uno-stress-presentation",
+          "fileName": "uno-stress-presentation.pptx",
+          "generator": "uno",
+          "changed": true,
+          "saved": true,
+          "sourceDigest": "ebfae52e0839182940b19c68783f9c22a11c7d3f7210291fff4e961ef8b6bdbf",
+          "sourceCharacters": 7727,
+          "currentRevision": null,
+          "validatedRevision": null,
+          "lastSuccessfulRevision": null,
+          "lineCount": 152,
+          "validation": "failed",
+          "requiredNextAction": "edit",
+          "diagnostics": [
+            {
+              "message": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1560, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1527, in main\n    namespace['create_document'](job)\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828080042\\document-drafts\\.candidate-uno-stress-presentation-dbd89f6b-d517-45cc-a6c1-f1aec719faf2.py\", line 111, in create_document\n    cell = table.getCellByPosition(column_index, row_index)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n__webpilot_document_draft__.com.sun.star.lang.IndexOutOfBoundsException: col 2 out of range 0..2",
+              "severity": "error"
+            }
+          ],
+          "error": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1560, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1527, in main\n    namespace['create_document'](job)\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828080042\\document-drafts\\.candidate-uno-stress-presentation-dbd89f6b-d517-45cc-a6c1-f1aec719faf2.py\", line 111, in create_document\n    cell = table.getCellByPosition(column_index, row_index)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n__webpilot_document_draft__.com.sun.star.lang.IndexOutOfBoundsException: col 2 out of range 0..2",
+          "workflow": {
+            "state": "authoring",
+            "checkpointAt": "2026-08-28T08:07:20.487Z",
+            "error": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1560, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1527, in main\n    namespace['create_document'](job)\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828080042\\document-drafts\\.candidate-uno-stress-presentation-dbd89f6b-d517-45cc-a6c1-f1aec719faf2.py\", line 111, in create_document\n    cell = table.getCellByPosition(column_index, row_index)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n__webpilot_document_draft__.com.sun.star.lang.IndexOutOfBoundsException: col 2 out of range 0..2"
+          },
+          "recoverySuggestion": "The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation."
+        }
+      },
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        }
+      ]
+    },
+    {
+      "documentId": "uno-stress-word",
+      "edited": {
+        "ok": false,
+        "payload": {
+          "kind": "uno-draft-validation",
+          "documentId": "uno-stress-word",
+          "fileName": "uno-stress-word.docx",
+          "generator": "uno",
+          "changed": true,
+          "saved": true,
+          "sourceDigest": "d400e9f4a5f87a431795e49bc2ec8ac809a52066f6e8c2a0104bd07ef73a6cd9",
+          "sourceCharacters": 7837,
+          "currentRevision": null,
+          "validatedRevision": null,
+          "lastSuccessfulRevision": null,
+          "lineCount": 142,
+          "validation": "failed",
+          "requiredNextAction": "edit",
+          "diagnostics": [
+            {
+              "code": "FONT_NOT_FOUND",
+              "message": "Requested font \"新宋体\" was not matched in the win32 font inventory; verify LibreOffice substitution.",
+              "severity": "warning",
+              "target": "新宋体"
+            },
+            {
+              "code": "FONT_NOT_FOUND",
+              "message": "Requested font \"zh-CN\" was not matched in the win32 font inventory; verify LibreOffice substitution.",
+              "severity": "warning",
+              "target": "zh-CN"
+            },
+            {
+              "code": "RUNTIME_DRAWING_TEXT_OUT_OF_PAGE",
+              "message": "Drawing text object bounds x=0, y=-1506, width=7200, height=1505 extend beyond page size 21590x27940; confirm the bleed or crop is intentional.",
+              "severity": "warning"
+            },
+            {
+              "code": "CROSS_RENDERER_PAGE_COUNT_MISMATCH",
+              "message": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6.",
+              "severity": "error"
+            }
+          ],
+          "error": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6.",
+          "workflow": {
+            "state": "authoring",
+            "checkpointAt": "2026-08-28T08:08:22.136Z",
+            "error": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6."
+          },
+          "recoverySuggestion": "The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation."
+        }
+      },
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "reopen",
+          "message": "文档已保存，正在重新打开验证"
+        },
+        {
+          "phase": "visual",
+          "message": "结构验证完成，预览已生成"
+        },
+        {
+          "phase": "artifact-validation",
+          "message": "正在执行统一 Office、字体和嵌入图片检查"
+        },
+        {
+          "phase": "renderer-validation",
+          "message": "正在通过 LibreOffice 和 Microsoft Office 验证渲染结果"
+        }
+      ]
+    }
+  ]
+}

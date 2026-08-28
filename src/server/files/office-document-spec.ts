@@ -139,11 +139,26 @@ export type OfficeDocumentDraft = {
   validationDiagnostics?: Array<{
     code?: string;
     column?: number;
+    elementId?: string;
     line?: number;
+    locator?: Record<string, unknown>;
     message: string;
     severity?: 'error' | 'warning';
+    target?: string;
     unitPath?: string;
   }>;
+  /** Stable source-to-artifact identity records emitted by the active authoring runtime. */
+  elementMap?: Array<{
+    artifactName?: string;
+    column?: number;
+    elementId: string;
+    kind: string;
+    line?: number;
+    locator?: Record<string, unknown>;
+    unitPath?: string;
+  }>;
+  /** Deterministic LibreOffice/Microsoft Office renderer matrix for the validated revision. */
+  rendererValidation?: Record<string, unknown>;
   /** Optional logical page/section units embedded in the source through @webpilot-unit markers. */
   sourceUnits?: Array<{
     path: string;

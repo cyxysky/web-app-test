@@ -1,0 +1,200 @@
+{
+  "generatedAt": "2026-08-28T09:23:56.329Z",
+  "runId": "uno_stress_20260828092234",
+  "environment": {
+    "officeGenerationMode": "uno",
+    "microsoftOfficeValidation": "required"
+  },
+  "cases": [
+    {
+      "input": {
+        "documentId": "uno-stress-presentation",
+        "documentType": "presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "sourceFile": "presentation.py"
+      },
+      "planned": {
+        "kind": "document-plan",
+        "documentId": "uno-stress-presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "documentType": "presentation",
+        "operation": "create",
+        "generator": "uno",
+        "sourceFileName": "uno-stress-presentation.py",
+        "sourceCharacters": 0,
+        "workflow": {
+          "state": "planned",
+          "checkpointAt": "2026-08-28T09:22:34.433Z"
+        },
+        "availableAssets": [
+          {
+            "assetName": "attachment-stress-image-office-image-fixture.png",
+            "bytes": 2005424,
+            "sha256": "cc819f532e33c3eced99c5480d3ba6943ddd5d13d80d9661c1b29f6976233a2a",
+            "origin": "attachment",
+            "ref": "stress-image",
+            "format": "png",
+            "width": 1536,
+            "height": 1024,
+            "aspectRatio": 1.5,
+            "optimized": false
+          }
+        ]
+      },
+      "generated": {
+        "kind": "uno-draft-validation",
+        "documentId": "uno-stress-presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "generator": "uno",
+        "changed": true,
+        "saved": true,
+        "sourceDigest": "ca23b78a1464961208585a256aabe8cf6b01702fdb7624710a0fe8a6b2a93f05",
+        "sourceCharacters": 8297,
+        "currentRevision": null,
+        "validatedRevision": null,
+        "lastSuccessfulRevision": null,
+        "lineCount": 161,
+        "validation": "failed",
+        "requiredNextAction": "edit",
+        "diagnostics": [
+          {
+            "code": "PPTX_CHART_HAS_NO_SERIES",
+            "message": "ppt/charts/chart1.xml contains no data series.",
+            "severity": "error",
+            "target": "ppt/charts/chart1.xml"
+          }
+        ],
+        "error": "ppt/charts/chart1.xml contains no data series.",
+        "workflow": {
+          "state": "authoring",
+          "checkpointAt": "2026-08-28T09:23:22.962Z",
+          "error": "ppt/charts/chart1.xml contains no data series."
+        }
+      },
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "reopen",
+          "message": "文档已保存，正在重新打开验证"
+        },
+        {
+          "phase": "visual",
+          "message": "结构验证完成，预览已生成"
+        },
+        {
+          "phase": "artifact-validation",
+          "message": "正在执行统一 Office、字体和嵌入图片检查"
+        }
+      ]
+    },
+    {
+      "input": {
+        "documentId": "uno-stress-word",
+        "documentType": "word",
+        "fileName": "uno-stress-word.docx",
+        "sourceFile": "word.py"
+      },
+      "planned": {
+        "kind": "document-plan",
+        "documentId": "uno-stress-word",
+        "fileName": "uno-stress-word.docx",
+        "documentType": "word",
+        "operation": "create",
+        "generator": "uno",
+        "sourceFileName": "uno-stress-word.py",
+        "sourceCharacters": 0,
+        "workflow": {
+          "state": "planned",
+          "checkpointAt": "2026-08-28T09:23:23.069Z"
+        },
+        "availableAssets": [
+          {
+            "assetName": "attachment-stress-image-office-image-fixture.png",
+            "bytes": 2005424,
+            "sha256": "cc819f532e33c3eced99c5480d3ba6943ddd5d13d80d9661c1b29f6976233a2a",
+            "origin": "attachment",
+            "ref": "stress-image",
+            "format": "png",
+            "width": 1536,
+            "height": 1024,
+            "aspectRatio": 1.5,
+            "optimized": false
+          }
+        ]
+      },
+      "generated": {
+        "kind": "uno-draft-validation",
+        "documentId": "uno-stress-word",
+        "fileName": "uno-stress-word.docx",
+        "generator": "uno",
+        "changed": true,
+        "saved": true,
+        "sourceDigest": "13f842ea28606c2854a1715455d40177b9219e3326bfe83e4342850140fb5f4d",
+        "sourceCharacters": 7952,
+        "currentRevision": null,
+        "validatedRevision": null,
+        "lastSuccessfulRevision": null,
+        "lineCount": 144,
+        "validation": "failed",
+        "requiredNextAction": "edit",
+        "diagnostics": [
+          {
+            "message": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1605, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1593, in main\n    verification = verify_and_preview(\n                   ^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1200, in verify_and_preview\n    word_layout_verification = verify_word_layout(component, element_map) if document_type == 'word' else None\n                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1355, in verify_word_layout\n    position, shape_size = shape.Position, shape.Size\n                           ^^^^^^^^^^^^^^\ncom.sun.star.beans.UnknownPropertyException: cannot get value Position",
+            "severity": "error"
+          }
+        ],
+        "error": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1605, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1593, in main\n    verification = verify_and_preview(\n                   ^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1200, in verify_and_preview\n    word_layout_verification = verify_word_layout(component, element_map) if document_type == 'word' else None\n                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1355, in verify_word_layout\n    position, shape_size = shape.Position, shape.Size\n                           ^^^^^^^^^^^^^^\ncom.sun.star.beans.UnknownPropertyException: cannot get value Position",
+        "workflow": {
+          "state": "authoring",
+          "checkpointAt": "2026-08-28T09:23:56.317Z",
+          "error": "Traceback (most recent call last):\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1605, in <module>\n    main()\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1593, in main\n    verification = verify_and_preview(\n                   ^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1200, in verify_and_preview\n    word_layout_verification = verify_word_layout(component, element_map) if document_type == 'word' else None\n                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\src\\server\\files\\libreoffice-program-worker.py\", line 1355, in verify_word_layout\n    position, shape_size = shape.Position, shape.Size\n                           ^^^^^^^^^^^^^^\ncom.sun.star.beans.UnknownPropertyException: cannot get value Position"
+        }
+      },
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "reopen",
+          "message": "文档已保存，正在重新打开验证"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "createdAt": "2026-08-28T09:17:11.505Z",
+  "documentId": "uno-stress-presentation",
+  "documentType": "presentation",
+  "fileName": "uno-stress-presentation.pptx",
+  "intent": "Broad deterministic UNO stress validation fixture",
+  "operation": "create",
+  "generator": "uno",
+  "workflow": {
+    "state": "authoring",
+    "checkpointAt": "2026-08-28T09:17:55.277Z",
+    "error": "ppt/slides/slide1.xml contains a generated object without a stable elementId marker.\nppt/slides/slide1.xml contains a generated object without a stable elementId marker.\nppt/charts/chart1.xml contains no data series."
+  },
+  "updatedAt": "2026-08-28T09:17:55.277Z",
+  "program": "import uno\n\n\ndef _point(x, y):\n    value = uno.createUnoStruct('com.sun.star.awt.Point')\n    value.X, value.Y = int(x), int(y)\n    return value\n\n\ndef _size(width, height):\n    value = uno.createUnoStruct('com.sun.star.awt.Size')\n    value.Width, value.Height = int(width), int(height)\n    return value\n\n\ndef _expert_text(expert, document, page, element_id, text, x, y, width, height, font_size=18):\n    shape = document.createInstance('com.sun.star.drawing.TextShape')\n    shape.Position, shape.Size = _point(x, y), _size(width, height)\n    page.add(shape)\n    shape.String = text\n    cursor = shape.Text.createTextCursor()\n    cursor.gotoEnd(True)\n    cursor.CharHeight = float(font_size)\n    expert.tag(shape, element_id, 'text', {'role': 'expert-text'})\n    return shape\n\n\ndef create_document(job):\n    expert = job.expert('Stress coverage requires charts, tables, notes, hyperlinks, and advanced drawing properties.')\n    document = expert.new_document('presentation')\n    deck = job.presentation('deck', component=document)\n    bounds = job.document_bounds(document)\n    slide_width, slide_height = bounds['width'], bounds['height']\n\n    # @webpilot-unit pages/slide-01\n    page = deck.add_slide('slide-01')\n    deck.add_shape('slide-01/background', page, 0, 0, slide_width, slide_height)\n    background = page.getByIndex(0)\n    background.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    background.FillColor = 0x0B2545\n    background.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')\n    title = deck.add_text('slide-01/title', page, 'UNO Office 全面压力验证', 1700, 2500, 24500, 3300, font_size=30, color=0xFFFFFF)\n    title.CharWeight = 150.0\n    deck.add_text('slide-01/subtitle', page, '文本 · 表格 · 图表 · 图片 · 形状 · 超链接 · 备注', 1700, 6300, 24500, 1800, font_size=17, color=0xB8D8F0)\n    deck.add_text('slide-01/footer', page, 'LibreOffice UNO → PPTX → LibreOffice / Microsoft Office', 1700, 13200, 24500, 1000, font_size=11, color=0xD7E8F5)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-02\n    page = deck.add_slide('slide-02')\n    deck.add_text('slide-02/title', page, '多语言文本与富文本属性必须稳定', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    rich = _expert_text(expert, document, page, 'slide-02/rich-text', '中文 English العربية Русский\\n粗体 · 斜体 · 下划线 · 字距', 1700, 3300, 23800, 4200, 22)\n    cursor = rich.Text.createTextCursor()\n    cursor.gotoStart(False)\n    cursor.goRight(2, True)\n    cursor.CharWeight = 150.0\n    cursor.gotoEnd(True)\n    cursor.CharColor = 0x2563EB\n    rich.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'NONE')\n    link = _expert_text(expert, document, page, 'slide-02/hyperlink', 'https://example.com/uno-validation', 1700, 9000, 15000, 1300, 15)\n    link_cursor = link.Text.createTextCursor()\n    link_cursor.gotoEnd(True)\n    link_cursor.CharColor = 0x1565C0\n    link_cursor.CharUnderline = 1\n    link.OnClick = uno.Enum('com.sun.star.presentation.ClickAction', 'DOCUMENT')\n    link.Bookmark = 'https://example.com/uno-validation'\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-03\n    page = deck.add_slide('slide-03')\n    deck.add_text('slide-03/title', page, '形状、透明度、旋转和连接线不能越界', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    rectangle = deck.add_shape('slide-03/rectangle', page, 2200, 3600, 6500, 4400)\n    rectangle.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    rectangle.FillColor = 0x2563EB\n    rectangle.FillTransparence = 18\n    rectangle.LineColor = 0x163B73\n    rectangle.RotateAngle = 700\n    ellipse = deck.add_shape('slide-03/ellipse', page, 10700, 3600, 5200, 5200, service='com.sun.star.drawing.EllipseShape')\n    ellipse.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    ellipse.FillColor = 0x10B981\n    ellipse.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')\n    line = deck.add_shape('slide-03/connector', page, 7800, 5200, 4300, 900, service='com.sun.star.drawing.LineShape')\n    line.LineColor = 0xF59E0B\n    line.LineWidth = 120\n    _expert_text(expert, document, page, 'slide-03/callout', '旋转 7°', 2300, 8500, 6200, 1200, 15)\n    _expert_text(expert, document, page, 'slide-03/ellipse-label', '圆形', 11300, 9000, 4000, 1200, 15)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-04\n    page = deck.add_slide('slide-04')\n    deck.add_text('slide-04/title', page, '图片在两种缩放比例下保持清晰', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    deck.add_image('slide-04/image-wide', page, 'attachment-stress-image-office-image-fixture.png', 1600, 3100, 15800, 9000)\n    deck.add_image('slide-04/image-thumb', page, 'attachment-stress-image-office-image-fixture.png', 19400, 4700, 6500, 4300)\n    deck.add_text('slide-04/caption', page, '同一素材用于验证大图、缩略图和 PPTX 媒体关系。', 1600, 12800, 24000, 1100, font_size=14, color=0x334155)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-05\n    page = deck.add_slide('slide-05')\n    deck.add_text('slide-05/title', page, '原生表格必须可以编辑并完整序列化', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    table_shape = document.createInstance('com.sun.star.drawing.TableShape')\n    table_shape.Position, table_shape.Size = _point(2200, 3500), _size(23500, 7200)\n    page.add(table_shape)\n    table = table_shape.Model\n    values = [\n        ['维度', 'LibreOffice', 'Microsoft Office'],\n        ['结构', 'OOXML 重开', 'COM 重开'],\n        ['版式', 'PDF 渲染', 'PDF 渲染'],\n        ['结论', '必须通过', '必须通过'],\n    ]\n    desired_rows, desired_columns = len(values), len(values[0])\n    if table.Rows.Count < desired_rows:\n        table.Rows.insertByIndex(table.Rows.Count, desired_rows - table.Rows.Count)\n    if table.Columns.Count < desired_columns:\n        table.Columns.insertByIndex(table.Columns.Count, desired_columns - table.Columns.Count)\n    for row_index, row_values in enumerate(values):\n        for column_index, value in enumerate(row_values):\n            cell = table.getCellByPosition(column_index, row_index)\n            cell.String = value\n            cell_cursor = cell.createTextCursor()\n            cell_cursor.gotoEnd(True)\n            cell_cursor.CharHeight = 14\n            if row_index == 0:\n                cell_cursor.CharWeight = 150.0\n                cell.FillColor = 0xDCEAF7\n    expert.tag(table_shape, 'slide-05/table', 'table', {'slide': 5})\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-06\n    page = deck.add_slide('slide-06')\n    deck.add_text('slide-06/title', page, '原生图表对象验证嵌入关系和跨渲染器兼容性', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    chart = document.createInstance('com.sun.star.drawing.OLE2Shape')\n    chart.CLSID = '12DCAE26-281F-416F-A234-C3086127382E'\n    chart.Position, chart.Size = _point(2700, 3300), _size(22500, 9000)\n    page.add(chart)\n    expert.tag(chart, 'slide-06/chart', 'chart', {'slide': 6})\n    deck.add_text('slide-06/caption', page, '默认 Chart2 数据用于验证可编辑图表对象，而不是位图替代。', 2700, 12900, 22000, 1000, font_size=13, color=0x475569)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-07\n    page = deck.add_slide('slide-07')\n    deck.add_text('slide-07/title', page, '演讲者备注必须保留', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    deck.add_text('slide-07/body', page, '此页包含 Notes Page 文本，用于验证备注关系和序列化。', 2200, 4500, 22000, 2600, font_size=22, color=0x334155)\n    notes_page = page.getNotesPage()\n    notes = document.createInstance('com.sun.star.drawing.TextShape')\n    notes.Position, notes.Size = _point(1200, 1200), _size(18000, 3500)\n    notes_page.add(notes)\n    notes.String = 'Speaker notes: explain the deterministic validation sequence and known limitations.'\n    expert.tag(notes, 'slide-07/notes', 'speaker-notes', {'slide': 7})\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-08\n    page = deck.add_slide('slide-08')\n    deck.add_text('slide-08/title', page, '验证结论必须来自结构、渲染和逐页视觉检查', 1500, 900, 25000, 2200, font_size=25, color=0x0B2545)\n    deck.add_text('slide-08/body', page, '结构通过 ≠ 版式正确\\nLibreOffice 通过 ≠ Microsoft Office 一致\\n视觉通过 ≠ 所有交互对象语义完整', 2500, 4200, 22500, 6000, font_size=22, color=0x1F2937)\n    # @webpilot-endunit\n\n    deck.save()\n    deck.close()",
+  "validationStatus": "failed",
+  "validationDiagnostics": [
+    {
+      "code": "PPTX_ELEMENT_ID_MISSING",
+      "message": "ppt/slides/slide1.xml contains a generated object without a stable elementId marker.",
+      "severity": "error",
+      "target": "ppt/slides/slide1.xml"
+    },
+    {
+      "code": "PPTX_ELEMENT_ID_MISSING",
+      "message": "ppt/slides/slide1.xml contains a generated object without a stable elementId marker.",
+      "severity": "error",
+      "target": "ppt/slides/slide1.xml"
+    },
+    {
+      "code": "PPTX_CHART_HAS_NO_SERIES",
+      "message": "ppt/charts/chart1.xml contains no data series.",
+      "severity": "error",
+      "target": "ppt/charts/chart1.xml"
+    }
+  ],
+  "sourceUnits": [
+    {
+      "path": "pages/slide-01",
+      "sourceDigest": "26303c56d2765fd4ba9ebce21ddb7039c20cece60881f85d1e31eb4df6f9a2a1",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-02",
+      "sourceDigest": "44bf61d8bdc54fff10d70ed21d5b3679fa95a50ae15fada38832a8fc5846ad74",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-03",
+      "sourceDigest": "395a77dd27b5be0f45724173556357bed5b27e246f5cfd9ddbeb6ebcc733dfb5",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-04",
+      "sourceDigest": "0706c264a9516ef8c2a15857e2ddd41e258271d1d97b7615c893de52c92efdda",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-05",
+      "sourceDigest": "02147e64501b74af5dc963e85fc3de5360252e03c07bea37a6d559893c2fd4c0",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-06",
+      "sourceDigest": "b29800cd9b134df5fcaa93f97d2a80c11b9acdd8cb50c6b1fc50ea7af296d906",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-07",
+      "sourceDigest": "a5b13e0542e9744c0adc2fdd535c8362bd1081932a34dfb51a879c1bbf101ea9",
+      "status": "failed"
+    },
+    {
+      "path": "pages/slide-08",
+      "sourceDigest": "b1205642a10f198343dc819af4cba6b2c05fcb74e5da70d3d8974e17919422fb",
+      "status": "failed"
+    }
+  ],
+  "sourceDigest": "47949939880e11450d36055506592a5369d5597e9022bd7d6528af98f7c306de"
+}

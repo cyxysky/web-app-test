@@ -1,0 +1,1364 @@
+{
+  "generatedAt": "2026-08-28T09:40:08.888Z",
+  "runId": "uno_stress_20260828093823",
+  "environment": {
+    "officeGenerationMode": "uno",
+    "microsoftOfficeValidation": "required"
+  },
+  "cases": [
+    {
+      "input": {
+        "documentId": "uno-stress-presentation",
+        "documentType": "presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "sourceFile": "presentation.py"
+      },
+      "planned": {
+        "kind": "document-plan",
+        "documentId": "uno-stress-presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "documentType": "presentation",
+        "operation": "create",
+        "generator": "uno",
+        "sourceFileName": "uno-stress-presentation.py",
+        "sourceCharacters": 0,
+        "workflow": {
+          "state": "planned",
+          "checkpointAt": "2026-08-28T09:38:23.111Z"
+        },
+        "availableAssets": [
+          {
+            "assetName": "attachment-stress-image-office-image-fixture.png",
+            "bytes": 2005424,
+            "sha256": "cc819f532e33c3eced99c5480d3ba6943ddd5d13d80d9661c1b29f6976233a2a",
+            "origin": "attachment",
+            "ref": "stress-image",
+            "format": "png",
+            "width": 1536,
+            "height": 1024,
+            "aspectRatio": 1.5,
+            "optimized": false
+          }
+        ]
+      },
+      "generated": {
+        "kind": "uno-draft-validation",
+        "documentId": "uno-stress-presentation",
+        "fileName": "uno-stress-presentation.pptx",
+        "generator": "uno",
+        "sourceDigest": "f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b",
+        "sourceCharacters": 8334,
+        "currentRevision": 1,
+        "validatedRevision": 1,
+        "validationStatus": "passed",
+        "documentChanged": true,
+        "cacheHit": false,
+        "generationDiagnostics": {
+          "bytes": 1899036,
+          "output": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.pptx",
+          "preview": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+          "renderer": "libreoffice-uno",
+          "verification": {
+            "issues": [],
+            "passed": true,
+            "format": "presentation",
+            "pages": 8,
+            "images": {
+              "checked": 2
+            },
+            "text": {
+              "textShapes": 25,
+              "nonEmptyTextShapes": 18,
+              "textCharacters": 458,
+              "shapeTypes": {
+                "com.sun.star.drawing.CustomShape": 21,
+                "com.sun.star.drawing.LineShape": 1,
+                "com.sun.star.drawing.GraphicObjectShape": 2,
+                "com.sun.star.drawing.TableShape": 1,
+                "com.sun.star.drawing.OLE2Shape": 1
+              }
+            },
+            "layout": {
+              "checkedTextShapes": 18,
+              "issues": [],
+              "passed": true
+            },
+            "fidelity": null
+          },
+          "elementMap": [
+            {
+              "elementId": "deck",
+              "artifactName": "wp_deck",
+              "kind": "presentation",
+              "line": 31,
+              "column": 1,
+              "locator": {
+                "role": "document"
+              }
+            },
+            {
+              "elementId": "slide-01",
+              "artifactName": "wp_slide_01",
+              "kind": "slide",
+              "line": 36,
+              "column": 1,
+              "locator": {
+                "slide": 1
+              }
+            },
+            {
+              "elementId": "slide-01/background",
+              "artifactName": "wp_slide_01_background",
+              "kind": "shape",
+              "line": 37,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-01/title",
+              "artifactName": "wp_slide_01_title",
+              "kind": "text",
+              "line": 42,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-01/subtitle",
+              "artifactName": "wp_slide_01_subtitle",
+              "kind": "text",
+              "line": 44,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-01/footer",
+              "artifactName": "wp_slide_01_footer",
+              "kind": "text",
+              "line": 45,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-02",
+              "artifactName": "wp_slide_02",
+              "kind": "slide",
+              "line": 49,
+              "column": 1,
+              "locator": {
+                "slide": 2
+              }
+            },
+            {
+              "elementId": "slide-02/title",
+              "artifactName": "wp_slide_02_title",
+              "kind": "text",
+              "line": 50,
+              "column": 1,
+              "locator": {
+                "slide": 2,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-02/rich-text",
+              "artifactName": "wp_slide_02_rich_text",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-02/hyperlink",
+              "artifactName": "wp_slide_02_hyperlink",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-03",
+              "artifactName": "wp_slide_03",
+              "kind": "slide",
+              "line": 69,
+              "column": 1,
+              "locator": {
+                "slide": 3
+              }
+            },
+            {
+              "elementId": "slide-03/title",
+              "artifactName": "wp_slide_03_title",
+              "kind": "text",
+              "line": 70,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-03/rectangle",
+              "artifactName": "wp_slide_03_rectangle",
+              "kind": "shape",
+              "line": 71,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-03/ellipse",
+              "artifactName": "wp_slide_03_ellipse",
+              "kind": "shape",
+              "line": 77,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-03/connector",
+              "artifactName": "wp_slide_03_connector",
+              "kind": "shape",
+              "line": 81,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-03/callout",
+              "artifactName": "wp_slide_03_callout",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-03/ellipse-label",
+              "artifactName": "wp_slide_03_ellipse_label",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-04",
+              "artifactName": "wp_slide_04",
+              "kind": "slide",
+              "line": 89,
+              "column": 1,
+              "locator": {
+                "slide": 4
+              }
+            },
+            {
+              "elementId": "slide-04/title",
+              "artifactName": "wp_slide_04_title",
+              "kind": "text",
+              "line": 90,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-04/image-wide",
+              "artifactName": "wp_slide_04_image_wide",
+              "kind": "image",
+              "line": 91,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-04/image-thumb",
+              "artifactName": "wp_slide_04_image_thumb",
+              "kind": "image",
+              "line": 92,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-04/caption",
+              "artifactName": "wp_slide_04_caption",
+              "kind": "text",
+              "line": 93,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-05",
+              "artifactName": "wp_slide_05",
+              "kind": "slide",
+              "line": 97,
+              "column": 1,
+              "locator": {
+                "slide": 5
+              }
+            },
+            {
+              "elementId": "slide-05/title",
+              "artifactName": "wp_slide_05_title",
+              "kind": "text",
+              "line": 98,
+              "column": 1,
+              "locator": {
+                "slide": 5,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-05/table",
+              "artifactName": "wp_slide_05_table",
+              "kind": "table",
+              "line": 124,
+              "column": 1,
+              "locator": {
+                "slide": 5
+              }
+            },
+            {
+              "elementId": "slide-06",
+              "artifactName": "wp_slide_06",
+              "kind": "slide",
+              "line": 128,
+              "column": 1,
+              "locator": {
+                "slide": 6
+              }
+            },
+            {
+              "elementId": "slide-06/title",
+              "artifactName": "wp_slide_06_title",
+              "kind": "text",
+              "line": 129,
+              "column": 1,
+              "locator": {
+                "slide": 6,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-06/chart",
+              "artifactName": "wp_slide_06_chart",
+              "kind": "chart",
+              "line": 134,
+              "column": 1,
+              "locator": {
+                "slide": 6
+              }
+            },
+            {
+              "elementId": "slide-06/caption",
+              "artifactName": "wp_slide_06_caption",
+              "kind": "text",
+              "line": 140,
+              "column": 1,
+              "locator": {
+                "slide": 6,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-07",
+              "artifactName": "wp_slide_07",
+              "kind": "slide",
+              "line": 144,
+              "column": 1,
+              "locator": {
+                "slide": 7
+              }
+            },
+            {
+              "elementId": "slide-07/title",
+              "artifactName": "wp_slide_07_title",
+              "kind": "text",
+              "line": 145,
+              "column": 1,
+              "locator": {
+                "slide": 7,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-07/body",
+              "artifactName": "wp_slide_07_body",
+              "kind": "text",
+              "line": 146,
+              "column": 1,
+              "locator": {
+                "slide": 7,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-07/notes",
+              "artifactName": "wp_slide_07_notes",
+              "kind": "speaker-notes",
+              "line": 152,
+              "column": 1,
+              "locator": {
+                "slide": 7
+              }
+            },
+            {
+              "elementId": "slide-08",
+              "artifactName": "wp_slide_08",
+              "kind": "slide",
+              "line": 156,
+              "column": 1,
+              "locator": {
+                "slide": 8
+              }
+            },
+            {
+              "elementId": "slide-08/title",
+              "artifactName": "wp_slide_08_title",
+              "kind": "text",
+              "line": 157,
+              "column": 1,
+              "locator": {
+                "slide": 8,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-08/body",
+              "artifactName": "wp_slide_08_body",
+              "kind": "text",
+              "line": 158,
+              "column": 1,
+              "locator": {
+                "slide": 8,
+                "shape": 2
+              }
+            }
+          ],
+          "staticDiagnostics": [
+            {
+              "code": "EXPERT_MODE_USED",
+              "line": 29,
+              "column": 14,
+              "message": "Expert mode declared: Stress coverage requires charts, tables, notes, hyperlinks, and advanced drawing properties.",
+              "severity": "warning"
+            }
+          ]
+        },
+        "automaticValidation": {
+          "issues": [],
+          "passed": true,
+          "requestedFonts": [
+            "Arial",
+            "DejaVu Sans",
+            "Times New Roman",
+            "Wingdings",
+            "Symbol"
+          ],
+          "missingFonts": [],
+          "media": [
+            {
+              "name": "ppt/media/image1.png",
+              "width": 1536,
+              "height": 1024,
+              "format": "png"
+            }
+          ],
+          "platform": "win32",
+          "rendererMatrix": {
+            "issues": [],
+            "passed": true,
+            "policy": "required",
+            "renderers": {
+              "libreOffice": {
+                "available": true,
+                "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+                "renderer": "libreoffice",
+                "status": "passed",
+                "summary": {
+                  "pages": 8,
+                  "textCharacters": 536
+                }
+              },
+              "microsoftOffice": {
+                "available": true,
+                "renderer": "microsoft-office",
+                "status": "passed",
+                "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.microsoft.preview.pdf",
+                "summary": {
+                  "pages": 8,
+                  "textCharacters": 539
+                }
+              }
+            }
+          }
+        },
+        "workflow": {
+          "state": "render-ready",
+          "checkpointAt": "2026-08-28T09:39:00.450Z"
+        },
+        "qualityGate": {
+          "structural": true,
+          "renderers": {
+            "libreOffice": {
+              "available": true,
+              "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+              "renderer": "libreoffice",
+              "status": "passed",
+              "summary": {
+                "pages": 8,
+                "textCharacters": 536
+              }
+            },
+            "microsoftOffice": {
+              "available": true,
+              "renderer": "microsoft-office",
+              "status": "passed",
+              "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.microsoft.preview.pdf",
+              "summary": {
+                "pages": 8,
+                "textCharacters": 539
+              }
+            }
+          },
+          "microsoftOfficePolicy": "required",
+          "visual": {
+            "previewGenerated": true,
+            "modelReviewRequired": true,
+            "previewPages": [
+              1,
+              2,
+              4,
+              7,
+              8
+            ],
+            "fullReviewStatus": "pending"
+          }
+        }
+      },
+      "rendered": {
+        "artifactId": "uno_stress_20260828093823/generated/uno-stress-presentation/f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b/uno-stress-presentation.pptx",
+        "kind": "generated",
+        "fileName": "uno-stress-presentation.pptx",
+        "path": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\generated\\uno-stress-presentation\\f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b\\uno-stress-presentation.pptx",
+        "url": "/api/artifacts/uno_stress_20260828093823/generated/uno-stress-presentation/f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b/uno-stress-presentation.pptx",
+        "downloadUrl": "/api/artifacts/uno_stress_20260828093823/generated/uno-stress-presentation/f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b/uno-stress-presentation.pptx?download=1",
+        "bytes": 1899036,
+        "documentId": "uno-stress-presentation",
+        "sourceDigest": "f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b",
+        "renderedDigest": "f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b",
+        "currentRevision": 1,
+        "documentChanged": false,
+        "cacheHit": true,
+        "availableAssets": [
+          {
+            "assetName": "attachment-stress-image-office-image-fixture.png",
+            "bytes": 2005424,
+            "sha256": "cc819f532e33c3eced99c5480d3ba6943ddd5d13d80d9661c1b29f6976233a2a",
+            "origin": "attachment",
+            "ref": "stress-image",
+            "format": "png",
+            "width": 1536,
+            "height": 1024,
+            "aspectRatio": 1.5,
+            "optimized": false
+          }
+        ],
+        "generationDiagnostics": {
+          "bytes": 1899036,
+          "output": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.pptx",
+          "preview": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+          "renderer": "libreoffice-uno",
+          "verification": {
+            "issues": [],
+            "passed": true,
+            "format": "presentation",
+            "pages": 8,
+            "images": {
+              "checked": 2
+            },
+            "text": {
+              "textShapes": 25,
+              "nonEmptyTextShapes": 18,
+              "textCharacters": 458,
+              "shapeTypes": {
+                "com.sun.star.drawing.CustomShape": 21,
+                "com.sun.star.drawing.LineShape": 1,
+                "com.sun.star.drawing.GraphicObjectShape": 2,
+                "com.sun.star.drawing.TableShape": 1,
+                "com.sun.star.drawing.OLE2Shape": 1
+              }
+            },
+            "layout": {
+              "checkedTextShapes": 18,
+              "issues": [],
+              "passed": true
+            },
+            "fidelity": null
+          },
+          "elementMap": [
+            {
+              "elementId": "deck",
+              "artifactName": "wp_deck",
+              "kind": "presentation",
+              "line": 31,
+              "column": 1,
+              "locator": {
+                "role": "document"
+              }
+            },
+            {
+              "elementId": "slide-01",
+              "artifactName": "wp_slide_01",
+              "kind": "slide",
+              "line": 36,
+              "column": 1,
+              "locator": {
+                "slide": 1
+              }
+            },
+            {
+              "elementId": "slide-01/background",
+              "artifactName": "wp_slide_01_background",
+              "kind": "shape",
+              "line": 37,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-01/title",
+              "artifactName": "wp_slide_01_title",
+              "kind": "text",
+              "line": 42,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-01/subtitle",
+              "artifactName": "wp_slide_01_subtitle",
+              "kind": "text",
+              "line": 44,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-01/footer",
+              "artifactName": "wp_slide_01_footer",
+              "kind": "text",
+              "line": 45,
+              "column": 1,
+              "locator": {
+                "slide": 1,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-02",
+              "artifactName": "wp_slide_02",
+              "kind": "slide",
+              "line": 49,
+              "column": 1,
+              "locator": {
+                "slide": 2
+              }
+            },
+            {
+              "elementId": "slide-02/title",
+              "artifactName": "wp_slide_02_title",
+              "kind": "text",
+              "line": 50,
+              "column": 1,
+              "locator": {
+                "slide": 2,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-02/rich-text",
+              "artifactName": "wp_slide_02_rich_text",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-02/hyperlink",
+              "artifactName": "wp_slide_02_hyperlink",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-03",
+              "artifactName": "wp_slide_03",
+              "kind": "slide",
+              "line": 69,
+              "column": 1,
+              "locator": {
+                "slide": 3
+              }
+            },
+            {
+              "elementId": "slide-03/title",
+              "artifactName": "wp_slide_03_title",
+              "kind": "text",
+              "line": 70,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-03/rectangle",
+              "artifactName": "wp_slide_03_rectangle",
+              "kind": "shape",
+              "line": 71,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-03/ellipse",
+              "artifactName": "wp_slide_03_ellipse",
+              "kind": "shape",
+              "line": 77,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-03/connector",
+              "artifactName": "wp_slide_03_connector",
+              "kind": "shape",
+              "line": 81,
+              "column": 1,
+              "locator": {
+                "slide": 3,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-03/callout",
+              "artifactName": "wp_slide_03_callout",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-03/ellipse-label",
+              "artifactName": "wp_slide_03_ellipse_label",
+              "kind": "text",
+              "line": 24,
+              "column": 1,
+              "locator": {
+                "role": "expert-text"
+              }
+            },
+            {
+              "elementId": "slide-04",
+              "artifactName": "wp_slide_04",
+              "kind": "slide",
+              "line": 89,
+              "column": 1,
+              "locator": {
+                "slide": 4
+              }
+            },
+            {
+              "elementId": "slide-04/title",
+              "artifactName": "wp_slide_04_title",
+              "kind": "text",
+              "line": 90,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-04/image-wide",
+              "artifactName": "wp_slide_04_image_wide",
+              "kind": "image",
+              "line": 91,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-04/image-thumb",
+              "artifactName": "wp_slide_04_image_thumb",
+              "kind": "image",
+              "line": 92,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-04/caption",
+              "artifactName": "wp_slide_04_caption",
+              "kind": "text",
+              "line": 93,
+              "column": 1,
+              "locator": {
+                "slide": 4,
+                "shape": 4
+              }
+            },
+            {
+              "elementId": "slide-05",
+              "artifactName": "wp_slide_05",
+              "kind": "slide",
+              "line": 97,
+              "column": 1,
+              "locator": {
+                "slide": 5
+              }
+            },
+            {
+              "elementId": "slide-05/title",
+              "artifactName": "wp_slide_05_title",
+              "kind": "text",
+              "line": 98,
+              "column": 1,
+              "locator": {
+                "slide": 5,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-05/table",
+              "artifactName": "wp_slide_05_table",
+              "kind": "table",
+              "line": 124,
+              "column": 1,
+              "locator": {
+                "slide": 5
+              }
+            },
+            {
+              "elementId": "slide-06",
+              "artifactName": "wp_slide_06",
+              "kind": "slide",
+              "line": 128,
+              "column": 1,
+              "locator": {
+                "slide": 6
+              }
+            },
+            {
+              "elementId": "slide-06/title",
+              "artifactName": "wp_slide_06_title",
+              "kind": "text",
+              "line": 129,
+              "column": 1,
+              "locator": {
+                "slide": 6,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-06/chart",
+              "artifactName": "wp_slide_06_chart",
+              "kind": "chart",
+              "line": 134,
+              "column": 1,
+              "locator": {
+                "slide": 6
+              }
+            },
+            {
+              "elementId": "slide-06/caption",
+              "artifactName": "wp_slide_06_caption",
+              "kind": "text",
+              "line": 140,
+              "column": 1,
+              "locator": {
+                "slide": 6,
+                "shape": 3
+              }
+            },
+            {
+              "elementId": "slide-07",
+              "artifactName": "wp_slide_07",
+              "kind": "slide",
+              "line": 144,
+              "column": 1,
+              "locator": {
+                "slide": 7
+              }
+            },
+            {
+              "elementId": "slide-07/title",
+              "artifactName": "wp_slide_07_title",
+              "kind": "text",
+              "line": 145,
+              "column": 1,
+              "locator": {
+                "slide": 7,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-07/body",
+              "artifactName": "wp_slide_07_body",
+              "kind": "text",
+              "line": 146,
+              "column": 1,
+              "locator": {
+                "slide": 7,
+                "shape": 2
+              }
+            },
+            {
+              "elementId": "slide-07/notes",
+              "artifactName": "wp_slide_07_notes",
+              "kind": "speaker-notes",
+              "line": 152,
+              "column": 1,
+              "locator": {
+                "slide": 7
+              }
+            },
+            {
+              "elementId": "slide-08",
+              "artifactName": "wp_slide_08",
+              "kind": "slide",
+              "line": 156,
+              "column": 1,
+              "locator": {
+                "slide": 8
+              }
+            },
+            {
+              "elementId": "slide-08/title",
+              "artifactName": "wp_slide_08_title",
+              "kind": "text",
+              "line": 157,
+              "column": 1,
+              "locator": {
+                "slide": 8,
+                "shape": 1
+              }
+            },
+            {
+              "elementId": "slide-08/body",
+              "artifactName": "wp_slide_08_body",
+              "kind": "text",
+              "line": 158,
+              "column": 1,
+              "locator": {
+                "slide": 8,
+                "shape": 2
+              }
+            }
+          ],
+          "staticDiagnostics": [
+            {
+              "code": "EXPERT_MODE_USED",
+              "line": 29,
+              "column": 14,
+              "message": "Expert mode declared: Stress coverage requires charts, tables, notes, hyperlinks, and advanced drawing properties.",
+              "severity": "warning"
+            }
+          ]
+        },
+        "automaticValidation": {
+          "issues": [],
+          "passed": true,
+          "requestedFonts": [
+            "Arial",
+            "DejaVu Sans",
+            "Times New Roman",
+            "Wingdings",
+            "Symbol"
+          ],
+          "missingFonts": [],
+          "media": [
+            {
+              "name": "ppt/media/image1.png",
+              "width": 1536,
+              "height": 1024,
+              "format": "png"
+            }
+          ],
+          "platform": "win32",
+          "rendererMatrix": {
+            "issues": [],
+            "passed": true,
+            "policy": "required",
+            "renderers": {
+              "libreOffice": {
+                "available": true,
+                "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+                "renderer": "libreoffice",
+                "status": "passed",
+                "summary": {
+                  "pages": 8,
+                  "textCharacters": 536
+                }
+              },
+              "microsoftOffice": {
+                "available": true,
+                "renderer": "microsoft-office",
+                "status": "passed",
+                "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.microsoft.preview.pdf",
+                "summary": {
+                  "pages": 8,
+                  "textCharacters": 539
+                }
+              }
+            }
+          }
+        },
+        "workflow": {
+          "state": "qa-pending",
+          "checkpointAt": "2026-08-28T09:39:12.974Z",
+          "renderedDigest": "f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b"
+        },
+        "qualityGate": {
+          "structural": true,
+          "renderers": {
+            "libreOffice": {
+              "available": true,
+              "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.preview.pdf",
+              "renderer": "libreoffice",
+              "status": "passed",
+              "summary": {
+                "pages": 8,
+                "textCharacters": 536
+              }
+            },
+            "microsoftOffice": {
+              "available": true,
+              "renderer": "microsoft-office",
+              "status": "passed",
+              "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\document-drafts\\.uno-stress-presentation.f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b.validation.microsoft.preview.pdf",
+              "summary": {
+                "pages": 8,
+                "textCharacters": 539
+              }
+            }
+          },
+          "microsoftOfficePolicy": "required",
+          "visual": {
+            "previewGenerated": true,
+            "modelReviewRequired": true,
+            "previewPages": [
+              1,
+              2,
+              4,
+              7,
+              8
+            ],
+            "fullReviewStatus": "pending"
+          }
+        },
+        "visualVerification": {
+          "imageCount": 5,
+          "pageCount": 8,
+          "renderedPages": [
+            1,
+            2,
+            4,
+            7,
+            8
+          ],
+          "renderer": "pdf",
+          "automaticChecks": [
+            {
+              "pageNumber": 1,
+              "width": 1400,
+              "height": 787,
+              "issues": []
+            },
+            {
+              "pageNumber": 2,
+              "width": 1400,
+              "height": 787,
+              "issues": []
+            },
+            {
+              "pageNumber": 4,
+              "width": 1400,
+              "height": 787,
+              "issues": []
+            },
+            {
+              "pageNumber": 7,
+              "width": 1400,
+              "height": 787,
+              "issues": []
+            },
+            {
+              "pageNumber": 8,
+              "width": 1400,
+              "height": 787,
+              "issues": []
+            }
+          ],
+          "gateStatus": "pending-model-review",
+          "requiredCondition": "visualQaDigest === renderedDigest, every indexed page has been read, and every page has an explicit passed review"
+        }
+      },
+      "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\generated\\uno-stress-presentation\\f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b\\uno-stress-presentation.pptx",
+      "previewImages": [
+        "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\attachment-previews\\a9417019781c6b797ba95af519b5ca33e516516275e36bb3c8c2cadb60a1b6cd\\page-0001.png",
+        "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\attachment-previews\\a9417019781c6b797ba95af519b5ca33e516516275e36bb3c8c2cadb60a1b6cd\\page-0002.png",
+        "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\attachment-previews\\a9417019781c6b797ba95af519b5ca33e516516275e36bb3c8c2cadb60a1b6cd\\page-0004.png",
+        "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\attachment-previews\\a9417019781c6b797ba95af519b5ca33e516516275e36bb3c8c2cadb60a1b6cd\\page-0007.png",
+        "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828093823\\attachment-previews\\a9417019781c6b797ba95af519b5ca33e516516275e36bb3c8c2cadb60a1b6cd\\page-0008.png"
+      ],
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "reopen",
+          "message": "文档已保存，正在重新打开验证"
+        },
+        {
+          "phase": "visual",
+          "message": "结构验证完成，预览已生成"
+        },
+        {
+          "phase": "artifact-validation",
+          "message": "正在执行统一 Office、字体和嵌入图片检查"
+        },
+        {
+          "phase": "renderer-validation",
+          "message": "正在通过 LibreOffice 和 Microsoft Office 验证渲染结果"
+        },
+        {
+          "phase": "visual",
+          "message": "正在生成验证预览"
+        },
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "artifact-validation",
+          "message": "正在执行统一 Office、字体和嵌入图片检查"
+        },
+        {
+          "phase": "renderer-validation",
+          "message": "正在通过 LibreOffice 和 Microsoft Office 验证渲染结果"
+        },
+        {
+          "phase": "visual",
+          "message": "正在生成逐页预览"
+        },
+        {
+          "phase": "publish",
+          "message": "正在发布最终文件"
+        }
+      ]
+    },
+    {
+      "input": {
+        "documentId": "uno-stress-word",
+        "documentType": "word",
+        "fileName": "uno-stress-word.docx",
+        "sourceFile": "word.py"
+      },
+      "planned": {
+        "kind": "document-plan",
+        "documentId": "uno-stress-word",
+        "fileName": "uno-stress-word.docx",
+        "documentType": "word",
+        "operation": "create",
+        "generator": "uno",
+        "sourceFileName": "uno-stress-word.py",
+        "sourceCharacters": 0,
+        "workflow": {
+          "state": "planned",
+          "checkpointAt": "2026-08-28T09:39:13.029Z"
+        },
+        "availableAssets": [
+          {
+            "assetName": "attachment-stress-image-office-image-fixture.png",
+            "bytes": 2005424,
+            "sha256": "cc819f532e33c3eced99c5480d3ba6943ddd5d13d80d9661c1b29f6976233a2a",
+            "origin": "attachment",
+            "ref": "stress-image",
+            "format": "png",
+            "width": 1536,
+            "height": 1024,
+            "aspectRatio": 1.5,
+            "optimized": false
+          },
+          {
+            "assetName": "generated-uno-stress-presentation-f8963e8f29b3fbc6a9de2fbc9155a0a52471cab0e8b456dc3f286c1416accd4b-uno-stress-presentation.pptx",
+            "bytes": 1899036,
+            "sha256": "0f099e0bd604e988aba50e6727363037f1d08dd1da3107b75836c09a77fd255e",
+            "origin": "generated",
+            "format": "pptx"
+          }
+        ]
+      },
+      "generated": {
+        "kind": "uno-draft-validation",
+        "documentId": "uno-stress-word",
+        "fileName": "uno-stress-word.docx",
+        "generator": "uno",
+        "changed": true,
+        "saved": true,
+        "sourceDigest": "13f842ea28606c2854a1715455d40177b9219e3326bfe83e4342850140fb5f4d",
+        "sourceCharacters": 7952,
+        "currentRevision": null,
+        "validatedRevision": null,
+        "lastSuccessfulRevision": null,
+        "lineCount": 144,
+        "validation": "failed",
+        "requiredNextAction": "edit",
+        "diagnostics": [
+          {
+            "code": "DOCX_FLOATING_OBJECTS_REQUIRE_VISUAL_QA",
+            "message": "1 floating DrawingML object(s) were preserved. They are supported for freeform authoring but require visual confirmation because they do not participate in normal text flow.",
+            "severity": "warning",
+            "target": "word/document.xml"
+          },
+          {
+            "code": "RUNTIME_DRAWING_TEXT_OUT_OF_PAGE",
+            "column": 1,
+            "elementId": "section-06/text-frame",
+            "line": 110,
+            "locator": {
+              "section": 6
+            },
+            "message": "Drawing text object bounds x=0, y=-1506, width=7200, height=1505 extend beyond page size 21590x27940; confirm the bleed or crop is intentional.",
+            "severity": "warning"
+          },
+          {
+            "code": "CROSS_RENDERER_PAGE_COUNT_MISMATCH",
+            "message": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6.",
+            "severity": "error"
+          }
+        ],
+        "error": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6.",
+        "workflow": {
+          "state": "authoring",
+          "checkpointAt": "2026-08-28T09:40:08.878Z",
+          "error": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6."
+        }
+      },
+      "progress": [
+        {
+          "phase": "static-analysis",
+          "message": "正在检查脚本语法和确定性错误"
+        },
+        {
+          "phase": "assets",
+          "message": "正在同步文件素材"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "execute",
+          "message": "正在启动 LibreOffice"
+        },
+        {
+          "phase": "execute",
+          "message": "正在执行文档脚本"
+        },
+        {
+          "phase": "reopen",
+          "message": "文档已保存，正在重新打开验证"
+        },
+        {
+          "phase": "visual",
+          "message": "结构验证完成，预览已生成"
+        },
+        {
+          "phase": "artifact-validation",
+          "message": "正在执行统一 Office、字体和嵌入图片检查"
+        },
+        {
+          "phase": "renderer-validation",
+          "message": "正在通过 LibreOffice 和 Microsoft Office 验证渲染结果"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,710 @@
+{
+  "createdAt": "2026-08-28T09:58:03.422Z",
+  "documentId": "uno-stress-presentation",
+  "documentType": "presentation",
+  "fileName": "uno-stress-presentation.pptx",
+  "intent": "Broad deterministic UNO stress validation fixture",
+  "operation": "create",
+  "generator": "uno",
+  "workflow": {
+    "state": "completed",
+    "checkpointAt": "2026-08-28T10:07:33.428Z",
+    "renderedDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175"
+  },
+  "updatedAt": "2026-08-28T10:07:33.429Z",
+  "program": "import uno\n\n\ndef _point(x, y):\n    value = uno.createUnoStruct('com.sun.star.awt.Point')\n    value.X, value.Y = int(x), int(y)\n    return value\n\n\ndef _size(width, height):\n    value = uno.createUnoStruct('com.sun.star.awt.Size')\n    value.Width, value.Height = int(width), int(height)\n    return value\n\n\ndef _expert_text(expert, document, page, element_id, text, x, y, width, height, font_size=18):\n    shape = document.createInstance('com.sun.star.drawing.TextShape')\n    shape.Position, shape.Size = _point(x, y), _size(width, height)\n    page.add(shape)\n    shape.String = text\n    cursor = shape.Text.createTextCursor()\n    cursor.gotoEnd(True)\n    cursor.CharHeight = float(font_size)\n    expert.tag(shape, element_id, 'text', {'role': 'expert-text'})\n    return shape\n\n\ndef create_document(job):\n    expert = job.expert('Stress coverage requires charts, tables, notes, hyperlinks, and advanced drawing properties.')\n    document = expert.new_document('presentation')\n    deck = job.presentation('deck', component=document)\n    bounds = job.document_bounds(document)\n    slide_width, slide_height = bounds['width'], bounds['height']\n\n    # @webpilot-unit pages/slide-01\n    page = deck.add_slide('slide-01')\n    deck.add_shape('slide-01/background', page, 0, 0, slide_width, slide_height)\n    background = page.getByIndex(0)\n    background.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    background.FillColor = 0x0B2545\n    background.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')\n    title = deck.add_text('slide-01/title', page, 'UNO Office 全面压力验证', 1700, 2500, 24500, 3300, font_size=30, color=0xFFFFFF)\n    title.CharWeight = 150.0\n    deck.add_text('slide-01/subtitle', page, '文本 · 表格 · 图表 · 图片 · 形状 · 超链接 · 备注', 1700, 6300, 24500, 1800, font_size=17, color=0xB8D8F0)\n    deck.add_text('slide-01/footer', page, 'LibreOffice UNO → PPTX → LibreOffice / Microsoft Office', 1700, 13200, 24500, 1000, font_size=11, color=0xD7E8F5)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-02\n    page = deck.add_slide('slide-02')\n    deck.add_text('slide-02/title', page, '多语言文本与富文本属性必须稳定', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    rich = _expert_text(expert, document, page, 'slide-02/rich-text', '中文 English العربية Русский\\n粗体 · 斜体 · 下划线 · 字距', 1700, 3300, 23800, 4200, 22)\n    cursor = rich.Text.createTextCursor()\n    cursor.gotoStart(False)\n    cursor.goRight(2, True)\n    cursor.CharWeight = 150.0\n    cursor.gotoEnd(True)\n    cursor.CharColor = 0x2563EB\n    rich.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'NONE')\n    link = _expert_text(expert, document, page, 'slide-02/hyperlink', 'https://example.com/uno-validation', 1700, 9000, 15000, 1300, 15)\n    link_cursor = link.Text.createTextCursor()\n    link_cursor.gotoEnd(True)\n    link_cursor.CharColor = 0x1565C0\n    link_cursor.CharUnderline = 1\n    link.OnClick = uno.Enum('com.sun.star.presentation.ClickAction', 'DOCUMENT')\n    link.Bookmark = 'https://example.com/uno-validation'\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-03\n    page = deck.add_slide('slide-03')\n    deck.add_text('slide-03/title', page, '形状、透明度、旋转和连接线不能越界', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    rectangle = deck.add_shape('slide-03/rectangle', page, 2200, 3600, 6500, 4400)\n    rectangle.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    rectangle.FillColor = 0x2563EB\n    rectangle.FillTransparence = 18\n    rectangle.LineColor = 0x163B73\n    rectangle.RotateAngle = 700\n    ellipse = deck.add_shape('slide-03/ellipse', page, 10700, 3600, 5200, 5200, service='com.sun.star.drawing.EllipseShape')\n    ellipse.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    ellipse.FillColor = 0x10B981\n    ellipse.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')\n    line = deck.add_shape('slide-03/connector', page, 7800, 5200, 4300, 900, service='com.sun.star.drawing.LineShape')\n    line.LineColor = 0xF59E0B\n    line.LineWidth = 120\n    _expert_text(expert, document, page, 'slide-03/callout', '旋转 7°', 2300, 8500, 6200, 1200, 15)\n    _expert_text(expert, document, page, 'slide-03/ellipse-label', '圆形', 11300, 9000, 4000, 1200, 15)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-04\n    page = deck.add_slide('slide-04')\n    deck.add_text('slide-04/title', page, '图片在两种缩放比例下保持清晰', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    deck.add_image('slide-04/image-wide', page, 'attachment-stress-image-office-image-fixture.png', 1600, 3100, 15800, 9000)\n    deck.add_image('slide-04/image-thumb', page, 'attachment-stress-image-office-image-fixture.png', 19400, 4700, 6500, 4300)\n    deck.add_text('slide-04/caption', page, '同一素材用于验证大图、缩略图和 PPTX 媒体关系。', 1600, 12800, 24000, 1100, font_size=14, color=0x334155)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-05\n    page = deck.add_slide('slide-05')\n    deck.add_text('slide-05/title', page, '原生表格必须可以编辑并完整序列化', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    table_shape = document.createInstance('com.sun.star.drawing.TableShape')\n    table_shape.Position, table_shape.Size = _point(2200, 3500), _size(23500, 7200)\n    page.add(table_shape)\n    table = table_shape.Model\n    values = [\n        ['维度', 'LibreOffice', 'Microsoft Office'],\n        ['结构', 'OOXML 重开', 'COM 重开'],\n        ['版式', 'PDF 渲染', 'PDF 渲染'],\n        ['结论', '必须通过', '必须通过'],\n    ]\n    desired_rows, desired_columns = len(values), len(values[0])\n    if table.Rows.Count < desired_rows:\n        table.Rows.insertByIndex(table.Rows.Count, desired_rows - table.Rows.Count)\n    if table.Columns.Count < desired_columns:\n        table.Columns.insertByIndex(table.Columns.Count, desired_columns - table.Columns.Count)\n    column_width = int(table_shape.Size.Width / desired_columns)\n    row_height = int(table_shape.Size.Height / desired_rows)\n    for column_index in range(desired_columns):\n        table.Columns.getByIndex(column_index).Width = column_width\n    for row_index in range(desired_rows):\n        table.Rows.getByIndex(row_index).Height = row_height\n    for row_index, row_values in enumerate(values):\n        for column_index, value in enumerate(row_values):\n            cell = table.getCellByPosition(column_index, row_index)\n            cell.String = value\n            cell_cursor = cell.createTextCursor()\n            cell_cursor.gotoEnd(True)\n            cell_cursor.CharHeight = 14\n            if row_index == 0:\n                cell_cursor.CharWeight = 150.0\n                cell.FillColor = 0xDCEAF7\n    expert.tag(table_shape, 'slide-05/table', 'table', {'slide': 5})\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-06\n    page = deck.add_slide('slide-06')\n    deck.add_text('slide-06/title', page, '原生图表对象验证嵌入关系和跨渲染器兼容性', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    chart = document.createInstance('com.sun.star.drawing.OLE2Shape')\n    chart.CLSID = '12DCAE26-281F-416F-A234-C3086127382E'\n    chart.Position, chart.Size = _point(2700, 3300), _size(22500, 9000)\n    page.add(chart)\n    expert.tag(chart, 'slide-06/chart', 'chart', {'slide': 6})\n    chart.Model.createDefaultChart()\n    chart_data = chart.Model.Data\n    chart_data.setData(((18.0, 24.0, 31.0), (14.0, 22.0, 29.0)))\n    chart_data.setRowDescriptions(('2025', '2026'))\n    chart_data.setColumnDescriptions(('Q1', 'Q2', 'Q3'))\n    deck.add_text('slide-06/caption', page, '默认 Chart2 数据用于验证可编辑图表对象，而不是位图替代。', 2700, 12900, 22000, 1000, font_size=13, color=0x475569)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-07\n    page = deck.add_slide('slide-07')\n    deck.add_text('slide-07/title', page, '演讲者备注必须保留', 1500, 700, 25000, 1800, font_size=25, color=0x0B2545)\n    deck.add_text('slide-07/body', page, '此页包含 Notes Page 文本，用于验证备注关系和序列化。', 2200, 4500, 22000, 2600, font_size=22, color=0x334155)\n    notes_page = page.getNotesPage()\n    notes = document.createInstance('com.sun.star.drawing.TextShape')\n    notes.Position, notes.Size = _point(1200, 1200), _size(18000, 3500)\n    notes_page.add(notes)\n    notes.String = 'Speaker notes: explain the deterministic validation sequence and known limitations.'\n    expert.tag(notes, 'slide-07/notes', 'speaker-notes', {'slide': 7})\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/slide-08\n    page = deck.add_slide('slide-08')\n    deck.add_text('slide-08/title', page, '验证结论必须来自结构、渲染和逐页视觉检查', 1500, 900, 25000, 2200, font_size=25, color=0x0B2545)\n    deck.add_text('slide-08/body', page, '结构通过 ≠ 版式正确\\nLibreOffice 通过 ≠ Microsoft Office 一致\\n视觉通过 ≠ 所有交互对象语义完整', 2500, 4200, 22500, 6000, font_size=22, color=0x1F2937)\n    # @webpilot-endunit\n\n    deck.save()\n    deck.close()",
+  "validationStatus": "passed",
+  "validationDiagnostics": [
+    {
+      "code": "RAW_UNO_SERVICE",
+      "line": 17,
+      "column": 13,
+      "message": "Raw UNO service creation is high risk; declare expert mode and tag the created object.",
+      "severity": "warning"
+    },
+    {
+      "code": "EXPERT_MODE_USED",
+      "line": 29,
+      "column": 14,
+      "message": "Expert mode declared: Stress coverage requires charts, tables, notes, hyperlinks, and advanced drawing properties.",
+      "severity": "warning"
+    },
+    {
+      "code": "RAW_UNO_SERVICE",
+      "line": 99,
+      "column": 19,
+      "message": "Raw UNO service creation is high risk; declare expert mode and tag the created object.",
+      "severity": "warning",
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "code": "HIGH_RISK_LAYOUT_PROPERTY",
+      "line": 117,
+      "column": 9,
+      "message": "Direct assignment to Width can cause clipping or overlap; confirm geometry and tag the element.",
+      "severity": "warning",
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "code": "HIGH_RISK_LAYOUT_PROPERTY",
+      "line": 119,
+      "column": 9,
+      "message": "Direct assignment to Height can cause clipping or overlap; confirm geometry and tag the element.",
+      "severity": "warning",
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "code": "RAW_UNO_SERVICE",
+      "line": 136,
+      "column": 13,
+      "message": "Raw UNO service creation is high risk; declare expert mode and tag the created object.",
+      "severity": "warning",
+      "unitPath": "pages/slide-06"
+    },
+    {
+      "code": "RAW_UNO_SERVICE",
+      "line": 154,
+      "column": 13,
+      "message": "Raw UNO service creation is high risk; declare expert mode and tag the created object.",
+      "severity": "warning",
+      "unitPath": "pages/slide-07"
+    }
+  ],
+  "validatedSourceDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+  "elementMap": [
+    {
+      "elementId": "deck",
+      "artifactName": "wp_deck",
+      "kind": "presentation",
+      "line": 31,
+      "column": 1,
+      "locator": {
+        "role": "document"
+      }
+    },
+    {
+      "elementId": "slide-01",
+      "artifactName": "wp_slide_01",
+      "kind": "slide",
+      "line": 36,
+      "column": 1,
+      "locator": {
+        "slide": 1
+      },
+      "unitPath": "pages/slide-01"
+    },
+    {
+      "elementId": "slide-01/background",
+      "artifactName": "wp_slide_01_background",
+      "kind": "shape",
+      "line": 37,
+      "column": 1,
+      "locator": {
+        "slide": 1,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-01"
+    },
+    {
+      "elementId": "slide-01/title",
+      "artifactName": "wp_slide_01_title",
+      "kind": "text",
+      "line": 42,
+      "column": 1,
+      "locator": {
+        "slide": 1,
+        "shape": 2
+      },
+      "unitPath": "pages/slide-01"
+    },
+    {
+      "elementId": "slide-01/subtitle",
+      "artifactName": "wp_slide_01_subtitle",
+      "kind": "text",
+      "line": 44,
+      "column": 1,
+      "locator": {
+        "slide": 1,
+        "shape": 3
+      },
+      "unitPath": "pages/slide-01"
+    },
+    {
+      "elementId": "slide-01/footer",
+      "artifactName": "wp_slide_01_footer",
+      "kind": "text",
+      "line": 45,
+      "column": 1,
+      "locator": {
+        "slide": 1,
+        "shape": 4
+      },
+      "unitPath": "pages/slide-01"
+    },
+    {
+      "elementId": "slide-02",
+      "artifactName": "wp_slide_02",
+      "kind": "slide",
+      "line": 49,
+      "column": 1,
+      "locator": {
+        "slide": 2
+      },
+      "unitPath": "pages/slide-02"
+    },
+    {
+      "elementId": "slide-02/title",
+      "artifactName": "wp_slide_02_title",
+      "kind": "text",
+      "line": 50,
+      "column": 1,
+      "locator": {
+        "slide": 2,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-02"
+    },
+    {
+      "elementId": "slide-02/rich-text",
+      "artifactName": "wp_slide_02_rich_text",
+      "kind": "text",
+      "line": 24,
+      "column": 1,
+      "locator": {
+        "role": "expert-text"
+      }
+    },
+    {
+      "elementId": "slide-02/hyperlink",
+      "artifactName": "wp_slide_02_hyperlink",
+      "kind": "text",
+      "line": 24,
+      "column": 1,
+      "locator": {
+        "role": "expert-text"
+      }
+    },
+    {
+      "elementId": "slide-03",
+      "artifactName": "wp_slide_03",
+      "kind": "slide",
+      "line": 69,
+      "column": 1,
+      "locator": {
+        "slide": 3
+      },
+      "unitPath": "pages/slide-03"
+    },
+    {
+      "elementId": "slide-03/title",
+      "artifactName": "wp_slide_03_title",
+      "kind": "text",
+      "line": 70,
+      "column": 1,
+      "locator": {
+        "slide": 3,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-03"
+    },
+    {
+      "elementId": "slide-03/rectangle",
+      "artifactName": "wp_slide_03_rectangle",
+      "kind": "shape",
+      "line": 71,
+      "column": 1,
+      "locator": {
+        "slide": 3,
+        "shape": 2
+      },
+      "unitPath": "pages/slide-03"
+    },
+    {
+      "elementId": "slide-03/ellipse",
+      "artifactName": "wp_slide_03_ellipse",
+      "kind": "shape",
+      "line": 77,
+      "column": 1,
+      "locator": {
+        "slide": 3,
+        "shape": 3
+      },
+      "unitPath": "pages/slide-03"
+    },
+    {
+      "elementId": "slide-03/connector",
+      "artifactName": "wp_slide_03_connector",
+      "kind": "shape",
+      "line": 81,
+      "column": 1,
+      "locator": {
+        "slide": 3,
+        "shape": 4
+      },
+      "unitPath": "pages/slide-03"
+    },
+    {
+      "elementId": "slide-03/callout",
+      "artifactName": "wp_slide_03_callout",
+      "kind": "text",
+      "line": 24,
+      "column": 1,
+      "locator": {
+        "role": "expert-text"
+      }
+    },
+    {
+      "elementId": "slide-03/ellipse-label",
+      "artifactName": "wp_slide_03_ellipse_label",
+      "kind": "text",
+      "line": 24,
+      "column": 1,
+      "locator": {
+        "role": "expert-text"
+      }
+    },
+    {
+      "elementId": "slide-04",
+      "artifactName": "wp_slide_04",
+      "kind": "slide",
+      "line": 89,
+      "column": 1,
+      "locator": {
+        "slide": 4
+      },
+      "unitPath": "pages/slide-04"
+    },
+    {
+      "elementId": "slide-04/title",
+      "artifactName": "wp_slide_04_title",
+      "kind": "text",
+      "line": 90,
+      "column": 1,
+      "locator": {
+        "slide": 4,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-04"
+    },
+    {
+      "elementId": "slide-04/image-wide",
+      "artifactName": "wp_slide_04_image_wide",
+      "kind": "image",
+      "line": 91,
+      "column": 1,
+      "locator": {
+        "slide": 4,
+        "shape": 2
+      },
+      "unitPath": "pages/slide-04"
+    },
+    {
+      "elementId": "slide-04/image-thumb",
+      "artifactName": "wp_slide_04_image_thumb",
+      "kind": "image",
+      "line": 92,
+      "column": 1,
+      "locator": {
+        "slide": 4,
+        "shape": 3
+      },
+      "unitPath": "pages/slide-04"
+    },
+    {
+      "elementId": "slide-04/caption",
+      "artifactName": "wp_slide_04_caption",
+      "kind": "text",
+      "line": 93,
+      "column": 1,
+      "locator": {
+        "slide": 4,
+        "shape": 4
+      },
+      "unitPath": "pages/slide-04"
+    },
+    {
+      "elementId": "slide-05",
+      "artifactName": "wp_slide_05",
+      "kind": "slide",
+      "line": 97,
+      "column": 1,
+      "locator": {
+        "slide": 5
+      },
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "elementId": "slide-05/title",
+      "artifactName": "wp_slide_05_title",
+      "kind": "text",
+      "line": 98,
+      "column": 1,
+      "locator": {
+        "slide": 5,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "elementId": "slide-05/table",
+      "artifactName": "wp_slide_05_table",
+      "kind": "table",
+      "line": 130,
+      "column": 1,
+      "locator": {
+        "slide": 5
+      },
+      "unitPath": "pages/slide-05"
+    },
+    {
+      "elementId": "slide-06",
+      "artifactName": "wp_slide_06",
+      "kind": "slide",
+      "line": 134,
+      "column": 1,
+      "locator": {
+        "slide": 6
+      },
+      "unitPath": "pages/slide-06"
+    },
+    {
+      "elementId": "slide-06/title",
+      "artifactName": "wp_slide_06_title",
+      "kind": "text",
+      "line": 135,
+      "column": 1,
+      "locator": {
+        "slide": 6,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-06"
+    },
+    {
+      "elementId": "slide-06/chart",
+      "artifactName": "wp_slide_06_chart",
+      "kind": "chart",
+      "line": 140,
+      "column": 1,
+      "locator": {
+        "slide": 6
+      },
+      "unitPath": "pages/slide-06"
+    },
+    {
+      "elementId": "slide-06/caption",
+      "artifactName": "wp_slide_06_caption",
+      "kind": "text",
+      "line": 146,
+      "column": 1,
+      "locator": {
+        "slide": 6,
+        "shape": 3
+      },
+      "unitPath": "pages/slide-06"
+    },
+    {
+      "elementId": "slide-07",
+      "artifactName": "wp_slide_07",
+      "kind": "slide",
+      "line": 150,
+      "column": 1,
+      "locator": {
+        "slide": 7
+      },
+      "unitPath": "pages/slide-07"
+    },
+    {
+      "elementId": "slide-07/title",
+      "artifactName": "wp_slide_07_title",
+      "kind": "text",
+      "line": 151,
+      "column": 1,
+      "locator": {
+        "slide": 7,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-07"
+    },
+    {
+      "elementId": "slide-07/body",
+      "artifactName": "wp_slide_07_body",
+      "kind": "text",
+      "line": 152,
+      "column": 1,
+      "locator": {
+        "slide": 7,
+        "shape": 2
+      },
+      "unitPath": "pages/slide-07"
+    },
+    {
+      "elementId": "slide-07/notes",
+      "artifactName": "wp_slide_07_notes",
+      "kind": "speaker-notes",
+      "line": 158,
+      "column": 1,
+      "locator": {
+        "slide": 7
+      },
+      "unitPath": "pages/slide-07"
+    },
+    {
+      "elementId": "slide-08",
+      "artifactName": "wp_slide_08",
+      "kind": "slide",
+      "line": 162,
+      "column": 1,
+      "locator": {
+        "slide": 8
+      },
+      "unitPath": "pages/slide-08"
+    },
+    {
+      "elementId": "slide-08/title",
+      "artifactName": "wp_slide_08_title",
+      "kind": "text",
+      "line": 163,
+      "column": 1,
+      "locator": {
+        "slide": 8,
+        "shape": 1
+      },
+      "unitPath": "pages/slide-08"
+    },
+    {
+      "elementId": "slide-08/body",
+      "artifactName": "wp_slide_08_body",
+      "kind": "text",
+      "line": 164,
+      "column": 1,
+      "locator": {
+        "slide": 8,
+        "shape": 2
+      },
+      "unitPath": "pages/slide-08"
+    }
+  ],
+  "rendererValidation": {
+    "issues": [],
+    "passed": true,
+    "policy": "required",
+    "renderers": {
+      "libreOffice": {
+        "available": true,
+        "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828095803\\document-drafts\\.uno-stress-presentation.ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175.validation.preview.pdf",
+        "renderer": "libreoffice",
+        "status": "passed",
+        "summary": {
+          "pages": 8,
+          "textCharacters": 563
+        }
+      },
+      "microsoftOffice": {
+        "available": true,
+        "renderer": "microsoft-office",
+        "status": "passed",
+        "outputPath": "C:\\Users\\chenjf\\Desktop\\test2\\web-app-test\\validation\\uno-stress\\artifacts\\uno_stress_20260828095803\\document-drafts\\.uno-stress-presentation.ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175.validation.microsoft.preview.pdf",
+        "summary": {
+          "pages": 8,
+          "textCharacters": 563
+        }
+      }
+    }
+  },
+  "sourceUnits": [
+    {
+      "path": "pages/slide-01",
+      "sourceDigest": "26303c56d2765fd4ba9ebce21ddb7039c20cece60881f85d1e31eb4df6f9a2a1",
+      "validatedDigest": "26303c56d2765fd4ba9ebce21ddb7039c20cece60881f85d1e31eb4df6f9a2a1",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-02",
+      "sourceDigest": "44bf61d8bdc54fff10d70ed21d5b3679fa95a50ae15fada38832a8fc5846ad74",
+      "validatedDigest": "44bf61d8bdc54fff10d70ed21d5b3679fa95a50ae15fada38832a8fc5846ad74",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-03",
+      "sourceDigest": "395a77dd27b5be0f45724173556357bed5b27e246f5cfd9ddbeb6ebcc733dfb5",
+      "validatedDigest": "395a77dd27b5be0f45724173556357bed5b27e246f5cfd9ddbeb6ebcc733dfb5",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-04",
+      "sourceDigest": "0706c264a9516ef8c2a15857e2ddd41e258271d1d97b7615c893de52c92efdda",
+      "validatedDigest": "0706c264a9516ef8c2a15857e2ddd41e258271d1d97b7615c893de52c92efdda",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-05",
+      "sourceDigest": "0cfdbc9bea4f19c9f6140f5b44797e794e73d69f52d778c88b3e589ed8432796",
+      "validatedDigest": "0cfdbc9bea4f19c9f6140f5b44797e794e73d69f52d778c88b3e589ed8432796",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-06",
+      "sourceDigest": "97ac52fcd589b0354b7c4dccf3b8b5c1f68e74e727c1e8b1ceac58f94750c0cf",
+      "validatedDigest": "97ac52fcd589b0354b7c4dccf3b8b5c1f68e74e727c1e8b1ceac58f94750c0cf",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-07",
+      "sourceDigest": "a5b13e0542e9744c0adc2fdd535c8362bd1081932a34dfb51a879c1bbf101ea9",
+      "validatedDigest": "a5b13e0542e9744c0adc2fdd535c8362bd1081932a34dfb51a879c1bbf101ea9",
+      "status": "passed"
+    },
+    {
+      "path": "pages/slide-08",
+      "sourceDigest": "b1205642a10f198343dc819af4cba6b2c05fcb74e5da70d3d8974e17919422fb",
+      "validatedDigest": "b1205642a10f198343dc819af4cba6b2c05fcb74e5da70d3d8974e17919422fb",
+      "status": "passed"
+    }
+  ],
+  "sourceDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+  "currentRevision": 1,
+  "revisions": [
+    {
+      "revision": 1,
+      "sourceDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+      "createdAt": "2026-08-28T09:58:45.177Z",
+      "sourceFileName": "000001.py"
+    }
+  ],
+  "validatedRevision": 1,
+  "renderedDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+  "renderedArtifactId": "uno_stress_20260828095803/generated/uno-stress-presentation/ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175/uno-stress-presentation.pptx",
+  "renderedFileName": "uno-stress-presentation.pptx",
+  "renderedSourceDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+  "visualQaSeenPages": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "visualQaReviews": [
+    {
+      "pageNumber": 1,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 2,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 3,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 4,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 5,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 6,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 7,
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "pageNumber": 8,
+      "status": "passed",
+      "issues": []
+    }
+  ],
+  "visualQaPageDigests": [
+    {
+      "pageNumber": 1,
+      "screenshotDigest": "008eac8066eafe04740ed92b1834973df421528f1db8bd2345a74fe19add5d16"
+    },
+    {
+      "pageNumber": 2,
+      "screenshotDigest": "96006f8a6328350f2e5360c40e2701fb2fcc95aa71cc45985a22b2c4a16f2dfe"
+    },
+    {
+      "pageNumber": 3,
+      "screenshotDigest": "a86e8c2a08d8bed73629861cd1a5e903908c6891cf2ecdd235f7e614fb3ef186"
+    },
+    {
+      "pageNumber": 4,
+      "screenshotDigest": "dc875441177a1d39336993b3865cfc87e7c93b5c697021377b29f96397cc90db"
+    },
+    {
+      "pageNumber": 5,
+      "screenshotDigest": "8cba5b8f69152f1f2831451a0167f0107067ac5ac2dfd0139ebbcbb37b7ec740"
+    },
+    {
+      "pageNumber": 6,
+      "screenshotDigest": "986865b2cf7b0580116d80d5b987fccc5b99724ad3584b8e07c5c2a5f32456f1"
+    },
+    {
+      "pageNumber": 7,
+      "screenshotDigest": "42b156e907201f504a8a0fcfc3d3d549ef5a7a8960ac7776e6cf52a4053338c2"
+    },
+    {
+      "pageNumber": 8,
+      "screenshotDigest": "8691bd1db85b9779b63aabaa49f3659183e8f16bd7f934ac23d72dce060dcd6b"
+    }
+  ],
+  "visualQaArtifactId": "uno_stress_20260828095803/generated/uno-stress-presentation/ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175/uno-stress-presentation.pptx",
+  "visualQaPageCount": 8,
+  "visualQaDigest": "ffdb2eeeee1dc03c1694410434366fc413749693aafe18026acd02b8adccd175",
+  "visualQaReviewCache": [
+    {
+      "screenshotDigest": "008eac8066eafe04740ed92b1834973df421528f1db8bd2345a74fe19add5d16",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "96006f8a6328350f2e5360c40e2701fb2fcc95aa71cc45985a22b2c4a16f2dfe",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "a86e8c2a08d8bed73629861cd1a5e903908c6891cf2ecdd235f7e614fb3ef186",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "dc875441177a1d39336993b3865cfc87e7c93b5c697021377b29f96397cc90db",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "8cba5b8f69152f1f2831451a0167f0107067ac5ac2dfd0139ebbcbb37b7ec740",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "986865b2cf7b0580116d80d5b987fccc5b99724ad3584b8e07c5c2a5f32456f1",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "42b156e907201f504a8a0fcfc3d3d549ef5a7a8960ac7776e6cf52a4053338c2",
+      "status": "passed",
+      "issues": []
+    },
+    {
+      "screenshotDigest": "8691bd1db85b9779b63aabaa49f3659183e8f16bd7f934ac23d72dce060dcd6b",
+      "status": "passed",
+      "issues": []
+    }
+  ]
+}

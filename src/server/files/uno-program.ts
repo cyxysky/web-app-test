@@ -21,7 +21,7 @@ export type UnoGeneratedDocument = {
   report: Record<string, unknown>;
 };
 
-export type UnoApiTarget = 'all' | 'document' | 'page' | 'text' | 'sheet' | 'cell' | 'shape';
+export type UnoApiTarget = 'all' | 'document' | 'page' | 'text' | 'cursor' | 'sheet' | 'cell' | 'shape' | 'table' | 'table-column' | 'table-row' | 'chart' | 'chart-data';
 
 /**
  * This intentionally validates only the public program contract. It does not
@@ -130,6 +130,8 @@ function runWorker(input: {
         ...process.env,
         PATH: [input.libreOfficeProgramDirectory, process.env.PATH].filter(Boolean).join(path.delimiter),
         PYTHONPATH: [input.libreOfficeProgramDirectory, existingPythonPath].filter(Boolean).join(path.delimiter),
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,

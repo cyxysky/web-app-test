@@ -10783,10 +10783,11 @@ export function BrowserChatWorkspace({
                 const displayTitle = sessionDisplayTitle(item);
                 const titleParts = sessionTitleParts(item);
                 const active = (loadingSessionId || session?.id || requestedSessionId) === item.id;
+                const running = isBrowserChatSessionRunning(item);
                   return (
                     <WorkspaceSidebarArchiveRow
                       active={active}
-                      ariaLabel={displayTitle}
+                      ariaLabel={running ? `${displayTitle}，${t('AI 正在处理')}` : displayTitle}
                       collapsed={sidebarCollapsed}
                       collapsedAction={(
                         <button
@@ -10801,6 +10802,7 @@ export function BrowserChatWorkspace({
                         </button>
                       )}
                       collapsedIcon={<MessageSquare size={17} />}
+                      cornerStatus={running ? <Loader2 className="spin" size={8} /> : undefined}
                       disabled={Boolean(loadingSessionId && loadingSessionId !== item.id)}
                       expandedAction={(
                         <WorkspaceOverflowMenu
@@ -10822,10 +10824,12 @@ export function BrowserChatWorkspace({
                           </button>
                         </WorkspaceOverflowMenu>
                       )}
-                      expandedIcon={titleParts.fileName
-                        ? <FileText aria-hidden="true" size={16} />
-                        : undefined}
-                      iconTone={active ? 'accent' : 'muted'}
+                      expandedIcon={running
+                        ? <Loader2 aria-label={t('AI 正在处理')} className="spin" role="status" size={16} />
+                        : titleParts.fileName
+                          ? <FileText aria-hidden="true" size={16} />
+                          : undefined}
+                      iconTone={running ? 'running' : active ? 'accent' : 'muted'}
                       meta={sessionSidebarTime(item, language)}
                       onOpen={() => {
                         setMobileHistoryOpen(false);

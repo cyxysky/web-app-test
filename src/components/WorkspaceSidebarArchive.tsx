@@ -195,6 +195,7 @@ type WorkspaceSidebarArchiveRowProps = {
   collapsed: boolean;
   collapsedAction?: ReactNode;
   collapsedIcon: ReactNode;
+  cornerStatus?: ReactNode;
   disabled?: boolean;
   expandedAction?: ReactNode;
   expandedIcon?: ReactNode;
@@ -214,6 +215,7 @@ export function WorkspaceSidebarArchiveRow({
   collapsed,
   collapsedAction,
   collapsedIcon,
+  cornerStatus,
   disabled = false,
   expandedAction,
   expandedIcon,
@@ -259,6 +261,11 @@ export function WorkspaceSidebarArchiveRow({
         <span className="workspace-sidebar-archive-row-title">{title}</span>
         {meta ? <span className="workspace-sidebar-archive-row-meta">{meta}</span> : null}
       </button>
+      {cornerStatus ? (
+        <span aria-hidden="true" className="workspace-sidebar-archive-row-corner-status">
+          {cornerStatus}
+        </span>
+      ) : null}
       {visibleAction ? (
         <span className="workspace-sidebar-archive-row-action">{visibleAction}</span>
       ) : null}

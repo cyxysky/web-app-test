@@ -59,15 +59,6 @@
   padding: 0 0 16px;
 }
 
-.browser-chat-tool-failure-summary {
-  background: color-mix(in srgb, var(--danger) 9%, var(--panel));
-  border-bottom: 1px solid color-mix(in srgb, var(--danger) 24%, var(--border));
-  color: var(--foreground);
-  font-size: 13px;
-  line-height: 1.5;
-  padding: 11px 24px;
-}
-
 .browser-chat-tool-detail-section {
   background: transparent;
   border: 0;

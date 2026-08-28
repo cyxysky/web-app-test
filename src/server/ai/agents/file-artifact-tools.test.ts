@@ -16,6 +16,7 @@ import {
   pendingOfficeDocumentWork,
   planFileArtifact,
   readUnoDraft,
+  recordOfficeVisualQaProgress,
   renderFileArtifact,
   syncDocumentAssets,
   verifyCurrentUnoRenderedArtifact,
@@ -785,6 +786,76 @@ test('does not require visual QA when the active model cannot inspect images', a
       { requireVisualQa: false },
     );
     assert.deepEqual(textModelPending, []);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('does not complete visual QA when any fully read page has a failed review', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-visual-qa-failed-page-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  process.env.ARTIFACTS_DIR = root;
+  try {
+    await planFileArtifact({
+      documentId: 'visual-review', documentType: 'word', fileName: 'report.docx', runId: 'chat_test',
+    });
+    const draftsDir = path.join(root, 'chat_test', 'document-drafts');
+    const metadataPath = path.join(draftsDir, 'visual-review.json');
+    const draft = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
+    const digest = createHash('sha256').update(wordProgram).digest('hex');
+    const artifactId = `chat_test/generated/visual-review/${digest}/report.docx`;
+    await writeFile(path.join(draftsDir, 'visual-review.py'), wordProgram, 'utf8');
+    await writeFile(metadataPath, JSON.stringify({
+      ...draft,
+      program: wordProgram,
+      renderedArtifactId: artifactId,
+      renderedDigest: digest,
+      renderedSourceDigest: digest,
+      sourceDigest: digest,
+      workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString(), renderedDigest: digest },
+    }), 'utf8');
+
+    const readResult = await recordOfficeVisualQaProgress({
+      action: 'read',
+      artifactId,
+      runId: 'chat_test',
+      result: {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'file-visual-read',
+          screenshotCount: 2,
+          screenshots: [
+            { pageNumber: 1, screenshotDigest: 'a'.repeat(64) },
+            { pageNumber: 2, screenshotDigest: 'b'.repeat(64) },
+          ],
+        }),
+      },
+    });
+    assert.equal(readResult.ok, true, readResult.actual);
+    const reportResult = await recordOfficeVisualQaProgress({
+      action: 'report',
+      artifactId,
+      runId: 'chat_test',
+      result: {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'file-visual-report',
+          reviews: [
+            { pageNumber: 1, status: 'passed', issues: [] },
+            { pageNumber: 2, status: 'failed', issues: [{ type: 'overlap', description: 'Text overlaps the footer.' }] },
+          ],
+        }),
+      },
+    });
+    assert.equal(reportResult.ok, true, reportResult.actual);
+    const resultPayload = JSON.parse(reportResult.actual || '{}') as { visualQa?: { complete?: boolean; visualQaDigest?: string | null } };
+    assert.equal(resultPayload.visualQa?.complete, false);
+    assert.equal(resultPayload.visualQa?.visualQaDigest, null);
+    const saved = JSON.parse(await readFile(metadataPath, 'utf8')) as { visualQaDigest?: string; workflow?: { state?: string } };
+    assert.equal(saved.visualQaDigest, undefined);
+    assert.equal(saved.workflow?.state, 'qa-pending');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;

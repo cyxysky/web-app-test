@@ -1,0 +1,74 @@
+{
+  "createdAt": "2026-08-28T09:39:13.029Z",
+  "documentId": "uno-stress-word",
+  "documentType": "word",
+  "fileName": "uno-stress-word.docx",
+  "intent": "Broad deterministic UNO stress validation fixture",
+  "operation": "create",
+  "generator": "uno",
+  "workflow": {
+    "state": "authoring",
+    "checkpointAt": "2026-08-28T09:40:08.878Z",
+    "error": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6."
+  },
+  "updatedAt": "2026-08-28T09:40:08.878Z",
+  "program": "import uno\n\n\ndef _append_rich_paragraph(expert, document):\n    text = document.Text\n    cursor = text.createTextCursor()\n    cursor.gotoEnd(False)\n    bookmark = document.createInstance('com.sun.star.text.Bookmark')\n    expert.tag(bookmark, 'section-02/rich-text', 'paragraph-marker', {'section': 2})\n    text.insertTextContent(cursor, bookmark, False)\n    cursor.CharHeight = 12\n    cursor.CharWeight = 150.0\n    text.insertString(cursor, '粗体 Bold  ', False)\n    cursor.CharWeight = 100.0\n    cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC')\n    cursor.CharColor = 0x2563EB\n    text.insertString(cursor, '斜体 Italic  ', False)\n    cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'NONE')\n    cursor.CharUnderline = 1\n    cursor.HyperLinkURL = 'https://example.com/uno-validation'\n    text.insertString(cursor, '可点击超链接', False)\n    cursor.HyperLinkURL = ''\n    cursor.CharUnderline = 0\n    text.insertControlCharacter(cursor, uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK'), False)\n\n\ndef _append_footnote_and_annotation(expert, document):\n    text = document.Text\n    cursor = text.createTextCursor()\n    cursor.gotoEnd(False)\n    text.insertString(cursor, '脚注与批注锚点', False)\n    footnote_marker = document.createInstance('com.sun.star.text.Bookmark')\n    expert.tag(footnote_marker, 'section-05/footnote-marker', 'footnote-marker', {'section': 5})\n    text.insertTextContent(cursor, footnote_marker, False)\n    footnote = document.createInstance('com.sun.star.text.Footnote')\n    text.insertTextContent(cursor, footnote, False)\n    footnote.Label = '1'\n    footnote.Text.String = '这是通过原生 UNO 创建的脚注内容。'\n    text.insertString(cursor, '，后面继续正文。', False)\n    annotation_marker = document.createInstance('com.sun.star.text.Bookmark')\n    expert.tag(annotation_marker, 'section-05/annotation-marker', 'annotation-marker', {'section': 5})\n    text.insertTextContent(cursor, annotation_marker, False)\n    annotation = document.createInstance('com.sun.star.text.TextField.Annotation')\n    annotation.Author = 'WebPilot UNO validation'\n    annotation.Content = '批注结构测试：此对象通常不会出现在 PDF 中。'\n    text.insertTextContent(cursor, annotation, False)\n    text.insertControlCharacter(cursor, uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK'), False)\n\n\ndef create_document(job):\n    expert = job.expert('Stress coverage requires rich text, hyperlinks, footnotes, annotations, frames, and drawing objects.')\n    document = expert.new_document('writer')\n    layout = job.writer('document', component=document)\n    layout.set_page('page-style', width=21590, height=27940, margins=(2540, 2540, 2200, 2200))\n    layout.set_header_footer(\n        header='UNO Writer 全面压力验证',\n        footer='结构 + 双渲染器 + 逐页视觉检查',\n        header_element_id='header',\n        footer_element_id='footer',\n    )\n\n    # @webpilot-unit pages/page-01\n    layout.add_heading('cover/title', 'UNO Writer 全面压力验证', level=1, color=0x0B2545, align='CENTER')\n    layout.add_paragraph('cover/subtitle', '覆盖常见正文、复杂对象和高风险版式边界', font_size=14, color=0x475569, align='CENTER', space_after=420)\n    layout.add_paragraph('cover/meta', 'DOCX · LibreOffice Writer · Microsoft Word · 2026-08-28', font_size=10, color=0x64748B, align='CENTER')\n    layout.add_page_break('page-break-02')\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/page-02\n    layout.add_heading('section-01/title', '1. 标题、正文、段落间距与多语言', level=1, color=0x0B2545)\n    layout.add_paragraph('section-01/body', '这是一段用于验证自动换行、行距和分页的正文。English text verifies Latin metrics; العربية and Русский verify mixed-script fallback. Emoji: ✓ ★ ⚠.', font_size=11, line_spacing=1.25, space_after=180)\n    layout.add_heading('section-01/h2', '1.1 二级标题', level=2, color=0x2563EB)\n    layout.add_paragraph('section-01/long-body', '长段落用于观察边界处的换行行为。' * 16, font_size=10.5, line_spacing=1.3, space_after=220)\n    layout.add_heading('section-02/title', '2. 富文本与超链接', level=1, color=0x0B2545)\n    _append_rich_paragraph(expert, document)\n    layout.add_heading('section-03/title', '3. 项目符号与层级', level=1, color=0x0B2545)\n    layout.add_bullets('section-03/bullets', ['第一项：短文本', '第二项：这是一条会自动换行的较长项目符号，用于检查第二行是否与正文文本对齐。', '第三项：中文与 English 混排'], level=0, font_size=11)\n    layout.add_bullets('section-03/nested', ['嵌套项目 A', '嵌套项目 B'], level=1, font_size=10.5)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/page-03\n    layout.add_page_break('page-break-03')\n    layout.add_heading('section-04/title', '4. 表格、列宽、换行与跨页', level=1, color=0x0B2545)\n    rows = [['编号', '项目', '状态', '说明']]\n    for index in range(1, 18):\n        rows.append([str(index), '验证项 ' + str(index), '通过' if index % 3 else '关注', '用于验证可变行高、长文本自动换行以及表格接近分页边界时的行为。' if index % 2 else '短说明'])\n    layout.add_table('section-04/table', rows, column_widths=[10, 22, 14, 54], header=True, font_size=9)\n    layout.add_paragraph('section-04/caption', '表 1：17 行跨页边界表格。表格之后必须保留自然间距。', font_size=9, italic=True, color=0x64748B, space_before=160, space_after=220)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/page-04\n    layout.add_page_break('page-break-04')\n    layout.add_heading('section-05/title', '5. 图片、脚注和批注', level=1, color=0x0B2545)\n    layout.add_inline_image('section-05/image', 'attachment-stress-image-office-image-fixture.png', width=12500)\n    layout.add_paragraph('section-05/image-caption', '图 1：用于验证内联图片、比例和分页。', font_size=9, italic=True, color=0x64748B, align='CENTER', space_after=260)\n    _append_footnote_and_annotation(expert, document)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/page-05\n    layout.add_page_break('page-break-05')\n    layout.add_heading('section-06/title', '6. 浮动文本框与绘图对象', level=1, color=0x0B2545)\n    layout.add_paragraph('section-06/intro', '以下对象位于独立页面，避免与流式正文发生非预期重叠。', font_size=11, space_after=300)\n    cursor = document.Text.createTextCursor()\n    cursor.gotoEnd(False)\n    frame = document.createInstance('com.sun.star.text.TextFrame')\n    frame.Width, frame.Height = 7200, 3200\n    frame.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AS_CHARACTER')\n    document.Text.insertTextContent(cursor, frame, False)\n    frame.Text.String = '原生 UNO TextFrame\\n用于验证文本框内部换行。'\n    expert.tag(frame, 'section-06/text-frame', 'text-frame', {'section': 6})\n    document.Text.insertControlCharacter(cursor, uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK'), False)\n    draw_page = document.DrawPage\n    shape = document.createInstance('com.sun.star.drawing.RectangleShape')\n    position = uno.createUnoStruct('com.sun.star.awt.Point')\n    position.X, position.Y = 12500, 9000\n    shape_size = uno.createUnoStruct('com.sun.star.awt.Size')\n    shape_size.Width, shape_size.Height = 5000, 2600\n    shape.Position, shape.Size = position, shape_size\n    shape.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AT_PAGE')\n    shape.AnchorPageNo = 6\n    shape.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')\n    shape.FillColor = 0xDCEAF7\n    shape.LineColor = 0x2563EB\n    draw_page.add(shape)\n    expert.tag(shape, 'section-06/drawing-shape', 'shape', {'section': 6})\n    layout.add_paragraph('section-06/outro', '绘图对象应保持在页面可用区域内，并且不遮挡上方文本框。', font_size=11, space_before=3200, space_after=180)\n    # @webpilot-endunit\n\n    # @webpilot-unit pages/page-06\n    layout.add_page_break('page-break-06')\n    layout.add_heading('section-07/title', '7. 最终检查清单', level=1, color=0x0B2545)\n    layout.add_table('section-07/checklist', [\n        ['检查项', '期望结果'],\n        ['字符', '无乱码、无缺字'],\n        ['版式', '无重叠、无裁切、无异常空白页'],\n        ['表格', '完整、可编辑、换行自然'],\n        ['对象', '图片、脚注、批注、文本框和形状保留'],\n        ['渲染', 'LibreOffice 与 Microsoft Office 页数一致'],\n    ], column_widths=[28, 72], header=True, font_size=10)\n    layout.add_paragraph('section-07/conclusion', '结构检查只能证明文件包可读；最终结论仍然依赖双渲染器和逐页视觉检查。', font_size=11, bold=True, color=0x0B2545, space_before=260, space_after=180)\n    # @webpilot-endunit\n\n    layout.save()\n    layout.close()",
+  "validationStatus": "failed",
+  "validationDiagnostics": [
+    {
+      "code": "DOCX_FLOATING_OBJECTS_REQUIRE_VISUAL_QA",
+      "message": "1 floating DrawingML object(s) were preserved. They are supported for freeform authoring but require visual confirmation because they do not participate in normal text flow.",
+      "severity": "warning",
+      "target": "word/document.xml"
+    },
+    {
+      "code": "RUNTIME_DRAWING_TEXT_OUT_OF_PAGE",
+      "column": 1,
+      "elementId": "section-06/text-frame",
+      "line": 110,
+      "locator": {
+        "section": 6
+      },
+      "message": "Drawing text object bounds x=0, y=-1506, width=7200, height=1505 extend beyond page size 21590x27940; confirm the bleed or crop is intentional.",
+      "severity": "warning"
+    },
+    {
+      "code": "CROSS_RENDERER_PAGE_COUNT_MISMATCH",
+      "message": "LibreOffice rendered 7 page(s), while Microsoft Office rendered 6.",
+      "severity": "error"
+    }
+  ],
+  "sourceUnits": [
+    {
+      "path": "pages/page-01",
+      "sourceDigest": "8e83da40f631e9abba33dad2d9546fe6cba4137916201d90595a04e862f2400a",
+      "status": "failed"
+    },
+    {
+      "path": "pages/page-02",
+      "sourceDigest": "72e6494f2a09505ef03dcc3276aa938a41113fd20a421cb5e6346c5aab994c2d",
+      "status": "failed"
+    },
+    {
+      "path": "pages/page-03",
+      "sourceDigest": "8cf38889e3819cf8113ae771c19a80bddb9c765d5dcbefbfa17d1d742ab12c1d",
+      "status": "failed"
+    },
+    {
+      "path": "pages/page-04",
+      "sourceDigest": "8857542a7992f7a7d5e76a8cc8c5b4e019f3cb764911d436fe5212b1fe147755",
+      "status": "failed"
+    },
+    {
+      "path": "pages/page-05",
+      "sourceDigest": "4ff64eda3b47977bc963f732836d11837cb37137aae2f28d8551ac6a72d9d37a",
+      "status": "failed"
+    },
+    {
+      "path": "pages/page-06",
+      "sourceDigest": "14ee60c4a74eee7275cf06d26f791a5f7819e1d28d1c773ea577ffbf7c8d1b2f",
+      "status": "failed"
+    }
+  ],
+  "sourceDigest": "13f842ea28606c2854a1715455d40177b9219e3326bfe83e4342850140fb5f4d"
+}

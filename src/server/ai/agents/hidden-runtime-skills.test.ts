@@ -86,6 +86,12 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /single editable source buffer/);
   assert.match(fileArtifactRuntimeSkillContent, /Failure keeps the exact edited source/);
   assert.match(fileArtifactRuntimeSkillContent, /visualQaDigest equals renderedDigest/);
+  assert.match(fileArtifactRuntimeSkillContent, /Prefer `slide\.addChart\(\)` for standard column charts, horizontal bar charts, and doughnut charts/);
+  assert.match(fileArtifactRuntimeSkillContent, /Prefer `slide\.addTable\(\)` for standard tables/);
+  assert.match(fileArtifactRuntimeSkillContent, /Use `slide\.addShape\(\)` to construct KPI progress bars, mini charts, and special infographics/);
+  assert.match(fileArtifactRuntimeSkillContent, /job\.writer/);
+  assert.match(fileArtifactRuntimeSkillContent, /job\.expert/);
+  assert.match(fileArtifactRuntimeSkillContent, /elementId/);
   assert.match(fileArtifactRuntimeSkillContent, /Continue the original document workflow/);
   assert.match(fileArtifactRuntimeSkillContent, /## file API signatures/);
   assert.match(fileArtifactRuntimeSkillContent, /declare function file\(input: FileInput\)/);
