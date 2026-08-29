@@ -48,6 +48,3 @@ export const browserChatToolConfirmationRequestSchema = z.object({
   confirmationId: text(120).min(1),
   action: z.enum(['confirm', 'cancel']),
 }).strict();
-
-export type CreateBrowserChatSessionRequest = z.infer<typeof createBrowserChatSessionRequestSchema>;
-export type SendBrowserChatMessageRequest = z.infer<typeof sendBrowserChatMessageRequestSchema>;

@@ -43,21 +43,7 @@
   white-space: normal;
 }
 
-.settings-workspace .personal-memory-copy p {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: pre-wrap;
-}
 
-.browser-chat-settings-pane .settings-card {
-  background: transparent;
-  border-bottom: 1px solid var(--border);
-  border-top: 1px solid var(--border);
-  box-shadow: none;
-  display: grid;
-  gap: 0;
-  border-color: var(--border);
-}
 
 .browser-chat-settings-pane .settings-row {
   background: transparent;
@@ -205,80 +191,15 @@
   border-radius: var(--app-radius-md);
 }
 
-.skills-manager-item,
-.personal-memory-item {
-  border-color: color-mix(in srgb, var(--border) 82%, transparent);
-}
 
-.skills-manager-item-main b,
-.personal-memory-item h3 {
-  font-weight: 600;
-}
 
-.skills-manager-item:hover,
-.personal-memory-item:hover {
-  background: var(--app-surface-hover);
-}
 
-.domain-accordion-list {
-  display: grid;
-  min-width: 0;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--app-radius-md);
-  overflow: hidden;
-}
 
-.domain-accordion-group + .domain-accordion-group {
-  border-top: 1px solid var(--border);
-  border-top-color: var(--border);
-}
 
-.domain-accordion-toggle {
-  align-items: center;
-  border: 0;
-  cursor: pointer;
-  display: grid;
-  font: inherit;
-  gap: 9px;
-  grid-template-columns: 18px minmax(0, 1fr) auto 18px;
-  text-align: left;
-  width: 100%;
-  background: transparent;
-  border-radius: 0;
-  color: var(--muted-strong);
-  min-height: 44px;
-  padding: 0 12px;
-}
 
-.domain-accordion-toggle strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--foreground);
-  font-size: 13px;
-  font-weight: 600;
-}
 
-.domain-accordion-toggle span {
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 500;
-}
 
-.domain-accordion-toggle:hover,
-.domain-accordion-group.open > .domain-accordion-toggle {
-  box-shadow: none;
-  transform: none;
-  background: var(--app-surface-hover);
-  color: var(--foreground);
-}
 
-.domain-accordion-content-shell {
-  min-height: 0;
-  overflow: hidden;
-  border-top-color: color-mix(in srgb, var(--border) 76%, transparent);
-}
 
 .login-account-form {
   display: grid;
@@ -379,23 +300,8 @@
   flex: 0 0 auto;
 }
 
-.management-data-table-heading {
-  align-items: center;
-  display: flex;
-  gap: 4px;
-  min-width: 0;
-}
 
-.management-data-table-heading > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
-.management-table-actions-column .management-data-table-heading {
-  justify-content: flex-end;
-}
 
 .login-account-form label small,
 .login-account-security-note,
@@ -411,40 +317,9 @@
   color: var(--accent-strong);
 }
 
-.login-account-item {
-  align-items: center;
-  border: 0;
-  display: grid;
-  gap: 12px;
-  grid-template-columns: 32px minmax(0, 1fr) auto;
-  min-width: 0;
-  padding: 13px 2px;
-  border-color: color-mix(in srgb, var(--border) 82%, transparent);
-  border-radius: var(--app-radius-sm);
-}
 
-.login-account-item:hover {
-  background: var(--app-surface-hover);
-}
 
-.login-account-item-main > strong {
-  color: var(--foreground);
-  line-height: 1.4;
-  overflow-wrap: anywhere;
-  font-size: 13px;
-  font-weight: 600;
-}
 
-.login-account-item-main > span,
-.login-account-item-main > small {
-  overflow-wrap: anywhere;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-}
 
 .skills-manager-item-actions .ui-icon-button,
 .personal-memory-actions .ui-icon-button,

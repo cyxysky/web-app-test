@@ -69,10 +69,6 @@ export function browserActionRules(screenshotAvailable = true) {
   ];
 }
 
-export function browserContextLine() {
-  return `No page state is preloaded. Call the relevant browser tool directly. The execution layer runs readBrowserState internally when needed, includes its complete result in prerequisiteResults, and then executes the requested browser tool in the same call. Call readBrowserState explicitly only when the snapshot itself is the desired result. The first browserCode call automatically loads and returns hidden Skill ${activeBrowserRuntimeSkillId()}.`;
-}
-
 export function screenshotObservationRule(screenshotAvailable = true) {
   return screenshotAvailable
     ? '- Final page identity is attached automatically. Actual browser operations, navigation, and tab changes also attach direct incremental domChanges; page console errors appear once in domChanges.extra.errors, with no separate console payload. Results never include an automatic axTree, and pure successful reads attach no automatic DOM content. No screenshot is attached automatically. When AX, DOM, or pixel evidence is necessary, write the corresponding read explicitly in browserCode; emit pixels with await nodeRepl.emitImage(await page.screenshot({ fullPage: false })) so the image becomes visible to the model in the next model step.'

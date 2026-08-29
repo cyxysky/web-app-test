@@ -131,6 +131,7 @@ import {
 } from './browser-chat-tool-input-coercion';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 import type { BrowserChatFileVisualInput } from './browser-chat-attachment-reader';
+import { createBrowserChatDefectReport } from '@/server/storage/browser-chat-defect-store';
 
 export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
 
@@ -759,10 +760,6 @@ function concise(value?: string, max = 220) {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
-function basenameOfPath(value?: string) {
-  return value ? value.split(/[\\/]/).filter(Boolean).at(-1) || value : '';
-}
-
 function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
   const recent = traces.slice(-limit);
   if (!recent.length) return '[none]';
@@ -774,7 +771,12 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
       : trace.result.ok
         ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
-    const shots = trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
+    const screenshotNames = trace.name === 'browserCode'
+      ? browserCodeScreenshotFileNames((trace.screenshots || []).map((screenshot) => screenshot.path))
+      : [];
+    const shots = screenshotNames.length
+      ? `; screenshotFileNames=${JSON.stringify(screenshotNames)}`
+      : trace.screenshots?.length ? `; screenshots=${trace.screenshots.length}` : '';
     const why = reason ? `; reason=${sanitizeHistoricalToolText(reason, 140)}` : '';
     return `${index + 1}. ${trace.name}: ${status}${why}${shots}`;
   }).join('\n');
@@ -873,20 +875,6 @@ class VisualContextManager {
     return record;
   }
 
-  manage(action: 'clearHistory' | 'keepLatestOnly' | 'pinCurrent' | 'compressScrollSequence', reason: string) {
-    if (action === 'clearHistory') {
-      this.frames = this.frames.filter((frame) => frame.id === this.currentId || frame.role === 'pinned');
-    } else if (action === 'keepLatestOnly') {
-      this.frames = this.frames.filter((frame) => frame.id === this.currentId);
-    } else if (action === 'pinCurrent') {
-      this.frames = this.frames.map((frame) => frame.id === this.currentId ? { ...frame, role: 'pinned', reason } : frame);
-    } else if (action === 'compressScrollSequence') {
-      const scrollFrames = this.frames.filter((frame) => frame.group === 'scroll-sequence' && frame.id !== this.currentId);
-      const keep = new Set(scrollFrames.slice(-2).map((frame) => frame.id));
-      this.frames = this.frames.filter((frame) => frame.group !== 'scroll-sequence' || frame.id === this.currentId || keep.has(frame.id) || frame.role === 'pinned');
-    }
-    this.trim();
-  }
 
   current() {
     return this.frames.find((frame) => frame.id === this.currentId);
@@ -899,34 +887,7 @@ class VisualContextManager {
     };
   }
 
-  renderText() {
-    const current = this.current();
-    const history = this.frames.filter((frame) => frame.id !== this.currentId);
-    const frameSummary = (frame: VisualFrameRecord) => (
-      `${frame.id} ${concise(frame.reason, 80)} image=${basenameOfPath(frame.path)}${frame.originalPath ? ` original=${basenameOfPath(frame.originalPath)}` : ''}${frame.markerPath ? ` marker=${basenameOfPath(frame.markerPath)}` : ''}${frame.capture ? ` capture=${frame.capture}` : ''}`
-    );
-    return [
-      'Visual Context Manager:',
-      `current: ${current ? frameSummary(current) : '[none]'}`,
-      'current 是唯一允许使用编号进行点击、输入、hover、drag 定位的截图。',
-      history.length
-        ? `history 仅供参考，不能使用其中编号操作：\n${history.map((frame) => `- ${frameSummary(frame)} role=${frame.role} group=${frame.group || '-'}`).join('\n')}`
-        : 'history: [none]',
-    ].join('\n');
-  }
 
-  imagePaths(historyLimit = Number(process.env.AI_VISUAL_ATTACHED_HISTORY_LIMIT || 0)) {
-    const paths: string[] = [];
-    const current = this.current();
-    if (current) paths.push(current.path);
-    if (current?.markerPath) paths.push(current.markerPath);
-    const history = this.frames.filter((item) => item.id !== this.currentId).slice(-Math.max(0, historyLimit));
-    for (const frame of history) {
-      paths.push(frame.path);
-      if (frame.markerPath) paths.push(frame.markerPath);
-    }
-    return paths;
-  }
 
   private createFrame(frame: Omit<VisualFrameRecord, 'id' | 'role' | 'createdAt'>, role: VisualFrameRecord['role']) {
     this.sequence += 1;
@@ -1132,6 +1093,83 @@ async function readCurrentBrowserState(
   });
 }
 
+function screenshotFileName(filePath: string) {
+  return filePath.replace(/\\/g, '/').split('/').at(-1)?.trim() || '';
+}
+
+function browserCodeScreenshotFileNames(paths: string[]) {
+  return [...new Set(paths.map(screenshotFileName).filter(Boolean))];
+}
+
+const reportDefectInputSchema = z.object({
+  problemDescription: z.string().min(1).max(800).describe('A precise user-visible description of the observed defect.'),
+  whyItIsAProblem: z.string().min(1).max(1_200).describe('Why the observed behavior harms correctness, usability, or task completion.'),
+  reasons: z.array(z.string().min(1).max(500)).min(1).max(8).describe('Concrete evidence-based reasons that support classifying the behavior as a defect.'),
+  reproductionSteps: z.array(z.string().min(1).max(500)).min(1).max(20).describe('Ordered steps that reproduce the defect from a known page state.'),
+  screenshotFileNames: z.array(z.string().min(1).max(260).regex(/^[^\\/]+$/)).min(1).max(6).describe('One to six exact screenshot file names returned by prior successful browserCode calls in this Agent run.'),
+}).strict();
+
+type ReportDefectInput = z.infer<typeof reportDefectInputSchema>;
+
+function resolveDefectScreenshotEvidence(traces: ToolTrace[], requestedFileNames: string[]) {
+  const candidates = new Map<string, { fileName: string; path: string }>();
+  for (const trace of traces) {
+    if (trace.name !== 'browserCode' || trace.result?.ok !== true) continue;
+    for (const screenshot of trace.screenshots || []) {
+      if (screenshot.kind === 'marker') continue;
+      const fileName = screenshotFileName(screenshot.path);
+      if (fileName) candidates.set(fileName.toLocaleLowerCase(), { fileName, path: screenshot.path });
+    }
+  }
+  const missing: string[] = [];
+  const screenshots = requestedFileNames.flatMap((requested) => {
+    const fileName = screenshotFileName(requested);
+    const candidate = candidates.get(fileName.toLocaleLowerCase());
+    if (!candidate) {
+      missing.push(requested);
+      return [];
+    }
+    return [candidate];
+  });
+  return {
+    screenshots: [...new Map(screenshots.map((item) => [item.path, item])).values()],
+    missing,
+    availableFileNames: [...candidates.values()].map((item) => item.fileName),
+  };
+}
+
+function reportBrowserChatDefect(
+  sessionId: string | undefined,
+  traces: ToolTrace[],
+  input: ReportDefectInput,
+): BrowserActionResult {
+  if (!sessionId) return { ok: false, actual: 'reportDefect is unavailable because the conversation id is missing.' };
+  const evidence = resolveDefectScreenshotEvidence(traces, input.screenshotFileNames);
+  if (evidence.missing.length) {
+    return {
+      ok: false,
+      actual: `Screenshot evidence rejected because these files were not emitted by a successful browserCode call in this Agent run: ${evidence.missing.join(', ')}. Available screenshot file names: ${evidence.availableFileNames.join(', ') || '[none]'}.`,
+    };
+  }
+  const report = createBrowserChatDefectReport(sessionId, {
+    problemDescription: input.problemDescription,
+    whyItIsAProblem: input.whyItIsAProblem,
+    reasons: input.reasons,
+    reproductionSteps: input.reproductionSteps,
+    screenshots: evidence.screenshots,
+  });
+  return {
+    ok: true,
+    actual: JSON.stringify({
+      defectId: report.id,
+      title: report.title,
+      severity: report.severity,
+      screenshotFileNames: report.screenshots.map((screenshot) => screenshot.fileName),
+      stored: true,
+    }),
+  };
+}
+
 async function bundledBrowserToolPrerequisiteResults(input: {
   toolName: string;
   preflightPending: boolean;
@@ -1305,7 +1343,10 @@ function makeBrowserTools(
             : undefined;
           referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
         }
-        return compactToolResultForModel(name, result);
+        const resultForModel = name === 'browserCode' && imagePaths.length
+          ? { ...result, screenshotFileNames: browserCodeScreenshotFileNames(imagePaths) }
+          : result;
+        return compactToolResultForModel(name, resultForModel);
       });
     };
     const queued = toolExecutionQueue.then(run, run);
@@ -1354,6 +1395,22 @@ function makeBrowserTools(
           });
         }, execution);
       },
+    }),
+    reportDefect: tool({
+      description: 'Proactively report one evidence-backed product defect or reproducible product problem found while testing the live interface. During a testing task, calling this tool is mandatory as soon as browserCode has reproduced the issue and emitted at least one screenshot that visibly proves it; do not defer the report to the final answer or wait for the user to ask. Do not report speculation, expected behavior, environment/configuration/permission limitations, or the same issue twice. screenshotFileNames must exactly match the safe file names returned by a successful browserCode call in this Agent run.',
+      inputSchema: withToolInputExamples(reportDefectInputSchema, [{
+        problemDescription: '长表格向下滚动后，横向滚动条离开当前视口。',
+        whyItIsAProblem: '用户无法在浏览表格中段时横向查看右侧列。',
+        reasons: ['横向滚动条只有到达表格底部后才可操作。'],
+        reproductionSteps: ['打开包含宽表格的对话', '向下滚动到表格中段', '尝试横向滚动'],
+        screenshotFileNames: ['step-1-browser-code-1-example.png'],
+      }]),
+      execute: (input, execution) => record(
+        'reportDefect',
+        input,
+        () => Promise.resolve(reportBrowserChatDefect(referenceOptions?.runId, traces, input)),
+        execution,
+      ),
     }),
     waitForHumanVerification: tool({
       description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
@@ -1692,6 +1749,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
     '- Copy every delivered Artifact downloadUrl exactly from the successful tool result. Never construct, absolutize, repair, or infer an Artifact URL from a sessionId, artifactId, hostname, or file name, and never call a URL an absolute filesystem path. Before finalizing Office/PDF work, reconcile the original requirements with automaticValidation.formatChecks, validation issues, and visual-QA scope. Visual QA proves page layout only; it does not prove requested native charts, formulas, images, comments, footnotes, or other semantic features. A missing, zero-count, unsupported, failed, or unverified required feature must be reported as a limitation, never as fully passed.',
     '- If agent.state tracks task stage, coverage, status, issues, or artifacts, update those records before the final answer so no pending/generated/failed field contradicts a complete claim. Do not set an overall complete/passed state while any required item remains pending, unsupported, failed, or unverified unless the user explicitly accepted a partial result.',
+    '- Defect reporting is a mandatory part of every interface or product testing task. As soon as live browser evidence reveals a real defect or reproducible product problem (including functional, data, interaction, visual/layout, or compatibility problems), proactively reproduce it, use browserCode to emit a screenshot that visibly proves it, and call reportDefect in the immediately following model step with the exact screenshotFileNames returned by browserCode before continuing unrelated test cases. Never wait for the user to ask, defer reporting until the final answer, or merely describe the problem in test notes or the final report. Create one report for each unique confirmed problem. Investigate permission, configuration, version, requirement, and environment explanations first; report only an observed product problem, never speculation or expected behavior, and do not report duplicates. Recording a defect does not end the requested test unless its full scope is complete.',
     screenshotAvailable && input.fileVisualAvailable
       ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
       : screenshotAvailable
@@ -1715,6 +1773,7 @@ function runtimeToolNames(includeVisualTools = true) {
   return [
     'readBrowserState',
     'browserCode',
+    'reportDefect',
     'waitForHumanVerification',
     'subagent',
     'file',
@@ -2167,7 +2226,6 @@ async function executeRuntimeStep(input: {
   });
   const contextMs = 0;
   const screenshotReadStartedAt = Date.now();
-  const screenshot = undefined;
   ensureActive();
   const userReferenceImagePaths = Array.from(new Set(referenceImagePaths.filter(Boolean))).slice(0, 4);
   const userReferenceImages = modelSupportsImageInput()
@@ -2218,7 +2276,6 @@ async function executeRuntimeStep(input: {
   }
 
   async function runAgent(
-    includeImage: boolean,
     retryState: RuntimeRetryState | undefined,
     executionIdentity: RuntimeExecutionIdentity,
   ) {
@@ -3283,7 +3340,6 @@ async function executeRuntimeStep(input: {
       stepIndex,
       attemptNumber,
     );
-    const includeImage = Boolean(screenshot);
     const retryState = retryingAfterFailure && lastRetryState?.messages.length ? lastRetryState : undefined;
     try {
       if (retryingAfterFailure) {
@@ -3347,7 +3403,7 @@ async function executeRuntimeStep(input: {
         provider: getModelSettings().provider,
         model: getModelSettings().model,
       });
-      const result = await runAgent(includeImage, retryState, executionIdentity);
+      const result = await runAgent(retryState, executionIdentity);
       const requestOutcomeMessage = result.responseFinished
         ? result.responseStatus === 'passed'
           ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求已返回并正常结束。`
@@ -4351,6 +4407,22 @@ async function executeCodexRuntimeObject(input: {
         };
       }
       return readSubagent(uuid);
+    }
+    if (type === 'reportDefect') {
+      const parsed = reportDefectInputSchema.safeParse({
+        problemDescription: normalizedParams.problemDescription,
+        whyItIsAProblem: normalizedParams.whyItIsAProblem,
+        reasons: normalizedParams.reasons,
+        reproductionSteps: normalizedParams.reproductionSteps,
+        screenshotFileNames: normalizedParams.screenshotFileNames,
+      });
+      if (!parsed.success) {
+        return {
+          ok: false,
+          actual: `reportDefect input is invalid: ${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`,
+        };
+      }
+      return reportBrowserChatDefect(runId, traces, parsed.data);
     }
     if (type === 'file' && normalizedParams.action === 'read') {
       const documentId = typeof normalizedParams.documentId === 'string' ? normalizedParams.documentId.trim() : undefined;

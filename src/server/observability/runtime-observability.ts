@@ -89,19 +89,3 @@ export function structuredLog(input: StructuredLogInput) {
   else if (level === 'warn') console.warn(payload);
   else console.info(payload);
 }
-
-export async function measureMetric<T>(
-  name: string,
-  labels: Record<string, string | number>,
-  operation: () => Promise<T>,
-) {
-  const startedAt = performance.now();
-  try {
-    const result = await operation();
-    recordMetricTiming(name, performance.now() - startedAt, { ...labels, status: 'ok' });
-    return result;
-  } catch (error) {
-    recordMetricTiming(name, performance.now() - startedAt, { ...labels, status: 'error' });
-    throw error;
-  }
-}

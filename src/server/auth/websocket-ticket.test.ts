@@ -90,3 +90,37 @@ test('websocket tickets are short-lived, scoped, origin-bound, and one-time', ()
     rmSync(dataRoot, { force: true, recursive: true });
   }
 });
+
+test('keeps an unconsumed websocket ticket across database schema reinitialization', () => {
+  const dataRoot = mkdtempSync(path.join(tmpdir(), 'webpilot-ticket-reinitialize-'));
+  const previousDataRoot = process.env.APP_DATA_DIR;
+  process.env.APP_DATA_DIR = dataRoot;
+
+  try {
+    const preview = createWebSocketTicket({
+      origin: 'https://webpilot.test',
+      scope: 'browser-preview',
+      sessionId: 'session-reinitialize',
+      userId: 'user-1',
+    });
+
+    closeSqliteDatabase();
+    getSqliteDatabase();
+
+    assert.deepEqual(consumeWebSocketTicket({
+      origin: 'https://webpilot.test',
+      scope: 'browser-preview',
+      sessionId: 'session-reinitialize',
+      ticket: preview.ticket,
+    }), {
+      scope: 'browser-preview',
+      sessionId: 'session-reinitialize',
+      userId: 'user-1',
+    });
+  } finally {
+    closeSqliteDatabase();
+    if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;
+    else process.env.APP_DATA_DIR = previousDataRoot;
+    rmSync(dataRoot, { force: true, recursive: true });
+  }
+});

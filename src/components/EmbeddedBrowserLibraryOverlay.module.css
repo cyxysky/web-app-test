@@ -51,7 +51,6 @@
 }
 
 .headerActions button,
-.searchBar button,
 .removeItem {
   align-items: center;
   background: transparent;
@@ -68,7 +67,6 @@
 }
 
 .headerActions button:hover,
-.searchBar button:hover,
 .removeItem:hover {
   background: transparent !important;
   color: var(--foreground) !important;
@@ -80,44 +78,13 @@
 }
 
 .headerActions button:active,
-.searchBar button:active,
 .removeItem:active {
   transform: scale(0.94);
 }
 
-.searchBar {
-  align-items: center;
-  background: color-mix(in srgb, var(--foreground) 5%, transparent);
-  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
-  border-radius: 10px;
-  color: var(--muted);
-  display: flex;
-  gap: 8px;
-  height: 38px;
-  margin: 10px 14px 2px;
-  padding: 0 8px 0 11px;
-}
 
-.searchBar:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 52%, var(--border));
-  box-shadow: 0 0 0 3px var(--focus);
-}
 
-.searchBar input {
-  background: transparent;
-  border: 0;
-  color: var(--foreground);
-  flex: 1 1 auto;
-  font: inherit;
-  font-size: 13px;
-  min-width: 0;
-  outline: none;
-}
 
-.searchBar button {
-  height: 26px;
-  width: 26px;
-}
 
 .content {
   display: flex;
@@ -322,8 +289,7 @@
 }
 
 @media (hover: none), (pointer: coarse) {
-  .headerActions button,
-.searchBar button,
+.headerActions button,
 .removeItem,
 .sectionHeading {
     min-height: 44px;
@@ -376,9 +342,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .card,
+.card,
 .headerActions button,
-.searchBar button,
 .removeItem {
     transition: none;
   }

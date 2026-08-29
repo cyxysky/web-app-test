@@ -11,7 +11,7 @@ type DatabaseRuntimeState = {
   schemaVersion?: number;
 };
 
-const currentSchemaVersion = 23;
+const currentSchemaVersion = 24;
 const defaultApplicationUserId = '1';
 const obsoleteRuntimeEnvKeys = new Set([
   'AI_PROMPT_INCLUDE_FULL_TIMELINE',
@@ -727,15 +727,39 @@ function applyVersionTwentyThreeMigration(database: DatabaseSync) {
   }
 }
 
+function applyVersionTwentyFourMigration(database: DatabaseSync) {
+  const applied = database.prepare('SELECT 1 FROM schema_migration WHERE version = 24').get();
+  if (applied) return;
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS browser_chat_defect (
+        session_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        record_json TEXT NOT NULL,
+        PRIMARY KEY (session_id, id),
+        FOREIGN KEY (session_id) REFERENCES browser_chat_session(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS browser_chat_defect_session_created_idx
+        ON browser_chat_defect(session_id, created_at DESC);
+    `);
+    database.prepare(`
+      INSERT INTO schema_migration (version, name, applied_at)
+      VALUES (24, 'browser-chat-defect-report', ?)
+    `).run(new Date().toISOString());
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function sqliteDatabasePath() {
   return path.join(appDataRoot(), '.data', databaseFileName);
 }
 
 function initializeSchema(database: DatabaseSync) {
-  database.exec(`
-    PRAGMA foreign_keys = OFF;
-    DROP TABLE IF EXISTS websocket_ticket;
-  `);
   database.exec(`
     PRAGMA foreign_keys = ON;
     PRAGMA busy_timeout = 5000;
@@ -911,7 +935,23 @@ function initializeSchema(database: DatabaseSync) {
     CREATE INDEX IF NOT EXISTS browser_code_runtime_state_expiry_idx
       ON browser_code_runtime_state(expires_at)
       WHERE expires_at IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS browser_chat_defect (
+      session_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      record_json TEXT NOT NULL,
+      PRIMARY KEY (session_id, id),
+      FOREIGN KEY (session_id) REFERENCES browser_chat_session(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS browser_chat_defect_session_created_idx
+      ON browser_chat_defect(session_id, created_at DESC);
   `);
+
+  database.prepare(`
+    DELETE FROM websocket_ticket
+    WHERE expires_at <= ? OR consumed_at IS NOT NULL
+  `).run(new Date().toISOString());
 
   database.prepare(`
     INSERT OR IGNORE INTO schema_migration (version, name, applied_at)
@@ -944,14 +984,15 @@ function initializeSchema(database: DatabaseSync) {
   applyVersionTwentyOneMigration(database);
   applyVersionTwentyTwoMigration(database);
   applyVersionTwentyThreeMigration(database);
+  applyVersionTwentyFourMigration(database);
 }
 
 export function getSqliteDatabase() {
   const databasePath = sqliteDatabasePath();
   if (runtimeState.database && runtimeState.databasePath === databasePath) {
-    if (runtimeState.schemaVersion !== currentSchemaVersion) {
+    if ((runtimeState.schemaVersion ?? 0) < currentSchemaVersion) {
       initializeSchema(runtimeState.database);
-      runtimeState.schemaVersion = currentSchemaVersion;
+      runtimeState.schemaVersion = Math.max(runtimeState.schemaVersion ?? 0, currentSchemaVersion);
     }
     return runtimeState.database;
   }

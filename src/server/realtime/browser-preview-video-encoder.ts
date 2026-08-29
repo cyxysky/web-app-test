@@ -52,10 +52,6 @@ export class FragmentedMp4Chunker {
 
   constructor(private readonly options: FragmentedMp4ChunkerOptions) {}
 
-  getInitializationSegment() {
-    return this.initializationSegment;
-  }
-
   push(chunk: Buffer) {
     if (!chunk.length) return;
     this.pending = this.pending.length ? Buffer.concat([this.pending, chunk]) : chunk;
@@ -221,9 +217,6 @@ export class BrowserPreviewVideoEncoder {
     this.start();
   }
 
-  getInitializationSegment() {
-    return this.chunker.getInitializationSegment();
-  }
 
   metrics(): BrowserPreviewVideoEncoderMetrics {
     return { ...this.state };

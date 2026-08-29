@@ -100,7 +100,6 @@ const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
 const MIN_SCREENSHOT_TIMEOUT_MS = 1000;
 const MAX_SCREENSHOT_TIMEOUT_MS = 120000;
 const SCREENSHOT_FAILURE_CONTEXT_TIMEOUT_MS = 2000;
-const DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS = 3000;
 const DEFAULT_BROWSER_POPUP_WAIT_MS = 0;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS = 1500;
 const DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS = 250;
@@ -243,6 +242,8 @@ export type BrowserActionResult = {
   referenceImagePath?: string;
   /** Images emitted by browserCode that should be attached to the next model request in order. */
   referenceImagePaths?: string[];
+  /** Safe basenames for emitted screenshots that may be cited by reportDefect. */
+  screenshotFileNames?: string[];
   /** A compact continuation cursor for paged snapshot readers. */
   nextCursor?: string;
   /** Low-level page facts returned by the DOM operation protocol. Code returns an AX tree instead. */
@@ -332,19 +333,6 @@ type FocusedElementSummary = {
   isTextEntryTarget?: boolean;
 };
 
-type CandidateDomState = {
-  descriptor?: string;
-  tagName?: string;
-  type?: string;
-  valueLength?: number;
-  checked?: boolean;
-  selectedIndex?: number;
-  ariaPressed?: string;
-  ariaExpanded?: string;
-  disabled?: boolean;
-  text?: string;
-};
-
 type ViewportMetrics = {
   width: number;
   height: number;
@@ -397,20 +385,6 @@ type ScreenshotTiming = {
   separateMarkerMap: boolean;
   steps: ScreenshotTimingStep[];
 };
-
-function formatScreenshotTimingStep(step: ScreenshotTimingStep) {
-  const parts = [`${step.name}=${step.elapsedMs}ms`];
-  if (step.count !== undefined) parts.push(`count=${step.count}`);
-  if (step.skipped) parts.push('skip');
-  if (step.error) parts.push(`error=${step.error}`);
-  return parts.join(' ');
-}
-
-function formatScreenshotTimingSummary(timing?: ScreenshotTiming) {
-  if (!timing) return '';
-  const steps = timing.steps.map(formatScreenshotTimingStep).join(' | ');
-  return `screenshot timing: total=${timing.totalMs}ms, candidates=${timing.candidateCount}, scrollAreas=${timing.scrollAreaCount}; ${steps}`;
-}
 
 export type ScreenshotCaptureMode = 'viewport' | 'fullPage';
 
@@ -1867,7 +1841,6 @@ export class BrowserSession {
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private screenshotGenerationSequence = 0;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
-  private lastScreenshotCandidates: InteractiveCandidate[] = [];
   private lastDomNodeReferences = new Map<string, DomNodeReference>();
   private domVisiblePublicIdByFrameLocalRef = new Map<string, string>();
   private domVisibleSnapshotKey?: string;
@@ -1880,8 +1853,6 @@ export class BrowserSession {
   private interActionChangeJournal?: InterActionChangeJournal;
   private interActionChangeJournalSequence = 0;
   private lastScrollableAreas: ScrollableArea[] = [];
-  private lastCandidateMarkerScreenshotPath?: string;
-  private lastOriginalScreenshotPath?: string;
   private lastScreenshotTiming?: ScreenshotTiming;
   private ownedPages = new Set<Page>();
   private browserOwnership: BrowserOwnership = 'launched';
@@ -2336,16 +2307,6 @@ export class BrowserSession {
     return sessionId === this.options.runId || normalizePageGroupId(sessionId) === this.pageGroupId;
   }
 
-  private async findInitialElectronEmbeddedBrowserPages(context: BrowserContext) {
-    if (this.browserSurface !== 'electron-embedded') return [];
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      const pages = await this.findElectronEmbeddedBrowserSessionPages(context);
-      if (pages.length) return pages.reverse();
-      if (attempt < 11) await sleep(160);
-    }
-    return [];
-  }
-
   private async findElectronEmbeddedBrowserSessionPages(context: BrowserContext) {
     const pages: Page[] = [];
     for (const page of [...context.pages()].reverse()) {
@@ -2527,26 +2488,7 @@ export class BrowserSession {
     });
   }
 
-  async startTrace(runId: string) {
-    if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return;
-    if (this.browserOwnership === 'shared' && process.env.PLAYWRIGHT_TRACE_SHARED !== 'true') return;
-    await this.context.tracing.start({
-      screenshots: true,
-      snapshots: true,
-      sources: true,
-      title: `AI browser run ${runId}`,
-    }).catch(() => undefined);
-  }
 
-  async stopTrace(runId: string) {
-    if (!this.context || process.env.PLAYWRIGHT_TRACE === 'false') return undefined;
-    if (this.browserOwnership === 'shared' && process.env.PLAYWRIGHT_TRACE_SHARED !== 'true') return undefined;
-    const dir = artifactPath(runId);
-    await mkdir(dir, { recursive: true });
-    const tracePath = path.join(dir, 'trace.zip');
-    await this.context.tracing.stop({ path: tracePath }).catch(() => undefined);
-    return tracePath;
-  }
 
   private claimPage(page: Page, options: { allowSteal?: boolean; makeActive?: boolean } = {}) {
     if (page.isClosed()) return false;
@@ -3684,7 +3626,6 @@ export class BrowserSession {
       this.domVisibleObservationId = undefined;
       this.domVisibleExposedReferenceIds.clear();
       this.lastInteractiveCandidates = [];
-      this.lastScreenshotCandidates = [];
     };
 
     if (input.kind === 'move' || input.kind === 'click' || input.kind === 'drag' || input.kind === 'scroll') {
@@ -3904,10 +3845,6 @@ export class BrowserSession {
   // Keep a no-op target for console listeners installed by an older dev-server
   // module before page-console collection was removed. Those listeners can
   // outlive a hot reload while the controlled browser session stays open.
-  private recordPageConsoleEntry(...legacyArguments: unknown[]) {
-    void legacyArguments;
-  }
-
   private attachLivePreviewDownloadListener(page: Page) {
     this.livePreviewDownloadListenerPages ||= new WeakSet<Page>();
     if (this.livePreviewDownloadListenerPages.has(page)) return;
@@ -4174,53 +4111,12 @@ export class BrowserSession {
     );
   }
 
-  async openInNewTab(url: string): Promise<BrowserActionResult> {
-    if (!this.context) return { ok: false, actual: 'Browser context is unavailable.' };
-    const page = await this.context.newPage();
-    this.claimPage(page);
-    await page.bringToFront().catch(() => undefined);
-    return this.open(url);
-  }
 
   async readStructuredPageText() {
     return (await this.readDomObservation({ includeInteractiveCandidates: false })).structuredText;
   }
 
   /** Read-only link inventory across the current page and its frames. */
-  async readPageLinks() {
-    const links: Array<{ url: string; title: string }> = Array.from(this.observedPageLinks.values());
-    const seen = new Set(links.map((link) => link.url.toLowerCase()));
-    for (const frame of this.activePage.frames()) {
-      const frameLinks = await frame.evaluate(() => Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href]'))
-        .map((anchor) => {
-          const rawUrl = anchor.href || anchor.getAttribute('href') || '';
-          let url = '';
-          try {
-            url = new URL(rawUrl, document.baseURI).href;
-          } catch {
-            return undefined;
-          }
-          if (!/^https?:\/\//i.test(url)) return undefined;
-          const title = [
-            anchor.textContent,
-            anchor.getAttribute('title'),
-            anchor.getAttribute('aria-label'),
-            anchor.querySelector('img')?.getAttribute('alt'),
-          ].map((value) => value?.replace(/\s+/g, ' ').trim()).find(Boolean) || url;
-          return { url, title };
-        })
-        .filter((item): item is { url: string; title: string } => Boolean(item)))
-        .catch(() => [] as Array<{ url: string; title: string }>);
-      for (const link of frameLinks) {
-        const key = link.url.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        links.push({ url: link.url.slice(0, 4_000), title: link.title.slice(0, 500) });
-        if (links.length >= 300) return links;
-      }
-    }
-    return links;
-  }
 
   private async readDomObservation(options: {
     includeInteractiveCandidates: boolean;
@@ -4594,34 +4490,8 @@ export class BrowserSession {
     await timed('prepareArtifactDir', () => mkdir(dir, { recursive: true }));
     const fileName = phase === 'manual' ? `step-${stepIndex}.png` : `step-${stepIndex}-${phase}.png`;
     const filePath = path.join(dir, fileName);
-    const shouldCaptureCandidates = false;
-    const candidateLabelsEnabled = false;
-    const scrollAreaLabelsEnabled = false;
-    const candidates = shouldCaptureCandidates
-      ? await timed('refreshInteractiveCandidates', () => this.refreshInteractiveCandidates().catch(() => [] as InteractiveCandidate[]), (items) => ({ count: items.length }))
-      : [];
-    const scrollAreas = shouldCaptureCandidates
-      ? await timed('refreshScrollableAreas', () => this.refreshScrollableAreas().catch(() => this.lastScrollableAreas), (items) => ({ count: items.length }))
-      : [];
-    if (!shouldCaptureCandidates) {
-      skipped('refreshInteractiveCandidates');
-      skipped('refreshScrollableAreas');
-    }
-    if (shouldCaptureCandidates) {
-      // This immutable-by-convention snapshot is the only source of candidate IDs
-      // for the following AI request and click. Later context scans must not make a
-      // screenshot label point at a different element.
-      this.lastScreenshotCandidates = candidates.map((candidate) => ({
-        ...candidate,
-        rect: { ...candidate.rect },
-        center: { ...candidate.center },
-      }));
-    } else {
-      this.lastScreenshotCandidates = [];
-    }
-    this.lastCandidateMarkerScreenshotPath = undefined;
-    this.lastOriginalScreenshotPath = undefined;
-    const separateMarkerMap = false;
+    skipped('refreshInteractiveCandidates');
+    skipped('refreshScrollableAreas');
     await timed('removeCandidateOverlayBefore', () => this.removeCandidateOverlay());
     const screenshotTimeoutMs = boundedPositiveIntegerEnv(
       'SCREENSHOT_TIMEOUT_MS',
@@ -4632,13 +4502,7 @@ export class BrowserSession {
     // Original clean screenshots are disabled globally; keep only the primary screenshot
     // and, when configured, the separate marker map.
     skipped('captureOriginalScreenshot');
-    if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
-      await timed('drawInlineOverlay', () => this.drawCandidateOverlay(
-        candidateLabelsEnabled ? candidates : [],
-        false,
-        scrollAreaLabelsEnabled ? scrollAreas : [],
-      ));
-    } else skipped('drawInlineOverlay');
+    skipped('drawInlineOverlay');
     try {
       await timed('capturePrimaryScreenshot', () => this.capturePngScreenshot({
         capture,
@@ -4654,36 +4518,11 @@ export class BrowserSession {
         filePath,
       });
     } finally {
-      if ((candidateLabelsEnabled || scrollAreaLabelsEnabled) && !separateMarkerMap) {
-        await timed('removeInlineOverlay', () => this.removeCandidateOverlay());
-      } else skipped('removeInlineOverlay');
+      skipped('removeInlineOverlay');
     }
-    if (separateMarkerMap) {
-      const markerFilePath = path.join(dir, `step-${stepIndex}-${phase}-markers.png`);
-      await timed('drawMarkerOverlay', () => this.drawCandidateOverlay(candidates, true, scrollAreaLabelsEnabled ? scrollAreas : []));
-      try {
-        await timed('captureMarkerScreenshot', () => this.capturePngScreenshot({
-          capture,
-          filePath: markerFilePath,
-          outputPixelRatio: options.outputPixelRatio,
-          timeoutMs: screenshotTimeoutMs,
-        }), () => ({ path: markerFilePath }));
-        this.lastCandidateMarkerScreenshotPath = markerFilePath;
-      } catch (error) {
-        throw await this.buildScreenshotFailureError(error, {
-          phase: `${String(phase)}-markers`,
-          capture,
-          timeoutMs: screenshotTimeoutMs,
-          filePath: markerFilePath,
-        });
-      } finally {
-        await timed('removeMarkerOverlay', () => this.removeCandidateOverlay());
-      }
-    } else {
-      skipped('drawMarkerOverlay');
-      skipped('captureMarkerScreenshot');
-      skipped('removeMarkerOverlay');
-    }
+    skipped('drawMarkerOverlay');
+    skipped('captureMarkerScreenshot');
+    skipped('removeMarkerOverlay');
     const [image, viewportMetrics, scrollPosition] = await timed('readScreenshotMetadata', () => Promise.all([
       this.readPngSize(filePath),
       this.getViewportMetrics(),
@@ -4709,13 +4548,11 @@ export class BrowserSession {
       capture,
       totalMs: Date.now() - totalStartedAt,
       path: filePath,
-      markerPath: this.lastCandidateMarkerScreenshotPath,
-      originalPath: this.lastOriginalScreenshotPath,
-      candidateCount: candidates.length,
-      scrollAreaCount: scrollAreas.length,
-      candidateLabelsEnabled,
-      scrollAreaLabelsEnabled,
-      separateMarkerMap,
+      candidateCount: 0,
+      scrollAreaCount: 0,
+      candidateLabelsEnabled: false,
+      scrollAreaLabelsEnabled: false,
+      separateMarkerMap: false,
       steps: timingSteps,
     };
     return filePath;
@@ -4762,61 +4599,14 @@ export class BrowserSession {
     return filePath;
   }
 
-  getLastScreenshotMetrics() {
-    return this.lastScreenshotMetrics;
-  }
 
   getLastScreenshotTiming() {
     return this.lastScreenshotTiming;
   }
 
-  formatLastScreenshotTiming() {
-    return formatScreenshotTimingSummary(this.lastScreenshotTiming);
-  }
 
   // 返回最近一次操作前截图对应的纯标识图路径；仅双截图兼容模式会使用。
-  getLastCandidateMarkerScreenshotPath() {
-    return this.lastCandidateMarkerScreenshotPath;
-  }
-
-  getLastOriginalScreenshotPath() {
-    return this.lastOriginalScreenshotPath;
-  }
-
   // 返回当前可见交互候选元素，供语义快照与调试工具定位控件。
-  async getInteractiveCandidates(): Promise<BrowserActionResult> {
-    const candidates = await this.refreshInteractiveCandidates();
-    return {
-      ok: true,
-      actual: candidates.map((candidate) => {
-        const depth = Math.max(0, candidate.path.split('.').filter(Boolean).length - 1);
-        const indent = '  '.repeat(Math.min(depth, 10));
-        const className = candidate.className
-          ? `.${candidate.className.split(/\s+/).filter(Boolean).slice(0, 3).join('.')}`
-          : '';
-        const role = [candidate.role, candidate.type].filter(Boolean).join('/');
-        const label = [
-          candidate.name,
-          candidate.text,
-          candidate.ariaLabel,
-          candidate.placeholder,
-          candidate.title,
-          candidate.nearbyText,
-        ].map((value) => value?.replace(/\s+/g, ' ').trim()).find(Boolean) || '[unlabeled]';
-        const state = [
-          candidate.clickable ? 'clickable' : '',
-          candidate.input ? 'input' : '',
-          candidate.disabled ? 'disabled' : '',
-          candidate.opensExternalApp ? `external-app=${candidate.externalAppProtocol || 'custom-protocol'}` : '',
-          candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
-          candidate.href ? `href=${candidate.href}` : '',
-          candidate.framePath ? `frame=${candidate.framePath}` : '',
-          candidate.shadow ? 'shadow' : '',
-        ].filter(Boolean).join(', ');
-        return `${indent}- #${candidate.id} ${candidate.tag}${className}${role ? `[${role}]` : ''}: "${label.slice(0, 160)}"${state ? ` (${state})` : ''}`;
-      }).join('\n') || '[no visible interactive elements detected]',
-    };
-  }
 
   // Debug entrypoint for stepping through interactive candidate collection on a real page.
   async debugInteractiveCandidateScan(input: { pause?: boolean; includeScreenshot?: boolean; runId?: string } = {}) {
@@ -4868,20 +4658,7 @@ export class BrowserSession {
   }
 
   // 返回简化后的 DOM 树文本，作为候选列表不足时的兜底定位信息。
-  async getSimplifiedDomTree(): Promise<BrowserActionResult> {
-    const result = await this.readSimplifiedDomTree({ scope: 'full' });
-    return { ok: true, actual: result.tree };
-  }
 
-  async listTabs(): Promise<BrowserActionResult> {
-    const tabs = this.getTabsSnapshot();
-    return {
-      ok: true,
-      actual: tabs.length
-        ? [`Tab group: ${this.pageGroupId}`, ...tabs.map((tab) => `${tab.index}${tab.active ? ' [active]' : ''}: ${tab.url}`)].join('\n')
-        : 'No tabs found for this run.',
-    };
-  }
 
   // 返回当前活动标签页最近的 HTTP 请求，供 AI 定位接口错误、状态码异常和静态资源问题。
   private async resetInterActionChangeJournal() {
@@ -5007,14 +4784,6 @@ export class BrowserSession {
   }
 
   // 切换到指定标签页，并把它设为后续操作的活动页。
-  async switchTab(index: number): Promise<BrowserActionResult> {
-    const previousGeneration = this.snapshotGeneration;
-    const pages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
-    const page = pages[index];
-    if (!page) return { ok: false, actual: `Tab ${index} not found.` };
-    await this.activateSessionPage(page);
-    return this.completeActionWithDomChanges(`Switched to tab ${index}: ${page.url()}`, previousGeneration);
-  }
 
   // 向当前焦点元素输入文本。
   async waitForPage(): Promise<BrowserActionResult> {
@@ -5327,31 +5096,6 @@ export class BrowserSession {
     }
   }
 
-  private async waitAfterAction() {
-    const settleMs = Number(process.env.BROWSER_ACTION_SETTLE_MS || 0);
-    const loadStateTimeoutMs = boundedPositiveIntegerEnv(
-      'BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS',
-      DEFAULT_BROWSER_ACTION_LOAD_STATE_TIMEOUT_MS,
-      100,
-      30000,
-    );
-    await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch(() => undefined);
-    await this.ensurePageGroup(this.activePage);
-    if (Number.isFinite(settleMs) && settleMs > 0) {
-      await this.waitForStableViewport(Math.min(Math.max(settleMs, 0), 2000));
-    }
-    const [manualNote, focusNote] = await Promise.all([this.manualVerificationNote(), this.focusNote()]);
-    return `${manualNote}${focusNote}`;
-  }
-
-  private async replaceFocusedText(text: string, clearFirst: boolean) {
-    if (clearFirst) {
-      await this.activePage.keyboard.press('Control+A').catch(() => undefined);
-      await this.activePage.keyboard.press('Backspace').catch(() => undefined);
-    }
-    if (text) await this.activePage.keyboard.type(text, { delay: 20 });
-  }
-
   private async insertFocusedTextFast(text: string, timings?: Record<string, number>): Promise<boolean> {
     if (!text) return true;
     // Do the value update inside the document first.  Unlike
@@ -5452,10 +5196,6 @@ export class BrowserSession {
     return ' 检测到页面需要人工验证，请等待用户在浏览器中完成后再继续。';
   }
 
-  private async focusNote() {
-    const focusedElement = await this.getFocusedElement();
-    return ` Focused element after action: ${focusedElement.summary}`;
-  }
 
   private async getFocusedElement(): Promise<FocusedElementSummary> {
     return this.activePage.evaluate(() => {
@@ -5524,56 +5264,6 @@ export class BrowserSession {
       hasFocus: false,
       summary: `Unable to inspect focused element: ${error instanceof Error ? error.message : String(error)}`,
     }));
-  }
-
-  private async candidateDomState(candidate: InteractiveCandidate): Promise<CandidateDomState | undefined> {
-    if (candidate.shadow) return undefined;
-    const target = candidate.framePath ? this.frameFromPath(candidate.framePath) : this.activePage.mainFrame();
-    if (!target) return undefined;
-    await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((pathValue) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      if (!runtime) return undefined;
-      let element = runtime.elementFromPath(pathValue);
-      if (!element) return undefined;
-      element = runtime.actionableTargetFor(element);
-      const field = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
-      const tagName = element.tagName.toLowerCase();
-      const text = (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160) || undefined;
-      return {
-        descriptor: runtime.descriptor(element),
-        tagName,
-        type: tagName === 'input' ? (field as HTMLInputElement).type : undefined,
-        valueLength: 'value' in field ? (field.value || '').length : undefined,
-        checked: 'checked' in field ? Boolean((field as HTMLInputElement).checked) : undefined,
-        selectedIndex: 'selectedIndex' in field ? Number((field as HTMLSelectElement).selectedIndex) : undefined,
-        ariaPressed: element.getAttribute('aria-pressed') || undefined,
-        ariaExpanded: element.getAttribute('aria-expanded') || undefined,
-        disabled: Boolean((field as HTMLInputElement).disabled || element.getAttribute('aria-disabled') === 'true'),
-        text,
-      };
-    }, candidate.path).catch(() => undefined);
-  }
-
-  private candidateDomStateSummary(state?: CandidateDomState) {
-    if (!state) return 'unavailable';
-    return [
-      state.descriptor,
-      state.tagName ? `tag=${state.tagName}` : '',
-      state.type ? `type=${state.type}` : '',
-      typeof state.valueLength === 'number' ? `valueLength=${state.valueLength}` : '',
-      typeof state.checked === 'boolean' ? `checked=${state.checked}` : '',
-      typeof state.selectedIndex === 'number' ? `selectedIndex=${state.selectedIndex}` : '',
-      state.ariaPressed ? `aria-pressed=${state.ariaPressed}` : '',
-      state.ariaExpanded ? `aria-expanded=${state.ariaExpanded}` : '',
-      state.disabled ? 'disabled=true' : '',
-      state.text ? `text="${state.text}"` : '',
-    ].filter(Boolean).join(', ');
-  }
-
-  private candidateDomStateChanged(before?: CandidateDomState, after?: CandidateDomState) {
-    if (!before || !after) return false;
-    return JSON.stringify(before) !== JSON.stringify(after);
   }
 
   private async detectManualVerification(): Promise<ManualVerificationDetails> {
@@ -5874,24 +5564,6 @@ export class BrowserSession {
     return all;
   }
 
-  private describeCandidate(candidate: InteractiveCandidate) {
-    const parts = [
-      candidate.tag,
-      candidate.role ? `role=${candidate.role}` : '',
-      candidate.name ? `name="${candidate.name.slice(0, 80)}"` : '',
-      candidate.signals?.length ? `signals=${candidate.signals.join('|')}` : '',
-      candidate.opensExternalApp ? `external-app=${candidate.externalAppProtocol || 'custom-protocol'}` : '',
-      candidate.href ? `href=${candidate.href.slice(0, 140)}` : '',
-      candidate.framePath ? `frame=${candidate.framePath}` : '',
-    ].filter(Boolean);
-    return parts.join(' ');
-  }
-
-  private externalAppCandidateNote(candidate: InteractiveCandidate) {
-    if (!candidate.opensExternalApp) return '';
-    const protocol = candidate.externalAppProtocol ? ` (${candidate.externalAppProtocol}:)` : '';
-    return ` This candidate is marked as an external-application link${protocol}; the browser URL/page may remain unchanged. No host process check is performed, so ok=true means the click was delivered as an external-app launch attempt, not that the native app launch was server-verifiable.`;
-  }
 
   private watchForPopup(page: Page) {
     const configuredWaitMs = this.options.popupWaitMs;
@@ -5987,56 +5659,6 @@ export class BrowserSession {
       if (!frame) return undefined;
     }
     return frame;
-  }
-
-  private resolveCapturedCandidatePoint(candidate: InteractiveCandidate, descriptor: string) {
-    const px = candidate.center?.x;
-    const py = candidate.center?.y;
-    if (typeof px !== 'number' || typeof py !== 'number') return undefined;
-    const viewport = this.lastScreenshotMetrics?.viewport;
-    if (viewport && (px < 0 || py < 0 || px >= viewport.width || py >= viewport.height)) return undefined;
-    return {
-      x: px,
-      y: py,
-      descriptor: `${descriptor} captured ${this.describeCandidate(candidate)}`,
-      offscreen: false,
-    };
-  }
-
-  private async resolveShadowCandidatePoint(candidate: InteractiveCandidate) {
-    const px = candidate.center?.x;
-    const py = candidate.center?.y;
-    if (typeof px !== 'number' || typeof py !== 'number') return undefined;
-    return this.activePage
-      .evaluate(({ x, y }) => {
-        if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return undefined;
-        function deepTopmost(pointX: number, pointY: number) {
-          let root: Document | ShadowRoot = document;
-          let found: Element | undefined;
-          for (let depth = 0; depth < 24; depth += 1) {
-            const stack = root.elementsFromPoint(pointX, pointY) as Element[];
-            let top: Element | undefined;
-            for (const item of stack) {
-              if (!item) continue;
-              if (item.closest && item.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) continue;
-              top = item;
-              break;
-            }
-            if (!top) break;
-            found = top;
-            const sub = (top as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
-            if (!sub) break;
-            root = sub;
-          }
-          return found;
-        }
-        const element = deepTopmost(x, y);
-        if (!element) return undefined;
-        const tag = element.tagName.toLowerCase();
-        const id = element.id ? `#${element.id}` : '';
-        return { x, y, descriptor: `${tag}${id}`, offscreen: false };
-      }, { x: px, y: py })
-      .catch(() => undefined);
   }
 
   private async elementHandleForDomPath(frame: Frame, pathValue: string, locatorCandidates: string[] = []) {
@@ -6779,11 +6401,6 @@ export class BrowserSession {
     return this.snapshotObservationViews(generation);
   }
 
-  currentSnapshotGenerationId() {
-    const generation = this.snapshotGeneration;
-    if (!generation || generation.page !== this.activePage || generation.url !== this.activePage.url()) return undefined;
-    return generation.id;
-  }
 
   private async readInteractionCounts(): Promise<BrowserInteractionCounts> {
     const frames = this.actionFrames();
@@ -8994,93 +8611,6 @@ export class BrowserSession {
     return clip.right > clip.left && clip.bottom > clip.top ? clip : undefined;
   }
 
-  private async readRawDomTree() {
-    const frameLimit = numericLimitFromEnv('DOM_RAW_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
-    const mainFrame = this.activePage.mainFrame();
-    const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
-    const parts: string[] = [];
-
-    for (const frame of frames) {
-      const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
-      if (frame !== mainFrame && framePath === undefined) continue;
-      const raw = await this.readFrameRawDom(frame).catch(() => undefined);
-      if (!raw) continue;
-      if (framePath) {
-        parts.push(`<!-- iframe ${framePath}${frame.url() ? ` url="${frame.url().replace(/--/g, '-')}"` : ''} -->\n${raw}`);
-      } else {
-        parts.push(raw);
-      }
-    }
-
-    return parts.join('\n\n') || '[empty raw DOM]';
-  }
-
-  private async readFrameRawDom(target: Page | Frame) {
-    return target.evaluate(() => {
-      const agentOverlaySelector = '#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__';
-      const voidTags = new Set([
-        'area',
-        'base',
-        'br',
-        'col',
-        'embed',
-        'hr',
-        'img',
-        'input',
-        'link',
-        'meta',
-        'param',
-        'source',
-        'track',
-        'wbr',
-      ]);
-      const rawTextTags = new Set(['script', 'style']);
-      const escapeText = (value: string) => value
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;');
-      const escapeAttribute = (value: string) => escapeText(value).replaceAll('"', '&quot;');
-
-      const serializeNode = (node: Node, parentTag = ''): string => {
-        if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
-          const docType = node as DocumentType;
-          const publicId = docType.publicId ? ` PUBLIC "${escapeAttribute(docType.publicId)}"` : '';
-          const systemId = docType.systemId ? `${publicId ? '' : ' SYSTEM'} "${escapeAttribute(docType.systemId)}"` : '';
-          return `<!DOCTYPE ${docType.name}${publicId}${systemId}>`;
-        }
-        if (node.nodeType === Node.TEXT_NODE) {
-          const value = node.nodeValue || '';
-          return rawTextTags.has(parentTag) ? value : escapeText(value);
-        }
-        if (node.nodeType === Node.COMMENT_NODE) {
-          return `<!--${(node.nodeValue || '').replace(/--/g, '-')}-->`;
-        }
-        if (node.nodeType !== Node.ELEMENT_NODE) return '';
-
-        const element = node as Element;
-        if (element.closest(agentOverlaySelector)) return '';
-
-        const tag = element.tagName.toLowerCase();
-        const attributes = Array.from(element.attributes)
-          .map((attribute) => `${attribute.name}="${escapeAttribute(attribute.value)}"`)
-          .join(' ');
-        const openTag = attributes ? `<${tag} ${attributes}>` : `<${tag}>`;
-        if (voidTags.has(tag)) return openTag;
-
-        const shadowRoot = element.shadowRoot;
-        const shadowDom = shadowRoot
-          ? `<template shadowrootmode="${shadowRoot.mode}">${Array.from(shadowRoot.childNodes).map((child) => serializeNode(child, tag)).join('')}</template>`
-          : '';
-        const children = Array.from(element.childNodes).map((child) => serializeNode(child, tag)).join('');
-        return `${openTag}${shadowDom}${children}</${tag}>`;
-      };
-
-      return [
-        document.doctype ? serializeNode(document.doctype) : '',
-        document.documentElement ? serializeNode(document.documentElement) : '',
-      ].filter(Boolean).join('\n');
-    });
-  }
 
   private async readVisibleDomSnapshot(
     target: Page | Frame,
@@ -9220,560 +8750,6 @@ export class BrowserSession {
     };
   }
 
-  private async drawCandidateOverlay(candidates: InteractiveCandidate[], markersOnly = false, scrollAreas: ScrollableArea[] = []) {
-    const visible = candidates;
-    const visibleScrollAreas = scrollAreas.slice(0, Math.max(1, Number(process.env.SCREENSHOT_SCROLL_AREA_LABEL_LIMIT || 12)));
-    await this.activePage.evaluate(({ items, scrollAreas: areas, markersOnly: hidePageContent }) => {
-      document.getElementById('__ai_candidate_overlay__')?.remove();
-      const overlay = document.createElement('div');
-      overlay.id = '__ai_candidate_overlay__';
-      Object.assign(overlay.style, {
-        position: 'fixed',
-        inset: '0',
-        pointerEvents: 'none',
-        zIndex: '2147483647',
-        margin: '0',
-        padding: '0',
-        background: hidePageContent ? '#ffffff' : 'transparent',
-      });
-
-      type Point = { x: number; y: number };
-      type LabelBox = { left: number; top: number; right: number; bottom: number };
-      type TargetBox = LabelBox & { index: number };
-      type Leader = { start: Point; end: Point };
-      type LeaderBox = LabelBox & { segment: Leader };
-      type LabelLayout = LabelBox & {
-        external: boolean;
-        compact: boolean;
-        leader?: Leader;
-      };
-      const placedLabels: LabelBox[] = [];
-      const placedLeaders: Leader[] = [];
-      const fragment = document.createDocumentFragment();
-      const spatialCellSize = Math.max(48, Math.min(128, Math.round(Math.max(window.innerWidth, window.innerHeight) / 14)));
-      function cellsFor(box: LabelBox) {
-        const keys: string[] = [];
-        const left = Math.floor(box.left / spatialCellSize);
-        const right = Math.floor(Math.max(box.left, box.right) / spatialCellSize);
-        const top = Math.floor(box.top / spatialCellSize);
-        const bottom = Math.floor(Math.max(box.top, box.bottom) / spatialCellSize);
-        for (let y = top; y <= bottom; y += 1) {
-          for (let x = left; x <= right; x += 1) {
-            keys.push(`${x}:${y}`);
-          }
-        }
-        return keys;
-      }
-      function createSpatialIndex<T extends LabelBox>() {
-        const map = new Map<string, T[]>();
-        return {
-          add(item: T) {
-            for (const key of cellsFor(item)) {
-              const bucket = map.get(key);
-              if (bucket) bucket.push(item);
-              else map.set(key, [item]);
-            }
-          },
-          nearby(box: LabelBox) {
-            const seen = new Set<T>();
-            const results: T[] = [];
-            for (const key of cellsFor(box)) {
-              for (const item of map.get(key) || []) {
-                if (seen.has(item)) continue;
-                seen.add(item);
-                results.push(item);
-              }
-            }
-            return results;
-          },
-        };
-      }
-      const placedLabelIndex = createSpatialIndex<LabelBox>();
-      const placedLeaderIndex = createSpatialIndex<LeaderBox>();
-      const targetBoxIndex = createSpatialIndex<TargetBox>();
-      const targetBoxes: TargetBox[] = items
-        .map((item, index) => ({ rect: item.rect, index }))
-        .filter(({ rect }) => rect && rect.width > 0 && rect.height > 0)
-        .map(({ rect, index }) => ({
-          index,
-          left: Math.max(0, rect.x),
-          top: Math.max(0, rect.y),
-          right: Math.min(window.innerWidth, rect.x + rect.width),
-          bottom: Math.min(window.innerHeight, rect.y + rect.height),
-        }));
-      for (const target of targetBoxes) targetBoxIndex.add(target);
-      function overlaps(a: LabelBox, b: LabelBox) {
-        return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-      }
-      function expanded(box: LabelBox, padding: number) {
-        return {
-          left: box.left - padding,
-          top: box.top - padding,
-          right: box.right + padding,
-          bottom: box.bottom + padding,
-        };
-      }
-      function leaderBounds(leader: Leader, padding = 0): LeaderBox {
-        return {
-          left: Math.min(leader.start.x, leader.end.x) - padding,
-          top: Math.min(leader.start.y, leader.end.y) - padding,
-          right: Math.max(leader.start.x, leader.end.x) + padding,
-          bottom: Math.max(leader.start.y, leader.end.y) + padding,
-          segment: leader,
-        };
-      }
-      function placeLabel(box: LabelBox) {
-        placedLabels.push(box);
-        placedLabelIndex.add(box);
-      }
-      function placeLeader(leader: Leader) {
-        placedLeaders.push(leader);
-        placedLeaderIndex.add(leaderBounds(leader, 2));
-      }
-      function clamp(value: number, min: number, max: number) {
-        return Math.max(min, Math.min(max, value));
-      }
-      function pointInside(box: LabelBox, point: Point) {
-        return point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom;
-      }
-      function drawScrollArea(area: {
-        id: string;
-        rect: { x: number; y: number; width: number; height: number };
-        scroll: { canScrollUp: boolean; canScrollDown: boolean; canScrollLeft: boolean; canScrollRight: boolean };
-      }) {
-        if (!area.rect || area.rect.width <= 0 || area.rect.height <= 0) return;
-        const color = '#059669';
-        const boxLeft = clamp(area.rect.x, 1, Math.max(1, window.innerWidth - 2));
-        const boxTop = clamp(area.rect.y, 1, Math.max(1, window.innerHeight - 2));
-        const boxWidth = Math.max(1, Math.min(area.rect.width, window.innerWidth - boxLeft - 1));
-        const boxHeight = Math.max(1, Math.min(area.rect.height, window.innerHeight - boxTop - 1));
-        const box = document.createElement('div');
-        Object.assign(box.style, {
-          position: 'absolute',
-          left: `${boxLeft}px`,
-          top: `${boxTop}px`,
-          width: `${boxWidth}px`,
-          height: `${boxHeight}px`,
-          border: `3px dashed ${color}`,
-          borderRadius: '4px',
-          boxSizing: 'border-box',
-          background: 'transparent',
-          pointerEvents: 'none',
-        });
-        const label = document.createElement('div');
-        const directions = [
-          area.scroll.canScrollUp ? '↑' : '',
-          area.scroll.canScrollDown ? '↓' : '',
-          area.scroll.canScrollLeft ? '←' : '',
-          area.scroll.canScrollRight ? '→' : '',
-        ].filter(Boolean).join('');
-        label.textContent = `${area.id}${directions ? ` ${directions}` : ''}`;
-        Object.assign(label.style, {
-          position: 'absolute',
-          left: `${clamp(boxLeft + 4, 1, Math.max(1, window.innerWidth - 90))}px`,
-          top: `${clamp(boxTop + 4, 1, Math.max(1, window.innerHeight - 20))}px`,
-          minWidth: '26px',
-          height: '22px',
-          padding: '0 6px',
-          borderRadius: '4px',
-          background: color,
-          color: '#fff',
-          border: '1px solid #fff',
-          boxSizing: 'border-box',
-          font: '900 13px/20px Arial, sans-serif',
-          textAlign: 'center',
-          boxShadow: '0 2px 6px rgba(0,0,0,0.28)',
-          pointerEvents: 'none',
-        });
-        fragment.appendChild(box);
-        fragment.appendChild(label);
-      }
-      function segmentIntersectsBox(segment: Leader, box: LabelBox, padding = 0) {
-        const target = expanded(box, padding);
-        if (pointInside(target, segment.start) || pointInside(target, segment.end)) return true;
-        const dx = segment.end.x - segment.start.x;
-        const dy = segment.end.y - segment.start.y;
-        let minT = 0;
-        let maxT = 1;
-        const checks: Array<[number, number]> = [
-          [-dx, segment.start.x - target.left],
-          [dx, target.right - segment.start.x],
-          [-dy, segment.start.y - target.top],
-          [dy, target.bottom - segment.start.y],
-        ];
-        for (const [p, q] of checks) {
-          if (Math.abs(p) < 0.0001) {
-            if (q < 0) return false;
-            continue;
-          }
-          const ratio = q / p;
-          if (p < 0) minT = Math.max(minT, ratio);
-          else maxT = Math.min(maxT, ratio);
-          if (minT > maxT) return false;
-        }
-        return true;
-      }
-      function segmentsIntersect(a: Leader, b: Leader) {
-        function orientation(p: Point, q: Point, r: Point) {
-          return (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
-        }
-        const o1 = orientation(a.start, a.end, b.start);
-        const o2 = orientation(a.start, a.end, b.end);
-        const o3 = orientation(b.start, b.end, a.start);
-        const o4 = orientation(b.start, b.end, a.end);
-        return o1 * o2 < 0 && o3 * o4 < 0;
-      }
-      function canPlaceLabel(box: LabelBox, avoidTargets: boolean, currentTargetIndex: number) {
-        const padded = expanded(box, 1);
-        if (placedLabelIndex.nearby(padded).some((placed) => overlaps(padded, expanded(placed, 1)))) return false;
-        if (placedLeaderIndex.nearby(padded).some((leader) => segmentIntersectsBox(leader.segment, padded))) return false;
-        if (
-          avoidTargets &&
-          targetBoxIndex.nearby(padded).some(
-            (target) => target.index !== currentTargetIndex && overlaps(padded, expanded(target, 1)),
-          )
-        ) return false;
-        return true;
-      }
-      function canPlaceExternal(box: LabelBox, leader: Leader, currentTargetIndex: number) {
-        if (!canPlaceLabel(box, true, currentTargetIndex)) return false;
-        const leaderBox = leaderBounds(leader, 2);
-        if (
-          targetBoxIndex.nearby(leaderBox).some(
-            (target) => target.index !== currentTargetIndex && segmentIntersectsBox(leader, target, 1),
-          )
-        ) return false;
-        if (placedLabelIndex.nearby(leaderBox).some((placed) => segmentIntersectsBox(leader, placed, 1))) return false;
-        if (placedLeaderIndex.nearby(leaderBox).some((placed) => segmentsIntersect(leader, placed.segment))) return false;
-        return true;
-      }
-      function isDenseSmallTarget(rect: { x: number; y: number; width: number; height: number }) {
-        if (rect.width > 56 || rect.height > 36) return false;
-        const current = {
-          left: rect.x,
-          top: rect.y,
-          right: rect.x + rect.width,
-          bottom: rect.y + rect.height,
-        };
-        let nearby = 0;
-        for (const target of targetBoxIndex.nearby(expanded(current, 6))) {
-          const same =
-            Math.abs(target.left - current.left) < 0.5 &&
-            Math.abs(target.top - current.top) < 0.5 &&
-            Math.abs(target.right - current.right) < 0.5 &&
-            Math.abs(target.bottom - current.bottom) < 0.5;
-          if (same) continue;
-          const gapX = Math.max(0, Math.max(target.left - current.right, current.left - target.right));
-          const gapY = Math.max(0, Math.max(target.top - current.bottom, current.top - target.bottom));
-          if (gapX <= 6 && gapY <= 6) nearby += 1;
-          if (nearby >= 2) return true;
-        }
-        return false;
-      }
-      function edgePoint(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
-        const rectCenterX = rect.x + rect.width / 2;
-        const rectCenterY = rect.y + rect.height / 2;
-        const boxCenterX = (box.left + box.right) / 2;
-        const boxCenterY = (box.top + box.bottom) / 2;
-        const dx = boxCenterX - rectCenterX;
-        const dy = boxCenterY - rectCenterY;
-        if (Math.abs(dx / Math.max(1, rect.width)) > Math.abs(dy / Math.max(1, rect.height))) {
-          return {
-            x: dx >= 0 ? rect.x + rect.width : rect.x,
-            y: clamp(boxCenterY, rect.y, rect.y + rect.height),
-          };
-        }
-        return {
-          x: clamp(boxCenterX, rect.x, rect.x + rect.width),
-          y: dy >= 0 ? rect.y + rect.height : rect.y,
-        };
-      }
-      function labelEdgePoint(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
-        const rectCenterX = rect.x + rect.width / 2;
-        const rectCenterY = rect.y + rect.height / 2;
-        const boxCenterX = (box.left + box.right) / 2;
-        const boxCenterY = (box.top + box.bottom) / 2;
-        const dx = rectCenterX - boxCenterX;
-        const dy = rectCenterY - boxCenterY;
-        if (Math.abs(dx / Math.max(1, box.right - box.left)) > Math.abs(dy / Math.max(1, box.bottom - box.top))) {
-          return {
-            x: dx >= 0 ? box.right : box.left,
-            y: clamp(rectCenterY, box.top, box.bottom),
-          };
-        }
-        return {
-          x: clamp(rectCenterX, box.left, box.right),
-          y: dy >= 0 ? box.bottom : box.top,
-        };
-      }
-      function leaderFor(rect: { x: number; y: number; width: number; height: number }, box: LabelBox) {
-        const start = edgePoint(rect, box);
-        const end = labelEdgePoint(rect, box);
-        const dx = end.x - start.x;
-        const dy = end.y - start.y;
-        const length = Math.max(1, Math.hypot(dx, dy));
-        const outsideGap = Math.min(2, length / 2);
-        return {
-          start: {
-            x: start.x + (dx / length) * outsideGap,
-            y: start.y + (dy / length) * outsideGap,
-          },
-          end,
-        };
-      }
-      function externalOptions(
-        rect: { x: number; y: number; width: number; height: number },
-        labelWidth: number,
-        labelHeight: number,
-      ) {
-        const centerX = rect.x + rect.width / 2;
-        const centerY = rect.y + rect.height / 2;
-        const distances = [6, 16, 28, 44, 64];
-        const options: Array<{ left: number; top: number }> = [];
-        for (const gap of distances) {
-          options.push(
-            { left: rect.x + rect.width + gap, top: centerY - labelHeight / 2 },
-            { left: rect.x - labelWidth - gap, top: centerY - labelHeight / 2 },
-            { left: centerX - labelWidth / 2, top: rect.y - labelHeight - gap },
-            { left: centerX - labelWidth / 2, top: rect.y + rect.height + gap },
-          );
-        }
-        return options;
-      }
-      function labelPosition(
-        rect: { x: number; y: number; width: number; height: number },
-        normalLabelWidth: number,
-        normalLabelHeight: number,
-        compactLabelWidth: number,
-        compactLabelHeight: number,
-        denseSmall: boolean,
-        currentTargetIndex: number,
-      ): LabelLayout {
-        const safeInset = 6;
-        const minLeft = Math.min(safeInset, Math.max(0, window.innerWidth - normalLabelWidth));
-        const minTop = Math.min(safeInset, Math.max(0, window.innerHeight - normalLabelHeight));
-        const maxLeft = Math.max(minLeft, window.innerWidth - normalLabelWidth - safeInset);
-        const maxTop = Math.max(minTop, window.innerHeight - normalLabelHeight - safeInset);
-        const currentTarget = {
-          left: Math.max(0, rect.x),
-          top: Math.max(0, rect.y),
-          right: Math.min(window.innerWidth, rect.x + rect.width),
-          bottom: Math.min(window.innerHeight, rect.y + rect.height),
-        };
-        const currentTargetArea = Math.max(1, (currentTarget.right - currentTarget.left) * (currentTarget.bottom - currentTarget.top));
-        const labelArea = normalLabelWidth * normalLabelHeight;
-        const preferExternal =
-          denseSmall ||
-          rect.width < normalLabelWidth + 10 ||
-          rect.height < normalLabelHeight + 8 ||
-          labelArea / currentTargetArea > 0.16;
-        const external = externalOptions(rect, normalLabelWidth, normalLabelHeight);
-        const internal = [
-          { left: rect.x + rect.width - normalLabelWidth, top: rect.y + rect.height - normalLabelHeight },
-          { left: rect.x + rect.width - normalLabelWidth, top: rect.y },
-          { left: rect.x, top: rect.y + rect.height - normalLabelHeight },
-          { left: rect.x, top: rect.y },
-        ];
-
-        if (preferExternal) {
-          for (const option of external) {
-            if (
-              option.left < safeInset ||
-              option.top < safeInset ||
-              option.left + normalLabelWidth > window.innerWidth - safeInset ||
-              option.top + normalLabelHeight > window.innerHeight - safeInset
-            ) continue;
-            const box = {
-              left: option.left,
-              top: option.top,
-              right: option.left + normalLabelWidth,
-              bottom: option.top + normalLabelHeight,
-            };
-            const leader = leaderFor(rect, box);
-            if (canPlaceExternal(box, leader, currentTargetIndex)) {
-              placeLabel(box);
-              placeLeader(leader);
-              return { ...box, external: true, compact: false, leader };
-            }
-          }
-        }
-
-        if (!denseSmall) {
-          const preferred = preferExternal ? internal : [...internal, ...external];
-          for (const option of preferred) {
-            const left = clamp(option.left, 0, maxLeft);
-            const top = clamp(option.top, 0, maxTop);
-            const box = {
-              left,
-              top,
-              right: left + normalLabelWidth,
-              bottom: top + normalLabelHeight,
-            };
-            const labelOverlapsCurrentTarget = overlaps(box, currentTarget);
-            if (!labelOverlapsCurrentTarget) {
-              const leader = leaderFor(rect, box);
-              if (!canPlaceExternal(box, leader, currentTargetIndex)) continue;
-              placeLabel(box);
-              placeLeader(leader);
-              return { ...box, external: true, compact: false, leader };
-            }
-            if (!canPlaceLabel(box, false, currentTargetIndex)) continue;
-            placeLabel(box);
-            return { ...box, external: false, compact: false };
-          }
-        }
-
-        const compactMinLeft = Math.min(1, Math.max(0, window.innerWidth - compactLabelWidth));
-        const compactMinTop = Math.min(1, Math.max(0, window.innerHeight - compactLabelHeight));
-        const compactMaxLeft = Math.max(compactMinLeft, window.innerWidth - compactLabelWidth - 1);
-        const compactMaxTop = Math.max(compactMinTop, window.innerHeight - compactLabelHeight - 1);
-        const compactInternal = [
-          { left: rect.x + rect.width - compactLabelWidth - 1, top: rect.y + rect.height - compactLabelHeight - 1 },
-          { left: rect.x + rect.width - compactLabelWidth - 1, top: rect.y + 1 },
-          { left: rect.x + 1, top: rect.y + rect.height - compactLabelHeight - 1 },
-          { left: rect.x + 1, top: rect.y + 1 },
-        ];
-        for (const option of compactInternal) {
-          const left = clamp(option.left, compactMinLeft, compactMaxLeft);
-          const top = clamp(option.top, compactMinTop, compactMaxTop);
-          const box = {
-            left,
-            top,
-            right: left + compactLabelWidth,
-            bottom: top + compactLabelHeight,
-          };
-          if (canPlaceLabel(box, false, currentTargetIndex)) {
-            placeLabel(box);
-            return { ...box, external: false, compact: true };
-          }
-        }
-
-        const left = clamp(rect.x + rect.width - compactLabelWidth - 1, compactMinLeft, compactMaxLeft);
-        const top = clamp(rect.y + rect.height - compactLabelHeight - 1, compactMinTop, compactMaxTop);
-        const finalBox = {
-          left,
-          top,
-          right: left + compactLabelWidth,
-          bottom: top + compactLabelHeight,
-        };
-        placeLabel(finalBox);
-        return { ...finalBox, external: false, compact: true };
-      }
-      function drawLeader(leader: Leader, color: string, width = 1) {
-        const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        line.setAttribute('x1', String(leader.start.x));
-        line.setAttribute('y1', String(leader.start.y));
-        line.setAttribute('x2', String(leader.end.x));
-        line.setAttribute('y2', String(leader.end.y));
-        line.setAttribute('stroke', color);
-        line.setAttribute('stroke-width', String(width));
-        line.setAttribute('stroke-linecap', 'butt');
-        line.setAttribute('vector-effect', 'non-scaling-stroke');
-        svg.appendChild(line);
-      }
-
-      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      Object.assign(svg.style, {
-        position: 'absolute',
-        left: '0',
-        top: '0',
-        width: '100%',
-        height: '100%',
-        overflow: 'visible',
-      });
-      svg.setAttribute('width', String(window.innerWidth));
-      svg.setAttribute('height', String(window.innerHeight));
-      fragment.appendChild(svg);
-
-      for (const area of areas) {
-        drawScrollArea(area);
-      }
-
-      for (let itemIndex = 0; itemIndex < items.length; itemIndex += 1) {
-        const item = items[itemIndex];
-        const rect = item.rect;
-        if (!rect || rect.width <= 0 || rect.height <= 0) continue;
-
-        const box = document.createElement('div');
-        const color = '#2563eb';
-        const boxLeft = clamp(rect.x, 1, Math.max(1, window.innerWidth - 2));
-        const boxTop = clamp(rect.y, 1, Math.max(1, window.innerHeight - 2));
-        const boxWidth = Math.max(1, Math.min(rect.width, window.innerWidth - boxLeft - 1));
-        const boxHeight = Math.max(1, Math.min(rect.height, window.innerHeight - boxTop - 1));
-        Object.assign(box.style, {
-          position: 'absolute',
-          left: `${boxLeft}px`,
-          top: `${boxTop}px`,
-          width: `${boxWidth}px`,
-          height: `${boxHeight}px`,
-          border: `2px solid ${color}`,
-          borderRadius: '3px',
-          boxSizing: 'border-box',
-          background: 'transparent',
-          boxShadow: 'none',
-        });
-
-        const label = document.createElement('div');
-        label.textContent = item.id;
-        const denseSmall = isDenseSmallTarget(rect);
-        // 标签只保留白字和黑色描边阴影，尽量减少对页面文字的遮挡。
-        const normalLabelWidth = Math.max(16, item.id.length * 9 + 4);
-        const normalLabelHeight = 16;
-        const compactLabelWidth = Math.max(9, Math.min(normalLabelWidth, item.id.length * 5 + 3, Math.max(9, rect.width - 1)));
-        const compactLabelHeight = Math.max(9, Math.min(11, Math.max(9, rect.height - 1)));
-        const labelBox = labelPosition(
-          rect,
-          normalLabelWidth,
-          normalLabelHeight,
-          compactLabelWidth,
-          compactLabelHeight,
-          denseSmall,
-          itemIndex,
-        );
-        const labelWidth = labelBox.right - labelBox.left;
-        const labelHeight = labelBox.bottom - labelBox.top;
-        if (labelBox.external && labelBox.leader) {
-          drawLeader(labelBox.leader, color, 2);
-        }
-        Object.assign(label.style, {
-          position: 'absolute',
-          left: `${labelBox.left}px`,
-          top: `${labelBox.top}px`,
-          width: `${labelWidth}px`,
-          height: `${labelHeight}px`,
-          padding: '0',
-          boxSizing: 'border-box',
-          background: 'transparent',
-          color: '#fff',
-          border: '0',
-          borderRadius: '0',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          font: labelBox.compact
-            ? `900 ${item.id.length >= 3 ? 8 : 9}px/${labelHeight}px Arial, sans-serif`
-            : `900 14px/${labelHeight}px Arial, sans-serif`,
-          letterSpacing: '0',
-          textAlign: 'center',
-          boxShadow: 'none',
-          WebkitTextStroke: '2px rgba(0,0,0,0.9)',
-          paintOrder: 'stroke fill',
-          textShadow: [
-            '0 1px 2px rgba(0,0,0,0.95)',
-            '1px 0 2px rgba(0,0,0,0.95)',
-            '-1px 0 2px rgba(0,0,0,0.95)',
-            '0 -1px 2px rgba(0,0,0,0.95)',
-          ].join(', '),
-        });
-
-        fragment.appendChild(box);
-        fragment.appendChild(label);
-      }
-
-      overlay.appendChild(fragment);
-      document.documentElement.appendChild(overlay);
-    }, { items: visible, scrollAreas: visibleScrollAreas, markersOnly }).catch(() => undefined);
-  }
 
   private async removeCandidateOverlay() {
     await this.activePage

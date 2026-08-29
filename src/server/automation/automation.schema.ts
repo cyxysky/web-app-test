@@ -131,16 +131,11 @@ export type AutomationRunStepRecord = z.infer<typeof automationRunStepRecordSche
 export type AutomationRunLogEntry = z.infer<typeof automationRunLogEntrySchema>;
 export type AutomationRunLease = z.infer<typeof automationRunLeaseSchema>;
 export type AutomationRunRecord = z.infer<typeof automationRunRecordSchema>;
-export type AutomationScheduleRecurrence = z.infer<typeof automationScheduleRecurrenceSchema>;
-export type AutomationScheduleOverlap = z.infer<typeof automationScheduleOverlapSchema>;
-export type AutomationScheduleMisfire = z.infer<typeof automationScheduleMisfireSchema>;
 export type AutomationScheduleRecord = z.infer<typeof automationScheduleRecordSchema>;
 
 export type CreateAutomationCaseInput = Omit<AutomationCaseRecord, 'id' | 'createdAt' | 'updatedAt'> & {
   id?: string;
 };
-
-export type UpdateAutomationCaseInput = Partial<Omit<AutomationCaseRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt'>>;
 
 export type CreateAutomationRunInput = Omit<
   AutomationRunRecord,
@@ -173,11 +168,4 @@ export type UpdateAutomationRunInput = Partial<Omit<
 
 export type CreateAutomationScheduleInput = Omit<AutomationScheduleRecord, 'id' | 'createdAt' | 'updatedAt'> & {
   id?: string;
-};
-
-export type UpdateAutomationScheduleInput = Partial<Omit<
-  AutomationScheduleRecord,
-  'id' | 'userId' | 'createdAt' | 'updatedAt' | 'lastRunAt'
->> & {
-  lastRunAt?: string | null;
 };

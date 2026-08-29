@@ -417,23 +417,6 @@ export function getLoginAccountById(id: string, userId?: unknown) {
   return row ? metadataFromRow(row) : undefined;
 }
 
-export function findLoginAccountByDomainUsername(input: {
-  userId?: unknown;
-  domain: unknown;
-  username: unknown;
-}) {
-  ensureLoginAccountUserMigration();
-  const userId = normalizeLoginAccountUserId(input.userId);
-  const domain = normalizeLoginAccountDomain(input.domain);
-  const username = normalizeUsername(input.username);
-  const row = getSqliteDatabase().prepare(`
-    SELECT ${metadataColumns}
-    FROM login_account
-    WHERE user_id = ? AND domain = ? AND username = ?
-  `).get(userId, domain, username) as LoginAccountRow | undefined;
-  return row ? metadataFromRow(row) : undefined;
-}
-
 export function createLoginAccount(input: CreateLoginAccountInput) {
   ensureLoginAccountUserMigration();
   const userId = normalizeLoginAccountUserId(input.userId);
@@ -540,82 +523,6 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
       WHERE id = ? AND user_id = ?
     `).get(previous.id, previous.user_id) as LoginAccountRow;
     return metadataFromRow(updated);
-  });
-}
-
-export function importLoginAccounts(items: CreateLoginAccountInput[], userId?: unknown) {
-  ensureLoginAccountUserMigration();
-  const normalizedUserId = normalizeLoginAccountUserId(userId);
-  return runSqliteTransaction((database) => {
-    const find = database.prepare(`
-      SELECT * FROM login_account
-      WHERE user_id = ? AND domain = ? AND username = ?
-    `);
-    const insert = database.prepare(`
-      INSERT INTO login_account (
-        id, user_id, shared, domain, username, label, login_url, status,
-        password_envelope, created_at, updated_at, last_used_at, use_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
-    `);
-    const update = database.prepare(`
-      UPDATE login_account
-      SET shared = ?, label = ?, login_url = ?, status = ?, password_envelope = ?, updated_at = ?
-      WHERE id = ? AND user_id = ?
-    `);
-    let created = 0;
-    let updated = 0;
-    for (const input of items) {
-      const domain = normalizeLoginAccountDomain(input.domain);
-      const username = normalizeUsername(input.username);
-      const label = normalizeLabel(input.label, username);
-      const loginUrl = normalizeLoginUrl(input.loginUrl, domain);
-      const status = normalizeStatus(input.status);
-      const shared = input.shared === true;
-      const timestamp = now();
-      const previous = find.get(normalizedUserId, domain, username) as LoginAccountRow | undefined;
-      if (previous) {
-        const passwordEnvelope = encryptPassword(input.password, {
-          id: previous.id,
-          user_id: previous.user_id,
-          domain,
-          username,
-        });
-        update.run(
-          shared ? 1 : 0,
-          label,
-          loginUrl,
-          status,
-          passwordEnvelope,
-          timestamp,
-          previous.id,
-          previous.user_id,
-        );
-        updated += 1;
-        continue;
-      }
-      const id = `account_${randomUUID()}`;
-      const passwordEnvelope = encryptPassword(input.password, {
-        id,
-        user_id: normalizedUserId,
-        domain,
-        username,
-      });
-      insert.run(
-        id,
-        normalizedUserId,
-        shared ? 1 : 0,
-        domain,
-        username,
-        label,
-        loginUrl,
-        status,
-        passwordEnvelope,
-        timestamp,
-        timestamp,
-      );
-      created += 1;
-    }
-    return { created, updated };
   });
 }
 
@@ -732,22 +639,4 @@ export function resolveLoginAccountCredentialById(id: string, userId?: unknown, 
   const normalizedUserId = normalizeLoginAccountUserId(userId);
   const row = fullRowById(id.trim(), normalizedUserId);
   return row ? resolveCredentialRow(row, options) : undefined;
-}
-
-export function resolveLoginAccountCredential(input: {
-  userId?: unknown;
-  domain: unknown;
-  username: unknown;
-}) {
-  ensureLoginAccountUserMigration();
-  const userId = normalizeLoginAccountUserId(input.userId);
-  const domain = normalizeLoginAccountDomain(input.domain);
-  const username = normalizeUsername(input.username);
-  const row = getSqliteDatabase().prepare(`
-    SELECT * FROM login_account
-    WHERE (user_id = ? OR shared = 1) AND domain = ? AND username = ?
-    ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
-    LIMIT 1
-  `).get(userId, domain, username, userId) as LoginAccountRow | undefined;
-  return row ? resolveCredentialRow(row) : undefined;
 }

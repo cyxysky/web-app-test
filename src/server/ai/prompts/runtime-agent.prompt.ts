@@ -1,19 +1,3 @@
-type ManualVerificationPromptContext = {
-  manualVerification?: {
-    detected?: boolean;
-    captchaFields?: unknown[];
-  } | null;
-};
-
-type CompletionVerificationPromptInput = {
-  requirement: string;
-  attachScreenshot: boolean;
-  proposedClaim: unknown;
-  currentUrl: string;
-  manualVerification?: unknown;
-  recentProgressNotes: string[];
-};
-
 export function currentRuntimeTimePromptLine(now = new Date()) {
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
   const localTime = new Intl.DateTimeFormat('zh-CN', {
@@ -22,61 +6,6 @@ export function currentRuntimeTimePromptLine(now = new Date()) {
     timeZone,
   }).format(now);
   return `Current time: ${localTime} (${timeZone}; ISO ${now.toISOString()}).`;
-}
-
-export function buildCompletionPromptLines(usesScreenshot: boolean) {
-  const evidence = usesScreenshot ? 'screenshot' : 'textual page context / candidates / DOM / URL / focus';
-  return [
-    'Completion rules:',
-    `- done=true only when EVERY requirement clause is proven by ${evidence}. Partial progress is not completion.`,
-    '- If anything is still missing or uncertain, call one more tool instead of finishing.',
-    '- status=blocked only for manual verification/security/login wait; blocked must use done=false.',
-    '- status=failed only when the requirement is clearly impossible or failed end-to-end.',
-  ];
-}
-
-export function buildVerificationPromptLines(pageContext: ManualVerificationPromptContext, usesScreenshot: boolean) {
-  const mv = pageContext.manualVerification;
-  if (!mv?.detected && !mv?.captchaFields?.length) return [];
-  const source = usesScreenshot ? 'screenshot' : 'page context';
-  return [
-    'Verification rules:',
-    `- Verification scan: ${JSON.stringify(mv)}`,
-    '- If captchaAppearsFilled=true, do not block; submit/login and continue.',
-    `- If ${source} shows an empty captcha/OTP/security challenge that cannot proceed, return done=false status=blocked.`,
-  ];
-}
-
-export function buildCompletionVerificationPrompt(input: CompletionVerificationPromptInput) {
-  const { requirement, attachScreenshot, proposedClaim, currentUrl, manualVerification, recentProgressNotes } = input;
-  return [
-    'You are an independent completion judge. The executor agent claims the user requirement is FULLY complete.',
-    attachScreenshot
-      ? 'Verify using ONLY the attached viewport screenshot and the requirement text. Be strict: partial progress is NOT complete.'
-      : 'Verify using ONLY the textual browser context and the requirement text. No screenshot image is attached because visual mode is disabled. Be strict: partial progress is NOT complete.',
-    '',
-    `User requirement (every clause must be visibly satisfied for verified=true):\n${requirement}`,
-    '',
-    'Executor claim:',
-    JSON.stringify(proposedClaim, null, 2),
-    '',
-    `Current URL: ${currentUrl}`,
-    `Verification scan JSON: ${JSON.stringify(manualVerification ?? null)}`,
-    `Recent progress notes (oldest first):\n${recentProgressNotes.join('\n') || '[none]'}`,
-    '',
-    'Rules:',
-    attachScreenshot
-      ? '- verified=true only if the screenshot clearly proves ALL parts of the requirement are done.'
-      : '- verified=true only if the textual browser context clearly proves ALL parts of the requirement are done.',
-    '- Empty captcha/OTP, login not finished, or waiting for user input -> verified=false, status="blocked".',
-    '- Wrong page or missing required outcome -> verified=false; set remainingWork to concrete next steps.',
-    '- If the requirement is visibly impossible, verified=true with status="failed" is allowed.',
-    '- summary and remainingWork must be written in Chinese.',
-    '',
-    'Reply with JSON only (no tools):',
-    '{ "verified": boolean, "status": "passed"|"failed"|"blocked", "summary": string, "remainingWork": string }',
-    '- remainingWork: required when verified=false; list what the executor should do next (Chinese OK). Empty string when verified=true.',
-  ].join('\n');
 }
 
 export function buildCodexObjectPrompt(
@@ -122,6 +51,7 @@ export function buildCodexObjectPrompt(
     allowedTypes.includes('file') ? '- The first file call automatically loads and returns system-file-artifact-runtime while continuing the original call. Follow it for every list/read/download/plan/generate/edit/render/convert/jsApi/unoApi call and preserve the same documentId across retries.' : '',
     allowedTypes.includes('skill') ? '- For skill, set params.action="read" and provide the exact params.skillId from an available <system_skill> or user Skill summary before the governed tool action.' : '',
     allowedTypes.includes('subagent') ? '- The first subagent action="spawn" automatically loads and returns system-subagent-runtime while continuing the spawn. action="read" is ungated and accepts exactly one returned UUID in the required order.' : '',
+    allowedTypes.includes('reportDefect') ? '- During an interface or product testing task, proactively calling reportDefect is mandatory for every unique confirmed defect or reproducible product problem. After browserCode reproduces the problem and emits visible screenshot proof, call reportDefect in the immediately following model step before continuing unrelated test cases; never wait for the user, defer it to the final answer, or only mention it in test notes. Set exactly these evidence fields in params: problemDescription, whyItIsAProblem, reasons (string array), reproductionSteps (ordered string array), and screenshotFileNames (exact basenames returned by a prior successful browserCode call). Never report speculation, expected behavior, environment/configuration/permission limitations, or duplicates.' : '',
     browserCodeEnabled ? '- For a browser action, set type="browserCode" and put the program in params.code plus a concise params.reason.' : '',
     '- Never create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Keep recovered or irrelevant low-level failures in process logs. Mention only unresolved failures that materially limit the requested outcome, briefly alongside the affected result or limitation.',
     answerAllowed

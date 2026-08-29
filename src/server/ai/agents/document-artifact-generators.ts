@@ -16,8 +16,6 @@ export type GeneratedFileOutput = {
 };
 
 export const generatedTextExtensions = generatedFileExtensions('text');
-const maxXlsRows = 65_536;
-const maxXlsColumns = 256;
 const wordExtensions = new Set(['.doc', '.docx', '.odt']);
 const spreadsheetExtensions = new Set(['.xls', '.xlsx', '.ods']);
 const presentationExtensions = new Set(['.ppt', '.pptx', '.odp']);
@@ -68,17 +66,6 @@ function generateDelimitedText(input: GeneratedFileInput, extension: '.csv' | '.
   if (!rows?.length) throw new Error(`${extension.toUpperCase()} generation requires a non-empty table block.`);
   const delimiter = extension === '.tsv' ? '\t' : ',';
   return Buffer.from(`${rows.map((row) => row.map((cell) => quotedDelimitedCell(cell, delimiter)).join(delimiter)).join('\n')}\n`, 'utf8');
-}
-
-function validateXlsLimits(input: GeneratedFileInput) {
-  const tables = flattenBlocks(input.blocks).filter((block) => block.type === 'table' && Array.isArray(block.rows));
-  for (const [index, table] of tables.entries()) {
-    const rows = table.rows || [];
-    if (rows.length > maxXlsRows) throw new Error(`Excel .xls table ${index + 1} exceeds the ${maxXlsRows} row BIFF8 limit.`);
-    if (rows.reduce((maximum, row) => Math.max(maximum, row.length), 0) > maxXlsColumns) {
-      throw new Error(`Excel .xls table ${index + 1} exceeds the ${maxXlsColumns} column BIFF8 limit.`);
-    }
-  }
 }
 
 function validateOfficeTarget(input: Pick<OfficeDocumentSpec, 'documentType'>, extension: string) {

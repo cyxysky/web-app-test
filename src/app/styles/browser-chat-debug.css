@@ -59,103 +59,19 @@
   padding: 0 0 16px;
 }
 
-.browser-chat-tool-detail-section {
-  background: transparent;
-  border: 0;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  padding: 16px 24px;
-  width: 100%;
-}
 
-.browser-chat-tool-detail-section:last-child {
-  border-bottom: 0;
-}
 
-.browser-chat-tool-detail-section h3 {
-  color: var(--foreground);
-  display: block;
-  font-size: 13px;
-  font-weight: 680;
-  margin: 0 0 12px;
-}
 
-.browser-chat-tool-detail-section p {
-  color: var(--foreground);
-  font-size: 13px;
-  line-height: 1.55;
-  margin: 0;
-  overflow-wrap: anywhere;
-}
 
-.browser-chat-tool-detail-summary {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  padding: 16px 18px;
-  border-bottom: 1px solid var(--border);
-}
 
-.browser-chat-tool-detail-summary div {
-  border-left: 1px solid var(--border);
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-  padding: 0 18px;
-}
 
-.browser-chat-tool-detail-summary div:first-child {
-  border-left: 0;
-}
 
-.browser-chat-tool-detail-summary span {
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.2;
-}
 
-.browser-chat-tool-detail-summary strong {
-  color: var(--foreground);
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.45;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
-.browser-chat-tool-detail-layout {
-  display: grid;
-  grid-template-columns: minmax(280px, 36%) minmax(0, 1fr);
-  min-height: 0;
-  overflow: hidden;
-}
 
-.browser-chat-tool-context-panel {
-  border-right: 1px solid var(--border);
-  min-height: 0;
-  overflow: auto;
-}
 
-.browser-chat-tool-detail-section pre {
-  background: var(--code-panel);
-  border: 1px solid var(--border);
-  border-radius: var(--app-radius-sm);
-  color: var(--code-foreground);
-  font-size: 12px;
-  line-height: 1.55;
-  margin: 0;
-  max-height: 640px;
-  overflow: auto;
-  padding: 10px;
-  white-space: pre-wrap;
-}
 
-.browser-chat-tool-detail-payload {
-  margin: 0;
-}
 
-.browser-chat-tool-detail-payload summary,
 .browser-chat-log-detail-block summary {
   color: var(--muted-strong);
   cursor: pointer;
@@ -166,20 +82,11 @@
   outline: none;
 }
 
-.browser-chat-tool-detail-payload summary {
-  color: var(--foreground);
-  font-size: 12.5px;
-  font-weight: 520;
-}
 
-.browser-chat-tool-detail-payload summary:hover,
 .browser-chat-log-detail-block summary:hover {
   color: var(--foreground);
 }
 
-.browser-chat-tool-detail-payload pre {
-  margin-top: 8px;
-}
 
 .browser-chat-tool-output-panel {
   display: grid;
@@ -248,11 +155,6 @@
   font-weight: 600;
 }
 
-.browser-chat-tool-output-divider {
-  background: var(--border);
-  height: 20px;
-  width: 1px;
-}
 
 .browser-chat-tool-wrap-toggle {
   background: var(--border-strong);
@@ -374,23 +276,8 @@
   color: #a7adb5;
 }
 
-.browser-chat-tool-output-empty {
-  align-self: start;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.6;
-  margin: 0;
-}
 
-.ui-modal-overlay.browser-chat-log-dialog-overlay {
-  padding: clamp(22px, 2.8vw, 36px);
-}
 
-.ui-modal.ui-modal--wide.browser-chat-log-dialog {
-  --ui-modal-inline-size: 1520px;
-  height: min(calc(100dvh - 48px), 900px);
-  min-height: min(650px, calc(100dvh - 28px));
-}
 
 .browser-chat-log-dialog .browser-chat-log-dialog-header {
   min-height: 72px;
@@ -467,24 +354,7 @@
   width: auto;
 }
 
-.browser-chat-log-copy-button {
-  align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 8px;
-  color: var(--muted-strong);
-  cursor: pointer;
-  display: inline-flex;
-  font-size: 12px;
-  gap: 6px;
-  min-height: 32px;
-  padding: 5px 7px;
-}
 
-.browser-chat-log-copy-button:hover {
-  background: var(--panel-soft);
-  color: var(--foreground);
-}
 
 .browser-chat-log-load-more {
   align-items: center;
@@ -931,26 +801,9 @@
   border-color: color-mix(in srgb, var(--log-tone) 20%, var(--panel));
 }
 
-:root[data-theme="dark"] .browser-chat-tool-detail-summary div,
-:root[data-theme="dark"] .browser-chat-tool-detail-section {
-  background: transparent;
-  border-color: var(--border);
-  color: var(--foreground);
-}
 
-:root[data-theme="dark"] .browser-chat-tool-detail-summary span {
-  color: var(--muted);
-}
 
-:root[data-theme="dark"] .browser-chat-tool-detail-summary strong,
-:root[data-theme="dark"] .browser-chat-tool-detail-section h3,
-:root[data-theme="dark"] .browser-chat-tool-detail-section p {
-  color: var(--foreground);
-}
 
-:root[data-theme="dark"] .browser-chat-tool-detail-section pre {
-  border: 1px solid var(--border-strong);
-}
 
 @media (max-width: 900px) {
   .browser-chat-tool-io-grid {
@@ -964,10 +817,6 @@
     min-height: 0;
   }
 
-  .ui-modal.ui-modal--wide.browser-chat-log-dialog {
-    height: calc(100dvh - 28px);
-    min-height: 0;
-  }
 
   .browser-chat-log-dialog .browser-chat-log-dialog-header {
     min-height: 72px;
@@ -1005,15 +854,7 @@
     min-height: 0;
   }
 
-  .browser-chat-tool-detail-layout {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(180px, 0.72fr) minmax(300px, 1.28fr);
-  }
 
-  .browser-chat-tool-context-panel {
-    border-bottom: 1px solid var(--border);
-    border-right: 0;
-  }
 
   .browser-chat-tool-output-panel {
     padding: 16px 18px 18px;
@@ -1021,13 +862,11 @@
 }
 
 @media (max-width: 650px) {
-  .browser-chat-tool-dialog-overlay,
-  .browser-chat-log-dialog-overlay {
+.browser-chat-tool-dialog-overlay {
     padding: 8px;
   }
 
-  .browser-chat-tool-dialog,
-  .ui-modal.ui-modal--wide.browser-chat-log-dialog {
+.browser-chat-tool-dialog {
     height: calc(100dvh - 16px);
   }
 
@@ -1050,13 +889,6 @@
     font-size: 12px !important;
   }
 
-  .browser-chat-log-copy-button {
-    font-size: 0;
-    height: 32px;
-    justify-content: center;
-    padding: 0;
-    width: 32px;
-  }
 
   .browser-chat-log-toolbar {
     align-items: stretch;
@@ -1130,28 +962,10 @@
     padding: 12px 14px;
   }
 
-  .browser-chat-tool-detail-summary {
-    grid-template-columns: 1fr;
-    padding: 8px 14px;
-  }
 
-  .browser-chat-tool-detail-summary div {
-    border-left: 0;
-    border-top: 1px solid var(--border);
-    padding: 9px 4px;
-  }
 
-  .browser-chat-tool-detail-summary div:first-child {
-    border-top: 0;
-  }
 
-  .browser-chat-tool-detail-layout {
-    grid-template-rows: minmax(160px, 0.62fr) minmax(280px, 1.38fr);
-  }
 
-  .browser-chat-tool-detail-section {
-    padding: 16px 18px;
-  }
 
   .browser-chat-tool-output-header {
     align-items: flex-start;

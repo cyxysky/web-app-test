@@ -1,7 +1,6 @@
 import type {
   JSONArray,
   JSONObject,
-  JSONValue,
   LanguageModelV4,
   LanguageModelV4CallOptions,
   LanguageModelV4GenerateResult,

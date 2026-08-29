@@ -10,11 +10,6 @@
   right: auto;
 }
 
-@keyframes ui-loading-spin {
-  to {
-    transform: rotate(1turn);
-  }
-}
 
 @keyframes ui-loading-content-in {
   from {
@@ -37,35 +32,21 @@ a:not([data-slot], [data-slot] *) {
   font: inherit;
 }
 
-.app-shell {
-  margin: 0 auto;
-  min-height: 100vh;
-  padding: 28px;
-  width: min(100%, 1400px);
-}
 
-.dashboard-v2 :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
-.case-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
-.settings-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *),
-.redesigned-run-shell :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *) {
+.settings-workspace :where(h1, h2, h3, h4, p, span, strong, small, a, button, label, dt, dd, li, figcaption):not([data-slot], [data-slot] *) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.dashboard-v2 :where(input, select):not([data-slot], [data-slot] *),
-.case-workspace :where(input, select):not([data-slot], [data-slot] *),
-.settings-workspace :where(input, select):not([data-slot], [data-slot] *),
-.redesigned-run-shell :where(input, select):not([data-slot], [data-slot] *) {
+.settings-workspace :where(input, select):not([data-slot], [data-slot] *) {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.case-workspace :where(textarea, pre):not([data-slot], [data-slot] *),
-.settings-workspace :where(textarea, pre):not([data-slot], [data-slot] *),
-.redesigned-run-shell :where(textarea, pre):not([data-slot], [data-slot] *) {
+.settings-workspace :where(textarea, pre):not([data-slot], [data-slot] *) {
   overflow: auto;
   text-overflow: clip;
   white-space: pre-wrap;
@@ -89,32 +70,9 @@ a:not([data-slot], [data-slot] *) {
   color: var(--foreground);
 }
 
-.section-head {
-  align-items: flex-start;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  gap: 12px;
-  justify-content: space-between;
-  margin-bottom: 16px;
-  padding-bottom: 14px;
-}
 
-.section-head h2 {
-  font-size: 17px;
-  line-height: 1.3;
-  margin: 0 0 5px;
-}
 
-.section-head p {
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.6;
-  margin: 0;
-}
 
-.badge.neutral {
-  color: var(--muted-strong);
-}
 
 .status-passed {
   background: #edf8f3;
@@ -141,11 +99,8 @@ a:not([data-slot], [data-slot] *) {
 }
 
 .status-running,
-.status-paused,
 .status-ready,
-.status-generated,
-.status-draft,
-.status-queued {
+.status-draft {
   background: #eef2ff;
   border-color: #cdd7ff;
   color: #304081;
@@ -449,33 +404,13 @@ a:not([data-slot], [data-slot] *) {
   resize: vertical;
 }
 
-.hint,
 .muted {
   color: var(--muted);
 }
 
-.run-shell {
-  display: grid;
-  gap: 14px;
-}
 
-.case-main-panel {
-  background: transparent;
-  border: 0;
-  border-radius: 14px;
-  box-shadow: none;
-  display: grid;
-  gap: 18px;
-}
 
-.chevron {
-  color: var(--muted);
-  transition: transform 0.16s ease;
-}
 
-.chevron.open {
-  transform: rotate(180deg);
-}
 
 .error {
   background: #fff1f0;
@@ -492,11 +427,6 @@ a:not([data-slot], [data-slot] *) {
   }
 }
 
-@keyframes nav-loading-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
 
 @keyframes embedded-browser-loading-sweep {
   0% {
@@ -508,91 +438,23 @@ a:not([data-slot], [data-slot] *) {
   }
 }
 
-.redesigned-run-shell {
-  width: min(100%, 1500px);
-}
 
-.run-execution-panel {
-  background: rgba(255, 255, 255, 0.9);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  box-shadow: 0 16px 40px rgba(13, 13, 13, 0.07);
-  min-width: 0;
-  padding: 18px;
-}
 
 .textarea:not([data-slot], [data-slot] *).compact {
   min-height: 88px;
 }
 
 @media (max-width: 720px) {
-  .app-shell {
-    padding: 16px;
-  }
 
-  .shot-grid {
-    grid-template-columns: 1fr;
-  }
 
-  .run-execution-panel {
-    padding: 14px;
-  }
 }
 
-.dashboard-v2 {
-  display: flex;
-  flex-direction: column;
-  gap: 22px;
-  margin: 0 auto;
-  min-height: 100vh;
-  padding: 26px 32px 48px;
-  width: min(100%, 1680px);
-}
 
-.case-workspace {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  margin: 0 auto;
-  min-height: 100vh;
-  padding: 28px;
-  width: min(100%, 1500px);
-}
 
-@keyframes detail-panel-in {
-  from {
-    opacity: 0.88;
-    transform: translateX(18px);
-  }
 
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
 
-.section-head.compact {
-  margin: 0;
-}
 
-.section-head.compact h2 {
-  font-size: 18px;
-  margin: 0;
-}
 
-.section-head.compact p {
-  color: var(--muted-strong);
-  line-height: 1.6;
-  margin: 6px 0 0;
-  max-width: 980px;
-  white-space: normal;
-}
-
-.tool-shot-grid {
-  display: grid;
-  gap: 8px;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-}
 
 .link-button {
   align-items: center;
@@ -669,12 +531,6 @@ a:not([data-slot], [data-slot] *) {
   margin: 0;
 }
 
-.browser-chat-tool-detail-summary :where(div, span, strong),
-.browser-chat-tool-detail-section :where(p, summary, code) {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
 
 .ui-modal-close {
   flex: 0 0 auto;
@@ -708,58 +564,12 @@ a:not([data-slot], [data-slot] *) {
   list-style: none;
 }
 
-.image-viewer-toolbar>div {
-  align-items: center;
-  display: flex;
-  gap: 10px;
-}
 
-.image-viewer-toolbar span {
-  color: var(--muted-strong);
-  font-size: 13px;
-  font-weight: 850;
-  min-width: 46px;
-  text-align: center;
-}
 
-.image-viewer-toolbar strong {
-  color: var(--foreground);
-  font-size: 13px;
-  font-weight: 850;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
-.image-viewer-toolbar button:disabled {
-  cursor: not-allowed;
-  opacity: 0.42;
-}
 
-.image-viewer-stage {
-  align-items: center;
-  cursor: zoom-out;
-  display: flex;
-  height: 100%;
-  justify-content: center;
-  min-height: 0;
-  overflow: hidden;
-  width: 100%;
-}
 
-.image-viewer-stage img {
-  cursor: grab;
-  max-height: 88vh;
-  max-width: 94vw;
-  object-fit: contain;
-  transform-origin: center center;
-  transition: transform 0.08s ease;
-  user-select: none;
-}
 
-.image-viewer-stage img:active {
-  cursor: grabbing;
-}
 
 .theme-color-picker {
   align-items: center;
@@ -823,11 +633,6 @@ a:not([data-slot], [data-slot] *) {
   font-weight: 900;
 }
 
-.domain-grouped-list {
-  display: grid;
-  gap: 12px;
-  min-width: 0;
-}
 
 .skill-status {
   align-items: center;
@@ -863,12 +668,6 @@ a:not([data-slot], [data-slot] *) {
   color: var(--warning);
 }
 
-.dashboard-folder-layout {
-  display: grid;
-  gap: 24px;
-  grid-template-columns: 220px minmax(0, 1fr);
-  min-width: 0;
-}
 
 /* Unified controls */
 :where(.ui-button, .ui-icon-button) {
@@ -895,11 +694,6 @@ a:not([data-slot], [data-slot] *) {
   background: var(--button-neutral-hover-bg);
 }
 
-.ui-button--danger:not(:disabled):hover {
-  background: var(--button-danger-bg);
-  border-color: var(--button-danger-bg);
-  box-shadow: var(--shadow-tight);
-}
 
 :where(.ui-button, .ui-icon-button):disabled {
   cursor: not-allowed;
@@ -944,7 +738,7 @@ a:not([data-slot], [data-slot] *) {
   color: var(--danger);
 }
 
-:where(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-chat-recent-delete, .browser-chat-overflow-menu button.danger):not(:disabled):hover {
+:where(.ui-icon-button--danger, .settings-model-row-button.danger):not(:disabled):hover {
   background: transparent;
   border-color: transparent;
   color: var(--danger);
@@ -965,7 +759,7 @@ a:not([data-slot], [data-slot] *) {
     transform 0.16s ease;
 }
 
-:is(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-chat-recent-delete, .browser-chat-overflow-menu button.danger):not(:disabled):hover {
+:is(.ui-icon-button--danger, .settings-model-row-button.danger):not(:disabled):hover {
   background: transparent !important;
   border-color: transparent !important;
   box-shadow: none !important;
@@ -980,9 +774,6 @@ a:not([data-slot], [data-slot] *) {
 
 @media (max-width: 1180px) {
 
-  .dashboard-folder-layout {
-    grid-template-columns: 200px minmax(0, 1fr);
-  }
 }
 
 @media (max-width: 900px) {
@@ -996,9 +787,6 @@ a:not([data-slot], [data-slot] *) {
     flex-wrap: wrap;
   }
 
-  .dashboard-folder-layout {
-    grid-template-columns: 1fr;
-  }
 }
 
 @keyframes fade-in {
@@ -1011,17 +799,6 @@ a:not([data-slot], [data-slot] *) {
   }
 }
 
-@keyframes modal-in {
-  from {
-    transform: translateY(14px) scale(0.98);
-    opacity: 0.7;
-  }
-
-  to {
-    transform: translateY(0) scale(1);
-    opacity: 1;
-  }
-}
 
 .browser-chat-shell {
   display: grid;
@@ -1061,29 +838,7 @@ a:not([data-slot], [data-slot] *) {
 }
 
 
-.browser-chat-nav-item {
-  align-items: center;
-  background: transparent;
-  border: 0;
-  border-radius: 12px;
-  color: var(--muted-strong);
-  cursor: pointer;
-  display: flex;
-  font-size: 13px;
-  font-weight: 680;
-  gap: 9px;
-  min-height: 34px;
-  min-width: 0;
-  padding: 0 10px;
-  text-align: left;
-  transition:
-    background 0.16s ease,
-    color 0.16s ease,
-    justify-content 0.22s ease,
-    padding 0.22s ease;
-}
 
-.browser-chat-nav-item span,
 .browser-chat-brand strong,
 .browser-chat-theme-toggle span {
   transition:
@@ -1091,29 +846,10 @@ a:not([data-slot], [data-slot] *) {
     transform 0.16s ease;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item {
-  justify-content: center;
-  padding: 0;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item span {
-  display: none;
-}
 
-.browser-chat-nav-item.active,
-.browser-chat-nav-item:hover {
-  background: color-mix(in srgb, var(--foreground) 5%, transparent);
-  color: var(--foreground);
-}
 
-.browser-chat-nav-item:disabled {
-  cursor: not-allowed;
-  opacity: 0.58;
-}
 
-.browser-chat-nav-item.muted {
-  color: var(--muted-strong);
-}
 
 .browser-chat-sidebar-section {
   display: grid;
@@ -1137,22 +873,7 @@ a:not([data-slot], [data-slot] *) {
   padding: 0 6px;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button {
-  background: transparent;
-  border-color: transparent;
-  border-radius: 12px;
-  color: var(--muted-strong);
-  height: 36px;
-  justify-content: center;
-  margin-bottom: 2px;
-  min-height: 36px;
-  padding: 0;
-  width: 36px;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button span {
-  display: none;
-}
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-section,
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-list {
@@ -1161,9 +882,6 @@ a:not([data-slot], [data-slot] *) {
 }
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-check,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-delete,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-open>span,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-open small,
 .browser-chat-layout.sidebar-collapsed .browser-chat-history-loading span {
   display: none;
 }
@@ -1221,25 +939,11 @@ a:not([data-slot], [data-slot] *) {
   display: none;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-header h2,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-row-menu {
+.browser-chat-layout.sidebar-collapsed .browser-chat-recent-header h2 {
   display: none;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-open {
-  align-items: center;
-  display: inline-flex;
-  height: 36px;
-  justify-content: center;
-  min-height: 36px;
-  padding: 0;
-  position: relative;
-  width: 36px;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-icon {
-  color: var(--foreground);
-}
 
 .browser-chat-subnav {
   display: grid;
@@ -1281,11 +985,6 @@ a:not([data-slot], [data-slot] *) {
   width: 36px;
 }
 
-.browser-chat-layout.sidebar-collapsed :where(.browser-chat-new-chat-button):not(:disabled):hover {
-  background: color-mix(in srgb, var(--foreground) 6%, transparent);
-  border-color: transparent;
-  color: var(--foreground);
-}
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-subnav {
   gap: 6px;
@@ -1320,7 +1019,6 @@ body.is-dragging-embedded-tab * {
   margin: 0;
 }
 
-.browser-chat-cases-pane,
 .browser-chat-settings-pane {
   min-width: 0;
   overflow: auto;
@@ -1328,29 +1026,7 @@ body.is-dragging-embedded-tab * {
 }
 
 /* Motion layer */
-@keyframes ui-rise-in {
-  from {
-    opacity: 0;
-    transform: translateY(14px) scale(0.985);
-  }
 
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
-
-@keyframes ui-slide-in-left {
-  from {
-    opacity: 0;
-    transform: translateX(-14px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
 
 @keyframes ui-scale-in {
   from {
@@ -1364,41 +1040,10 @@ body.is-dragging-embedded-tab * {
   }
 }
 
-@keyframes ui-soft-pulse {
 
-  0%,
-  100% {
-    box-shadow: 0 0 0 rgba(16, 163, 127, 0);
-  }
 
-  50% {
-    box-shadow: 0 0 0 4px rgba(16, 163, 127, 0.14);
-  }
-}
 
-@keyframes ui-icon-breathe {
-
-  0%,
-  100% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.08);
-  }
-}
-
-@keyframes ui-sheen {
-  from {
-    transform: translateX(-140%) skewX(-18deg);
-  }
-
-  to {
-    transform: translateX(180%) skewX(-18deg);
-  }
-}
-
-:where(.ui-button, .ui-icon-button, .browser-chat-log-button, .browser-chat-attach, .browser-chat-send, .browser-chat-stop, .browser-chat-close, .browser-chat-nav-item, .browser-chat-subnav button, .browser-chat-recent-open, .browser-chat-recent-delete, .browser-chat-tool-card, .browser-chat-tool-shot-card, .browser-chat-reference-main) {
+:where(.ui-button, .ui-icon-button, .browser-chat-log-button, .browser-chat-attach, .browser-chat-send, .browser-chat-stop, .browser-chat-subnav button, .browser-chat-tool-card, .browser-chat-reference-main) {
   transition:
     background var(--motion-fast) ease,
     border-color var(--motion-fast) ease,
@@ -1408,7 +1053,7 @@ body.is-dragging-embedded-tab * {
     transform var(--motion-fast) ease;
 }
 
-:where(.ui-button, .ui-icon-button, .browser-chat-log-button, .browser-chat-attach, .browser-chat-send, .browser-chat-stop, .browser-chat-close, .browser-chat-nav-item, .browser-chat-subnav button, .browser-chat-recent-open, .browser-chat-recent-delete, .browser-chat-tool-card):not(:disabled):active {
+:where(.ui-button, .ui-icon-button, .browser-chat-log-button, .browser-chat-attach, .browser-chat-send, .browser-chat-stop, .browser-chat-subnav button, .browser-chat-tool-card):not(:disabled):active {
   opacity: 0.9;
   transform: scale(0.975);
 }
@@ -1417,7 +1062,7 @@ body.is-dragging-embedded-tab * {
   background: rgba(15, 17, 21, 0.82);
 }
 
-:root[data-theme="dark"] :where(.case-main-panel, .ui-modal, .run-execution-panel, .settings-card, .browser-chat-sidebar, .browser-chat-chat-pane, .browser-chat-message>div:last-child, .browser-chat-recent-item, .browser-chat-tool-shot-card, .browser-chat-composer-shell, .browser-chat-embedded-browser, .browser-chat-embedded-tab, .browser-chat-embedded-toolbar) {
+:root[data-theme="dark"] :where(.ui-modal, .browser-chat-sidebar, .browser-chat-chat-pane, .browser-chat-message>div:last-child, .browser-chat-composer-shell, .browser-chat-embedded-browser, .browser-chat-embedded-tab, .browser-chat-embedded-toolbar) {
   background-color: var(--panel);
   border-color: var(--border);
   color: var(--foreground);
@@ -1459,11 +1104,6 @@ body.is-dragging-embedded-tab * {
   border-color: var(--border-strong);
 }
 
-:root[data-theme="dark"] :where(.badge) {
-  background: color-mix(in srgb, var(--panel-warm) 70%, var(--panel));
-  border-color: var(--border);
-  color: var(--muted-strong);
-}
 
 :root[data-theme="dark"] :where(.status-passed) {
   background: color-mix(in srgb, var(--success) 14%, var(--panel));
@@ -1489,13 +1129,13 @@ body.is-dragging-embedded-tab * {
   color: #fcd34d;
 }
 
-:root[data-theme="dark"] :where(.status-running, .status-paused, .status-ready, .status-generated, .status-draft, .status-queued) {
+:root[data-theme="dark"] :where(.status-running, .status-ready, .status-draft) {
   background: color-mix(in srgb, #93c5fd 14%, var(--panel));
   border-color: color-mix(in srgb, #93c5fd 32%, var(--border));
   color: #bfdbfe;
 }
 
-:root[data-theme="dark"] :where(.ui-modal-header, .image-viewer-toolbar) {
+:root[data-theme="dark"] :where(.ui-modal-header) {
   background-color: color-mix(in srgb, var(--panel) 92%, transparent);
   border-color: var(--border);
   color: var(--foreground);
@@ -1513,18 +1153,7 @@ body.is-dragging-embedded-tab * {
   color: var(--muted);
 }
 
-:root[data-theme="dark"] .browser-chat-recent-item:hover,
-:root[data-theme="dark"] .browser-chat-nav-item:hover {
-  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
-}
 
-:root[data-theme="dark"] .browser-chat-recent-item.active,
-:root[data-theme="dark"] .browser-chat-recent-item.active:hover,
-:root[data-theme="dark"] .browser-chat-nav-item.active,
-:root[data-theme="dark"] .browser-chat-nav-item.active:hover {
-  background: color-mix(in srgb, var(--accent) 18%, var(--panel));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
-}
 
 :root[data-theme="dark"] .theme-color-picker label>span {
   box-shadow: inset 0 0 0 1px rgba(245, 245, 246, 0.16);
@@ -1561,30 +1190,30 @@ body.is-dragging-embedded-tab * {
   color: var(--danger);
 }
 
-:root[data-theme="dark"] :where(.ui-icon-button--danger, .settings-model-row-button.danger, .browser-chat-recent-delete, .browser-chat-overflow-menu button.danger):not(:disabled):hover {
+:root[data-theme="dark"] :where(.ui-icon-button--danger, .settings-model-row-button.danger):not(:disabled):hover {
   background: transparent;
   border-color: transparent;
   color: var(--danger);
 }
 
-:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button, .browser-chat-new-chat-button) {
+:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button) {
   background: transparent;
   border-color: var(--border);
   box-shadow: none;
   color: var(--muted-strong);
 }
 
-:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button, .browser-chat-new-chat-button):not(:disabled):hover {
+:root[data-theme="dark"] :where(.personal-memory-head-actions .ui-button):not(:disabled):hover {
   background: color-mix(in srgb, var(--foreground) 5%, transparent);
   border-color: var(--border);
   color: var(--foreground);
 }
 
-:root[data-theme="dark"] :where(.browser-chat-nav-item:hover, .browser-chat-subnav button:hover) {
+:root[data-theme="dark"] :where(.browser-chat-subnav button:hover) {
   background: color-mix(in srgb, var(--foreground) 5%, transparent);
 }
 
-:root[data-theme="dark"] :where(.browser-chat-nav-item.active, .browser-chat-nav-item.active:hover, .browser-chat-subnav button.active, .browser-chat-subnav button.active:hover) {
+:root[data-theme="dark"] :where(.browser-chat-subnav button.active, .browser-chat-subnav button.active:hover) {
   background: color-mix(in srgb, var(--foreground) 8%, transparent);
   box-shadow: none;
   color: var(--foreground);
@@ -1641,15 +1270,14 @@ body.is-dragging-embedded-tab * {
   background: color-mix(in srgb, var(--panel) 96%, var(--panel-soft));
 }
 
-.custom-select-menu,
-.browser-chat-overflow-menu {
+.custom-select-menu {
   backdrop-filter: blur(12px) saturate(1.08);
   border-color: color-mix(in srgb, var(--border) 90%, transparent);
 }
 
 @media (hover: hover) {
 
-  :where(.browser-chat-nav-item, .browser-chat-subnav button, .browser-chat-recent-item):hover {
+:where(.browser-chat-subnav button):hover {
     background: var(--app-surface-hover);
   }
 }
@@ -1673,49 +1301,19 @@ body.is-dragging-embedded-tab * {
     display: none;
   }
 
-  .browser-chat-cases-pane,
-  .browser-chat-settings-pane {
+.browser-chat-settings-pane {
     padding: 18px;
   }
 }
 
 /* Reference-style browser chat composer */
 
-.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-new-chat-button {
-  display: none;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button {
-  background: transparent;
-  border-color: transparent;
-  box-shadow: none;
-  transition:
-    color 0.16s ease,
-    transform 0.16s ease;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button:not(:disabled):hover,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-new-chat-button:not(:disabled):hover {
-  background: transparent;
-  border-color: transparent;
-  color: var(--foreground);
-  transform: scale(1.06);
-}
 
 /* Expanded sidebar: use one active surface across primary and secondary navigation. */
-.browser-chat-layout:not(.sidebar-collapsed) :is(
-  .browser-chat-nav-item.active,
-  .browser-chat-nav-item.active:hover,
-  .browser-chat-subnav button.active,
-  .browser-chat-subnav button.active:hover
-),
-:root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) :is(
-  .browser-chat-nav-item.active,
-  .browser-chat-nav-item.active:hover,
-  .browser-chat-subnav button.active,
-  .browser-chat-subnav button.active:hover
-) {
+.browser-chat-layout:not(.sidebar-collapsed) :is(.browser-chat-subnav button.active, .browser-chat-subnav button.active:hover),
+:root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) :is(.browser-chat-subnav button.active, .browser-chat-subnav button.active:hover) {
   background: var(--app-surface-active);
   box-shadow: none;
   color: var(--foreground);
@@ -1727,23 +1325,9 @@ body.is-dragging-embedded-tab * {
   border-top-color: rgba(255, 255, 255, 0.055);
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav {
-  padding-bottom: 8px;
-  position: relative;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav::after {
-  background: color-mix(in srgb, var(--border) 72%, transparent);
-  bottom: 0;
-  content: "";
-  height: 1px;
-  left: 50%;
-  position: absolute;
-  transform: translateX(-50%);
-  width: 20px;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(.browser-chat-brand .ui-icon-button, .browser-chat-nav-item, .browser-chat-new-chat-button, .browser-chat-theme-toggle, .browser-chat-subnav button, .browser-chat-recent-open) {
+.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(.browser-chat-brand .ui-icon-button, .browser-chat-theme-toggle, .browser-chat-subnav button) {
   align-items: center;
   border-radius: 10px;
   display: inline-flex;
@@ -1756,23 +1340,14 @@ body.is-dragging-embedded-tab * {
   width: 36px;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item {
-  display: block;
-  padding-left: 0;
-  border-radius: 10px;
-  height: 36px;
-  overflow: visible;
-  position: relative;
-  width: 36px;
-}
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(.browser-chat-brand .ui-icon-button, .browser-chat-nav-item, .browser-chat-new-chat-button, .browser-chat-theme-toggle, .browser-chat-subnav button, .browser-chat-recent-open) > svg:not(.spin) {
+.browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(.browser-chat-brand .ui-icon-button, .browser-chat-theme-toggle, .browser-chat-subnav button) > svg:not(.spin) {
   flex: 0 0 auto;
   height: 20px;
   width: 20px;
 }
 
-.browser-chat-layout.sidebar-collapsed :is(.browser-chat-nav-item.active, .browser-chat-subnav button.active, .browser-chat-recent-item.active)::before {
+.browser-chat-layout.sidebar-collapsed :is(.browser-chat-subnav button.active)::before {
   background: var(--accent);
   border-radius: 0 999px 999px 0;
   content: "";
@@ -1784,29 +1359,18 @@ body.is-dragging-embedded-tab * {
   width: 2px;
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active,
-.browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active:hover,
 .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active,
 .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active:hover,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active,
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active:hover,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-nav-item.active:hover,
 :root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active:hover,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active,
-:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active:hover {
+:root[data-theme="dark"] .browser-chat-layout.sidebar-collapsed .browser-chat-subnav button.active:hover {
   background: transparent;
   box-shadow: none;
 }
 
-.browser-chat-layout.sidebar-collapsed :is(.browser-chat-nav-item.active, .browser-chat-subnav button.active) {
+.browser-chat-layout.sidebar-collapsed :is(.browser-chat-subnav button.active) {
   color: var(--accent-strong);
 }
 
-.browser-chat-layout.sidebar-collapsed .browser-chat-recent-item.active .browser-chat-recent-icon {
-  color: var(--accent-strong);
-}
 
 /* Unified refined motion */
 @keyframes ui-disclosure-in {
@@ -1847,7 +1411,7 @@ body.is-dragging-embedded-tab * {
   }
 }
 
-:where(.browser-chat-embedded-tab, .browser-chat-overflow-menu button, .browser-chat-recent-item, .browser-chat-section-create, .custom-select-option, .settings-tabs button, .skills-manager-item-main) {
+:where(.browser-chat-embedded-tab, .browser-chat-section-create, .custom-select-option, .settings-tabs button) {
   transition:
     background-color var(--motion-fast) ease,
     border-color var(--motion-fast) ease,
@@ -1857,7 +1421,7 @@ body.is-dragging-embedded-tab * {
     transform var(--motion-normal) var(--ease-emphasized);
 }
 
-:where(.ui-button, .ui-icon-button, .browser-chat-nav-item, .browser-chat-subnav button, .browser-chat-overflow-menu button, .custom-select-option, .skills-manager-item-main) > svg {
+:where(.ui-button, .ui-icon-button, .browser-chat-subnav button, .custom-select-option) > svg {
   transform-origin: center;
   transition:
     color var(--motion-fast) ease,
@@ -1865,7 +1429,7 @@ body.is-dragging-embedded-tab * {
     transform var(--motion-normal) var(--ease-spring);
 }
 
-:where(.browser-chat-nav-item.active, .browser-chat-subnav button.active, .settings-tabs button.active) > svg {
+:where(.browser-chat-subnav button.active, .settings-tabs button.active) > svg {
   animation: ui-icon-settle var(--motion-slow) var(--ease-emphasized) both;
 }
 
@@ -1882,16 +1446,7 @@ body.is-dragging-embedded-tab * {
     transform var(--motion-normal) var(--ease-emphasized);
 }
 
-:where(
-  .settings-card,
-  .personal-memory-item,
-  .skills-manager-item,
-  .browser-chat-message > div:last-child,
-  .browser-chat-tool-card,
-  .browser-chat-tool-shot-card,
-  .case-main-panel,
-  .run-execution-panel
-) {
+:where(.browser-chat-message > div:last-child, .browser-chat-tool-card) {
   transition:
     background-color var(--motion-normal) ease,
     border-color var(--motion-normal) ease,
@@ -1901,13 +1456,7 @@ body.is-dragging-embedded-tab * {
 
 @media (hover: hover) {
 
-  :where(
-    .settings-card,
-    .personal-memory-item,
-    .skills-manager-item,
-    .browser-chat-tool-card,
-    .browser-chat-tool-shot-card
-  ):hover {
+:where(.browser-chat-tool-card):hover {
     border-color: color-mix(in srgb, var(--accent) 14%, var(--border));
     box-shadow: 0 10px 28px color-mix(in srgb, #000000 5%, transparent);
   }

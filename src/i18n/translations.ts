@@ -555,6 +555,34 @@ const en: Record<string, string> = {
   '变量值已复制': 'Variable value copied',
   '复制变量 {name} 的值': 'Copy the value of {name}',
   '复制变量值': 'Copy variable value',
+  '模型运行记录': 'Model run records',
+  '当前对话': 'Current conversation',
+  '查看模型运行记录，共 {count} 项': 'View model run records, {count} total',
+  '模型运行记录：{variables} 个变量，{defects} 个缺陷': 'Model run records: {variables} variables, {defects} defects',
+  '读取模型运行记录失败': 'Failed to load model run records',
+  '复制运行记录失败': 'Failed to copy model run records',
+  '当前记录已复制': 'Current records copied',
+  '复制全部缺陷': 'Copy all defects',
+  '复制当前记录': 'Copy current records',
+  '关闭模型运行记录': 'Close model run records',
+  '模型运行记录分类': 'Model run record categories',
+  '变量': 'Variables',
+  '缺陷': 'Defects',
+  '正在刷新运行记录': 'Refreshing model run records',
+  '当前对话暂无模型变量': 'No model variables in this conversation',
+  '模型报告的缺陷': 'Defects reported by the model',
+  '共 {count} 项': '{count} total',
+  '模型尚未报告缺陷': 'The model has not reported any defects',
+  '问题描述': 'Problem description',
+  '为什么这是问题': 'Why this is a problem',
+  '判定理由': 'Reasons for the finding',
+  '复现步骤': 'Reproduction steps',
+  '截图证明': 'Screenshot evidence',
+  '刚刚': 'Just now',
+  '{count} 分钟前': '{count} minutes ago',
+  '{count} 小时前': '{count} hours ago',
+  '查看截图 {name}': 'View screenshot {name}',
+  '缺陷截图证明：{name}': 'Defect screenshot evidence: {name}',
   '正在加载对话': 'Loading conversation',
   '执行日志': 'Execution logs',
   '复制日志': 'Copy logs',
@@ -1895,8 +1923,4 @@ export function translateText(language: Language, value: string, params?: Record
   if (language === 'zh' && reverseEn[value]) return formatParams(reverseEn[value], params);
   const formatted = formatParams(value, params);
   return translateDynamicText(language, formatted);
-}
-
-export function isKnownEnglish(value: string) {
-  return Boolean(reverseEn[value]);
 }

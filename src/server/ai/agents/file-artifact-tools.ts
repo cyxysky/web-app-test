@@ -21,10 +21,6 @@ import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
 } from '@/server/files/office-document-spec';
-import {
-  fillDocxTemplateBuffer,
-  type DocxTemplateFillOperation,
-} from './docx-template-filler';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import type { BrowserCodeAttachmentBinding } from '@/server/browser/browser-code-runner';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
@@ -144,15 +140,6 @@ type ConvertArtifactInput = {
   sourceArtifactId?: string;
   fileName?: string | null;
   includeVisualVerification?: boolean;
-};
-
-type FillDocumentTemplateArtifactInput = {
-  runId?: string;
-  templateAttachmentId?: string;
-  fileName?: string | null;
-  includeVisualVerification?: boolean;
-  operations?: DocxTemplateFillOperation[];
-  attachmentBindings?: BrowserCodeAttachmentBinding[];
 };
 
 type ArtifactToolPayload = {
@@ -2974,77 +2961,6 @@ export async function renderFileArtifact(input: RenderArtifactInput): Promise<Br
     return await withDraftLock(input.runId, documentId, () => renderFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
   } catch (error) {
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
-  }
-}
-
-export async function fillDocumentTemplateArtifact(input: FillDocumentTemplateArtifactInput): Promise<BrowserActionResult> {
-  try {
-    const templateAttachmentId = String(input.templateAttachmentId || '').trim();
-    const binding = input.attachmentBindings?.find((item) => item.ref === templateAttachmentId);
-    if (!binding) {
-      return { ok: false, actual: 'fillDocumentTemplate failed: templateAttachmentId is not a registered attachment in this conversation.' };
-    }
-    if (path.extname(binding.name).toLowerCase() !== '.docx') {
-      return { ok: false, actual: 'fillDocumentTemplate failed: the registered template must be a .docx file.' };
-    }
-    const operations = Array.isArray(input.operations) ? input.operations : [];
-    if (!operations.length) {
-      return { ok: false, actual: 'fillDocumentTemplate failed: at least one fill operation is required.' };
-    }
-    const metadata = await stat(binding.path);
-    if (metadata.size > FILE_DOWNLOAD_MAX_BYTES) {
-      return { ok: false, actual: `fillDocumentTemplate failed: template exceeds ${FILE_DOWNLOAD_MAX_BYTES} bytes.` };
-    }
-    const requestedName = sanitizeFileName(
-      input.fileName || binding.name.replace(/\.docx$/i, '-filled.docx'),
-      `filled-document-${Date.now()}.docx`,
-    );
-    if (path.extname(requestedName).toLowerCase() !== '.docx') {
-      return { ok: false, actual: 'fillDocumentTemplate failed: fileName must end with .docx.' };
-    }
-    const filled = await fillDocxTemplateBuffer(await readFile(binding.path), operations);
-    const dir = artifactDir(input.runId, 'generated');
-    await mkdir(dir, { recursive: true });
-    const target = await uniqueArtifactPath(dir, requestedName);
-    await writeFile(target.filePath, filled.buffer);
-    const visualVerification = input.includeVisualVerification
-      ? await renderBrowserChatAttachmentVisuals({
-          absolutePath: target.filePath,
-          buffer: filled.buffer,
-          extension: '.docx',
-          name: target.fileName,
-          previewRoot: artifactDir(input.runId, 'attachment-previews'),
-        })
-      : undefined;
-    return {
-      ok: true,
-      actual: JSON.stringify({
-        ...artifactResultPayload({
-          kind: 'generated',
-          fileName: target.fileName,
-          filePath: target.filePath,
-          bytes: filled.buffer.byteLength,
-        }),
-        templateValidation: {
-          changedParts: filled.changedParts,
-          filledOperations: filled.filledOperations,
-          preservedParts: filled.preservedParts,
-        },
-        visualVerification: visualVerification ? {
-          imageCount: visualVerification.imagePaths.length,
-          pageCount: visualVerification.pageCount,
-          renderedPages: visualVerification.renderedPages,
-          renderer: visualVerification.renderer,
-          warning: visualVerification.warning,
-        } : {
-          status: 'not-performed',
-          reason: 'The selected model does not accept image input; no visual conclusion was made.',
-        },
-      }),
-      referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
-    };
-  } catch (error) {
-    return { ok: false, actual: `fillDocumentTemplate failed: ${error instanceof Error ? error.message : String(error)}` };
   }
 }
 

@@ -12,9 +12,7 @@ import {
   type CreateAutomationCaseInput,
   type CreateAutomationRunInput,
   type CreateAutomationScheduleInput,
-  type UpdateAutomationCaseInput,
   type UpdateAutomationRunInput,
-  type UpdateAutomationScheduleInput,
 } from '@/server/automation/automation.schema';
 import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from '@/server/storage/sqlite-database';
 import { publishRealtimeRefreshEvent, type RefreshEntityType } from '@/server/realtime/ws-refresh';
@@ -155,25 +153,6 @@ function persistRun(database: DatabaseSync, record: AutomationRunRecord) {
   );
 }
 
-function persistSchedule(database: DatabaseSync, record: AutomationScheduleRecord) {
-  database.prepare(`
-    UPDATE automation_schedule SET
-      case_id = ?, title = ?, recurrence = ?, enabled = ?, next_run_at = ?,
-      record_json = ?, updated_at = ?
-    WHERE id = ? AND user_id = ?
-  `).run(
-    record.caseId,
-    record.title,
-    record.recurrence,
-    record.enabled ? 1 : 0,
-    record.nextRunAt,
-    JSON.stringify(record),
-    record.updatedAt,
-    record.id,
-    record.userId,
-  );
-}
-
 export type AutomationCaseListOptions = {
   beforeId?: string;
   beforeUpdatedAt?: string;
@@ -234,37 +213,6 @@ export function createAutomationCase(input: CreateAutomationCaseInput) {
     record.updatedAt,
   );
   publishAutomationRecord('automationCase', record);
-  return record;
-}
-
-export function updateAutomationCase(id: string, patch: UpdateAutomationCaseInput, userId?: string) {
-  const record = runSqliteTransaction((database) => {
-    const current = readCase(database, id, userId);
-    if (!current) return undefined;
-    const record = automationCaseRecordSchema.parse({
-      ...current,
-      ...definedValues(patch),
-      id: current.id,
-      userId: current.userId,
-      createdAt: current.createdAt,
-      updatedAt: now(),
-    });
-    database.prepare(`
-      UPDATE automation_case SET
-        source_session_id = ?, title = ?, target_url = ?, record_json = ?, updated_at = ?
-      WHERE id = ? AND user_id = ?
-    `).run(
-      record.sourceSessionId,
-      record.title,
-      record.targetUrl,
-      JSON.stringify(record),
-      record.updatedAt,
-      record.id,
-      record.userId,
-    );
-    return record;
-  });
-  if (record) publishAutomationRecord('automationCase', record);
   return record;
 }
 
@@ -377,18 +325,6 @@ function automationRunWithPatch(
   return automationRunRecordSchema.parse(candidate);
 }
 
-export function updateAutomationRun(id: string, patch: UpdateAutomationRunInput, userId?: string) {
-  const record = runSqliteTransaction((database) => {
-    const current = readRun(database, id, userId);
-    if (!current) return undefined;
-    const record = automationRunWithPatch(current, patch);
-    persistRun(database, record);
-    return record;
-  });
-  if (record) publishAutomationRecord('automationRun', record);
-  return record;
-}
-
 /** Atomically update a run only while it is in one of the expected states. */
 export function updateAutomationRunIfStatus(
   id: string,
@@ -412,17 +348,6 @@ export function updateAutomationRunIfStatus(
   });
   if (result?.updated) publishAutomationRecord('automationRun', result.run);
   return result;
-}
-
-export function deleteAutomationRun(id: string, userId?: string) {
-  const record = readRun(getSqliteDatabase(), id, userId);
-  const statement = userId === undefined
-    ? getSqliteDatabase().prepare('DELETE FROM automation_run WHERE id = ?')
-    : getSqliteDatabase().prepare('DELETE FROM automation_run WHERE id = ? AND user_id = ?');
-  const result = userId === undefined ? statement.run(id) : statement.run(id, userId);
-  const deleted = Number(result.changes) > 0;
-  if (deleted && record) publishAutomationRecord('automationRun', record, true);
-  return deleted;
 }
 
 export function claimAutomationRunLease(
@@ -507,10 +432,6 @@ export function listAutomationSchedules(options: AutomationScheduleListOptions =
   return rows.map(parseScheduleRow).filter((record): record is AutomationScheduleRecord => Boolean(record));
 }
 
-export function getAutomationSchedule(id: string, userId?: string) {
-  return readSchedule(getSqliteDatabase(), id, userId);
-}
-
 export function createAutomationSchedule(input: CreateAutomationScheduleInput) {
   const record = runSqliteTransaction((database) => {
     ensureCaseOwner(database, input.caseId, input.userId);
@@ -541,36 +462,6 @@ export function createAutomationSchedule(input: CreateAutomationScheduleInput) {
     return record;
   });
   publishAutomationRecord('automationSchedule', record);
-  return record;
-}
-
-export function updateAutomationSchedule(
-  id: string,
-  patch: UpdateAutomationScheduleInput,
-  userId?: string,
-) {
-  const record = runSqliteTransaction((database) => {
-    const current = readSchedule(database, id, userId);
-    if (!current) return undefined;
-    if (patch.caseId && patch.caseId !== current.caseId) {
-      ensureCaseOwner(database, patch.caseId, current.userId);
-    }
-    const { lastRunAt, ...ordinaryPatch } = patch;
-    const candidate: Record<string, unknown> = {
-      ...current,
-      ...definedValues(ordinaryPatch),
-      id: current.id,
-      userId: current.userId,
-      createdAt: current.createdAt,
-      updatedAt: now(),
-    };
-    if (lastRunAt === null) delete candidate.lastRunAt;
-    else if (lastRunAt !== undefined) candidate.lastRunAt = lastRunAt;
-    const record = automationScheduleRecordSchema.parse(candidate);
-    persistSchedule(database, record);
-    return record;
-  });
-  if (record) publishAutomationRecord('automationSchedule', record);
   return record;
 }
 

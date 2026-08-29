@@ -61,15 +61,7 @@
   max-width: 620px;
 }
 
-.browser-chat-onboarding-copy p {
-  color: var(--muted);
-  font-size: 14px;
-  line-height: 1.7;
-  margin: 0 auto;
-  max-width: 620px;
-}
 
-.browser-chat-tutorial-link,
 .browser-chat-tutorial-skip {
   background: transparent;
   border: 0;
@@ -80,7 +72,6 @@
   padding: 5px;
 }
 
-.browser-chat-tutorial-link:hover,
 .browser-chat-tutorial-skip:hover { color: var(--foreground); }
 
 .browser-chat-onboarding {

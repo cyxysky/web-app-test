@@ -13,12 +13,6 @@ import {
   type PersonalMemoryItem,
 } from '@/server/ai/personal-memory';
 
-export const personalMemoryToolNames = [
-  'memory',
-] as const;
-
-export type PersonalMemoryToolName = (typeof personalMemoryToolNames)[number];
-
 export type PersonalMemoryToolContext = {
   userId?: unknown;
   currentUrl?: string;

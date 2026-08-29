@@ -29,6 +29,7 @@ import {
   readBrowserChatStepsByIndexes,
 } from '@/server/storage/browser-chat-history-store';
 import { executeBrowserCodeRuntimeStateOperation } from '@/server/storage/browser-code-runtime-state';
+import { readBrowserChatDefectReports } from '@/server/storage/browser-chat-defect-store';
 import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-store';
 
 function belongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: string | number) {
@@ -176,10 +177,14 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
 export function readBrowserChatRuntimeState(sessionId: string, userId?: string | number) {
   const session = readBrowserChatSessionOwner(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
-  return executeBrowserCodeRuntimeStateOperation(sessionId, {
+  const runtimeState = executeBrowserCodeRuntimeStateOperation(sessionId, {
     action: 'list',
     input: {},
   });
+  return {
+    ...runtimeState,
+    defects: readBrowserChatDefectReports(sessionId),
+  };
 }
 
 export function readBrowserChatSessionHistoryPage(

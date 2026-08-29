@@ -56,11 +56,9 @@ html {
   --app-overlay: rgba(0, 0, 0, 0.58);
   --code-panel: #050505;
   --code-foreground: #f5f5f5;
-  --inverse-panel: #ffffff;
   --inverse-foreground: #000000;
   --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.28);
   --shadow-sm: 0 6px 18px rgba(0, 0, 0, 0.28);
-  --shadow-soft: 0 18px 56px rgba(0, 0, 0, 0.34);
   --shadow-tight: 0 10px 28px rgba(0, 0, 0, 0.32);
   --shadow-lg: 0 28px 86px rgba(0, 0, 0, 0.5);
   --modal-overlay-bg: rgba(0, 0, 0, 0.62);
@@ -259,14 +257,8 @@ body {
   border-color: var(--button-primary-hover-bg);
 }
 
-.ui-button--danger {
-  background: var(--button-danger-bg);
-  border-color: var(--button-danger-bg);
-  color: #ffffff;
-  box-shadow: 0 1px 2px color-mix(in srgb, var(--danger) 22%, transparent);
-}
 
-html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send, .browser-chat-scroll-to-bottom):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-close, .browser-chat-download-item-action, .browser-chat-web-preview-button, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow-trigger, .domain-list-search > button):not([data-slot], [data-slot] *) {
+html :is(button.ui-icon-button, button:not(.ui-button, .browser-chat-send, .browser-chat-scroll-to-bottom):has(> svg:only-child), .settings-model-row-button, .browser-chat-theme-toggle, .browser-chat-attach, .browser-chat-stop, .browser-chat-download-item-action, .browser-chat-embedded-new-group, .browser-chat-embedded-tool-button, .browser-chat-embedded-address-action, .browser-chat-embedded-tab-group-action, .browser-chat-embedded-tab-close, .browser-chat-embedded-tab-mute, .browser-chat-overflow-trigger, .domain-list-search > button):not([data-slot], [data-slot] *) {
   backdrop-filter: none !important;
   background: transparent !important;
   border: 0 !important;
@@ -285,9 +277,6 @@ html .ui-button--neutral:has(> svg):not(.ui-modal-footer .ui-button) {
   color: var(--foreground) !important;
 }
 
-html .ui-button--danger:has(> svg):not(.ui-modal-footer .ui-button) {
-  color: var(--danger) !important;
-}
 
 html .ui-button:has(> svg):not(.ui-button--primary, .ui-modal-footer .ui-button):not(:disabled):hover,
 html .ui-button:has(> svg):not(.ui-button--primary, .ui-modal-footer .ui-button):not(:disabled):active {
@@ -536,35 +525,11 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 /* Shared surfaces */
-:where(.case-main-panel, .run-execution-panel) {
-  background: var(--panel);
-  border-color: var(--border);
-  border-radius: var(--app-radius-lg);
-  box-shadow: var(--shadow-sm);
-}
 
-.badge {
-  align-items: center;
-  border: 1px solid #d9d9e3;
-  border-radius: 999px;
-  display: inline-flex;
-  gap: 5px;
-  line-height: 1;
-  padding: 5px 9px;
-  width: fit-content;
-  white-space: nowrap;
-  background: var(--panel-soft);
-  border-color: var(--border);
-  color: var(--muted-strong);
-  font-size: 11px;
-  font-weight: 600;
-  min-height: 23px;
-}
 
 .error,
 .browser-chat-download-location-error,
-.browser-chat-web-preview-alert,
-.personal-memory-delete-error {
+.browser-chat-web-preview-alert {
   background: color-mix(in srgb, var(--danger) 9%, var(--panel));
   border: 1px solid color-mix(in srgb, var(--danger) 22%, var(--border));
   border-radius: var(--app-radius-sm);
@@ -788,14 +753,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   padding: 16px 24px;
 }
 
-.ui-modal.ui-modal--compact,
-.ui-modal.admin-settings-password-dialog {
-  --ui-modal-inline-size: 520px;
-}
 
-.ui-modal.ui-modal--wide {
-  --ui-modal-inline-size: 1180px;
-}
 
 .ui-modal.ui-modal--skill {
   --ui-modal-inline-size: 760px;
@@ -809,14 +767,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
 }
 
 /* Compact form dialogs use one quiet, input-first card language. */
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) {
   --form-dialog-surface: #ffffff;
   --form-dialog-field: #f5f5f6;
   --form-dialog-field-border: #e4e4e7;
@@ -830,14 +781,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   box-shadow: 0 26px 80px color-mix(in srgb, #020617 28%, transparent);
 }
 
-:root[data-theme="dark"] .ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) {
+:root[data-theme="dark"] .ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) {
   --form-dialog-surface: #17181c;
   --form-dialog-field: #242426;
   --form-dialog-field-border: #3a3a3d;
@@ -850,124 +794,55 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   box-shadow: 0 28px 88px rgba(0, 0, 0, .58);
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) > :is(.ui-modal-header, header) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) > :is(.ui-modal-header, header) {
   background: var(--form-dialog-surface);
   border-bottom: 0;
   min-height: 0;
   padding: 16px 24px;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) > .ui-modal-body {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) > .ui-modal-body {
   background: var(--form-dialog-surface);
   padding: 16px 24px;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) > .ui-modal-footer {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) > .ui-modal-footer {
   background: var(--form-dialog-surface);
   border-top: 0;
   min-height: 0;
   padding: 16px 24px;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(.ui-modal-title, header h2) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(.ui-modal-title, header h2) {
   color: var(--form-dialog-title);
   font-size: 17px;
   font-weight: 720;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(.ui-modal-subtitle, header p) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(.ui-modal-subtitle, header p) {
   color: var(--form-dialog-label);
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) .ui-modal-close {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) .ui-modal-close {
   border-color: var(--form-dialog-field-border);
   color: var(--form-dialog-value);
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) .ui-modal-heading-icon {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) .ui-modal-heading-icon {
   background: var(--panel-soft);
   border-radius: 12px;
   height: 42px;
   width: 42px;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(
-  .modal-field,
-  .automation-dialog-fields label,
-  .login-account-form label > span,
-  .personal-memory-field > span,
-  .admin-settings-password-form label > span
-) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(.modal-field, .automation-dialog-fields label, .login-account-form label > span, .personal-memory-field > span, .admin-settings-password-form label > span) {
   color: var(--form-dialog-label);
   font-family: var(--app-font-mono);
   font-size: 12px;
   font-weight: 600;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(input, textarea, select, .custom-select-button) {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(input, textarea, select, .custom-select-button) {
   background: var(--form-dialog-field);
   border-color: var(--form-dialog-field-border);
   border-radius: 12px;
@@ -976,39 +851,18 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   min-height: 44px;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(input, textarea)::placeholder {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(input, textarea)::placeholder {
   color: var(--form-dialog-placeholder);
   opacity: 1;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(input, textarea):disabled {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(input, textarea):disabled {
   color: var(--form-dialog-label);
   -webkit-text-fill-color: var(--form-dialog-label);
   opacity: .72;
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) :is(input, textarea, select, .custom-select-button):focus-visible {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) :is(input, textarea, select, .custom-select-button):focus-visible {
   border-color: color-mix(in srgb, var(--form-dialog-value) 46%, var(--form-dialog-field-border));
 }
 
@@ -1020,14 +874,7 @@ input[type="checkbox"]:not([data-slot], [data-slot] *):focus-visible {
   color: var(--form-dialog-label);
 }
 
-.ui-modal:is(
-  .ui-modal--form,
-  .ui-modal--compact,
-  .automation-dialog,
-  .login-account-modal,
-  .ui-modal--personal-memory,
-  .browser-chat-message-generation-dialog
-) .ui-modal-footer .ui-button {
+.ui-modal:is(.ui-modal--form, .automation-dialog, .login-account-modal, .ui-modal--personal-memory, .browser-chat-message-generation-dialog) .ui-modal-footer .ui-button {
   border-radius: 999px;
   min-height: 42px;
   padding-inline: 18px;

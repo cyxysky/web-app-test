@@ -112,6 +112,16 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
       ...('code' in source ? { code: browserCodeFromGeneratedMarkup(source.code) } : {}),
     };
   }
+  if (toolName === 'reportDefect') {
+    const source = recordFromUnknown(unwrapToolTransport(value));
+    if (!source) return value;
+    return {
+      ...source,
+      reasons: arrayFromJsonString(source.reasons),
+      reproductionSteps: arrayFromJsonString(source.reproductionSteps),
+      screenshotFileNames: arrayFromJsonString(source.screenshotFileNames),
+    };
+  }
   if (toolName !== 'file' && toolName !== 'fileVisual') return value;
   const source = recordFromUnknown(unwrapToolTransport(value));
   if (!source) return value;

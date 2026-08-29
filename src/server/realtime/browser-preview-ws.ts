@@ -77,7 +77,7 @@ type BrowserPreviewWebSocketState = {
   streams: Map<string, BrowserPreviewStream>;
 };
 
-const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 26;
+const BROWSER_PREVIEW_IMPLEMENTATION_VERSION = 27;
 
 declare global {
   var __browserChatPreviewWebSocketState: BrowserPreviewWebSocketState | undefined;
