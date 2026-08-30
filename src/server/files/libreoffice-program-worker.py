@@ -1688,6 +1688,11 @@ def verify_presentation_layout(component, element_map=None):
         (entry.get('locator', {}).get('slide'), entry.get('locator', {}).get('shape')): entry
         for entry in (element_map or [])
     }
+    element_by_artifact_name = {
+        str(entry.get('artifactName')): entry
+        for entry in (element_map or [])
+        if entry.get('artifactName')
+    }
 
     def intersection(left, right):
         overlap_width = max(0, min(left['x'] + left['width'], right['x'] + right['width']) - max(left['x'], right['x']))
@@ -1718,7 +1723,15 @@ def verify_presentation_layout(component, element_map=None):
             position, shape_size = shape.Position, shape.Size
             x, y = int(position.X), int(position.Y)
             width, height = int(shape_size.Width), int(shape_size.Height)
-            mapped = element_lookup.get((page_index + 1, shape_index + 1), {})
+            # PPTX export may convert or omit a drawing service (for example a
+            # CaptionShape or MeasureShape), shifting every later shape index.
+            # Names are the stable serialized identity; use the authored index
+            # only as a fallback for formats/services that do not retain Name.
+            shape_name = str(getattr(shape, 'Name', '') or '')
+            mapped = element_by_artifact_name.get(shape_name) or element_lookup.get(
+                (page_index + 1, shape_index + 1),
+                {},
+            )
             try:
                 value = str(shape.String or '').strip()
             except Exception:
@@ -1737,7 +1750,7 @@ def verify_presentation_layout(component, element_map=None):
                     'severity': 'error', 'type': 'text_out_of_bounds', 'page': page_index + 1,
                     'shape': shape_index + 1,
                     'description': f'Text box is outside slide bounds: x={x}, y={y}, width={width}, height={height}, slideWidth={page_width}, slideHeight={page_height}.',
-                }, element_map or [], str(getattr(shape, 'Name', '') or ''), {'slide': page_index + 1, 'shape': shape_index + 1}))
+                }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
             layout = mapped.get('layout') if isinstance(mapped.get('layout'), dict) else {}
             locator = mapped.get('locator') if isinstance(mapped.get('locator'), dict) else {}
             role = str(layout.get('role') or locator.get('layoutRole') or 'content').strip().lower()

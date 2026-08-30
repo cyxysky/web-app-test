@@ -6,6 +6,7 @@
 /out
 /dist
 /.tmp
+/output
 /validation
 /playwright-report
 /test-results

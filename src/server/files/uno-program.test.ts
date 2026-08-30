@@ -204,6 +204,34 @@ def create_document(job):
   assert.equal(verification.layout?.issues?.some((issue) => issue.elementIds?.includes('slide-01/background')), false);
 });
 
+test('presentation layout maps reopened shapes by stable artifact name before mutable shape index', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'stable-shape-name-mapping.pptx',
+    sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    page = deck.add_slide('slide-01')
+    deck.add_text('slide-01/left', page, 'Left', 1000, 1000, 5000, 1200, font_size=18)
+    deck.add_shape('slide-01/export-sensitive', page, 9000, 1000, 2000, 1200,
+                   service='com.sun.star.drawing.CaptionShape', line=0x2563EB,
+                   layout_role='decoration', allow_overlap=True)
+    deck.add_text('slide-01/right', page, 'Right', 16000, 1000, 5000, 1200, font_size=18)
+    deck.save()
+    deck.close()
+`,
+  });
+  const verification = generated.report.verification as {
+    layout?: { issues?: Array<{ elementIds?: string[]; type?: string }> };
+  };
+  assert.equal(verification.layout?.issues?.some((issue) => issue.type === 'text_overlap'), false);
+  assert.equal(verification.layout?.issues?.some((issue) => issue.elementIds?.includes('slide-01/right')), false);
+});
+
 test('resolves a unique downloaded asset suffix and allows an image-only slide', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
