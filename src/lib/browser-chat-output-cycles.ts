@@ -2,7 +2,7 @@ import type {
   BrowserChatAiOutputCycle,
   BrowserChatAiOutputView,
 } from '@/server/ai/schemas/runtime.schema';
-import { asRecord } from '@/lib/unknown-value';
+import { asRecord } from './unknown-value';
 
 function stripAnsiControlCodes(value: string) {
   return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
@@ -267,10 +267,44 @@ export function browserChatAiOutputCycleFromDebugEvent(input: {
   subagentId?: string;
   batchId?: string;
 }): BrowserChatAiOutputCycle | undefined {
-  if (input.phase !== 'ai:runtime:response' && input.phase !== 'ai:runtime:object') return undefined;
   const details = asRecord(input.details);
   const detailsValue = asRecord(details?.value) || details;
   const event = asRecord(detailsValue?.event) || detailsValue;
+  if (input.phase === 'ai:context-compression:complete') {
+    const execution = asRecord(event?.execution);
+    const toolCallId = stringFromUnknown(event?.toolCallId) || stringFromUnknown(execution?.toolCallId) || input.id;
+    const estimatedTokensBefore = Number(event?.estimatedTokensBefore);
+    const estimatedTokensAfter = Number(event?.estimatedTokensAfter);
+    const before = Number.isFinite(estimatedTokensBefore) ? Math.max(0, Math.round(estimatedTokensBefore)) : undefined;
+    const after = Number.isFinite(estimatedTokensAfter) ? Math.max(0, Math.round(estimatedTokensAfter)) : undefined;
+    return {
+      id: input.id,
+      messageId: input.messageId,
+      output: {
+        parts: [{ index: 0, kind: 'tool' }],
+        reasoning: [],
+        texts: [],
+        tools: [{
+          id: toolCallId,
+          input: {
+            estimatedTokensBefore: before,
+            estimatedTokensAfter: after,
+          },
+          name: 'contextCompression',
+          ok: true,
+          result: before !== undefined && after !== undefined
+            ? `Context compressed from ${before} to ${after} estimated tokens.`
+            : 'Context compression completed.',
+        }],
+      },
+      stepIndex: input.stepIndex,
+      sequence: input.sequence,
+      createdAt: input.createdAt,
+      subagentId: input.subagentId,
+      batchId: input.batchId,
+    };
+  }
+  if (input.phase !== 'ai:runtime:response' && input.phase !== 'ai:runtime:object') return undefined;
   const aiOutput = asRecord(event?.aiOutput);
   if (!aiOutput) return undefined;
   const rawAgentStepIndex = Number(aiOutput.agentStepIndex);

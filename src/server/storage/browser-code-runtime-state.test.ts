@@ -27,6 +27,19 @@ test('browserCode conversation state persists across database reopen and isolate
     assert.equal(restored.revision, 1);
     assert.deepEqual(restored.value, { issueId: '30789', step: 2 });
 
+    const largeValue = `data:image/png;base64,${'A'.repeat(1_100_000)}`;
+    stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
+      action: 'set',
+      input: { key: 'task.large-image', value: largeValue },
+    });
+    databaseModule.closeSqliteDatabase();
+    const restoredLarge = stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
+      action: 'get',
+      input: { key: 'task.large-image' },
+    }) as { found: boolean; value: unknown };
+    assert.equal(restoredLarge.found, true);
+    assert.equal(restoredLarge.value, largeValue);
+
     const isolated = stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-b', {
       action: 'get',
       input: { key: 'task.progress' },

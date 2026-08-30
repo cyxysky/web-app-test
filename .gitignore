@@ -5,6 +5,7 @@
 /.next-dev-runtime
 /out
 /dist
+/.tmp
 /validation
 /playwright-report
 /test-results

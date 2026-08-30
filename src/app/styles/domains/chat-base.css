@@ -2639,6 +2639,66 @@
   min-width: 0;
 }
 
+.browser-chat-tool-context-info {
+  align-items: center;
+  border-radius: 999px;
+  color: var(--muted);
+  cursor: help;
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 28px;
+  justify-content: center;
+  width: 24px;
+}
+
+.browser-chat-tool-context-info:hover,
+.browser-chat-tool-context-info:focus-visible {
+  background: var(--panel-soft);
+  color: var(--foreground);
+  outline: none;
+}
+
+.browser-chat-tool-context-info:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus-ring) 38%, transparent);
+}
+
+.browser-chat-tool-context-tooltip {
+  background: var(--foreground);
+  border: 1px solid color-mix(in srgb, var(--background) 20%, transparent);
+  border-radius: 10px;
+  box-shadow: var(--shadow-tight);
+  color: var(--background);
+  display: grid;
+  font-size: 12px;
+  gap: 3px;
+  line-height: 1.45;
+  max-width: calc(100vw - 24px);
+  min-width: 0;
+  padding: 9px 11px;
+  pointer-events: none;
+  position: fixed;
+  white-space: normal;
+  width: min(280px, calc(100vw - 24px));
+  z-index: 10000;
+}
+
+.browser-chat-tool-context-tooltip strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.browser-chat-tool-context-tooltip small {
+  color: color-mix(in srgb, var(--background) 68%, transparent);
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+.browser-chat-tool-context-divider {
+  border-top: 1px solid color-mix(in srgb, var(--background) 22%, transparent);
+  height: 0;
+  margin: 5px 0 2px;
+}
+
 .browser-chat-tool-image-button {
   align-items: center;
   background: transparent;

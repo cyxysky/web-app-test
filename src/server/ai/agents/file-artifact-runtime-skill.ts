@@ -96,8 +96,8 @@ type FileInput =
       action: "unoApi";
       reason?: string;
       documentId: string;
-      documentType?: DocumentType;
-      target?: ApiTarget;
+      documentType?: DocumentType; // inferred from the planned documentId when omitted
+      target?: ApiTarget; // inferred from query; otherwise defaults to "document"
       query?: string;
       offset?: number;
       limit?: number;
@@ -136,7 +136,8 @@ type FileLineEdit =
   | { kind: "replaceRange"; startLine: number; endLine: number; newText: string }
   | { kind: "deleteRange"; startLine: number; endLine: number }
   | { kind: "insertBefore" | "insertAfter"; line: number; newText: string }
-  | { kind: "replaceText"; oldText: string; occurrence?: number; newText: string };
+  | { kind: "replaceText"; oldText: string; occurrence?: number; newText: string } // occurrence is a one-based match index, never a replacement count
+  | { kind: "replaceAll"; oldText: string; newText: string };
 \`\`\`
 
 Action requirements:
@@ -146,7 +147,7 @@ Action requirements:
 - \`download\`: provide a real source in \`urlOrPath\`, \`url\`, or \`path\`, plus \`fileType\` without a dot.
 - \`convert\`: \`sourceArtifactId\` is the exact Artifact ID of the source Office file.
 - \`plan\`: \`documentId\`, \`fileName\`, and \`documentType\` are required. \`operation\` defaults to \`"create"\`; \`sourceAttachmentId\` is required for \`operation: "modify"\`.
-- \`unoApi\` and \`jsApi\`: call only after plan and only for its returned generation mode, always with the same \`documentId\`.
+- \`unoApi\` and \`jsApi\`: call only after plan and only for its returned generation mode, always with the same \`documentId\`. \`unoApi\` infers \`documentType\` from that plan and always returns the complete reflection catalog; use \`query\` only to filter that catalog.
 - \`generate\`: call exactly once for a planned document. It creates the single editable source buffer even when validation fails.
 - \`edit\`: after generation, including a failed initial validation, repair the same saved source with structured \`edits\`, one unified \`patch\`, or \`restoreRevision\`. Do not combine these mutation forms and do not send a whole-program replacement.
 - \`render\`: publishes only the current source after that exact source passes validation.
@@ -164,15 +165,18 @@ For JavaScript presentation drafts that use PptxGenJS:
 
 UNO Writer keeps the complete LibreOffice API available. Do not tell the user that an Office feature is unavailable merely because the high-level facade does not expose it.
 
-The stable facade, element mapping, expert-mode audit, high-risk static checks, format-specific deterministic checks, and dual-renderer matrix in this section apply only to UNO drafts. JavaScript drafts continue to use \`job.PptxGenJS\`, \`job.docx\`, and \`job.ExcelJS\` directly with their existing validation flow.
+The stable facade, element mapping, expert-mode audit, high-risk static checks, and format-specific deterministic checks in this section apply only to UNO drafts. JavaScript drafts continue to use \`job.PptxGenJS\`, \`job.docx\`, and \`job.ExcelJS\` directly with their existing validation flow.
 
 - For new documents, use \`job.writer(elementId)\`, \`job.presentation(elementId)\`, or \`job.spreadsheet(elementId)\` by default. The stable facade covers ordinary flow content and bounded page, slide, and cell layout.
 - Every generated page, paragraph, heading, list, table, chart, image, shape, worksheet, range, and cell must have a stable \`elementId\`. Reuse the same ID when repairing that logical element.
 - If the stable facade cannot express a required Office feature, declare \`expert = job.expert("concrete reason")\`. Use the raw UNO handles exposed by that expert object and call \`expert.tag(target, elementId, kind, locator)\` for each raw UNO object.
 - Expert mode preserves full Office capability, but it is explicit and auditable. Direct \`layout.raw\`, \`job.new_document()\`, and untagged raw UNO objects are rejected before execution.
 - Keep ordinary text, tables, and images in flow layout unless the requested appearance genuinely needs floating placement. When using a floating frame, shape, image, or embedded chart, assign its anchor, wrapping, size, and position deliberately and inspect every affected rendered page.
+- For Impress, read `deck.bounds()` once and compose ordinary content with `deck.content_box()`, `deck.grid()`, and `deck.stack()`. Do not hand-calculate a dense page of unrelated absolute coordinates when a facade layout can allocate non-overlapping cells.
+- Impress text and images participate in collision validation automatically. `add_shape` is decorative by default; use `layout_role="content", allow_overlap=False` for semantic bars, chart marks, table cells, and diagram nodes. Use `layout_role="background"` or `"container"` and `allow_overlap=True` only for deliberate underlays.
+- Treat every `text_overlap`, `image_overlap`, or `content_overlap` diagnostic as a blocking layout defect. Repair only the listed `elementIds` using the returned intersection and overlap ratio; do not hide the defect by shrinking body text below 16pt.
 - Output validation may report floating objects, positioned text frames, or exact-height table rows as visual-review risks. These warnings preserve advanced authoring freedom; they are not permission to skip visual QA. Fix unintended clipping or overlap in the same source, while retaining intentional freeform composition.
-- Deterministic validation runs before visual QA: format-specific package checks, LibreOffice rendering, then Microsoft Office rendering. Microsoft Office validation is required by default; an unavailable renderer blocks delivery and is never described as passed. Set \`MICROSOFT_OFFICE_VALIDATION=if-available\` only for an environment where LibreOffice-only delivery is intentionally accepted.
+- Deterministic validation runs before visual QA: format-specific package checks followed by LibreOffice render-and-reopen verification. Microsoft Office is not launched or required by this pipeline.
 - Never use a successful reopen or a structurally valid package as proof that pagination is visually correct. Complete the current-artifact page review only after all deterministic gates have passed.
 
 ## file call examples
@@ -408,17 +412,19 @@ Do not mix ids from different documents or formats. Different documentIds and ou
 
 The plan result selects the mode; do not choose a different branch afterward.
 
-- UNO: read unoApi for the planned document and target. Geometry uses 1/100 mm while CharHeight uses points. In Impress, set Position/Size, add the shape to the page, write String/Text, then apply formatting. Never create scrollable text controls.
+- UNO: read unoApi for the planned document. Geometry uses 1/100 mm while CharHeight uses points. In Impress, set Position/Size, add the shape to the page, write String/Text, then apply formatting. Never create scrollable text controls.
+- Facade element IDs must resolve to non-empty unique stable strings at runtime. Deterministic loop expressions such as \`"slide-" + str(i)\` are allowed. Local helper functions that happen to be named \`add_text\` or \`add_shape\` are not facade calls. Raw UNO objects still require \`expert.tag(...)\` on the exact serialized object.
+- The presentation facade directly supports \`deck.bounds()\`, \`deck.add_text(..., font_size, color, bold, italic, align, font_name)\`, and \`deck.add_shape(..., service, fill, line, line_width, fill_transparency)\`. \`deck.add_text\` keeps the exact requested box size; leave a small edge margin and resize the box or shorten copy if text does not fit. Use \`deck.bounds()\` for every full-slide/background or edge-aligned object. Copy the exact signatures returned by unoApi; do not guess other style keywords.
 - JavaScript: read jsApi for the planned document and use only its cookbook and supported libraries. Keep shared initialization/helpers/final output outside optional units.
 - PDF is supported in both modes. JavaScript mode authors the matching Office intermediate and converts that exact result locally.
 
 ## Editing and recovery
 
-action=edit accepts replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText, a unified patch, or restoreRevision. Do not send an unversioned complete program replacement through edit.
+action=edit accepts replaceRange, insertBefore, insertAfter, deleteRange, exact replaceText/replaceAll, a unified patch, or restoreRevision. Do not send an unversioned complete program replacement through edit, and do not replace most of the source with one replaceRange. For replaceText, omit occurrence when oldText is unique; otherwise occurrence is the one-based index of the intended match, not the number of replacements. To replace every exact match, send one replaceAll edit instead of a list of numbered replaceText edits.
 
 Every edit updates the one saved working source and validates it. Success creates a validated revision. Failure keeps the exact edited source plus diagnostics and requires another edit; it never restores an older source automatically. Use action=read when fresh line numbers or exact current text are needed. Rendering and final delivery remain blocked while validationStatus is failed.
 
-Large scripts may optionally wrap self-contained page or section bodies in @webpilot-unit markers and use path-scoped read/edit. Unit edits validate an isolated candidate, while final render still validates the complete document.
+Large scripts may optionally wrap self-contained page or section bodies in @webpilot-unit markers and use path-scoped read/edit. Unit edits validate an isolated candidate, while final render still validates the complete document. Near-complete replaceRange edits are blocked; repair a focused region, use replaceAll for repeated exact text, or edit one marked unit.
 
 ## Rendering and visual QA
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import contextlib
 import hashlib
 import inspect
@@ -48,6 +49,54 @@ def size(width, height):
     value = uno.createUnoStruct('com.sun.star.awt.Size')
     value.Width, value.Height = int(width), int(height)
     return value
+
+
+def source_image_dimensions(path: Path):
+    """Read intrinsic pixel/vector dimensions without trusting UNO lazy metadata."""
+    data = path.read_bytes()
+    if data.startswith(b'\x89PNG\r\n\x1a\n') and len(data) >= 24:
+        return int.from_bytes(data[16:20], 'big'), int.from_bytes(data[20:24], 'big')
+    if data[:2] == b'\xff\xd8':
+        position = 2
+        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while position + 4 <= len(data):
+            while position < len(data) and data[position] != 0xFF:
+                position += 1
+            while position < len(data) and data[position] == 0xFF:
+                position += 1
+            if position >= len(data):
+                break
+            marker = data[position]
+            position += 1
+            if marker in {0x01, 0xD8, 0xD9}:
+                continue
+            if position + 2 > len(data):
+                break
+            length = int.from_bytes(data[position:position + 2], 'big')
+            if length < 2 or position + length > len(data):
+                break
+            segment = data[position + 2:position + length]
+            if marker in sof_markers and len(segment) >= 5:
+                return int.from_bytes(segment[3:5], 'big'), int.from_bytes(segment[1:3], 'big')
+            position += length
+    if data[:6] in {b'GIF87a', b'GIF89a'} and len(data) >= 10:
+        return int.from_bytes(data[6:8], 'little'), int.from_bytes(data[8:10], 'little')
+    if path.suffix.lower() == '.svg' or b'<svg' in data[:1024].lower():
+        head = data[:16384].decode('utf-8', errors='ignore')
+        tag_match = re.search(r'<svg\b[^>]*>', head, flags=re.IGNORECASE | re.DOTALL)
+        tag = tag_match.group(0) if tag_match else head
+        width_match = re.search(r'\bwidth\s*=\s*["\']\s*([0-9.]+)', tag, flags=re.IGNORECASE)
+        height_match = re.search(r'\bheight\s*=\s*["\']\s*([0-9.]+)', tag, flags=re.IGNORECASE)
+        if width_match and height_match:
+            return float(width_match.group(1)), float(height_match.group(1))
+        view_box = re.search(
+            r'\bviewBox\s*=\s*["\']\s*[-0-9.]+[ ,]+[-0-9.]+[ ,]+([0-9.]+)[ ,]+([0-9.]+)',
+            tag,
+            flags=re.IGNORECASE,
+        )
+        if view_box:
+            return float(view_box.group(1)), float(view_box.group(2))
+    return None
 
 
 def save_document(document, job):
@@ -139,6 +188,7 @@ class DocumentJob:
     source_path: Path
     opened_documents: set = field(default_factory=set, compare=False)
     element_records: dict = field(default_factory=dict, compare=False)
+    layout_issues: list = field(default_factory=list, compare=False)
 
     @property
     def output_url(self):
@@ -149,7 +199,18 @@ class DocumentJob:
         if candidate != self.assets_path and self.assets_path not in candidate.parents:
             raise ValueError('Asset paths must stay within job.assets_path')
         if not candidate.is_file():
-            available = ', '.join(item['name'] for item in self.list_assets()) or '(none)'
+            assets = self.list_assets()
+            requested = Path(str(name)).name.lower()
+            exact_case_insensitive = [item for item in assets if item['name'].lower() == requested]
+            suffix_matches = [
+                item for item in assets
+                if Path(item['name']).suffix.lower() == Path(requested).suffix.lower()
+                and Path(item['name']).stem.lower().endswith(Path(requested).stem.lower())
+            ]
+            matches = exact_case_insensitive or suffix_matches
+            if len(matches) == 1:
+                return (self.assets_path / matches[0]['name']).resolve()
+            available = ', '.join(item['name'] for item in assets) or '(none)'
             raise FileNotFoundError(f'Asset {name!r} is not in this conversation workspace. Available assets: {available}')
         return candidate
 
@@ -324,6 +385,35 @@ class WriterLayout:
         styles = self._component.StyleFamilies.getByName('PageStyles')
         return styles.getByName(styles.getElementNames()[0])
 
+    def _insert_bookmarked_text(self, text, cursor, record, value):
+        """Insert text and anchor the exported element marker to a real range.
+
+        LibreOffice drops collapsed/zero-length Writer bookmarks while saving
+        DOCX. Selecting the inserted content keeps the marker in OOXML. Empty
+        structural paragraphs receive a hidden word-joiner so their bookmark
+        also survives without producing visible text.
+        """
+        content = str(value)
+        marker_content = content or '\u2060'
+        text.insertString(cursor, marker_content, False)
+        marker_cursor = text.createTextCursorByRange(cursor)
+        marker_cursor.goLeft(len(marker_content), True)
+        if not content:
+            try:
+                marker_cursor.CharHidden = True
+            except Exception:
+                pass
+        bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
+        bookmark.Name = record['artifactName']
+        text.insertTextContent(marker_cursor, bookmark, True)
+        # Do not leak the hidden marker formatting into following flow content.
+        # LibreOffice otherwise exports later runs with w:vanish and may reduce
+        # inline graphics to the height of a single hidden text line.
+        try:
+            cursor.CharHidden = False
+        except Exception:
+            pass
+
     @staticmethod
     def _column_name(index):
         value = int(index) + 1
@@ -353,29 +443,40 @@ class WriterLayout:
         if header:
             if not header_element_id:
                 raise ValueError('header_element_id is required when header text is present')
+            style.HeaderIsShared = True
+            style.HeaderIsDynamicHeight = False
+            style.HeaderHeight = 700
+            style.HeaderBodyDistance = 300
             style.HeaderText.String = str(header)
             record = self.job.register_element(header_element_id, 'header', style.HeaderText, {'role': 'header'})
             cursor = style.HeaderText.createTextCursor()
             cursor.gotoStart(False)
+            cursor.goRight(len(str(header)), True)
             bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
             bookmark.Name = record['artifactName']
-            style.HeaderText.insertTextContent(cursor, bookmark, False)
+            style.HeaderText.insertTextContent(cursor, bookmark, True)
         if footer:
             if not footer_element_id:
                 raise ValueError('footer_element_id is required when footer text is present')
+            style.FooterIsShared = True
+            style.FooterIsDynamicHeight = False
+            style.FooterHeight = 700
+            style.FooterBodyDistance = 250
             style.FooterText.String = str(footer)
             record = self.job.register_element(footer_element_id, 'footer', style.FooterText, {'role': 'footer'})
             cursor = style.FooterText.createTextCursor()
             cursor.gotoStart(False)
+            cursor.goRight(len(str(footer)), True)
             bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
             bookmark.Name = record['artifactName']
-            style.FooterText.insertTextContent(cursor, bookmark, False)
+            style.FooterText.insertTextContent(cursor, bookmark, True)
         return self
 
     def add_paragraph(self, element_id, value='', font_size=11, bold=False, italic=False, color=0x000000,
                       align='LEFT', line_spacing=1.3, space_before=0, space_after=180, paragraph_style=None):
         cursor = self._end_cursor()
         cursor.NumberingStyleName = ''
+        cursor.CharHidden = False
         if paragraph_style:
             cursor.ParaStyleName = str(paragraph_style)
         cursor.CharHeight = float(font_size)
@@ -390,10 +491,7 @@ class WriterLayout:
         cursor.ParaBottomMargin = max(0, int(space_after))
         self._paragraph_count += 1
         record = self.job.register_element(element_id, 'paragraph', None, {'paragraph': self._paragraph_count})
-        bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
-        bookmark.Name = record['artifactName']
-        self._component.Text.insertTextContent(cursor, bookmark, False)
-        self._component.Text.insertString(cursor, str(value), False)
+        self._insert_bookmarked_text(self._component.Text, cursor, record, value)
         paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
         self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
         return self
@@ -417,6 +515,7 @@ class WriterLayout:
         list_level = max(0, int(level))
         for index, value in enumerate(values):
             cursor = self._end_cursor()
+            cursor.CharHidden = False
             cursor.CharHeight = float(font_size)
             cursor.CharColor = int(color)
             cursor.ParaBottomMargin = 80
@@ -427,12 +526,12 @@ class WriterLayout:
                 f'{element_id}/{index + 1}', 'list-item', None,
                 {'paragraph': self._paragraph_count, 'level': list_level},
             )
-            bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
-            bookmark.Name = record['artifactName']
-            self._component.Text.insertTextContent(cursor, bookmark, False)
-            self._component.Text.insertString(cursor, str(value), False)
+            self._insert_bookmarked_text(self._component.Text, cursor, record, value)
             paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
             self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
+        trailing_cursor = self._end_cursor()
+        trailing_cursor.NumberingStyleName = ''
+        trailing_cursor.CharHidden = False
         return self
 
     def add_table(self, element_id, rows, column_widths=None, header=True, font_size=10):
@@ -443,10 +542,9 @@ class WriterLayout:
         if any(len(row) != column_count for row in data):
             raise ValueError('Writer table rows must all have the same column count')
         cursor = self._end_cursor()
+        cursor.CharHidden = False
         record = self.job.register_element(element_id, 'table', None, {'table': len(self._component.TextTables.ElementNames) + 1})
-        bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
-        bookmark.Name = record['artifactName']
-        self._component.Text.insertTextContent(cursor, bookmark, False)
+        self._insert_bookmarked_text(self._component.Text, cursor, record, '')
         table = self._component.createInstance('com.sun.star.text.TextTable')
         table.initialize(len(data), column_count)
         self._component.Text.insertTextContent(cursor, table, False)
@@ -476,47 +574,108 @@ class WriterLayout:
                 if header and row_index == 0:
                     cell_cursor.CharWeight = 150.0
                     cell.BackColor = 0xE8EEF7
+        # Establish an ordinary flow paragraph after the table. Without this,
+        # Writer can anchor the next inline object to the table's terminal row
+        # and export it with a one-line height in DOCX.
+        cursor.gotoEnd(False)
+        cursor.NumberingStyleName = ''
+        cursor.CharHidden = False
+        paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
+        self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
+        self._paragraph_count += 1
         return table
 
-    def add_inline_image(self, element_id, asset_name, width=None, height=None):
+    def add_inline_image(self, element_id, asset_name, width=None, height=None, align='CENTER', space_after=180):
         cursor = self._end_cursor()
-        record = self.job.register_element(element_id, 'image', None, {'image': len(self.job.element_records)})
-        bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
-        bookmark.Name = record['artifactName']
-        self._component.Text.insertTextContent(cursor, bookmark, False)
+        cursor.NumberingStyleName = ''
+        cursor.CharHidden = False
+        cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
+        cursor.ParaBottomMargin = max(0, int(space_after))
         image = self._component.createInstance('com.sun.star.text.TextGraphicObject')
-        image.GraphicURL = uno.systemPathToFileUrl(str(self.job.asset_path(asset_name)))
+        self.job.register_element(element_id, 'image', image, {'image': len(self.job.element_records)})
+        asset_path = self.job.asset_path(asset_name)
+        asset_url = uno.systemPathToFileUrl(str(asset_path))
+        try:
+            provider = self.job.context.ServiceManager.createInstanceWithContext(
+                'com.sun.star.graphic.GraphicProvider', self.job.context
+            )
+            graphic = provider.queryGraphic((self.job.property('URL', asset_url),))
+        except Exception:
+            graphic = None
+        if graphic is not None:
+            image.Graphic = graphic
+        else:
+            image.GraphicURL = asset_url
         image.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AS_CHARACTER')
         bounds = self.job.document_bounds(self._component)
+        intrinsic = source_image_dimensions(asset_path)
         try:
             natural_size = image.Graphic.Size100thMM
             natural_width, natural_height = int(natural_size.Width), int(natural_size.Height)
         except Exception:
             natural_width, natural_height = 12000, 7000
-        if width is not None and height is None and natural_width > 0:
-            height = int(float(width) * natural_height / natural_width)
-        elif height is not None and width is None and natural_height > 0:
-            width = int(float(height) * natural_width / natural_height)
+        ratio_width, ratio_height = intrinsic or (natural_width, natural_height)
+        ratio_valid = float(ratio_width or 0) > 0 and float(ratio_height or 0) > 0
+        if width is not None and height is None and ratio_valid:
+            height = int(round(float(width) * float(ratio_height) / float(ratio_width)))
+        elif height is not None and width is None and ratio_valid:
+            width = int(round(float(height) * float(ratio_width) / float(ratio_height)))
         elif width is None and height is None:
-            scale = min(1.0, bounds['contentWidth'] / natural_width, bounds['contentHeight'] / natural_height)
-            width, height = int(natural_width * scale), int(natural_height * scale)
-        image.Width = min(int(width or natural_width), bounds['contentWidth'])
-        image.Height = min(int(height or natural_height), bounds['contentHeight'])
-        if image.Width <= 0 or image.Height <= 0:
+            if ratio_valid:
+                width = min(bounds['contentWidth'], natural_width if natural_width > 100 else bounds['contentWidth'])
+                height = int(round(float(width) * float(ratio_height) / float(ratio_width)))
+                if height > bounds['contentHeight']:
+                    height = bounds['contentHeight']
+                    width = int(round(float(height) * float(ratio_width) / float(ratio_height)))
+            else:
+                width, height = min(12000, bounds['contentWidth']), min(7000, bounds['contentHeight'])
+        target_width = min(int(width or natural_width), bounds['contentWidth'])
+        target_height = min(int(height or natural_height), bounds['contentHeight'])
+        if target_width <= 0 or target_height <= 0:
             raise ValueError('Writer inline image dimensions must be positive')
+        image.Width, image.Height = target_width, target_height
         self._component.Text.insertTextContent(cursor, image, False)
+        # Writer may replace one dimension with lazy graphic metadata during insertion.
+        # Apply the exact box again after the object is anchored in the document.
+        try:
+            image.setSize(size(target_width, target_height))
+        except Exception:
+            image.Width, image.Height = target_width, target_height
+        paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
+        self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
+        self._paragraph_count += 1
         return image
 
     def add_page_break(self, element_id):
         cursor = self._end_cursor()
         cursor.NumberingStyleName = ''
+        cursor.CharHidden = False
+        # Page breaks must live on a neutral flow paragraph. Writer otherwise
+        # inherits the previous paragraph's margins/style onto the break and
+        # the first paragraph of the next page. That can make alternating pages
+        # begin inside the header, especially after captions or list items.
+        try:
+            cursor.ParaStyleName = 'Standard'
+        except Exception:
+            pass
+        cursor.ParaTopMargin = 0
+        cursor.ParaBottomMargin = 0
         record = self.job.register_element(element_id, 'page-break', None, {'paragraph': self._paragraph_count + 1})
-        bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
-        bookmark.Name = record['artifactName']
-        self._component.Text.insertTextContent(cursor, bookmark, False)
+        self._insert_bookmarked_text(self._component.Text, cursor, record, '')
         cursor.BreakType = uno.Enum('com.sun.star.style.BreakType', 'PAGE_BEFORE')
         paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
         self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
+        following_cursor = self._end_cursor()
+        following_cursor.NumberingStyleName = ''
+        following_cursor.CharHidden = False
+        try:
+            following_cursor.ParaStyleName = 'Standard'
+            following_cursor.BreakType = uno.Enum('com.sun.star.style.BreakType', 'NONE')
+        except Exception:
+            pass
+        following_cursor.ParaTopMargin = 0
+        following_cursor.ParaBottomMargin = 0
+        self._paragraph_count += 1
         return self
 
     def save(self):
@@ -538,9 +697,92 @@ class WriterLayout:
 class PresentationLayout:
     """Stable Impress geometry helpers. Expert mode covers unmodeled services."""
 
+    _LAYOUT_ROLES = {'content', 'container', 'decoration', 'background'}
+
     def __init__(self, job, component):
         self.job, self._component = job, component
         self._slide_count = 0
+
+    def bounds(self):
+        """Return exact slide width/height in 1/100 mm for facade geometry."""
+        return self.job.document_bounds(self._component)
+
+    def content_box(self, margins=(1600, 1600, 1400, 1200)):
+        """Return a safe content rectangle inside the current slide bounds.
+
+        ``margins`` is ``(left, right, top, bottom)`` in 1/100 mm. Keeping
+        layout arithmetic in this facade avoids model-authored hard-coded
+        page sizes and makes the same program portable across slide formats.
+        """
+        if not isinstance(margins, (list, tuple)) or len(margins) != 4:
+            raise ValueError('Presentation margins must be (left, right, top, bottom).')
+        left, right, top, bottom = [max(0, int(value)) for value in margins]
+        bounds = self.bounds()
+        width = int(bounds['width']) - left - right
+        height = int(bounds['height']) - top - bottom
+        if width <= 0 or height <= 0:
+            raise ValueError(
+                f'Presentation margins leave no usable content area: margins={tuple(margins)}, '
+                f'slideWidth={int(bounds["width"])}, slideHeight={int(bounds["height"])}'
+            )
+        return {'x': left, 'y': top, 'width': width, 'height': height}
+
+    @staticmethod
+    def _normalized_weights(count, weights):
+        if weights is None:
+            return [1.0] * count
+        values = [float(value) for value in weights]
+        if len(values) != count or any(value <= 0 for value in values):
+            raise ValueError('Layout weights must contain one positive value per track.')
+        return values
+
+    def grid(self, columns, rows, box=None, gap=500, column_weights=None, row_weights=None):
+        """Partition a rectangle into deterministic non-overlapping cells."""
+        columns, rows = int(columns), int(rows)
+        if columns <= 0 or rows <= 0:
+            raise ValueError('Presentation grid requires positive columns and rows.')
+        area = dict(box or self.content_box())
+        x, y = int(area['x']), int(area['y'])
+        width, height = int(area['width']), int(area['height'])
+        if isinstance(gap, (list, tuple)):
+            if len(gap) != 2:
+                raise ValueError('Presentation grid gap must be a number or (horizontal, vertical).')
+            gap_x, gap_y = [max(0, int(value)) for value in gap]
+        else:
+            gap_x = gap_y = max(0, int(gap))
+        available_width = width - gap_x * (columns - 1)
+        available_height = height - gap_y * (rows - 1)
+        if available_width <= 0 or available_height <= 0:
+            raise ValueError('Presentation grid gaps leave no usable cell area.')
+        column_values = self._normalized_weights(columns, column_weights)
+        row_values = self._normalized_weights(rows, row_weights)
+        column_widths = [int(available_width * value / sum(column_values)) for value in column_values]
+        row_heights = [int(available_height * value / sum(row_values)) for value in row_values]
+        column_widths[-1] += available_width - sum(column_widths)
+        row_heights[-1] += available_height - sum(row_heights)
+        cells, cell_y = [], y
+        for row, row_height in enumerate(row_heights):
+            cell_x = x
+            for column, column_width in enumerate(column_widths):
+                cells.append({
+                    'x': cell_x, 'y': cell_y,
+                    'width': column_width, 'height': row_height,
+                })
+                cell_x += column_width + gap_x
+            cell_y += row_height + gap_y
+        return cells
+
+    def stack(self, count, box=None, direction='vertical', gap=400, weights=None):
+        """Partition a rectangle into a vertical or horizontal content stack."""
+        count = int(count)
+        if count <= 0:
+            raise ValueError('Presentation stack requires a positive item count.')
+        direction = str(direction or 'vertical').strip().lower()
+        if direction == 'vertical':
+            return self.grid(1, count, box=box, gap=(0, gap), row_weights=weights)
+        if direction == 'horizontal':
+            return self.grid(count, 1, box=box, gap=(gap, 0), column_weights=weights)
+        raise ValueError("Presentation stack direction must be 'vertical' or 'horizontal'.")
 
     def add_slide(self, element_id):
         if self._slide_count == 0 and self._component.DrawPages.Count == 1:
@@ -559,35 +801,137 @@ class PresentationLayout:
         )
         return page
 
-    def _add_shape(self, page, element_id, service, x, y, width, height, kind):
+    def _add_shape(self, page, element_id, service, x, y, width, height, kind,
+                   layout_role='content', allow_overlap=False):
         if min(int(x), int(y)) < 0 or int(width) <= 0 or int(height) <= 0:
-            raise ValueError('Presentation geometry requires non-negative position and positive size')
+            raise ValueError(
+                'Presentation geometry requires non-negative position and positive size: '
+                f'elementId={element_id!r}, x={int(x)}, y={int(y)}, width={int(width)}, height={int(height)}'
+            )
+        page_bounds = self.bounds()
+        if int(x) + int(width) > int(page_bounds['width']) or int(y) + int(height) > int(page_bounds['height']):
+            self.job.layout_issues.append({
+                'code': 'PRESENTATION_GEOMETRY_INVALID', 'severity': 'error', 'elementId': str(element_id),
+                **self.job._source_location(),
+                'message': (
+                    'Presentation geometry exceeds slide bounds: '
+                    f'x={int(x)}, y={int(y)}, width={int(width)}, height={int(height)}, '
+                    f'slideWidth={int(page_bounds["width"])}, slideHeight={int(page_bounds["height"])}'
+                ),
+            })
         shape = self._component.createInstance(service)
         shape.Position, shape.Size = point(int(x), int(y)), size(int(width), int(height))
         page.add(shape)
         page_name = str(getattr(page, 'Name', '') or '')
         page_record = next((item for item in self.job.element_records.values() if item.get('artifactName') == page_name), None)
         page_index = int((page_record or {}).get('locator', {}).get('slide') or 1)
-        self.job.register_element(element_id, kind, shape, {'slide': page_index, 'shape': int(page.getCount())})
+        role = str(layout_role or 'content').strip().lower()
+        if role not in self._LAYOUT_ROLES:
+            raise ValueError(f'Unknown presentation layout_role {layout_role!r}; expected one of {sorted(self._LAYOUT_ROLES)}.')
+        record = self.job.register_element(element_id, kind, shape, {'slide': page_index, 'shape': int(page.getCount())})
+        record['layout'] = {
+            'role': role,
+            'allowOverlap': bool(allow_overlap),
+            'x': int(x), 'y': int(y), 'width': int(width), 'height': int(height),
+        }
         return shape
 
-    def add_text(self, element_id, page, text, x, y, width, height, font_size=18, color=0x000000):
-        shape = self._add_shape(page, element_id, 'com.sun.star.drawing.TextShape', x, y, width, height, 'text')
+    def add_text(self, element_id, page, text, x, y, width, height, font_size=18, color=0x000000,
+                 bold=False, italic=False, align='LEFT', font_name=None, fit='shrink', min_font_size=8,
+                 padding=0, valign='TOP', layout_role='content', allow_overlap=False):
+        shape = self._add_shape(
+            page, element_id, 'com.sun.star.drawing.TextShape', x, y, width, height, 'text',
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+        # Let Impress measure wrapped text with its installed fonts, then lock
+        # the authored box. This is more reliable than estimating CJK/Latin
+        # glyph metrics in JavaScript and prevents exporter-side growth.
+        requested_width, requested_height = int(width), int(height)
+        shape.TextAutoGrowHeight = False
+        shape.TextAutoGrowWidth = False
+        shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'NONE')
+        try:
+            shape.TextMinimumFrameHeight = 0
+            shape.TextMinimumFrameWidth = 0
+            shape.TextMaximumFrameHeight = int(self.bounds()['height'])
+            shape.TextMaximumFrameWidth = requested_width
+        except Exception:
+            pass
+        inset = max(0, int(padding))
+        for property_name in ('TextLeftDistance', 'TextRightDistance', 'TextUpperDistance', 'TextLowerDistance'):
+            try:
+                setattr(shape, property_name, inset)
+            except Exception:
+                pass
+        try:
+            shape.TextVerticalAdjust = uno.Enum('com.sun.star.drawing.TextVerticalAdjust', str(valign).upper())
+        except Exception:
+            pass
         shape.String = str(text)
         cursor = shape.Text.createTextCursor()
         cursor.gotoEnd(True)
         cursor.CharHeight, cursor.CharColor = float(font_size), int(color)
+        cursor.CharWeight = 150.0 if bold else 100.0
+        cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE')
+        cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
+        if font_name:
+            cursor.CharFontName = str(font_name)
+        shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
+        shape.TextAutoGrowHeight = True
+        measured_height = max(requested_height, int(getattr(shape.Size, 'Height', requested_height)))
+        fit_mode = str(fit or 'shrink').strip().lower()
+        if fit_mode not in {'none', 'shrink'}:
+            raise ValueError("Presentation text fit must be 'shrink' or 'none'.")
+        if measured_height > requested_height and fit_mode == 'shrink':
+            scale = requested_height / measured_height
+            if float(font_size) * scale < float(min_font_size):
+                record = self.job.element_records.get(str(element_id), {})
+                self.job.layout_issues.append({
+                    'code': 'PRESENTATION_TEXT_OVERFLOW', 'severity': 'error', 'elementId': str(element_id),
+                    'line': record.get('line'), 'column': record.get('column'), 'locator': record.get('locator'),
+                    'message': (
+                        f'Text requires an estimated {float(font_size) * scale:.2f}pt font to fit '
+                        f'{requested_width}x{requested_height}, below min_font_size={float(min_font_size):g}; '
+                        f'requestedFontSize={float(font_size):g}, measuredHeight={measured_height}. '
+                        'Increase the box or shorten the copy.'
+                    ),
+                })
+            shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'PROPORTIONAL')
+        shape.TextAutoGrowHeight = False
+        shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
         return shape
 
-    def add_shape(self, element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape'):
-        return self._add_shape(page, element_id, service, x, y, width, height, 'shape')
+    def add_shape(self, element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape',
+                  fill=None, line=None, line_width=0, fill_transparency=0,
+                  layout_role='decoration', allow_overlap=True):
+        shape = self._add_shape(
+            page, element_id, service, x, y, width, height, 'shape',
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+        if fill is not None:
+            shape.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')
+            shape.FillColor = int(fill)
+            shape.FillTransparence = max(0, min(100, int(fill_transparency)))
+            if line is None:
+                shape.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+        if line is not None:
+            shape.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'SOLID')
+            shape.LineColor = int(line)
+            shape.LineWidth = max(0, int(line_width))
+        return shape
 
-    def add_image(self, element_id, page, asset_name, x, y, width, height):
-        shape = self._add_shape(page, element_id, 'com.sun.star.drawing.GraphicObjectShape', x, y, width, height, 'image')
+    def add_image(self, element_id, page, asset_name, x, y, width, height,
+                  layout_role='content', allow_overlap=False):
+        shape = self._add_shape(
+            page, element_id, 'com.sun.star.drawing.GraphicObjectShape', x, y, width, height, 'image',
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
         shape.GraphicURL = uno.systemPathToFileUrl(str(self.job.asset_path(asset_name)))
         return shape
 
     def save(self):
+        if self.job.layout_issues:
+            raise ValueError('__WEBPILOT_LAYOUT_DIAGNOSTICS__' + json.dumps(self.job.layout_issues, ensure_ascii=False))
         save_document(self._component, self.job)
         return self
 
@@ -673,22 +1017,40 @@ def validate_program(source: str):
         raise ValueError('Draft must define exactly one synchronous create_document(job) function')
     if isinstance(entrypoints[0], ast.AsyncFunctionDef):
         raise ValueError('create_document(job) must be synchronous')
-    diagnostics, expert_calls, tag_calls = [], 0, 0
-    element_methods = {
-        'add_paragraph', 'add_heading', 'add_bullets', 'add_table', 'add_inline_image', 'add_page_break',
-        'add_slide', 'add_text', 'add_shape', 'add_image', 'add_worksheet', 'set_cell', 'set_range',
-    }
+    diagnostics, expert_calls, tag_calls, element_ids = [], 0, 0, {}
+    def visit_module_level(node):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        if isinstance(node, ast.Call):
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ''
+            if name == 'create_document':
+                diagnostics.append({
+                    'code': 'DRAFT_ENTRYPOINT_CALLED_DIRECTLY', 'line': node.lineno, 'column': node.col_offset + 1,
+                    'message': 'Do not call create_document yourself. The LibreOffice worker invokes create_document(job) with the real job object.',
+                    'severity': 'error',
+                })
+        for child in ast.iter_child_nodes(node):
+            visit_module_level(child)
+    for node in tree.body:
+        visit_module_level(node)
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ''
+            if name in {'writer', 'presentation', 'spreadsheet', 'set_page', 'add_slide', 'add_text', 'add_shape', 'add_image',
+                        'add_paragraph', 'add_heading', 'add_table', 'add_inline_image', 'add_page_break'} and node.args:
+                element = node.args[0]
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    if element.value in element_ids:
+                        diagnostics.append({
+                            'code': 'DUPLICATE_ELEMENT_ID', 'line': node.lineno, 'column': node.col_offset + 1,
+                            'message': f'Duplicate literal elementId {element.value!r}; first declared on line {element_ids[element.value]}. Element IDs must be unique.',
+                            'severity': 'error',
+                        })
+                    else:
+                        element_ids[element.value] = node.lineno
             if name in {'eval', 'exec', 'compile', '__import__'}:
                 diagnostics.append({'code': 'UNSAFE_DYNAMIC_EXECUTION', 'line': node.lineno, 'column': node.col_offset + 1,
                                     'message': f'{name} is forbidden in an Office draft.', 'severity': 'error'})
-            if name in element_methods:
-                first = node.args[0] if node.args else next((item.value for item in node.keywords if item.arg == 'element_id'), None)
-                if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
-                    diagnostics.append({'code': 'ELEMENT_ID_REQUIRED', 'line': node.lineno, 'column': node.col_offset + 1,
-                                        'message': f'{name} requires a stable string element_id.', 'severity': 'error'})
             if name == 'expert':
                 expert_calls += 1
                 reason = node.args[0] if node.args else None
@@ -703,6 +1065,27 @@ def validate_program(source: str):
         if isinstance(node, ast.Attribute) and node.attr == 'raw':
             diagnostics.append({'code': 'RAW_ACCESS_REQUIRES_EXPERT_MODE', 'line': node.lineno, 'column': node.col_offset + 1,
                                 'message': 'Direct .raw access is not available; use job.expert(reason).', 'severity': 'error'})
+    defined = set(dir(builtins)) | {'uno', '__name__', '__file__', '__webpilot_static_diagnostics__'}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Param)):
+            defined.add(node.id)
+        elif isinstance(node, ast.arg):
+            defined.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.alias):
+            defined.add(node.asname or node.name.split('.')[0])
+        elif isinstance(node, ast.ExceptHandler) and isinstance(node.name, str):
+            defined.add(node.name)
+    undefined = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in defined and node.id not in undefined:
+            undefined.add(node.id)
+            diagnostics.append({
+                'code': 'PYTHON_UNDEFINED_NAME', 'line': node.lineno, 'column': node.col_offset + 1,
+                'message': f'Python name {node.id!r} is referenced but never defined in this draft.',
+                'severity': 'error',
+            })
     if expert_calls and not tag_calls:
         diagnostics.append({'code': 'EXPERT_ELEMENTS_NOT_TAGGED', 'message': 'Expert mode is used, but no expert.tag(...) call was found.', 'severity': 'error'})
     errors = [item for item in diagnostics if item['severity'] == 'error']
@@ -819,34 +1202,14 @@ def uno_cookbook(document_type):
         'ControlCharacter has paragraph/line characters but no PAGE_BREAK member. Writer page breaks use the paragraph BreakType enum.',
         'For Impress TextShape objects, assign Position and Size, call page.add(shape), and only then assign String/Text and text formatting. Text written before page.add(shape) is lost by this LibreOffice runtime.',
         'For an existing-file modification plan, pass source_name=exactSourceAssetName to the matching stable facade. If expert access is required, call expert.open_document(name). Never create a replacement document.',
-        'Use storeToURL for PDF export and storeAsURL for editable Office formats. Select the filter from job.output_path.suffix.',
-        'Close the document only after the synchronous store/export call has returned.',
+        'Call the stable facade save() exactly once inside create_document(job), followed by close(). The worker-owned facade selects the output filter.',
+        'Never call create_document yourself, never append create_document(None), and never paste storeToURL/storeAsURL worker internals into a draft.',
     ]
+    facade_signatures = []
     save_examples = {
-        'word': '''def save_document(doc, job):
-    suffix = job.output_path.suffix.lower()
-    filters = {
-        '.doc': 'MS Word 97', '.docx': 'Office Open XML Text',
-        '.odt': 'writer8', '.pdf': 'writer_pdf_Export',
-    }
-    properties = (job.property('FilterName', filters[suffix]), job.property('Overwrite', True))
-    (doc.storeToURL if suffix == '.pdf' else doc.storeAsURL)(job.output_url, properties)''',
-        'spreadsheet': '''def save_document(doc, job):
-    suffix = job.output_path.suffix.lower()
-    filters = {
-        '.xls': 'MS Excel 97', '.xlsx': 'Calc MS Excel 2007 XML',
-        '.ods': 'calc8', '.pdf': 'calc_pdf_Export',
-    }
-    properties = (job.property('FilterName', filters[suffix]), job.property('Overwrite', True))
-    (doc.storeToURL if suffix == '.pdf' else doc.storeAsURL)(job.output_url, properties)''',
-        'presentation': '''def save_document(doc, job):
-    suffix = job.output_path.suffix.lower()
-    filters = {
-        '.ppt': 'MS PowerPoint 97', '.pptx': 'Impress MS PowerPoint 2007 XML',
-        '.odp': 'impress8', '.pdf': 'impress_pdf_Export',
-    }
-    properties = (job.property('FilterName', filters[suffix]), job.property('Overwrite', True))
-    (doc.storeToURL if suffix == '.pdf' else doc.storeAsURL)(job.output_url, properties)''',
+        'word': 'layout.save()\nlayout.close()',
+        'spreadsheet': 'workbook.save()\nworkbook.close()',
+        'presentation': 'deck.save()\ndeck.close()',
     }
     if document_type == 'word':
         operations = {
@@ -971,12 +1334,44 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
     workbook.close()'''
         coverage = ['create/save XLS/XLSX/ODS/PDF', 'strings, numbers, and formulas', 'cell formatting', 'row/column sizing', 'merged cells and freeze panes', 'images on draw page', 'multiple sheets']
     else:
+        common_rules.append(
+            'deck.add_text measures wrapping with LibreOffice, keeps the requested Position/Size fixed, and shrinks only as far as min_font_size. Resize the box or shorten copy when it cannot fit readably.'
+        )
+        common_rules.append(
+            'Slide objects follow insertion order. Add full-slide backgrounds and decorative layers before text, images, and foreground content so later shapes do not cover earlier content.'
+        )
+        common_rules.append(
+            'Use deck.content_box(), deck.grid(), and deck.stack() for ordinary composition instead of hand-calculating every coordinate. The returned cells are guaranteed not to overlap.'
+        )
+        common_rules.append(
+            'Text and images are collision-checked as content. add_shape defaults to decoration; pass layout_role="content", allow_overlap=False for semantic data shapes that must participate in collision checks. Set allow_overlap=True only for a deliberate overlay.'
+        )
+        facade_signatures = [
+            "deck.bounds() -> {'kind': 'presentation', 'width': int, 'height': int}",
+            "deck.content_box(margins=(1600, 1600, 1400, 1200)) -> {'x': int, 'y': int, 'width': int, 'height': int}",
+            "deck.grid(columns, rows, box=None, gap=500, column_weights=None, row_weights=None) -> list[rect]",
+            "deck.stack(count, box=None, direction='vertical', gap=400, weights=None) -> list[rect]",
+            "deck.add_slide(element_id)",
+            "deck.add_text(element_id, page, text, x, y, width, height, font_size=18, color=0x000000, bold=False, italic=False, align='LEFT', font_name=None, fit='shrink', min_font_size=8, padding=0, valign='TOP', layout_role='content', allow_overlap=False)",
+            "deck.add_shape(element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape', fill=None, line=None, line_width=0, fill_transparency=0, layout_role='decoration', allow_overlap=True)",
+            "deck.add_image(element_id, page, asset_name, x, y, width, height, layout_role='content', allow_overlap=False)",
+        ]
         operations = {
             'openExisting': '''deck = job.presentation('source-deck', source_name='exact-source-asset-name.pptx')
 # Modify through the stable facade and preserve all unrelated slides and objects.''',
             'bounds': '''bounds = job.document_bounds(doc)
 # Exact keys: kind, width, height. Values are 1/100 mm.
 slide_width, slide_height = bounds['width'], bounds['height']''',
+            'autoLayout': '''safe = deck.content_box(margins=(1600, 1600, 3200, 1400))
+cards = deck.grid(3, 1, box=safe, gap=700, column_weights=[1, 1, 1])
+for index, card in enumerate(cards):
+    deck.add_shape(f'slide-01/card-{index + 1}', page, card['x'], card['y'], card['width'], card['height'], fill=0xE8EEF7)
+    inner = deck.stack(2, box={
+        'x': card['x'] + 500, 'y': card['y'] + 500,
+        'width': card['width'] - 1000, 'height': card['height'] - 1000,
+    }, gap=250, weights=[1, 2])
+    deck.add_text(f'slide-01/card-{index + 1}/title', page, f'Card {index + 1}', **inner[0], font_size=22, bold=True)
+    deck.add_text(f'slide-01/card-{index + 1}/body', page, 'Body copy with measured wrapping.', **inner[1], font_size=16, min_font_size=16)''',
             'textShape': '''shape = doc.createInstance('com.sun.star.drawing.TextShape')
 position = uno.createUnoStruct('com.sun.star.awt.Point'); position.X, position.Y = 1600, 1200
 size = uno.createUnoStruct('com.sun.star.awt.Size'); size.Width, size.Height = 22000, 3000
@@ -1009,26 +1404,30 @@ page.add(card)''',
         }
         complete = '''def create_document(job):
     deck = job.presentation('deck')
+    bounds = deck.bounds()
     page = deck.add_slide('slide-01')
-    deck.add_text('slide-01/title', page, 'UNO Impress deck', 1600, 1200, 22000, 3200, font_size=28)
-    deck.add_shape('slide-01/card', page, 1600, 5200, 9000, 5000)
+    deck.add_shape('slide-01/background', page, 0, 0, bounds['width'], bounds['height'], fill=0xF8FAFC, layout_role='background', allow_overlap=True)
+    card = deck.grid(2, 1, box=deck.content_box(margins=(1600, 1600, 5200, 1800)), gap=800)[0]
+    deck.add_shape('slide-01/card', page, card['x'], card['y'], card['width'], card['height'], fill=0x2563EB, layout_role='container', allow_overlap=True)
+    deck.add_text('slide-01/title', page, 'UNO Impress deck', 1600, 1200, 22000, 3200, font_size=28, color=0x0F172A, bold=True)
     deck.save()
     deck.close()'''
-        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'text shapes with fixed point-size formatting', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
-    modification = save_examples[document_type] + '''
-
-def create_document(job):
+        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'safe content boxes', 'grid and stack auto-layout', 'text shapes with measured fixed bounds', 'content collision diagnostics', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
+    facade_name = {'word': 'writer', 'spreadsheet': 'spreadsheet', 'presentation': 'presentation'}[document_type]
+    modification = f'''def create_document(job):
     # Replace this placeholder with sourceDocument.assetName returned by action=plan.
     expert = job.expert('The requested edit requires direct access to existing Office objects.')
     doc = expert.open_document('exact-source-asset-name')
-    expert.tag(doc, 'source-document', 'existing-document', {'role': 'document'})
+    expert.tag(doc, 'source-document', 'existing-document', {{'role': 'document'}})
+    layout = job.{facade_name}('source-document-layout', component=doc)
     # Locate and edit only the requested existing content here.
-    save_document(doc, job)
-    job.close(doc)'''
+    layout.save()
+    layout.close()'''
     return {
         'status': 'copy these installed-runtime patterns; do not paraphrase them into guessed UNO calls',
         'coverage': coverage,
         'rules': common_rules,
+        'facadeSignatures': facade_signatures,
         'completeDocument': complete,
         'completeExistingDocumentModification': modification,
         'operations': operations,
@@ -1250,6 +1649,8 @@ def verify_presentation_text(component):
             shape_types[shape_type or '(unknown)'] = shape_types.get(shape_type or '(unknown)', 0) + 1
             if shape_type.startswith('com.sun.star.presentation.'):
                 continue
+            if not shape_type.endswith('TextShape'):
+                continue
             try:
                 value = str(shape.String or '')
             except Exception:
@@ -1274,54 +1675,136 @@ def verify_presentation_text(component):
 
 
 def verify_presentation_layout(component, element_map=None):
-    """Reject objective slide defects and report high-confidence overlap diagnostics."""
-    issues = []
-    checked_text_shapes = 0
+    """Reject objective slide defects and non-intentional content collisions.
+
+    Backgrounds, containers and decoration are excluded from collision checks.
+    Content overlap is allowed only when the authored element record explicitly
+    opts in with ``allowOverlap``. This keeps ordinary overlay design possible
+    without making every unmarked model-authored collision invisible.
+    """
+    issues, page_occupancy = [], []
+    checked_text_shapes = checked_content_shapes = 0
+    element_lookup = {
+        (entry.get('locator', {}).get('slide'), entry.get('locator', {}).get('shape')): entry
+        for entry in (element_map or [])
+    }
+
+    def intersection(left, right):
+        overlap_width = max(0, min(left['x'] + left['width'], right['x'] + right['width']) - max(left['x'], right['x']))
+        overlap_height = max(0, min(left['y'] + left['height'], right['y'] + right['height']) - max(left['y'], right['y']))
+        return {
+            'x': max(left['x'], right['x']), 'y': max(left['y'], right['y']),
+            'width': overlap_width, 'height': overlap_height,
+            'area': overlap_width * overlap_height,
+        }
+
+    def collision_threshold(left, right):
+        kinds = {left['kind'], right['kind']}
+        if kinds == {'text'}:
+            return 0.02, 'text_overlap'
+        if kinds == {'image'}:
+            return 0.05, 'image_overlap'
+        return 0.08 if kinds == {'text', 'image'} else 0.10, 'content_overlap'
+
     for page_index in range(component.DrawPages.Count):
         page = component.DrawPages.getByIndex(page_index)
         page_width, page_height = int(page.Width), int(page.Height)
         if page.getCount() == 0:
             issues.append({'severity': 'error', 'type': 'empty_page', 'page': page_index + 1, 'description': 'Page has no shapes.'})
             continue
-        text_boxes = []
+        content_boxes = []
         for shape_index in range(page.getCount()):
             shape = page.getByIndex(shape_index)
+            position, shape_size = shape.Position, shape.Size
+            x, y = int(position.X), int(position.Y)
+            width, height = int(shape_size.Width), int(shape_size.Height)
+            mapped = element_lookup.get((page_index + 1, shape_index + 1), {})
             try:
                 value = str(shape.String or '').strip()
             except Exception:
                 value = ''
-            if not value:
-                continue
-            checked_text_shapes += 1
-            position, shape_size = shape.Position, shape.Size
-            x, y = int(position.X), int(position.Y)
-            width, height = int(shape_size.Width), int(shape_size.Height)
-            if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > page_width or y + height > page_height:
+            kind = str(mapped.get('kind') or ('text' if value else '')).strip().lower()
+            if not kind:
+                try:
+                    if shape.supportsService('com.sun.star.drawing.GraphicObjectShape'):
+                        kind = 'image'
+                except Exception:
+                    pass
+            if value:
+                checked_text_shapes += 1
+            if value and (width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > page_width or y + height > page_height):
                 issues.append(map_issue({
                     'severity': 'error', 'type': 'text_out_of_bounds', 'page': page_index + 1,
                     'shape': shape_index + 1,
                     'description': f'Text box is outside slide bounds: x={x}, y={y}, width={width}, height={height}, slideWidth={page_width}, slideHeight={page_height}.',
                 }, element_map or [], str(getattr(shape, 'Name', '') or ''), {'slide': page_index + 1, 'shape': shape_index + 1}))
-            text_boxes.append({'shape': shape_index + 1, 'text': value[:80], 'x': x, 'y': y, 'width': width, 'height': height})
-        for left_index in range(len(text_boxes)):
-            left = text_boxes[left_index]
-            for right in text_boxes[left_index + 1:]:
-                overlap_width = max(0, min(left['x'] + left['width'], right['x'] + right['width']) - max(left['x'], right['x']))
-                overlap_height = max(0, min(left['y'] + left['height'], right['y'] + right['height']) - max(left['y'], right['y']))
-                overlap_area = overlap_width * overlap_height
+            layout = mapped.get('layout') if isinstance(mapped.get('layout'), dict) else {}
+            locator = mapped.get('locator') if isinstance(mapped.get('locator'), dict) else {}
+            role = str(layout.get('role') or locator.get('layoutRole') or 'content').strip().lower()
+            allow_overlap = bool(layout.get('allowOverlap', locator.get('allowOverlap', False)))
+            if role in {'background', 'container', 'decoration'} or allow_overlap:
+                continue
+            if kind not in {'text', 'image', 'shape', 'chart', 'table', 'diagram', 'expert-element'}:
+                continue
+            checked_content_shapes += 1
+            box = {
+                'shape': shape_index + 1, 'elementId': mapped.get('elementId'),
+                'kind': kind, 'role': role, 'text': value[:80],
+                'x': x, 'y': y, 'width': width, 'height': height,
+            }
+            content_boxes.append(box)
+            if width <= 0 or height <= 0 or x < 0 or y < 0 or x + width > page_width or y + height > page_height:
+                issues.append({
+                    'severity': 'error', 'type': 'content_out_of_bounds', 'page': page_index + 1,
+                    'shape': shape_index + 1, 'elementIds': [mapped.get('elementId')] if mapped.get('elementId') else [],
+                    'description': f'{kind} content is outside slide bounds: x={x}, y={y}, width={width}, height={height}, slideWidth={page_width}, slideHeight={page_height}.',
+                    'repairHint': 'Move or resize only the reported elementId so every edge remains inside deck.bounds().',
+                })
+        occupied_area = sum(max(0, item['width']) * max(0, item['height']) for item in content_boxes)
+        occupancy = occupied_area / max(1, page_width * page_height)
+        page_occupancy.append({'page': page_index + 1, 'contentBoxes': len(content_boxes), 'ratio': round(occupancy, 4)})
+        if occupancy > 0.88:
+            issues.append({
+                'severity': 'warning', 'type': 'high_content_occupancy', 'page': page_index + 1,
+                'description': f'Content boxes consume {occupancy:.0%} of the slide area before accounting for whitespace; visual crowding is likely.',
+                'repairHint': 'Reduce information density, increase whitespace, or split the content across slides.',
+            })
+        for left_index in range(len(content_boxes)):
+            left = content_boxes[left_index]
+            for right in content_boxes[left_index + 1:]:
+                overlap = intersection(left, right)
+                if overlap['width'] < 120 or overlap['height'] < 120:
+                    continue
                 smaller_area = min(left['width'] * left['height'], right['width'] * right['height'])
-                if smaller_area > 0 and overlap_area / smaller_area >= 0.75:
-                    issue = {
-                        'severity': 'error', 'type': 'text_overlap', 'page': page_index + 1,
-                        'shapes': [left['shape'], right['shape']],
-                        'description': f'High-confidence text-box overlap between shapes {left["shape"]} and {right["shape"]}.',
-                    }
-                    issue['elementIds'] = [item.get('elementId') for item in [
-                        next((entry for entry in (element_map or []) if entry.get('locator', {}).get('slide') == page_index + 1 and entry.get('locator', {}).get('shape') == left['shape']), {}),
-                        next((entry for entry in (element_map or []) if entry.get('locator', {}).get('slide') == page_index + 1 and entry.get('locator', {}).get('shape') == right['shape']), {}),
-                    ] if item.get('elementId')]
-                    issues.append(issue)
-    return {'checkedTextShapes': checked_text_shapes, 'issues': issues, 'passed': not any(item['severity'] == 'error' for item in issues)}
+                if smaller_area <= 0:
+                    continue
+                ratio = overlap['area'] / smaller_area
+                threshold, issue_type = collision_threshold(left, right)
+                if ratio < threshold:
+                    continue
+                element_ids = [value for value in (left.get('elementId'), right.get('elementId')) if value]
+                issues.append({
+                    'severity': 'error', 'type': issue_type, 'page': page_index + 1,
+                    'shapes': [left['shape'], right['shape']], 'kinds': [left['kind'], right['kind']],
+                    'elementIds': element_ids,
+                    'intersection': {key: overlap[key] for key in ('x', 'y', 'width', 'height')},
+                    'overlapRatio': round(ratio, 4),
+                    'description': (
+                        f'{left["kind"]} and {right["kind"]} overlap by {ratio:.0%} of the smaller box '
+                        f'between shapes {left["shape"]} and {right["shape"]}.'
+                    ),
+                    'repairHint': (
+                        'Move, resize, shorten, or reflow only the reported elementIds. '
+                        'If the overlap is deliberate, set allow_overlap=True on that authored element.'
+                    ),
+                })
+    return {
+        'checkedTextShapes': checked_text_shapes,
+        'checkedContentShapes': checked_content_shapes,
+        'pageOccupancy': page_occupancy,
+        'issues': issues,
+        'passed': not any(item['severity'] == 'error' for item in issues),
+    }
 
 
 def verify_word_layout(component, element_map=None):
@@ -1600,7 +2083,7 @@ def main():
             except AttributeError as error:
                 raise RuntimeError(
                     f'UNO draft attempted an unavailable member: {error}. '
-                    'Call file action=unoApi for the relevant target, copy the matching returned cookbook operation, '
+                    'Call file action=unoApi, copy the matching operation from its complete returned catalog, '
                     'and edit the current draft.py with that installed-runtime pattern.'
                 ) from error
         if args.required_source_asset and args.required_source_asset not in job.opened_documents:

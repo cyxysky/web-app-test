@@ -12,11 +12,15 @@ import { fileFormatForExtension, fileFormatForMimeType, normalizedFileExtension 
 import {
   generateFileToPaths,
 } from './document-artifact-generators';
-import { inspectUnoApi, type UnoApiTarget } from '@/server/files/uno-program';
+import { inspectUnoApi } from '@/server/files/uno-program';
 import { convertOfficeFile } from '@/server/files/libreoffice';
 import { validateOfficeArtifact, type OfficeElementMapEntry } from '@/server/files/office-artifact-validator';
 import { validateOfficeRendererMatrix } from '@/server/files/office-render-validation';
-import { analyzeOfficeProgram, type OfficeProgramDiagnostic } from '@/server/files/office-program-analysis';
+import {
+  analyzeOfficeProgram,
+  diagnoseOfficeProgramRuntimeError,
+  type OfficeProgramDiagnostic,
+} from '@/server/files/office-program-analysis';
 import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
@@ -79,7 +83,7 @@ export type FileGenerationProgress = {
 
 export type UnoDraftLineEdit = {
   /** Defaults to replaceRange for compatibility with existing calls. */
-  kind?: 'deleteRange' | 'insertAfter' | 'insertBefore' | 'replaceRange' | 'replaceText';
+  kind?: 'deleteRange' | 'insertAfter' | 'insertBefore' | 'replaceAll' | 'replaceRange' | 'replaceText';
   /** One-based, inclusive source line range from action=read. */
   startLine?: number;
   endLine?: number;
@@ -114,7 +118,6 @@ type UnoApiInput = {
   runId?: string;
   documentId?: string;
   documentType?: OfficeDocumentKind;
-  target?: UnoApiTarget;
   query?: string;
   offset?: number;
   limit?: number;
@@ -162,6 +165,22 @@ type ArtifactToolPayload = {
   currentRevision?: number | null;
   lastSuccessfulRevision?: number | null;
   error?: string;
+  recoverySuggestion?: string;
+  repairHints?: string[];
+  diagnostics?: Array<{
+    code?: string;
+    column?: number;
+    elementId?: string;
+    elementIds?: string[];
+    line?: number;
+    locator?: Record<string, unknown>;
+    message?: string;
+    page?: number;
+    severity?: string;
+    shapes?: number[];
+    sourceExcerpt?: string;
+    target?: string;
+  }>;
   automaticValidation?: {
     formatChecks?: unknown;
     issues?: Array<{ code?: string; message?: string; severity?: string }>;
@@ -513,6 +532,103 @@ function compactVisualVerification(payload: ArtifactToolPayload) {
   ].filter(Boolean).join('; ');
 }
 
+function compactOfficeFailure(payload: ArtifactToolPayload) {
+  const diagnostics = Array.isArray(payload.diagnostics)
+    ? payload.diagnostics.slice(0, 24).map((diagnostic) => {
+      const location = diagnostic.line
+          ? `@${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ''}`
+          : diagnostic.page ? `@page-${diagnostic.page}`
+            : diagnostic.target ? `@${diagnostic.target}` : '';
+        const identity = [diagnostic.severity, diagnostic.code].filter(Boolean).join(':') || 'issue';
+        const message = String(diagnostic.message || '').replace(/\s+/g, ' ').trim().slice(0, 260);
+        const elements = Array.isArray(diagnostic.elementIds) && diagnostic.elementIds.length
+          ? `[elements=${diagnostic.elementIds.join(',')}]`
+          : diagnostic.elementId ? `[element=${diagnostic.elementId}]` : '';
+        const sourceExcerpt = String(diagnostic.sourceExcerpt || '').trim();
+        const source = sourceExcerpt
+          ? ` [source=${sourceExcerpt.replace(/\s*\n\s*/g, ' ↵ ').slice(0, 1_200)}]`
+          : '';
+        return `${identity}${location}${elements}${message ? `=${message}` : ''}${source}`;
+      })
+    : [];
+  const error = String(payload.error || 'validation failed').replace(/\s+/g, ' ').trim().slice(0, 1_200);
+  const repairHints = Array.isArray(payload.repairHints)
+    ? payload.repairHints.slice(0, 6).map((hint) => String(hint).replace(/\s+/g, ' ').trim().slice(0, 360)).filter(Boolean)
+    : [];
+  return [
+    `error=${error}`,
+    diagnostics.length ? `diagnostics=${diagnostics.join(' | ')}` : '',
+    repairHints.length ? `repairHints=${repairHints.join(' | ')}` : '',
+    payload.recoverySuggestion ? `recovery=${String(payload.recoverySuggestion).replace(/\s+/g, ' ').trim().slice(0, 500)}` : '',
+  ].filter(Boolean).join('; ');
+}
+
+export function officeValidationRepairHints(
+  diagnostics: Array<Partial<OfficeProgramDiagnostic> & { target?: string }> = [],
+  errorText = '',
+) {
+  const codes = new Set(diagnostics.map((diagnostic) => String(diagnostic.code || '')).filter(Boolean));
+  const combinedError = [errorText, ...diagnostics.map((diagnostic) => diagnostic.message || '')].join('\n');
+  const hints: string[] = [];
+  if (codes.has('PYTHON_SYNTAX')) {
+    hints.push('Repair only the exact block shown in the diagnostic sourceExcerpt. It includes the reported line and any opening-line reference from Python. Do not replace the complete source while a local syntax error remains.');
+  }
+  if (codes.has('PYTHON_UNDEFINED_NAME')) {
+    hints.push('Define the reported name before first use or replace it with the intended existing variable. Repair the exact sourceExcerpt; do not use numbered batch replacement for a local name error.');
+  }
+  if (codes.has('DRAFT_ENTRYPOINT_CALLED_DIRECTLY')) {
+    hints.push('Delete the direct create_document(...) call. The LibreOffice worker invokes create_document(job) with the real job object; the draft must only define that function.');
+  }
+  if (codes.has('PRESENTATION_GEOMETRY_INVALID')) {
+    hints.push('Repair the exact reported add_text/add_shape/add_image call. Keep x/y >= 0, width/height > 0, and x+width/y+height inside deck.bounds(); for repeated elements, verify every loop iteration.');
+  }
+  if (codes.has('PRESENTATION_TEXT_OVERFLOW')) {
+    hints.push('Increase the reported text box, shorten its copy, or redesign that local block. The facade measured the text with LibreOffice fonts and refused to shrink below min_font_size.');
+  }
+  if (codes.has('DUPLICATE_ELEMENT_ID')) {
+    hints.push('Rename only the later duplicate elementId so every generated object has one stable unique ID. Do not rename unrelated elements.');
+  }
+  if (codes.has('PPTX_ELEMENT_ID_MISSING')) {
+    hints.push('A serialized slide object lacks a wp_ element marker. Create it through the presentation facade, or call expert.tag on the exact raw object immediately after adding it. Renaming unrelated IDs or page-number text cannot fix this diagnostic.');
+  }
+  if (codes.has('PPTX_OBJECT_OUT_OF_BOUNDS')) {
+    hints.push('Repair only the reported elementId geometry using deck.bounds(); keep x/y non-negative and x+width/y+height inside those bounds with a small edge margin. Full-slide backgrounds must use bounds["width"] and bounds["height"].');
+  }
+  if (codes.has('RUNTIME_TEXT_OUT_OF_BOUNDS')) {
+    hints.push('Move or resize only the reported text element inside deck.bounds(). The stable facade now keeps text boxes at their requested size, so do not compensate with guessed page dimensions.');
+  }
+  if (codes.has('RUNTIME_TEXT_OVERLAP')) {
+    hints.push('Separate or resize the reported text boxes. The overlap covers at least 20% of the smaller box and is blocked before publication.');
+  }
+  if (codes.has('RUNTIME_IMAGE_OVERLAP')) {
+    hints.push('Move or resize the reported images so they no longer overlap. If a collage is intentional, compose it as one image asset before placing it.');
+  }
+  if (codes.has('ELEMENT_MAPPING_NOT_EMBEDDED')) {
+    hints.push('The registered element ID was not written onto the serialized artifact object. Tag the actual saved object rather than a wrapper, page collection, or temporary value.');
+  }
+  if (codes.has('EXPERT_ELEMENTS_NOT_TAGGED')) {
+    hints.push('Every raw object created through expert mode must be registered with expert.tag(target, element_id, kind, locator).');
+  }
+  if (/unexpected keyword argument/i.test(errorText)) {
+    hints.push('The facade rejected a guessed keyword. Query unoApi for the planned document and copy its exact facadeSignatures before editing the failing call.');
+  }
+  if (/Direct job\.(?:new_document|open_document)\(\) is expert-only/i.test(errorText)) {
+    hints.push('Use the matching stable job.writer/job.presentation/job.spreadsheet facade; use job.expert(reason) only for an unmodeled operation and tag every created raw object.');
+  }
+  const missingName = combinedError.match(/NameError:\s*name ['"]([^'"]+)['"] is not defined/i)?.[1];
+  if (missingName) {
+    hints.push(`Python name ${missingName} is undefined. Read the reported line and replace it with an existing declared identifier or define it before first use; do not batch numbered replacements.`);
+  }
+  const missingAsset = combinedError.match(/FileNotFoundError:\s*Asset ['"]([^'"]+)['"] is not in this conversation workspace\.\s*Available assets:\s*([^\n]+)/i);
+  if (missingAsset) {
+    hints.push(`Asset ${missingAsset[1]} is unavailable. Use one exact available asset name: ${missingAsset[2].trim()}. Unique case/download-prefix differences are resolved automatically.`);
+  }
+  if (/Presentation geometry (?:requires non-negative position and positive size|exceeds slide bounds)/i.test(combinedError)) {
+    hints.push('Presentation objects require x/y >= 0, width/height > 0, and their far edge inside deck.bounds(). To remove an object, delete its call instead of replacing it with a zero-size placeholder.');
+  }
+  return hints;
+}
+
 export function formatFileArtifactResult(toolName: string, actual?: string) {
   if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
@@ -530,7 +646,7 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
     }
     if (payload.kind === 'uno-draft-validation') {
       if (payload.validation === 'failed' || payload.validationStatus === 'failed') {
-        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
+        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; ${compactOfficeFailure(payload)}`;
       }
       return [
         `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`,
@@ -538,7 +654,7 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       ].filter(Boolean).join('; ');
     }
     if (payload.kind === 'office-source-unit-validation' && payload.validation === 'failed') {
-      return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; error=${payload.error || 'validation failed'}`;
+      return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; ${compactOfficeFailure(payload)}`;
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
@@ -1132,6 +1248,8 @@ export type OfficeDraftCatalogEntry = {
   validationStatus: OfficeDocumentDraft['validationStatus'] | null;
   renderedDigest: string | null;
   visualQaDigest: string | null;
+  visualQaFailedPages?: number[];
+  visualQaFailureSummary?: string[];
   state: NonNullable<OfficeDocumentDraft['workflow']>['state'];
   updatedAt: string;
 };
@@ -1153,6 +1271,7 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
     if (!DOCUMENT_ID_PATTERN.test(documentId)) continue;
     try {
       const draft = await loadDraft(runId, documentId);
+      const failedReviews = (draft.visualQaReviews || []).filter((review) => review.status === 'failed');
       catalog.push({
         documentId: draft.documentId,
         documentType: draft.documentType,
@@ -1164,6 +1283,9 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         validationStatus: draft.validationStatus || null,
         renderedDigest: draft.renderedDigest || draft.renderedSourceDigest || null,
         visualQaDigest: draft.visualQaDigest || null,
+        visualQaFailedPages: failedReviews.map((review) => review.pageNumber),
+        visualQaFailureSummary: failedReviews.flatMap((review) => review.issues
+          .map((issue) => `page ${review.pageNumber}: ${issue.type}: ${issue.description}`)).slice(0, 20),
         state: draft.workflow?.state || (draft.program ? 'authoring' : 'planned'),
         updatedAt: draft.updatedAt,
       });
@@ -1189,7 +1311,7 @@ export async function officeDraftCatalogForPrompt(runId: string | undefined) {
   return [
     '[Current Office draft catalog - trusted runtime metadata]',
     'Resume an existing logical document with its exact documentId. Do not guess an ID or create a replacement unless the user explicitly requests a new document.',
-    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | revision=${draft.revision ?? 'none'} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | updatedAt=${draft.updatedAt}`),
+    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | revision=${draft.revision ?? 'none'} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'}${draft.visualQaFailedPages?.length ? ` | visualQaFailedPages=${draft.visualQaFailedPages.join(',')} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
   ].join('\n');
 }
 
@@ -1206,7 +1328,10 @@ export async function pendingOfficeDocumentWork(
     else if (draft.validationStatus === 'failed') pending.push({ ...draft, requiredNextAction: 'edit' });
     else if (draft.renderedDigest !== draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'render' });
     else if (draft.state === 'qa-pending' && options.requireVisualQa !== false) {
-      pending.push({ ...draft, requiredNextAction: 'fileVisual' });
+      pending.push({
+        ...draft,
+        requiredNextAction: draft.visualQaFailedPages?.length ? 'edit' : 'fileVisual',
+      });
     }
     return pending;
   }, []);
@@ -1381,6 +1506,48 @@ function draftSourceLineCount(source: string) {
   return (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized).split('\n').length;
 }
 
+function sourceEditCandidateSummary(source: string, oldText: string) {
+  const sourceLines = normalizedDraftSource(source).split('\n');
+  const needleLines = normalizedDraftSource(oldText).split('\n');
+  const windowSize = Math.max(1, needleLines.length);
+  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLowerCase();
+  const needle = normalize(needleLines.join('\n'));
+  const diceScore = (left: string, right: string) => {
+    const bigrams = (value: string) => {
+      const output = new Map<string, number>();
+      for (let index = 0; index < value.length - 1; index += 1) {
+        const gram = value.slice(index, index + 2);
+        output.set(gram, (output.get(gram) || 0) + 1);
+      }
+      return output;
+    };
+    if (!left || !right) return 0;
+    if (left === right) return 1;
+    const leftBigrams = bigrams(left);
+    const rightBigrams = bigrams(right);
+    let shared = 0;
+    for (const [gram, count] of leftBigrams) shared += Math.min(count, rightBigrams.get(gram) || 0);
+    const total = [...leftBigrams.values()].reduce((sum, count) => sum + count, 0)
+      + [...rightBigrams.values()].reduce((sum, count) => sum + count, 0);
+    return total ? (2 * shared) / total : 0;
+  };
+  const candidates = sourceLines
+    .map((_line, index) => {
+      const text = sourceLines.slice(index, index + windowSize).join('\n');
+      return { line: index + 1, score: diceScore(needle, normalize(text)), text };
+    })
+    .filter((candidate) => candidate.score >= 0.2)
+    .sort((left, right) => right.score - left.score || left.line - right.line)
+    .slice(0, 3)
+    .map((candidate) => {
+      const snippet = candidate.text.replace(/\s+/g, ' ').trim();
+      return `line ${candidate.line}: ${snippet.slice(0, 180)}${snippet.length > 180 ? '…' : ''}`;
+    });
+  return candidates.length
+    ? ` Closest current candidates: ${candidates.join(' | ')}. Copy exact current text from action=read before retrying.`
+    : ' No close current candidate was found. Call action=read and copy the exact current text before retrying.';
+}
+
 /**
  * Apply Code-Editor-style line replacements. Ranges are one-based and always
  * refer to the same source returned by action=read, so a batch cannot shift
@@ -1392,12 +1559,12 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
     throw new Error('file action=edit requires at least one line edit.');
   }
   const normalized = normalizedDraftSource(source);
-  const textEdits = edits.filter((edit) => edit.kind === 'replaceText');
+  const textEdits = edits.filter((edit) => edit.kind === 'replaceText' || edit.kind === 'replaceAll');
   if (textEdits.length) {
-    if (textEdits.length !== edits.length) throw new Error('replaceText edits cannot be mixed with line edits in one atomic batch.');
-    const replacements = textEdits.map((edit, editIndex) => {
+    if (textEdits.length !== edits.length) throw new Error('replaceText/replaceAll edits cannot be mixed with line edits in one atomic batch.');
+    const replacements = textEdits.flatMap((edit, editIndex) => {
       const oldText = normalizedDraftSource(String(edit.oldText || ''));
-      if (!oldText) throw new Error(`source edit ${editIndex + 1} replaceText requires non-empty oldText.`);
+      if (!oldText) throw new Error(`source edit ${editIndex + 1} ${edit.kind} requires non-empty oldText.`);
       const offsets: number[] = [];
       let cursor = 0;
       while (cursor <= normalized.length - oldText.length) {
@@ -1410,12 +1577,30 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
       if (occurrence !== undefined && (!Number.isInteger(occurrence) || occurrence < 1)) {
         throw new Error(`source edit ${editIndex + 1} occurrence must be a positive integer.`);
       }
-      if (!offsets.length) throw new Error(`source edit ${editIndex + 1} could not find oldText in the current source.`);
-      if (occurrence === undefined && offsets.length !== 1) {
-        throw new Error(`source edit ${editIndex + 1} oldText matched ${offsets.length} locations; provide occurrence or a larger exact source region.`);
+      if (!offsets.length) {
+        throw new Error(`source edit ${editIndex + 1} could not find oldText in the current source.${sourceEditCandidateSummary(normalized, oldText)}`);
       }
-      const start = offsets[(occurrence || 1) - 1];
-      if (start === undefined) throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches.`);
+      if (edit.kind === 'replaceAll') {
+        if (occurrence !== undefined) throw new Error(`source edit ${editIndex + 1} replaceAll does not accept occurrence.`);
+        return offsets.map((start) => ({
+          start,
+          end: start + oldText.length,
+          newText: normalizedDraftSource(edit.newText),
+          editIndex,
+        }));
+      }
+      if (occurrence === undefined && offsets.length !== 1) {
+        throw new Error(`source edit ${editIndex + 1} oldText matched ${offsets.length} locations; occurrence means the one-based match index, not a replacement count. Provide an occurrence between 1 and ${offsets.length}, use a larger exact source region, or use replaceAll to replace every match.`);
+      }
+      // A unique exact match is unambiguous. Providers occasionally populate
+      // occurrence with an intended replacement count (for example 10 or 50),
+      // even though occurrence is a match index. Do not reject a safe unique
+      // replacement because of that transport/model mistake.
+      const resolvedOccurrence = offsets.length === 1 ? 1 : (occurrence || 1);
+      const start = offsets[resolvedOccurrence - 1];
+      if (start === undefined) {
+        throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches. occurrence is the one-based match index, not the number of replacements. Use replaceAll when every exact match should change.`);
+      }
       return { start, end: start + oldText.length, newText: normalizedDraftSource(edit.newText), editIndex };
     });
     const ordered = [...replacements].sort((left, right) => left.start - right.start);
@@ -1443,6 +1628,10 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
     }
     if (startLine < 1 || endLine < startLine || endLine > lineCount) {
       throw new Error(`source edit ${editIndex + 1} range ${startLine}-${endLine} is outside the current 1-${lineCount} source lines. Read the draft again.`);
+    }
+    const replacedLineCount = endLine - startLine + 1;
+    if (kind === 'replaceRange' && replacedLineCount >= 100 && replacedLineCount / lineCount >= 0.6) {
+      throw new Error(`source edit ${editIndex + 1} replaces ${replacedLineCount} of ${lineCount} lines. Near-complete source replacement is blocked because it commonly destroys valid indentation and identifiers. Use smaller exact edits or add @webpilot-unit markers and edit one page/section path.`);
     }
     if (typeof edit.newText !== 'string') {
       throw new Error(`source edit ${editIndex + 1} requires string newText.`);
@@ -1598,12 +1787,17 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
         actual: `Document ${documentId} uses JavaScript generation. UNO API guidance is unavailable for this draft; call action=jsApi for ${draft.documentType} instead.`,
       };
     }
-    if (!input.documentType || !input.target) return { ok: false, actual: 'file action=unoApi requires documentType and target.' };
+    if (input.documentType && input.documentType !== draft.documentType) {
+      return {
+        ok: false,
+        actual: `Document ${documentId} is planned as ${draft.documentType}, not ${input.documentType}. Omit documentType or use the planned value.`,
+      };
+    }
+    const documentType = draft.documentType;
     return {
       ok: true,
-      actual: JSON.stringify({ kind: 'uno-api', sourceUnitGuidance: 'For large sources, optional # @webpilot-unit pages/slide-001 and # @webpilot-endunit markers allow path-scoped read/edit with local line numbers. Keep shared helpers outside page units.', ...(await inspectUnoApi({
-        documentType: input.documentType,
-        target: input.target,
+      actual: JSON.stringify({ kind: 'uno-api', documentId, documentType, sourceUnitGuidance: 'For large sources, optional # @webpilot-unit pages/slide-001 and # @webpilot-endunit markers allow path-scoped read/edit with local line numbers. Keep shared helpers outside page units.', ...(await inspectUnoApi({
+        documentType,
         query: input.query,
         offset: input.offset,
         limit: input.limit,
@@ -1762,30 +1956,50 @@ function generatedElementMap(diagnostics: unknown): OfficeElementMapEntry[] {
   ));
 }
 
-function generatedVerificationIssues(diagnostics: unknown) {
+export function generatedVerificationIssues(diagnostics: unknown) {
   if (!diagnostics || typeof diagnostics !== 'object') return [];
   const verification = (diagnostics as { verification?: unknown }).verification;
   if (!verification || typeof verification !== 'object') return [];
   const issues = (verification as { issues?: unknown }).issues;
   if (!Array.isArray(issues)) return [];
-  return issues.filter((issue): issue is {
+  const normalized = issues.filter((issue): issue is {
     column?: number;
     elementId?: string;
+    elementIds?: string[];
     line?: number;
     locator?: Record<string, unknown>;
+    page?: number;
+    shapes?: number[];
     description: string;
     severity: 'error' | 'warning';
     type: string;
   } => Boolean(issue && typeof issue === 'object' && typeof (issue as { description?: unknown }).description === 'string'))
-    .map((issue) => ({
-      code: `RUNTIME_${String(issue.type || 'LAYOUT').toUpperCase()}`,
-      column: issue.column,
-      elementId: issue.elementId,
-      line: issue.line,
-      locator: issue.locator,
-      message: issue.description,
-      severity: issue.severity === 'error' ? 'error' as const : 'warning' as const,
-    }));
+    .map((issue) => {
+      const page = typeof issue.page === 'number' && Number.isFinite(issue.page) ? issue.page : undefined;
+      const shapes = Array.isArray(issue.shapes) ? issue.shapes.filter((shape) => Number.isInteger(shape)) : undefined;
+      const elementIds = Array.isArray(issue.elementIds)
+        ? issue.elementIds.filter((elementId): elementId is string => typeof elementId === 'string' && Boolean(elementId))
+        : undefined;
+      return {
+        code: `RUNTIME_${String(issue.type || 'LAYOUT').toUpperCase()}`,
+        column: issue.column,
+        elementId: issue.elementId,
+        elementIds,
+        line: issue.line,
+        locator: issue.locator || (page ? { slide: page, ...(shapes?.length ? { shapes } : {}) } : undefined),
+        message: issue.description,
+        page,
+        severity: issue.severity === 'error' ? 'error' as const : 'warning' as const,
+        shapes,
+      };
+    });
+  const seen = new Set<string>();
+  return normalized.filter((issue) => {
+    const key = JSON.stringify([issue.code, issue.page, issue.shapes, issue.elementIds, issue.message]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
@@ -1798,7 +2012,6 @@ function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDr
     artifactPath: `${base}${extension}`,
     metadataPath: `${base}.json`,
     previewPath: `${base}.preview.pdf`,
-    microsoftPreviewPath: `${base}.microsoft.preview.pdf`,
   };
 }
 
@@ -1921,7 +2134,6 @@ async function prepareValidatedDraft(input: {
         unlink(cache.artifactPath).catch(() => undefined),
         unlink(cache.metadataPath).catch(() => undefined),
         unlink(cache.previewPath).catch(() => undefined),
-        unlink(cache.microsoftPreviewPath).catch(() => undefined),
       ]);
       candidate = await prepareValidatedDraftLegacy(input);
       validation = await validateOfficeArtifact({
@@ -1953,13 +2165,9 @@ async function prepareValidatedDraft(input: {
     }
     let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
     if (unoStrict) {
-      await input.onProgress?.({ phase: 'renderer-validation', message: '正在通过 LibreOffice 和 Microsoft Office 验证渲染结果' });
-      const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
+      await input.onProgress?.({ phase: 'renderer-validation', message: '正在通过 LibreOffice 验证渲染结果' });
       rendererMatrix = await validateOfficeRendererMatrix({
-        absolutePath: candidate.generated.outputPath,
-        extension: candidate.generated.extension,
         libreOfficePdfPath: candidate.generated.previewPath,
-        microsoftPdfPath: cache.microsoftPreviewPath,
       });
       validation = {
         ...validation,
@@ -2003,19 +2211,23 @@ async function prepareValidatedDraft(input: {
     await writeDraftWorkspace(input.runId, input.draft);
     return { ...candidate, validation };
   } catch (error) {
-    const diagnostics = error && typeof error === 'object' && 'diagnostics' in error
+    const explicitDiagnostics = error && typeof error === 'object' && 'diagnostics' in error
       ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
       : undefined;
+    const errorText = error instanceof Error ? error.message : String(error);
+    const diagnostics = explicitDiagnostics || (input.draft.generator === 'uno'
+      ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
+      : undefined);
     input.draft.validationStatus = 'failed';
     input.draft.validationDiagnostics = diagnostics || [{
-      message: error instanceof Error ? error.message : String(error),
+      message: errorText,
       severity: 'error',
     }];
     synchronizeSourceUnits(input.draft, 'failed');
     input.draft.workflow = {
       state: 'authoring',
       checkpointAt: new Date().toISOString(),
-      error: error instanceof Error ? error.message : String(error),
+      error: errorText,
     };
     throw error;
   }
@@ -2071,7 +2283,7 @@ async function validateDraft(input: {
         qualityGate: {
           structural: true,
           renderers: candidate.validation.rendererMatrix?.renderers,
-          microsoftOfficePolicy: candidate.validation.rendererMatrix?.policy,
+          rendererPolicy: candidate.validation.rendererMatrix?.policy,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
@@ -2109,6 +2321,7 @@ async function validateDraft(input: {
         validation: 'failed',
         requiredNextAction: 'edit',
         diagnostics: input.draft.validationDiagnostics || [],
+        repairHints: officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
         error: saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError,
         workflow: input.draft.workflow,
       }),
@@ -2131,7 +2344,6 @@ async function validateDraftSourceUnit(input: {
   const sourcePath = path.join(directory, `.unit-${suffix}${input.draft.generator === 'javascript' ? '.mjs' : '.py'}`);
   const outputPath = path.join(directory, `.unit-${suffix}${extension}`);
   const previewPath = path.join(directory, `.unit-${suffix}.preview.pdf`);
-  const microsoftPreviewPath = path.join(directory, `.unit-${suffix}.microsoft.preview.pdf`);
   try {
     if (!input.draft.program) throw new Error('The Office draft has no working source.');
     const unit = parseSourceUnits(input.draft.program).find((candidate) => candidate.path === input.sourceUnitPath);
@@ -2187,10 +2399,7 @@ async function validateDraftSourceUnit(input: {
     let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
     if (unoStrict) {
       rendererMatrix = await validateOfficeRendererMatrix({
-        absolutePath: generated.outputPath,
-        extension: generated.extension,
         libreOfficePdfPath: generated.previewPath,
-        microsoftPdfPath: microsoftPreviewPath,
       });
       validation = {
         ...validation,
@@ -2257,13 +2466,17 @@ async function validateDraftSourceUnit(input: {
       state.validatedDigest = undefined;
       state.status = 'failed';
     }
-    const diagnostics = error && typeof error === 'object' && 'diagnostics' in error
+    const explicitDiagnostics = error && typeof error === 'object' && 'diagnostics' in error
       ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
       : undefined;
+    const errorText = error instanceof Error ? error.message : String(error);
+    const diagnostics = explicitDiagnostics || (input.draft.generator === 'uno'
+      ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
+      : undefined);
     input.draft.validationStatus = 'failed';
-    input.draft.validationDiagnostics = (diagnostics || [{ message: error instanceof Error ? error.message : String(error), severity: 'error' as const }])
+    input.draft.validationDiagnostics = (diagnostics || [{ message: errorText, severity: 'error' as const }])
       .map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath }));
-    input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) };
+    input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString(), error: errorText };
     let saveError: string | undefined;
     try {
       await saveWorkingDraft(input.runId, input.draft);
@@ -2284,6 +2497,7 @@ async function validateDraftSourceUnit(input: {
         lastSuccessfulRevision: input.draft.validatedRevision || input.draft.currentRevision || null,
         requiredNextAction: 'edit',
         diagnostics: input.draft.validationDiagnostics,
+        repairHints: officeValidationRepairHints(input.draft.validationDiagnostics, error instanceof Error ? error.message : String(error)),
         error: saveError
           ? `${error instanceof Error ? error.message : String(error)}\nWorking source save failed: ${saveError}`
           : error instanceof Error ? error.message : String(error),
@@ -2295,7 +2509,6 @@ async function validateDraftSourceUnit(input: {
       unlink(sourcePath).catch(() => undefined),
       unlink(outputPath).catch(() => undefined),
       unlink(previewPath).catch(() => undefined),
-      unlink(microsoftPreviewPath).catch(() => undefined),
     ]);
   }
 }
@@ -2412,7 +2625,7 @@ async function renderDraft(input: {
         qualityGate: {
           structural: true,
           renderers: candidate.validation.rendererMatrix?.renderers,
-          microsoftOfficePolicy: candidate.validation.rendererMatrix?.policy,
+          rendererPolicy: candidate.validation.rendererMatrix?.policy,
           visual: visualVerification ? {
             previewGenerated: visualVerification.imagePaths.length > 0,
             modelReviewRequired: true,
@@ -2857,6 +3070,7 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
     seenPageCount: number;
     reviewedPageCount: number;
     failedPages: number[];
+    failedReviews: Array<{ pageNumber: number; issues: Array<{ type: string; description: string; region?: string; severity?: string }> }>;
   }> = [];
   for (const entry of entries) {
     if (!entry.name.endsWith('.json') || entry.name.endsWith('.transaction.json')) continue;
@@ -2886,6 +3100,9 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
           failedPages: Array.from(reviews.values())
             .filter((review) => review.status === 'failed')
             .map((review) => review.pageNumber),
+          failedReviews: Array.from(reviews.values())
+            .filter((review) => review.status === 'failed')
+            .map((review) => ({ pageNumber: review.pageNumber, issues: review.issues })),
         });
       }
     } catch {

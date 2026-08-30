@@ -10,6 +10,8 @@ import {
   normalizeRuntimeContinuationSummary,
   sanitizeRuntimeContinuationSummary,
   selectRecentRuntimeMessageBlocks,
+  runtimeContinuationDirectiveMarker,
+  runtimeContinuationSummaryMarker,
 } from './runtime-context-compression';
 import {
   runtimeContextCompressionTargetCeilingRatio,
@@ -17,6 +19,10 @@ import {
   runtimeContextCompressionThresholdRatio,
   runtimeContextWindowTokens,
 } from './runtime-context-budget';
+import {
+  runtimeCurrentTimeMarker,
+  runtimeOperationalContextMarker,
+} from './runtime-prompt-cache';
 
 test('runtime context uses an eighty-five percent trigger and a ten-to-twenty percent compression target', () => {
   assert.equal(runtimeContextWindowTokens(), 256000);
@@ -71,6 +77,76 @@ test('merges an SDK response chain without duplicating messages already prepared
     [firstCall, firstResult, spawnCall, spawnResult],
   );
   assert.deepEqual(merged, [user, firstCall, firstResult, spawnCall, spawnResult]);
+});
+
+test('terminal merge does not resurrect the pre-compression response history', () => {
+  const summary: ModelMessage = {
+    role: 'user',
+    content: '[WebPilot continuation summary]\n{"completed":["old call"]}',
+  };
+  const oldCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'old-1', toolName: 'browserCode', input: {} }],
+  };
+  const oldResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'old-1', toolName: 'browserCode', output: { type: 'text', value: 'old result' } }],
+  };
+  const retainedCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'retained-2', toolName: 'browserCode', input: {} }],
+  };
+  const retainedResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'retained-2', toolName: 'browserCode', output: { type: 'text', value: 'retained result' } }],
+  };
+  const finalAnswer: ModelMessage = { role: 'assistant', content: 'done' };
+  const merged = mergeRuntimeModelMessageChain(
+    [
+      summary,
+      retainedCall,
+      retainedResult,
+      { role: 'user', content: `${runtimeContinuationDirectiveMarker}\nresume` },
+      { role: 'user', content: `${runtimeOperationalContextMarker}\nlatest state` },
+      { role: 'user', content: `${runtimeCurrentTimeMarker}\nnow` },
+    ],
+    [oldCall, oldResult, retainedCall, retainedResult, finalAnswer],
+    4,
+  );
+
+  assert.deepEqual(merged, [summary, retainedCall, retainedResult, finalAnswer]);
+  assert.equal(merged.some((message) => message === oldCall || message === oldResult), false);
+  assert.equal(merged.some((message) => (
+    typeof message.content === 'string'
+    && (message.content.startsWith(runtimeOperationalContextMarker)
+      || message.content.startsWith(runtimeCurrentTimeMarker))
+  )), false);
+});
+
+test('terminal merge keeps only the new response when compression retains no raw response block', () => {
+  const summary: ModelMessage = {
+    role: 'user',
+    content: `${runtimeContinuationSummaryMarker}\n{"remaining":["return final answer"]}`,
+  };
+  const oldCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'old-1', toolName: 'browserCode', input: {} }],
+  };
+  const oldResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'old-1', toolName: 'browserCode', output: { type: 'text', value: 'old result' } }],
+  };
+  const finalAnswer: ModelMessage = { role: 'assistant', content: 'done' };
+
+  assert.deepEqual(mergeRuntimeModelMessageChain(
+    [
+      summary,
+      { role: 'user', content: `${runtimeContinuationDirectiveMarker}\nresume` },
+      { role: 'user', content: `${runtimeOperationalContextMarker}\nlatest state` },
+    ],
+    [oldCall, oldResult, finalAnswer],
+    2,
+  ), [summary, finalAnswer]);
 });
 
 test('compression keeps only complete recent blocks that fit the ten-percent raw-tail budget', () => {

@@ -125,7 +125,7 @@ get/delete also accept a key string, while list/clear also accept a prefix strin
 
 State is stored by the host in SQLite under the current browser conversation. It survives JavaScript-kernel recycling, browser idle release, later conversation turns, and backend restart. The parent Agent and its child Agents share the conversation state, which is deleted with the conversation.
 
-Keys contain 1-120 printable characters. A conversation stores at most 100 keys, 64000 serialized characters per value, and 1000000 serialized characters in total. Values may contain only JSON-safe primitives, arrays, and plain records, with at most 30 nested levels. Optional ttlMs accepts 1000 milliseconds through 30 days. set increments revision; expectedRevision provides optimistic concurrency, where 0 requires a missing key.
+Keys contain 1-120 printable characters and a conversation stores at most 100 keys. Values may contain JSON-safe primitives, arrays, and plain records with at most 30 nested levels; the host does not impose an application-level serialized-character limit, so large extracted text and base64 data can be persisted when the task requires it. Avoid echoing large restored values through nodeRepl.write unless they are needed in model context. Optional ttlMs accepts 1000 milliseconds through 30 days. set increments revision; expectedRevision provides optimistic concurrency, where 0 requires a missing key.
 
 Persist only reconstructable task data such as IDs, URLs, selectors, drafts, progress, and verified results. Never store passwords, credential values or references, cookies, authorization headers, access tokens, or other secrets. A restored selector, tab ID, URL, or observation is historical data and must be validated against the live browser before acting.
 
@@ -200,6 +200,7 @@ nodeRepl.write({ status: apiResponse.status(), data: apiPayload });
 ### Inspection extensions on Page
 
 - \`await page.domSnapshot(options?): Promise<string>\`, where \`options.scope\` is \`"active"\` (default) or \`"all"\`. The returned string contains a \`[page-state]\` JSON line plus an active-surface-scoped accessibility tree. It is a string, so do not read \`.surfaces\` from it.
+- \`page.getByUid(uid): Locator\` synchronously resolves an exact \`dom-*\` UID from the latest exposed DOM evidence to a normal Playwright Locator. A stale, detached, navigated, or unexposed UID throws \`STALE_DOM_EVIDENCE\`; refresh evidence instead of editing or guessing the UID.
 - \`await page.activeSurface(): Promise<{ activeSurface?, surfaces, surfaceStack, topSurfaceIds }>\` — structured popup/overlay state. Surface records include \`id, kind, label, descriptor, modal, selector?, framePath?, parentId?, depth, zIndex, rect, signals\`.
 - Ordinary Playwright reads include \`locator.count()\`, \`isVisible()\`, \`isEnabled()\`, \`isChecked()\`, \`inputValue()\`, \`innerText()\`, \`textContent()\`, \`getAttribute()\`, \`allTextContents()\`, \`ariaSnapshot()\`, and \`boundingBox()\`.
 - DOM-only reads belong inside \`page.evaluate(callback, arg?)\`. Browser-page callbacks cannot access Node globals, the local filesystem, environment variables, credentials, or runtime objects such as \`nodeRepl\`.
@@ -225,6 +226,7 @@ Use normal Playwright composition:
 - \`page.getByPlaceholder(text, { exact? })\`
 - \`page.getByText(text, { exact? })\`
 - \`page.getByTestId(testId)\`
+- \`page.getByUid(uid)\` for an exact current \`dom-*\` UID
 - \`page.locator(selector)\`
 - \`locator.getByRole(...)\`, \`locator.getByText(...)\`, \`locator.locator(...)\`, \`locator.filter(...)\`
 - \`page.frameLocator(selector)\` for an observed iframe, then call Page extensions on the Page that owns the resulting locator.

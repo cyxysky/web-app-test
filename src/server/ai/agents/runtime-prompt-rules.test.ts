@@ -26,6 +26,9 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /locator\.selectOption/);
   assert.match(rules, /page\.evaluate/);
   assert.match(rules, /page\.domSnapshot/);
+  assert.match(rules, /page\.getByUid\(uid\)/);
+  assert.match(rules, /ZERO_MATCH_DIAGNOSTICS/);
+  assert.match(rules, /STALE_DOM_EVIDENCE/);
   assert.match(rules, /nodeRepl\.write/);
   assert.match(rules, /bindings persist across calls/);
   assert.match(rules, /infrastructure watchdog/);

@@ -54,6 +54,7 @@ import {
   type BrowserCodeActivity,
   type BrowserCodeConnection,
   type BrowserCodeCredentialBinding,
+  type BrowserCodeUidReference,
 } from './browser-code-runner';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface';
 import {
@@ -4826,6 +4827,33 @@ export class BrowserSession {
   }
 
   // 等待用户手动完成验证码/安全校验，超时后返回阻塞信息。
+  private browserCodeUidReferences(): BrowserCodeUidReference[] {
+    const observationId = this.domVisibleObservationId;
+    if (!observationId) return [];
+    return [...this.domVisibleExposedReferenceIds]
+      .flatMap((uid) => {
+        const reference = this.lastDomNodeReferences.get(uid);
+        if (
+          !reference
+          || reference.observationId !== observationId
+          || !reference.interactive
+          || !reference.localRef
+        ) return [];
+        return [{
+          uid,
+          observationId,
+          localRef: reference.localRef,
+          framePath: reference.framePath,
+          label: reference.label.slice(0, 300),
+          descriptor: reference.descriptor.slice(0, 300),
+          line: reference.line.slice(0, 1_200),
+          surfaceId: reference.surfaceId,
+          capabilities: reference.capabilities,
+        } satisfies BrowserCodeUidReference];
+      })
+      .slice(0, 1_000);
+  }
+
   async executeBrowserCode(input: {
     code: string;
     runId: string;
@@ -4892,6 +4920,7 @@ export class BrowserSession {
         credentials: input.credentials,
         executionId,
         maxOutputChars: input.maxOutputChars,
+        uidReferences: this.browserCodeUidReferences(),
         abortSignal: input.abortSignal,
       });
     } finally {

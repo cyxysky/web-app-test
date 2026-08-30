@@ -1869,7 +1869,7 @@ function compactStepForRealtime(step: StepExecutionResult): StepExecutionResult 
     ...clientStep,
     tools: clientStep.tools.map((tool) => {
       const realtimeTool = { ...tool };
-      // `file action=unoApi target=all` is an inspection result. Its full
+      // `file action=unoApi` is a complete inspection result. Its full
       // runtime reflection must reach the client-side result dialog rather
       // than being reduced to a status-only tool card.
       if (realtimeTool.name !== 'file') delete realtimeTool.rawResult;
@@ -2183,7 +2183,7 @@ function recoveredStatusForStaleAssistantMessage(
 }
 
 function finalizeIdleRunningAssistantMessages(session: BrowserChatSessionRecord) {
-  if (session.busy || session.status === 'running') return false;
+  if (session.busy || session.status === 'running' || activeTurns.has(session.id)) return false;
   let changed = false;
   session.messages = session.messages.map((message) => {
     if (message.role !== 'assistant' || message.status !== 'running') return message;
@@ -2197,6 +2197,18 @@ function finalizeIdleRunningAssistantMessages(session: BrowserChatSessionRecord)
     return updated;
   });
   return changed;
+}
+
+function markRecoveredRunningAssistantMessagesDirty(
+  session: BrowserChatSessionRecord,
+  persisted: Pick<BrowserChatSessionSnapshot, 'messages'>,
+) {
+  const persistedMessages = new Map(persisted.messages.map((message) => [message.id, message]));
+  for (const message of session.messages) {
+    const previous = persistedMessages.get(message.id);
+    if (previous?.role !== 'assistant' || previous.status !== 'running' || message.status === 'running') continue;
+    markMessageDirty(session, message);
+  }
 }
 
 function markAssistantMessageInterrupted(assistantMessageId?: string) {
@@ -2870,6 +2882,7 @@ function restoreCompactedBrowserChatSession(session: BrowserChatSessionRecord) {
     targetUrl: targetUrl || restored.targetUrl,
   });
   seedPersistenceCursor(session, persisted);
+  markRecoveredRunningAssistantMessagesDirty(session, persisted);
   return session;
 }
 
@@ -2884,7 +2897,10 @@ function hydrateSession(sessionId: string) {
   const persisted = readRuntimeSessionSnapshot(sessionId);
   const applied = persisted ? applyPersistedSnapshotToRuntime(persisted) : false;
   const session = sessions.get(sessionId);
-  if (session && persisted && applied) seedPersistenceCursor(session, persisted);
+  if (session && persisted && applied) {
+    seedPersistenceCursor(session, persisted);
+    markRecoveredRunningAssistantMessagesDirty(session, persisted);
+  }
   else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
   if (session) {
     scheduleBrowserChatSessionEviction(sessionId);
@@ -3916,6 +3932,7 @@ export async function sendBrowserChatMessage(
     });
     return clientSnapshot(session);
   }
+  finalizeIdleRunningAssistantMessages(session);
   store.applyRuntimeEnv();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);

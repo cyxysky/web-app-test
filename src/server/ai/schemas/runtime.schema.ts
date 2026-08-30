@@ -79,6 +79,12 @@ export type VisualFrameRecord = {
 export type AiToolContextSnapshot = {
   requestId?: string;
   requestCreatedAt?: string;
+  estimatedTotalTokens?: number;
+  estimatedTextTokens?: number;
+  estimatedImageTokens?: number;
+  estimatedToolSchemaTokens?: number;
+  imageCount?: number;
+  method?: string;
 };
 
 export type AiRequestSnapshot = {
@@ -114,6 +120,10 @@ export type StepToolCall = {
   transient?: boolean;
   result?: string;
   rawResult?: unknown;
+  /** Complete elapsed time from tool dispatch through result post-processing. */
+  elapsedMs?: number;
+  /** Provider API response time for the model request that emitted this tool call. */
+  aiRequestElapsedMs?: number;
   progress?: {
     phase: string;
     message: string;

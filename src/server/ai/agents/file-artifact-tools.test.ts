@@ -10,9 +10,12 @@ import {
   downloadFileArtifact,
   editUnoFileArtifact,
   formatFileArtifactResult,
+  generatedVerificationIssues,
   generateUnoFileArtifact,
   getOfficeJsApi,
+  getUnoApi,
   listOfficeDrafts,
+  officeValidationRepairHints,
   pendingOfficeDocumentWork,
   planFileArtifact,
   readUnoDraft,
@@ -115,9 +118,21 @@ test('formats a failed validation as failed instead of validated', () => {
     currentRevision: 2,
     lastSuccessfulRevision: 2,
     error: 'Syntax error',
+    diagnostics: [{
+      code: 'PYTHON_SYNTAX',
+      line: 51,
+      column: 5,
+      severity: 'error',
+      message: 'expected an indented block',
+      sourceExcerpt: '  50 | if ready:\n> 51 | next_step() ',
+    }],
+    repairHints: ['Read a small range around line 51 and repair that exact block.'],
   }));
   assert.match(formatted || '', /validation failed/i);
   assert.match(formatted || '', /workingSourceSaved=true/);
+  assert.match(formatted || '', /PYTHON_SYNTAX@51:5/);
+  assert.match(formatted || '', /source=.*51 \| next_step/);
+  assert.match(formatted || '', /repairHints=/);
   assert.doesNotMatch(formatted || '', /source validated/i);
 });
 
@@ -472,6 +487,22 @@ test('supports structured editor operations and unified patches', () => {
   assert.equal(applyUnoDraftLineEdits(source, [
     { kind: 'replaceText', oldText: 'two\nthree', newText: 'TWO\nTHREE' },
   ]), 'one\nTWO\nTHREE\nfour\n');
+  assert.equal(applyUnoDraftLineEdits(source, [
+    { kind: 'replaceText', oldText: 'two', occurrence: 50, newText: 'TWO' },
+  ]), 'one\nTWO\nthree\nfour\n');
+  assert.equal(applyUnoDraftLineEdits('same\nsame\nother\n', [
+    { kind: 'replaceAll', oldText: 'same', newText: 'changed' },
+  ]), 'changed\nchanged\nother\n');
+  assert.throws(() => applyUnoDraftLineEdits('same\nsame\n', [
+    { kind: 'replaceText', oldText: 'same', occurrence: 10, newText: 'changed' },
+  ]), /one-based match index, not the number of replacements/);
+  assert.throws(() => applyUnoDraftLineEdits("deck.add_text('footer', page, 'x', 0, 0, 1000, 1400)\n", [
+    { kind: 'replaceText', oldText: "deck.add_text('footer', page, 'x', 0, 0, 1000, 1200)", newText: 'fixed' },
+  ]), /Closest current candidates: line 1: deck\.add_text/);
+  const largeSource = Array.from({ length: 180 }, (_, index) => `line-${index + 1}`).join('\n');
+  assert.throws(() => applyUnoDraftLineEdits(largeSource, [
+    { kind: 'replaceRange', startLine: 20, endLine: 160, newText: 'replacement' },
+  ]), /Near-complete source replacement is blocked/);
   assert.equal(applyUnoDraftPatch(source, [
     '--- a/draft.py',
     '+++ b/draft.py',
@@ -482,6 +513,69 @@ test('supports structured editor operations and unified patches', () => {
     ' three',
     ' four',
   ].join('\n')), 'one\nTWO\nthree\nfour\n');
+});
+
+test('keeps page and element IDs while deduplicating overlap diagnostics', () => {
+  const diagnostics = generatedVerificationIssues({
+    verification: {
+      issues: Array.from({ length: 2 }, () => ({
+        description: 'High-confidence text-box overlap between shapes 3 and 4.',
+        elementIds: ['slide-2/title', 'slide-2/subtitle'],
+        page: 2,
+        severity: 'warning',
+        shapes: [3, 4],
+        type: 'text_overlap',
+      })),
+    },
+  });
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(diagnostics[0].elementIds, ['slide-2/title', 'slide-2/subtitle']);
+  assert.deepEqual(diagnostics[0].locator, { slide: 2, shapes: [3, 4] });
+  assert.equal(diagnostics[0].severity, 'warning');
+});
+
+test('returns focused repair hints for common UNO runtime failures', () => {
+  const hints = officeValidationRepairHints([], [
+    "NameError: name 'F' is not defined",
+    "FileNotFoundError: Asset 'diagram.png' is not in this conversation workspace. Available assets: download-diagram.png, photo.jpg",
+    'ValueError: Presentation geometry requires non-negative position and positive size',
+  ].join('\n'));
+  assert.ok(hints.some((hint) => hint.includes('Python name F is undefined')));
+  assert.ok(hints.some((hint) => hint.includes('download-diagram.png')));
+  assert.ok(hints.some((hint) => hint.includes('zero-size placeholder')));
+});
+
+test('infers unoApi document type and always returns the complete API catalog', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-api-defaults-'));
+  const previousArtifacts = process.env.ARTIFACTS_DIR;
+  const previousMode = process.env.OFFICE_GENERATION_MODE;
+  process.env.ARTIFACTS_DIR = root;
+  process.env.OFFICE_GENERATION_MODE = 'uno';
+  try {
+    const planned = await planFileArtifact({
+      documentId: 'uno-api-defaults',
+      documentType: 'presentation',
+      fileName: 'defaults.pptx',
+      runId: 'chat_test',
+    });
+    assert.equal(planned.ok, true, planned.actual);
+    const result = await getUnoApi({ documentId: 'uno-api-defaults', query: 'placeholder', runId: 'chat_test' });
+    assert.equal(result.ok, true, result.actual);
+    const payload = JSON.parse(result.actual || '{}') as { documentType?: string; target?: string; complete?: boolean };
+    assert.equal(payload.documentType, 'presentation');
+    assert.equal(payload.target, 'all');
+    assert.equal(payload.complete, true);
+  } finally {
+    if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousArtifacts;
+    if (previousMode === undefined) delete process.env.OFFICE_GENERATION_MODE;
+    else process.env.OFFICE_GENERATION_MODE = previousMode;
+    await rm(root, { force: true, recursive: true });
+  }
 });
 
 test('records source revisions and restores an older revision as a new save', async () => {
@@ -912,6 +1006,9 @@ test('does not complete visual QA when any fully read page has a failed review',
     const resultPayload = JSON.parse(reportResult.actual || '{}') as { visualQa?: { complete?: boolean; visualQaDigest?: string | null } };
     assert.equal(resultPayload.visualQa?.complete, false);
     assert.equal(resultPayload.visualQa?.visualQaDigest, null);
+    const pendingRepair = await pendingOfficeDocumentWork('chat_test', new Set(['visual-review']));
+    assert.equal(pendingRepair[0]?.requiredNextAction, 'edit');
+    assert.deepEqual(pendingRepair[0]?.visualQaFailedPages, [2]);
     const saved = JSON.parse(await readFile(metadataPath, 'utf8')) as { visualQaDigest?: string; workflow?: { state?: string } };
     assert.equal(saved.visualQaDigest, undefined);
     assert.equal(saved.workflow?.state, 'qa-pending');

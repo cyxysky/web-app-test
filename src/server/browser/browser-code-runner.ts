@@ -11,6 +11,18 @@ export type BrowserCodeConnection = {
   endpoint: string;
 };
 
+export type BrowserCodeUidReference = {
+  uid: string;
+  observationId: string;
+  localRef: string;
+  framePath?: string;
+  label: string;
+  descriptor: string;
+  line: string;
+  surfaceId?: string;
+  capabilities?: string[];
+};
+
 export type BrowserCodeExecutionLog = {
   level: 'log' | 'info' | 'warn' | 'error';
   text: string;
@@ -320,6 +332,7 @@ export type BrowserCodeExecutionInput = {
   maxOutputChars?: number;
   attachments?: BrowserCodeAttachmentBinding[];
   credentials?: BrowserCodeCredentialBinding[];
+  uidReferences?: BrowserCodeUidReference[];
   abortSignal?: AbortSignal;
 };
 
@@ -350,7 +363,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 33;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 34;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -497,6 +510,12 @@ function browserCodeKernelMain() {
   type CoordinateRectEvidence = CoordinateClickEvidence & {
     rect: { height: number; width: number; x: number; y: number };
   };
+  type KernelUidBinding = BrowserCodeUidReference & {
+    frame: import('playwright').Frame;
+    page: import('playwright').Page;
+    token: string;
+    boundEpoch: number;
+  };
   type KernelPageObservation = BrowserCodePageObservation;
   type ActionObservation = {
     action: string;
@@ -524,6 +543,9 @@ function browserCodeKernelMain() {
     pendingCoordinateClickEvidence: Map<import('playwright').Page, CoordinateClickEvidence>;
     pendingCoordinateRectEvidence: Map<import('playwright').Page, CoordinateRectEvidence[]>;
     observationsBeforeAction: WeakMap<import('playwright').Page, KernelPageObservation>;
+    uidBindings: Map<string, KernelUidBinding>;
+    uidBindingErrors: Map<string, string>;
+    uidReferences: Map<string, BrowserCodeUidReference>;
     requestId: string;
     verification?: BrowserCodeActivity['verification'];
   } | undefined;
@@ -535,6 +557,7 @@ function browserCodeKernelMain() {
   const pendingRuntimeStateOperations = new Map<string, {
     reject: (error: Error) => void;
     resolve: (value: unknown) => void;
+    timer: ReturnType<typeof setTimeout>;
   }>();
   let chain = Promise.resolve();
 
@@ -557,7 +580,13 @@ function browserCodeKernelMain() {
       return;
     }
     const operationId = childRandomUUID();
-    pendingRuntimeStateOperations.set(operationId, { reject, resolve });
+    const timer = setTimeout(() => {
+      const pendingOperation = pendingRuntimeStateOperations.get(operationId);
+      if (!pendingOperation) return;
+      pendingRuntimeStateOperations.delete(operationId);
+      pendingOperation.reject(new Error('agent.state operation timed out after 10000ms.'));
+    }, 10_000);
+    pendingRuntimeStateOperations.set(operationId, { reject, resolve, timer });
     send({
       type: 'state-operation',
       requestId: activeExecution.requestId,
@@ -750,6 +779,107 @@ function browserCodeKernelMain() {
     return frame?._page;
   };
 
+  const browserCodeUidAttribute = 'data-ai-browser-code-uid';
+
+  const frameFromUidPath = (page: import('playwright').Page, framePath?: string) => {
+    if (!framePath) return page.mainFrame();
+    const parts = framePath.split('.').map((part) => Number(part));
+    if (parts.some((part) => !Number.isInteger(part) || part < 0)) return undefined;
+    let frame: import('playwright').Frame | undefined = page.mainFrame();
+    for (const part of parts) {
+      frame = frame.childFrames()[part];
+      if (!frame) return undefined;
+    }
+    return frame;
+  };
+
+  const bindExecutionUidReferences = async (
+    page: import('playwright').Page,
+    references: BrowserCodeUidReference[],
+  ) => {
+    const execution = activeExecution;
+    if (!execution) return;
+    const groups = new Map<import('playwright').Frame, Array<BrowserCodeUidReference & { token: string }>>();
+    for (const [index, reference] of references.slice(0, 1_000).entries()) {
+      const uid = String(reference.uid || '').trim();
+      if (!/^dom-\d+-\d+$/.test(uid)) continue;
+      execution.uidReferences.set(uid, reference);
+      const frame = frameFromUidPath(page, reference.framePath);
+      if (!frame || frame.isDetached()) {
+        execution.uidBindingErrors.set(uid, `STALE_DOM_EVIDENCE: UID ${uid} belongs to an iframe that is no longer available.`);
+        continue;
+      }
+      const token = `bcu-${execution.requestId.replace(/[^a-z0-9]/gi, '')}-${index}`;
+      const list = groups.get(frame) || [];
+      list.push({ ...reference, token });
+      groups.set(frame, list);
+    }
+    for (const [frame, entries] of groups) {
+      const results = await frame.evaluate((input) => {
+        const browserWindow = window as Window & {
+          __aiDomMutationState?: { epoch?: number };
+          __aiDomRuntime?: { visibleDomElement?: (ref: string) => Element | undefined };
+        };
+        const runtime = browserWindow.__aiDomRuntime;
+        return input.map(({ localRef, token }) => {
+          const element = runtime?.visibleDomElement?.(localRef);
+          if (!element?.isConnected) {
+            return { ok: false as const, reason: 'the observed DOM node is detached or no longer resolves' };
+          }
+          const tokens = new Set((element.getAttribute('data-ai-browser-code-uid') || '').split(/\s+/).filter(Boolean));
+          tokens.add(token);
+          element.setAttribute('data-ai-browser-code-uid', [...tokens].join(' '));
+          return { ok: true as const, epoch: Number(browserWindow.__aiDomMutationState?.epoch || 0) };
+        });
+      }, entries.map(({ localRef, token }) => ({ localRef, token }))).catch((error) => (
+        entries.map(() => ({
+          ok: false as const,
+          reason: error instanceof Error ? error.message : String(error),
+        }))
+      ));
+      for (const [index, entry] of entries.entries()) {
+        const result = results[index];
+        if (!result?.ok) {
+          execution.uidBindingErrors.set(
+            entry.uid,
+            `STALE_DOM_EVIDENCE: UID ${entry.uid} ${result?.reason || 'could not be rebound to the live DOM'}. Capture fresh DOM evidence.`,
+          );
+          continue;
+        }
+        execution.uidBindings.set(entry.uid, {
+          ...entry,
+          boundEpoch: result.epoch,
+          frame,
+          page,
+        });
+      }
+    }
+  };
+
+  const clearExecutionUidBindings = async () => {
+    const execution = activeExecution;
+    if (!execution?.uidBindings.size) return;
+    const tokensByFrame = new Map<import('playwright').Frame, string[]>();
+    for (const binding of execution.uidBindings.values()) {
+      const list = tokensByFrame.get(binding.frame) || [];
+      list.push(binding.token);
+      tokensByFrame.set(binding.frame, list);
+    }
+    await Promise.all([...tokensByFrame].map(async ([frame, tokens]) => {
+      if (frame.isDetached()) return;
+      await frame.evaluate((values) => {
+        const removals = new Set(values);
+        for (const element of Array.from(document.querySelectorAll('[data-ai-browser-code-uid]'))) {
+          const remaining = (element.getAttribute('data-ai-browser-code-uid') || '')
+            .split(/\s+/)
+            .filter((token) => token && !removals.has(token));
+          if (remaining.length) element.setAttribute('data-ai-browser-code-uid', remaining.join(' '));
+          else element.removeAttribute('data-ai-browser-code-uid');
+        }
+      }, tokens).catch(() => undefined);
+    }));
+  };
+
   const readUnifiedPageObservation = async (
     page: import('playwright').Page,
   ): Promise<KernelPageObservation> => {
@@ -919,6 +1049,164 @@ function browserCodeKernelMain() {
     activeExecution.observationsBeforeAction.set(page, after);
   };
 
+  const locatorIntentTerms = (selector: string) => {
+    const terms = new Set<string>();
+    const add = (value: string | undefined) => {
+      const normalized = String(value || '')
+        .replace(/\\([\\"'])/g, '$1')
+        .normalize('NFKC')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+      if (normalized.length >= 2 && normalized.length <= 160) terms.add(normalized);
+    };
+    for (const match of selector.matchAll(/["']([^"']{2,160})["']/g)) add(match[1]);
+    for (const match of selector.matchAll(/(?:^|[\s>+~,])([#.][\w-]{2,120})/g)) add(match[1].slice(1));
+    for (const match of selector.matchAll(/internal:role=([\w-]+)/g)) add(match[1]);
+    for (const match of selector.matchAll(/\[([\w-]+)=([^\]\s]+)/g)) {
+      add(match[1]);
+      add(match[2].replace(/^['"]|['"]$/g, ''));
+    }
+    return [...terms].slice(0, 16);
+  };
+
+  const zeroMatchCandidateDiagnostics = async (locator: import('playwright').Locator) => {
+    const frame = locatorFrame(locator);
+    const page = locatorPage(locator);
+    const selector = String(Reflect.get(locator, '_selector') || '').slice(0, 800);
+    const terms = locatorIntentTerms(selector);
+    if (!frame || !page) return '';
+    const snapshotResult = await settleKernelTask(frame.evaluate((input) => {
+      type Candidate = {
+        ref?: string;
+        tag: string;
+        label: string;
+        descriptor: string;
+        line: string;
+        surfaceId?: string;
+        capabilities?: string[];
+        locatorCandidates?: string[];
+        priority?: number;
+      };
+      const browserWindow = window as Window & {
+        __aiDomMutationState?: { epoch?: number };
+        __aiDomRuntime?: {
+          pageObservation?: () => { activeSurface?: { id?: string } };
+          visibleDomSnapshot?: (options: {
+            maxChars: number;
+            maxElements: number;
+            preserveExistingRefs: boolean;
+          }) => { items?: Candidate[] };
+        };
+      };
+      const runtime = browserWindow.__aiDomRuntime;
+      const activeSurfaceId = runtime?.pageObservation?.()?.activeSurface?.id;
+      const captured = runtime?.visibleDomSnapshot?.({
+        maxChars: 40_000,
+        maxElements: 250,
+        preserveExistingRefs: true,
+      });
+      const visible = (element: Element) => {
+        if (!element.isConnected || element.hasAttribute('hidden') || (element as HTMLElement).inert) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== 'none'
+          && style.visibility !== 'hidden'
+          && Number(style.opacity || '1') > 0.01
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const fallbackItems = () => Array.from(document.querySelectorAll([
+        'button', 'a[href]', 'input:not([type="hidden"])', 'textarea', 'select',
+        '[role="button"]', '[role="checkbox"]', '[role="combobox"]', '[role="link"]',
+        '[role="menuitem"]', '[role="option"]', '[role="radio"]', '[role="tab"]',
+        '[role="textbox"]', '[role="treeitem"]', '[onclick]', '[tabindex]:not([tabindex="-1"])',
+      ].join(','))).filter(visible).slice(0, 250).map((element): Candidate => {
+        const htmlElement = element as HTMLElement;
+        const inputElement = element as HTMLInputElement;
+        const tag = element.tagName.toLowerCase();
+        const role = element.getAttribute('role') || '';
+        const label = String(
+          element.getAttribute('aria-label')
+          || element.getAttribute('placeholder')
+          || element.getAttribute('title')
+          || (inputElement.type !== 'password' ? inputElement.value : '')
+          || htmlElement.innerText
+          || element.textContent
+          || '',
+        ).replace(/\s+/g, ' ').trim().slice(0, 240);
+        const descriptor = `${tag}${element.id ? `#${element.id}` : ''}${role ? `[role="${role}"]` : ''}`;
+        const locatorCandidates = [
+          element.id ? `#${CSS.escape(element.id)}` : '',
+          ...['data-testid', 'data-test', 'data-qa', 'data-cy', 'name', 'placeholder']
+            .flatMap((name) => element.getAttribute(name) ? [`[${name}="${element.getAttribute(name)}"]`] : []),
+        ].filter(Boolean).slice(0, 5);
+        return { tag, label, descriptor, line: `${descriptor} ${label}`, locatorCandidates };
+      });
+      const candidates = (captured?.items?.length ? captured.items : fallbackItems())
+        .filter((item) => Boolean(item && item.tag))
+        .map((item) => {
+          const corpus = [item.tag, item.label, item.descriptor, item.line]
+            .filter(Boolean)
+            .join(' ')
+            .normalize('NFKC')
+            .replace(/\s+/g, ' ')
+            .toLowerCase();
+          const compactCorpus = corpus.replace(/\s+/g, '');
+          let score = Math.min(30, Math.max(0, Number(item.priority) || 0) / 3);
+          if (activeSurfaceId && item.surfaceId === activeSurfaceId) score += 35;
+          for (const term of input.terms) {
+            const compactTerm = term.replace(/\s+/g, '');
+            if (corpus === term) score += 100;
+            else if (corpus.includes(term)) score += 55;
+            else if (compactTerm.length >= 2 && compactCorpus.includes(compactTerm)) score += 45;
+          }
+          return { item, score };
+        })
+        .sort((left, right) => right.score - left.score)
+        .slice(0, 8)
+        .map(({ item, score }) => ({
+          ref: item.ref,
+          score: Math.round(score),
+          tag: item.tag,
+          label: String(item.label || '').slice(0, 240),
+          descriptor: String(item.descriptor || '').slice(0, 240),
+          surfaceId: item.surfaceId,
+          capabilities: item.capabilities?.slice(0, 8),
+          locatorCandidates: item.locatorCandidates?.slice(0, 5),
+        }));
+      return {
+        epoch: Number(browserWindow.__aiDomMutationState?.epoch || 0),
+        activeSurfaceId,
+        candidates,
+      };
+    }, { terms }), browserCodeSnapshotFallbackTimeoutMs, 'zero-match candidate diagnostics');
+    if (!snapshotResult.ok) {
+      return ` ZERO_MATCH_DIAGNOSTICS ${JSON.stringify({
+        selector,
+        diagnosticError: snapshotResult.error,
+      })}`;
+    }
+    const uidByLocalRef = new Map<string, string>();
+    for (const binding of activeExecution?.uidBindings.values() || []) {
+      if (binding.frame === frame) uidByLocalRef.set(binding.localRef, binding.uid);
+    }
+    const staleUid = [...(activeExecution?.uidBindings.values() || [])]
+      .find((binding) => selector.includes(binding.token))?.uid;
+    const candidates = snapshotResult.value.candidates.map((candidate) => ({
+      ...(candidate.ref && uidByLocalRef.get(candidate.ref) ? { uid: uidByLocalRef.get(candidate.ref) } : {}),
+      ...candidate,
+      ref: undefined,
+    }));
+    return ` ZERO_MATCH_DIAGNOSTICS ${JSON.stringify({
+      selector,
+      epoch: snapshotResult.value.epoch,
+      activeSurfaceId: snapshotResult.value.activeSurfaceId,
+      ...(staleUid ? { staleUid } : {}),
+      candidates,
+    }).slice(0, 3_500)}`;
+  };
+
   const resolveActionableLocator = async (
     locator: object,
     action: string,
@@ -937,6 +1225,9 @@ function browserCodeKernelMain() {
     }
     const originalCandidate = locator as import('playwright').Locator;
     const originalCount = await originalCandidate.count();
+    const zeroMatchDiagnostics = originalCount === 0
+      ? await zeroMatchCandidateDiagnostics(originalCandidate)
+      : '';
     const skipVisibleFilter = action.toLowerCase() === 'setinputfiles';
     const candidateSet = skipVisibleFilter
       ? originalCandidate
@@ -1225,7 +1516,8 @@ function browserCodeKernelMain() {
       throw new Error(
         `ACTIONABILITY_FAILED: ${action} matched ${originalCount} elements; ${visibilityStage}; `
         + `${actionableIndices.length} passed full actionability. Exactly one candidate must pass both stages.`
-        + (diagnostics ? ` ${diagnostics}` : ''),
+        + (diagnostics ? ` ${diagnostics}` : '')
+        + zeroMatchDiagnostics,
       );
     }
     return candidateSet.nth(actionableIndices[0]);
@@ -2289,12 +2581,37 @@ function browserCodeKernelMain() {
     const existing = tabWrappers.get(page);
     if (existing) return existing;
     const extendedPage = page as import('playwright').Page & {
+      getByUid?: (uid: string) => import('playwright').Locator;
       domSnapshot?: (options?: { scope?: 'active' | 'all' }) => Promise<string>;
       activeSurface?: () => Promise<Pick<KernelPageObservation, 'activeSurface' | 'surfaces' | 'surfaceStack' | 'topSurfaceIds'>>;
       setTextSelection?: (locator: import('playwright').Locator, input: BrowserTextSelectionSpec) => Promise<unknown>;
       verifyState?: (input: BrowserCodeVerifyStateInput) => Promise<unknown>;
       expectNavigation?: <T>(action: () => Promise<T>, options?: { timeoutMs?: number; url?: string | RegExp; waitUntil?: NonNullable<Parameters<import('playwright').Page['waitForURL']>[1]>['waitUntil'] }) => Promise<T>;
     };
+    if (typeof extendedPage.getByUid !== 'function') {
+      Object.defineProperty(extendedPage, 'getByUid', {
+        configurable: false,
+        enumerable: false,
+        value: (uidInput: string) => {
+          const uid = String(uidInput || '').trim();
+          if (!activeExecution) throw new Error('page.getByUid() is only available while browserCode is executing.');
+          const binding = activeExecution.uidBindings.get(uid);
+          if (!binding) {
+            const knownError = activeExecution.uidBindingErrors.get(uid);
+            if (knownError) throw new Error(knownError);
+            throw new Error(
+              `STALE_DOM_EVIDENCE: UID ${uid || '[empty]'} is not an exposed current DOM UID `
+              + `(${activeExecution.uidBindings.size} live UIDs are available). Use an exact uid from the latest DOM evidence.`,
+            );
+          }
+          if (binding.page !== page || binding.frame.isDetached()) {
+            throw new Error(`STALE_DOM_EVIDENCE: UID ${uid} belongs to another page or a detached iframe. Capture fresh DOM evidence.`);
+          }
+          return existingLocator(binding.frame.locator(`[${browserCodeUidAttribute}~="${binding.token}"]`));
+        },
+        writable: false,
+      });
+    }
     if (typeof extendedPage.domSnapshot !== 'function') {
       Object.defineProperty(extendedPage, 'domSnapshot', {
         configurable: false,
@@ -2465,12 +2782,13 @@ function browserCodeKernelMain() {
     capabilities: Object.freeze({ cua: true, images: true, playwright: true, tabLifecycle: true }),
     documentation: async () => [
       'browserCode exposes one controlled browser runtime in ordinary JavaScript.',
-      'Use browser.tabs.list()/new()/use()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), attachmentVault.setInputFiles(), and nodeRepl.emitImage().',
+      'Use browser.tabs.list()/new()/use()/finalize(), browser.user.openTabs()/claimTab(), tab.playwright, tab.cua, page.getByUid(), page.domSnapshot(), page.activeSurface(), page.setTextSelection(), page.verifyState(), page.expectNavigation(), attachmentVault.setInputFiles(), and nodeRepl.emitImage().',
       'page.domSnapshot() returns page-state plus a read-only Playwright AX tree scoped to the active surface by default; pass { scope: "all" } only for background context. browser.user.openTabs() reports only tabs owned by the current conversation group, with active-tab and tab-group metadata.',
       'Page and Locator factory methods expose only currently rendered matches: CSS-hidden descendants and zero-rectangle nodes are excluded before count() and positional selection. aria-hidden changes accessibility exposure but does not by itself make a geometrically rendered target invisible or unactionable. Element actions then validate target computed style and hit testing, run an action-specific Playwright trial for every remaining pointer candidate, and execute only the unique candidate that passes all stages; CSS-hidden file inputs used by setInputFiles are recovered only at that action boundary.',
       'Coordinate clicks require either reusable fresh viewport-screenshot evidence from a previous cell or a point inside a rect returned by boundingBox() for one exact visible actionable Locator. Rect-derived clicks work without image input.',
       'page.verifyState() is an optional read-only assertion helper; it never gates later actions or successful cell completion.',
       'Every session Page exposes setTextSelection(locator, spec). Call it on the Page that owns the locator, including for frame locators, then use that same Page keyboard.insertText()/press() in the same cell. Use browser.tabs.use(tab) or tab.use() when the global page binding should switch tabs.',
+      'page.getByUid(uid) synchronously returns a normal Playwright Locator for an exact dom-* UID exposed by the latest DOM evidence. A stale, unexposed, navigated, or detached UID fails with STALE_DOM_EVIDENCE and must be replaced from fresh evidence.',
       `Playwright action timeout: ${browserCodeActionTimeoutMs}ms; navigation timeout: ${browserCodeNavigationTimeoutMs}ms.`,
       `Playwright screenshot timeout: ${browserCodeScreenshotTimeoutMs}ms unless an explicit positive timeout is provided.`,
     ].join('\n'),
@@ -2654,6 +2972,7 @@ function browserCodeKernelMain() {
     code: string;
     attachments?: BrowserCodeAttachmentBinding[];
     credentials?: BrowserCodeCredentialBinding[];
+    uidReferences?: BrowserCodeUidReference[];
     executionId: string;
     maxOutputChars?: number;
     requestId: string;
@@ -2689,6 +3008,9 @@ function browserCodeKernelMain() {
       pendingCoordinateClickEvidence: new Map(),
       pendingCoordinateRectEvidence: new Map(),
       observationsBeforeAction: new WeakMap(),
+      uidBindings: new Map(),
+      uidBindingErrors: new Map(),
+      uidReferences: new Map(),
       requestId: input.requestId,
     };
     const publishPendingCoordinateClickEvidence = async () => {
@@ -2717,6 +3039,7 @@ function browserCodeKernelMain() {
     };
 
     try {
+      await bindExecutionUidReferences(page, input.uidReferences || []);
       await evaluateCell(String(input.code));
       await publishPendingCoordinateClickEvidence();
       const outputs = activeExecution.outputs;
@@ -2777,6 +3100,7 @@ function browserCodeKernelMain() {
         memoryUsage: hostProcess.memoryUsage(),
       });
     } finally {
+      await clearExecutionUidBindings();
       activeExecution = undefined;
     }
   };
@@ -2789,6 +3113,7 @@ function browserCodeKernelMain() {
       const pendingOperation = pendingRuntimeStateOperations.get(operationId);
       if (!pendingOperation) return;
       pendingRuntimeStateOperations.delete(operationId);
+      clearTimeout(pendingOperation.timer);
       if (input.ok === true) pendingOperation.resolve(input.value);
       else pendingOperation.reject(new Error(typeof input.error === 'string' ? input.error : 'agent.state operation failed.'));
       return;
@@ -2803,6 +3128,7 @@ function browserCodeKernelMain() {
           code: string;
           attachments?: BrowserCodeAttachmentBinding[];
           credentials?: BrowserCodeCredentialBinding[];
+          uidReferences?: BrowserCodeUidReference[];
           executionId: string;
           maxOutputChars?: number;
           requestId: string;
@@ -3004,6 +3330,19 @@ export class BrowserCodeKernel {
           ref: String(credential.ref || ''),
           value: String(credential.value || ''),
           allowedOrigins: Array.from(new Set((credential.allowedOrigins || []).map((origin) => String(origin)))),
+        })),
+        uidReferences: (input.uidReferences || []).map((reference) => ({
+          uid: String(reference.uid || ''),
+          observationId: String(reference.observationId || ''),
+          localRef: String(reference.localRef || ''),
+          framePath: reference.framePath ? String(reference.framePath) : undefined,
+          label: String(reference.label || ''),
+          descriptor: String(reference.descriptor || ''),
+          line: String(reference.line || ''),
+          surfaceId: reference.surfaceId ? String(reference.surfaceId) : undefined,
+          capabilities: Array.isArray(reference.capabilities)
+            ? reference.capabilities.map((capability) => String(capability))
+            : undefined,
         })),
         executionId: input.executionId,
         maxOutputChars,
@@ -3212,7 +3551,10 @@ export class BrowserCodeKernel {
       sendResult({ ok: false, error: 'agent.state is unavailable outside a persistent browser conversation.' });
       return;
     }
-    void Promise.resolve(runtimeState({
+    // Invoke through a resolved promise so synchronous validation/storage
+    // errors are returned to the kernel instead of leaving agent.state await
+    // pending until the whole browserCode cell watchdog expires.
+    void Promise.resolve().then(() => runtimeState({
       action: action as BrowserCodeRuntimeStateOperation['action'],
       input: record.input,
     })).then(

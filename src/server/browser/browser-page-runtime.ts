@@ -203,7 +203,11 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   win.__aiDomMutationState = mutationState;
   if (!mutationState.observer) {
     mutationState.observer = new MutationObserver((mutations) => {
-      const meaningful = mutations.some((mutation) => {
+      const relevantMutations = mutations.filter((mutation) => !(
+        mutation.type === 'attributes'
+        && mutation.attributeName === 'data-ai-browser-code-uid'
+      ));
+      const meaningful = relevantMutations.some((mutation) => {
         const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
         return !target?.closest?.('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__');
       });
@@ -211,7 +215,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       mutationState.pendingMutations = mutationState.pendingMutations || [];
       mutationState.pendingMutationKeys = mutationState.pendingMutationKeys || new WeakMap<Node, Set<string>>();
       mutationState.journalMutations = mutationState.journalMutations || [];
-      for (const mutation of mutations) {
+      for (const mutation of relevantMutations) {
         if (mutationState.journalMutations.length >= 10000) mutationState.journalOverflow = true;
         else mutationState.journalMutations.push(mutation);
         if (mutationState.pendingMutations.length >= 500) {

@@ -21,8 +21,6 @@ export type UnoGeneratedDocument = {
   report: Record<string, unknown>;
 };
 
-export type UnoApiTarget = 'all' | 'document' | 'page' | 'text' | 'cursor' | 'sheet' | 'cell' | 'shape' | 'table' | 'table-column' | 'table-row' | 'chart' | 'chart-data';
-
 /**
  * This intentionally validates only the public program contract. It does not
  * translate, rewrite, or infer UNO calls. Security is supplied by the Worker
@@ -196,7 +194,6 @@ function runWorker(input: {
 
 export async function inspectUnoApi(input: {
   documentType: OfficeDocumentKind;
-  target: UnoApiTarget;
   query?: string;
   offset?: number;
   limit?: number;
@@ -213,12 +210,12 @@ export async function inspectUnoApi(input: {
       executable: python,
       args: [
         worker,
-        '--inspect-target', input.target,
+        '--inspect-target', 'all',
         '--document-type', input.documentType,
         '--profile', path.join(directory, 'profile'),
         '--soffice', soffice,
         '--api-offset', String(Math.max(0, input.offset || 0)),
-        '--api-limit', String(input.target === 'all' ? 2_000 : Math.min(300, Math.max(1, input.limit || 120))),
+        '--api-limit', String(2_000),
         ...(input.query ? ['--api-query', input.query] : []),
       ],
       libreOfficeProgramDirectory: path.dirname(soffice),

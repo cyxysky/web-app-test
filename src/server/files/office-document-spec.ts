@@ -140,10 +140,14 @@ export type OfficeDocumentDraft = {
     code?: string;
     column?: number;
     elementId?: string;
+    elementIds?: string[];
     line?: number;
     locator?: Record<string, unknown>;
     message: string;
+    page?: number;
     severity?: 'error' | 'warning';
+    shapes?: number[];
+    sourceExcerpt?: string;
     target?: string;
     unitPath?: string;
   }>;
@@ -157,7 +161,7 @@ export type OfficeDocumentDraft = {
     locator?: Record<string, unknown>;
     unitPath?: string;
   }>;
-  /** Deterministic LibreOffice/Microsoft Office renderer matrix for the validated revision. */
+  /** Deterministic LibreOffice renderer validation for the validated revision. */
   rendererValidation?: Record<string, unknown>;
   /** Optional logical page/section units embedded in the source through @webpilot-unit markers. */
   sourceUnits?: Array<{

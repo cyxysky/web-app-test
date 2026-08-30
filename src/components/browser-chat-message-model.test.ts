@@ -5,6 +5,7 @@ import {
   browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
+  normalizeBrowserChatMessageRunStates,
   browserChatTerminalAnswerCycleIndex,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
@@ -169,6 +170,29 @@ test('keeps an empty running assistant message so the loading animation remains 
   );
 
   assert.deepEqual(entries, [{ item: running, kind: 'message' }]);
+});
+
+test('only the current assistant turn remains running in the UI', () => {
+  const messages = [
+    { content: '', id: 'old-assistant', role: 'assistant' as const, status: 'running', activity: { phase: 'ai:runtime:request' } },
+    { content: 'next request', id: 'new-user', role: 'user' as const },
+    { content: '', id: 'current-assistant', role: 'assistant' as const, status: 'running', activity: { phase: 'ai:text:streaming' } },
+  ];
+
+  const active = normalizeBrowserChatMessageRunStates(messages, {
+    currentAssistantMessageId: 'current-assistant',
+    sessionBusy: true,
+  });
+  assert.equal(active[0]?.status, 'interrupted');
+  assert.equal(active[0]?.activity, undefined);
+  assert.equal(active[2]?.status, 'running');
+
+  const idle = normalizeBrowserChatMessageRunStates(messages, {
+    currentAssistantMessageId: 'current-assistant',
+    sessionBusy: false,
+  });
+  assert.equal(idle[0]?.status, 'interrupted');
+  assert.equal(idle[2]?.status, 'interrupted');
 });
 
 test('reads message logs only from the direct message id', () => {

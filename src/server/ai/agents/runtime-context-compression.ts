@@ -1,4 +1,5 @@
 import type { ModelMessage } from 'ai';
+import { isRuntimePromptCacheMetadataMessage } from './runtime-prompt-cache';
 
 type RuntimeContinuationState = {
   blockers?: unknown;
@@ -28,6 +29,20 @@ type RuntimeContinuationSummary = {
 const TRANSIENT_BROWSER_EVIDENCE_KEYS = new Set(['axTree', 'domChanges', 'domSnapshot']);
 
 export const runtimeContinuationSummaryMarker = '[WebPilot continuation summary]';
+export const runtimeContinuationDirectiveMarker = '[WebPilot continuation directive]';
+
+function isRuntimeContinuationDirectiveMessage(message: ModelMessage) {
+  return message.role === 'user'
+    && typeof message.content === 'string'
+    && message.content.startsWith(runtimeContinuationDirectiveMarker);
+}
+
+function stableRuntimeModelMessages(messages: ModelMessage[]) {
+  return messages.filter((message) => (
+    !isRuntimePromptCacheMetadataMessage(message)
+    && !isRuntimeContinuationDirectiveMessage(message)
+  ));
+}
 
 function modelMessageContainsToolCall(message: ModelMessage) {
   return message.role === 'assistant'
@@ -58,19 +73,46 @@ function runtimeModelMessageFingerprint(message: ModelMessage) {
   }
 }
 
-export function mergeRuntimeModelMessageChain(base: ModelMessage[], response: ModelMessage[]) {
-  if (!response.length) return [...base];
-  const baseFingerprints = base.map(runtimeModelMessageFingerprint);
-  const responseFingerprints = response.map(runtimeModelMessageFingerprint);
-  for (let overlap = Math.min(base.length, response.length); overlap > 0; overlap -= 1) {
-    const baseStart = base.length - overlap;
-    const matches = responseFingerprints.slice(0, overlap).every((fingerprint, index) => (
-      fingerprint !== undefined
-      && fingerprint === baseFingerprints[baseStart + index]
-    ));
-    if (matches) return [...base, ...response.slice(overlap)];
+export function mergeRuntimeModelMessageChain(
+  base: ModelMessage[],
+  response: ModelMessage[],
+  responsePrefixLength?: number,
+) {
+  const stableBase = stableRuntimeModelMessages(base);
+  const responseTail = responsePrefixLength === undefined
+    ? response
+    : response.slice(Math.max(0, Math.min(response.length, responsePrefixLength)));
+  const stableResponse = stableRuntimeModelMessages(responseTail);
+  if (!stableResponse.length) return stableBase;
+  // The executor knows exactly how much of the SDK response transcript was
+  // present before the final model call. Prefer that boundary over content
+  // matching because compression replaces the matching prefix with a summary.
+  if (responsePrefixLength !== undefined) return [...stableBase, ...stableResponse];
+  const baseFingerprints = stableBase.map(runtimeModelMessageFingerprint);
+  const responseFingerprints = stableResponse.map(runtimeModelMessageFingerprint);
+  let bestOverlap = 0;
+  let bestResponseEnd = 0;
+  for (let responseEnd = 1; responseEnd <= stableResponse.length; responseEnd += 1) {
+    const maximumOverlap = Math.min(stableBase.length, responseEnd);
+    let overlap = 0;
+    while (overlap < maximumOverlap) {
+      const baseFingerprint = baseFingerprints[stableBase.length - overlap - 1];
+      const responseFingerprint = responseFingerprints[responseEnd - overlap - 1];
+      if (baseFingerprint === undefined || baseFingerprint !== responseFingerprint) break;
+      overlap += 1;
+    }
+    const responseStart = responseEnd - overlap;
+    // A single generic repeated message in the middle is not a safe boundary.
+    // Prefix matches retain the previous behavior, while compressed tool chains
+    // normally provide at least the assistant-call and tool-result pair.
+    if (overlap === 1 && responseStart !== 0) continue;
+    if (overlap > bestOverlap || (overlap === bestOverlap && responseEnd > bestResponseEnd)) {
+      bestOverlap = overlap;
+      bestResponseEnd = responseEnd;
+    }
   }
-  return [...base, ...response];
+  if (bestOverlap) return [...stableBase, ...stableResponse.slice(bestResponseEnd)];
+  return [...stableBase, ...stableResponse];
 }
 
 export function selectRecentRuntimeMessageBlocks(

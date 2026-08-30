@@ -34,6 +34,27 @@ export function browserChatMessageIsTextStreaming(message: BrowserChatMessageLik
     && message.activity?.phase === 'ai:text:streaming';
 }
 
+export function normalizeBrowserChatMessageRunStates<TMessage extends BrowserChatMessageLike>(
+  messages: TMessage[],
+  input: { currentAssistantMessageId?: string; sessionBusy: boolean },
+) {
+  let changed = false;
+  const normalized = messages.map((message) => {
+    if (
+      message.role !== 'assistant'
+      || message.status !== 'running'
+      || (input.sessionBusy && message.id === input.currentAssistantMessageId)
+    ) return message;
+    changed = true;
+    return {
+      ...message,
+      activity: undefined,
+      status: 'interrupted',
+    } as TMessage;
+  });
+  return changed ? normalized : messages;
+}
+
 export type BrowserChatAiCycleRenderEntry<TCycle extends BrowserChatAiOutputCycleLike> =
   | { cycle: TCycle; kind: 'cycle' }
   | { cycles: TCycle[]; id: string; kind: 'executed' };

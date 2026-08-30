@@ -39,6 +39,7 @@ import {
   Bug,
   Check,
   CircleAlert,
+  CircleHelp,
   Clock3,
   ChevronDown,
   ClipboardCheck,
@@ -120,6 +121,11 @@ import {
 } from '@/components/browser-chat-history-controller';
 import { browserChatSubagentRecordsForToolCall } from '@/components/browser-chat-subagent-model';
 import {
+  browserChatToolContextTokenMetrics,
+  browserChatToolTimingMetrics,
+} from '@/components/browser-chat-tool-context';
+import { browserChatCurrentTurnAssistantMessageId } from '@/components/browser-chat-output-files-state';
+import {
   normalizeBrowserChatMarkdown,
   remarkBrowserChatCjkStrong,
 } from '@/components/browser-chat-markdown';
@@ -188,6 +194,7 @@ import {
   browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
+  normalizeBrowserChatMessageRunStates,
   browserChatTerminalAnswerCycleIndex,
   buildBrowserChatAiCycleRenderEntries,
   buildBrowserChatLogIndex,
@@ -480,13 +487,8 @@ function writeStoredEmbeddedChatCollapsed(collapsed: boolean) {
   window.localStorage.setItem(EMBEDDED_CHAT_COLLAPSED_STORAGE_KEY, collapsed ? 'true' : 'false');
 }
 
-function hasRunningAssistantMessage(session?: Pick<BrowserChatSession, 'messages'> | null) {
-  const lastMessage = session?.messages?.[session.messages.length - 1];
-  return Boolean(lastMessage?.role === 'assistant' && lastMessage.status === 'running');
-}
-
 function isBrowserChatSessionRunning(session?: BrowserChatSession | null) {
-  return Boolean(session && (session.busy || session.status === 'running' || hasRunningAssistantMessage(session)));
+  return Boolean(session && (session.busy || session.status === 'running'));
 }
 
 const browserChatInterruptedReply = '本轮对话已由用户中止。已保留中止前已执行的工具和页面记录。';
@@ -1277,6 +1279,7 @@ function browserChatToolLabel(name: string, input: unknown, t: (value: string) =
   if (filePresentation) return t(filePresentation.label);
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
+    contextCompression: '压缩上下文',
     file: '文件操作',
     fileVisual: '视觉检查',
     memory: '记忆管理',
@@ -1313,6 +1316,13 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
 
   const lower = name.toLowerCase();
   if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
+  if (name === 'contextCompression') {
+    const before = typeof record.estimatedTokensBefore === 'number' ? Math.round(record.estimatedTokensBefore) : undefined;
+    const after = typeof record.estimatedTokensAfter === 'number' ? Math.round(record.estimatedTokensAfter) : undefined;
+    return before !== undefined && after !== undefined
+      ? `${before.toLocaleString('zh-CN')} → ${after.toLocaleString('zh-CN')} Token`
+      : t('历史对话上下文压缩完成');
+  }
   if (name === 'file') {
     return toolInputValue(record, [
       'fileName',
@@ -1359,6 +1369,7 @@ function isSubagentSpawnTool(name: string, input: unknown) {
 function BrowserChatToolIcon({ input, name }: { input?: unknown; name: string }) {
   const lower = name.toLowerCase();
   if (name === 'browserCode') return <Braces size={13} />;
+  if (name === 'contextCompression') return <Brain size={13} />;
   const filePresentation = browserChatFileToolPresentation(name, input);
   if (filePresentation) {
     const icons: Record<BrowserChatFileToolPresentationKey, ReactNode> = {
@@ -3121,6 +3132,129 @@ function BrowserChatToolScreenshotButton({ tool }: { tool: BrowserChatToolCall }
   );
 }
 
+function BrowserChatToolContextTokenInfo({ tool }: { tool: BrowserChatToolCall }) {
+  const { t } = useI18n();
+  const tooltipId = useId();
+  const anchorRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement | null>(null);
+  const [tooltipOpen, setTooltipOpen] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState({ left: -10_000, top: -10_000 });
+  const { after, before, delta } = browserChatToolContextTokenMetrics(tool);
+  const { aiRequestElapsedMs, toolElapsedMs } = browserChatToolTimingMetrics(tool);
+  const formatTokens = (value: number) => value.toLocaleString('zh-CN');
+  const formatElapsed = (value: number) => {
+    if (value < 1_000) return `${value} ms`;
+    if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 2 : 1)} s`;
+    const minutes = Math.floor(value / 60_000);
+    const seconds = (value % 60_000) / 1_000;
+    return `${minutes} min ${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+  };
+  const deltaText = delta === undefined
+    ? undefined
+    : delta >= 0
+      ? t('本次调用增加 {count} Token', { count: formatTokens(delta) })
+      : t('本次调用减少 {count} Token', { count: formatTokens(Math.abs(delta)) });
+  const beforeText = before === undefined
+    ? undefined
+    : t('调用前：{count} Token', { count: formatTokens(before) });
+  const afterText = after === undefined
+    ? before === undefined ? undefined : t('等待下一次模型请求统计')
+    : t('调用后：{count} Token', { count: formatTokens(after) });
+  const toolElapsedText = toolElapsedMs === undefined
+    ? undefined
+    : t('工具调用耗时：{duration}', { duration: formatElapsed(toolElapsedMs) });
+  const aiElapsedText = aiRequestElapsedMs === undefined
+    ? undefined
+    : t('AI API 请求耗时：{duration}', { duration: formatElapsed(aiRequestElapsedMs) });
+  const summary = [deltaText, beforeText, afterText, toolElapsedText, aiElapsedText]
+    .filter(Boolean)
+    .join('；') || t('暂无上下文与耗时统计');
+  const updateTooltipPosition = useCallback(() => {
+    const anchor = anchorRef.current;
+    if (!anchor || typeof window === 'undefined') return;
+    const rect = anchor.getBoundingClientRect();
+    const padding = 12;
+    const gap = 10;
+    const tooltipWidth = Math.min(280, Math.max(1, window.innerWidth - padding * 2));
+    const tooltipHeight = tooltipRef.current?.offsetHeight || 126;
+    const centeredTop = Math.min(
+      Math.max(padding, rect.top + rect.height / 2 - tooltipHeight / 2),
+      Math.max(padding, window.innerHeight - tooltipHeight - padding),
+    );
+    let left: number;
+    let top: number;
+    if (rect.right + gap + tooltipWidth <= window.innerWidth - padding) {
+      left = rect.right + gap;
+      top = centeredTop;
+    } else if (rect.left - gap - tooltipWidth >= padding) {
+      left = rect.left - gap - tooltipWidth;
+      top = centeredTop;
+    } else {
+      left = Math.min(
+        Math.max(padding, rect.left + rect.width / 2 - tooltipWidth / 2),
+        Math.max(padding, window.innerWidth - tooltipWidth - padding),
+      );
+      top = rect.bottom + gap + tooltipHeight <= window.innerHeight - padding
+        ? rect.bottom + gap
+        : Math.max(padding, rect.top - gap - tooltipHeight);
+    }
+    setTooltipPosition((current) => (
+      current.left === left && current.top === top ? current : { left, top }
+    ));
+  }, []);
+  useLayoutEffect(() => {
+    if (!tooltipOpen) return;
+    updateTooltipPosition();
+    window.addEventListener('resize', updateTooltipPosition);
+    window.addEventListener('scroll', updateTooltipPosition, true);
+    return () => {
+      window.removeEventListener('resize', updateTooltipPosition);
+      window.removeEventListener('scroll', updateTooltipPosition, true);
+    };
+  }, [tooltipOpen, updateTooltipPosition]);
+  const tooltip = (
+    <span
+      className="browser-chat-tool-context-tooltip is-portaled"
+      id={tooltipId}
+      ref={tooltipRef}
+      role="tooltip"
+      style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
+    >
+      <strong>{t('上下文 Token')}</strong>
+      {deltaText ? <span>{deltaText}</span> : null}
+      {beforeText ? <span>{beforeText}</span> : null}
+      {afterText ? <span>{afterText}</span> : null}
+      {!deltaText && !beforeText && !afterText ? <span>{t('暂无上下文 Token 统计')}</span> : null}
+      <small>{t('估算包含文本、工具定义、截图等全部模型输入。')}</small>
+      <span className="browser-chat-tool-context-divider" aria-hidden="true" />
+      <strong>{t('耗时')}</strong>
+      {toolElapsedText ? <span>{toolElapsedText}</span> : null}
+      {aiElapsedText ? <span>{aiElapsedText}</span> : null}
+      {!toolElapsedText && !aiElapsedText ? <span>{t('暂无耗时统计')}</span> : null}
+      <small>{t('工具耗时包含结果处理；AI API 耗时不包含工具执行。')}</small>
+    </span>
+  );
+  return (
+    <>
+      <span
+        aria-describedby={tooltipId}
+        aria-label={summary}
+        className="browser-chat-tool-context-info"
+        onBlur={() => setTooltipOpen(false)}
+        onFocus={() => setTooltipOpen(true)}
+        onPointerEnter={() => setTooltipOpen(true)}
+        onPointerLeave={() => setTooltipOpen(false)}
+        ref={anchorRef}
+        role="note"
+        tabIndex={0}
+      >
+        <CircleHelp aria-hidden="true" size={14} />
+      </span>
+      {tooltipOpen && typeof document !== 'undefined' ? createPortal(tooltip, document.body) : null}
+    </>
+  );
+}
+
 function browserChatArtifactOpenUrl(artifact: BrowserChatArtifactSummary) {
   return artifact.url || artifactApiUrl(artifact.path) || artifact.downloadUrl;
 }
@@ -3153,8 +3287,10 @@ function browserChatArtifactFileIcon(fileName: string, openUrl: string) {
 
 function BrowserChatMessageArtifactCards({
   artifacts,
+  expandedByDefault,
 }: {
   artifacts?: BrowserChatArtifactSummary[];
+  expandedByDefault: boolean;
 }) {
   const { t } = useI18n();
   const preview = useContext(BrowserChatScreenshotPreviewContext);
@@ -3174,7 +3310,8 @@ function BrowserChatMessageArtifactCards({
     const openUrl = browserChatArtifactOpenUrl(artifact);
     return openUrl ? [{ ...artifact, openUrl }] : [];
   }), [messageArtifacts]);
-  const [filesExpanded, setFilesExpanded] = useState(true);
+  const [filesExpanded, setFilesExpanded] = useState(expandedByDefault);
+  useEffect(() => setFilesExpanded(expandedByDefault), [expandedByDefault]);
   if (!files.length && !screenshots.length) return null;
   return (
     <section aria-label={t('输出文件')} className={`browser-chat-message-artifacts${filesExpanded ? ' is-expanded' : ''}`}>
@@ -3562,6 +3699,7 @@ const BrowserChatSubagentToolDisclosure = memo(function BrowserChatSubagentToolD
             {isActive ? <BrowserChatToolTailParticles /> : null}
           </span>
         </div>
+        <BrowserChatToolContextTokenInfo tool={tool} />
         <BrowserChatToolScreenshotButton tool={tool} />
       </div>
       <div className="browser-chat-subagent-body-shell">
@@ -3713,6 +3851,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
                   <BrowserChatToolCardContent active={isActiveTool} input={tool.input} label={label} meta={visibleMeta} name={tool.name} userAction={userAction} />
                   {isActiveTool ? <BrowserChatToolTailParticles /> : null}
                 </button>
+                <BrowserChatToolContextTokenInfo tool={tool} />
                 <BrowserChatToolScreenshotButton tool={tool} />
               </div>
             )}
@@ -3876,6 +4015,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
                   >
                     {card}
                   </button>
+                  <BrowserChatToolContextTokenInfo tool={executedTool} />
                   <BrowserChatToolScreenshotButton tool={executedTool} />
                 </div>
               )}
@@ -4117,6 +4257,7 @@ const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
       <article className={`browser-chat-message assistant${operationRunning ? ' is-running' : ''}`}>
         <div>
           <BrowserChatAssistantTimeline
+            artifactFilesExpanded={false}
             logs={[]}
             manualVerificationRequired={subagent.status === 'blocked' && subagent.resumable}
             message={assistantMessage}
@@ -4544,6 +4685,7 @@ const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
 });
 
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
+  artifactFilesExpanded,
   logs: liveLogs,
   manualVerificationRequired,
   message,
@@ -4560,6 +4702,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   steps: liveSteps,
   subagents: liveSubagents,
 }: {
+  artifactFilesExpanded: boolean;
   logs: BrowserChatLogRecord[];
   manualVerificationRequired?: boolean;
   message: BrowserChatMessage;
@@ -4939,12 +5082,18 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
         <p className="browser-chat-agent-empty">{t('AI 已完成本轮操作，未返回额外文本。')}</p>
       ) : null}
-      {!running ? <BrowserChatMessageArtifactCards artifacts={message.artifacts} /> : null}
+      {!running ? (
+        <BrowserChatMessageArtifactCards
+          artifacts={message.artifacts}
+          expandedByDefault={artifactFilesExpanded}
+        />
+      ) : null}
     </div>
   );
 });
 
 const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
+  artifactFilesExpanded,
   deletingQueuedMessage,
   generatingAutomationMessageId,
   skillsById,
@@ -4969,6 +5118,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   resolvingConfirmationId,
   resumingHumanVerification,
 }: {
+  artifactFilesExpanded: boolean;
   deletingQueuedMessage?: boolean;
   generatingAutomationMessageId: string | null;
   generatingSkillMessageId: string | null;
@@ -5018,6 +5168,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
       <div>
         {item.role === 'assistant' ? (
           <BrowserChatAssistantTimeline
+            artifactFilesExpanded={artifactFilesExpanded}
             logs={itemLogs}
             manualVerificationRequired={manualVerificationRequired}
             message={item}
@@ -5110,6 +5261,7 @@ function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, 
 }
 
 const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
+  expandedArtifactMessageId,
   items,
   lastAssistantMessageId,
   logIndex,
@@ -5126,6 +5278,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   subagents,
   stepsByIndex,
 }: {
+  expandedArtifactMessageId?: string;
   items: BrowserChatMessage[];
   lastAssistantMessageId?: string;
   logIndex: BrowserChatLogIndex;
@@ -5163,6 +5316,7 @@ const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
             {itemViews.map(({ item, logs, outputCycles: itemOutputCycles, running, steps, subagents: itemSubagents }) => (
               <div className="browser-chat-executed-entry" key={item.id}>
                 <BrowserChatAssistantTimeline
+                  artifactFilesExpanded={item.id === expandedArtifactMessageId}
                   logs={logs}
                   manualVerificationRequired={Boolean(sessionAwaitingHuman && item.id === lastAssistantMessageId)}
                   message={item}
@@ -5295,11 +5449,19 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   const getScrollContainer = useCallback(() => {
     return scrollRef.current;
   }, []);
-  const lastMessage = messages[messages.length - 1];
+  const displayMessages = useMemo(() => normalizeBrowserChatMessageRunStates(messages, {
+    currentAssistantMessageId: lastAssistantMessageId,
+    sessionBusy,
+  }), [lastAssistantMessageId, messages, sessionBusy]);
+  const lastMessage = displayMessages[displayMessages.length - 1];
+  const expandedArtifactMessageId = useMemo(
+    () => browserChatCurrentTurnAssistantMessageId(displayMessages),
+    [displayMessages],
+  );
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
   const renderEntries = useMemo(
     () => buildBrowserChatMessageRenderEntries(
-      messages,
+      displayMessages,
       logIndex,
       (message) => (
         pendingToolConfirmation?.messageId === message.id
@@ -5311,7 +5473,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       ),
       browserChatAssistantMessageHasExecutionMetadata,
     ),
-    [lastAssistantMessageId, logIndex, messages, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
+    [displayMessages, lastAssistantMessageId, logIndex, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
   );
   const scrollKey = [
     sessionId || '',
@@ -5619,6 +5781,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         if (entry.kind === 'executed-group') {
           return (
             <BrowserChatExecutedGroup
+              expandedArtifactMessageId={expandedArtifactMessageId}
               items={entry.items}
               key={entry.id}
               lastAssistantMessageId={lastAssistantMessageId}
@@ -5650,6 +5813,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemSubagents = subagents.filter((subagent) => subagent.messageId === item.id);
         return (
           <BrowserChatMessageItem
+            artifactFilesExpanded={item.id === expandedArtifactMessageId}
             deletingQueuedMessage={deletingQueuedMessageIds.has(item.id)}
             generatingAutomationMessageId={generatingAutomationMessageId}
             generatingSkillMessageId={generatingSkillMessageId}

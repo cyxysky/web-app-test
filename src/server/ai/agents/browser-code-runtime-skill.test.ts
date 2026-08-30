@@ -16,6 +16,8 @@ test('hidden browserCode runtime Skill documents the complete required operating
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\("https:\/\/example\.com\/"\)/);
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\(\{ url: "https:\/\/example\.com\/" \}\)/);
   assert.match(browserCodeRuntimeSkillContent, /page\.activeSurface\(\)/);
+  assert.match(browserCodeRuntimeSkillContent, /page\.getByUid\(uid\)/);
+  assert.match(browserCodeRuntimeSkillContent, /STALE_DOM_EVIDENCE/);
   assert.match(browserCodeRuntimeSkillContent, /coveredBySurfaceId/);
   assert.doesNotMatch(browserCodeRuntimeSkillContent, /requiredNextAction/);
   assert.match(browserCodeRuntimeSkillContent, /nodeRepl\.write/);

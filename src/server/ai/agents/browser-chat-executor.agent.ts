@@ -114,6 +114,7 @@ import {
   normalizeRuntimeContinuationSummary,
   sanitizeRuntimeContinuationSummary,
   selectRecentRuntimeMessageBlocks,
+  runtimeContinuationDirectiveMarker,
   runtimeContinuationSummaryMarker,
 } from './runtime-context-compression';
 import {
@@ -166,6 +167,7 @@ type ToolTrace = {
   startedAt?: number;
   completedAt?: number;
   elapsedMs?: number;
+  aiRequestElapsedMs?: number;
   actionElapsedMs?: number;
   postprocessTimings?: Record<string, number>;
   progress?: StepToolCall['progress'];
@@ -270,12 +272,31 @@ function modelSupportsImageInput() {
   return getModelSettings().supportsImageInput;
 }
 
-function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
-  if (!aiRequest?.id) return undefined;
-  return {
-    requestId: aiRequest.id,
-    requestCreatedAt: aiRequest.createdAt,
+function finiteContextStat(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+function toolContextFromStats(
+  stats: unknown,
+  aiRequest?: Pick<AiRequestSnapshot, 'createdAt' | 'id'>,
+): AiToolContextSnapshot | undefined {
+  const record = recordFromUnknown(stats);
+  const snapshot: AiToolContextSnapshot = {
+    requestId: aiRequest?.id,
+    requestCreatedAt: aiRequest?.createdAt,
+    estimatedTotalTokens: finiteContextStat(record.estimatedTotalTokens),
+    estimatedTextTokens: finiteContextStat(record.estimatedTextTokens),
+    estimatedImageTokens: finiteContextStat(record.estimatedImageTokens),
+    estimatedToolSchemaTokens: finiteContextStat(record.estimatedToolSchemaTokens),
+    imageCount: finiteContextStat(record.imageCount),
+    method: typeof record.method === 'string' ? record.method : undefined,
   };
+  return Object.values(snapshot).some((value) => value !== undefined) ? snapshot : undefined;
+}
+
+function toolContextFromAiRequest(aiRequest?: AiRequestSnapshot): AiToolContextSnapshot | undefined {
+  if (!aiRequest) return undefined;
+  return toolContextFromStats(aiRequest.options?.modelContextStats, aiRequest);
 }
 
 // 是否启用视觉候选标识。关闭时仍发送截图，但候选元素只以文本摘要进入 prompt。
@@ -476,7 +497,10 @@ function compactToolResultForModel(
   delete modelResult.referenceImagePath;
   delete modelResult.referenceImagePaths;
   if (!modelResult.actual) return modelResult;
-  const fileResult = modelResult.ok ? formatFileArtifactResult(name, modelResult.actual) : undefined;
+  // The trace/database retain the complete raw result. The model only needs a
+  // compact, actionable representation; otherwise repeated Office validation
+  // payloads and stack traces quickly dominate the conversation context.
+  const fileResult = formatFileArtifactResult(name, modelResult.actual);
   if (fileResult) return { ...modelResult, actual: fileResult };
   return modelResult;
 }
@@ -680,6 +704,8 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       transient: trace.transient,
       result: userFacingToolResult(trace.name, trace.result, 360),
       rawResult: trace.result,
+      elapsedMs: trace.elapsedMs,
+      aiRequestElapsedMs: trace.aiRequestElapsedMs,
       progress: trace.progress,
       contextBefore: trace.contextBefore,
       contextAfter: trace.contextAfter,
@@ -936,15 +962,17 @@ function createToolTrace(input: {
   toolInput: unknown;
   toolCallId?: string;
   aiRequest?: AiRequestSnapshot;
+  aiRequestElapsedMs?: number;
   runId?: string;
   stepIndex?: number;
 }) {
-  const { traces, name, toolInput, toolCallId, aiRequest, runId, stepIndex } = input;
+  const { traces, name, toolInput, toolCallId, aiRequest, aiRequestElapsedMs, runId, stepIndex } = input;
   const existing = toolCallId ? traces.find((trace) => trace.id === toolCallId) : undefined;
   if (existing) {
     existing.name = name;
     existing.input = toolInput;
     existing.startedAt ??= Date.now();
+    existing.aiRequestElapsedMs ??= aiRequestElapsedMs;
     existing.contextBefore ??= toolContextFromAiRequest(aiRequest);
     existing.screenshots ??= [];
     return existing;
@@ -956,6 +984,7 @@ function createToolTrace(input: {
     name,
     input: toolInput,
     startedAt: Date.now(),
+    aiRequestElapsedMs,
     contextBefore: toolContextFromAiRequest(aiRequest),
     screenshots,
   };
@@ -1003,7 +1032,7 @@ async function finalizeToolTraceVisuals(input: {
       reason: `${trace.name} explicit visual evidence`,
     });
     await onVisualContextChange?.(visualContext.snapshot());
-  } else if (!result.ok && visualContext) {
+  } else if (!result.ok && visualContext && runtimeToolRequiresBrowserSession(trace.name)) {
     pushFailureFrameScreenshots(screenshots, trace.name, visualContext.current());
   }
 
@@ -1019,6 +1048,7 @@ async function executeTracedBrowserAction(input: {
   toolCallId?: string;
   action: (abortSignal?: AbortSignal, trace?: ToolTrace) => Promise<BrowserActionResult>;
   aiRequest?: AiRequestSnapshot;
+  aiRequestElapsedMs?: number;
   runId?: string;
   stepIndex?: number;
   visualContext?: VisualContextManager;
@@ -1027,9 +1057,9 @@ async function executeTracedBrowserAction(input: {
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
 }) {
-  const { traces, name, toolInput, toolCallId, action, aiRequest, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
+  const { traces, name, toolInput, toolCallId, action, aiRequest, aiRequestElapsedMs, runId, stepIndex, visualContext, abortSignal, shouldContinue, onToolTrace, onVisualContextChange } = input;
   throwIfStopped(abortSignal, shouldContinue);
-  const trace = createToolTrace({ traces, name, toolInput, toolCallId, aiRequest, runId, stepIndex });
+  const trace = createToolTrace({ traces, name, toolInput, toolCallId, aiRequest, aiRequestElapsedMs, runId, stepIndex });
   const postprocessTimings: Record<string, number> = {};
   trace.postprocessTimings = postprocessTimings;
   let postprocessStartedAt = Date.now();
@@ -1226,6 +1256,7 @@ function makeBrowserTools(
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
     getAiRequest?: () => AiRequestSnapshot | undefined;
+    getAiRequestElapsedMs?: (toolCallId?: string) => number | undefined;
     abortSignal?: AbortSignal;
     shouldContinue?: () => boolean;
     onDebug?: ExecutionDebug;
@@ -1324,6 +1355,7 @@ function makeBrowserTools(
         abortSignal: referenceOptions?.abortSignal,
         shouldContinue: referenceOptions?.shouldContinue,
         aiRequest: referenceOptions?.getAiRequest?.() || aiRequest,
+        aiRequestElapsedMs: referenceOptions?.getAiRequestElapsedMs?.(execution?.toolCallId),
         onToolTrace,
         onVisualContextChange: traceVisualContext ? referenceOptions?.onVisualContextChange : undefined,
         action: actionAfterBrowserStart,
@@ -1522,7 +1554,7 @@ function makeBrowserTools(
           documentId: z.string().max(96).optional().describe('Stable model-chosen id reused across plan, API lookup, generate, edit, render, and visual correction. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. Example: "xsbn-5d-yxg-guide".'),
           fileName: z.string().max(180).optional().describe('Optional output file name including the target extension. Examples: "西双版纳5日游攻略-野象谷周边.pptx", "项目复盘.docx", or "预算明细.xlsx".'),
           fileType: z.string().regex(/^[a-z0-9]{1,10}$/).optional().describe('Required for action=download: the expected file extension without a dot, such as jpg, png, pdf, docx, xlsx, or pptx. Always infer and provide it even when fileName is omitted.'),
-          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('For plan/unoApi only: word, spreadsheet, or presentation. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
+          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('Required for plan. For unoApi it is inferred from the planned documentId when omitted; if provided it must match the plan. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
           operation: z.enum(['create', 'modify']).optional().describe('For plan: create a new document or modify an attached existing Office document.'),
           sourceAttachmentId: z.string().max(160).optional().describe('For operation=modify: exact attachment id of the existing Office file.'),
           intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
@@ -1532,12 +1564,12 @@ function makeBrowserTools(
           program: z.string().optional(),
           baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Optional compatibility field. Edits apply to the current draft; the result returns its new sourceDigest.'),
           edits: z.array(z.object({
-            kind: z.enum(['deleteRange', 'insertAfter', 'insertBefore', 'replaceRange', 'replaceText']).optional().describe('Defaults to replaceRange.'),
+            kind: z.enum(['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText']).optional().describe('Defaults to replaceRange. Use replaceAll once to replace every exact oldText match; do not emit one replaceText edit per occurrence.'),
             startLine: z.number().int().min(1).optional().describe('One-based first source line for replaceRange/deleteRange.'),
             endLine: z.number().int().min(1).optional().describe('One-based inclusive last source line for replaceRange/deleteRange.'),
             line: z.number().int().min(1).optional().describe('One-based anchor line for insertBefore/insertAfter.'),
             oldText: z.string().min(1).optional().describe('Exact current source for replaceText.'),
-            occurrence: z.number().int().min(1).optional().describe('One-based oldText occurrence; omit when the match is unique.'),
+            occurrence: z.number().int().min(1).optional().describe('For replaceText only: one-based index of the oldText match, not a replacement count. Omit when oldText is unique; use replaceAll for every match.'),
             newText: z.string().optional().describe('Replacement or inserted source. Omit for deleteRange.'),
           }).strict()).min(1).max(100).optional(),
           patch: z.string().optional().describe('For action=edit: a standard unified diff against the current draft. Do not combine with edits.'),
@@ -1547,11 +1579,11 @@ function makeBrowserTools(
           offset: z.number().int().min(0).optional(),
           limit: z.number().int().min(1).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
           pages: z.array(z.number().int().min(1)).max(6).optional(),
-          target: z.enum(['all', 'document', 'page', 'text', 'sheet', 'cell', 'shape']).optional(),
-          query: z.string().max(120).optional(),
+          query: z.string().max(1_000).optional().describe('Optional filter applied across the complete UNO API catalog. Keep it focused; target is always all and is not an input parameter.'),
         }).passthrough(),
       ), [
         { reason: 'Download the referenced JPEG image', action: 'download', urlOrPath: 'https://example.com/image', fileType: 'jpg' },
+        { reason: 'Inspect planned presentation APIs', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation', query: 'placeholder remove slide' },
         {
           action: 'plan',
           reason: '规划西双版纳攻略演示文稿',
@@ -1853,7 +1885,7 @@ const fullLogDetailsFlag = '__browserChatFullLogDetails';function binaryLogDescr
   };
 }
 
-function sanitizeModelLogValue(
+export function sanitizeModelLogValue(
   value: unknown,
   imagePaths: string[],
   state: { imageIndex: number },
@@ -1864,14 +1896,16 @@ function sanitizeModelLogValue(
   if (value instanceof Error) {
     if (seen.has(value)) return '[Circular]';
     seen.add(value);
+    const extraEntries = Object.entries(value).filter(([key]) => !['cause', 'message', 'name', 'stack'].includes(key));
     return {
-      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      ...Object.fromEntries(extraEntries.map(([key, item]) => [
         key,
         sanitizeModelLogValue(item, imagePaths, state, seen),
       ])),
       name: value.name,
       message: value.message,
-      cause: sanitizeModelLogValue(value.cause, imagePaths, state, seen),
+      stack: value.stack,
+      ...(value.cause === undefined ? {} : { cause: sanitizeModelLogValue(value.cause, imagePaths, state, seen) }),
     };
   }
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) {
@@ -2310,6 +2344,20 @@ async function executeRuntimeStep(input: {
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
+    const publishToolTrace = async (trace: ToolTrace) => {
+      upsertToolTrace(traces, trace);
+      upsertToolTrace(durableTraces, trace);
+      await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
+    };
+    const attachContextAfterToCompletedTools = async (contextAfter?: AiToolContextSnapshot) => {
+      if (contextAfter?.estimatedTotalTokens === undefined) return;
+      for (const trace of traces) {
+        if (!trace.result || !trace.completedAt || trace.contextAfter?.estimatedTotalTokens !== undefined) continue;
+        if (!trace.contextBefore?.requestId) continue;
+        trace.contextAfter = contextAfter;
+        await publishToolTrace(trace);
+      }
+    };
     let requestSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, allowedToolTypes) : prompt;
     let latestText = '';
     const initialVisualPaths: string[] = [];
@@ -2356,7 +2404,6 @@ async function executeRuntimeStep(input: {
         });
       }
     };
-    const continuationDirectiveMarker = '[WebPilot continuation directive]';
     const durableContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
     const historyMessages = ensureRuntimeContinuationSummaryMessage(
       [...(input.conversation || [])] as RuntimeModelMessage[],
@@ -2432,12 +2479,14 @@ async function executeRuntimeStep(input: {
     const stepTraceStarts = new Map<number, number>();
     const stepStartedAt = new Map<number, number>();
     const stepModelMessagesForLog = new Map<number, unknown>();
+    const aiRequestElapsedByToolCallId = new Map<string, number>();
     let contextSegmentationTurns = 0;
     let lastPreparedMessages = [...initialMessages];
+    let lastPreparedResponsePrefixLength = 0;
     let latestContextCompression: BrowserChatModelContextCompression | undefined;
     const originalGoal = requirementOf(runtimeRecord).trim();
     const continuationDirectiveText = [
-      continuationDirectiveMarker,
+      runtimeContinuationDirectiveMarker,
       'This is runtime continuation metadata, not a new user request.',
       'Resume only the unfinished remaining/nextStep work in the continuation summary and the newest tool result.',
       'Do not restart the original goal, repeat completed research/downloads/generation, or recreate an existing artifact.',
@@ -2624,6 +2673,9 @@ async function executeRuntimeStep(input: {
       }
 
       const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      lastPreparedResponsePrefixLength = previousMessages?.length
+        ? Math.max(0, sourceMessages.length - initialMessages.length)
+        : 0;
       let unsummarizedMessages = compactedModelContext?.length
         ? messagesAddedAfterCompactedContext(sourceMessages)
         : sourceMessages;
@@ -2650,6 +2702,10 @@ async function executeRuntimeStep(input: {
       let modelContextSegmentation: Record<string, unknown> | undefined;
       const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths);
       const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
+      // Attribute the complete would-be next model input to the tool before a
+      // possible compression changes it. The compression trace below records
+      // that separate decrease, so it is never charged to the preceding tool.
+      await attachContextAfterToCompletedTools(toolContextFromStats(messageStats));
       if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
         const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
         const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
@@ -2770,6 +2826,30 @@ async function executeRuntimeStep(input: {
           thresholdTokens,
           windowTokens,
         };
+        const compressionCompletedAt = Date.now();
+        const compressionToolCallId = `context-compression:${input.runId}:${stepIndex}:${contextSegmentationTurns}`;
+        const compressionTrace: ToolTrace = {
+          id: compressionToolCallId,
+          name: 'contextCompression',
+          input: {
+            estimatedTokensBefore: messageStats.estimatedTotalTokens,
+            estimatedTokensAfter: afterStats.estimatedTotalTokens,
+            retainedMessageCount,
+            summarizedMessageCount: summarySourceMessages.length,
+            trigger: 'model context threshold exceeded',
+          },
+          result: {
+            ok: true,
+            actual: `Context compressed from ${messageStats.estimatedTotalTokens} to ${afterStats.estimatedTotalTokens} estimated tokens.`,
+          },
+          startedAt: compressionCompletedAt - summaryResult.elapsedMs,
+          completedAt: compressionCompletedAt,
+          elapsedMs: summaryResult.elapsedMs,
+          actionElapsedMs: summaryResult.elapsedMs,
+          contextBefore: toolContextFromStats(messageStats),
+          contextAfter: toolContextFromStats(afterStats),
+        };
+        await publishToolTrace(compressionTrace);
         await input.onContextCompression?.({
           activeMessages: [...messagesToSend],
           contextCompression: latestContextCompression,
@@ -2796,6 +2876,7 @@ async function executeRuntimeStep(input: {
           message: `Context compression completed for agent step ${agentStepIndex}.`,
           details: {
             ...modelContextSegmentation,
+            toolCallId: compressionToolCallId,
             modelContextStats: {
               ...afterStats,
               thresholdRatio,
@@ -2826,7 +2907,8 @@ async function executeRuntimeStep(input: {
         imagePaths: [...attachedImagePaths],
         agentStepOffset: agentStepIndex - 1,
       });
-      aiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-tools-system-and-conversation-prefix', runtimeOperationalContextCharacters: runtimeMetadata.operationalContextCharacters, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      const nextAiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-tools-system-and-conversation-prefix', runtimeOperationalContextCharacters: runtimeMetadata.operationalContextCharacters, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
+      aiRequest = nextAiRequest;
       lastAiRequest = aiRequest;
       const hiddenSkillGateActive = stepAllowedToolTypes.length !== allowedToolTypes.length;
       const activeTools = browserStateGatePending || hiddenSkillGateActive
@@ -2946,7 +3028,11 @@ async function executeRuntimeStep(input: {
         text: execution.text,
         traces,
         aiRequest,
-        modelMessages: mergeRuntimeModelMessageChain(lastPreparedMessages, result.responseMessages),
+        modelMessages: mergeRuntimeModelMessageChain(
+          lastPreparedMessages,
+          result.responseMessages,
+          lastPreparedResponsePrefixLength,
+        ),
         turnMessages: [...turnInputMessages, ...result.responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
@@ -2977,6 +3063,9 @@ async function executeRuntimeStep(input: {
       stepIndex,
       visualContext,
       getAiRequest: () => aiRequest,
+      getAiRequestElapsedMs: (toolCallId) => toolCallId
+        ? aiRequestElapsedByToolCallId.get(toolCallId)
+        : undefined,
       abortSignal,
       shouldContinue: input.shouldContinue,
       requestToolConfirmation: input.requestToolConfirmation,
@@ -3073,6 +3162,18 @@ async function executeRuntimeStep(input: {
         if (approval === 'denied') return { type: 'denied' as const, reason: 'User cancelled the server-classified operation.' };
         return 'not-applicable' as const;
       } : undefined;
+      const onAgentLanguageModelCallEnd = (event: {
+        content: ReadonlyArray<unknown>;
+        performance: { responseTimeMs: number };
+      }) => {
+        const responseTimeMs = finiteContextStat(event.performance.responseTimeMs);
+        if (responseTimeMs === undefined) return;
+        for (const part of event.content) {
+          const record = recordFromUnknown(part);
+          if (record.type !== 'tool-call' || typeof record.toolCallId !== 'string') continue;
+          aiRequestElapsedByToolCallId.set(record.toolCallId, responseTimeMs);
+        }
+      };
       const onAgentToolExecutionStart = async (event: { toolCall: { toolCallId: string; toolName: string; input: unknown } }) => {
         if (!externalToolNames.has(event.toolCall.toolName)) return;
         requestWatchdog.pause();
@@ -3081,6 +3182,7 @@ async function executeRuntimeStep(input: {
           name: event.toolCall.toolName,
           input: event.toolCall.input,
           startedAt: Date.now(),
+          aiRequestElapsedMs: aiRequestElapsedByToolCallId.get(event.toolCall.toolCallId),
           contextBefore: toolContextFromAiRequest(aiRequest),
         };
         upsertToolTrace(traces, trace);
@@ -3107,8 +3209,8 @@ async function executeRuntimeStep(input: {
           completedAt: Date.now(),
           elapsedMs: event.toolExecutionMs,
           actionElapsedMs: event.toolExecutionMs,
+          aiRequestElapsedMs: aiRequestElapsedByToolCallId.get(event.toolCall.toolCallId),
           contextBefore: toolContextFromAiRequest(aiRequest),
-          contextAfter: toolContextFromAiRequest(aiRequest),
         };
         upsertToolTrace(traces, trace);
         upsertToolTrace(durableTraces, trace);
@@ -3190,6 +3292,7 @@ async function executeRuntimeStep(input: {
         stopWhen,
         prepareStep: prepareAgentStep,
         toolApproval: approveAgentTool,
+        onLanguageModelCallEnd: onAgentLanguageModelCallEnd,
         onToolExecutionStart: onAgentToolExecutionStart,
         onToolExecutionEnd: onAgentToolExecutionEnd,
         onStepEnd: onAgentStepEnd,
@@ -3303,7 +3406,11 @@ async function executeRuntimeStep(input: {
         text: latestText,
         traces,
         aiRequest,
-        modelMessages: mergeRuntimeModelMessageChain(lastPreparedMessages, responseMessages),
+        modelMessages: mergeRuntimeModelMessageChain(
+          lastPreparedMessages,
+          responseMessages,
+          lastPreparedResponsePrefixLength,
+        ),
         turnMessages: [...turnInputMessages, ...responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
@@ -3676,9 +3783,13 @@ export async function executeInteractiveBrowserTurn(input: {
         ? requiredSubagentReadDirective(requiredSubagentUuid, pendingSubagentUuids.length)
         : '';
       const requiredVisualQaInstruction = requiredVisualQa
-        ? `[Mandatory Office visual QA gate]
+        ? requiredVisualQa.failedPages.length
+          ? `[Mandatory Office visual repair gate]
+Continue the current artifact workflow and the same documentId=${requiredVisualQa.documentId}; do not recreate the document or repeat source research. Do not present a delivery/final-success summary yet.
+The latest rendered artifact failed visual QA on pages ${requiredVisualQa.failedPages.join(', ')}. Repair the current saved source with file action=edit using these recorded findings: ${JSON.stringify(requiredVisualQa.failedReviews.flatMap((review) => review.issues.map((issue) => ({ page: review.pageNumber, ...issue }))).slice(0, 20))}. Do not call fileVisual again until the source has been edited and re-rendered. Success is forbidden until the new rendered digest passes every page.`
+          : `[Mandatory Office visual QA gate]
 Continue the current artifact workflow; do not restart the user's original task, revisit source research, or recreate already generated documents. Do not present a delivery/final-success summary yet.
-The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered yet. Its renderedDigest is ${requiredVisualQa.renderedDigest}, visualQaDigest is ${requiredVisualQa.visualQaDigest || 'null'}, ${requiredVisualQa.seenPageCount}/${requiredVisualQa.pageCount || '?'} pages have been read, and ${requiredVisualQa.reviewedPageCount}/${requiredVisualQa.pageCount || '?'} pages have explicit reviews${requiredVisualQa.failedPages.length ? ` (failed pages: ${requiredVisualQa.failedPages.join(', ')})` : ''}. Call fileVisual index/read and then report an explicit passed/failed conclusion for every page. Reading alone never passes QA. Success is forbidden until every page passes and visualQaDigest === renderedDigest.`
+The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered yet. Its renderedDigest is ${requiredVisualQa.renderedDigest}, visualQaDigest is ${requiredVisualQa.visualQaDigest || 'null'}, ${requiredVisualQa.seenPageCount}/${requiredVisualQa.pageCount || '?'} pages have been read, and ${requiredVisualQa.reviewedPageCount}/${requiredVisualQa.pageCount || '?'} pages have explicit reviews. Call fileVisual index/read and then report an explicit passed/failed conclusion for every page. Reading alone never passes QA. Success is forbidden until every page passes and visualQaDigest === renderedDigest.`
         : '';
       const requiredDocumentWorkInstruction = requiredDocumentWork
         ? `[Mandatory Office document completion gate]
@@ -3746,7 +3857,8 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       ensureActive();
       activeModelMessages = actionResult.modelMessages;
       turnModelMessages.push(...actionResult.turnMessages);
-      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(actionResult.traces)) {
+      const operationalTraces = actionResult.traces.filter((trace) => trace.name !== 'contextCompression');
+      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(operationalTraces)) {
         loadedHiddenRuntimeSkillIds.add(skillId);
       }
       await input.onModelMessages?.({
@@ -3756,8 +3868,8 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       ensureActive();
       contextCompression = actionResult.contextCompression || contextCompression;
       activeContinuationSummary = actionResult.contextCompression?.continuationSummary || activeContinuationSummary;
-      browserStatePreflightComplete ||= !requiresBrowserStatePreflight(false, actionResult.traces);
-      for (const trace of actionResult.traces) {
+      browserStatePreflightComplete ||= !requiresBrowserStatePreflight(false, operationalTraces);
+      for (const trace of operationalTraces) {
         const toolInput = splitToolInputAndReason(trace.input).input;
         if (trace.name === 'file' && typeof toolInput.documentId === 'string' && toolInput.documentId) {
           turnDocumentIds.add(toolInput.documentId);
@@ -3766,14 +3878,14 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         const artifactId = parseJsonObjectText(trace.result.actual)?.artifactId;
         if (typeof artifactId === 'string' && artifactId) turnRenderedArtifactIds.add(artifactId);
       }
-      if (actionResult.traces.length) {
+      if (operationalTraces.length) {
         activeContinuationSummary = fallbackRuntimeContinuationSummary({
           goal: input.instruction,
           stepIndex,
           agentStep: newSteps.length + 1,
           previousSummary: activeContinuationSummary,
-          recentToolAttempts: formatCurrentToolAttemptSummary(actionResult.traces, 5),
-          runtimeState: continuationRuntimeStateFromTraces(actionResult.traces),
+          recentToolAttempts: formatCurrentToolAttemptSummary(operationalTraces, 5),
+          runtimeState: continuationRuntimeStateFromTraces(operationalTraces),
         });
         await input.onContinuationSummary?.(activeContinuationSummary);
       }
@@ -3785,14 +3897,15 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         activeModelMessages = [...recovery.messages];
         turnModelMessages.splice(0, turnModelMessages.length, ...recovery.turnMessages);
       }
-      if (liveToolTraces.length) {
+      const operationalLiveToolTraces = liveToolTraces.filter((trace) => trace.name !== 'contextCompression');
+      if (operationalLiveToolTraces.length) {
         activeContinuationSummary = fallbackRuntimeContinuationSummary({
           goal: input.instruction,
           stepIndex,
           agentStep: newSteps.length + 1,
           previousSummary: activeContinuationSummary,
-          recentToolAttempts: formatCurrentToolAttemptSummary(liveToolTraces, 8),
-          runtimeState: continuationRuntimeStateFromTraces(liveToolTraces),
+          recentToolAttempts: formatCurrentToolAttemptSummary(operationalLiveToolTraces, 8),
+          runtimeState: continuationRuntimeStateFromTraces(operationalLiveToolTraces),
         });
         await input.onContinuationSummary?.(activeContinuationSummary);
       }
@@ -3900,7 +4013,8 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       continue;
     }
 
-    const decision = deriveBrowserChatStepDecision(actionResult.text, actionResult.traces);
+    const operationalTraces = actionResult.traces.filter((trace) => trace.name !== 'contextCompression');
+    const decision = deriveBrowserChatStepDecision(actionResult.text, operationalTraces);
     const completedStep: StepExecutionResult = {
       index: stepIndex,
       action: decision.action,
@@ -3917,7 +4031,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
     ensureActive();
     await input.onProgress?.(completedStep);
     ensureActive();
-    const lastToolName = actionResult.traces.at(-1)?.name;
+    const lastToolName = operationalTraces.at(-1)?.name;
     const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
     if (pendingSubagentUuids.length) {
       await input.onDebug?.({
@@ -4241,12 +4355,10 @@ export async function executeRecordedBrowserOperation(
       }
       if (input.action === 'unoApi') {
         const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
-        const target = input.target === 'all' || input.target === 'document' || input.target === 'page' || input.target === 'text' || input.target === 'sheet' || input.target === 'cell' || input.target === 'shape' ? input.target : undefined;
         return getUnoApi({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
           documentType,
-          target,
           query: typeof input.query === 'string' ? input.query : undefined,
           offset: typeof input.offset === 'number' ? input.offset : undefined,
           limit: typeof input.limit === 'number' ? input.limit : undefined,
@@ -4271,7 +4383,7 @@ export async function executeRecordedBrowserOperation(
             ? input.edits.reduce<UnoDraftLineEdit[]>((result, edit) => {
               if (!edit || typeof edit !== 'object' || Array.isArray(edit)) return result;
               const value = edit as Record<string, unknown>;
-              const kind = ['deleteRange', 'insertAfter', 'insertBefore', 'replaceRange', 'replaceText'].includes(String(value.kind || ''))
+              const kind = ['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText'].includes(String(value.kind || ''))
                 ? String(value.kind) as UnoDraftLineEdit['kind']
                 : undefined;
               result.push({

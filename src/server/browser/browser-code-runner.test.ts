@@ -13,6 +13,7 @@ import {
   BrowserCodeKernel,
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
+  type BrowserCodeUidReference,
 } from './browser-code-runner';
 
 let browserServer: BrowserServer;
@@ -56,6 +57,7 @@ async function run(code: string, options: {
   maxOutputChars?: number;
   attachments?: BrowserCodeAttachmentBinding[];
   credentials?: BrowserCodeCredentialBinding[];
+  uidReferences?: BrowserCodeUidReference[];
 } = {}) {
   const executionId = randomUUID();
   await page.evaluate((id) => {
@@ -101,6 +103,53 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   assert.equal(result.activity?.navigationChanged, false);
   assert.equal(result.activity?.tabChanged, false);
   assert.equal(result.activity ? 'observation' in result.activity : false, false);
+});
+
+test('page.getByUid resolves an exposed DOM UID to a governed Playwright locator', async () => {
+  await page.setContent('<button id="uid-save" onclick="document.body.dataset.uidClicked=\'true\'">Save by UID</button>');
+  await page.evaluate(() => {
+    Object.defineProperty(window, '__aiDomRuntime', {
+      configurable: true,
+      value: {
+        visibleDomElement: (ref: string) => ref === '7' ? document.querySelector('#uid-save') : undefined,
+        pageObservation: () => ({
+          epoch: 12,
+          url: location.href,
+          title: document.title,
+          surfaces: [],
+          surfaceStack: [],
+          topSurfaceIds: [],
+          surfaceTransition: 'initial',
+        }),
+      },
+    });
+  });
+  const uidReferences: BrowserCodeUidReference[] = [{
+    uid: 'dom-1-7',
+    observationId: 'dom-observation-1',
+    localRef: '7',
+    label: 'Save by UID',
+    descriptor: 'button#uid-save',
+    line: '<button uid=dom-1-7 id="uid-save">Save by UID</button>',
+    capabilities: ['click'],
+  }];
+
+  const result = await run(`
+    var uidSaveButton = page.getByUid('dom-1-7');
+    await uidSaveButton.click();
+    nodeRepl.write({
+      clicked: await page.locator('body').getAttribute('data-uid-clicked'),
+      getByUidType: typeof page.getByUid,
+    });
+  `, { uidReferences });
+
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.value, { clicked: 'true', getByUidType: 'function' });
+  assert.equal(await page.locator('#uid-save').getAttribute('data-ai-browser-code-uid'), null);
+
+  const stale = await run(`page.getByUid('dom-9-9');`, { uidReferences });
+  assert.equal(stale.ok, false);
+  assert.match(stale.error || '', /STALE_DOM_EVIDENCE: UID dom-9-9 is not an exposed current DOM UID/i);
 });
 
 test('domSnapshot skips an unresponsive iframe instead of reaching the kernel watchdog', async () => {
@@ -227,6 +276,8 @@ test('browserCode bounds a missing locator and preserves the kernel after the fa
   `);
   assert.equal(failed.ok, false);
   assert.match(failed.error || '', /ACTIONABILITY_FAILED: click matched 0 elements/i);
+  assert.match(failed.error || '', /ZERO_MATCH_DIAGNOSTICS/);
+  assert.match(failed.error || '', /Save/);
   assert.equal(failed.activity?.actions.includes('locator.click'), false, 'a rejected candidate must not be recorded as an executed action');
   assert.ok(Date.now() - startedAt < 2_000, 'missing locator should fail before entering Playwright action timeout');
 
@@ -1293,6 +1344,38 @@ test('browserCode agent state survives a kernel recycle', async () => {
     `);
     assert.equal(objectForm.ok, true, objectForm.error);
     assert.equal((objectForm.value as { value: unknown }).value, 'still-supported');
+  } finally {
+    await stateKernel.close();
+  }
+});
+
+test('browserCode returns synchronous agent state validation failures without waiting for the cell timeout', async () => {
+  const stateKernel = new BrowserCodeKernel(
+    { protocol: 'cdp', endpoint: cdpEndpoint },
+    {
+      executionTimeoutMs: 5_000,
+      runtimeState: () => {
+        throw new Error('agent.state value must not contain circular references.');
+      },
+    },
+  );
+  const executionId = randomUUID();
+  await page.evaluate((id) => {
+    Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+      configurable: true,
+      value: id,
+    });
+  }, executionId);
+
+  try {
+    const startedAt = Date.now();
+    const result = await stateKernel.execute({
+      code: `await agent.state.set({key:'too-large',value:'x'});`,
+      executionId,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error || '', /must not contain circular references/);
+    assert.ok(Date.now() - startedAt < 4_000, `state failure took ${Date.now() - startedAt}ms`);
   } finally {
     await stateKernel.close();
   }

@@ -2,8 +2,6 @@
 
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEYS = 100;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEY_CHARS = 120;
-export const BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_CHARS = 64_000;
-export const BROWSER_CODE_RUNTIME_STATE_MAX_TOTAL_CHARS = 1_000_000;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 
 const runtimeStateNamespace = 'conversation';
@@ -114,9 +112,7 @@ function serializeRuntimeStateValue(value: unknown) {
   };
   visit(value, 0);
   const serialized = JSON.stringify(value);
-  if (serialized === undefined || serialized.length > BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_CHARS) {
-    throw new Error(`agent.state value must serialize to at most ${BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_CHARS} characters.`);
-  }
+  if (serialized === undefined) throw new Error('agent.state value must be JSON-serializable.');
   return serialized;
 }
 
@@ -210,17 +206,13 @@ export function executeBrowserCodeRuntimeStateOperation(
         throw new Error(`agent.state revision conflict for key ${JSON.stringify(key)}: expected ${expectedRevision}, current ${currentRevision}.`);
       }
       const aggregate = database.prepare(`
-        SELECT COUNT(*) AS key_count, COALESCE(SUM(LENGTH(value_json)), 0) AS total_chars
+        SELECT COUNT(*) AS key_count
         FROM browser_code_runtime_state
         WHERE session_id = ? AND namespace = ?
-      `).get(sessionId, runtimeStateNamespace) as { key_count?: number; total_chars?: number };
+      `).get(sessionId, runtimeStateNamespace) as { key_count?: number };
       const keyCount = Number(aggregate.key_count) || 0;
       if (!existing && keyCount >= BROWSER_CODE_RUNTIME_STATE_MAX_KEYS) {
         throw new Error(`agent.state stores at most ${BROWSER_CODE_RUNTIME_STATE_MAX_KEYS} keys per conversation.`);
-      }
-      const totalChars = (Number(aggregate.total_chars) || 0) - (existing?.value_json.length || 0) + valueJson.length;
-      if (totalChars > BROWSER_CODE_RUNTIME_STATE_MAX_TOTAL_CHARS) {
-        throw new Error(`agent.state values exceed the ${BROWSER_CODE_RUNTIME_STATE_MAX_TOTAL_CHARS}-character conversation limit.`);
       }
       const revision = currentRevision + 1;
       const expiresAt = ttlMs === undefined ? null : new Date(Date.now() + ttlMs).toISOString();
