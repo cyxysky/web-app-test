@@ -10,6 +10,7 @@ import {
   downloadFileArtifact,
   editUnoFileArtifact,
   formatFileArtifactResult,
+  generatedRuntimeDiagnostics,
   generatedVerificationIssues,
   generateUnoFileArtifact,
   getOfficeJsApi,
@@ -22,10 +23,21 @@ import {
   recordOfficeVisualQaProgress,
   repairFileArtifactDownloadLinks,
   renderFileArtifact,
+  sourceUnitsForDraft,
   syncDocumentAssets,
   verifyCurrentUnoRenderedArtifact,
 } from './file-artifact-tools';
 import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
+
+const passedPageVisualChecks = {
+  overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed',
+  typography: 'passed', contrast: 'passed', visualHierarchy: 'passed',
+  chartTableLegibility: 'not-applicable', imageQuality: 'not-applicable',
+} as const;
+const passedDeckVisualChecks = {
+  templateConsistency: 'passed', typographyConsistency: 'passed', colorConsistency: 'passed',
+  spacingRhythm: 'passed', componentConsistency: 'passed',
+} as const;
 
 test('repairs artifact links by artifact ID without trusting the model hostname or link label', () => {
   const tools = [
@@ -66,11 +78,10 @@ test('repairs artifact links by artifact ID without trusting the model hostname 
 
 const wordProgram = `
 def create_document(job):
-    document = job.new_document('word')
-    cursor = document.Text.createTextCursor()
-    document.Text.insertString(cursor, 'Generated through the UNO worker', False)
-    document.storeAsURL(job.output_url, (job.property('FilterName', 'Office Open XML Text'),))
-    job.close(document)
+    document = job.writer('document')
+    document.add_paragraph('body', 'Generated through the UNO worker')
+    document.save()
+    document.close()
 `;
 
 test('requires a stable documentId during semantic planning', async () => {
@@ -115,8 +126,6 @@ test('formats a failed validation as failed instead of validated', () => {
     fileName: 'failed.docx',
     validation: 'failed',
     saved: true,
-    currentRevision: 2,
-    lastSuccessfulRevision: 2,
     error: 'Syntax error',
     diagnostics: [{
       code: 'PYTHON_SYNTAX',
@@ -134,6 +143,20 @@ test('formats a failed validation as failed instead of validated', () => {
   assert.match(formatted || '', /source=.*51 \| next_step/);
   assert.match(formatted || '', /repairHints=/);
   assert.doesNotMatch(formatted || '', /source validated/i);
+});
+
+test('formats a passed draft validation with render as the next action', () => {
+  const formatted = formatFileArtifactResult('file', JSON.stringify({
+    kind: 'uno-draft-validation',
+    documentId: 'ready-deck',
+    fileName: 'ready.pptx',
+    sourceCharacters: 24000,
+    validationStatus: 'passed',
+    requiredNextAction: 'render',
+    automaticValidation: { passed: true, issues: [] },
+  }));
+  assert.match(formatted || '', /source validated/i);
+  assert.match(formatted || '', /requiredNextAction=render/);
 });
 
 test('keeps structural counts and visual gate status in the model-facing artifact summary', () => {
@@ -433,12 +456,20 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
     const overwrite = await generateUnoFileArtifact({
       documentId: 'uno-report', program: wordProgram, render: false, runId: 'chat_test',
     });
-    assert.equal(overwrite.ok, false);
-    assert.match(overwrite.actual || '', /already has source/);
+    assert.equal(overwrite.ok, true, overwrite.actual);
 
     const draft = await readUnoDraft({ documentId: 'uno-report', runId: 'chat_test' });
     assert.equal(draft.ok, true, draft.actual);
     const draftPayload = JSON.parse(draft.actual || '{}') as { sourceDigest: string };
+    const atomicallyReplaced = await generateUnoFileArtifact({
+      documentId: 'uno-report',
+      program: wordProgram.replace('Generated through the UNO worker', 'Generated through atomic replacement'),
+      render: false,
+      runId: 'chat_test',
+    });
+    assert.equal(atomicallyReplaced.ok, true, atomicallyReplaced.actual);
+    const replacementPayload = JSON.parse(atomicallyReplaced.actual || '{}') as { sourceDigest: string };
+    assert.notEqual(replacementPayload.sourceDigest, draftPayload.sourceDigest);
     assert.match(draft.actual || '', /Generated through the UNO worker/);
     assert.match(await readFile(path.join(root, 'chat_test', 'document-drafts', 'uno-report.py'), 'utf8'), /create_document/);
     assert.match(await readFile(path.join(root, 'chat_test', 'document-drafts', 'uno-report.json'), 'utf8'), /sourceDigest/);
@@ -447,11 +478,10 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
     assert.equal(rerendered.ok, true, rerendered.actual);
     const replacement = await editUnoFileArtifact({
       documentId: 'uno-report',
-      baseDigest: draftPayload.sourceDigest,
       edits: [{
-        startLine: 4,
-        endLine: 4,
-        newText: "    document.Text.insertString(cursor, 'Generated through a replacement program', False)",
+        startLine: 3,
+        endLine: 3,
+        newText: "    document.add_paragraph('body', 'Generated through a replacement program')",
       }],
       render: false,
       runId: 'chat_test',
@@ -472,10 +502,54 @@ test('applies line edits against one stable line-numbered source', () => {
     { startLine: 2, endLine: 2, newText: 'TWO\nTWO-DETAIL' },
     { startLine: 4, endLine: 4, newText: 'FOUR' },
   ]), 'one\nTWO\nTWO-DETAIL\nthree\nFOUR\n');
-  assert.throws(() => applyUnoDraftLineEdits(source, [
-    { startLine: 2, endLine: 3, newText: 'middle' },
-    { startLine: 3, endLine: 4, newText: 'overlap' },
-  ]), /overlap/);
+  assert.equal(applyUnoDraftLineEdits(source, [
+    { startLine: 1, endLine: 3, newText: 'one\nTWO\nthree' },
+    { startLine: 2, endLine: 4, newText: 'two\nthree\nFOUR' },
+  ]), 'one\nTWO\nthree\nFOUR\n');
+  assert.equal(applyUnoDraftLineEdits(source, [
+    { startLine: 2, endLine: 2, newText: 'first' },
+    { startLine: 2, endLine: 2, newText: 'second' },
+  ]), 'one\nsecond\nthree\nfour\n');
+  const nested = `def create_document(job):
+    def add_bg(page):
+        deck.add_shape('bg', page, 0, 0, 100, 100)
+    add_bg(page)
+`;
+  assert.equal(applyUnoDraftLineEdits(nested, [{
+    kind: 'replaceRange',
+    startLine: 2,
+    endLine: 3,
+    newText: `def add_bg(sid, page):
+        deck.add_shape(sid + '/bg', page, 0, 0, 100, 100)`,
+  }]), `def create_document(job):
+def add_bg(sid, page):
+        deck.add_shape(sid + '/bg', page, 0, 0, 100, 100)
+    add_bg(page)
+`);
+  assert.equal(applyUnoDraftLineEdits(nested, [{
+    kind: 'replaceRange',
+    startLine: 2,
+    endLine: 3,
+    preserveIndent: true,
+    newText: 'def nested_helper():\n    pass',
+  }]), `def create_document(job):
+    def nested_helper():
+        pass
+    add_bg(page)
+`);
+  assert.equal(applyUnoDraftLineEdits(nested, [{
+    kind: 'replaceRange',
+    startLine: 2,
+    endLine: 3,
+    newText: `# replacement copied with exact indentation
+    page = deck.add_slide('slide-08')
+    chart_box = deck.content_box()`,
+  }]), `def create_document(job):
+# replacement copied with exact indentation
+    page = deck.add_slide('slide-08')
+    chart_box = deck.content_box()
+    add_bg(page)
+`);
 });
 
 test('supports structured editor operations and unified patches', () => {
@@ -487,6 +561,15 @@ test('supports structured editor operations and unified patches', () => {
   assert.equal(applyUnoDraftLineEdits(source, [
     { kind: 'replaceText', oldText: 'two\nthree', newText: 'TWO\nTHREE' },
   ]), 'one\nTWO\nTHREE\nfour\n');
+  assert.equal(applyUnoDraftLineEdits(source, [
+    { kind: 'replaceText', oldText: 'two', newText: 'TWO' },
+    { kind: 'replaceText', oldText: 'TWO\nthree', newText: 'middle' },
+  ]), 'one\nmiddle\nfour\n');
+  assert.equal(applyUnoDraftLineEdits(source, [
+    { kind: 'replaceText', oldText: 'one-detail', newText: 'ONE-DETAIL' },
+    { kind: 'insertAfter', line: 1, newText: 'one-detail' },
+    { kind: 'replaceRange', startLine: 3, endLine: 3, newText: 'THREE' },
+  ]), 'one\nONE-DETAIL\ntwo\nTHREE\nfour\n');
   assert.equal(applyUnoDraftLineEdits(source, [
     { kind: 'replaceText', oldText: 'two', occurrence: 50, newText: 'TWO' },
   ]), 'one\nTWO\nthree\nfour\n');
@@ -534,6 +617,106 @@ test('keeps page and element IDs while deduplicating overlap diagnostics', () =>
   assert.equal(diagnostics[0].severity, 'warning');
 });
 
+test('preserves deterministic runtime ID disambiguation as a warning diagnostic', () => {
+  const diagnostics = generatedRuntimeDiagnostics({
+    runtimeDiagnostics: [{
+      code: 'ELEMENT_ID_AUTO_DISAMBIGUATED',
+      elementId: 'slide-01/title-2',
+      line: 42,
+      message: "Duplicate requested elementId 'slide-01/title' was registered as 'slide-01/title-2'.",
+      severity: 'warning',
+    }],
+  });
+  assert.deepEqual(diagnostics, [{
+    code: 'ELEMENT_ID_AUTO_DISAMBIGUATED',
+    elementId: 'slide-01/title-2',
+    line: 42,
+    message: "Duplicate requested elementId 'slide-01/title' was registered as 'slide-01/title-2'.",
+    severity: 'warning',
+  }]);
+});
+
+test('clusters pairwise presentation overlaps around the highest-degree source element', () => {
+  const diagnostics = generatedVerificationIssues({
+    elementMap: [
+      { elementId: 'slide-2/oversized-copy', line: 120, locator: { slide: 2, shape: 3 } },
+      { elementId: 'slide-2/card-a', line: 130, locator: { slide: 2, shape: 4 } },
+      { elementId: 'slide-2/card-b', line: 140, locator: { slide: 2, shape: 5 } },
+      { elementId: 'slide-2/card-c', line: 150, locator: { slide: 2, shape: 6 } },
+    ],
+    verification: {
+      issues: ['card-a', 'card-b', 'card-c'].map((card, index) => ({
+        description: `text overlap ${index + 1}`,
+        elementIds: ['slide-2/oversized-copy', `slide-2/${card}`],
+        page: 2,
+        severity: 'error',
+        shapes: [3, index + 4],
+        type: 'text_overlap',
+      })),
+    },
+  });
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].elementId, 'slide-2/oversized-copy');
+  assert.equal(diagnostics[0].line, 120);
+  assert.deepEqual(diagnostics[0].elementIds, [
+    'slide-2/oversized-copy', 'slide-2/card-a', 'slide-2/card-b', 'slide-2/card-c',
+  ]);
+  assert.match(diagnostics[0].message, /primary overlap source/);
+});
+
+test('infers editable page and sheet units from proven UNO authoring patterns', () => {
+  const writerUnits = sourceUnitsForDraft(`def create_document(job):
+    layout = job.writer('report')
+    layout.add_paragraph('cover/title', 'Cover')
+    layout.add_page_break('break/page-002')
+    layout.add_heading('page-002/title', 'Page two')
+    layout.add_page_break('break/page-003')
+    layout.add_paragraph('page-003/body', 'Page three')
+    layout.save()
+    layout.close()
+`, { documentType: 'word', generator: 'uno' });
+  assert.deepEqual(writerUnits.map((unit) => unit.path), [
+    'pages/page-001', 'pages/page-002', 'pages/page-003',
+  ]);
+  assert.match(writerUnits[1].content, /page-002\/title/);
+  assert.doesNotMatch(writerUnits[1].content, /page-003\/body/);
+
+  const calcUnits = sourceUnitsForDraft(`def create_document(job):
+    workbook = job.spreadsheet('book')
+    dashboard = workbook.add_worksheet('sheet/dashboard', 'Dashboard')
+    data = workbook.add_worksheet('sheet/data', 'Data')
+    dashboard.getCellRangeByName('A1').String = 'Dashboard'
+    dashboard.getCellRangeByName('A2').Formula = '=Data.A1'
+    data.getCellRangeByName('A1').Value = 42
+    workbook.save()
+    workbook.close()
+`, { documentType: 'spreadsheet', generator: 'uno' });
+  assert.deepEqual(calcUnits.map((unit) => unit.path), ['sheets/sheet-001', 'sheets/sheet-002']);
+  assert.match(calcUnits[0].content, /Dashboard/);
+  assert.doesNotMatch(calcUnits[0].content, /Value = 42/);
+
+  const presentationUnits = sourceUnitsForDraft(`def create_document(job):
+    deck = job.presentation('deck')
+    def add_bg(sid, page):
+        deck.add_shape(sid + '/bg', page, 0, 0, 1000, 1000)
+    def section_divider(sid, title):
+        page = deck.add_slide(sid)
+        add_bg(sid, page)
+        deck.add_text(sid + '/title', page, title, 100, 100, 800, 200)
+    section_divider('s03-section', 'Section')
+    page = deck.add_slide('s30-risk-matrix')
+    add_bg('s30', page)
+    deck.save()
+    deck.close()
+`, { documentType: 'presentation', generator: 'uno' });
+  assert.deepEqual(presentationUnits.map((unit) => unit.path), [
+    'symbols/add_bg', 'symbols/section_divider', 'pages/s03-section', 'pages/s30-risk-matrix',
+  ]);
+  assert.match(presentationUnits[1].content, /def section_divider/);
+  assert.match(presentationUnits[2].content, /section_divider\('s03-section'/);
+  assert.doesNotMatch(presentationUnits[3].content, /def section_divider/);
+});
+
 test('returns focused repair hints for common UNO runtime failures', () => {
   const hints = officeValidationRepairHints([], [
     "NameError: name 'F' is not defined",
@@ -543,6 +726,11 @@ test('returns focused repair hints for common UNO runtime failures', () => {
   assert.ok(hints.some((hint) => hint.includes('Python name F is undefined')));
   assert.ok(hints.some((hint) => hint.includes('download-diagram.png')));
   assert.ok(hints.some((hint) => hint.includes('zero-size placeholder')));
+  const helperHints = officeValidationRepairHints([], "TypeError: create_document.<locals>.add_rect() got an unexpected keyword argument 'layout_role'");
+  assert.ok(helperHints.some((hint) => hint.includes('locally defined helper')));
+  assert.equal(helperHints.some((hint) => hint.includes('Query unoApi')), false);
+  const bridgeHints = officeValidationRepairHints([{ code: 'UNO_BRIDGE_DISPOSED', message: 'Binary URP bridge disposed', severity: 'error' }]);
+  assert.ok(bridgeHints.some((hint) => hint.includes('retried once')));
 });
 
 test('infers unoApi document type and always returns the complete API catalog', async (context) => {
@@ -578,28 +766,31 @@ test('infers unoApi document type and always returns the complete API catalog', 
   }
 });
 
-test('records source revisions and restores an older revision as a new save', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-revisions-'));
+test('keeps one current source per documentId without revision history', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-single-source-'));
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
   try {
-    await planFileArtifact({ documentId: 'revision-workflow', documentType: 'word', fileName: 'revision.docx', runId: 'chat_test' });
-    const generated = await generateUnoFileArtifact({ documentId: 'revision-workflow', program: wordProgram, render: false, runId: 'chat_test' });
+    await planFileArtifact({ documentId: 'single-source-workflow', documentType: 'word', fileName: 'single.docx', runId: 'chat_test' });
+    const generated = await generateUnoFileArtifact({ documentId: 'single-source-workflow', program: wordProgram, render: false, runId: 'chat_test' });
     assert.equal(generated.ok, true, generated.actual);
     const edited = await editUnoFileArtifact({
-      documentId: 'revision-workflow',
-      edits: [{ kind: 'replaceText', oldText: 'Generated through the UNO worker', newText: 'Revision two' }],
+      documentId: 'single-source-workflow',
+      edits: [{ kind: 'replaceText', oldText: 'Generated through the UNO worker', newText: 'Current source edit' }],
       render: false,
       runId: 'chat_test',
     });
     assert.equal(edited.ok, true, edited.actual);
-    const restored = await editUnoFileArtifact({ documentId: 'revision-workflow', restoreRevision: 1, render: false, runId: 'chat_test' });
-    assert.equal(restored.ok, true, restored.actual);
-    const current = await readUnoDraft({ documentId: 'revision-workflow', runId: 'chat_test' });
-    const payload = JSON.parse(current.actual || '{}') as { currentRevision?: number; revisions?: unknown[]; program?: string };
-    assert.equal(payload.currentRevision, 3);
-    assert.equal(payload.revisions?.length, 3);
-    assert.match(payload.program || '', /Generated through the UNO worker/);
+    const current = await readUnoDraft({ documentId: 'single-source-workflow', runId: 'chat_test' });
+    const payload = JSON.parse(current.actual || '{}') as Record<string, unknown> & { program?: string };
+    assert.match(payload.program || '', /Current source edit/);
+    assert.equal('currentRevision' in payload, false);
+    assert.equal('validatedRevision' in payload, false);
+    assert.equal('revisions' in payload, false);
+    const metadata = JSON.parse(await readFile(path.join(root, 'chat_test', 'document-drafts', 'single-source-workflow.json'), 'utf8')) as Record<string, unknown>;
+    assert.equal('currentRevision' in metadata, false);
+    assert.equal('validatedRevision' in metadata, false);
+    assert.equal('revisions' in metadata, false);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -607,7 +798,7 @@ test('records source revisions and restores an older revision as a new save', as
   }
 });
 
-test('keeps a failed edit in the single working source and blocks rendering until it is repaired', async () => {
+test('saves cumulative syntax repairs so multiple errors can be fixed across edits', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-edit-repair-'));
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
@@ -616,62 +807,71 @@ test('keeps a failed edit in the single working source and blocks rendering unti
     const generated = await generateUnoFileArtifact({ documentId: 'transactional-edit', program: wordProgram, render: false, runId: 'chat_test' });
     assert.equal(generated.ok, true, generated.actual);
     const before = JSON.parse((await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' })).actual || '{}') as {
-      currentRevision?: number;
       program?: string;
       sourceDigest?: string;
     };
 
     const failed = await editUnoFileArtifact({
       documentId: 'transactional-edit',
-      edits: [{ kind: 'replaceText', oldText: "    cursor = document.Text.createTextCursor()", newText: '    if (' }],
+      edits: [{
+        kind: 'replaceText',
+        oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+        newText: '    if (\n    while (',
+      }],
       includeVisualVerification: false,
       runId: 'chat_test',
     });
     assert.equal(failed.ok, false, failed.actual);
     const failure = JSON.parse(failed.actual || '{}') as {
+      kind?: string;
+      changed?: boolean;
       saved?: boolean;
-      currentRevision?: number;
-      lastSuccessfulRevision?: number;
       requiredNextAction?: string;
     };
+    assert.equal(failure.kind, 'uno-draft-validation');
+    assert.equal(failure.changed, true);
     assert.equal(failure.saved, true);
-    assert.equal(failure.currentRevision, before.currentRevision);
-    assert.equal(failure.lastSuccessfulRevision, before.currentRevision);
     assert.equal(failure.requiredNextAction, 'edit');
 
     const after = JSON.parse((await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' })).actual || '{}') as {
-      currentRevision?: number;
       program?: string;
       sourceDigest?: string;
-      revisions?: unknown[];
       validationStatus?: string;
     };
-    assert.equal(after.currentRevision, before.currentRevision);
     assert.notEqual(after.sourceDigest, before.sourceDigest);
+    assert.notEqual(after.program, before.program);
     assert.match(after.program || '', /if \(/);
+    assert.match(after.program || '', /while \(/);
     assert.equal(after.validationStatus, 'failed');
-    assert.equal(after.revisions?.length, 1);
-    const pendingRepair = await pendingOfficeDocumentWork('chat_test', new Set(['transactional-edit']));
-    assert.equal(pendingRepair[0]?.requiredNextAction, 'edit');
 
-    const blockedRender = await renderFileArtifact({ documentId: 'transactional-edit', runId: 'chat_test' });
-    assert.equal(blockedRender.ok, false, blockedRender.actual);
-    assert.equal(JSON.parse(blockedRender.actual || '{}').requiredNextAction, 'edit');
+    const firstRepair = await editUnoFileArtifact({
+      documentId: 'transactional-edit',
+      edits: [{
+        kind: 'replaceText',
+        oldText: '    if (',
+        newText: "    document.add_paragraph('body', 'First syntax error repaired')",
+      }],
+      includeVisualVerification: false,
+      runId: 'chat_test',
+    });
+    assert.equal(firstRepair.ok, false, firstRepair.actual);
+    const afterFirstRepair = await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' });
+    assert.match(afterFirstRepair.actual || '', /First syntax error repaired/);
+    assert.match(afterFirstRepair.actual || '', /while \(/);
 
     const repaired = await editUnoFileArtifact({
       documentId: 'transactional-edit',
-      edits: [{ kind: 'replaceText', oldText: '    if (', newText: '    cursor = document.Text.createTextCursor()' }],
+      edits: [{ kind: 'replaceText', oldText: '    while (', newText: '    # Second syntax error repaired' }],
       includeVisualVerification: false,
       runId: 'chat_test',
     });
     assert.equal(repaired.ok, true, repaired.actual);
     const repairedDraft = JSON.parse((await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' })).actual || '{}') as {
-      currentRevision?: number;
       program?: string;
       validationStatus?: string;
     };
-    assert.equal(repairedDraft.currentRevision, 1);
-    assert.equal(repairedDraft.program, before.program);
+    assert.match(repairedDraft.program || '', /First syntax error repaired/);
+    assert.match(repairedDraft.program || '', /Second syntax error repaired/);
     assert.equal(repairedDraft.validationStatus, 'passed');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
@@ -729,6 +929,62 @@ test('reads and edits one marked page unit without changing other source units',
   }
 });
 
+test('indexes large presentation slide blocks and requires bounded source reads', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-inferred-units-'));
+  const previous = process.env.ARTIFACTS_DIR;
+  const previousMode = process.env.OFFICE_GENERATION_MODE;
+  process.env.ARTIFACTS_DIR = root;
+  process.env.OFFICE_GENERATION_MODE = 'uno';
+  const filler = Array.from({ length: 305 }, (_, index) => `    # shared helper note ${index + 1}`).join('\n');
+  const program = `def create_document(job):
+    deck = job.presentation('deck')
+${filler}
+    page1 = deck.add_slide('slide-01')
+    deck.add_text('slide-01/title', page1, 'One', 1000, 1000, 8000, 1400, font_size=24)
+    page2 = deck.add_slide('slide-02')
+    deck.add_text('slide-02/title', page2, 'Two', 1000, 1000, 8000, 1400, font_size=24)
+    deck.save()
+    deck.close()
+`;
+  try {
+    await planFileArtifact({ documentId: 'inferred-units', documentType: 'presentation', fileName: 'inferred.pptx', runId: 'chat_test' });
+    const generated = await generateUnoFileArtifact({ documentId: 'inferred-units', program, render: false, runId: 'chat_test' });
+    assert.equal(generated.ok, true, generated.actual);
+    const overview = JSON.parse((await readUnoDraft({ documentId: 'inferred-units', runId: 'chat_test' })).actual || '{}') as {
+      program?: string;
+      programOmitted?: boolean;
+      sourceUnits?: Array<{ inferred?: boolean; path?: string }>;
+    };
+    assert.equal(overview.programOmitted, true);
+    assert.equal(overview.program, undefined);
+    assert.deepEqual(overview.sourceUnits?.map((unit) => unit.path), ['pages/slide-001', 'pages/slide-002']);
+    assert.ok(overview.sourceUnits?.every((unit) => unit.inferred));
+
+    const helperWindow = JSON.parse((await readUnoDraft({
+      documentId: 'inferred-units', startLine: 150, endLine: 158, runId: 'chat_test',
+    })).actual || '{}') as { program?: string; sourceLineRange?: { startLine?: number; endLine?: number } };
+    assert.deepEqual(helperWindow.sourceLineRange, { startLine: 150, endLine: 158, totalLines: 313 });
+    assert.match(helperWindow.program || '', /^\s*150 \|/);
+
+    const secondSlide = JSON.parse((await readUnoDraft({
+      documentId: 'inferred-units', path: 'pages/slide-002', runId: 'chat_test',
+    })).actual || '{}') as { program?: string; sourceUnitPath?: string };
+    assert.equal(secondSlide.sourceUnitPath, 'pages/slide-002');
+    assert.match(secondSlide.program || '', /slide-02\/title/);
+    assert.doesNotMatch(secondSlide.program || '', /slide-01\/title/);
+  } finally {
+    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previous;
+    if (previousMode === undefined) delete process.env.OFFICE_GENERATION_MODE;
+    else process.env.OFFICE_GENERATION_MODE = previousMode;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
 test('recovers an interrupted validation checkpoint after a backend restart', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-office-recovery-'));
   const previous = process.env.ARTIFACTS_DIR;
@@ -770,35 +1026,22 @@ test('applies current line edits after the initial draft without a version hands
       render: false,
       runId: 'chat_test',
     });
-    assert.equal(retried.ok, false, retried.actual);
-    assert.match(retried.actual || '', /Do not send another complete program/);
+    assert.equal(retried.ok, true, retried.actual);
 
     const current = await readUnoDraft({ documentId: 'editor-workflow', runId: 'chat_test' });
     assert.equal(current.ok, true, current.actual);
-    const currentPayload = JSON.parse(current.actual || '{}') as { sourceDigest: string };
-    const stale = await editUnoFileArtifact({
-      documentId: 'editor-workflow',
-      baseDigest: '0'.repeat(64),
-      edits: [{ startLine: 4, endLine: 4, newText: "    document.Text.insertString(cursor, 'stale edit', False)" }],
-      render: false,
-      runId: 'chat_test',
-    });
-    assert.equal(stale.ok, true, stale.actual);
-    assert.equal(JSON.parse(stale.actual || '{}').documentChanged, true);
+    assert.match(current.actual || '', /generate retry/);
 
     const edited = await editUnoFileArtifact({
       documentId: 'editor-workflow',
-      baseDigest: currentPayload.sourceDigest,
-      edits: [{ startLine: 4, endLine: 4, newText: "    document.Text.insertString(cursor, 'targeted edit', False)" }],
+      edits: [{ startLine: 3, endLine: 3, newText: "    document.add_paragraph('body', 'targeted edit')" }],
       render: false,
       runId: 'chat_test',
     });
     assert.equal(edited.ok, true, edited.actual);
-    const editedPayload = JSON.parse(edited.actual || '{}') as { sourceDigest: string };
     const unchanged = await editUnoFileArtifact({
       documentId: 'editor-workflow',
-      baseDigest: editedPayload.sourceDigest,
-      edits: [{ startLine: 4, endLine: 4, newText: "    document.Text.insertString(cursor, 'targeted edit', False)" }],
+      edits: [{ startLine: 3, endLine: 3, newText: "    document.add_paragraph('body', 'targeted edit')" }],
       render: false,
       runId: 'chat_test',
     });
@@ -996,9 +1239,10 @@ test('does not complete visual QA when any fully read page has a failed review',
         actual: JSON.stringify({
           kind: 'file-visual-report',
           reviews: [
-            { pageNumber: 1, status: 'passed', issues: [] },
-            { pageNumber: 2, status: 'failed', issues: [{ type: 'overlap', description: 'Text overlaps the footer.' }] },
+            { pageNumber: 1, status: 'passed', observation: 'The title, body copy, and footer are visibly separated with balanced whitespace.', checks: passedPageVisualChecks, issues: [] },
+            { pageNumber: 2, status: 'failed', observation: 'The body text visibly collides with the footer and interrupts the bottom spacing rhythm.', checks: { ...passedPageVisualChecks, overlap: 'failed' }, issues: [{ type: 'overlap', description: 'Text overlaps the footer.' }] },
           ],
+          deckReview: { status: 'failed', observation: 'Comparing both rendered pages shows that the footer clearance is inconsistent and the second page breaks the shared vertical spacing system.', checks: { ...passedDeckVisualChecks, spacingRhythm: 'failed' }, issues: [{ type: 'spacing-consistency', description: 'Footer spacing differs across pages.' }] },
         }),
       },
     });

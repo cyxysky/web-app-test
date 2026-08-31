@@ -5,6 +5,8 @@ import { PDFParse } from 'pdf-parse';
 import sharp from 'sharp';
 
 export type OfficeArtifactIssue = {
+  callColumn?: number;
+  callLine?: number;
   code: string;
   column?: number;
   elementId?: string;
@@ -17,6 +19,8 @@ export type OfficeArtifactIssue = {
 
 export type OfficeElementMapEntry = {
   artifactName?: string;
+  callColumn?: number;
+  callLine?: number;
   column?: number;
   elementId: string;
   kind: string;
@@ -83,7 +87,15 @@ function xmlAttribute(source: string, name: string) {
 
 function mappedIssue(issue: OfficeArtifactIssue, elementMap: OfficeElementMapEntry[], artifactName?: string) {
   const mapped = artifactName ? elementMap.find((entry) => entry.artifactName === artifactName) : undefined;
-  return mapped ? { ...issue, elementId: mapped.elementId, line: mapped.line, column: mapped.column, locator: mapped.locator } : issue;
+  return mapped ? {
+    ...issue,
+    elementId: mapped.elementId,
+    line: mapped.line,
+    column: mapped.column,
+    callLine: mapped.callLine,
+    callColumn: mapped.callColumn,
+    locator: mapped.locator,
+  } : issue;
 }
 
 async function validateRelationships(zip: JSZip, issues: OfficeArtifactIssue[]) {
@@ -154,7 +166,14 @@ async function validatePresentationPackage(zip: JSZip, issues: OfficeArtifactIss
       if (requireElementIds && (!objectName || !objectName.startsWith('wp_'))) {
         issues.push({ code: 'PPTX_ELEMENT_ID_MISSING', message: `${slide.name} contains a generated object without a stable elementId marker.`, severity: 'error', target: slide.name });
       }
-      if (width <= 0 || height <= 0 || x < 0 || y < 0 || (slideWidth && x + width > slideWidth) || (slideHeight && y + height > slideHeight)) {
+      // DrawingML serializes a legal horizontal/vertical line with one zero
+      // extent. Requiring both extents to be positive rejects chart axes,
+      // ticks, rules, and connectors even though PowerPoint/LibreOffice render
+      // them correctly. Keep the strict positive-size rule for every other
+      // object and still reject a point-sized line or an out-of-slide line.
+      const isLine = /<a:prstGeom\b[^>]*\bprst="line"/i.test(block);
+      const invalidSize = isLine ? width < 0 || height < 0 || (width === 0 && height === 0) : width <= 0 || height <= 0;
+      if (invalidSize || x < 0 || y < 0 || (slideWidth && x + width > slideWidth) || (slideHeight && y + height > slideHeight)) {
         issues.push(mappedIssue({
           code: 'PPTX_OBJECT_OUT_OF_BOUNDS',
           message: `${slide.name} contains invalid object bounds x=${x}, y=${y}, width=${width}, height=${height}.`,
@@ -216,14 +235,25 @@ async function validateSpreadsheetPackage(zip: JSZip, issues: OfficeArtifactIssu
   }
 }
 
-async function officePackageFormatChecks(zip: JSZip, extension: string) {
+async function officePackageFormatChecks(zip: JSZip, extension: string, featureCounts: Record<string, number> = {}) {
   const fileNames = Object.values(zip.files).filter((entry) => !entry.dir).map((entry) => entry.name);
   if (extension === '.pptx') {
     const slides = Object.values(zip.files).filter((entry) => !entry.dir && /^ppt\/slides\/slide\d+\.xml$/i.test(entry.name));
     const slideXml = await Promise.all(slides.map((entry) => entry.async('string')));
+    const nativeChartCount = fileNames.filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name)).length;
+    const vectorChartCount = Number(featureCounts.vectorChart || 0);
     return {
       presentation: {
-        chartCount: fileNames.filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name)).length,
+        chartCount: nativeChartCount,
+        nativeChartCount,
+        vectorChartCount,
+        totalChartCount: nativeChartCount + vectorChartCount,
+        vectorBarChartCount: Number(featureCounts.vectorBarChart || 0),
+        vectorLineChartCount: Number(featureCounts.vectorLineChart || 0),
+        vectorDonutChartCount: Number(featureCounts.vectorDonutChart || 0),
+        authoredExternalHyperlinkCount: Number(featureCounts.externalHyperlink || 0),
+        authoredInternalSlideHyperlinkCount: Number(featureCounts.internalSlideHyperlink || 0),
+        serializedHyperlinkCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:hlinkClick\b/gi) || []).length, 0),
         imageCount: fileNames.filter((name) => name.startsWith('ppt/media/')).length,
         slideCount: slides.length,
         tableCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:tbl\b/gi) || []).length, 0),
@@ -289,6 +319,7 @@ export async function validateOfficeArtifact(input: {
   extension: string;
   requireElementIds?: boolean;
   validationProfile?: 'basic' | 'uno-strict';
+  featureCounts?: Record<string, number>;
 }) {
   const issues: OfficeArtifactIssue[] = [];
   const extension = input.extension.toLowerCase();
@@ -402,7 +433,7 @@ export async function validateOfficeArtifact(input: {
     missingFonts,
     media,
     platform: process.platform,
-    formatChecks: await officePackageFormatChecks(zip, extension),
+    formatChecks: await officePackageFormatChecks(zip, extension, input.featureCounts),
   };
 }
 

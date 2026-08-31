@@ -2,6 +2,42 @@ export type OfficeCellValue = string | number | boolean | null;
 
 export type OfficeDocumentKind = 'presentation' | 'spreadsheet' | 'word';
 
+export type OfficeVisualQaCheckStatus = 'failed' | 'not-applicable' | 'passed';
+
+export type OfficeVisualQaPageChecks = {
+  overlap: OfficeVisualQaCheckStatus;
+  clipping: OfficeVisualQaCheckStatus;
+  alignment: OfficeVisualQaCheckStatus;
+  spacing: OfficeVisualQaCheckStatus;
+  typography: OfficeVisualQaCheckStatus;
+  contrast: OfficeVisualQaCheckStatus;
+  visualHierarchy: OfficeVisualQaCheckStatus;
+  chartTableLegibility: OfficeVisualQaCheckStatus;
+  imageQuality: OfficeVisualQaCheckStatus;
+};
+
+export type OfficeVisualQaDeckChecks = {
+  templateConsistency: 'failed' | 'passed';
+  typographyConsistency: 'failed' | 'passed';
+  colorConsistency: 'failed' | 'passed';
+  spacingRhythm: 'failed' | 'passed';
+  componentConsistency: 'failed' | 'passed';
+};
+
+export type OfficeVisualQaIssue = {
+  type: string;
+  description: string;
+  region?: string;
+  severity?: 'error' | 'warning';
+};
+
+export type OfficeVisualQaDeckReview = {
+  status: 'failed' | 'passed';
+  observation: string;
+  checks: OfficeVisualQaDeckChecks;
+  issues: OfficeVisualQaIssue[];
+};
+
 export type OfficeBlockType =
   | 'page'
   | 'sheet'
@@ -130,12 +166,11 @@ export type OfficeDocumentDraft = {
   program?: string;
   /** SHA-256 of the workspace draft.py content, used to detect split-brain metadata. */
   sourceDigest?: string;
-  /** Monotonic editor revision. Restoring an older source creates a new revision. */
-  currentRevision?: number;
-  /** Most recent revision that passed static analysis, execution, reopen, and structural validation. */
-  validatedRevision?: number;
+  /** Digest of the current source after static analysis, execution, reopen, and structural validation pass. */
   validatedSourceDigest?: string;
   validationStatus?: 'failed' | 'pending' | 'passed';
+  /** Consecutive failed validations for the current repair sequence. */
+  validationFailureCount?: number;
   validationDiagnostics?: Array<{
     code?: string;
     column?: number;
@@ -161,9 +196,9 @@ export type OfficeDocumentDraft = {
     locator?: Record<string, unknown>;
     unitPath?: string;
   }>;
-  /** Deterministic LibreOffice renderer validation for the validated revision. */
+  /** Deterministic LibreOffice renderer validation for the validated source. */
   rendererValidation?: Record<string, unknown>;
-  /** Optional logical page/section units embedded in the source through @webpilot-unit markers. */
+  /** Logical page/section units from explicit markers or inferred presentation slide blocks. */
   sourceUnits?: Array<{
     path: string;
     sourceDigest: string;
@@ -177,12 +212,6 @@ export type OfficeDocumentDraft = {
     recoveredFrom?: 'rendering' | 'validating';
     renderedDigest?: string;
   };
-  revisions?: Array<{
-    revision: number;
-    sourceDigest: string;
-    createdAt: string;
-    sourceFileName: string;
-  }>;
   /** Artifact identity of the last published source. A later edit makes this stale. */
   renderedArtifactId?: string;
   /** Current published source digest. Kept alongside renderedSourceDigest for legacy metadata compatibility. */
@@ -197,24 +226,20 @@ export type OfficeDocumentDraft = {
   visualQaReviews?: Array<{
     pageNumber: number;
     status: 'failed' | 'passed';
-    issues: Array<{
-      type: string;
-      description: string;
-      region?: string;
-      severity?: 'error' | 'warning';
-    }>;
+    observation: string;
+    checks: OfficeVisualQaPageChecks;
+    issues: OfficeVisualQaIssue[];
   }>;
-  /** Exact rendered screenshot hashes used to safely reuse passed reviews across artifact revisions. */
+  /** Required cross-page consistency judgment for the exact rendered artifact. */
+  visualQaDeckReview?: OfficeVisualQaDeckReview;
+  /** Exact rendered screenshot hashes used to safely reuse passed reviews across published outputs. */
   visualQaPageDigests?: Array<{ pageNumber: number; screenshotDigest: string }>;
   visualQaReviewCache?: Array<{
     screenshotDigest: string;
     status: 'failed' | 'passed';
-    issues: Array<{
-      type: string;
-      description: string;
-      region?: string;
-      severity?: 'error' | 'warning';
-    }>;
+    observation: string;
+    checks: OfficeVisualQaPageChecks;
+    issues: OfficeVisualQaIssue[];
   }>;
   updatedAt: string;
 };

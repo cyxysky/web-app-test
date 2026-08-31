@@ -6,6 +6,11 @@ import { fileFormatForName, normalizedFileExtension } from '@/server/files/file-
 import { normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import { inspectDocxTemplateBuffer } from './docx-template-filler';
+import type {
+  OfficeVisualQaDeckChecks,
+  OfficeVisualQaIssue,
+  OfficeVisualQaPageChecks,
+} from '@/server/files/office-document-spec';
 
 export type BrowserChatReadableAttachment = {
   id: string;
@@ -31,16 +36,51 @@ export type BrowserChatFileVisualInput = {
   reviews?: Array<{
     screenshotId: string;
     status: 'failed' | 'passed';
-    issues?: Array<{
-      type: string;
-      description: string;
-      region?: string;
-      severity?: 'error' | 'warning';
-    }>;
+    observation: string;
+    checks: OfficeVisualQaPageChecks;
+    issues?: OfficeVisualQaIssue[];
   }>;
+  deckReview?: {
+    status: 'failed' | 'passed';
+    observation: string;
+    checks: OfficeVisualQaDeckChecks;
+    issues?: OfficeVisualQaIssue[];
+  };
   offset?: number;
   limit?: number;
 };
+
+const visualQaPageCheckNames = [
+  'overlap', 'clipping', 'alignment', 'spacing', 'typography', 'contrast',
+  'visualHierarchy', 'chartTableLegibility', 'imageQuality',
+] as const;
+const visualQaDeckCheckNames = [
+  'templateConsistency', 'typographyConsistency', 'colorConsistency',
+  'spacingRhythm', 'componentConsistency',
+] as const;
+
+function assertVisualQaPageChecks(checks: OfficeVisualQaPageChecks | undefined, label: string) {
+  if (!checks || typeof checks !== 'object') throw new Error(`${label} requires all visual-quality checks`);
+  const failed: string[] = [];
+  for (const name of visualQaPageCheckNames) {
+    const status = checks[name];
+    if (status !== 'passed' && status !== 'failed' && status !== 'not-applicable') throw new Error(`${label} requires check ${name}`);
+    if (status === 'not-applicable' && name !== 'chartTableLegibility' && name !== 'imageQuality') throw new Error(`${label} cannot mark ${name} not-applicable`);
+    if (status === 'failed') failed.push(name);
+  }
+  return failed;
+}
+
+function assertVisualQaDeckChecks(checks: OfficeVisualQaDeckChecks | undefined) {
+  if (!checks || typeof checks !== 'object') throw new Error('deckReview requires all cross-page consistency checks');
+  const failed: string[] = [];
+  for (const name of visualQaDeckCheckNames) {
+    const status = checks[name];
+    if (status !== 'passed' && status !== 'failed') throw new Error(`deckReview requires check ${name}`);
+    if (status === 'failed') failed.push(name);
+  }
+  return failed;
+}
 
 type AttachmentKind = 'archive' | 'image' | 'pdf' | 'presentation' | 'spreadsheet' | 'tab' | 'text' | 'unknown' | 'word';
 
@@ -237,10 +277,32 @@ export async function readBrowserChatFileVisuals(input: {
           ...(issue.region ? { region: String(issue.region).trim() } : {}),
           ...(issue.severity ? { severity: issue.severity } : {}),
         })).filter((issue) => issue.type && issue.description);
+        const observation = String(review.observation || '').trim();
+        if (observation.length < 20) throw new Error(`review ${review.screenshotId} requires a concrete visual observation of at least 20 characters`);
+        const failedChecks = assertVisualQaPageChecks(review.checks, `review ${review.screenshotId}`);
         if (review.status === 'passed' && issues.length) throw new Error(`passed review ${review.screenshotId} cannot contain issues`);
         if (review.status === 'failed' && !issues.length) throw new Error(`failed review ${review.screenshotId} requires at least one issue`);
-        return { screenshotId: review.screenshotId, pageNumber, status: review.status, issues };
+        if (review.status === 'passed' && failedChecks.length) throw new Error(`passed review ${review.screenshotId} cannot contain failed checks`);
+        if (review.status === 'failed' && !failedChecks.length) throw new Error(`failed review ${review.screenshotId} requires at least one failed check`);
+        return { screenshotId: review.screenshotId, pageNumber, status: review.status, observation, checks: review.checks, issues };
       });
+      const deckReview = request.deckReview ? {
+        status: request.deckReview.status,
+        observation: String(request.deckReview.observation || '').trim(),
+        checks: request.deckReview.checks,
+        issues: (request.deckReview.issues || []).map((issue) => ({
+          type: String(issue.type || '').trim(),
+          description: String(issue.description || '').trim(),
+          ...(issue.region ? { region: String(issue.region).trim() } : {}),
+          ...(issue.severity ? { severity: issue.severity } : {}),
+        })).filter((issue) => issue.type && issue.description),
+      } : undefined;
+      if (deckReview && deckReview.observation.length < 30) throw new Error('deckReview requires a concrete cross-page observation of at least 30 characters');
+      const failedDeckChecks = deckReview ? assertVisualQaDeckChecks(deckReview.checks) : [];
+      if (deckReview?.status === 'passed' && deckReview.issues.length) throw new Error('passed deckReview cannot contain issues');
+      if (deckReview?.status === 'failed' && !deckReview.issues.length) throw new Error('failed deckReview requires at least one issue');
+      if (deckReview?.status === 'passed' && failedDeckChecks.length) throw new Error('passed deckReview cannot contain failed checks');
+      if (deckReview?.status === 'failed' && !failedDeckChecks.length) throw new Error('failed deckReview requires at least one failed check');
       return {
         ok: true,
         actual: JSON.stringify({
@@ -248,9 +310,10 @@ export async function readBrowserChatFileVisuals(input: {
           artifactId: request.artifactId,
           fileName: attachment.name,
           reviews,
-          instruction: reviews.some((review) => review.status === 'failed')
+          ...(deckReview ? { deckReview } : {}),
+          instruction: reviews.some((review) => review.status === 'failed') || deckReview?.status === 'failed'
             ? 'Fix every reported issue, render a replacement artifact, and restart visual QA from index.'
-            : 'Continue reading and reporting unreviewed pages until every indexed page has an explicit passed review.',
+            : 'Continue reading and reporting unreviewed pages until every indexed page has an evidence-backed passed review, then submit a passed deckReview comparing cross-page consistency.',
         }),
       };
     }
@@ -303,6 +366,7 @@ export async function readBrowserChatFileVisuals(input: {
           renderer: visuals.renderer,
           warning: visuals.warning,
           automaticChecks: visuals.automaticChecks || [],
+          automaticCheckScope: 'render-integrity-only: dimensions and near-blank detection; this is not a visual-quality verdict',
           instruction: 'Call fileVisual action=read with one to six exact screenshotIds. Continue in ordered batches until every required page has been inspected.',
         }),
       };
@@ -336,7 +400,8 @@ export async function readBrowserChatFileVisuals(input: {
         renderer: visuals.renderer,
         warning: visuals.warning,
         automaticChecks: visuals.automaticChecks || [],
-        instruction: 'The requested screenshots are attached to the next model request. Inspect their visible layout before deciding whether the artifact passes or needs a targeted edit.',
+        automaticCheckScope: 'render-integrity-only: dimensions and near-blank detection; this is not a visual-quality verdict',
+        instruction: 'The requested screenshots are attached to the next model request. Inspect overlap, clipping, alignment, spacing, typography, contrast, hierarchy, chart/table legibility, and image quality. Report concrete page-specific observations; a bare passed result is invalid.',
       }),
       referenceImagePaths: orderedImagePaths,
     };

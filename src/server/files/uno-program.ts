@@ -12,6 +12,7 @@ const WORKER_HARD_TIMEOUT_MS = Math.max(WORKER_IDLE_TIMEOUT_MS, Number(process.e
 const PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__';
 const PROGRAM_ENTRYPOINT = /^\s*def\s+create_document\s*\(\s*job\s*\)\s*:/m;
 const OUTPUT_EXTENSIONS = new Set(['.doc', '.docx', '.odt', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp', '.pdf']);
+const UNO_BRIDGE_DISPOSED_PATTERN = /(?:com\.sun\.star\.lang\.DisposedException|Binary URP bridge disposed|bridge disposed during call)/i;
 
 export type UnoGeneratedDocument = {
   buffer: Buffer;
@@ -30,6 +31,10 @@ export function assertControlledUnoProgram(sourceCode: string) {
   if (!PROGRAM_ENTRYPOINT.test(sourceCode)) {
     throw new Error('UNO source must define def create_document(job): with exactly one job parameter.');
   }
+}
+
+export function isTransientUnoBridgeError(error: unknown) {
+  return UNO_BRIDGE_DISPOSED_PATTERN.test(error instanceof Error ? error.message : String(error));
 }
 
 export async function resolveUnoProgramWorker() {
@@ -257,26 +262,44 @@ export async function generateUnoProgramDocument(input: {
     const outputPath = input.outputPath || path.join(directory, `output${extension}`);
     const previewPath = input.previewPath || path.join(directory, 'preview.pdf');
     const programPath = input.sourcePath || path.join(directory, 'draft.py');
-    const profilePath = path.join(directory, 'profile');
     if (!input.sourcePath) await writeFile(programPath, sourceCode, 'utf8');
-    const report = await runWorker({
-      executable: python,
-      args: [
-        worker,
-        '--program', programPath,
-        '--output', outputPath,
-        '--preview', previewPath,
-        '--assets', input.assetsPath || directory,
-        '--document-type', input.documentType,
-        '--profile', profilePath,
-        '--soffice', soffice,
-        '--expected-source-digest', expectedSourceDigest,
-        ...(input.requiredSourceAssetName ? ['--required-source-asset', input.requiredSourceAssetName] : []),
-      ],
-      libreOfficeProgramDirectory: path.dirname(soffice),
-      abortSignal: input.abortSignal,
-      onProgress: input.onProgress,
-    });
+    let report: Record<string, unknown> | undefined;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        report = await runWorker({
+          executable: python,
+          args: [
+            worker,
+            '--program', programPath,
+            '--output', outputPath,
+            '--preview', previewPath,
+            '--assets', input.assetsPath || directory,
+            '--document-type', input.documentType,
+            '--profile', path.join(directory, `profile-${attempt}`),
+            '--soffice', soffice,
+            '--expected-source-digest', expectedSourceDigest,
+            ...(input.requiredSourceAssetName ? ['--required-source-asset', input.requiredSourceAssetName] : []),
+          ],
+          libreOfficeProgramDirectory: path.dirname(soffice),
+          abortSignal: input.abortSignal,
+          onProgress: input.onProgress,
+        });
+        break;
+      } catch (error) {
+        if (attempt >= 2 || input.abortSignal?.aborted || !isTransientUnoBridgeError(error)) throw error;
+        await Promise.all([
+          rm(outputPath, { force: true }).catch(() => undefined),
+          rm(previewPath, { force: true }).catch(() => undefined),
+        ]);
+        await input.onProgress?.({
+          phase: 'bridge-retry',
+          message: 'LibreOffice UNO bridge disconnected; restarting an isolated office process and retrying once.',
+          current: attempt,
+          total: 2,
+        });
+      }
+    }
+    if (!report) throw new Error('LibreOffice UNO program worker completed without a report.');
     return {
       buffer: input.outputPath ? Buffer.alloc(0) : await readFile(outputPath),
       outputPath,

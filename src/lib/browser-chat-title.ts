@@ -80,8 +80,8 @@ export function browserChatSessionTitleParts(
   const explicitFile = explicitTitleFile(rawTitle);
   if (explicitFile) return explicitFile;
 
-  const fileName = referencedFileName(rawTitle, attachments);
   const normalizedText = normalizedTitleText(rawTitle);
+  const fileName = normalizedText ? '' : referencedFileName(rawTitle, attachments);
   const text = fileName && normalizedText.startsWith(fileName)
     ? normalizedTitleText(normalizedText.slice(fileName.length))
     : normalizedText;
@@ -97,7 +97,7 @@ export function browserChatSessionDisplayTitle(
   attachments: BrowserChatTitleAttachment[] = [],
 ) {
   const parts = browserChatSessionTitleParts(title, attachments);
-  return compactTitle([parts.fileName, parts.text].filter(Boolean).join(' · ') || '新对话', maxLength);
+  return compactTitle(parts.text || parts.fileName || '新对话', maxLength);
 }
 
 export function browserChatFirstMessageTitle(
@@ -105,7 +105,7 @@ export function browserChatFirstMessageTitle(
   attachments: BrowserChatTitleAttachment[],
   maxLength = 300,
 ) {
-  const fileName = referencedFileName(content, attachments);
   const text = normalizedTitleText(content);
-  return compactTitle([fileName, text].filter(Boolean).join(' · ') || '新建对话', maxLength);
+  const fileName = text ? '' : referencedFileName(content, attachments);
+  return compactTitle(text || fileName || '新建对话', maxLength);
 }

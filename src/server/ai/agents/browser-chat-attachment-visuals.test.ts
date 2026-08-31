@@ -9,6 +9,12 @@ import { generateFileBuffer } from './document-artifact-generators';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import { readBrowserChatFileVisuals } from './browser-chat-attachment-reader';
 
+const passedPageVisualChecks = {
+  overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed',
+  typography: 'passed', contrast: 'passed', visualHierarchy: 'passed',
+  chartTableLegibility: 'not-applicable', imageQuality: 'not-applicable',
+} as const;
+
 async function officeGenerationAvailable() {
   const executable = await resolveLibreOfficeExecutable();
   return Boolean(executable && await resolveLibreOfficePythonExecutable(executable) && await resolveUnoProgramWorker());
@@ -135,12 +141,46 @@ test('fileVisual records explicit structured page reviews separately from screen
       request: {
         action: 'report',
         artifactId: 'generated/report.pptx',
-        reviews: [{ screenshotId: 'screenshot-0001', status: 'passed', issues: [] }],
+        reviews: [{
+          screenshotId: 'screenshot-0001',
+          status: 'passed',
+          observation: 'The page title, content region, and footer are visibly separated with consistent margins and readable type.',
+          checks: passedPageVisualChecks,
+          issues: [],
+        }],
       },
     });
     assert.equal(result.ok, true, result.actual);
     assert.match(result.actual, /file-visual-report/);
     assert.match(result.actual, /"status":"passed"/);
+  } finally {
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('fileVisual rejects a bare pass without visual evidence and rubric checks', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-file-visual-bare-pass-'));
+  const artifactPath = path.join(root, 'report.pptx');
+  await writeFile(artifactPath, Buffer.from('saved-office-artifact'));
+  try {
+    const result = await readBrowserChatFileVisuals({
+      absolutePath: artifactPath,
+      attachment: {
+        id: 'generated/report.pptx',
+        kind: 'file',
+        name: 'report.pptx',
+        path: 'generated/report.pptx',
+        type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        url: '',
+      },
+      request: {
+        action: 'report',
+        artifactId: 'generated/report.pptx',
+        reviews: [{ screenshotId: 'screenshot-0001', status: 'passed', issues: [] }],
+      } as never,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.actual, /concrete visual observation|visual-quality checks/i);
   } finally {
     await rm(root, { force: true, recursive: true });
   }

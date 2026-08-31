@@ -7,12 +7,14 @@ import contextlib
 import hashlib
 import inspect
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 import zipfile
 from dataclasses import dataclass, field
@@ -49,6 +51,48 @@ def size(width, height):
     value = uno.createUnoStruct('com.sun.star.awt.Size')
     value.Width, value.Height = int(width), int(height)
     return value
+
+
+POINT_TO_100TH_MM = 2540.0 / 72.0
+
+
+def presentation_text_units(value):
+    """Return conservative em-widths for mixed CJK/Latin presentation text."""
+    lines = str(value or '').replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    measured = []
+    for line in lines:
+        units = 0.0
+        for character in line:
+            if character == '\t':
+                units += 2.0
+            elif character.isspace():
+                units += 0.33
+            elif unicodedata.east_asian_width(character) in {'W', 'F'}:
+                units += 1.0
+            elif unicodedata.category(character).startswith('P'):
+                units += 0.48
+            elif character.isupper() or character.isdigit():
+                units += 0.62
+            else:
+                units += 0.55
+        measured.append(units)
+    return measured or [0.0]
+
+
+def presentation_text_line_count(value, width, font_size, padding=0):
+    """Estimate wrapped lines using explicit 1/100 mm geometry and pt text."""
+    usable_width = max(1.0, float(width) - 2.0 * max(0.0, float(padding)))
+    em_width = max(1.0, float(font_size) * POINT_TO_100TH_MM)
+    units_per_line = max(0.5, usable_width / em_width)
+    return max(1, sum(max(1, int(math.ceil(units / units_per_line))) for units in presentation_text_units(value)))
+
+
+def presentation_text_height(font_size, lines=1, padding=0, line_spacing=1.22):
+    """Return a safe TextShape height in 1/100 mm for a pt font size."""
+    return int(math.ceil(
+        max(1, int(lines)) * max(1.0, float(font_size)) * POINT_TO_100TH_MM * max(1.0, float(line_spacing))
+        + 2.0 * max(0.0, float(padding))
+    ))
 
 
 def source_image_dimensions(path: Path):
@@ -189,6 +233,8 @@ class DocumentJob:
     opened_documents: set = field(default_factory=set, compare=False)
     element_records: dict = field(default_factory=dict, compare=False)
     layout_issues: list = field(default_factory=list, compare=False)
+    runtime_diagnostics: list = field(default_factory=list, compare=False)
+    feature_counts: dict = field(default_factory=dict, compare=False)
 
     @property
     def output_url(self):
@@ -284,24 +330,65 @@ class DocumentJob:
 
     def _source_location(self):
         expected = str(self.source_path.resolve())
+        matches = []
         for frame in inspect.stack():
             try:
                 if str(Path(frame.filename).resolve()) == expected:
-                    return {'line': int(frame.lineno), 'column': 1}
+                    matches.append({'line': int(frame.lineno), 'column': 1})
             except Exception:
                 continue
-        return {}
+        if not matches:
+            return {}
+        # inspect.stack() is ordered from the innermost frame outwards. The
+        # first authored frame is the real facade call inside a reusable
+        # helper; that is the line whose geometry or text policy must change.
+        # Preserve the outer call separately for dependency context without
+        # mislabeling it as the failing add_* statement.
+        location = dict(matches[0])
+        if matches[-1]['line'] != matches[0]['line']:
+            location['callLine'] = matches[-1]['line']
+            location['callColumn'] = matches[-1]['column']
+        return location
 
     def register_element(self, element_id, kind, target=None, locator=None, force_artifact_name=False):
-        value = str(element_id or '').strip()
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,127}', value):
+        requested_value = str(element_id or '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,127}', requested_value):
             raise ValueError('elementId must use 1-128 ASCII letters, numbers, dot, underscore, slash, or hyphen')
-        if value in self.element_records:
-            raise ValueError(f'Duplicate elementId: {value}. elementId values must be stable and unique.')
-        artifact_name = 'wp_' + re.sub(r'[^A-Za-z0-9_]', '_', value)
+
+        value = requested_value
+        duplicate_index = 1
+        while value in self.element_records:
+            duplicate_index += 1
+            suffix = f'-{duplicate_index}'
+            value = f'{requested_value[:128 - len(suffix)]}{suffix}'
+
+        source_location = self._source_location()
+        if value != requested_value:
+            first = self.element_records[requested_value]
+            self.runtime_diagnostics.append({
+                'code': 'ELEMENT_ID_AUTO_DISAMBIGUATED',
+                'severity': 'warning',
+                'message': (
+                    f'Duplicate requested elementId {requested_value!r} was registered as {value!r}. '
+                    'The artifact remains valid, but reusable helpers should derive role-specific IDs from a caller prefix.'
+                ),
+                'requestedElementId': requested_value,
+                'elementId': value,
+                'firstLine': first.get('line'),
+                **source_location,
+            })
+
+        artifact_base = 'wp_' + re.sub(r'[^A-Za-z0-9_]', '_', value)
+        artifact_name = artifact_base
+        used_artifact_names = {record.get('artifactName') for record in self.element_records.values()}
+        artifact_index = 1
+        while artifact_name in used_artifact_names:
+            artifact_index += 1
+            artifact_name = f'{artifact_base}_{artifact_index}'
         record = {
             'elementId': value, 'artifactName': artifact_name, 'kind': str(kind),
-            **self._source_location(), 'locator': dict(locator or {}),
+            **source_location, 'locator': dict(locator or {}),
+            **({'requestedElementId': requested_value, 'duplicateIndex': duplicate_index} if value != requested_value else {}),
         }
         self.element_records[value] = record
         if target is not None:
@@ -345,6 +432,12 @@ class DocumentJob:
     def element_map(self):
         return list(self.element_records.values())
 
+    def record_feature(self, name, count=1):
+        key = str(name or '').strip()
+        if not key:
+            raise ValueError('Feature name must be non-empty')
+        self.feature_counts[key] = int(self.feature_counts.get(key, 0)) + max(0, int(count))
+
 
 class UnoExpertAccess:
     """Explicit escape hatch for features not modeled by the stable facades."""
@@ -359,8 +452,42 @@ class UnoExpertAccess:
     def open_document(self, name):
         return self.job._open_document(name)
 
-    def tag(self, target, element_id, kind='expert-element', locator=None):
-        return self.job.register_element(element_id, kind, target, locator, force_artifact_name=True)
+    def component(self, layout):
+        """Return the raw component behind a worker-owned stable facade.
+
+        Keeping this escape hatch on the expert object prevents authored
+        programs from guessing private facade attributes such as ``_component``
+        or silently receiving ``None`` from ``getattr``.
+        """
+        component = getattr(layout, '_component', None)
+        if component is None:
+            raise ValueError(
+                'expert.component(layout) requires a facade returned by '
+                'job.writer(), job.presentation(), or job.spreadsheet().'
+            )
+        return component
+
+    def tag(self, target, element_id, kind='expert-element', locator=None,
+            layout_role=None, allow_overlap=None):
+        """Register a raw UNO object and, for Impress, its layout intent.
+
+        Raw ``shape`` objects follow the stable facade's default and are
+        decorative unless the author explicitly marks them as content. This
+        prevents a card/background rectangle from being diagnosed as
+        colliding with the text it is intentionally behind.
+        """
+        metadata = dict(locator or {})
+        if layout_role is not None:
+            role = str(layout_role).strip().lower()
+            if role not in {'background', 'container', 'content', 'decoration'}:
+                raise ValueError(
+                    f'Unknown presentation layout_role {layout_role!r}; '
+                    "expected background, container, content, or decoration."
+                )
+            metadata['layoutRole'] = role
+        if allow_overlap is not None:
+            metadata['allowOverlap'] = bool(allow_overlap)
+        return self.job.register_element(element_id, kind, target, metadata, force_artifact_name=True)
 
 
 class WriterLayout:
@@ -703,6 +830,54 @@ class PresentationLayout:
         self.job, self._component = job, component
         self._slide_count = 0
 
+    @staticmethod
+    def mm(value):
+        """Convert millimetres to UNO geometry units (1/100 mm)."""
+        return int(round(float(value) * 100.0))
+
+    @staticmethod
+    def cm(value):
+        """Convert centimetres to UNO geometry units (1/100 mm)."""
+        return int(round(float(value) * 1000.0))
+
+    @staticmethod
+    def inch(value):
+        """Convert inches to UNO geometry units (1/100 mm)."""
+        return int(round(float(value) * 2540.0))
+
+    @staticmethod
+    def pt(value):
+        """Convert typographic points to UNO geometry units (1/100 mm)."""
+        return int(round(float(value) * POINT_TO_100TH_MM))
+
+    @staticmethod
+    def text_height(font_size, lines=1, padding=0, line_spacing=1.22):
+        return presentation_text_height(font_size, lines=lines, padding=padding, line_spacing=line_spacing)
+
+    @staticmethod
+    def _rect(box):
+        if not isinstance(box, dict):
+            raise ValueError('Presentation box must be a dict containing x, y, width, and height.')
+        missing = [key for key in ('x', 'y', 'width', 'height') if key not in box]
+        if missing:
+            raise ValueError(f'Presentation box is missing {missing[0]!r}.')
+        return {key: int(box[key]) for key in ('x', 'y', 'width', 'height')}
+
+    def estimate_text_box(self, text, width, font_size=18, padding=0, min_font_size=None,
+                          line_spacing=1.22):
+        """Return safe text metrics without relying on TextShape minimum-frame noise."""
+        requested_size = max(1.0, float(font_size))
+        minimum_size = requested_size if min_font_size is None else max(1.0, float(min_font_size))
+        requested_lines = presentation_text_line_count(text, width, requested_size, padding)
+        minimum_lines = presentation_text_line_count(text, width, minimum_size, padding)
+        return {
+            'lines': requested_lines,
+            'height': presentation_text_height(requested_size, requested_lines, padding, line_spacing),
+            'minimumLines': minimum_lines,
+            'minimumHeight': presentation_text_height(minimum_size, minimum_lines, padding, line_spacing),
+            'unit': '1/100 mm',
+        }
+
     def bounds(self):
         """Return exact slide width/height in 1/100 mm for facade geometry."""
         return self.job.document_bounds(self._component)
@@ -710,19 +885,36 @@ class PresentationLayout:
     def content_box(self, margins=(1600, 1600, 1400, 1200)):
         """Return a safe content rectangle inside the current slide bounds.
 
-        ``margins`` is ``(left, right, top, bottom)`` in 1/100 mm. Keeping
-        layout arithmetic in this facade avoids model-authored hard-coded
-        page sizes and makes the same program portable across slide formats.
+        Prefer a named mapping with ``left``, ``right``, ``top`` and ``bottom``
+        values. The legacy tuple form is ``(left, right, top, bottom)``. Named
+        margins remove the easy-to-miss CSS-order ambiguity while keeping old
+        programs compatible.
         """
-        if not isinstance(margins, (list, tuple)) or len(margins) != 4:
-            raise ValueError('Presentation margins must be (left, right, top, bottom).')
-        left, right, top, bottom = [max(0, int(value)) for value in margins]
+        if isinstance(margins, dict):
+            allowed = {'left', 'right', 'top', 'bottom'}
+            unknown = sorted(set(margins) - allowed)
+            if unknown:
+                raise ValueError(
+                    f'Unknown presentation margin {unknown[0]!r}; expected left, right, top, or bottom.'
+                )
+            left, right, top, bottom = [
+                max(0, int(margins.get(key, 0))) for key in ('left', 'right', 'top', 'bottom')
+            ]
+            resolved_margins = {'left': left, 'right': right, 'top': top, 'bottom': bottom}
+        elif isinstance(margins, (list, tuple)) and len(margins) == 4:
+            left, right, top, bottom = [max(0, int(value)) for value in margins]
+            resolved_margins = (left, right, top, bottom)
+        else:
+            raise ValueError(
+                'Presentation margins must be a {left, right, top, bottom} mapping '
+                'or legacy (left, right, top, bottom) tuple.'
+            )
         bounds = self.bounds()
         width = int(bounds['width']) - left - right
         height = int(bounds['height']) - top - bottom
         if width <= 0 or height <= 0:
             raise ValueError(
-                f'Presentation margins leave no usable content area: margins={tuple(margins)}, '
+                f'Presentation margins leave no usable content area: margins={resolved_margins}, '
                 f'slideWidth={int(bounds["width"])}, slideHeight={int(bounds["height"])}'
             )
         return {'x': left, 'y': top, 'width': width, 'height': height}
@@ -876,30 +1068,208 @@ class PresentationLayout:
         cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
         if font_name:
             cursor.CharFontName = str(font_name)
+        requested_font_size = max(1.0, float(font_size))
+        minimum_font_size = max(1.0, float(min_font_size))
+        if minimum_font_size > requested_font_size:
+            raise ValueError(
+                f'Presentation min_font_size={minimum_font_size:g} cannot exceed font_size={requested_font_size:g} '
+                f'for elementId={element_id!r}.'
+            )
+        estimated_lines = presentation_text_line_count(text, requested_width, requested_font_size, inset)
+        estimated_height = presentation_text_height(requested_font_size, estimated_lines, inset)
+        minimum_lines = presentation_text_line_count(text, requested_width, minimum_font_size, inset)
+        minimum_height = presentation_text_height(minimum_font_size, minimum_lines, inset)
         shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
         shape.TextAutoGrowHeight = True
-        measured_height = max(requested_height, int(getattr(shape.Size, 'Height', requested_height)))
+        libreoffice_height = max(requested_height, int(getattr(shape.Size, 'Height', requested_height)))
+        # Impress TextShape reports a renderer-dependent minimum frame height
+        # even for short one-line text. Trust that value only when it materially
+        # exceeds our conservative mixed-script estimate; otherwise it creates
+        # false overflow cascades for footers and labels.
+        if estimated_height <= requested_height and libreoffice_height <= max(estimated_height + 120, int(estimated_height * 1.35)):
+            measured_height = estimated_height
+        else:
+            measured_height = max(estimated_height, libreoffice_height)
         fit_mode = str(fit or 'shrink').strip().lower()
         if fit_mode not in {'none', 'shrink'}:
             raise ValueError("Presentation text fit must be 'shrink' or 'none'.")
-        if measured_height > requested_height and fit_mode == 'shrink':
+        if measured_height > requested_height:
             scale = requested_height / measured_height
-            if float(font_size) * scale < float(min_font_size):
+            fitted_font_size = requested_font_size * scale
+            tolerance = 0.75
+            unreadable = fit_mode == 'none' or fitted_font_size + tolerance < minimum_font_size
+            if unreadable:
                 record = self.job.element_records.get(str(element_id), {})
                 self.job.layout_issues.append({
                     'code': 'PRESENTATION_TEXT_OVERFLOW', 'severity': 'error', 'elementId': str(element_id),
-                    'line': record.get('line'), 'column': record.get('column'), 'locator': record.get('locator'),
+                    'line': record.get('line'), 'column': record.get('column'),
+                    'callLine': record.get('callLine'), 'locator': record.get('locator'),
                     'message': (
-                        f'Text requires an estimated {float(font_size) * scale:.2f}pt font to fit '
-                        f'{requested_width}x{requested_height}, below min_font_size={float(min_font_size):g}; '
-                        f'requestedFontSize={float(font_size):g}, measuredHeight={measured_height}. '
-                        'Increase the box or shorten the copy.'
+                        f'Text requires an estimated {fitted_font_size:.2f}pt font to fit '
+                        f'{requested_width}x{requested_height} (1/100 mm), '
+                        f'below min_font_size={minimum_font_size:g}; requestedFontSize={requested_font_size:g}, '
+                        f'estimatedLines={estimated_lines}, estimatedHeight={estimated_height}, '
+                        f'minimumHeight={minimum_height}, libreOfficeHeight={libreoffice_height}, '
+                        f'effectiveMeasuredHeight={measured_height}. Increase the box, use deck.text_height(), '
+                        'shorten the copy, or split the layout.'
                     ),
                 })
-            shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'PROPORTIONAL')
+            if fit_mode == 'shrink':
+                shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'PROPORTIONAL')
         shape.TextAutoGrowHeight = False
         shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
         return shape
+
+    def add_text_box(self, element_id, page, text, box, font_size=18, color=0x000000,
+                     bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None,
+                     padding=None, valign='TOP', layout_role='content', allow_overlap=False):
+        """Add text to a semantic rectangle, deriving a safe height when omitted."""
+        if not isinstance(box, dict):
+            raise ValueError('Presentation text box must be a dict containing x, y, and width.')
+        missing = [key for key in ('x', 'y', 'width') if key not in box]
+        if missing:
+            raise ValueError(f'Presentation text box is missing {missing[0]!r}.')
+        inset = self.mm(2) if padding is None else max(0, int(padding))
+        minimum = float(font_size) if min_font_size is None else float(min_font_size)
+        metrics = self.estimate_text_box(text, int(box['width']), font_size, inset, minimum)
+        height = int(box.get('height', metrics['height']))
+        return self.add_text(
+            element_id, page, text, int(box['x']), int(box['y']), int(box['width']), height,
+            font_size=font_size, color=color, bold=bold, italic=italic, align=align,
+            font_name=font_name, fit='shrink', min_font_size=minimum, padding=inset,
+            valign=valign, layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+
+    def add_text_link(self, element_id, page, text, box, url=None, target_slide_id=None,
+                      font_size=18, color=0x2563EB, bold=False, italic=False,
+                      align='LEFT', font_name=None, min_font_size=None, padding=None,
+                      valign='TOP', layout_role='content', allow_overlap=False):
+        """Add clickable text for an external URL or a stable slide-element destination."""
+        if bool(url) == bool(target_slide_id):
+            raise ValueError('Presentation text link requires exactly one of url or target_slide_id.')
+        destination = str(url or '').strip()
+        feature = 'externalHyperlink'
+        if target_slide_id:
+            target = str(target_slide_id).strip()
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,127}', target):
+                raise ValueError('target_slide_id must be a stable facade element ID.')
+            destination = '#wp_' + re.sub(r'[^A-Za-z0-9_]', '_', target)
+            feature = 'internalSlideHyperlink'
+        if not destination:
+            raise ValueError('Presentation text link destination must be non-empty.')
+        shape = self.add_text_box(
+            element_id, page, text, box, font_size=font_size, color=color,
+            bold=bold, italic=italic, align=align, font_name=font_name,
+            min_font_size=min_font_size, padding=padding, valign=valign,
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+        shape.String = ''
+        cursor = shape.Text.createTextCursor()
+        field = self._component.createInstance('com.sun.star.text.TextField.URL')
+        field.URL = destination
+        field.Representation = str(text)
+        field.TargetFrame = '_blank' if feature == 'externalHyperlink' else ''
+        shape.Text.insertTextContent(cursor, field, False)
+        cursor = shape.Text.createTextCursor()
+        cursor.gotoEnd(True)
+        cursor.CharHeight, cursor.CharColor = float(font_size), int(color)
+        cursor.CharWeight = 150.0 if bold else 100.0
+        cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE')
+        cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
+        if font_name:
+            cursor.CharFontName = str(font_name)
+        self.job.record_feature(feature)
+        return shape
+
+    def add_card(self, element_id, page, box, title, body='', fill=0xFFFFFF, line=None,
+                 accent=None, title_size=20, body_size=14, title_color=0x0F172A,
+                 body_color=0x334155, padding=None, gap=None):
+        """Add a collision-safe card with an optional accent and measured text."""
+        area = self._rect(box)
+        inset = self.mm(4) if padding is None else max(0, int(padding))
+        spacing = self.mm(2) if gap is None else max(0, int(gap))
+        self.add_shape(
+            f'{element_id}/surface', page, **area, fill=fill, line=line,
+            line_width=self.mm(0.3) if line is not None else 0,
+            layout_role='container', allow_overlap=True,
+        )
+        accent_width = self.mm(1.2) if accent is not None else 0
+        if accent is not None:
+            self.add_shape(
+                f'{element_id}/accent', page, area['x'], area['y'], accent_width, area['height'],
+                fill=accent, layout_role='decoration', allow_overlap=True,
+            )
+        inner = {
+            'x': area['x'] + inset + accent_width,
+            'y': area['y'] + inset,
+            'width': area['width'] - inset * 2 - accent_width,
+            'height': area['height'] - inset * 2,
+        }
+        if inner['width'] <= 0 or inner['height'] <= 0:
+            raise ValueError(f'Presentation card {element_id!r} padding leaves no usable content area.')
+        title_metrics = self.estimate_text_box(title, inner['width'], title_size, 0, title_size)
+        title_height = int(title_metrics['height'])
+        if title_height > inner['height']:
+            raise ValueError(f'Presentation card {element_id!r} title does not fit its content area.')
+        title_box = {**inner, 'height': title_height}
+        self.add_text_box(
+            f'{element_id}/title', page, title, title_box, font_size=title_size,
+            min_font_size=title_size, color=title_color, bold=True, padding=0,
+        )
+        body_shape = None
+        if str(body or '').strip():
+            body_box = {
+                'x': inner['x'], 'y': inner['y'] + title_height + spacing,
+                'width': inner['width'], 'height': inner['height'] - title_height - spacing,
+            }
+            if body_box['height'] <= 0:
+                raise ValueError(f'Presentation card {element_id!r} has no room for body text.')
+            body_shape = self.add_text_box(
+                f'{element_id}/body', page, body, body_box, font_size=body_size,
+                min_font_size=body_size, color=body_color, padding=0,
+            )
+        return {'surface': self.job.element_records.get(f'{element_id}/surface'), 'body': body_shape, 'box': area}
+
+    def add_footer(self, element_id, page, left='', center='', right='', height=None,
+                   background=None, accent=None, font_size=10, color=0x64748B, padding=None,
+                   left_url=None, center_url=None, right_url=None):
+        """Add a measured three-zone footer aligned to the exact slide bounds."""
+        bounds = self.bounds()
+        inset = self.mm(2) if padding is None else max(0, int(padding))
+        safe_height = max(self.mm(8), self.text_height(font_size, padding=inset)) if height is None else int(height)
+        area = {'x': 0, 'y': int(bounds['height']) - safe_height, 'width': int(bounds['width']), 'height': safe_height}
+        if background is not None:
+            self.add_shape(
+                f'{element_id}/surface', page, **area, fill=background,
+                layout_role='background', allow_overlap=True,
+            )
+        if accent is not None:
+            self.add_shape(
+                f'{element_id}/accent', page, 0, area['y'], area['width'], self.mm(0.4),
+                fill=accent, layout_role='decoration', allow_overlap=True,
+            )
+        cells = self.grid(3, 1, box={
+            'x': inset, 'y': area['y'], 'width': area['width'] - inset * 2, 'height': area['height'],
+        }, gap=0)
+        values = (
+            (left, 'LEFT', 'left', left_url),
+            (center, 'CENTER', 'center', center_url),
+            (right, 'RIGHT', 'right', right_url),
+        )
+        for cell, (value, align, suffix, link) in zip(cells, values):
+            if str(value or '').strip():
+                if str(link or '').strip():
+                    self.add_text_link(
+                        f'{element_id}/{suffix}', page, value, cell, url=link,
+                        font_size=font_size, min_font_size=font_size, color=color,
+                        align=align, padding=0, valign='CENTER',
+                    )
+                else:
+                    self.add_text_box(
+                        f'{element_id}/{suffix}', page, value, cell, font_size=font_size,
+                        min_font_size=font_size, color=color, align=align, padding=0, valign='CENTER',
+                    )
+        return area
 
     def add_shape(self, element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape',
                   fill=None, line=None, line_width=0, fill_transparency=0,
@@ -920,6 +1290,83 @@ class PresentationLayout:
             shape.LineWidth = max(0, int(line_width))
         return shape
 
+    def add_connector(self, element_id, page, x1, y1, x2, y2, color=0x64748B,
+                      line_width=100, start_arrow=False, end_arrow=False,
+                      layout_role='decoration', allow_overlap=True):
+        """Add a stable straight connector without exposing raw ConnectorShape lifecycle.
+
+        LibreOffice ConnectorShape endpoints are unusually sensitive to mutation
+        order and can dispose the remote bridge in large decks. A two-point
+        PolyLineShape is stable across PPTX save/reopen, preserves rising versus
+        falling direction, and supports optional native arrow heads.
+        """
+        x1, y1, x2, y2 = [int(value) for value in (x1, y1, x2, y2)]
+        x, y = min(x1, x2), min(y1, y2)
+        width, height = max(1, abs(x2 - x1)), max(1, abs(y2 - y1))
+        shape = self._add_shape(
+            page, element_id, 'com.sun.star.drawing.PolyLineShape', x, y, width, height, 'connector',
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+        # Position+Size alone cannot encode whether a diagonal runs from the
+        # lower-left to upper-right. LineShape therefore silently mirrored
+        # every rising segment after PPTX export. Preserve the authored
+        # endpoints as an explicit two-point polyline instead of reconstructing
+        # direction from a directionless bounding box.
+        shape.PolyPolygon = ((point(x1, y1), point(x2, y2)),)
+        shape.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'SOLID')
+        shape.LineColor = int(color)
+        shape.LineWidth = max(0, int(line_width))
+        if start_arrow:
+            try:
+                shape.LineStartName = 'Arrow'
+            except Exception:
+                pass
+        if end_arrow:
+            try:
+                shape.LineEndName = 'Arrow'
+            except Exception:
+                pass
+        return shape
+
+    def add_connector_between(self, element_id, page, source_box, target_box, color=0x64748B,
+                              line_width=100, start_arrow=False, end_arrow=True, axis='auto',
+                              source_inset=0, target_inset=0, layout_role='decoration',
+                              allow_overlap=True):
+        """Connect two allocated layout boxes without hand-authored endpoint arithmetic."""
+        source, target = self._rect(source_box), self._rect(target_box)
+        source_center = (
+            source['x'] + source['width'] // 2,
+            source['y'] + source['height'] // 2,
+        )
+        target_center = (
+            target['x'] + target['width'] // 2,
+            target['y'] + target['height'] // 2,
+        )
+        direction = str(axis or 'auto').strip().lower()
+        if direction == 'auto':
+            direction = 'horizontal' if abs(target_center[0] - source_center[0]) >= abs(target_center[1] - source_center[1]) else 'vertical'
+        if direction not in {'horizontal', 'vertical'}:
+            raise ValueError("Presentation connector axis must be 'auto', 'horizontal', or 'vertical'.")
+        source_gap = max(0, int(source_inset))
+        target_gap = max(0, int(target_inset))
+        if direction == 'horizontal':
+            if target_center[0] >= source_center[0]:
+                x1, x2 = source['x'] + source['width'] - source_gap, target['x'] + target_gap
+            else:
+                x1, x2 = source['x'] + source_gap, target['x'] + target['width'] - target_gap
+            y1, y2 = source_center[1], target_center[1]
+        else:
+            if target_center[1] >= source_center[1]:
+                y1, y2 = source['y'] + source['height'] - source_gap, target['y'] + target_gap
+            else:
+                y1, y2 = source['y'] + source_gap, target['y'] + target['height'] - target_gap
+            x1, x2 = source_center[0], target_center[0]
+        return self.add_connector(
+            element_id, page, x1, y1, x2, y2, color=color, line_width=line_width,
+            start_arrow=start_arrow, end_arrow=end_arrow,
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+
     def add_image(self, element_id, page, asset_name, x, y, width, height,
                   layout_role='content', allow_overlap=False):
         shape = self._add_shape(
@@ -928,6 +1375,375 @@ class PresentationLayout:
         )
         shape.GraphicURL = uno.systemPathToFileUrl(str(self.job.asset_path(asset_name)))
         return shape
+
+    def add_image_contain(self, element_id, page, asset_name, box, padding=0,
+                          layout_role='content', allow_overlap=False):
+        """Fit an image inside a semantic rectangle without changing its aspect ratio."""
+        area = self._rect(box)
+        inset = max(0, int(padding))
+        available_width = area['width'] - inset * 2
+        available_height = area['height'] - inset * 2
+        if available_width <= 0 or available_height <= 0:
+            raise ValueError(f'Presentation image {element_id!r} padding leaves no usable area.')
+        asset_path = self.job.asset_path(asset_name)
+        intrinsic = source_image_dimensions(asset_path)
+        if intrinsic and float(intrinsic[0]) > 0 and float(intrinsic[1]) > 0:
+            scale = min(available_width / float(intrinsic[0]), available_height / float(intrinsic[1]))
+            width = max(1, int(round(float(intrinsic[0]) * scale)))
+            height = max(1, int(round(float(intrinsic[1]) * scale)))
+        else:
+            width, height = available_width, available_height
+        x = area['x'] + inset + (available_width - width) // 2
+        y = area['y'] + inset + (available_height - height) // 2
+        shape = self._add_shape(
+            page, element_id, 'com.sun.star.drawing.GraphicObjectShape', x, y, width, height, 'image',
+            layout_role=layout_role, allow_overlap=allow_overlap,
+        )
+        shape.GraphicURL = uno.systemPathToFileUrl(str(asset_path))
+        return shape
+
+    def add_native_table(self, element_id, page, box, rows, column_weights=None,
+                         header_fill=0x0F172A, header_color=0xFFFFFF,
+                         body_fill=0xF8FAFC, alternate_fill=0xFFFFFF,
+                         body_color=0x1E293B, font_size=11, font_name=None,
+                         first_column_align='LEFT'):
+        """Add a native editable Impress TableShape with deterministic row/column sizing."""
+        area = self._rect(box)
+        self.job.record_feature('nativeEditableTable')
+        matrix = [list(row) for row in rows]
+        if not matrix or not matrix[0]:
+            raise ValueError('Presentation table requires at least one row and one column.')
+        column_count = len(matrix[0])
+        if any(len(row) != column_count for row in matrix):
+            raise ValueError('Presentation table rows must all contain the same number of columns.')
+        weights = self._normalized_weights(column_count, column_weights)
+        column_widths = [int(area['width'] * value / sum(weights)) for value in weights]
+        column_widths[-1] += area['width'] - sum(column_widths)
+        row_heights = [area['height'] // len(matrix)] * len(matrix)
+        row_heights[-1] += area['height'] - sum(row_heights)
+        shape = self._add_shape(
+            page, element_id, 'com.sun.star.drawing.TableShape',
+            area['x'], area['y'], area['width'], area['height'], 'table',
+            layout_role='content', allow_overlap=False,
+        )
+        table = shape.Model
+        if len(matrix) > 1:
+            table.Rows.insertByIndex(0, len(matrix) - 1)
+        if column_count > 1:
+            table.Columns.insertByIndex(0, column_count - 1)
+        for index, row_height in enumerate(row_heights):
+            table.Rows.getByIndex(index).Size = int(row_height)
+        for index, column_width in enumerate(column_widths):
+            table.Columns.getByIndex(index).Size = int(column_width)
+        for row_index, values in enumerate(matrix):
+            for column_index, value in enumerate(values):
+                cell = table.getCellByPosition(column_index, row_index)
+                cell.String = '' if value is None else str(value)
+                try:
+                    cell.FillColor = int(header_fill if row_index == 0 else (
+                        body_fill if row_index % 2 else alternate_fill
+                    ))
+                except Exception:
+                    pass
+                cursor = cell.createTextCursor()
+                cursor.gotoEnd(True)
+                cursor.CharHeight = float(font_size)
+                cursor.CharWeight = 150.0 if row_index == 0 else 100.0
+                cursor.CharColor = int(header_color if row_index == 0 else body_color)
+                if font_name:
+                    cursor.CharFontName = str(font_name)
+                alignment = 'CENTER' if row_index == 0 or column_index > 0 else str(first_column_align).upper()
+                cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', alignment)
+        return shape
+
+    @staticmethod
+    def _chart_values(categories, values):
+        labels = [str(value) for value in categories]
+        numbers = [float(value) for value in values]
+        if not labels or len(labels) != len(numbers):
+            raise ValueError('Presentation chart categories and values must be non-empty and have equal length.')
+        if any(not math.isfinite(value) for value in numbers):
+            raise ValueError('Presentation chart values must be finite numbers.')
+        return labels, numbers
+
+    @staticmethod
+    def _chart_palette(count, colors=None):
+        defaults = [0x2563EB, 0x10B981, 0xF59E0B, 0x8B5CF6, 0xEC4899, 0x06B6D4, 0xEF4444]
+        palette = [int(value) for value in (colors or defaults)]
+        if not palette:
+            raise ValueError('Presentation chart palette cannot be empty.')
+        return [palette[index % len(palette)] for index in range(count)]
+
+    def add_bar_chart(self, element_id, page, box, categories, values, colors=None,
+                      font_size=10, color=0x334155, baseline_color=0xCBD5E1,
+                      value_format='{value:g}'):
+        """Render a collision-safe vector bar chart from data, labels, and one semantic box."""
+        area = self._rect(box)
+        self.job.record_feature('vectorChart')
+        self.job.record_feature('vectorBarChart')
+        labels, numbers = self._chart_values(categories, values)
+        palette = self._chart_palette(len(labels), colors)
+        label_height = max(self.mm(8), self.text_height(font_size, lines=2))
+        value_height = max(self.mm(6), self.text_height(font_size))
+        plot = {
+            'x': area['x'], 'y': area['y'] + value_height,
+            'width': area['width'], 'height': area['height'] - label_height - value_height,
+        }
+        minimum_height = label_height + value_height + self.mm(8) + 1
+        if plot['height'] <= self.mm(8):
+            raise ValueError(
+                f'Presentation bar chart {element_id!r} boxHeight={area["height"]} is too short; '
+                f'minimumHeight={minimum_height} for fontSize={float(font_size):g}. '
+                'Use a taller grid cell or reduce named top/bottom content_box margins.'
+            )
+        slots = self.grid(len(labels), 1, box=plot, gap=max(self.mm(2), area['width'] // max(1, len(labels) * 8)))
+        upper = max(max(numbers), 0.0)
+        lower = min(min(numbers), 0.0)
+        span = upper - lower
+        if span <= 0:
+            span = max(abs(upper), abs(lower), 1.0)
+        baseline_y = plot['y'] + int(round(upper / span * plot['height']))
+        baseline_y = max(plot['y'], min(plot['y'] + plot['height'], baseline_y))
+        self.add_connector(
+            f'{element_id}/baseline', page, plot['x'], baseline_y,
+            plot['x'] + plot['width'], baseline_y,
+            color=baseline_color, line_width=self.mm(0.35),
+        )
+        for index, (label, value, slot, bar_color) in enumerate(zip(labels, numbers, slots, palette)):
+            bar_width = max(1, int(slot['width'] * 0.58))
+            bar_x = slot['x'] + (slot['width'] - bar_width) // 2
+            value_y = plot['y'] + int(round((upper - value) / span * plot['height']))
+            bar_y = min(value_y, baseline_y)
+            bar_height = max(1, abs(baseline_y - value_y))
+            self.add_shape(
+                f'{element_id}/bar-{index + 1}', page, bar_x, bar_y, bar_width, bar_height,
+                fill=bar_color, layout_role='decoration', allow_overlap=True,
+            )
+            label_box = {
+                'x': slot['x'], 'y': plot['y'] + plot['height'],
+                'width': slot['width'], 'height': label_height,
+            }
+            self.add_text_box(
+                f'{element_id}/category-{index + 1}', page, label, label_box,
+                font_size=font_size, min_font_size=font_size, color=color,
+                align='CENTER', valign='CENTER', padding=0,
+            )
+            formatted = str(value_format).format(value=value, index=index, category=label)
+            value_box = {
+                'x': slot['x'],
+                'y': max(area['y'], min(area['y'] + area['height'] - value_height, value_y - value_height)),
+                'width': slot['width'], 'height': value_height,
+            }
+            self.add_text_box(
+                f'{element_id}/value-{index + 1}', page, formatted, value_box,
+                font_size=font_size, min_font_size=font_size, color=color,
+                bold=True, align='CENTER', valign='CENTER', padding=0,
+            )
+        return {'box': area, 'plot': plot, 'count': len(labels)}
+
+    def add_line_chart(self, element_id, page, box, categories, values, color=0x2563EB,
+                       point_fill=0xFFFFFF, label_color=0x334155, font_size=9,
+                       value_format='{value:g}'):
+        """Render a deterministic one-series vector line chart without raw ConnectorShape calls."""
+        area = self._rect(box)
+        self.job.record_feature('vectorChart')
+        self.job.record_feature('vectorLineChart')
+        labels, numbers = self._chart_values(categories, values)
+        label_height = max(self.mm(8), self.text_height(font_size, lines=2))
+        value_height = max(self.mm(5), self.text_height(font_size))
+        plot = {
+            'x': area['x'] + self.mm(3), 'y': area['y'] + value_height,
+            'width': area['width'] - self.mm(6), 'height': area['height'] - label_height - value_height,
+        }
+        minimum_width = self.mm(6) + 1
+        minimum_height = label_height + value_height + self.mm(8) + 1
+        if plot['width'] <= 0 or plot['height'] <= self.mm(8):
+            raise ValueError(
+                f'Presentation line chart {element_id!r} box={area["width"]}x{area["height"]} is too small; '
+                f'minimum={minimum_width}x{minimum_height} for fontSize={float(font_size):g}. '
+                'Use a larger grid cell or reduce named content_box margins.'
+            )
+        lower, upper = min(numbers), max(numbers)
+        span = upper - lower or max(abs(upper), 1.0)
+        label_slots = self.grid(
+            len(labels), 1,
+            box={'x': plot['x'], 'y': plot['y'], 'width': plot['width'], 'height': plot['height']},
+            gap=self.mm(1),
+        )
+        xs = [slot['x'] + slot['width'] // 2 for slot in label_slots]
+        ys = [plot['y'] + int(round((upper - value) / span * plot['height'])) for value in numbers]
+        self.add_connector(
+            f'{element_id}/axis', page, plot['x'], plot['y'] + plot['height'],
+            plot['x'] + plot['width'], plot['y'] + plot['height'],
+            color=0xCBD5E1, line_width=self.mm(0.35),
+        )
+        for index in range(len(numbers) - 1):
+            self.add_connector(
+                f'{element_id}/segment-{index + 1}', page,
+                xs[index], ys[index], xs[index + 1], ys[index + 1],
+                color=color, line_width=self.mm(0.65),
+            )
+        point_size = self.mm(2.6)
+        for index, (label, value, x, y, label_slot) in enumerate(zip(labels, numbers, xs, ys, label_slots)):
+            self.add_shape(
+                f'{element_id}/point-{index + 1}', page,
+                x - point_size // 2, y - point_size // 2, point_size, point_size,
+                service='com.sun.star.drawing.EllipseShape', fill=point_fill,
+                line=color, line_width=self.mm(0.45), layout_role='decoration', allow_overlap=True,
+            )
+            self.add_text_box(
+                f'{element_id}/category-{index + 1}', page, label,
+                {'x': label_slot['x'], 'y': plot['y'] + plot['height'],
+                 'width': label_slot['width'], 'height': label_height},
+                font_size=font_size, min_font_size=font_size, color=label_color,
+                align='CENTER', valign='CENTER', padding=0,
+            )
+            self.add_text_box(
+                f'{element_id}/value-{index + 1}', page,
+                str(value_format).format(value=value, index=index, category=label),
+                {'x': label_slot['x'], 'y': max(area['y'], y - value_height),
+                 'width': label_slot['width'], 'height': value_height},
+                font_size=font_size, min_font_size=font_size, color=label_color,
+                bold=True, align='CENTER', valign='CENTER', padding=0,
+            )
+        return {'box': area, 'plot': plot, 'count': len(labels)}
+
+    def add_donut_chart(self, element_id, page, box, labels, values, colors=None,
+                        hole_fill=0xFFFFFF, label_color=0x334155, font_size=10,
+                        center_text='', center_subtitle='', center_text_color=0x0F172A,
+                        center_text_size=20, center_subtitle_size=9):
+        """Render stable Impress ellipse sectors plus a measured non-overlapping legend."""
+        area = self._rect(box)
+        self.job.record_feature('vectorChart')
+        self.job.record_feature('vectorDonutChart')
+        names, numbers = self._chart_values(labels, values)
+        if any(value < 0 for value in numbers) or sum(numbers) <= 0:
+            raise ValueError('Presentation donut values must be non-negative and have a positive total.')
+        palette = self._chart_palette(len(names), colors)
+        legend_width = max(self.mm(34), int(area['width'] * 0.42))
+        chart_width = area['width'] - legend_width - self.mm(4)
+        diameter = min(chart_width, area['height'])
+        if diameter <= self.mm(18):
+            raise ValueError(f'Presentation donut chart {element_id!r} is too small.')
+        chart_x = area['x'] + (chart_width - diameter) // 2
+        chart_y = area['y'] + (area['height'] - diameter) // 2
+        total = sum(numbers)
+        start = 0
+        for index, (value, sector_color) in enumerate(zip(numbers, palette)):
+            end = 36000 if index == len(numbers) - 1 else start + int(round(value / total * 36000))
+            sector = self.add_shape(
+                f'{element_id}/sector-{index + 1}', page,
+                chart_x, chart_y, diameter, diameter,
+                service='com.sun.star.drawing.EllipseShape', fill=sector_color,
+                layout_role='decoration', allow_overlap=True,
+            )
+            sector.CircleKind = uno.Enum('com.sun.star.drawing.CircleKind', 'SECTION')
+            sector.CircleStartAngle, sector.CircleEndAngle = int(start), int(end)
+            start = end
+        hole = int(diameter * 0.48)
+        self.add_shape(
+            f'{element_id}/hole', page,
+            chart_x + (diameter - hole) // 2, chart_y + (diameter - hole) // 2,
+            hole, hole, service='com.sun.star.drawing.EllipseShape', fill=hole_fill,
+            layout_role='decoration', allow_overlap=True,
+        )
+        if str(center_text or '').strip() or str(center_subtitle or '').strip():
+            center_box = {
+                'x': chart_x + (diameter - hole) // 2 + self.mm(2),
+                'y': chart_y + (diameter - hole) // 2 + self.mm(2),
+                'width': hole - self.mm(4), 'height': hole - self.mm(4),
+            }
+            center_rows = self.stack(
+                2, box=center_box, gap=0,
+                weights=(1.15, 0.85),
+            )
+            if str(center_text or '').strip():
+                self.add_text_box(
+                    f'{element_id}/center/value', page, center_text, center_rows[0],
+                    font_size=center_text_size, min_font_size=center_text_size,
+                    color=center_text_color, bold=True, align='CENTER', valign='BOTTOM', padding=0,
+                )
+            if str(center_subtitle or '').strip():
+                self.add_text_box(
+                    f'{element_id}/center/subtitle', page, center_subtitle, center_rows[1],
+                    font_size=center_subtitle_size, min_font_size=center_subtitle_size,
+                    color=label_color, align='CENTER', valign='TOP', padding=0,
+                )
+        legend = {
+            'x': area['x'] + chart_width + self.mm(4), 'y': area['y'],
+            'width': legend_width - self.mm(4), 'height': area['height'],
+        }
+        rows = self.stack(len(names), box=legend, gap=self.mm(1))
+        for index, (name, value, swatch, row) in enumerate(zip(names, numbers, palette, rows)):
+            marker = min(self.mm(4), max(1, row['height'] // 2))
+            marker_y = row['y'] + (row['height'] - marker) // 2
+            self.add_shape(
+                f'{element_id}/legend-{index + 1}/swatch', page,
+                row['x'], marker_y, marker, marker, fill=swatch,
+                layout_role='decoration', allow_overlap=True,
+            )
+            percent = value / total * 100.0
+            self.add_text_box(
+                f'{element_id}/legend-{index + 1}/label', page,
+                f'{name}  {percent:.1f}%',
+                {'x': row['x'] + marker + self.mm(2), 'y': row['y'],
+                 'width': row['width'] - marker - self.mm(2), 'height': row['height']},
+                font_size=font_size, min_font_size=font_size, color=label_color,
+                valign='CENTER', padding=0,
+            )
+        return {'box': area, 'chartBox': {'x': chart_x, 'y': chart_y, 'width': diameter, 'height': diameter}}
+
+    def add_timeline(self, element_id, page, box, events, colors=None,
+                     title_size=12, body_size=9, text_color=0x334155):
+        """Lay out alternating timeline events in deterministic equal-width tracks."""
+        area = self._rect(box)
+        items = []
+        for event in events:
+            if isinstance(event, dict):
+                items.append((str(event.get('title', '')), str(event.get('body', ''))))
+            elif isinstance(event, (list, tuple)) and len(event) >= 2:
+                items.append((str(event[0]), str(event[1])))
+            else:
+                items.append((str(event), ''))
+        if not items:
+            raise ValueError('Presentation timeline requires at least one event.')
+        palette = self._chart_palette(len(items), colors)
+        tracks = self.grid(len(items), 1, box=area, gap=self.mm(2))
+        axis_y = area['y'] + area['height'] // 2
+        self.add_connector(
+            f'{element_id}/axis', page, area['x'], axis_y,
+            area['x'] + area['width'], axis_y,
+            color=0x94A3B8, line_width=self.mm(0.5),
+        )
+        point_size = self.mm(3.2)
+        for index, ((title, body), track, event_color) in enumerate(zip(items, tracks, palette)):
+            center_x = track['x'] + track['width'] // 2
+            self.add_shape(
+                f'{element_id}/event-{index + 1}/point', page,
+                center_x - point_size // 2, axis_y - point_size // 2,
+                point_size, point_size, service='com.sun.star.drawing.EllipseShape',
+                fill=event_color, layout_role='decoration', allow_overlap=True,
+            )
+            top = index % 2 == 0
+            event_box = {
+                'x': track['x'],
+                'y': area['y'] if top else axis_y + self.mm(4),
+                'width': track['width'],
+                'height': area['height'] // 2 - self.mm(4),
+            }
+            stack = self.stack(2, box=event_box, gap=self.mm(1), weights=(1, 2))
+            self.add_text_box(
+                f'{element_id}/event-{index + 1}/title', page, title, stack[0],
+                font_size=title_size, min_font_size=title_size, color=event_color,
+                bold=True, align='CENTER', valign='CENTER', padding=0,
+            )
+            if body:
+                self.add_text_box(
+                    f'{element_id}/event-{index + 1}/body', page, body, stack[1],
+                    font_size=body_size, min_font_size=body_size, color=text_color,
+                    align='CENTER', valign='CENTER', padding=0,
+                )
+        return {'box': area, 'count': len(items)}
 
     def save(self):
         if self.job.layout_issues:
@@ -1036,21 +1852,28 @@ def validate_program(source: str):
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ''
-            if name in {'writer', 'presentation', 'spreadsheet', 'set_page', 'add_slide', 'add_text', 'add_shape', 'add_image',
+            if name in {'writer', 'presentation', 'spreadsheet', 'set_page', 'add_slide', 'add_text', 'add_shape', 'add_connector', 'add_image',
                         'add_paragraph', 'add_heading', 'add_table', 'add_inline_image', 'add_page_break'} and node.args:
                 element = node.args[0]
                 if isinstance(element, ast.Constant) and isinstance(element.value, str):
                     if element.value in element_ids:
                         diagnostics.append({
                             'code': 'DUPLICATE_ELEMENT_ID', 'line': node.lineno, 'column': node.col_offset + 1,
-                            'message': f'Duplicate literal elementId {element.value!r}; first declared on line {element_ids[element.value]}. Element IDs must be unique.',
-                            'severity': 'error',
+                            'message': f'Duplicate literal elementId {element.value!r}; first declared on line {element_ids[element.value]}. Runtime registration will disambiguate it deterministically, but the authored helper should use role-specific IDs.',
+                            'severity': 'warning',
                         })
                     else:
                         element_ids[element.value] = node.lineno
             if name in {'eval', 'exec', 'compile', '__import__'}:
                 diagnostics.append({'code': 'UNSAFE_DYNAMIC_EXECUTION', 'line': node.lineno, 'column': node.col_offset + 1,
                                     'message': f'{name} is forbidden in an Office draft.', 'severity': 'error'})
+            if name == 'createInstance' and node.args and isinstance(node.args[0], ast.Constant) \
+                    and node.args[0].value == 'com.sun.star.drawing.ConnectorShape':
+                diagnostics.append({
+                    'code': 'RAW_CONNECTOR_SHAPE_UNSTABLE', 'line': node.lineno, 'column': node.col_offset + 1,
+                    'message': 'Raw ConnectorShape can dispose the LibreOffice bridge in large Impress decks. Use deck.add_connector(...) with the same stable elementId instead.',
+                    'severity': 'error',
+                })
             if name == 'expert':
                 expert_calls += 1
                 reason = node.args[0] if node.args else None
@@ -1193,12 +2016,16 @@ def uno_cookbook(document_type):
     known pattern instead of guessing from member names.
     """
     common_rules = [
-        'All geometry is in 1/100 mm. Read job.document_bounds(doc); never assume A4 or a slide size.',
+        'Raw UNO geometry is in 1/100 mm. Read document bounds and, for Impress, prefer deck.mm/cm/inch/pt plus the high-level layout components; never assume A4 or a slide size.',
         'CharHeight is always measured in typographic points (pt), not 1/100 mm. Assign the requested point value directly; never multiply by 35.28 or any geometry conversion factor.',
         'uno.Enum(typeName, memberName) is for UNO enum types. uno.getConstantByName(fullyQualifiedName) is for constant groups. Never substitute guessed integers.',
+        'Only import uno. Do not use from com.sun.star... imports in authored Python; this installed runtime resolves UNO enums, constants, and structs through uno.Enum(...), uno.getConstantByName(...), and uno.createUnoStruct(...).',
         'Create a fresh end cursor with cursor = doc.Text.createTextCursor(); cursor.gotoEnd(False) before appending Writer content.',
         'Use job.writer(element_id), job.presentation(element_id), or job.spreadsheet(element_id) by default. Every generated element requires a stable elementId.',
-        'For an unmodeled feature, call expert = job.expert(concrete_reason), create the raw UNO object through expert, and register every created object with expert.tag(target, element_id, kind, locator).',
+        'Element IDs are document-global. Every reusable helper accepts a caller-owned sid/id_prefix and derives distinct role suffixes; never reuse one suffix for a shape and its text or for multiple helper calls.',
+        'Duplicate requested IDs are deterministically disambiguated as warnings so generation can continue, but durable source must repair the shared helper namespace instead of renaming one reported instance.',
+        'For an unmodeled feature, call expert = job.expert(concrete_reason). If a stable facade already exists, use doc = expert.component(layout); otherwise create/open the raw document through expert and wrap it with the matching facade. Never guess layout.component/_component or use getattr(layout, ...). Register every created raw object with expert.tag(target, element_id, kind, locator).',
+        'Do not use expert/raw UNO merely as a capability demonstration. Prefer stable facade components and use raw services only for a concrete requested feature the facade cannot express.',
         'ControlCharacter has paragraph/line characters but no PAGE_BREAK member. Writer page breaks use the paragraph BreakType enum.',
         'For Impress TextShape objects, assign Position and Size, call page.add(shape), and only then assign String/Text and text formatting. Text written before page.add(shape) is lost by this LibreOffice runtime.',
         'For an existing-file modification plan, pass source_name=exactSourceAssetName to the matching stable facade. If expert access is required, call expert.open_document(name). Never create a replacement document.',
@@ -1341,20 +2168,56 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
             'Slide objects follow insertion order. Add full-slide backgrounds and decorative layers before text, images, and foreground content so later shapes do not cover earlier content.'
         )
         common_rules.append(
-            'Use deck.content_box(), deck.grid(), and deck.stack() for ordinary composition instead of hand-calculating every coordinate. The returned cells are guaranteed not to overlap.'
+            'Use deck.mm/cm/inch/pt for explicit units and deck.content_box(), deck.grid(), deck.stack(), deck.add_text_box(), deck.add_card(), deck.add_footer(), deck.add_native_table(), deck.add_bar_chart(), deck.add_line_chart(), deck.add_donut_chart(), and deck.add_timeline() for ordinary composition. Avoid hand-calculating unrelated coordinates.'
+        )
+        common_rules.append(
+            'For images that must not distort, use deck.add_image_contain() with a semantic box. Reserve deck.add_image() stretching for deliberate full-bleed backgrounds or already-cropped assets.'
+        )
+        common_rules.append(
+            'Images use conversation workspace asset paths resolved by job.asset_path(); LibreOffice embeds them into the saved Office package. They are not limited to Base64 source literals.'
+        )
+        common_rules.append(
+            'Use deck.add_text_link() for external URLs and click-to-jump slide links. target_slide_id is the stable element ID passed to deck.add_slide(), and forward references are allowed.'
+        )
+        common_rules.append(
+            'deck.add_native_table() creates an editable native Impress TableShape. PowerPoint tables have editable cell text and styling but do not provide spreadsheet-style cell formulas.'
+        )
+        common_rules.append(
+            'Stable presentation chart helpers create editable vector shapes, not native OOXML chart parts. Validation reports vectorChartCount separately from nativeChartCount; do not interpret nativeChartCount=0 as absence of visible data charts.'
+        )
+        common_rules.append(
+            'The high-level table, chart, and timeline components are the proven path used by the installed regression deck. Pass data and a grid cell; do not recreate their raw UNO services or internal coordinates in model-authored helpers.'
         )
         common_rules.append(
             'Text and images are collision-checked as content. add_shape defaults to decoration; pass layout_role="content", allow_overlap=False for semantic data shapes that must participate in collision checks. Set allow_overlap=True only for a deliberate overlay.'
         )
+        common_rules.append(
+            'Raw expert shape tags use the same rule: expert.tag(shape, element_id, "shape") is decorative by default. For a semantic bar, node, table cell, or chart mark, pass layout_role="content", allow_overlap=False. Text and image tags remain collision-checked content by default.'
+        )
         facade_signatures = [
             "deck.bounds() -> {'kind': 'presentation', 'width': int, 'height': int}",
-            "deck.content_box(margins=(1600, 1600, 1400, 1200)) -> {'x': int, 'y': int, 'width': int, 'height': int}",
+            "deck.mm(value), deck.cm(value), deck.inch(value), deck.pt(value) -> int geometry units",
+            "deck.text_height(font_size, lines=1, padding=0, line_spacing=1.22) -> safe height in 1/100 mm",
+            "deck.estimate_text_box(text, width, font_size=18, padding=0, min_font_size=None, line_spacing=1.22) -> text metrics",
+            "deck.content_box(margins={'left': 1600, 'right': 1600, 'top': 1400, 'bottom': 1200}) -> {'x': int, 'y': int, 'width': int, 'height': int}; legacy tuple order is (left, right, top, bottom)",
             "deck.grid(columns, rows, box=None, gap=500, column_weights=None, row_weights=None) -> list[rect]",
             "deck.stack(count, box=None, direction='vertical', gap=400, weights=None) -> list[rect]",
             "deck.add_slide(element_id)",
             "deck.add_text(element_id, page, text, x, y, width, height, font_size=18, color=0x000000, bold=False, italic=False, align='LEFT', font_name=None, fit='shrink', min_font_size=8, padding=0, valign='TOP', layout_role='content', allow_overlap=False)",
+            "deck.add_text_box(element_id, page, text, box, font_size=18, color=0x000000, bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None, padding=None, valign='TOP', layout_role='content', allow_overlap=False)",
+            "deck.add_card(element_id, page, box, title, body='', fill=0xFFFFFF, line=None, accent=None, title_size=20, body_size=14, title_color=0x0F172A, body_color=0x334155, padding=None, gap=None)",
+            "deck.add_footer(element_id, page, left='', center='', right='', height=None, background=None, accent=None, font_size=10, color=0x64748B, padding=None, left_url=None, center_url=None, right_url=None)",
             "deck.add_shape(element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape', fill=None, line=None, line_width=0, fill_transparency=0, layout_role='decoration', allow_overlap=True)",
+            "deck.add_connector(element_id, page, x1, y1, x2, y2, color=0x64748B, line_width=100, start_arrow=False, end_arrow=False, layout_role='decoration', allow_overlap=True)",
+            "deck.add_connector_between(element_id, page, source_box, target_box, color=0x64748B, line_width=100, start_arrow=False, end_arrow=True, axis='auto', source_inset=0, target_inset=0, layout_role='decoration', allow_overlap=True)",
             "deck.add_image(element_id, page, asset_name, x, y, width, height, layout_role='content', allow_overlap=False)",
+            "deck.add_image_contain(element_id, page, asset_name, box, padding=0, layout_role='content', allow_overlap=False)",
+            "deck.add_text_link(element_id, page, text, box, url=None, target_slide_id=None, font_size=18, color=0x2563EB, bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None, padding=None, valign='TOP', layout_role='content', allow_overlap=False)",
+            "deck.add_native_table(element_id, page, box, rows, column_weights=None, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT')",
+            "deck.add_bar_chart(element_id, page, box, categories, values, colors=None, font_size=10, color=0x334155, baseline_color=0xCBD5E1, value_format='{value:g}')",
+            "deck.add_line_chart(element_id, page, box, categories, values, color=0x2563EB, point_fill=0xFFFFFF, label_color=0x334155, font_size=9, value_format='{value:g}')",
+            "deck.add_donut_chart(element_id, page, box, labels, values, colors=None, hole_fill=0xFFFFFF, label_color=0x334155, font_size=10, center_text='', center_subtitle='', center_text_color=0x0F172A, center_text_size=20, center_subtitle_size=9)",
+            "deck.add_timeline(element_id, page, box, events, colors=None, title_size=12, body_size=9, text_color=0x334155)",
         ]
         operations = {
             'openExisting': '''deck = job.presentation('source-deck', source_name='exact-source-asset-name.pptx')
@@ -1362,16 +2225,46 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
             'bounds': '''bounds = job.document_bounds(doc)
 # Exact keys: kind, width, height. Values are 1/100 mm.
 slide_width, slide_height = bounds['width'], bounds['height']''',
-            'autoLayout': '''safe = deck.content_box(margins=(1600, 1600, 3200, 1400))
-cards = deck.grid(3, 1, box=safe, gap=700, column_weights=[1, 1, 1])
+            'autoLayout': '''safe = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(32), 'bottom': deck.mm(14)})
+cards = deck.grid(3, 1, box=safe, gap=deck.mm(7), column_weights=[1, 1, 1])
 for index, card in enumerate(cards):
-    deck.add_shape(f'slide-01/card-{index + 1}', page, card['x'], card['y'], card['width'], card['height'], fill=0xE8EEF7)
-    inner = deck.stack(2, box={
-        'x': card['x'] + 500, 'y': card['y'] + 500,
-        'width': card['width'] - 1000, 'height': card['height'] - 1000,
-    }, gap=250, weights=[1, 2])
-    deck.add_text(f'slide-01/card-{index + 1}/title', page, f'Card {index + 1}', **inner[0], font_size=22, bold=True)
-    deck.add_text(f'slide-01/card-{index + 1}/body', page, 'Body copy with measured wrapping.', **inner[1], font_size=16, min_font_size=16)''',
+    deck.add_card(
+        f'slide-01/card-{index + 1}', page, card, f'Card {index + 1}',
+        'Body copy with measured wrapping.', fill=0xE8EEF7, accent=0x2563EB,
+        title_size=22, body_size=16,
+    )
+deck.add_footer('slide-01/footer', page, left='UNO', center='Measured layout', right='01')''',
+            'connector': '''flow_box = deck.content_box(margins={'left': deck.mm(28), 'right': deck.mm(28), 'top': deck.mm(54), 'bottom': deck.mm(42)})
+source_box, target_box = deck.grid(2, 1, box=flow_box, gap=deck.mm(22))
+deck.add_connector_between(
+    'slide-01/flow-arrow', page, source_box, target_box,
+    color=0x2563EB, line_width=deck.mm(0.8), end_arrow=True,
+)''',
+            'nativeTable': '''table_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+deck.add_native_table(
+    'slide-01/data-table', page, table_box,
+    [['Metric', 'Value', 'Status'], ['Aperture', '6.5 m', 'Operational'], ['Orbit', 'L2', 'Stable']],
+    column_weights=[1.4, 1, 1], font_size=11,
+)''',
+            'dataCharts': '''chart_cells = deck.grid(2, 1, box=deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)}), gap=deck.mm(8))
+deck.add_bar_chart('slide-01/bar', page, chart_cells[0], ['A', 'B', 'C'], [42, 67, 91])
+deck.add_line_chart('slide-01/line', page, chart_cells[1], ['Q1', 'Q2', 'Q3', 'Q4'], [12, 29, 24, 44])''',
+            'donutAndTimeline': '''content = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+left, right = deck.grid(2, 1, box=content, gap=deck.mm(8), column_weights=[1, 1.35])
+deck.add_donut_chart('slide-01/donut', page, left, ['Science', 'Engineering', 'Operations'], [48, 32, 20], center_text='100%', center_subtitle='Allocation')
+deck.add_timeline('slide-01/timeline', page, right, [
+    {'title': 'T0', 'body': 'Launch'}, {'title': 'T+1m', 'body': 'Cruise'},
+    {'title': 'T+6m', 'body': 'First light'}, {'title': 'Now', 'body': 'Science'},
+])''',
+            'imageContain': '''image_box = deck.grid(2, 1, box=deck.content_box(), gap=deck.mm(8))[0]
+deck.add_image_contain('slide-01/hero', page, 'exact-name-returned-by-plan.jpg', image_box, padding=deck.mm(2))''',
+            'hyperlinks': '''# target_slide_id may point forward to a slide created later with the same stable ID.
+deck.add_text_link('slide-01/toc-science', page, 'Jump to science results',
+    {'x': deck.mm(18), 'y': deck.mm(52), 'width': deck.mm(90), 'height': deck.mm(10)},
+    target_slide_id='slide-06-science', font_size=16, bold=True)
+deck.add_text_link('slide-01/official-site', page, 'Official mission website',
+    {'x': deck.mm(18), 'y': deck.mm(66), 'width': deck.mm(90), 'height': deck.mm(10)},
+    url='https://science.nasa.gov/mission/webb/', font_size=13)''',
             'textShape': '''shape = doc.createInstance('com.sun.star.drawing.TextShape')
 position = uno.createUnoStruct('com.sun.star.awt.Point'); position.X, position.Y = 1600, 1200
 size = uno.createUnoStruct('com.sun.star.awt.Size'); size.Width, size.Height = 22000, 3000
@@ -1397,7 +2290,9 @@ card.Position, card.Size = position, size
 card.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')
 card.FillColor = 0x2563EB
 card.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
-page.add(card)''',
+page.add(card)
+expert.tag(card, 'slide-01/card', 'shape', layout_role='container', allow_overlap=True)
+# For a semantic chart mark instead, use layout_role='content', allow_overlap=False.''',
             'newSlide': '''page = doc.DrawPages.insertNewByIndex(doc.DrawPages.Count)
 # Add shapes only after assigning explicit Position and Size inside bounds.''',
             'save': save_examples['presentation'],
@@ -1405,14 +2300,64 @@ page.add(card)''',
         complete = '''def create_document(job):
     deck = job.presentation('deck')
     bounds = deck.bounds()
+    NAVY, BLUE, TEAL, GOLD = 0x0F172A, 0x2563EB, 0x10B981, 0xF59E0B
+    PAPER, WHITE, INK, MUTED = 0xF8FAFC, 0xFFFFFF, 0x1E293B, 0x64748B
+
+    def page_base(sid, title, index):
+        page = deck.add_slide(sid)
+        deck.add_shape(f'{sid}/background', page, 0, 0, bounds['width'], bounds['height'], fill=PAPER, layout_role='background', allow_overlap=True)
+        deck.add_shape(f'{sid}/top-rule', page, 0, 0, bounds['width'], deck.mm(2), fill=BLUE, layout_role='decoration', allow_overlap=True)
+        deck.add_text(f'{sid}/title', page, title, deck.mm(16), deck.mm(9), bounds['width'] - deck.mm(32), deck.mm(13), font_size=26, min_font_size=24, color=INK, bold=True)
+        deck.add_footer(f'{sid}/footer', page, left='UNO / LibreOffice', center='High-level facade', right=f'{index:02d}', accent=BLUE)
+        return page
+
     page = deck.add_slide('slide-01')
-    deck.add_shape('slide-01/background', page, 0, 0, bounds['width'], bounds['height'], fill=0xF8FAFC, layout_role='background', allow_overlap=True)
-    card = deck.grid(2, 1, box=deck.content_box(margins=(1600, 1600, 5200, 1800)), gap=800)[0]
-    deck.add_shape('slide-01/card', page, card['x'], card['y'], card['width'], card['height'], fill=0x2563EB, layout_role='container', allow_overlap=True)
-    deck.add_text('slide-01/title', page, 'UNO Impress deck', 1600, 1200, 22000, 3200, font_size=28, color=0x0F172A, bold=True)
+    deck.add_shape('slide-01/background', page, 0, 0, bounds['width'], bounds['height'], fill=NAVY, layout_role='background', allow_overlap=True)
+    deck.add_shape('slide-01/accent', page, deck.mm(18), deck.mm(35), deck.mm(2), deck.mm(72), fill=GOLD, layout_role='decoration', allow_overlap=True)
+    deck.add_text('slide-01/title', page, 'UNO presentation system', deck.mm(24), deck.mm(43), bounds['width'] - deck.mm(48), deck.mm(24), font_size=38, min_font_size=34, color=WHITE, bold=True)
+    deck.add_text('slide-01/subtitle', page, 'A proven, data-driven layout built from stable facade components', deck.mm(24), deck.mm(73), bounds['width'] - deck.mm(48), deck.mm(14), font_size=19, min_font_size=18, color=0xCBD5E1)
+    deck.add_footer('slide-01/footer', page, left='UNO / LibreOffice', center='Regression blueprint', right='01', color=0xCBD5E1, accent=GOLD)
+
+    page = page_base('slide-02', 'Measured cards and deterministic grids', 2)
+    card_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+    cards = deck.grid(3, 1, box=card_box, gap=deck.mm(7))
+    for index, (title, body, accent) in enumerate([
+        ('Structure', 'Grid cells own every content region.' , BLUE),
+        ('Typography', 'Text is measured before publication.', TEAL),
+        ('Quality', 'Overlap and bounds are validated.', GOLD),
+    ]):
+        deck.add_card(f'slide-02/card-{index + 1}', page, cards[index], title, body, fill=WHITE, line=0xCBD5E1, accent=accent, title_size=22, body_size=15)
+
+    page = page_base('slide-03', 'Native editable table', 3)
+    table_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+    deck.add_native_table('slide-03/table', page, table_box, [
+        ['Capability', 'Implementation', 'Verification'],
+        ['Text', 'Measured TextShape', 'Overflow gate'],
+        ['Tables', 'Native TableShape', 'Reopen check'],
+        ['Charts', 'Stable vector marks', 'Overlap gate'],
+        ['Images', 'Aspect-ratio contain', 'Bounds gate'],
+    ], column_weights=[1.1, 1.6, 1.2], font_size=11)
+
+    page = page_base('slide-04', 'Data graphics without raw coordinate choreography', 4)
+    chart_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+    bar_box, line_box = deck.grid(2, 1, box=chart_box, gap=deck.mm(9))
+    deck.add_bar_chart('slide-04/bar', page, bar_box, ['A', 'B', 'C', 'D'], [42, 67, 54, 91], colors=[BLUE, TEAL, GOLD, 0x8B5CF6])
+    deck.add_line_chart('slide-04/line', page, line_box, ['Q1', 'Q2', 'Q3', 'Q4', 'Q5'], [12, 29, 24, 44, 51], color=TEAL)
+
+    page = page_base('slide-05', 'Composition: donut and timeline', 5)
+    visual_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
+    donut_box, timeline_box = deck.grid(2, 1, box=visual_box, gap=deck.mm(9), column_weights=[1, 1.4])
+    deck.add_donut_chart('slide-05/donut', page, donut_box, ['Science', 'Engineering', 'Operations'], [48, 32, 20], colors=[BLUE, TEAL, GOLD], center_text='100%', center_subtitle='Allocation')
+    deck.add_timeline('slide-05/timeline', page, timeline_box, [
+        {'title': 'T0', 'body': 'Launch'},
+        {'title': 'T+1m', 'body': 'Cruise'},
+        {'title': 'T+6m', 'body': 'First light'},
+        {'title': 'Now', 'body': 'Science'},
+    ], colors=[BLUE, TEAL, GOLD, 0x8B5CF6])
+
     deck.save()
     deck.close()'''
-        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'safe content boxes', 'grid and stack auto-layout', 'text shapes with measured fixed bounds', 'content collision diagnostics', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
+        coverage = ['create/save PPT/PPTX/ODP/PDF', 'native slide bounds', 'explicit unit conversion', 'safe content boxes', 'grid and stack auto-layout', 'measured text boxes', 'high-level cards and footers', 'native editable TableShape', 'vector bar charts', 'vector line charts', 'donut charts', 'alternating timelines', 'aspect-ratio-safe images', 'stable connectors and arrows', 'content collision diagnostics', 'graphic shapes', 'filled shapes', 'new slides', 'explicit in-slide geometry']
     facade_name = {'word': 'writer', 'spreadsheet': 'spreadsheet', 'presentation': 'presentation'}[document_type]
     modification = f'''def create_document(job):
     # Replace this placeholder with sourceDocument.assetName returned by action=plan.
@@ -1423,6 +2368,9 @@ page.add(card)''',
     # Locate and edit only the requested existing content here.
     layout.save()
     layout.close()'''
+    operations['expertFromFacade'] = '''expert = job.expert('The requested feature is not exposed by the stable facade.')
+doc = expert.component(layout)
+# Use doc only for that unmodeled feature and expert.tag(...) every raw object.'''
     return {
         'status': 'copy these installed-runtime patterns; do not paraphrase them into guessed UNO calls',
         'coverage': coverage,
@@ -1570,6 +2518,7 @@ def map_issue(issue, element_map, artifact_name=None, locator=None):
     if match:
         issue.update({
             'elementId': match.get('elementId'), 'line': match.get('line'), 'column': match.get('column'),
+            'callLine': match.get('callLine'), 'callColumn': match.get('callColumn'),
             'locator': match.get('locator'),
         })
     return issue
@@ -1679,8 +2628,10 @@ def verify_presentation_layout(component, element_map=None):
 
     Backgrounds, containers and decoration are excluded from collision checks.
     Content overlap is allowed only when the authored element record explicitly
-    opts in with ``allowOverlap``. This keeps ordinary overlay design possible
-    without making every unmarked model-authored collision invisible.
+    opts in with ``allowOverlap``. Untyped raw shapes match ``deck.add_shape``
+    and default to decoration; raw semantic shapes must opt in with
+    ``layoutRole=content``. This keeps card/background underlays out of the
+    collision graph without making text or image collisions invisible.
     """
     issues, page_occupancy = [], []
     checked_text_shapes = checked_content_shapes = 0
@@ -1753,7 +2704,9 @@ def verify_presentation_layout(component, element_map=None):
                 }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
             layout = mapped.get('layout') if isinstance(mapped.get('layout'), dict) else {}
             locator = mapped.get('locator') if isinstance(mapped.get('locator'), dict) else {}
-            role = str(layout.get('role') or locator.get('layoutRole') or 'content').strip().lower()
+            explicit_role = layout.get('role') or locator.get('layoutRole')
+            default_role = 'decoration' if kind == 'shape' else 'content'
+            role = str(explicit_role or default_role).strip().lower()
             allow_overlap = bool(layout.get('allowOverlap', locator.get('allowOverlap', False)))
             if role in {'background', 'container', 'decoration'} or allow_overlap:
                 continue
@@ -2117,7 +3070,9 @@ def main():
     print(json.dumps({
         'bytes': output.stat().st_size, 'output': str(output), 'preview': str(preview),
         'renderer': 'libreoffice-uno', 'verification': verification, 'elementMap': job.element_map(),
+        'featureCounts': job.feature_counts,
         'staticDiagnostics': namespace.get('__webpilot_static_diagnostics__', []),
+        'runtimeDiagnostics': job.runtime_diagnostics,
     }, ensure_ascii=False))
 
 

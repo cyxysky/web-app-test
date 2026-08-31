@@ -3875,6 +3875,7 @@ export async function sendBrowserChatMessage(
   const selectedSkills = store.getSkills(skillIds, session.userId).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
+  const firstMessageTitleText = text || (attachments.length ? '' : messageText);
   const skillReferences = formatSkillReferencesForUser(selectedSkills);
   const referencedAttachmentIds = inlineReferencedIds(messageText, 'ref');
   const inlineMessageText = contentWithInlineReferencesForPrompt(messageText, attachments);
@@ -3903,7 +3904,7 @@ export async function sendBrowserChatMessage(
     }
     const queuedAt = nextBrowserChatMessageTimestamp(session);
     const firstUserMessage = !session.messages.some((message) => message.role === 'user');
-    if (firstUserMessage) session.title = browserChatFirstMessageTitle(messageText, attachments);
+    if (firstUserMessage) session.title = browserChatFirstMessageTitle(firstMessageTitleText, attachments);
     const userMessage: BrowserChatMessage = {
       id: id('msg'),
       role: 'user',
@@ -3942,7 +3943,7 @@ export async function sendBrowserChatMessage(
   session.modelProvider = modelSettings.provider;
   session.model = modelSettings.model;
   const firstUserMessage = !session.messages.some((message) => message.role === 'user');
-  if (firstUserMessage) session.title = browserChatFirstMessageTitle(messageText, attachments);
+  if (firstUserMessage) session.title = browserChatFirstMessageTitle(firstMessageTitleText, attachments);
 
   const timestamp = nextBrowserChatMessageTimestamp(session);
   const fromStepIndex = Math.max(0, ...session.steps.map((step) => step.index)) + 1;

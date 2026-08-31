@@ -33,6 +33,33 @@ test('allows facade calls without statically requiring element IDs', async () =>
   assert.equal(result.passed, true);
 });
 
+test('keeps duplicate literal element IDs as a non-blocking source-quality warning', async () => {
+  const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    page = deck.add_slide('slide-01')
+    deck.add_text('slide-01/title', page, 'First', 100, 100, 2000, 1000)
+    deck.add_text('slide-01/title', page, 'Second', 100, 1200, 2000, 1000)
+    deck.save()
+    deck.close()`, 'uno');
+  if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+  const diagnostic = result.diagnostics.find((item) => item.code === 'DUPLICATE_ELEMENT_ID');
+  assert.equal(result.passed, true);
+  assert.equal(diagnostic?.severity, 'warning');
+  assert.match(diagnostic?.message || '', /disambiguate it deterministically/);
+});
+
+test('rejects stable facade methods called on an expert raw UNO document', async () => {
+  const result = await analyzeOfficeProgram(`def create_document(job):
+    expert = job.expert('need a raw Impress component')
+    doc = expert.new_document('impress')
+    page = doc.add_slide('slide-01')`, 'uno');
+  if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+  assert.equal(result.passed, false);
+  const diagnostic = result.diagnostics.find((item) => item.code === 'FACADE_METHOD_ON_RAW_UNO_DOCUMENT');
+  assert.match(diagnostic?.message || '', /doc\.add_slide/);
+  assert.match(diagnostic?.sourceExcerpt || '', /page = doc\.add_slide/);
+});
+
 test('includes both ends of a mismatched Python bracket in the syntax diagnostic excerpt', async () => {
   const result = await analyzeOfficeProgram(`def create_document(job):
     values = (

@@ -24,6 +24,8 @@ import {
 import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
+  OfficeVisualQaDeckChecks,
+  OfficeVisualQaPageChecks,
 } from '@/server/files/office-document-spec';
 import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
 import type { BrowserCodeAttachmentBinding } from '@/server/browser/browser-code-runner';
@@ -40,7 +42,42 @@ const downloadDomainQueues = new Map<string, Promise<void>>();
 const downloadDomainCooldowns = new Map<string, number>();
 const DRAFT_LOCK_WAIT_MS = 120_000;
 const STALE_DRAFT_LOCK_MS = 10 * 60_000;
-const OFFICE_PIPELINE_VERSION = 'office-pipeline-v6-uno-strict-validation';
+const MODEL_DIAGNOSTIC_LIMIT = 24;
+const TOOL_ERROR_MAX_CHARACTERS = 6_000;
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v8-visual-quality-links-and-features';
+const VISUAL_QA_PAGE_CHECKS = [
+  'overlap', 'clipping', 'alignment', 'spacing', 'typography', 'contrast',
+  'visualHierarchy', 'chartTableLegibility', 'imageQuality',
+] as const;
+const VISUAL_QA_DECK_CHECKS = [
+  'templateConsistency', 'typographyConsistency', 'colorConsistency',
+  'spacingRhythm', 'componentConsistency',
+] as const;
+
+function failedPageVisualChecks(checks: OfficeVisualQaPageChecks | undefined) {
+  if (!checks || typeof checks !== 'object') return { invalid: [...VISUAL_QA_PAGE_CHECKS], failed: [] as string[] };
+  const invalid: string[] = [];
+  const failed: string[] = [];
+  for (const name of VISUAL_QA_PAGE_CHECKS) {
+    const status = checks[name];
+    if (status !== 'passed' && status !== 'failed' && status !== 'not-applicable') invalid.push(name);
+    else if (status === 'not-applicable' && name !== 'chartTableLegibility' && name !== 'imageQuality') invalid.push(name);
+    else if (status === 'failed') failed.push(name);
+  }
+  return { invalid, failed };
+}
+
+function failedDeckVisualChecks(checks: OfficeVisualQaDeckChecks | undefined) {
+  if (!checks || typeof checks !== 'object') return { invalid: [...VISUAL_QA_DECK_CHECKS], failed: [] as string[] };
+  const invalid: string[] = [];
+  const failed: string[] = [];
+  for (const name of VISUAL_QA_DECK_CHECKS) {
+    const status = checks[name];
+    if (status !== 'passed' && status !== 'failed') invalid.push(name);
+    else if (status === 'failed') failed.push(name);
+  }
+  return { invalid, failed };
+}
 
 type DownloadArtifactInput = {
   runId?: string;
@@ -93,6 +130,8 @@ export type UnoDraftLineEdit = {
   oldText?: string;
   /** One-based occurrence for replaceText; omitted requires a unique match. */
   occurrence?: number;
+  /** replaceRange applies newText exactly; opt in only when newText is relative to the replaced block. */
+  preserveIndent?: boolean;
   newText: string;
 };
 
@@ -101,11 +140,7 @@ type EditUnoProgramInput = {
   documentId?: string;
   /** Optional @webpilot-unit path. Edits are scoped to that page/section source unit. */
   path?: string;
-  /** Optional legacy digest. A single chat owns its draft, so edits use the current source. */
-  baseDigest?: string;
   edits?: UnoDraftLineEdit[];
-  patch?: string;
-  restoreRevision?: number;
   program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
@@ -127,6 +162,9 @@ type ReadUnoDraftInput = {
   runId?: string;
   documentId?: string;
   path?: string;
+  /** Optional one-based source window. For a unit path, lines are local to that unit. */
+  startLine?: number;
+  endLine?: number;
 };
 
 type RenderArtifactInput = {
@@ -161,9 +199,9 @@ type ArtifactToolPayload = {
   cacheHit?: boolean;
   validation?: string;
   validationStatus?: string;
+  validationFailureCount?: number;
+  requiredNextAction?: string;
   saved?: boolean;
-  currentRevision?: number | null;
-  lastSuccessfulRevision?: number | null;
   error?: string;
   recoverySuggestion?: string;
   repairHints?: string[];
@@ -194,6 +232,34 @@ type ArtifactToolPayload = {
     status?: string;
   };
 };
+
+function compactToolText(value: unknown, limit = TOOL_ERROR_MAX_CHARACTERS) {
+  const text = String(value || '');
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n… ${text.length - limit} additional characters omitted; use the structured diagnostics and bounded source reads.`;
+}
+
+function compactValidationDiagnosticsForTool(
+  diagnostics: OfficeDocumentDraft['validationDiagnostics'],
+): NonNullable<OfficeDocumentDraft['validationDiagnostics']> {
+  const values = diagnostics || [];
+  if (values.length <= MODEL_DIAGNOSTIC_LIMIT) {
+    return values.map((diagnostic) => ({ ...diagnostic, message: compactToolText(diagnostic.message, 1_500) }));
+  }
+  return [
+    ...values.slice(0, MODEL_DIAGNOSTIC_LIMIT - 1)
+      .map((diagnostic) => ({ ...diagnostic, message: compactToolText(diagnostic.message, 1_500) })),
+    {
+      code: 'DIAGNOSTICS_TRUNCATED',
+      message: `${values.length - (MODEL_DIAGNOSTIC_LIMIT - 1)} additional diagnostics are retained in the saved validation artifact. Repair the listed primary sources or replace the failed architecture; do not request the complete list repeatedly.`,
+      severity: 'warning',
+    },
+  ];
+}
+
+function compactWorkflowForTool(workflow: OfficeDocumentDraft['workflow']) {
+  return workflow ? { ...workflow, error: workflow.error ? compactToolText(workflow.error) : undefined } : undefined;
+}
 
 export type FileArtifactToolResult = {
   name: string;
@@ -557,6 +623,8 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
     : [];
   return [
     `error=${error}`,
+    payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
+    payload.validationFailureCount ? `consecutiveValidationFailures=${payload.validationFailureCount}` : '',
     diagnostics.length ? `diagnostics=${diagnostics.join(' | ')}` : '',
     repairHints.length ? `repairHints=${repairHints.join(' | ')}` : '',
     payload.recoverySuggestion ? `recovery=${String(payload.recoverySuggestion).replace(/\s+/g, ' ').trim().slice(0, 500)}` : '',
@@ -571,10 +639,13 @@ export function officeValidationRepairHints(
   const combinedError = [errorText, ...diagnostics.map((diagnostic) => diagnostic.message || '')].join('\n');
   const hints: string[] = [];
   if (codes.has('PYTHON_SYNTAX')) {
-    hints.push('Repair only the exact block shown in the diagnostic sourceExcerpt. It includes the reported line and any opening-line reference from Python. Do not replace the complete source while a local syntax error remains.');
+    hints.push('Repair only the exact block shown in the diagnostic sourceExcerpt. For unexpected indent, replace the exact offending line or smallest complete Python block and preserve the indentation copied from read; do not repeat unchanged neighboring lines or enable preserveIndent. The excerpt includes any opening-line reference from Python. Do not replace the complete source while a local syntax error remains.');
   }
   if (codes.has('PYTHON_UNDEFINED_NAME')) {
     hints.push('Define the reported name before first use or replace it with the intended existing variable. Repair the exact sourceExcerpt; do not use numbered batch replacement for a local name error.');
+  }
+  if (codes.has('UNO_PYTHON_IMPORT_UNSUPPORTED')) {
+    hints.push('Remove only the reported from com.sun.star... import. Keep import uno and replace imported enums, constants, or structs with the exact uno.Enum(...), uno.getConstantByName(...), or uno.createUnoStruct(...) form returned by unoApi; do not invent aliases such as _FS or _LS.');
   }
   if (codes.has('DRAFT_ENTRYPOINT_CALLED_DIRECTLY')) {
     hints.push('Delete the direct create_document(...) call. The LibreOffice worker invokes create_document(job) with the real job object; the draft must only define that function.');
@@ -583,10 +654,40 @@ export function officeValidationRepairHints(
     hints.push('Repair the exact reported add_text/add_shape/add_image call. Keep x/y >= 0, width/height > 0, and x+width/y+height inside deck.bounds(); for repeated elements, verify every loop iteration.');
   }
   if (codes.has('PRESENTATION_TEXT_OVERFLOW')) {
-    hints.push('Increase the reported text box, shorten its copy, or redesign that local block. The facade measured the text with LibreOffice fonts and refused to shrink below min_font_size.');
+    hints.push('Increase the reported text box, shorten its copy, or redesign that local block. Use deck.text_height()/estimate_text_box() or add_text_box/card/footer so pt text is converted to 1/100 mm geometry safely. Do not auto-grow a shared helper without reflowing its dependent layout.');
+  }
+  if (codes.has('PRESENTATION_TEXT_BOX_TOO_SHORT')) {
+    hints.push('The source mixes point font sizes with an undersized 1/100 mm geometry box. Replace the hand-sized height with deck.text_height()/estimate_text_box(), or use add_text_box/card/footer; keep min_font_size readable.');
+  }
+  if (codes.has('SOURCE_UNITS_REQUIRED')) {
+    hints.push('Add @webpilot-unit/@webpilot-endunit markers around independent pages, sections, or sheets. Direct presentation slides, Writer add_page_break page blocks, and sequential Calc add_worksheet sheet blocks are indexed automatically when recognizable. Then read and edit one path at a time.');
+  }
+  if (codes.has('FACADE_METHOD_ON_RAW_UNO_DOCUMENT')) {
+    hints.push('Do not call presentation/writer/spreadsheet facade methods on expert.new_document/open_document results. Create a facade with job.presentation(..., component=rawDoc), job.writer(..., component=rawDoc), or job.spreadsheet(..., component=rawDoc), and make all stable layout calls on that facade variable. If this receiver mistake is repeated throughout the source, replace the failed draft atomically with action=generate instead of patching every call.');
+  }
+  if (codes.has('FACADE_COMPONENT_ACCESS_UNSUPPORTED')) {
+    hints.push('Do not guess facade internals or use getattr(layout, ...). Keep the existing facade, declare expert = job.expert(reason), and obtain its raw document with doc = expert.component(layout); use it only for the unmodeled feature and tag every created raw object.');
   }
   if (codes.has('DUPLICATE_ELEMENT_ID')) {
-    hints.push('Rename only the later duplicate elementId so every generated object has one stable unique ID. Do not rename unrelated elements.');
+    hints.push('The runtime deterministically disambiguates duplicate IDs so this warning no longer blocks generation. For durable source, repair the reusable helper once: accept a caller prefix and use distinct role suffixes such as /dot, /dot-inner, and /description. Do not regenerate the complete document for this warning.');
+  }
+  if (codes.has('ELEMENT_ID_AUTO_DISAMBIGUATED')) {
+    hints.push('The artifact was kept valid by deterministic runtime ID disambiguation. On the next relevant edit, update the shared helper namespace once instead of renaming only the last reported object or rewriting the complete source.');
+  }
+  if (codes.has('UNO_BRIDGE_DISPOSED')) {
+    hints.push('The runtime already retried once with a fresh isolated LibreOffice profile. If the bridge still disconnected at the same raw UNO call, replace only that expert helper with a stable facade operation or a simpler tagged object; do not rewrite unrelated pages.');
+  }
+  if (codes.has('RAW_CONNECTOR_SHAPE_UNSTABLE')) {
+    hints.push('Replace only the reported raw ConnectorShape helper with deck.add_connector(elementId, page, x1, y1, x2, y2, ...). Preserve the helper signature and caller IDs where possible; do not rewrite the document.');
+  }
+  if (codes.has('HELPER_FIXED_ELEMENT_ID')) {
+    hints.push('A reusable helper registers one fixed elementId for multiple objects. Add an id-prefix parameter and derive IDs such as f"{sid}/background"; update every helper call in the same focused edit.');
+  }
+  if (codes.has('HELPER_CALL_SIGNATURE_MISMATCH')) {
+    hints.push('The local helper definition and its callers disagree. Read the helper symbol and update its signature plus every affected call together; this is not a UNO facade API error.');
+  }
+  if (codes.has('HELPER_OVERLAP_DEFAULT_ENABLED')) {
+    hints.push('Default reusable layout helpers to allow_overlap=False. Pass True only at explicit background, container, or decorative call sites so content overlap remains detectable.');
   }
   if (codes.has('PPTX_ELEMENT_ID_MISSING')) {
     hints.push('A serialized slide object lacks a wp_ element marker. Create it through the presentation facade, or call expert.tag on the exact raw object immediately after adding it. Renaming unrelated IDs or page-number text cannot fix this diagnostic.');
@@ -598,7 +699,7 @@ export function officeValidationRepairHints(
     hints.push('Move or resize only the reported text element inside deck.bounds(). The stable facade now keeps text boxes at their requested size, so do not compensate with guessed page dimensions.');
   }
   if (codes.has('RUNTIME_TEXT_OVERLAP')) {
-    hints.push('Separate or resize the reported text boxes. The overlap covers at least 20% of the smaller box and is blocked before publication.');
+    hints.push('Repair the primary reported element before its related elements, then validate again. Separate or resize only that local block; do not change a shared layout helper unless every caller is intentionally reflowed.');
   }
   if (codes.has('RUNTIME_IMAGE_OVERLAP')) {
     hints.push('Move or resize the reported images so they no longer overlap. If a collage is intentional, compose it as one image asset before placing it.');
@@ -609,8 +710,11 @@ export function officeValidationRepairHints(
   if (codes.has('EXPERT_ELEMENTS_NOT_TAGGED')) {
     hints.push('Every raw object created through expert mode must be registered with expert.tag(target, element_id, kind, locator).');
   }
-  if (/unexpected keyword argument/i.test(errorText)) {
+  if (/unexpected keyword argument/i.test(errorText) && !/create_document\.<locals>\.[A-Za-z_][A-Za-z0-9_]*\(\)/i.test(errorText)) {
     hints.push('The facade rejected a guessed keyword. Query unoApi for the planned document and copy its exact facadeSignatures before editing the failing call.');
+  }
+  if (/create_document\.<locals>\.([A-Za-z_][A-Za-z0-9_]*)\(\).*unexpected keyword argument/i.test(errorText)) {
+    hints.push('A locally defined helper rejected the keyword. Update that helper signature and all of its callers together; querying unoApi will not change a user-defined Python function.');
   }
   if (/Direct job\.(?:new_document|open_document)\(\) is expert-only/i.test(errorText)) {
     hints.push('Use the matching stable job.writer/job.presentation/job.spreadsheet facade; use job.expert(reason) only for an unmodeled operation and tag every created raw object.');
@@ -646,15 +750,23 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
     }
     if (payload.kind === 'uno-draft-validation') {
       if (payload.validation === 'failed' || payload.validationStatus === 'failed') {
-        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; ${compactOfficeFailure(payload)}`;
+        return `Office source validation failed: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; ${compactOfficeFailure(payload)}`;
       }
       return [
         `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`,
+        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
         compactAutomaticValidation(payload),
       ].filter(Boolean).join('; ');
     }
     if (payload.kind === 'office-source-unit-validation' && payload.validation === 'failed') {
-      return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; currentRevision=${payload.currentRevision ?? 'none'}; lastSuccessfulRevision=${payload.lastSuccessfulRevision ?? 'none'}; ${compactOfficeFailure(payload)}`;
+      return `Office source-unit validation failed: Document ID: ${payload.documentId}; workingSourceSaved=${payload.saved === true}; ${compactOfficeFailure(payload)}`;
+    }
+    if (payload.kind === 'office-source-unit-validation' && payload.validation === 'passed') {
+      return [
+        `Office source unit validated: Document ID: ${payload.documentId}; sourceUnitPath=${String((payload as Record<string, unknown>).sourceUnitPath || '')}`,
+        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
+        compactAutomaticValidation(payload),
+      ].filter(Boolean).join('; ');
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
     const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
@@ -853,14 +965,6 @@ function draftProgramPath(runId: string | undefined, documentId: string, generat
     artifactDir(runId, 'document-drafts'),
     `${sanitizeFileName(documentId, 'document')}${generator === 'javascript' ? '.mjs' : '.py'}`,
   );
-}
-
-function draftRevisionDirectory(runId: string | undefined, documentId: string) {
-  return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.revisions`);
-}
-
-function draftRevisionFileName(revision: number, generator: OfficeDocumentDraft['generator'] = 'javascript') {
-  return `${String(revision).padStart(6, '0')}${generator === 'javascript' ? '.mjs' : '.py'}`;
 }
 
 function draftTransactionPath(runId: string | undefined, documentId: string) {
@@ -1178,9 +1282,18 @@ async function recoverDraftTransaction(runId: string | undefined, documentId: st
 
 async function loadDraft(runId: string | undefined, documentId: string) {
   await recoverDraftTransaction(runId, documentId);
-  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft & { revision?: unknown };
-  // Migrate metadata written by the retired caller-visible revision protocol.
+  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft & {
+    currentRevision?: unknown;
+    revision?: unknown;
+    revisions?: unknown;
+    validatedRevision?: unknown;
+  };
+  // Migrate metadata written by the retired editor revision protocol. A
+  // documentId owns one current source file; old history metadata is ignored.
+  delete parsed.currentRevision;
   delete parsed.revision;
+  delete parsed.revisions;
+  delete parsed.validatedRevision;
   parsed.generator ||= 'javascript';
   parsed.operation ||= parsed.sourceDocument ? 'modify' : 'create';
   parsed.renderedDigest ||= parsed.renderedSourceDigest;
@@ -1203,7 +1316,7 @@ async function loadDraft(runId: string | undefined, documentId: string) {
       const workspaceProgram = await readFile(draftProgramPath(runId, documentId, parsed.generator), 'utf8');
       const workspaceDigest = sourceDigest(workspaceProgram);
       if (parsed.sourceDigest && parsed.sourceDigest !== workspaceDigest) {
-        throw new Error('Workspace source file does not match its saved source metadata. Read the draft again or restore it before editing.');
+        throw new Error('Workspace source file does not match its saved source metadata. Reload the workspace before editing.');
       }
       // The file is the executable source of truth; JSON contains metadata only.
       parsed.program = workspaceProgram;
@@ -1242,14 +1355,15 @@ export type OfficeDraftCatalogEntry = {
   documentType: OfficeDocumentKind;
   fileName: string;
   generator: 'javascript' | 'uno';
-  revision: number | null;
   sourceDigest: string | null;
   validatedSourceDigest: string | null;
   validationStatus: OfficeDocumentDraft['validationStatus'] | null;
+  validationFailureCount: number;
   renderedDigest: string | null;
   visualQaDigest: string | null;
   visualQaFailedPages?: number[];
   visualQaFailureSummary?: string[];
+  visualQaDeckStatus?: 'failed' | 'passed';
   state: NonNullable<OfficeDocumentDraft['workflow']>['state'];
   updatedAt: string;
 };
@@ -1277,15 +1391,18 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         documentType: draft.documentType,
         fileName: draft.fileName,
         generator: draft.generator || 'javascript',
-        revision: draft.currentRevision || null,
         sourceDigest: draft.sourceDigest || null,
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || null,
+        validationFailureCount: draft.validationFailureCount || 0,
         renderedDigest: draft.renderedDigest || draft.renderedSourceDigest || null,
         visualQaDigest: draft.visualQaDigest || null,
         visualQaFailedPages: failedReviews.map((review) => review.pageNumber),
         visualQaFailureSummary: failedReviews.flatMap((review) => review.issues
-          .map((issue) => `page ${review.pageNumber}: ${issue.type}: ${issue.description}`)).slice(0, 20),
+          .map((issue) => `page ${review.pageNumber}: ${issue.type}: ${issue.description}`))
+          .concat((draft.visualQaDeckReview?.issues || []).map((issue) => `whole artifact: ${issue.type}: ${issue.description}`))
+          .slice(0, 20),
+        visualQaDeckStatus: draft.visualQaDeckReview?.status,
         state: draft.workflow?.state || (draft.program ? 'authoring' : 'planned'),
         updatedAt: draft.updatedAt,
       });
@@ -1311,7 +1428,7 @@ export async function officeDraftCatalogForPrompt(runId: string | undefined) {
   return [
     '[Current Office draft catalog - trusted runtime metadata]',
     'Resume an existing logical document with its exact documentId. Do not guess an ID or create a replacement unless the user explicitly requests a new document.',
-    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | revision=${draft.revision ?? 'none'} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'}${draft.visualQaFailedPages?.length ? ` | visualQaFailedPages=${draft.visualQaFailedPages.join(',')} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
+    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | validationFailureCount=${draft.validationFailureCount} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | visualQaDeckStatus=${draft.visualQaDeckStatus || 'none'}${draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? ` | visualQaFailedPages=${draft.visualQaFailedPages?.join(',') || 'none'} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
   ].join('\n');
 }
 
@@ -1325,12 +1442,15 @@ export async function pendingOfficeDocumentWork(
     requiredNextAction: 'edit' | 'generate' | 'render' | 'fileVisual';
   }>>((pending, draft) => {
     if (!draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'generate' });
-    else if (draft.validationStatus === 'failed') pending.push({ ...draft, requiredNextAction: 'edit' });
+    else if (draft.validationStatus === 'failed') pending.push({
+      ...draft,
+      requiredNextAction: 'edit',
+    });
     else if (draft.renderedDigest !== draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'render' });
     else if (draft.state === 'qa-pending' && options.requireVisualQa !== false) {
       pending.push({
         ...draft,
-        requiredNextAction: draft.visualQaFailedPages?.length ? 'edit' : 'fileVisual',
+        requiredNextAction: draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? 'edit' : 'fileVisual',
       });
     }
     return pending;
@@ -1371,34 +1491,10 @@ async function saveDraft(runId: string | undefined, draft: OfficeDocumentDraft) 
   draft.updatedAt = new Date().toISOString();
   draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
   if (draft.program) synchronizeSourceUnits(draft);
-  if (draft.program && draft.sourceDigest) {
-    const revisions = Array.isArray(draft.revisions) ? [...draft.revisions] : [];
-    const latest = revisions.at(-1);
-    if (!latest || latest.sourceDigest !== draft.sourceDigest) {
-      const revision = Math.max(0, ...revisions.map((item) => Number(item.revision) || 0)) + 1;
-      const sourceFileName = draftRevisionFileName(revision, draft.generator);
-      const revisionDirectory = draftRevisionDirectory(runId, draft.documentId);
-      const revisionTarget = path.join(revisionDirectory, sourceFileName);
-      const revisionCandidate = path.join(revisionDirectory, `.${sourceFileName}.${randomUUID()}.tmp`);
-      await mkdir(revisionDirectory, { recursive: true });
-      try {
-        await writeFile(revisionCandidate, draft.program, { encoding: 'utf8', flag: 'wx' });
-        await rename(revisionCandidate, revisionTarget);
-      } finally {
-        await unlink(revisionCandidate).catch(() => undefined);
-      }
-      revisions.push({ revision, sourceDigest: draft.sourceDigest, createdAt: draft.updatedAt, sourceFileName });
-      draft.currentRevision = revision;
-      draft.revisions = revisions;
-    } else {
-      draft.currentRevision = latest.revision;
-      draft.revisions = revisions;
-    }
-  }
   await writeDraftWorkspace(runId, draft);
 }
 
-/** Save the one editable source buffer without creating a validated revision. */
+/** Save the one editable source buffer after a failed validation. */
 async function saveWorkingDraft(runId: string | undefined, draft: OfficeDocumentDraft) {
   draft.updatedAt = new Date().toISOString();
   draft.sourceDigest = draft.program ? sourceDigest(draft.program) : undefined;
@@ -1411,6 +1507,7 @@ function invalidateActiveVisualQa(draft: OfficeDocumentDraft) {
   draft.visualQaPageCount = undefined;
   draft.visualQaSeenPages = [];
   draft.visualQaReviews = [];
+  draft.visualQaDeckReview = undefined;
   draft.visualQaPageDigests = [];
 }
 
@@ -1425,10 +1522,15 @@ function normalizedDraftSource(source: string) {
 type ParsedSourceUnit = {
   content: string;
   endLine: number;
+  inferred?: boolean;
+  kind?: 'explicit' | 'page' | 'sheet' | 'symbol';
   path: string;
   startLine: number;
+  symbolName?: string;
 };
 
+const LARGE_SOURCE_LINE_THRESHOLD = 300;
+const MAX_SOURCE_READ_LINES = 240;
 const SOURCE_UNIT_START = /^\s*(?:#|\/\/)\s*@webpilot-unit\s+([A-Za-z0-9][A-Za-z0-9._/-]{0,159})\s*$/;
 const SOURCE_UNIT_END = /^\s*(?:#|\/\/)\s*@webpilot-endunit\s*$/;
 
@@ -1438,6 +1540,20 @@ function normalizedSourceUnitPath(value: string | undefined) {
     throw new Error('Office source unit path must be a relative path using letters, numbers, dot, underscore, slash, or hyphen.');
   }
   return unitPath;
+}
+
+function sourceUnitForRequestedPath(units: ParsedSourceUnit[], requestedPath: string | undefined) {
+  if (!requestedPath) return undefined;
+  const exact = units.find((unit) => unit.path === requestedPath);
+  if (exact) return exact;
+  const legacySlide = /^pages\/slide-0*(\d+)$/i.exec(requestedPath)?.[1];
+  if (!legacySlide) return undefined;
+  const slideNumber = Number(legacySlide);
+  const semanticMatches = units.filter((unit) => {
+    const authoredNumber = /^pages\/(?:s|slide-)0*(\d+)(?:[-_/]|$)/i.exec(unit.path)?.[1];
+    return authoredNumber !== undefined && Number(authoredNumber) === slideNumber;
+  });
+  return semanticMatches.length === 1 ? semanticMatches[0] : undefined;
 }
 
 function parseSourceUnits(source: string): ParsedSourceUnit[] {
@@ -1453,11 +1569,296 @@ function parseSourceUnits(source: string): ParsedSourceUnit[] {
     if (endMarker < 0) throw new Error(`Office source unit ${unitPath} is missing @webpilot-endunit.`);
     const nested = lines.slice(index + 1, endMarker).find((line) => SOURCE_UNIT_START.test(line));
     if (nested) throw new Error(`Office source unit ${unitPath} contains a nested unit marker.`);
-    units.push({ path: unitPath, startLine: index + 2, endLine: endMarker, content: lines.slice(index + 1, endMarker).join('\n') });
+    units.push({ path: unitPath, startLine: index + 2, endLine: endMarker, content: lines.slice(index + 1, endMarker).join('\n'), kind: 'explicit' });
     names.add(unitPath);
     index = endMarker;
   }
   return units;
+}
+
+function inferredUnitSegment(value: string, fallback: string) {
+  const normalized = value.trim()
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return (normalized || fallback).slice(0, 100);
+}
+
+function inferredPythonSymbolSourceUnits(source: string): ParsedSourceUnit[] {
+  const lines = normalizedDraftSource(source).split('\n');
+  const candidates = lines.flatMap((line, index) => {
+    const match = /^(\s*)(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(line);
+    return match ? [{ index, indent: match[1].length, name: match[2] }] : [];
+  }).map((candidate) => {
+    let endIndex = lines.length - 1;
+    for (let index = candidate.index + 1; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!line.trim() || /^\s*#/.test(line)) continue;
+      const indent = line.match(/^\s*/)?.[0].length || 0;
+      if (indent <= candidate.indent) {
+        endIndex = index - 1;
+        break;
+      }
+    }
+    while (endIndex > candidate.index && !lines[endIndex].trim()) endIndex -= 1;
+    return { ...candidate, endIndex };
+  });
+  const reusable = candidates.filter((candidate) => candidate.name !== 'create_document' && !candidates.some((parent) => (
+    parent !== candidate
+    && parent.name !== 'create_document'
+    && parent.index < candidate.index
+    && parent.endIndex >= candidate.endIndex
+  )));
+  const names = new Set<string>();
+  return reusable.map((candidate) => {
+    const baseName = inferredUnitSegment(candidate.name, `function-line-${candidate.index + 1}`);
+    let unitName = baseName;
+    let suffix = 2;
+    while (names.has(unitName)) unitName = `${baseName}-${suffix++}`;
+    names.add(unitName);
+    return {
+      content: lines.slice(candidate.index, candidate.endIndex + 1).join('\n'),
+      endLine: candidate.endIndex + 1,
+      inferred: true,
+      kind: 'symbol' as const,
+      path: `symbols/${unitName}`,
+      startLine: candidate.index + 1,
+      symbolName: candidate.name,
+    };
+  });
+}
+
+function pythonCallEndIndex(lines: string[], startIndex: number) {
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    for (const character of lines[index]) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (quote) {
+        if (character === quote) quote = '';
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        quote = character;
+        continue;
+      }
+      if (character === '(') depth += 1;
+      else if (character === ')') depth -= 1;
+    }
+    if (depth <= 0) return index;
+  }
+  return startIndex;
+}
+
+function inferredPythonSlideFactoryCallUnits(source: string, symbols: ParsedSourceUnit[]) {
+  const lines = normalizedDraftSource(source).split('\n');
+  const factories = symbols.filter((symbol) => symbol.symbolName && /\.add_slide\s*\(/.test(symbol.content));
+  const starts = factories.flatMap((factory) => {
+    const escaped = factory.symbolName!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`^\\s*${escaped}\\s*\\(`);
+    return lines.flatMap((line, index) => {
+      const insideSymbol = symbols.some((symbol) => index + 1 >= symbol.startLine && index + 1 <= symbol.endLine);
+      return !insideSymbol && pattern.test(line) ? [{ factory, index }] : [];
+    });
+  }).sort((left, right) => left.index - right.index);
+  const names = new Set<string>();
+  return starts.map(({ factory, index }) => {
+    const endIndex = pythonCallEndIndex(lines, index);
+    const call = lines.slice(index, endIndex + 1).join('\n');
+    const firstArgument = new RegExp(`^\\s*${factory.symbolName}\\s*\\(\\s*(?:(\\d+)|['\"]([^'\"]+)['\"])`).exec(call);
+    const numeric = firstArgument?.[1];
+    const authored = firstArgument?.[2];
+    const authoredNumeric = authored?.match(/^slide[-_/]?(\d+)$/i)?.[1];
+    const baseName = numeric || authoredNumeric
+      ? `slide-${String(Number(numeric || authoredNumeric)).padStart(3, '0')}`
+      : authored
+        ? inferredUnitSegment(authored, `${factory.symbolName}-call-line-${index + 1}`)
+        : `${inferredUnitSegment(factory.symbolName || 'slide-factory', 'slide-factory')}-call-line-${index + 1}`;
+    let unitName = baseName;
+    let suffix = 2;
+    while (names.has(unitName)) unitName = `${baseName}-${suffix++}`;
+    names.add(unitName);
+    return {
+      content: call,
+      endLine: endIndex + 1,
+      inferred: true,
+      kind: 'page' as const,
+      path: `pages/${unitName}`,
+      startLine: index + 1,
+    };
+  });
+}
+
+function uniqueInferredSourceUnitPaths(units: ParsedSourceUnit[]) {
+  const paths = new Set<string>();
+  return units.map((unit) => {
+    if (!paths.has(unit.path)) {
+      paths.add(unit.path);
+      return unit;
+    }
+    let suffix = 2;
+    let path = `${unit.path}-${suffix}`;
+    while (paths.has(path)) path = `${unit.path}-${++suffix}`;
+    paths.add(path);
+    return { ...unit, path };
+  });
+}
+
+function inferredPresentationSourceUnits(
+  source: string,
+  generator: OfficeDocumentDraft['generator'],
+  symbols: ParsedSourceUnit[] = [],
+  additionalBoundaries: ParsedSourceUnit[] = [],
+): ParsedSourceUnit[] {
+  const lines = normalizedDraftSource(source).split('\n');
+  const slidePattern = generator === 'javascript'
+    ? /^(\s*)(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.addSlide\s*\(/
+    : /^(\s*)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.add_slide\s*\(/;
+  const starts = lines.flatMap((line, index) => {
+    const match = slidePattern.exec(line);
+    const insideSymbol = symbols.some((symbol) => index + 1 >= symbol.startLine && index + 1 <= symbol.endLine);
+    return match && !insideSymbol ? [{ index, indent: match[1].length, line }] : [];
+  });
+  if (!starts.length) return [];
+  const names = new Set<string>();
+  return starts.map((start, index) => {
+    const nextStart = [
+      starts[index + 1]?.index,
+      ...symbols.filter((symbol) => symbol.startLine - 1 > start.index).map((symbol) => symbol.startLine - 1),
+      ...additionalBoundaries.filter((unit) => unit.startLine - 1 > start.index).map((unit) => unit.startLine - 1),
+    ].filter((value): value is number => value !== undefined).sort((left, right) => left - right)[0];
+    let endIndex = nextStart === undefined ? lines.length - 1 : nextStart - 1;
+    if (nextStart === undefined) {
+      const terminal = lines.findIndex((line, candidate) => (
+        candidate > start.index
+        && (line.match(/^\s*/)?.[0].length || 0) <= start.indent
+        && /\.(?:save|close)\s*\(/.test(line)
+      ));
+      if (terminal > start.index) endIndex = terminal - 1;
+    }
+    while (endIndex > start.index && !lines[endIndex].trim()) endIndex -= 1;
+    const authoredId = /\.(?:add_slide|addSlide)\s*\(\s*['"]([^'"]+)['"]/.exec(start.line)?.[1];
+    const numericId = authoredId?.match(/^slide[-_/]?(\d+)$/i)?.[1];
+    const baseName = numericId
+      ? `slide-${String(Number(numericId)).padStart(3, '0')}`
+      : authoredId
+        ? inferredUnitSegment(authoredId, `slide-call-line-${start.index + 1}`)
+        : `slide-call-line-${start.index + 1}`;
+    let unitName = baseName;
+    let suffix = 2;
+    while (names.has(unitName)) unitName = `${baseName}-${suffix++}`;
+    names.add(unitName);
+    return {
+      content: lines.slice(start.index, endIndex + 1).join('\n'),
+      endLine: endIndex + 1,
+      inferred: true,
+      kind: 'page' as const,
+      path: `pages/${unitName}`,
+      startLine: start.index + 1,
+    };
+  });
+}
+
+function inferredWriterSourceUnits(source: string): ParsedSourceUnit[] {
+  const lines = normalizedDraftSource(source).split('\n');
+  const writerAssignment = lines.flatMap((line, index) => {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*job\.writer\s*\(/.exec(line);
+    return match ? [{ index, variable: match[1] }] : [];
+  }).at(-1);
+  if (!writerAssignment) return [];
+  const escaped = writerAssignment.variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const contentPattern = new RegExp(`^\\s*${escaped}\\.(?:add_heading|add_inline_image|add_page_break|add_paragraph|add_table)\\s*\\(`);
+  const firstContent = lines.findIndex((line, index) => index > writerAssignment.index && contentPattern.test(line));
+  if (firstContent < 0) return [];
+  const pageBreakPattern = new RegExp(`^\\s*${escaped}\\.add_page_break\\s*\\(`);
+  const starts = [firstContent, ...lines.flatMap((line, index) => (
+    index > firstContent && pageBreakPattern.test(line) ? [index] : []
+  ))];
+  if (starts.length < 2) return [];
+  return starts.map((start, index) => {
+    const nextStart = starts[index + 1];
+    let endIndex = nextStart === undefined ? lines.length - 1 : nextStart - 1;
+    if (nextStart === undefined) {
+      const terminal = lines.findIndex((line, candidate) => (
+        candidate > start && new RegExp(`^\\s*${escaped}\\.(?:save|close)\\s*\\(`).test(line)
+      ));
+      if (terminal > start) endIndex = terminal - 1;
+    }
+    while (endIndex > start && !lines[endIndex].trim()) endIndex -= 1;
+    return {
+      content: lines.slice(start, endIndex + 1).join('\n'),
+      endLine: endIndex + 1,
+      inferred: true,
+      kind: 'page' as const,
+      path: `pages/page-${String(index + 1).padStart(3, '0')}`,
+      startLine: start + 1,
+    };
+  });
+}
+
+function inferredCalcSourceUnits(source: string): ParsedSourceUnit[] {
+  const lines = normalizedDraftSource(source).split('\n');
+  const declarations = lines.flatMap((line, index) => {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z_][A-Za-z0-9_]*\.add_worksheet\s*\(/.exec(line);
+    return match ? [{ index, variable: match[1] }] : [];
+  });
+  if (declarations.length < 2) return [];
+  const lastDeclaration = declarations.at(-1)!.index;
+  const starts = declarations.flatMap((declaration, declarationIndex) => {
+    const escaped = declaration.variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const usePattern = new RegExp(`\\b${escaped}\\b`);
+    const index = lines.findIndex((line, candidate) => (
+      candidate > lastDeclaration && !/^\s*#/.test(line) && usePattern.test(line)
+    ));
+    return index < 0 ? [] : [{ declarationIndex, index }];
+  }).sort((left, right) => left.index - right.index);
+  if (starts.length < 2 || new Set(starts.map((start) => start.index)).size !== starts.length) return [];
+  return starts.map((start, index) => {
+    const nextStart = starts[index + 1]?.index;
+    let endIndex = nextStart === undefined ? lines.length - 1 : nextStart - 1;
+    if (nextStart === undefined) {
+      const terminal = lines.findIndex((line, candidate) => (
+        candidate > start.index && /^\s*[A-Za-z_][A-Za-z0-9_]*\.(?:save|close)\s*\(/.test(line)
+      ));
+      if (terminal > start.index) endIndex = terminal - 1;
+    }
+    while (endIndex > start.index && !lines[endIndex].trim()) endIndex -= 1;
+    return {
+      content: lines.slice(start.index, endIndex + 1).join('\n'),
+      endLine: endIndex + 1,
+      inferred: true,
+      kind: 'sheet' as const,
+      path: `sheets/sheet-${String(start.declarationIndex + 1).padStart(3, '0')}`,
+      startLine: start.index + 1,
+    };
+  });
+}
+
+export function sourceUnitsForDraft(source: string, draft: Pick<OfficeDocumentDraft, 'documentType' | 'generator'>) {
+  const explicit = parseSourceUnits(source);
+  if (explicit.length) return explicit;
+  if (draft.documentType === 'presentation') {
+    const symbols = draft.generator === 'uno' ? inferredPythonSymbolSourceUnits(source) : [];
+    const factoryCalls = draft.generator === 'uno' ? inferredPythonSlideFactoryCallUnits(source, symbols) : [];
+    return uniqueInferredSourceUnitPaths([
+      ...symbols,
+      ...factoryCalls,
+      ...inferredPresentationSourceUnits(source, draft.generator, symbols, factoryCalls),
+    ].sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine));
+  }
+  if (draft.generator !== 'uno') return [];
+  if (draft.documentType === 'word') return inferredWriterSourceUnits(source);
+  if (draft.documentType === 'spreadsheet') return inferredCalcSourceUnits(source);
+  return [];
 }
 
 function replaceSourceUnit(source: string, unit: ParsedSourceUnit, content: string) {
@@ -1466,11 +1867,41 @@ function replaceSourceUnit(source: string, unit: ParsedSourceUnit, content: stri
   return lines.join('\n');
 }
 
-function isolateSourceUnit(source: string, requestedPath: string, generator: OfficeDocumentDraft['generator']) {
+function sourceUnitForStructuredLineEdits(units: ParsedSourceUnit[], edits: UnoDraftLineEdit[]) {
+  const ranges = edits.map((edit) => {
+    const kind = edit.kind || 'replaceRange';
+    if (kind === 'replaceText' || kind === 'replaceAll') return undefined;
+    const startLine = kind === 'insertBefore' || kind === 'insertAfter'
+      ? Number(edit.line)
+      : Number(edit.startLine);
+    const endLine = kind === 'insertBefore' || kind === 'insertAfter'
+      ? Number(edit.line)
+      : Number(edit.endLine);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
+      return undefined;
+    }
+    return { startLine, endLine };
+  });
+  if (!ranges.length || ranges.some((range) => !range)) return undefined;
+  return units
+    .filter((unit) => unit.kind === 'page' || unit.kind === 'sheet')
+    .filter((unit) => ranges.every((range) => (
+      range!.startLine >= unit.startLine && range!.endLine <= unit.endLine
+    )))
+    .sort((left, right) => (
+      (left.endLine - left.startLine) - (right.endLine - right.startLine)
+    ))[0];
+}
+
+function isolateSourceUnit(
+  source: string,
+  requestedPath: string,
+  generator: OfficeDocumentDraft['generator'],
+  units: ParsedSourceUnit[],
+) {
   const lines = normalizedDraftSource(source).split('\n');
-  const units = parseSourceUnits(source);
   for (const unit of [...units].reverse()) {
-    if (unit.path === requestedPath) continue;
+    if (unit.path === requestedPath || unit.kind === 'symbol') continue;
     const current = lines.slice(unit.startLine - 1, unit.endLine);
     const contentIndent = current.find((line) => line.trim())?.match(/^\s*/)?.[0];
     const markerIndent = lines[unit.startLine - 2]?.match(/^\s*/)?.[0] || '';
@@ -1483,7 +1914,7 @@ function isolateSourceUnit(source: string, requestedPath: string, generator: Off
 
 function synchronizeSourceUnits(draft: OfficeDocumentDraft, validation?: 'failed' | 'passed') {
   const previous = new Map((draft.sourceUnits || []).map((unit) => [unit.path, unit]));
-  const units = parseSourceUnits(draft.program || '');
+  const units = sourceUnitsForDraft(draft.program || '', draft);
   draft.sourceUnits = units.map((unit) => {
     const digest = sourceDigest(unit.content);
     const prior = previous.get(unit.path);
@@ -1548,27 +1979,179 @@ function sourceEditCandidateSummary(source: string, oldText: string) {
     : ' No close current candidate was found. Call action=read and copy the exact current text before retrying.';
 }
 
+type SourceLineHunk = {
+  editIndex: number;
+  end: number;
+  newLines: string[];
+  start: number;
+};
+
+function editorReplacementLines(value: string) {
+  const normalized = normalizedDraftSource(value);
+  return normalized === '' ? [] : normalized.split('\n');
+}
+
+function replacementLinesWithPreservedIndent(
+  originalLines: string[],
+  replacementLines: string[],
+  preserveIndent = false,
+) {
+  if (!preserveIndent || !replacementLines.length) return replacementLines;
+  const originalFirst = originalLines.find((line) => line.trim());
+  const replacementFirst = replacementLines.find((line) => line.trim());
+  if (!originalFirst || !replacementFirst) return replacementLines;
+  const originalIndent = originalFirst.match(/^\s*/)?.[0] || '';
+  const replacementIndent = replacementFirst.match(/^\s*/)?.[0] || '';
+  if (replacementIndent.length >= originalIndent.length) return replacementLines;
+  const missingIndent = originalIndent.startsWith(replacementIndent)
+    ? originalIndent.slice(replacementIndent.length)
+    : originalIndent;
+  if (!missingIndent) return replacementLines;
+  return replacementLines.map((line) => line.trim() ? `${missingIndent}${line}` : line);
+}
+
 /**
- * Apply Code-Editor-style line replacements. Ranges are one-based and always
- * refer to the same source returned by action=read, so a batch cannot shift
- * the location of a later edit. Replacing from the last line upward keeps
- * those original coordinates stable.
+ * Reduce a broad replacement to the smallest changed line hunks. Agent edits
+ * often use overlapping context ranges even though the actual changed lines
+ * are independent. A line-level LCS lets those edits merge like a mature code
+ * editor instead of rejecting the complete atomic batch.
+ */
+function minimalSourceLineHunks(
+  original: string[],
+  replacement: string[],
+  sourceOffset: number,
+  editIndex: number,
+): SourceLineHunk[] {
+  const rows = original.length;
+  const columns = replacement.length;
+  const lcs = Array.from({ length: rows + 1 }, () => new Uint32Array(columns + 1));
+  for (let row = rows - 1; row >= 0; row -= 1) {
+    for (let column = columns - 1; column >= 0; column -= 1) {
+      lcs[row][column] = original[row] === replacement[column]
+        ? lcs[row + 1][column + 1] + 1
+        : Math.max(lcs[row + 1][column], lcs[row][column + 1]);
+    }
+  }
+  const hunks: SourceLineHunk[] = [];
+  let row = 0;
+  let column = 0;
+  while (row < rows || column < columns) {
+    if (row < rows && column < columns && original[row] === replacement[column]) {
+      row += 1;
+      column += 1;
+      continue;
+    }
+    const startRow = row;
+    const startColumn = column;
+    while (row < rows || column < columns) {
+      if (row < rows && column < columns && original[row] === replacement[column]) break;
+      if (column < columns && (row === rows || lcs[row][column + 1] >= lcs[row + 1][column])) column += 1;
+      else row += 1;
+    }
+    hunks.push({
+      editIndex,
+      start: sourceOffset + startRow,
+      end: sourceOffset + row,
+      newLines: replacement.slice(startColumn, column),
+    });
+  }
+  return hunks;
+}
+
+function sourceLineHunksConflict(left: SourceLineHunk, right: SourceLineHunk) {
+  const leftInsertion = left.start === left.end;
+  const rightInsertion = right.start === right.end;
+  if (leftInsertion && rightInsertion) return false;
+  if (leftInsertion) return left.start > right.start && left.start < right.end;
+  if (rightInsertion) return right.start > left.start && right.start < left.end;
+  return Math.max(left.start, right.start) < Math.min(left.end, right.end);
+}
+
+/**
+ * Apply editor-style source changes atomically. Line edits keep coordinates
+ * anchored to the same read, minimize every replacement, merge independent
+ * overlapping context, and use later edits for the same changed source lines.
+ * Exact-text edits then run in their supplied order against that in-memory
+ * candidate. This deterministic two-phase order lets callers safely combine
+ * both edit styles without making line coordinates depend on earlier text
+ * replacements.
  */
 export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]) {
   if (!Array.isArray(edits) || !edits.length) {
     throw new Error('file action=edit requires at least one line edit.');
   }
   const normalized = normalizedDraftSource(source);
-  const textEdits = edits.filter((edit) => edit.kind === 'replaceText' || edit.kind === 'replaceAll');
+  const indexedEdits = edits.map((edit, editIndex) => ({ edit, editIndex }));
+  const textEdits = indexedEdits.filter(({ edit }) => edit.kind === 'replaceText' || edit.kind === 'replaceAll');
+  const lineEdits = indexedEdits.filter(({ edit }) => edit.kind !== 'replaceText' && edit.kind !== 'replaceAll');
+  let result = normalized;
+  if (lineEdits.length) {
+    const hasFinalNewline = normalized.endsWith('\n');
+    const lines = hasFinalNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
+    const lineCount = lines.length;
+    const hunks: SourceLineHunk[] = [];
+    lineEdits.forEach(({ edit, editIndex }) => {
+      const kind = edit.kind || 'replaceRange';
+      const anchorLine = Number(edit.line);
+      const startLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.startLine);
+      const endLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.endLine);
+      if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
+        throw new Error(`source edit ${editIndex + 1} requires integer startLine and endLine from action=read.`);
+      }
+      if (startLine < 1 || endLine < startLine || endLine > lineCount) {
+        throw new Error(`source edit ${editIndex + 1} range ${startLine}-${endLine} is outside the current 1-${lineCount} source lines. Read the draft again.`);
+      }
+      if (typeof edit.newText !== 'string') {
+        throw new Error(`source edit ${editIndex + 1} requires string newText.`);
+      }
+      if (kind === 'insertBefore' || kind === 'insertAfter') {
+        hunks.push({
+          editIndex,
+          start: kind === 'insertBefore' ? startLine - 1 : startLine,
+          end: kind === 'insertBefore' ? startLine - 1 : startLine,
+          newLines: editorReplacementLines(edit.newText),
+        });
+        return;
+      }
+      const originalLines = lines.slice(startLine - 1, endLine);
+      const replacementLines = kind === 'deleteRange'
+        ? []
+        : kind === 'replaceRange'
+          ? replacementLinesWithPreservedIndent(originalLines, editorReplacementLines(edit.newText), edit.preserveIndent === true)
+          : editorReplacementLines(edit.newText);
+      const editHunks = minimalSourceLineHunks(originalLines, replacementLines, startLine - 1, editIndex);
+      const changedSourceLines = editHunks.reduce((total, hunk) => total + hunk.end - hunk.start, 0);
+      const insertedLines = editHunks.reduce((total, hunk) => total + hunk.newLines.length, 0);
+      if (kind === 'replaceRange' && Math.max(changedSourceLines, insertedLines) >= 100
+        && Math.max(changedSourceLines, insertedLines) / lineCount >= 0.6) {
+        throw new Error(`source edit ${editIndex + 1} changes most of the ${lineCount}-line source. Near-complete source replacement through edit is blocked because it commonly destroys valid indentation and identifiers. Use action=generate to atomically replace a failed draft, or edit one source-unit path.`);
+      }
+      hunks.push(...editHunks);
+    });
+
+    const merged: SourceLineHunk[] = [];
+    for (const hunk of hunks) {
+      for (let index = merged.length - 1; index >= 0; index -= 1) {
+        if (sourceLineHunksConflict(merged[index], hunk)) merged.splice(index, 1);
+      }
+      merged.push(hunk);
+    }
+    for (const hunk of merged.sort((left, right) => (
+      right.start - left.start || right.end - left.end || right.editIndex - left.editIndex
+    ))) {
+      lines.splice(hunk.start, hunk.end - hunk.start, ...hunk.newLines);
+    }
+    result = `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`;
+  }
+
   if (textEdits.length) {
-    if (textEdits.length !== edits.length) throw new Error('replaceText/replaceAll edits cannot be mixed with line edits in one atomic batch.');
-    const replacements = textEdits.flatMap((edit, editIndex) => {
+    for (const { edit, editIndex } of textEdits) {
       const oldText = normalizedDraftSource(String(edit.oldText || ''));
       if (!oldText) throw new Error(`source edit ${editIndex + 1} ${edit.kind} requires non-empty oldText.`);
       const offsets: number[] = [];
       let cursor = 0;
-      while (cursor <= normalized.length - oldText.length) {
-        const found = normalized.indexOf(oldText, cursor);
+      while (cursor <= result.length - oldText.length) {
+        const found = result.indexOf(oldText, cursor);
         if (found < 0) break;
         offsets.push(found);
         cursor = found + Math.max(1, oldText.length);
@@ -1578,86 +2161,26 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
         throw new Error(`source edit ${editIndex + 1} occurrence must be a positive integer.`);
       }
       if (!offsets.length) {
-        throw new Error(`source edit ${editIndex + 1} could not find oldText in the current source.${sourceEditCandidateSummary(normalized, oldText)}`);
+        throw new Error(`source edit ${editIndex + 1} could not find oldText after applying the preceding edits in this atomic batch.${sourceEditCandidateSummary(result, oldText)}`);
       }
+      const newText = normalizedDraftSource(edit.newText);
       if (edit.kind === 'replaceAll') {
         if (occurrence !== undefined) throw new Error(`source edit ${editIndex + 1} replaceAll does not accept occurrence.`);
-        return offsets.map((start) => ({
-          start,
-          end: start + oldText.length,
-          newText: normalizedDraftSource(edit.newText),
-          editIndex,
-        }));
+        for (const start of offsets.reverse()) {
+          result = `${result.slice(0, start)}${newText}${result.slice(start + oldText.length)}`;
+        }
+        continue;
       }
       if (occurrence === undefined && offsets.length !== 1) {
         throw new Error(`source edit ${editIndex + 1} oldText matched ${offsets.length} locations; occurrence means the one-based match index, not a replacement count. Provide an occurrence between 1 and ${offsets.length}, use a larger exact source region, or use replaceAll to replace every match.`);
       }
-      // A unique exact match is unambiguous. Providers occasionally populate
-      // occurrence with an intended replacement count (for example 10 or 50),
-      // even though occurrence is a match index. Do not reject a safe unique
-      // replacement because of that transport/model mistake.
       const resolvedOccurrence = offsets.length === 1 ? 1 : (occurrence || 1);
       const start = offsets[resolvedOccurrence - 1];
-      if (start === undefined) {
-        throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches. occurrence is the one-based match index, not the number of replacements. Use replaceAll when every exact match should change.`);
-      }
-      return { start, end: start + oldText.length, newText: normalizedDraftSource(edit.newText), editIndex };
-    });
-    const ordered = [...replacements].sort((left, right) => left.start - right.start);
-    for (let index = 1; index < ordered.length; index += 1) {
-      if (ordered[index].start < ordered[index - 1].end) {
-        throw new Error(`source edits ${ordered[index - 1].editIndex + 1} and ${ordered[index].editIndex + 1} overlap.`);
-      }
-    }
-    let result = normalized;
-    for (const edit of replacements.sort((left, right) => right.start - left.start)) {
-      result = `${result.slice(0, edit.start)}${edit.newText}${result.slice(edit.end)}`;
-    }
-    return result;
-  }
-  const hasFinalNewline = normalized.endsWith('\n');
-  const lines = hasFinalNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
-  const lineCount = lines.length;
-  const ordered = edits.map((edit, editIndex) => {
-    const kind = edit.kind || 'replaceRange';
-    const anchorLine = Number(edit.line);
-    const startLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.startLine);
-    const endLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.endLine);
-    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
-      throw new Error(`source edit ${editIndex + 1} requires integer startLine and endLine from action=read.`);
-    }
-    if (startLine < 1 || endLine < startLine || endLine > lineCount) {
-      throw new Error(`source edit ${editIndex + 1} range ${startLine}-${endLine} is outside the current 1-${lineCount} source lines. Read the draft again.`);
-    }
-    const replacedLineCount = endLine - startLine + 1;
-    if (kind === 'replaceRange' && replacedLineCount >= 100 && replacedLineCount / lineCount >= 0.6) {
-      throw new Error(`source edit ${editIndex + 1} replaces ${replacedLineCount} of ${lineCount} lines. Near-complete source replacement is blocked because it commonly destroys valid indentation and identifiers. Use smaller exact edits or add @webpilot-unit markers and edit one page/section path.`);
-    }
-    if (typeof edit.newText !== 'string') {
-      throw new Error(`source edit ${editIndex + 1} requires string newText.`);
-    }
-    const currentLine = lines[startLine - 1];
-    const newText = kind === 'deleteRange'
-      ? ''
-      : kind === 'insertBefore'
-        ? `${edit.newText}${edit.newText.endsWith('\n') ? '' : '\n'}${currentLine}`
-        : kind === 'insertAfter'
-          ? `${currentLine}\n${edit.newText}`
-          : edit.newText;
-    return { ...edit, startLine, endLine, newText, editIndex };
-  });
-  const ascending = [...ordered].sort((left, right) => left.startLine - right.startLine || left.endLine - right.endLine);
-  for (let index = 1; index < ascending.length; index += 1) {
-    if (ascending[index].startLine <= ascending[index - 1].endLine) {
-      throw new Error(`source edits ${ascending[index - 1].editIndex + 1} and ${ascending[index].editIndex + 1} overlap. Combine them into one line range.`);
+      if (start === undefined) throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches. Use replaceAll when every exact match should change.`);
+      result = `${result.slice(0, start)}${newText}${result.slice(start + oldText.length)}`;
     }
   }
-  for (const edit of ordered.sort((left, right) => right.startLine - left.startLine)) {
-    const replacement = normalizedDraftSource(edit.newText);
-    const replacementLines = replacement === '' ? [] : replacement.split('\n');
-    lines.splice(edit.startLine - 1, edit.endLine - edit.startLine + 1, ...replacementLines);
-  }
-  return `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`;
+  return result;
 }
 
 export function applyUnoDraftPatch(source: string, patchText: string) {
@@ -1707,12 +2230,12 @@ export function applyUnoDraftPatch(source: string, patchText: string) {
   return `${output.join('\n')}${hasFinalNewline ? '\n' : ''}`;
 }
 
-function numberedDraftSource(source: string) {
+function numberedDraftSource(source: string, firstLine = 1) {
   const normalized = normalizedDraftSource(source);
   const lines = (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized)
     .split('\n');
   return lines
-    .map((line, index) => `${String(index + 1).padStart(5, ' ')} | ${line}`)
+    .map((line, index) => `${String(firstLine + index).padStart(5, ' ')} | ${line}`)
     .join('\n');
 }
 
@@ -1722,13 +2245,43 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
     if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading an Office source draft.' };
     const draft = await loadDraft(input.runId, documentId);
     if (!draft.program) return { ok: false, actual: `Office draft ${documentId} has no source yet; call action=generate first.` };
-    const units = parseSourceUnits(draft.program);
+    const units = sourceUnitsForDraft(draft.program, draft);
     const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
-    const requestedUnit = requestedPath ? units.find((unit) => unit.path === requestedPath) : undefined;
+    const requestedUnit = sourceUnitForRequestedPath(units, requestedPath);
     if (requestedPath && !requestedUnit) {
-      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Read the document without path to list available source units.` };
+      const available = units.map((unit) => unit.path).join(', ') || '(none)';
+      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. For shared helpers or unmarked sources, read a bounded startLine/endLine window instead.` };
     }
     const readableSource = requestedUnit?.content ?? draft.program;
+    const readableLines = normalizedDraftSource(readableSource).split('\n');
+    const totalReadableLines = draftSourceLineCount(readableSource);
+    const requestedStart = input.startLine === undefined ? undefined : Number(input.startLine);
+    const requestedEnd = input.endLine === undefined ? undefined : Number(input.endLine);
+    if (requestedStart !== undefined && (!Number.isInteger(requestedStart) || requestedStart < 1)) {
+      return { ok: false, actual: 'Office draft read startLine must be a positive one-based integer.' };
+    }
+    if (requestedEnd !== undefined && (!Number.isInteger(requestedEnd) || requestedEnd < 1)) {
+      return { ok: false, actual: 'Office draft read endLine must be a positive one-based integer.' };
+    }
+    const explicitRange = requestedStart !== undefined || requestedEnd !== undefined;
+    const rangeStart = requestedStart ?? (requestedEnd === undefined ? 1 : Math.max(1, requestedEnd - MAX_SOURCE_READ_LINES + 1));
+    const rangeEnd = requestedEnd ?? (requestedStart === undefined
+      ? Math.min(totalReadableLines, MAX_SOURCE_READ_LINES)
+      : Math.min(totalReadableLines, rangeStart + MAX_SOURCE_READ_LINES - 1));
+    if (rangeStart > rangeEnd || rangeEnd > totalReadableLines) {
+      return { ok: false, actual: `Office draft read range ${rangeStart}-${rangeEnd} is outside the current 1-${totalReadableLines} source lines.` };
+    }
+    if (rangeEnd - rangeStart + 1 > MAX_SOURCE_READ_LINES) {
+      return { ok: false, actual: `Office draft read ranges are limited to ${MAX_SOURCE_READ_LINES} lines. Request a smaller window around the diagnostic.` };
+    }
+    const omitLargeProgram = !explicitRange && (
+      requestedUnit
+        ? totalReadableLines > MAX_SOURCE_READ_LINES
+        : totalReadableLines > LARGE_SOURCE_LINE_THRESHOLD
+    );
+    const returnedSource = omitLargeProgram
+      ? ''
+      : readableLines.slice(rangeStart - 1, rangeEnd).join('\n');
     return {
       ok: true,
       actual: JSON.stringify({
@@ -1745,28 +2298,36 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
           fileName: draft.sourceDocument.fileName,
         } : undefined,
         sourceDigest: sourceDigest(readableSource),
-        documentSourceDigest: sourceDigest(draft.program),
-        currentRevision: draft.currentRevision || null,
-        validatedRevision: draft.validatedRevision || null,
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || 'pending',
-        validationDiagnostics: draft.validationDiagnostics || [],
-        workflow: draft.workflow,
-        revisions: (draft.revisions || []).map((revision) => ({
-          revision: revision.revision,
-          sourceDigest: revision.sourceDigest,
-          createdAt: revision.createdAt,
-        })),
+        validationFailureCount: draft.validationFailureCount || 0,
+        validationDiagnostics: compactValidationDiagnosticsForTool(draft.validationDiagnostics),
+        workflow: compactWorkflowForTool(draft.workflow),
         sourceUnitPath: requestedUnit?.path,
+        sourceUnitKind: requestedUnit?.kind,
         sourceUnitGlobalLines: requestedUnit ? { startLine: requestedUnit.startLine, endLine: requestedUnit.endLine } : undefined,
-        sourceUnits: units.map((unit) => ({
-          path: unit.path,
-          sourceDigest: sourceDigest(unit.content),
-          lineCount: draftSourceLineCount(unit.content),
-          status: draft.sourceUnits?.find((state) => state.path === unit.path)?.status || 'pending',
-        })),
-        lineCount: draftSourceLineCount(readableSource),
-        program: numberedDraftSource(readableSource),
+        sourceUnitCount: units.length,
+        sourceUnits: !explicitRange && !requestedUnit
+          ? units.map((unit) => ({
+            inferred: unit.inferred === true,
+            kind: unit.kind,
+            path: unit.path,
+            sourceDigest: sourceDigest(unit.content),
+            lineCount: draftSourceLineCount(unit.content),
+            status: draft.sourceUnits?.find((state) => state.path === unit.path)?.status || 'pending',
+          }))
+          : undefined,
+        lineCount: totalReadableLines,
+        programOmitted: omitLargeProgram || undefined,
+        sourceLineRange: omitLargeProgram ? undefined : {
+          startLine: rangeStart,
+          endLine: rangeEnd,
+          totalLines: totalReadableLines,
+        },
+        readGuidance: omitLargeProgram
+          ? `This ${totalReadableLines}-line ${requestedUnit ? 'source unit' : 'draft'} is too large for an unbounded read. ${requestedUnit ? `Read the same path ${requestedUnit.path} with ` : 'Read one sourceUnits path, or use '}startLine/endLine around the reported diagnostic (maximum ${MAX_SOURCE_READ_LINES} lines).`
+          : undefined,
+        program: omitLargeProgram ? undefined : numberedDraftSource(returnedSource, rangeStart),
       }),
     };
   } catch (error) {
@@ -1775,11 +2336,11 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
 }
 
 export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult> {
+  const documentId = String(input.documentId || '').trim();
+  if (!documentId) {
+    return { ok: false, actual: 'file action=unoApi requires the documentId returned by action=plan, so the selected generator can be verified.' };
+  }
   try {
-    const documentId = String(input.documentId || '').trim();
-    if (!documentId) {
-      return { ok: false, actual: 'file action=unoApi requires the documentId returned by action=plan, so the selected generator can be verified.' };
-    }
     const draft = await loadDraft(input.runId, documentId);
     if ((draft.generator || 'javascript') === 'javascript') {
       return {
@@ -1796,12 +2357,18 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
     const documentType = draft.documentType;
     return {
       ok: true,
-      actual: JSON.stringify({ kind: 'uno-api', documentId, documentType, sourceUnitGuidance: 'For large sources, optional # @webpilot-unit pages/slide-001 and # @webpilot-endunit markers allow path-scoped read/edit with local line numbers. Keep shared helpers outside page units.', ...(await inspectUnoApi({
+      actual: JSON.stringify({
+        kind: 'uno-api',
+        documentId,
         documentType,
-        query: input.query,
-        offset: input.offset,
-        limit: input.limit,
-      })) }),
+        sourceUnitGuidance: `Sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines must be scoped. Presentation pages use authored slide IDs, reusable Python helpers use symbols/<function-name>, Writer page breaks and Calc worksheets are indexed semantically. Runtime-created pages are edited through their helper symbol instead of a guessed static page count. Other structures may use # @webpilot-unit and # @webpilot-endunit markers.`,
+        ...(await inspectUnoApi({
+          documentType,
+          query: input.query,
+          offset: input.offset,
+          limit: input.limit,
+        })),
+      }),
     };
   } catch (error) {
     return { ok: false, actual: `UNO API inspection failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -1912,7 +2479,7 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
       rules: [
         'Export exactly one async or synchronous createDocument(job) function.',
         'Recommended workflow: action=generate may create a small runnable skeleton, then repeated action=edit calls can add pages, sections, assets, and layout incrementally. This is guidance, not a size restriction; a complete runnable initial program remains valid when appropriate.',
-        'For large sources, optional // @webpilot-unit pages/slide-001 and // @webpilot-endunit markers let later file read/edit calls use path="pages/slide-001" and local line numbers. Keep shared theme/helpers outside page units.',
+        `Sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines require scoped editing. Add // @webpilot-unit and // @webpilot-endunit markers around independent pages, sections, or sheets; shared theme/helpers stay outside units and are read with startLine/endLine.`,
         'Write the final editable Office file to job.outputPath, or use await job.writeOutput(buffer) for docx buffers.',
         'job.listAssets() returns objects shaped exactly as { name, bytes }, never strings. Read asset.name; never call split() on an asset object.',
         'Use the exact availableAssets/listAssets name without URL encoding, decoding, basename guessing, or invented prefixes, then call await job.assetPath(exactName).',
@@ -1924,7 +2491,7 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
         'JavaScript mode creates PPTX, DOCX, or XLSX directly. A .pdf target is supported by creating the matching Office source for documentType and converting it with local LibreOffice.',
         'For PDF, still write to job.outputPath exactly as shown; its temporary extension is already the correct .pptx, .docx, or .xlsx source format.',
         'Existing-file modification remains UNO-based.',
-        'A rejected action=edit candidate is rolled back to the previous working source. Use the returned lastSuccessfulRevision/recoverySuggestion, make a focused edit, and call action=read only when fresh line numbers are needed.',
+        'Every structured action=edit updates the documentId current source before validation. If errors remain, continue with another focused edit against that saved source; call action=read only when fresh line numbers are needed.',
       ],
       recipes,
       completeDocument: examples[documentType],
@@ -1958,6 +2525,7 @@ function generatedElementMap(diagnostics: unknown): OfficeElementMapEntry[] {
 
 export function generatedVerificationIssues(diagnostics: unknown) {
   if (!diagnostics || typeof diagnostics !== 'object') return [];
+  const elementById = new Map(generatedElementMap(diagnostics).map((entry) => [entry.elementId, entry]));
   const verification = (diagnostics as { verification?: unknown }).verification;
   if (!verification || typeof verification !== 'object') return [];
   const issues = (verification as { issues?: unknown }).issues;
@@ -1980,13 +2548,15 @@ export function generatedVerificationIssues(diagnostics: unknown) {
       const elementIds = Array.isArray(issue.elementIds)
         ? issue.elementIds.filter((elementId): elementId is string => typeof elementId === 'string' && Boolean(elementId))
         : undefined;
+      const primaryElement = (issue.elementId && elementById.get(issue.elementId))
+        || (elementIds?.[0] ? elementById.get(elementIds[0]) : undefined);
       return {
         code: `RUNTIME_${String(issue.type || 'LAYOUT').toUpperCase()}`,
         column: issue.column,
         elementId: issue.elementId,
         elementIds,
-        line: issue.line,
-        locator: issue.locator || (page ? { slide: page, ...(shapes?.length ? { shapes } : {}) } : undefined),
+        line: issue.line || primaryElement?.line,
+        locator: issue.locator || primaryElement?.locator || (page ? { slide: page, ...(shapes?.length ? { shapes } : {}) } : undefined),
         message: issue.description,
         page,
         severity: issue.severity === 'error' ? 'error' as const : 'warning' as const,
@@ -1994,12 +2564,103 @@ export function generatedVerificationIssues(diagnostics: unknown) {
       };
     });
   const seen = new Set<string>();
-  return normalized.filter((issue) => {
+  const unique = normalized.filter((issue) => {
     const key = JSON.stringify([issue.code, issue.page, issue.shapes, issue.elementIds, issue.message]);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+  const overlapCodes = new Set(['RUNTIME_TEXT_OVERLAP', 'RUNTIME_IMAGE_OVERLAP', 'RUNTIME_CONTENT_OVERLAP']);
+  const clustered: typeof unique = [];
+  const overlapByPage = new Map<number, typeof unique>();
+  for (const issue of unique) {
+    if (!overlapCodes.has(issue.code) || !issue.page || (issue.elementIds?.length || 0) < 2) {
+      clustered.push(issue);
+      continue;
+    }
+    const pageIssues = overlapByPage.get(issue.page) || [];
+    pageIssues.push(issue);
+    overlapByPage.set(issue.page, pageIssues);
+  }
+  for (const [page, pageIssues] of overlapByPage) {
+    if (pageIssues.length === 1) {
+      clustered.push(pageIssues[0]);
+      continue;
+    }
+    let remaining = [...pageIssues];
+    let emitted = 0;
+    while (remaining.length && emitted < 12) {
+      const degree = new Map<string, number>();
+      for (const issue of remaining) {
+        for (const elementId of issue.elementIds || []) {
+          degree.set(elementId, (degree.get(elementId) || 0) + 1);
+        }
+      }
+      const root = [...degree.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0];
+      if (!root) break;
+      const incident = remaining.filter((issue) => issue.elementIds?.includes(root));
+      const incidentSet = new Set(incident);
+      remaining = remaining.filter((issue) => !incidentSet.has(issue));
+      const related = [...new Set(incident.flatMap((issue) => issue.elementIds || []).filter((elementId) => elementId !== root))];
+      const codes = new Set(incident.map((issue) => issue.code));
+      const rootRecord = elementById.get(root);
+      clustered.push({
+        ...incident[0],
+        code: codes.size === 1 ? incident[0].code : 'RUNTIME_CONTENT_OVERLAP',
+        elementId: root,
+        elementIds: [root, ...related.slice(0, 19)],
+        line: rootRecord?.line || incident[0].line,
+        locator: rootRecord?.locator || { slide: page },
+        message: `Element ${root} is a primary overlap source on slide ${page}: it intersects ${incident.length} element(s) (${related.slice(0, 12).join(', ')}${related.length > 12 ? ', ...' : ''}). Repair this element first instead of applying a global layout-helper change. The full pairwise collision report remains in the validation artifact.`,
+        page,
+        severity: incident.some((issue) => issue.severity === 'error') ? 'error' : 'warning',
+        shapes: undefined,
+      });
+      emitted += 1;
+    }
+    if (remaining.length) {
+      const remainingIds = [...new Set(remaining.flatMap((issue) => issue.elementIds || []))];
+      clustered.push({
+        ...remaining[0],
+        code: 'RUNTIME_CONTENT_OVERLAP',
+        elementId: undefined,
+        elementIds: remainingIds.slice(0, 20),
+        locator: { slide: page },
+        message: `${remaining.length} additional overlap pair(s) remain on slide ${page} after the 12 highest-degree source clusters. Repair the listed clusters, validate again, and use the validation artifact for the complete pair list.`,
+        page,
+        severity: remaining.some((issue) => issue.severity === 'error') ? 'error' : 'warning',
+        shapes: undefined,
+      });
+    }
+  }
+  return clustered;
+}
+
+function generatedFeatureCounts(diagnostics: unknown): Record<string, number> {
+  if (!diagnostics || typeof diagnostics !== 'object') return {};
+  const candidate = (diagnostics as { featureCounts?: unknown }).featureCounts;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return {};
+  return Object.fromEntries(Object.entries(candidate as Record<string, unknown>)
+    .map(([name, value]) => [name, Number(value)] as const)
+    .filter(([, value]) => Number.isSafeInteger(value) && value >= 0));
+}
+
+export function generatedRuntimeDiagnostics(diagnostics: unknown): OfficeProgramDiagnostic[] {
+  if (!diagnostics || typeof diagnostics !== 'object') return [];
+  const candidate = (diagnostics as { runtimeDiagnostics?: unknown }).runtimeDiagnostics;
+  if (!Array.isArray(candidate)) return [];
+  return candidate.filter((entry): entry is Record<string, unknown> => Boolean(
+    entry && typeof entry === 'object' && typeof (entry as { message?: unknown }).message === 'string',
+  )).map((entry) => ({
+    code: typeof entry.code === 'string' ? entry.code : 'UNO_RUNTIME_WARNING',
+    ...(typeof entry.callColumn === 'number' ? { callColumn: entry.callColumn } : {}),
+    ...(typeof entry.callLine === 'number' ? { callLine: entry.callLine } : {}),
+    ...(typeof entry.column === 'number' ? { column: entry.column } : {}),
+    ...(typeof entry.elementId === 'string' ? { elementId: entry.elementId } : {}),
+    ...(typeof entry.line === 'number' ? { line: entry.line } : {}),
+    message: String(entry.message),
+    severity: entry.severity === 'error' ? 'error' : 'warning',
+  }));
 }
 
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
@@ -2101,7 +2762,19 @@ async function prepareValidatedDraft(input: {
     input.draft.workflow = { state: 'validating', checkpointAt: new Date().toISOString() };
     await input.onProgress?.({ phase: 'static-analysis', message: '正在检查脚本语法和确定性错误' });
     const staticAnalysis = await analyzeOfficeProgram(input.draft.program, input.draft.generator || 'javascript');
-    const parsedUnits = parseSourceUnits(input.draft.program);
+    const parsedUnits = sourceUnitsForDraft(input.draft.program, input.draft);
+    if (draftSourceLineCount(input.draft.program) > LARGE_SOURCE_LINE_THRESHOLD && !parsedUnits.length) {
+      const diagnostic: OfficeProgramDiagnostic = {
+        code: 'SOURCE_UNITS_REQUIRED',
+        line: 1,
+        column: 1,
+        message: `Large Office sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines require independently editable source units. Presentation pages are indexed by authored slide ID and reusable Python helpers by symbol range; Writer page breaks and Calc worksheets are indexed semantically. Other structures require @webpilot-unit markers.`,
+        severity: 'error',
+      };
+      const error = new Error(diagnostic.message);
+      Object.assign(error, { diagnostics: [diagnostic] });
+      throw error;
+    }
     const staticDiagnostics = staticAnalysis.diagnostics.map((diagnostic) => {
       const unit = diagnostic.line
         ? parsedUnits.find((candidate) => diagnostic.line! >= candidate.startLine && diagnostic.line! <= candidate.endLine)
@@ -2124,6 +2797,7 @@ async function prepareValidatedDraft(input: {
     let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
       absolutePath: candidate.generated.outputPath,
       elementMap: unoStrict ? elementMap : undefined,
+      featureCounts: unoStrict ? generatedFeatureCounts(candidate.generated.diagnostics) : undefined,
       extension: candidate.generated.extension,
       requireElementIds: unoStrict && input.draft.operation !== 'modify',
       validationProfile: unoStrict ? 'uno-strict' : 'basic',
@@ -2139,6 +2813,7 @@ async function prepareValidatedDraft(input: {
       validation = await validateOfficeArtifact({
         absolutePath: candidate.generated.outputPath,
         elementMap: unoStrict ? generatedElementMap(candidate.generated.diagnostics) : undefined,
+        featureCounts: unoStrict ? generatedFeatureCounts(candidate.generated.diagnostics) : undefined,
         extension: candidate.generated.extension,
         requireElementIds: unoStrict && input.draft.operation !== 'modify',
         validationProfile: unoStrict ? 'uno-strict' : 'basic',
@@ -2152,15 +2827,20 @@ async function prepareValidatedDraft(input: {
       Object.assign(error, { diagnostics: validation.issues });
       throw error;
     }
+    const workerDiagnostics = unoStrict ? generatedRuntimeDiagnostics(candidate.generated.diagnostics) : [];
     const runtimeIssues = unoStrict ? generatedVerificationIssues(candidate.generated.diagnostics) : [];
     validation = {
       ...validation,
-      issues: [...validation.issues, ...runtimeIssues],
-      passed: validation.passed && !runtimeIssues.some((issue) => issue.severity === 'error'),
+      issues: [...validation.issues, ...workerDiagnostics, ...runtimeIssues],
+      passed: validation.passed
+        && !workerDiagnostics.some((issue) => issue.severity === 'error')
+        && !runtimeIssues.some((issue) => issue.severity === 'error'),
     };
     if (!validation.passed) {
-      const error = new Error(runtimeIssues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
-      Object.assign(error, { diagnostics: runtimeIssues });
+      const failedRuntimeDiagnostics = [...workerDiagnostics, ...runtimeIssues]
+        .filter((issue) => issue.severity === 'error');
+      const error = new Error(failedRuntimeDiagnostics.map((issue) => issue.message).join('\n'));
+      Object.assign(error, { diagnostics: failedRuntimeDiagnostics });
       throw error;
     }
     let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
@@ -2182,6 +2862,7 @@ async function prepareValidatedDraft(input: {
       }
     }
     input.draft.validationStatus = 'passed';
+    input.draft.validationFailureCount = 0;
     input.draft.validatedSourceDigest = sourceDigest(input.draft.program);
     input.draft.validationDiagnostics = [
       ...staticDiagnostics,
@@ -2207,8 +2888,6 @@ async function prepareValidatedDraft(input: {
     synchronizeSourceUnits(input.draft, 'passed');
     input.draft.workflow = { state: 'render-ready', checkpointAt: new Date().toISOString() };
     await saveDraft(input.runId, input.draft);
-    input.draft.validatedRevision = input.draft.currentRevision;
-    await writeDraftWorkspace(input.runId, input.draft);
     return { ...candidate, validation };
   } catch (error) {
     const explicitDiagnostics = error && typeof error === 'object' && 'diagnostics' in error
@@ -2219,6 +2898,7 @@ async function prepareValidatedDraft(input: {
       ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
       : undefined);
     input.draft.validationStatus = 'failed';
+    input.draft.validationFailureCount = (input.draft.validationFailureCount || 0) + 1;
     input.draft.validationDiagnostics = diagnostics || [{
       message: errorText,
       severity: 'error',
@@ -2272,9 +2952,8 @@ async function validateDraft(input: {
         generator: input.draft.generator || 'javascript',
         sourceDigest: sourceDigest(input.draft.program || ''),
         sourceCharacters: input.draft.program?.length || 0,
-        currentRevision: input.draft.currentRevision || null,
-        validatedRevision: input.draft.validatedRevision || null,
         validationStatus: input.draft.validationStatus,
+        requiredNextAction: 'render',
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         generationDiagnostics: candidate.generated.diagnostics,
@@ -2314,16 +2993,15 @@ async function validateDraft(input: {
         saved: !saveError,
         sourceDigest: sourceDigest(source),
         sourceCharacters: source.length,
-        currentRevision: input.draft.currentRevision || null,
-        validatedRevision: input.draft.validatedRevision || null,
-        lastSuccessfulRevision: input.draft.validatedRevision || input.draft.currentRevision || null,
         lineCount: draftSourceLineCount(source),
         validation: 'failed',
+        validationFailureCount: input.draft.validationFailureCount || 1,
         requiredNextAction: 'edit',
-        diagnostics: input.draft.validationDiagnostics || [],
+        diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
         repairHints: officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
-        error: saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError,
-        workflow: input.draft.workflow,
+        error: compactToolText(saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError),
+        recoverySuggestion: 'Continue editing this same current source. Read only the reported source unit or a small line window, then apply one focused structured edit to the exact diagnostic block. Do not use action=generate to repair a line-addressable validation error; generate is only for an intentional complete-draft replacement, not ordinary recovery.',
+        workflow: compactWorkflowForTool(input.draft.workflow),
       }),
     };
   }
@@ -2346,9 +3024,10 @@ async function validateDraftSourceUnit(input: {
   const previewPath = path.join(directory, `.unit-${suffix}.preview.pdf`);
   try {
     if (!input.draft.program) throw new Error('The Office draft has no working source.');
-    const unit = parseSourceUnits(input.draft.program).find((candidate) => candidate.path === input.sourceUnitPath);
+    const units = sourceUnitsForDraft(input.draft.program, input.draft);
+    const unit = units.find((candidate) => candidate.path === input.sourceUnitPath);
     if (!unit) throw new Error(`Office source unit ${input.sourceUnitPath} does not exist.`);
-    const isolatedSource = isolateSourceUnit(input.draft.program, input.sourceUnitPath, input.draft.generator);
+    const isolatedSource = isolateSourceUnit(input.draft.program, input.sourceUnitPath, input.draft.generator, units);
     await input.onProgress?.({ phase: 'unit-static-analysis', message: `正在检查 ${input.sourceUnitPath}` });
     const staticAnalysis = await analyzeOfficeProgram(isolatedSource, input.draft.generator || 'javascript');
     if (!staticAnalysis.passed) {
@@ -2376,6 +3055,7 @@ async function validateDraftSourceUnit(input: {
     let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
       absolutePath: generated.outputPath,
       elementMap: unoStrict ? elementMap : undefined,
+      featureCounts: unoStrict ? generatedFeatureCounts(generated.diagnostics) : undefined,
       extension: generated.extension,
       requireElementIds: unoStrict && input.draft.operation !== 'modify',
       validationProfile: unoStrict ? 'uno-strict' : 'basic',
@@ -2385,15 +3065,20 @@ async function validateDraftSourceUnit(input: {
       Object.assign(error, { diagnostics: validation.issues });
       throw error;
     }
+    const workerDiagnostics = unoStrict ? generatedRuntimeDiagnostics(generated.diagnostics) : [];
     const runtimeIssues = unoStrict ? generatedVerificationIssues(generated.diagnostics) : [];
     validation = {
       ...validation,
-      issues: [...validation.issues, ...runtimeIssues],
-      passed: validation.passed && !runtimeIssues.some((issue) => issue.severity === 'error'),
+      issues: [...validation.issues, ...workerDiagnostics, ...runtimeIssues],
+      passed: validation.passed
+        && !workerDiagnostics.some((issue) => issue.severity === 'error')
+        && !runtimeIssues.some((issue) => issue.severity === 'error'),
     };
     if (!validation.passed) {
-      const error = new Error(runtimeIssues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
-      Object.assign(error, { diagnostics: runtimeIssues });
+      const failedRuntimeDiagnostics = [...workerDiagnostics, ...runtimeIssues]
+        .filter((issue) => issue.severity === 'error');
+      const error = new Error(failedRuntimeDiagnostics.map((issue) => issue.message).join('\n'));
+      Object.assign(error, { diagnostics: failedRuntimeDiagnostics });
       throw error;
     }
     let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
@@ -2452,7 +3137,6 @@ async function validateDraftSourceUnit(input: {
         sourceUnitDigest: sourceDigest(unit.content),
         validation: 'passed',
         renderable: input.draft.validatedSourceDigest === sourceDigest(input.draft.program),
-        currentRevision: input.draft.currentRevision || null,
         assets: assets.map(describeDocumentAsset),
         automaticValidation: validation,
         automaticVisualChecks: visualVerification?.automaticChecks || [],
@@ -2474,6 +3158,7 @@ async function validateDraftSourceUnit(input: {
       ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
       : undefined);
     input.draft.validationStatus = 'failed';
+    input.draft.validationFailureCount = (input.draft.validationFailureCount || 0) + 1;
     input.draft.validationDiagnostics = (diagnostics || [{ message: errorText, severity: 'error' as const }])
       .map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath }));
     input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString(), error: errorText };
@@ -2493,15 +3178,14 @@ async function validateDraftSourceUnit(input: {
         saved: !saveError,
         renderable: false,
         sourceDigest: sourceDigest(input.draft.program || ''),
-        currentRevision: input.draft.currentRevision || null,
-        lastSuccessfulRevision: input.draft.validatedRevision || input.draft.currentRevision || null,
+        validationFailureCount: input.draft.validationFailureCount || 1,
         requiredNextAction: 'edit',
-        diagnostics: input.draft.validationDiagnostics,
+        diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
         repairHints: officeValidationRepairHints(input.draft.validationDiagnostics, error instanceof Error ? error.message : String(error)),
-        error: saveError
+        error: compactToolText(saveError
           ? `${error instanceof Error ? error.message : String(error)}\nWorking source save failed: ${saveError}`
-          : error instanceof Error ? error.message : String(error),
-        workflow: input.draft.workflow,
+          : error instanceof Error ? error.message : String(error)),
+        workflow: compactWorkflowForTool(input.draft.workflow),
       }),
     };
   } finally {
@@ -2534,17 +3218,18 @@ async function renderDraft(input: {
           sourceDigest: workingDigest,
           validatedSourceDigest: input.draft.validatedSourceDigest || null,
           validationStatus: input.draft.validationStatus,
-          diagnostics: input.draft.validationDiagnostics || [],
+          validationFailureCount: input.draft.validationFailureCount || 1,
+          diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
           requiredNextAction: 'edit',
-          error: 'The current working source failed validation. Continue editing this same source before rendering.',
-          workflow: input.draft.workflow,
+          error: 'The current working source failed validation. Continue editing this source or atomically replace it with action=generate before rendering.',
+          workflow: compactWorkflowForTool(input.draft.workflow),
         }),
       };
     }
     const candidate = await prepareValidatedDraft(input);
     const digest = sourceDigest(input.draft.program || '');
     if (input.draft.validatedSourceDigest !== digest || input.draft.validationStatus !== 'passed') {
-      throw new Error('The working source has not passed validation and cannot be rendered. Continue editing the saved working revision until validation passes.');
+      throw new Error('The working source has not passed validation and cannot be rendered. Continue editing the saved current source until validation passes.');
     }
     input.draft.workflow = { state: 'rendering', checkpointAt: new Date().toISOString() };
     await saveDraft(input.runId, input.draft);
@@ -2600,6 +3285,7 @@ async function renderDraft(input: {
     input.draft.visualQaPageCount = undefined;
     input.draft.visualQaSeenPages = [];
     input.draft.visualQaReviews = [];
+    input.draft.visualQaDeckReview = undefined;
     input.draft.visualQaPageDigests = [];
     input.draft.workflow = {
       state: visualVerification ? 'qa-pending' : 'completed',
@@ -2615,7 +3301,6 @@ async function renderDraft(input: {
         documentId: input.draft.documentId,
         sourceDigest: digest,
         renderedDigest: digest,
-        currentRevision: input.draft.currentRevision || null,
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         availableAssets: candidate.assets.map(describeDocumentAsset),
@@ -2643,8 +3328,9 @@ async function renderDraft(input: {
           renderer: visualVerification.renderer,
           warning: visualVerification.warning,
           automaticChecks: visualVerification.automaticChecks || [],
+          automaticCheckScope: 'render-integrity-only: dimensions and near-blank detection; not a visual-quality verdict',
           gateStatus: 'pending-model-review',
-          requiredCondition: 'visualQaDigest === renderedDigest, every indexed page has been read, and every page has an explicit passed review',
+          requiredCondition: 'visualQaDigest === renderedDigest, every indexed page has an evidence-backed passed review with all visual checks, and the complete artifact has a passed cross-page consistency review',
         } : {
           status: 'not-performed',
           reason: 'The selected model does not accept image input or the generated format has no page renderer; no visual conclusion was made.',
@@ -2764,19 +3450,18 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
       }
       throw error;
     }
-    if (persistedDraft.program) {
-      return {
-        ok: false,
-        actual: `Office draft ${documentId} already has source. Do not send another complete program. Use action=read only when the current source is unknown, then action=edit with line-range edits=[{startLine,endLine,newText}]. The edit is saved and validated before action=render publishes it.`,
-      };
-    }
     const draft = structuredClone(persistedDraft);
     draft.program = program;
     draft.validationStatus = 'pending';
+    draft.validationFailureCount = 0;
     draft.validationDiagnostics = [];
+    delete draft.elementMap;
+    delete draft.rendererValidation;
+    invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-    // Generation initializes the single editable source buffer. Validation
-    // failures keep this source saved so later edits can repair it in place.
+    // A documentId owns exactly one editable source buffer. Calling generate
+    // for that id atomically replaces its current source, regardless of the
+    // previous validation state.
     return validateDraft({ ...input, draft, documentChanged: true });
   } catch (error) {
     return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -2796,41 +3481,23 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     const persistedDraft = await loadDraft(input.runId, documentId);
     if (!persistedDraft.program) return { ok: false, actual: `Office draft ${documentId} has no program yet; call action=generate first.` };
     const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
-    const sourceUnits = parseSourceUnits(persistedDraft.program);
-    const requestedUnit = requestedPath ? sourceUnits.find((unit) => unit.path === requestedPath) : undefined;
+    const sourceUnits = sourceUnitsForDraft(persistedDraft.program, persistedDraft);
+    const requestedUnit = sourceUnitForRequestedPath(sourceUnits, requestedPath);
     if (requestedPath && !requestedUnit) {
-      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Read the document without path to list available units.` };
-    }
-    if (requestedPath && input.restoreRevision !== undefined) {
-      return { ok: false, actual: 'restoreRevision restores the complete document source and cannot be scoped to one source unit path.' };
+      const available = sourceUnits.map((unit) => unit.path).join(', ') || '(none)';
+      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. Read a bounded startLine/endLine window for shared helpers, then use structured line edits.` };
     }
     const editableSource = requestedUnit?.content ?? persistedDraft.program;
     const currentDigest = sourceDigest(editableSource);
     const draft = structuredClone(persistedDraft);
-    if (input.restoreRevision !== undefined) {
-      const revisionNumber = Number(input.restoreRevision);
-      const revision = persistedDraft.revisions?.find((item) => item.revision === revisionNumber);
-      if (!Number.isInteger(revisionNumber) || revisionNumber < 1 || !revision) {
-        return {
-          ok: false,
-          actual: `Office draft ${documentId} has no revision ${input.restoreRevision}. Read the draft to obtain the available revision numbers.`,
-        };
-      }
-      const revisionPath = path.join(draftRevisionDirectory(input.runId, documentId), path.basename(revision.sourceFileName));
-      draft.program = await readFile(revisionPath, 'utf8');
-    } else {
-      if (typeof input.patch === 'string' && input.patch.trim()) {
-        if (input.edits?.length) return { ok: false, actual: 'file action=edit accepts patch or edits, not both in one atomic call.' };
-        const edited = applyUnoDraftPatch(editableSource, input.patch);
-        draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
-      } else {
-        if (!Array.isArray(input.edits) || !input.edits.length) {
-          return { ok: false, actual: 'file action=edit requires edits, patch, or restoreRevision.' };
-        }
-        const edited = applyUnoDraftLineEdits(editableSource, input.edits);
-        draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
-      }
+    if (!Array.isArray(input.edits) || !input.edits.length) {
+      return { ok: false, actual: 'file action=edit requires structured edits.' };
     }
+    const inferredValidationUnit = requestedUnit
+      ? undefined
+      : sourceUnitForStructuredLineEdits(sourceUnits, input.edits);
+    const edited = applyUnoDraftLineEdits(editableSource, input.edits);
+    draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {
         ok: true,
@@ -2852,10 +3519,15 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     draft.validationDiagnostics = [];
     invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
+    const currentValidationUnit = requestedUnit || (inferredValidationUnit
+      ? sourceUnitForRequestedPath(sourceUnitsForDraft(draft.program, draft), inferredValidationUnit.path)
+      : undefined);
     // The current source is the editor buffer. Validation failures keep that
     // exact buffer and diagnostics so the next edit can repair it in place.
-    const validationResult = await (requestedUnit
-      ? validateDraftSourceUnit({ ...input, draft, sourceUnitPath: requestedUnit.path })
+    // A line-only edit contained by one inferred page/sheet is validated in
+    // isolation automatically. Final render still validates the full source.
+    const validationResult = await (currentValidationUnit && currentValidationUnit.kind !== 'symbol'
+      ? validateDraftSourceUnit({ ...input, draft, sourceUnitPath: currentValidationUnit.path })
       : validateDraft({ ...input, draft, documentChanged: true }));
     if (!validationResult.ok) {
       let failure: Record<string, unknown> = {};
@@ -2872,13 +3544,12 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           saved: failure.saved === true,
           sourceDigest: sourceDigest(draft.program || ''),
           sourceCharacters: draft.program?.length || 0,
-          currentRevision: draft.currentRevision || null,
-          lastSuccessfulRevision: persistedDraft.validatedRevision || persistedDraft.currentRevision || null,
           diagnostics: failure.diagnostics || draft.validationDiagnostics || [],
           validation: 'failed',
-          requiredNextAction: 'edit',
-          recoverySuggestion: 'The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation.',
-          workflow: draft.workflow,
+          requiredNextAction: failure.requiredNextAction || 'edit',
+          recoverySuggestion: failure.recoverySuggestion
+            || 'The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation.',
+          workflow: compactWorkflowForTool(draft.workflow),
         }),
       };
     }
@@ -2954,8 +3625,16 @@ export async function recordOfficeVisualQaProgress(input: {
       reviews?: Array<{
         pageNumber?: number;
         status?: 'failed' | 'passed';
+        observation?: string;
+        checks?: OfficeVisualQaPageChecks;
         issues?: Array<{ type?: string; description?: string; region?: string; severity?: 'error' | 'warning' }>;
       }>;
+      deckReview?: {
+        status?: 'failed' | 'passed';
+        observation?: string;
+        checks?: OfficeVisualQaDeckChecks;
+        issues?: Array<{ type?: string; description?: string; region?: string; severity?: 'error' | 'warning' }>;
+      };
     };
     return await withDraftLock(input.runId, identity.documentId, async () => {
       const draft = await loadDraft(input.runId, identity.documentId);
@@ -2968,6 +3647,7 @@ export async function recordOfficeVisualQaProgress(input: {
         draft.visualQaPageCount = undefined;
         draft.visualQaSeenPages = [];
         draft.visualQaReviews = [];
+        draft.visualQaDeckReview = undefined;
         draft.visualQaPageDigests = [];
       }
       const screenshotCount = Number(payload.screenshotCount);
@@ -2985,7 +3665,13 @@ export async function recordOfficeVisualQaProgress(input: {
             if (/^[a-f0-9]{64}$/i.test(screenshotDigest)) {
               pageDigests.set(page, screenshotDigest);
               const cached = reviewCache.get(screenshotDigest);
-              if (cached?.status === 'passed') reviewed.set(page, { pageNumber: page, status: 'passed', issues: [] });
+              if (cached?.status === 'passed') reviewed.set(page, {
+                pageNumber: page,
+                status: 'passed',
+                observation: cached.observation,
+                checks: cached.checks,
+                issues: [],
+              });
             }
           }
         }
@@ -3007,19 +3693,54 @@ export async function recordOfficeVisualQaProgress(input: {
             ...(issue.region ? { region: String(issue.region).trim() } : {}),
             ...(issue.severity ? { severity: issue.severity } : {}),
           })).filter((issue) => issue.type && issue.description);
+          const observation = String(review.observation || '').trim();
+          if (observation.length < 20) return { ok: false, actual: `fileVisual review rejected: page ${pageNumber} requires a concrete visual observation of at least 20 characters.` };
+          const checkResult = failedPageVisualChecks(review.checks);
+          if (checkResult.invalid.length) return { ok: false, actual: `fileVisual review rejected: page ${pageNumber} is missing or has invalid checks: ${checkResult.invalid.join(', ')}.` };
           if (review.status === 'passed' && issues.length) return { ok: false, actual: `fileVisual review rejected: passed page ${pageNumber} contains issues.` };
           if (review.status === 'failed' && !issues.length) return { ok: false, actual: `fileVisual review rejected: failed page ${pageNumber} requires issue details.` };
           if (review.status !== 'passed' && review.status !== 'failed') return { ok: false, actual: `fileVisual review rejected: page ${pageNumber} requires status passed or failed.` };
-          reviewed.set(pageNumber, { pageNumber, status: review.status, issues });
+          if (review.status === 'passed' && checkResult.failed.length) return { ok: false, actual: `fileVisual review rejected: passed page ${pageNumber} contains failed checks: ${checkResult.failed.join(', ')}.` };
+          if (review.status === 'failed' && !checkResult.failed.length) return { ok: false, actual: `fileVisual review rejected: failed page ${pageNumber} requires at least one failed check.` };
+          const duplicateObservation = [...reviewed.values()].find((existing) => existing.pageNumber !== pageNumber && existing.observation === observation);
+          if (duplicateObservation) return { ok: false, actual: `fileVisual review rejected: pages ${duplicateObservation.pageNumber} and ${pageNumber} reuse the same observation. Describe page-specific visible evidence.` };
+          reviewed.set(pageNumber, { pageNumber, status: review.status, observation, checks: review.checks!, issues });
         }
         draft.visualQaReviews = [...reviewed.values()].sort((left, right) => left.pageNumber - right.pageNumber);
         const cache = new Map((draft.visualQaReviewCache || []).map((review) => [review.screenshotDigest, review]));
         const pageDigests = new Map((draft.visualQaPageDigests || []).map((item) => [item.pageNumber, item.screenshotDigest]));
         for (const review of draft.visualQaReviews) {
           const screenshotDigest = pageDigests.get(review.pageNumber);
-          if (screenshotDigest) cache.set(screenshotDigest, { screenshotDigest, status: review.status, issues: review.issues });
+          if (screenshotDigest) cache.set(screenshotDigest, {
+            screenshotDigest,
+            status: review.status,
+            observation: review.observation,
+            checks: review.checks,
+            issues: review.issues,
+          });
         }
         draft.visualQaReviewCache = [...cache.values()].slice(-1_000);
+        if (payload.deckReview) {
+          const observation = String(payload.deckReview.observation || '').trim();
+          const issues = (payload.deckReview.issues || []).map((issue) => ({
+            type: String(issue.type || '').trim(),
+            description: String(issue.description || '').trim(),
+            ...(issue.region ? { region: String(issue.region).trim() } : {}),
+            ...(issue.severity ? { severity: issue.severity } : {}),
+          })).filter((issue) => issue.type && issue.description);
+          const checkResult = failedDeckVisualChecks(payload.deckReview.checks);
+          if (observation.length < 30) return { ok: false, actual: 'fileVisual deckReview rejected: a concrete cross-page observation of at least 30 characters is required.' };
+          if (checkResult.invalid.length) return { ok: false, actual: `fileVisual deckReview rejected: missing or invalid checks: ${checkResult.invalid.join(', ')}.` };
+          if (payload.deckReview.status !== 'passed' && payload.deckReview.status !== 'failed') return { ok: false, actual: 'fileVisual deckReview rejected: status must be passed or failed.' };
+          if (payload.deckReview.status === 'passed' && (issues.length || checkResult.failed.length)) return { ok: false, actual: 'fileVisual deckReview rejected: a passed review cannot contain issues or failed checks.' };
+          if (payload.deckReview.status === 'failed' && (!issues.length || !checkResult.failed.length)) return { ok: false, actual: 'fileVisual deckReview rejected: a failed review requires issue details and at least one failed check.' };
+          draft.visualQaDeckReview = {
+            status: payload.deckReview.status,
+            observation,
+            checks: payload.deckReview.checks!,
+            issues,
+          };
+        }
       }
       const pageCount = draft.visualQaPageCount || 0;
       const completeCoverage = pageCount > 0
@@ -3028,7 +3749,8 @@ export async function recordOfficeVisualQaProgress(input: {
       const completePassingReview = pageCount > 0
         && Array.from({ length: pageCount }, (_, index) => index + 1)
           .every((pageNumber) => reviews.get(pageNumber)?.status === 'passed');
-      draft.visualQaDigest = completeCoverage && completePassingReview ? identity.renderedDigest : undefined;
+      const completeDeckReview = draft.visualQaDeckReview?.status === 'passed';
+      draft.visualQaDigest = completeCoverage && completePassingReview && completeDeckReview ? identity.renderedDigest : undefined;
       draft.workflow = {
         state: draft.visualQaDigest === identity.renderedDigest ? 'completed' : 'qa-pending',
         checkpointAt: new Date().toISOString(),
@@ -3048,7 +3770,8 @@ export async function recordOfficeVisualQaProgress(input: {
             seenPages: draft.visualQaSeenPages || [],
             reviewedPageCount: draft.visualQaReviews?.length || 0,
             failedPages: (draft.visualQaReviews || []).filter((review) => review.status === 'failed').map((review) => review.pageNumber),
-            complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage && completePassingReview,
+            deckReviewStatus: draft.visualQaDeckReview?.status || null,
+            complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage && completePassingReview && completeDeckReview,
           },
         }),
       };
@@ -3071,6 +3794,8 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
     reviewedPageCount: number;
     failedPages: number[];
     failedReviews: Array<{ pageNumber: number; issues: Array<{ type: string; description: string; region?: string; severity?: string }> }>;
+    deckReviewStatus?: 'failed' | 'passed';
+    deckReviewIssues: Array<{ type: string; description: string; region?: string; severity?: string }>;
   }> = [];
   for (const entry of entries) {
     if (!entry.name.endsWith('.json') || entry.name.endsWith('.transaction.json')) continue;
@@ -3085,10 +3810,12 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
       const reviews = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
       const completePassingReview = pageCount > 0
         && Array.from({ length: pageCount }, (_, index) => reviews.get(index + 1)?.status === 'passed');
+      const completeDeckReview = draft.visualQaDeckReview?.status === 'passed';
       if (draft.visualQaArtifactId !== draft.renderedArtifactId
         || draft.visualQaDigest !== renderedDigest
         || !completeCoverage
-        || !completePassingReview) {
+        || !completePassingReview
+        || !completeDeckReview) {
         pending.push({
           documentId: draft.documentId,
           artifactId: draft.renderedArtifactId,
@@ -3103,6 +3830,8 @@ export async function pendingOfficeVisualQa(runId?: string, artifactIds?: Readon
           failedReviews: Array.from(reviews.values())
             .filter((review) => review.status === 'failed')
             .map((review) => ({ pageNumber: review.pageNumber, issues: review.issues })),
+          deckReviewStatus: draft.visualQaDeckReview?.status,
+          deckReviewIssues: draft.visualQaDeckReview?.issues || [],
         });
       }
     } catch {

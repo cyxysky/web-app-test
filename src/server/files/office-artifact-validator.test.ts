@@ -21,7 +21,21 @@ test('validates the final OOXML package independently from its authoring engine'
     assert.ok(Array.isArray(result.media));
     assert.ok(result.platform.length > 0);
     assert.deepEqual(result.formatChecks, {
-      presentation: { chartCount: 0, imageCount: 0, slideCount: 1, tableCount: 0 },
+      presentation: {
+        chartCount: 0,
+        nativeChartCount: 0,
+        vectorChartCount: 0,
+        totalChartCount: 0,
+        vectorBarChartCount: 0,
+        vectorLineChartCount: 0,
+        vectorDonutChartCount: 0,
+        authoredExternalHyperlinkCount: 0,
+        authoredInternalSlideHyperlinkCount: 0,
+        serializedHyperlinkCount: 0,
+        imageCount: 0,
+        slideCount: 1,
+        tableCount: 0,
+      },
     });
   } finally {
     await rm(directory, { force: true, recursive: true });
@@ -140,6 +154,39 @@ test('applies OOXML structure checks to JavaScript basic validation', async () =
     const result = await validateOfficeArtifact({ absolutePath: target, extension: '.xlsx', validationProfile: 'basic' });
     assert.equal(result.passed, false);
     assert.equal(result.issues.some((issue) => issue.code === 'XLSX_NO_WORKSHEETS'), true);
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test('accepts zero extent on exactly one axis for DrawingML line shapes', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-pptx-lines-'));
+  const target = path.join(directory, 'axis-lines.pptx');
+  try {
+    const zip = new JSZip();
+    zip.file('ppt/presentation.xml', '<p:presentation xmlns:p="p"><p:sldSz cx="1000" cy="1000"/></p:presentation>');
+    zip.file('ppt/slides/slide1.xml', [
+      '<p:sld xmlns:p="p" xmlns:a="a"><p:cSld><p:spTree>',
+      '<p:sp><p:nvSpPr><p:cNvPr id="2" name="wp_horizontal"/></p:nvSpPr><p:spPr>',
+      '<a:xfrm><a:off x="100" y="200"/><a:ext cx="700" cy="0"/></a:xfrm>',
+      '<a:prstGeom prst="line"><a:avLst/></a:prstGeom></p:spPr></p:sp>',
+      '<p:sp><p:nvSpPr><p:cNvPr id="3" name="wp_vertical"/></p:nvSpPr><p:spPr>',
+      '<a:xfrm><a:off x="300" y="100"/><a:ext cx="0" cy="800"/></a:xfrm>',
+      '<a:prstGeom prst="line"><a:avLst/></a:prstGeom></p:spPr></p:sp>',
+      '</p:spTree></p:cSld></p:sld>',
+    ].join(''));
+    await writeFile(target, await zip.generateAsync({ type: 'nodebuffer' }));
+    const result = await validateOfficeArtifact({
+      absolutePath: target,
+      elementMap: [
+        { elementId: 'horizontal', artifactName: 'wp_horizontal', kind: 'connector', line: 1, locator: { slide: 1, shape: 1 } },
+        { elementId: 'vertical', artifactName: 'wp_vertical', kind: 'connector', line: 2, locator: { slide: 1, shape: 2 } },
+      ],
+      extension: '.pptx',
+      validationProfile: 'uno-strict',
+    });
+    assert.equal(result.passed, true);
+    assert.equal(result.issues.some((issue) => issue.code === 'PPTX_OBJECT_OUT_OF_BOUNDS'), false);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

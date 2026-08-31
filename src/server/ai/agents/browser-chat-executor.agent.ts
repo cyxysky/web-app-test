@@ -1245,6 +1245,32 @@ function attachPrerequisiteResults(
   } satisfies BrowserActionResult;
 }
 
+const visualQaCheckStatusSchema = z.enum(['failed', 'not-applicable', 'passed']);
+const visualQaPageChecksSchema = z.object({
+  overlap: visualQaCheckStatusSchema,
+  clipping: visualQaCheckStatusSchema,
+  alignment: visualQaCheckStatusSchema,
+  spacing: visualQaCheckStatusSchema,
+  typography: visualQaCheckStatusSchema,
+  contrast: visualQaCheckStatusSchema,
+  visualHierarchy: visualQaCheckStatusSchema,
+  chartTableLegibility: visualQaCheckStatusSchema,
+  imageQuality: visualQaCheckStatusSchema,
+}).strict();
+const visualQaDeckChecksSchema = z.object({
+  templateConsistency: z.enum(['failed', 'passed']),
+  typographyConsistency: z.enum(['failed', 'passed']),
+  colorConsistency: z.enum(['failed', 'passed']),
+  spacingRhythm: z.enum(['failed', 'passed']),
+  componentConsistency: z.enum(['failed', 'passed']),
+}).strict();
+const visualQaIssuesSchema = z.array(z.object({
+  type: z.string().min(1).max(80),
+  description: z.string().min(1).max(500),
+  region: z.string().max(120).optional(),
+  severity: z.enum(['error', 'warning']).optional(),
+}).strict()).max(50).optional();
+
 function makeBrowserTools(
   session: BrowserSession,
   traces: ToolTrace[],
@@ -1559,10 +1585,11 @@ function makeBrowserTools(
           sourceAttachmentId: z.string().max(160).optional().describe('For operation=modify: exact attachment id of the existing Office file.'),
           intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
           url: z.string().max(8_000).optional(),
-          path: z.string().max(8_000).optional().describe('For draft read/edit, an optional relative @webpilot-unit path such as pages/slide-008; for download, a source path or URL as documented by that action.'),
+          path: z.string().max(8_000).optional().describe('For draft read/edit, an optional semantic source-unit path returned by read, such as pages/s30-risk-matrix or symbols/add_bg; for download, a source path or URL as documented by that action.'),
+          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based first source line. Use a small window around a diagnostic instead of reading a large complete draft.'),
+          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based inclusive last source line; source windows are limited to 240 lines.'),
           urlOrPath: z.string().max(8_000).optional(),
           program: z.string().optional(),
-          baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Optional compatibility field. Edits apply to the current draft; the result returns its new sourceDigest.'),
           edits: z.array(z.object({
             kind: z.enum(['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText']).optional().describe('Defaults to replaceRange. Use replaceAll once to replace every exact oldText match; do not emit one replaceText edit per occurrence.'),
             startLine: z.number().int().min(1).optional().describe('One-based first source line for replaceRange/deleteRange.'),
@@ -1570,10 +1597,9 @@ function makeBrowserTools(
             line: z.number().int().min(1).optional().describe('One-based anchor line for insertBefore/insertAfter.'),
             oldText: z.string().min(1).optional().describe('Exact current source for replaceText.'),
             occurrence: z.number().int().min(1).optional().describe('For replaceText only: one-based index of the oldText match, not a replacement count. Omit when oldText is unique; use replaceAll for every match.'),
+            preserveIndent: z.boolean().optional().describe('For replaceRange: defaults to false, so newText indentation is applied exactly. Set true only when newText is intentionally relative to the replaced block; never set it for source copied from read or mixed-indent Python blocks.'),
             newText: z.string().optional().describe('Replacement or inserted source. Omit for deleteRange.'),
-          }).strict()).min(1).max(100).optional(),
-          patch: z.string().optional().describe('For action=edit: a standard unified diff against the current draft. Do not combine with edits.'),
-          restoreRevision: z.number().int().min(1).optional().describe('For action=edit: restore this revision as a new current revision.'),
+          }).strict()).min(1).max(100).optional().describe('Structured edits may mix line ranges and exact-text replacements. Line edits use coordinates from the same read and merge first; replaceText/replaceAll then run in supplied order against that candidate. For a single Python indentation diagnostic, replace the exact offending line or minimal block and do not repeat unchanged neighboring lines.'),
           render: z.boolean().optional(),
           includeVisuals: z.boolean().optional(),
           offset: z.number().int().min(0).optional(),
@@ -1603,7 +1629,13 @@ function makeBrowserTools(
         }
         if (input.action === 'read') {
           if (input.documentId) {
-            return record('file', input, () => readUnoDraft({ documentId: input.documentId, path: input.path, runId: referenceOptions?.runId }), execution);
+            return record('file', input, () => readUnoDraft({
+              documentId: input.documentId,
+              path: input.path,
+              startLine: input.startLine,
+              endLine: input.endLine,
+              runId: referenceOptions?.runId,
+            }), execution);
           }
           const includeVisuals = modelSupportsImageInput()
             && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
@@ -1637,7 +1669,7 @@ function makeBrowserTools(
           return record('file', input, () => getOfficeJsApi({ ...input, runId: referenceOptions?.runId }), execution);
         }
         if (input.action === 'generate') {
-          return record('file', input, (abortSignal, trace) => generateUnoFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
+          return record('file', input, (abortSignal, trace) => generateUnoFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: false }), execution);
         }
         if (input.action === 'render') {
           return record('file', input, (abortSignal, trace) => renderFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
@@ -1650,22 +1682,20 @@ function makeBrowserTools(
             line: edit.line,
             oldText: edit.oldText,
             occurrence: edit.occurrence,
+            preserveIndent: edit.preserveIndent,
             newText: edit.newText || '',
           }));
           return record('file', input, (abortSignal, trace) => editUnoFileArtifact({
             documentId: input.documentId,
             path: input.path,
-            baseDigest: input.baseDigest,
             program: input.program,
             edits,
-            patch: input.patch,
-            restoreRevision: input.restoreRevision,
             render: input.render,
             abortSignal,
             onProgress: fileProgressReporter(trace),
             runId: referenceOptions?.runId,
             attachmentBindings: referenceOptions?.attachmentBindings,
-            includeVisualVerification: modelSupportsImageInput(),
+            includeVisualVerification: false,
           }), execution);
         }
         return record('file', input, () => Promise.resolve({
@@ -1676,7 +1706,7 @@ function makeBrowserTools(
     }),
     ...(modelSupportsImageInput() && referenceOptions?.readFileVisuals ? {
       fileVisual: tool({
-        description: `Index, read, and report page-level visual QA for the exact current artifact. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
+        description: `Index, read, and report evidence-backed page-level and cross-page visual QA for the exact current artifact. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
         inputSchema: z.preprocess(
           (input) => coerceBrowserChatToolInput('fileVisual', input),
           browserToolInput({
@@ -1686,25 +1716,46 @@ function makeBrowserTools(
             reviews: z.array(z.object({
               screenshotId: z.string().min(1).max(40),
               status: z.enum(['failed', 'passed']),
-              issues: z.array(z.object({
-                type: z.string().min(1).max(80),
-                description: z.string().min(1).max(500),
-                region: z.string().max(120).optional(),
-                severity: z.enum(['error', 'warning']).optional(),
-              }).strict()).max(50).optional(),
-            }).strict()).min(1).max(6).optional().describe('For action=report: explicit conclusions for screenshots already read from this artifact.'),
+              observation: z.string().trim().min(20).max(1_000).describe('Concrete page-specific visual evidence covering composition and readability; a generic pass statement is invalid.'),
+              checks: visualQaPageChecksSchema,
+              issues: visualQaIssuesSchema,
+            }).strict()).min(1).max(6).optional().describe('For action=report: evidence-backed conclusions for screenshots already read from this artifact.'),
+            deckReview: z.object({
+              status: z.enum(['failed', 'passed']),
+              observation: z.string().trim().min(30).max(2_000).describe('Concrete cross-page comparison of the complete rendered artifact.'),
+              checks: visualQaDeckChecksSchema,
+              issues: visualQaIssuesSchema,
+            }).strict().optional().describe('Required once after every page has been read and reviewed; evaluates consistency across the complete artifact.'),
             offset: z.number().int().min(0).optional().describe('For action=index only: zero-based screenshot-list offset. Defaults to 0.'),
             limit: z.number().int().min(1).max(200).optional().describe('For action=index only: number of screenshot ids to list. Defaults to 100.'),
           }, [
             { reason: '列出当前文稿的全部预览页', action: 'index', artifactId: 'exact-artifact-id-from-file-result', offset: 0, limit: 100 },
             { reason: '读取前两页预览图', action: 'read', artifactId: 'exact-artifact-id-from-file-result', screenshotIds: ['screenshot-0001', 'screenshot-0002'] },
-            { reason: '提交第一页视觉检查结论', action: 'report', artifactId: 'exact-artifact-id-from-file-result', reviews: [{ screenshotId: 'screenshot-0001', status: 'passed' }] },
+            { reason: '提交第一页视觉检查结论', action: 'report', artifactId: 'exact-artifact-id-from-file-result', reviews: [{ screenshotId: 'screenshot-0001', status: 'passed', observation: '标题、正文和数据图形层级清楚，四周留白均衡，当前预览尺寸下全部文字可读。', checks: { overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed', typography: 'passed', contrast: 'passed', visualHierarchy: 'passed', chartTableLegibility: 'passed', imageQuality: 'not-applicable' } }] },
           ]).superRefine((input, context) => {
             if (input.action === 'read' && !input.screenshotIds?.length) {
               context.addIssue({ code: z.ZodIssueCode.custom, message: 'read requires screenshotIds.', path: ['screenshotIds'] });
             }
             if (input.action === 'report' && !input.reviews?.length) {
               context.addIssue({ code: z.ZodIssueCode.custom, message: 'report requires reviews.', path: ['reviews'] });
+            }
+            for (const [index, review] of (input.reviews || []).entries()) {
+              const failedChecks = Object.entries(review.checks).filter(([, status]) => status === 'failed').map(([name]) => name);
+              const invalidNotApplicable = Object.entries(review.checks)
+                .filter(([name, status]) => status === 'not-applicable' && name !== 'chartTableLegibility' && name !== 'imageQuality')
+                .map(([name]) => name);
+              if (invalidNotApplicable.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `Only chartTableLegibility and imageQuality may be not-applicable; invalid: ${invalidNotApplicable.join(', ')}.`, path: ['reviews', index, 'checks'] });
+              if (review.status === 'passed' && failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `A passed review cannot contain failed checks: ${failedChecks.join(', ')}.`, path: ['reviews', index, 'status'] });
+              if (review.status === 'failed' && !failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed review requires at least one failed check.', path: ['reviews', index, 'checks'] });
+              if (review.status === 'passed' && review.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A passed review cannot contain issues.', path: ['reviews', index, 'issues'] });
+              if (review.status === 'failed' && !review.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed review requires issue details.', path: ['reviews', index, 'issues'] });
+            }
+            if (input.deckReview) {
+              const failedChecks = Object.entries(input.deckReview.checks).filter(([, status]) => status === 'failed').map(([name]) => name);
+              if (input.deckReview.status === 'passed' && failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `A passed deckReview cannot contain failed checks: ${failedChecks.join(', ')}.`, path: ['deckReview', 'status'] });
+              if (input.deckReview.status === 'failed' && !failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed deckReview requires at least one failed check.', path: ['deckReview', 'checks'] });
+              if (input.deckReview.status === 'passed' && input.deckReview.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A passed deckReview cannot contain issues.', path: ['deckReview', 'issues'] });
+              if (input.deckReview.status === 'failed' && !input.deckReview.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed deckReview requires issue details.', path: ['deckReview', 'issues'] });
             }
           }),
         ),
@@ -3793,7 +3844,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         : '';
       const requiredDocumentWorkInstruction = requiredDocumentWork
         ? `[Mandatory Office document completion gate]
-Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The current workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. If validation failed, repair the same saved source; do not render an older revision. A final response is forbidden until the current validated source is rendered and any required visual QA is completed.`
+Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The current workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. If validation failed, repair the same saved current source; do not render a stale artifact. A final response is forbidden until the current validated source is rendered and any required visual QA is completed.`
         : '';
       actionResult = await executeRuntimeStep({
         session: input.session,
@@ -4309,7 +4360,13 @@ export async function executeRecordedBrowserOperation(
         return listOfficeDrafts({ runId });
       }
       if (input.action === 'read' && typeof input.documentId === 'string') {
-        return readUnoDraft({ runId, documentId: input.documentId });
+        return readUnoDraft({
+          runId,
+          documentId: input.documentId,
+          path: typeof input.path === 'string' ? input.path : undefined,
+          startLine: typeof input.startLine === 'number' ? input.startLine : undefined,
+          endLine: typeof input.endLine === 'number' ? input.endLine : undefined,
+        });
       }
       if (input.action === 'download') {
         return downloadFileArtifact({
@@ -4349,7 +4406,7 @@ export async function executeRecordedBrowserOperation(
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
           program: typeof input.program === 'string' ? input.program : undefined,
           render: input.render === false ? false : undefined,
-          includeVisualVerification: true,
+          includeVisualVerification: false,
           attachmentBindings,
         });
       }
@@ -4376,9 +4433,7 @@ export async function executeRecordedBrowserOperation(
         return editUnoFileArtifact({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          baseDigest: typeof input.baseDigest === 'string' ? input.baseDigest : undefined,
           program: typeof input.program === 'string' ? input.program : undefined,
-          patch: typeof input.patch === 'string' ? input.patch : undefined,
           edits: Array.isArray(input.edits)
             ? input.edits.reduce<UnoDraftLineEdit[]>((result, edit) => {
               if (!edit || typeof edit !== 'object' || Array.isArray(edit)) return result;
@@ -4393,14 +4448,14 @@ export async function executeRecordedBrowserOperation(
                 line: Number.isInteger(value.line) ? Number(value.line) : undefined,
                 oldText: typeof value.oldText === 'string' ? value.oldText : undefined,
                 occurrence: Number.isInteger(value.occurrence) ? Number(value.occurrence) : undefined,
+                preserveIndent: typeof value.preserveIndent === 'boolean' ? value.preserveIndent : undefined,
                 newText: typeof value.newText === 'string' ? value.newText : '',
               });
               return result;
             }, [])
             : undefined,
-          restoreRevision: Number.isInteger(input.restoreRevision) ? Number(input.restoreRevision) : undefined,
           render: input.render === false ? false : undefined,
-          includeVisualVerification: true,
+          includeVisualVerification: false,
           attachmentBindings,
         });
       }
@@ -4538,7 +4593,13 @@ async function executeCodexRuntimeObject(input: {
     }
     if (type === 'file' && normalizedParams.action === 'read') {
       const documentId = typeof normalizedParams.documentId === 'string' ? normalizedParams.documentId.trim() : undefined;
-      if (documentId) return readUnoDraft({ runId, documentId });
+      if (documentId) return readUnoDraft({
+        runId,
+        documentId,
+        path: typeof normalizedParams.path === 'string' ? normalizedParams.path : undefined,
+        startLine: typeof normalizedParams.startLine === 'number' ? normalizedParams.startLine : undefined,
+        endLine: typeof normalizedParams.endLine === 'number' ? normalizedParams.endLine : undefined,
+      });
       if (!readFile) return { ok: false, actual: 'file action=read is unavailable in this runtime.' };
       const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : undefined;
       const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : undefined;
@@ -4576,6 +4637,11 @@ async function executeCodexRuntimeObject(input: {
             const screenshotId = typeof review?.screenshotId === 'string' ? review.screenshotId.trim() : '';
             const status: 'failed' | 'passed' | undefined = review?.status === 'passed' || review?.status === 'failed' ? review.status : undefined;
             if (!screenshotId || !status) return [];
+            const observation = typeof review?.observation === 'string' ? review.observation.trim() : '';
+            const checks = review?.checks && typeof review.checks === 'object' && !Array.isArray(review.checks)
+              ? review.checks as NonNullable<BrowserChatFileVisualInput['reviews']>[number]['checks']
+              : undefined;
+            if (!observation || !checks) return [];
             const issues = Array.isArray(review?.issues) ? review.issues.flatMap((issue) => {
               const value = issue && typeof issue === 'object' && !Array.isArray(issue) ? issue as Record<string, unknown> : undefined;
               const issueType = typeof value?.type === 'string' ? value.type.trim() : '';
@@ -4591,7 +4657,7 @@ async function executeCodexRuntimeObject(input: {
                 ...(severity ? { severity } : {}),
               }];
             }) : [];
-            return [{ screenshotId, status, issues }];
+            return [{ screenshotId, status, observation, checks, issues }];
           }).slice(0, 6)
         : undefined;
       if (action === 'report' && !reviews?.length) {
@@ -4599,11 +4665,32 @@ async function executeCodexRuntimeObject(input: {
       }
       const version = await verifyCurrentUnoRenderedArtifact({ runId, artifactId });
       if (!version.ok) return version;
+      const rawDeckReview = normalizedParams.deckReview && typeof normalizedParams.deckReview === 'object' && !Array.isArray(normalizedParams.deckReview)
+        ? normalizedParams.deckReview as Record<string, unknown>
+        : undefined;
+      const deckReview = rawDeckReview && (rawDeckReview.status === 'passed' || rawDeckReview.status === 'failed')
+        && typeof rawDeckReview.observation === 'string'
+        && rawDeckReview.checks && typeof rawDeckReview.checks === 'object' && !Array.isArray(rawDeckReview.checks)
+        ? {
+            status: rawDeckReview.status as 'failed' | 'passed',
+            observation: rawDeckReview.observation.trim(),
+            checks: rawDeckReview.checks as NonNullable<BrowserChatFileVisualInput['deckReview']>['checks'],
+            issues: Array.isArray(rawDeckReview.issues) ? rawDeckReview.issues.flatMap((issue) => {
+              const value = issue && typeof issue === 'object' && !Array.isArray(issue) ? issue as Record<string, unknown> : undefined;
+              const issueType = typeof value?.type === 'string' ? value.type.trim() : '';
+              const description = typeof value?.description === 'string' ? value.description.trim() : '';
+              if (!issueType || !description) return [];
+              const severity: 'error' | 'warning' | undefined = value?.severity === 'error' || value?.severity === 'warning' ? value.severity : undefined;
+              return [{ type: issueType, description, ...(typeof value?.region === 'string' ? { region: value.region } : {}), ...(severity ? { severity } : {}) }];
+            }) : [],
+          }
+        : undefined;
       const visualResult = await readFileVisuals({
         action,
         artifactId,
         screenshotIds,
         reviews,
+        deckReview,
         offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
         limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
       });

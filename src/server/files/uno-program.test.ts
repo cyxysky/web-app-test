@@ -5,7 +5,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import JSZip from 'jszip';
-import { generateUnoProgramDocument, inspectUnoApi, resolveUnoProgramWorker } from './uno-program';
+import {
+  generateUnoProgramDocument,
+  inspectUnoApi,
+  isTransientUnoBridgeError,
+  resolveUnoProgramWorker,
+} from './uno-program';
 import { resolveLibreOfficeExecutable } from './libreoffice';
 import { validateOfficeArtifact } from './office-artifact-validator';
 
@@ -13,6 +18,11 @@ test('forces UTF-8 for UNO worker diagnostics on Windows and other hosts', async
   const source = await readFile(new URL('./uno-program.ts', import.meta.url), 'utf8');
   assert.match(source, /PYTHONIOENCODING:\s*'utf-8'/);
   assert.match(source, /PYTHONUTF8:\s*'1'/);
+});
+
+test('recognizes only disposed UNO bridge failures as isolated-worker retry candidates', () => {
+  assert.equal(isTransientUnoBridgeError(new Error('com.sun.star.lang.DisposedException: Binary URP bridge disposed during call')), true);
+  assert.equal(isTransientUnoBridgeError(new Error("NameError: name 'slide2' is not defined")), false);
 });
 
 test('UNO verification reopens generated Office files read-only', async () => {
@@ -86,6 +96,40 @@ def create_document(job):
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
+});
+
+test('UNO runtime deterministically disambiguates duplicate requested element IDs', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'duplicate-id-disambiguation.pptx',
+    sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    page = deck.add_slide('slide-01')
+    deck.add_text('slide-01/title', page, 'First', 1000, 1000, 6000, 1000)
+    deck.add_text('slide-01/title', page, 'Second', 1000, 2500, 6000, 1000)
+    deck.add_connector('slide-01/flow', page, 9000, 1200, 14000, 2200, color=0x2563EB, end_arrow=True)
+    deck.save()
+    deck.close()
+`,
+  });
+  const elements = generated.report.elementMap as Array<{
+    duplicateIndex?: number;
+    elementId?: string;
+    requestedElementId?: string;
+  }>;
+  assert.equal(elements.some((entry) => entry.elementId === 'slide-01/title'), true);
+  assert.equal(elements.some((entry) => entry.elementId === 'slide-01/title-2'
+    && entry.requestedElementId === 'slide-01/title'
+    && entry.duplicateIndex === 2), true);
+  assert.equal(elements.some((entry) => entry.elementId === 'slide-01/flow'), true);
+  const runtimeDiagnostics = generated.report.runtimeDiagnostics as Array<{ code?: string; severity?: string }>;
+  assert.equal(runtimeDiagnostics.some((entry) => entry.code === 'ELEMENT_ID_AUTO_DISAMBIGUATED'
+    && entry.severity === 'warning'), true);
 });
 
 test('Writer page-break markers do not hide or collapse the following inline image', async (context) => {
@@ -167,6 +211,133 @@ def create_document(job):
   }
 });
 
+test('presentation element maps report the real helper line and preserve its outer callsite', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const sourceCode = [
+    'def create_document(job):',
+    "    deck = job.presentation('deck')",
+    "    page = deck.add_slide('slide-01')",
+    '    def add_label(element_id, text, y):',
+    '        return deck.add_text(element_id, page, text, 1000, y, 9000, 1400, font_size=24)',
+    "    add_label('slide-01/title', 'Concrete callsite', 1200)",
+    '    deck.save()',
+    '    deck.close()',
+    '',
+  ].join('\n');
+  const helperLine = sourceCode.split('\n').findIndex((line) => line.includes('return deck.add_text')) + 1;
+  const callLine = sourceCode.split('\n').findIndex((line) => line.includes("add_label('slide-01/title'")) + 1;
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'concrete-callsite.pptx',
+    sourceCode,
+  });
+  const element = (generated.report.elementMap as Array<{ callLine?: number; elementId?: string; line?: number }>)
+    .find((entry) => entry.elementId === 'slide-01/title');
+  assert.equal(element?.line, helperLine);
+  assert.equal(element?.callLine, callLine);
+});
+
+test('presentation high-level units and components support multi-slide expansion', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'high-level-presentation-layout.pptx',
+    sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    bounds = deck.bounds()
+    for index in range(1, 8):
+        sid = f'slide-{index:02d}'
+        page = deck.add_slide(sid)
+        deck.add_shape(f'{sid}/background', page, 0, 0, bounds['width'], bounds['height'], fill=0xF8FAFC, layout_role='background')
+        card = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(22), 'bottom': deck.mm(18)})
+        deck.add_card(f'{sid}/card', page, card, f'Card {index}', 'Measured body copy.', fill=0xFFFFFF, line=0xCBD5E1, accent=0x2563EB, title_size=22, body_size=14)
+        deck.add_footer(f'{sid}/footer', page, left='UNO', center='High-level layout', right=f'{index:02d}', font_size=10)
+    deck.save()
+    deck.close()
+`,
+  });
+  assert.equal((generated.report.verification as { pages?: number }).pages, 7);
+  const elements = generated.report.elementMap as Array<{ elementId?: string }>;
+  assert.equal(elements.some((entry) => entry.elementId === 'slide-07/card/title'), true);
+  assert.equal(elements.some((entry) => entry.elementId === 'slide-07/footer/right'), true);
+});
+
+test('presentation facade serializes external and internal text hyperlinks and reports vector charts separately', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'facade-links-and-charts.pptx',
+    sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    page = deck.add_slide('slide-01')
+    deck.add_text_link('slide-01/external', page, 'Official website',
+        {'x': deck.mm(16), 'y': deck.mm(24), 'width': deck.mm(90), 'height': deck.mm(12)},
+        url='https://example.com/', font_size=16)
+    deck.add_text_link('slide-01/internal', page, 'Jump to details',
+        {'x': deck.mm(16), 'y': deck.mm(42), 'width': deck.mm(90), 'height': deck.mm(12)},
+        target_slide_id='slide-02', font_size=16)
+    deck.add_bar_chart('slide-01/bar', page,
+        {'x': deck.mm(118), 'y': deck.mm(24), 'width': deck.mm(140), 'height': deck.mm(90)},
+        ['A', 'B', 'C'], [20, 45, 70])
+    page = deck.add_slide('slide-02')
+    deck.add_text('slide-02/title', page, 'Details', deck.mm(16), deck.mm(24), deck.mm(120), deck.mm(16), font_size=24)
+    deck.save()
+    deck.close()
+`,
+  });
+  const features = generated.report.featureCounts as Record<string, number>;
+  assert.equal(features.externalHyperlink, 1);
+  assert.equal(features.internalSlideHyperlink, 1);
+  assert.equal(features.vectorChart, 1);
+  assert.equal(features.vectorBarChart, 1);
+  const archive = await JSZip.loadAsync(generated.buffer);
+  const slideXml = await archive.file('ppt/slides/slide1.xml')!.async('text');
+  assert.ok((slideXml.match(/<a:hlinkClick\b/g) || []).length >= 2, 'both links must survive PPTX serialization');
+  assert.match(slideXml, /ppaction:\/\/hlinksldjump/, 'the internal text link must serialize as a slide jump action');
+  const slideRelationships = await archive.file('ppt/slides/_rels/slide1.xml.rels')!.async('text');
+  assert.match(slideRelationships, /Target="https:\/\/example\.com\/"[^>]*TargetMode="External"/);
+  assert.match(slideRelationships, /Type="[^"]+\/slide" Target="slide2\.xml"/);
+  const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-links-and-charts-'));
+  try {
+    const target = path.join(directory, 'facade-links-and-charts.pptx');
+    await writeFile(target, generated.buffer);
+    const validation = await validateOfficeArtifact({
+      absolutePath: target,
+      extension: '.pptx',
+      featureCounts: features,
+    });
+    const presentationChecks = (validation.formatChecks as { presentation?: Record<string, number> } | undefined)?.presentation;
+    assert.deepEqual(presentationChecks, {
+      chartCount: 0,
+      nativeChartCount: 0,
+      vectorChartCount: 1,
+      totalChartCount: 1,
+      vectorBarChartCount: 1,
+      vectorLineChartCount: 0,
+      vectorDonutChartCount: 0,
+      authoredExternalHyperlinkCount: 1,
+      authoredInternalSlideHyperlinkCount: 1,
+      serializedHyperlinkCount: 2,
+      imageCount: 0,
+      slideCount: 2,
+      tableCount: 0,
+    });
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
 test('presentation auto-layout keeps cells separate and diagnoses semantic shape collisions', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
@@ -202,6 +373,55 @@ def create_document(job):
   assert.equal(verification.layout?.checkedContentShapes, 3);
   assert.equal(verification.layout?.pageOccupancy?.[0]?.contentBoxes, 3);
   assert.equal(verification.layout?.issues?.some((issue) => issue.elementIds?.includes('slide-01/background')), false);
+});
+
+test('raw expert shapes default to decoration and explicit semantic shapes remain collision checked', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'expert-shape-layout-intent.pptx',
+    sourceCode: `
+def create_document(job):
+    expert = job.expert('Create raw Impress shapes with explicit layout intent.')
+    document = expert.new_document('impress')
+    deck = job.presentation('deck', component=document)
+    page = deck.add_slide('slide-01')
+
+    card = document.createInstance('com.sun.star.drawing.RectangleShape')
+    card_position = uno.createUnoStruct('com.sun.star.awt.Point')
+    card_position.X, card_position.Y = 1000, 1000
+    card_size = uno.createUnoStruct('com.sun.star.awt.Size')
+    card_size.Width, card_size.Height = 8000, 3200
+    card.Position, card.Size = card_position, card_size
+    page.add(card)
+    expert.tag(card, 'slide-01/card', 'shape')
+    deck.add_text('slide-01/card/title', page, 'Contained title', 1400, 1400, 7200, 1200, font_size=20)
+
+    data_mark = document.createInstance('com.sun.star.drawing.RectangleShape')
+    mark_position = uno.createUnoStruct('com.sun.star.awt.Point')
+    mark_position.X, mark_position.Y = 11000, 1000
+    mark_size = uno.createUnoStruct('com.sun.star.awt.Size')
+    mark_size.Width, mark_size.Height = 8000, 3200
+    data_mark.Position, data_mark.Size = mark_position, mark_size
+    page.add(data_mark)
+    expert.tag(data_mark, 'slide-01/data-mark', 'shape', layout_role='content', allow_overlap=False)
+    deck.add_text('slide-01/data-label', page, 'Semantic collision', 11400, 1400, 7200, 1200, font_size=20)
+
+    deck.save()
+    deck.close()
+`,
+  });
+  const verification = generated.report.verification as {
+    layout?: { issues?: Array<{ elementIds?: string[]; type?: string }> };
+  };
+  const issues = verification.layout?.issues || [];
+  assert.equal(issues.some((issue) => issue.elementIds?.includes('slide-01/card')), false);
+  assert.equal(issues.some((issue) => issue.type === 'content_overlap'
+    && issue.elementIds?.includes('slide-01/data-mark')
+    && issue.elementIds?.includes('slide-01/data-label')), true);
 });
 
 test('presentation layout maps reopened shapes by stable artifact name before mutable shape index', async (context) => {
@@ -368,7 +588,7 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
     {
       documentType: 'presentation' as const,
       fileName: 'impress-cookbook.pptx',
-      operations: ['openExisting', 'bounds', 'textShape', 'image', 'shape', 'newSlide', 'save'],
+      operations: ['openExisting', 'bounds', 'autoLayout', 'connector', 'nativeTable', 'dataCharts', 'donutAndTimeline', 'imageContain', 'textShape', 'image', 'shape', 'newSlide', 'save'],
     },
   ];
   for (const item of cases) {
@@ -408,6 +628,13 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
       assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.bounds()')));
       assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.grid(')));
       assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.stack(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_connector(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_native_table(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_bar_chart(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_line_chart(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_donut_chart(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_timeline(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_image_contain(')));
       assert.ok(cookbook.facadeSignatures?.some((signature) => signature.includes('add_text') && signature.includes('bold=False')));
       assert.ok(cookbook.facadeSignatures?.some((signature) => signature.includes('add_shape') && signature.includes('fill=None')));
       assert.match(cookbook.operations!.autoLayout, /deck\.grid\(/);
