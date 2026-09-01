@@ -20,23 +20,11 @@ test('validates the final OOXML package independently from its authoring engine'
     assert.deepEqual(result.requestedFonts, ['Arial']);
     assert.ok(Array.isArray(result.media));
     assert.ok(result.platform.length > 0);
-    assert.deepEqual(result.formatChecks, {
-      presentation: {
-        chartCount: 0,
-        nativeChartCount: 0,
-        vectorChartCount: 0,
-        totalChartCount: 0,
-        vectorBarChartCount: 0,
-        vectorLineChartCount: 0,
-        vectorDonutChartCount: 0,
-        authoredExternalHyperlinkCount: 0,
-        authoredInternalSlideHyperlinkCount: 0,
-        serializedHyperlinkCount: 0,
-        imageCount: 0,
-        slideCount: 1,
-        tableCount: 0,
-      },
-    });
+    const presentationChecks = (result.formatChecks as { presentation: Record<string, number> }).presentation;
+    assert.equal(presentationChecks.slideCount, 1);
+    assert.equal(presentationChecks.nativeChartCount, 0);
+    assert.equal(presentationChecks.transitionCount, 0);
+    assert.equal(presentationChecks.notesCount, 0);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -49,6 +37,37 @@ test('flags a nearly uniform rendered page for automatic visual review', async (
     await sharp({ create: { width: 800, height: 600, channels: 3, background: '#ffffff' } }).png().toFile(target);
     const result = await inspectRenderedPage(target);
     assert.ok(result.issues.some((issue) => issue.code === 'PAGE_APPEARS_BLANK'));
+  } finally {
+    await rm(directory, { force: true, recursive: true });
+  }
+});
+
+test('blocks an existing-file edit that drops preserve-only PowerPoint parts', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-preservation-'));
+  const source = path.join(directory, 'source.pptx');
+  const output = path.join(directory, 'output.pptx');
+  const addPresentationCore = (zip: JSZip) => {
+    zip.file('ppt/presentation.xml', '<p:presentation xmlns:p="p"><p:sldSz cx="12192000" cy="6858000"/></p:presentation>');
+    zip.file('ppt/slides/slide1.xml', '<p:sld xmlns:p="p"><p:cSld><p:spTree/></p:cSld></p:sld>');
+  };
+  try {
+    const before = new JSZip();
+    addPresentationCore(before);
+    before.file('ppt/diagrams/data1.xml', '<dgm:dataModel xmlns:dgm="dgm"/>');
+    await writeFile(source, await before.generateAsync({ type: 'nodebuffer' }));
+    const after = new JSZip();
+    addPresentationCore(after);
+    await writeFile(output, await after.generateAsync({ type: 'nodebuffer' }));
+
+    const result = await validateOfficeArtifact({
+      absolutePath: output,
+      sourceAbsolutePath: source,
+      extension: '.pptx',
+    });
+    assert.equal(result.passed, false);
+    assert.ok(result.issues.some((issue) => (
+      issue.code === 'OFFICE_PRESERVE_ONLY_FEATURE_LOST' && issue.target === 'smartArt'
+    )));
   } finally {
     await rm(directory, { force: true, recursive: true });
   }
@@ -211,9 +230,12 @@ test('rejects visible XLSX error cells and reports deterministic workbook counts
 
     assert.equal(result.passed, false);
     assert.ok(result.issues.some((issue) => issue.code === 'XLSX_FORMULA_ERROR_LITERAL'));
-    assert.deepEqual(result.formatChecks, {
-      spreadsheet: { chartCount: 1, errorCellCount: 1, formulaCount: 2, imageCount: 0, worksheetCount: 1 },
-    });
+    const spreadsheetChecks = (result.formatChecks as { spreadsheet: Record<string, number> }).spreadsheet;
+    assert.equal(spreadsheetChecks.chartCount, 1);
+    assert.equal(spreadsheetChecks.errorCellCount, 1);
+    assert.equal(spreadsheetChecks.formulaCount, 2);
+    assert.equal(spreadsheetChecks.worksheetCount, 1);
+    assert.equal(spreadsheetChecks.dataValidationCount, 0);
   } finally {
     await rm(directory, { force: true, recursive: true });
   }

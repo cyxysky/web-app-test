@@ -13,14 +13,31 @@ export type RegisteredBrowserChatTurn<TSession> = {
   session: TSession;
   assistantMessageId: string;
   abortController: AbortController;
+  hardTimeout?: ReturnType<typeof setTimeout>;
+  hardTimeoutAt?: string;
 };
 
 export function registerBrowserChatTurn<TSession>(
   registry: Map<string, RegisteredBrowserChatTurn<TSession>>,
   sessionId: string,
   turn: RegisteredBrowserChatTurn<TSession>,
+  options: { timeoutMs?: number; timeoutMessage?: string } = {},
 ) {
-  registry.set(sessionId, turn);
+  const previous = registry.get(sessionId);
+  if (previous?.hardTimeout) clearTimeout(previous.hardTimeout);
+  const timeoutMs = Number(options.timeoutMs);
+  const registered = { ...turn };
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    registered.hardTimeoutAt = new Date(Date.now() + timeoutMs).toISOString();
+    registered.hardTimeout = setTimeout(() => {
+      if (registry.get(sessionId) !== registered || registered.abortController.signal.aborted) return;
+      registered.abortController.abort(new Error(
+        options.timeoutMessage || `Browser chat turn exceeded its ${Math.round(timeoutMs / 60_000)} minute hard limit.`,
+      ));
+    }, timeoutMs);
+    registered.hardTimeout.unref?.();
+  }
+  registry.set(sessionId, registered);
 }
 
 export function registeredBrowserChatTurnIsActive<TSession>(
@@ -48,6 +65,7 @@ export function clearRegisteredBrowserChatTurn<TSession>(
     registered?.assistantMessageId !== assistantMessageId
     || registered.abortController !== abortController
   ) return false;
+  if (registered.hardTimeout) clearTimeout(registered.hardTimeout);
   registry.delete(sessionId);
   return true;
 }
@@ -59,6 +77,7 @@ export function revokeRegisteredBrowserChatTurn<TSession>(
 ) {
   const registered = registry.get(sessionId);
   if (!registered) return undefined;
+  if (registered.hardTimeout) clearTimeout(registered.hardTimeout);
   registry.delete(sessionId);
   const abortDispatched = !registered.abortController.signal.aborted;
   if (abortDispatched) registered.abortController.abort(reason);

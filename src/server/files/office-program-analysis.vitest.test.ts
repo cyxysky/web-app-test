@@ -54,50 +54,51 @@ create_document(None)`, 'uno');
 def create_document(job):
     deck = job.presentation('deck')`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'UNO_PYTHON_IMPORT_UNSUPPORTED');
+    const diagnostic = result.diagnostics.find((item) => item.code === 'MODEL_RAW_UNO_FORBIDDEN');
     expect(result.passed).toBe(false);
-    expect(diagnostic?.message).toContain('uno.Enum');
+    expect(diagnostic?.message).toContain('worker-owned');
     expect(diagnostic?.sourceExcerpt).toContain('from com.sun.star.drawing');
   });
 
-  it('rejects guessed facade component access and points to expert.component', async () => {
+  it('rejects guessed facade component access and points to high-level recipes', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     doc = getattr(deck, 'component', None)
     doc.createInstance('com.sun.star.drawing.RectangleShape')`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'FACADE_COMPONENT_ACCESS_UNSUPPORTED');
+    const diagnostic = result.diagnostics.find((item) => item.code === 'MODEL_RAW_UNO_FORBIDDEN');
     expect(result.passed).toBe(false);
-    expect(diagnostic?.message).toContain('expert.component(deck)');
+    expect(diagnostic?.message).toContain('high-level capability recipe');
     expect(diagnostic?.sourceExcerpt).toContain("getattr(deck, 'component', None)");
   });
 
-  it('rejects facade methods called on an expert raw UNO document', async () => {
+  it('rejects expert access before any raw UNO document can be created', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     expert = job.expert('need a raw Impress component')
     doc = expert.new_document('impress')
     page = doc.add_slide('slide-01')`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'FACADE_METHOD_ON_RAW_UNO_DOCUMENT');
+    const diagnostic = result.diagnostics.find((item) => item.code === 'MODEL_RAW_UNO_FORBIDDEN');
     expect(result.passed).toBe(false);
-    expect(diagnostic?.message).toContain('doc.add_slide');
-    expect(diagnostic?.sourceExcerpt).toContain("page = doc.add_slide('slide-01')");
+    expect(diagnostic?.message).toContain('job.expert() is worker-owned');
+    expect(diagnostic?.sourceExcerpt).toContain("expert = job.expert");
   });
 
-  it('rejects unstable raw ConnectorShape creation with a facade replacement', async () => {
+  it('rejects raw ConnectorShape creation with a facade recipe replacement', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     expert = job.expert('need a connection between diagram nodes')
     doc = expert.new_document('presentation')
     connector = doc.createInstance('com.sun.star.drawing.ConnectorShape')`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'RAW_CONNECTOR_SHAPE_UNSTABLE');
+    const diagnostic = result.diagnostics.find((item) => item.code === 'MODEL_RAW_UNO_FORBIDDEN'
+      && item.message.includes('Raw UNO service creation'));
     expect(result.passed).toBe(false);
-    expect(diagnostic?.message).toContain('deck.add_connector');
+    expect(diagnostic?.message).toContain('versioned feature recipe');
     expect(diagnostic?.sourceExcerpt).toContain('ConnectorShape');
   });
 
-  it('warns about duplicate literal element IDs without blocking deterministic runtime disambiguation', async () => {
+  it('allows duplicate literal element IDs because runtime slide scope disambiguates them', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     page = deck.add_slide('slide-01')
@@ -106,15 +107,11 @@ def create_document(job):
     deck.save()
     deck.close()`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'DUPLICATE_ELEMENT_ID');
     expect(result.passed).toBe(true);
-    expect(diagnostic?.severity).toBe('warning');
-    expect(diagnostic?.message).toContain('first declared on line 4');
-    expect(diagnostic?.message).toContain('disambiguate it deterministically');
-    expect(diagnostic?.sourceExcerpt).toContain("deck.add_text('slide-01/title'");
+    expect(result.diagnostics.some((item) => item.code === 'DUPLICATE_ELEMENT_ID')).toBe(false);
   });
 
-  it('rejects a fixed element ID inside a repeatedly called helper', async () => {
+  it('allows a fixed child element ID inside a helper called for different slides', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     def add_bg(page):
@@ -126,10 +123,8 @@ def create_document(job):
     deck.save()
     deck.close()`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-    const diagnostic = result.diagnostics.find((item) => item.code === 'HELPER_FIXED_ELEMENT_ID');
-    expect(result.passed).toBe(false);
-    expect(diagnostic?.message).toContain("fixed elementId 'bg'");
-    expect(diagnostic?.sourceExcerpt).toContain("deck.add_shape('bg'");
+    expect(result.passed).toBe(true);
+    expect(result.diagnostics.some((item) => item.code === 'HELPER_FIXED_ELEMENT_ID')).toBe(false);
   });
 
   it('rejects local helper signature drift and overlap-suppression defaults', async () => {
@@ -246,6 +241,18 @@ def create_document(job):
     expect(diagnostic.line).toBe(4);
     expect(diagnostic.sourceExcerpt).toContain('   4 |');
     expect(diagnostic.sourceExcerpt).not.toContain(' 932 |');
+  });
+
+  it('classifies a LibreOffice pipe startup failure as infrastructure, not source code', () => {
+    const source = `def create_document(job):
+    deck = job.presentation('deck')`;
+    const [diagnostic] = diagnoseOfficeProgramRuntimeError(
+      source,
+      `RuntimeError: Unable to connect to LibreOffice UNO: Connector : couldn't connect to pipe "webpilot_deadbeef": 1`,
+    );
+    expect(diagnostic.code).toBe('UNO_BRIDGE_STARTUP');
+    expect(diagnostic.line).toBeUndefined();
+    expect(diagnostic.sourceExcerpt).toBeUndefined();
   });
 
   it('expands batched UNO layout diagnostics with source excerpts', () => {

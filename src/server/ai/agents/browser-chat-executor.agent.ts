@@ -1586,15 +1586,15 @@ function makeBrowserTools(
           intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
           url: z.string().max(8_000).optional(),
           path: z.string().max(8_000).optional().describe('For draft read/edit, an optional semantic source-unit path returned by read, such as pages/s30-risk-matrix or symbols/add_bg; for download, a source path or URL as documented by that action.'),
-          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based first source line. Use a small window around a diagnostic instead of reading a large complete draft.'),
-          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based inclusive last source line; source windows are limited to 240 lines.'),
+          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based global first source line. The coordinate remains global even when path selects a source unit.'),
+          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based inclusive global last source line; source windows are limited to 240 lines.'),
           urlOrPath: z.string().max(8_000).optional(),
           program: z.string().optional(),
           edits: z.array(z.object({
             kind: z.enum(['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText']).optional().describe('Defaults to replaceRange. Use replaceAll once to replace every exact oldText match; do not emit one replaceText edit per occurrence.'),
-            startLine: z.number().int().min(1).optional().describe('One-based first source line for replaceRange/deleteRange.'),
-            endLine: z.number().int().min(1).optional().describe('One-based inclusive last source line for replaceRange/deleteRange.'),
-            line: z.number().int().min(1).optional().describe('One-based anchor line for insertBefore/insertAfter.'),
+            startLine: z.number().int().min(1).optional().describe('One-based global first source line copied from action=read, including when path is supplied.'),
+            endLine: z.number().int().min(1).optional().describe('One-based inclusive global last source line copied from action=read, including when path is supplied.'),
+            line: z.number().int().min(1).optional().describe('One-based global anchor line for insertBefore/insertAfter.'),
             oldText: z.string().min(1).optional().describe('Exact current source for replaceText.'),
             occurrence: z.number().int().min(1).optional().describe('For replaceText only: one-based index of the oldText match, not a replacement count. Omit when oldText is unique; use replaceAll for every match.'),
             preserveIndent: z.boolean().optional().describe('For replaceRange: defaults to false, so newText indentation is applied exactly. Set true only when newText is intentionally relative to the replaced block; never set it for source copied from read or mixed-indent Python blocks.'),
@@ -1605,11 +1605,11 @@ function makeBrowserTools(
           offset: z.number().int().min(0).optional(),
           limit: z.number().int().min(1).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
           pages: z.array(z.number().int().min(1)).max(6).optional(),
-          query: z.string().max(1_000).optional().describe('Optional filter applied across the complete UNO API catalog. Keep it focused; target is always all and is not an input parameter.'),
+          query: z.string().max(1_000).optional().describe('Ignored. unoApi returns the complete executable high-level Office cookbook with exact signatures, value schemas, and examples; do not query one feature at a time.'),
         }).passthrough(),
       ), [
         { reason: 'Download the referenced JPEG image', action: 'download', urlOrPath: 'https://example.com/image', fileType: 'jpg' },
-        { reason: 'Inspect planned presentation APIs', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation', query: 'placeholder remove slide' },
+        { reason: 'Load the complete planned presentation facade once', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation' },
         {
           action: 'plan',
           reason: '规划西双版纳攻略演示文稿',
@@ -1706,7 +1706,7 @@ function makeBrowserTools(
     }),
     ...(modelSupportsImageInput() && referenceOptions?.readFileVisuals ? {
       fileVisual: tool({
-        description: `Index, read, and report evidence-backed page-level and cross-page visual QA for the exact current artifact. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
+        description: `Index, read, and report evidence-backed page-level and cross-page visual QA for the exact current artifact. Reviews must judge actual pixels, aesthetics, chart semantics, and image identification; known visible defects cannot be waived as compatibility limits. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
         inputSchema: z.preprocess(
           (input) => coerceBrowserChatToolInput('fileVisual', input),
           browserToolInput({
@@ -2438,7 +2438,7 @@ async function executeRuntimeStep(input: {
         return;
       }
       const text = documentVisualQa
-        ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect it before finalizing. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, and content outside the page. Continue calling fileVisual action=read until every indexed screenshot has been inspected. If a defect exists, read the draft and use focused file action=edit startLine/endLine edits, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
+      ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect the actual pixels at a useful size before finalizing. Use three passes: identify visible content and reading order; scan all page edges and object boundaries for clipping or overlap; then judge composition, hierarchy, typography, color, chart semantics, and image treatment. The page observation must name concrete visible anchors and locations, not paraphrase the rubric. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, weak hierarchy, poor composition, default-looking styling, and content outside the page. For every chart, verify that a reader can identify every bar, line, point, or sector: reject 1/2/3 placeholder categories, generic-only series names, and missing or unreadable legends, axis labels, or data labels. Verify that content images are contextually identified or captioned and have alt/source attribution when required. Never list a known visible defect as a compatibility boundary and then pass it; never claim that a count such as 4 satisfies a requirement of at least 5. Continue calling fileVisual action=read until every indexed screenshot has been inspected. After all pages, compare the complete ordered set and cite at least two concrete cross-page observations in deckReview. If a defect exists, read the draft and use focused file action=edit startLine/endLine edits, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
         : source === 'file:read'
           ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
           : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';

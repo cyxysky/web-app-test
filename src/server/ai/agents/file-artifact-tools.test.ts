@@ -15,6 +15,7 @@ import {
   generateUnoFileArtifact,
   getOfficeJsApi,
   getUnoApi,
+  hasOnlyRetryableOfficeValidationFailure,
   listOfficeDrafts,
   officeValidationRepairHints,
   pendingOfficeDocumentWork,
@@ -388,7 +389,7 @@ test('does not infer existing-file modification from natural-language intent', a
     assert.equal(planned.ok, true, planned.actual);
     const payload = JSON.parse(planned.actual || '{}') as { generator?: string; operation?: string };
     assert.equal(payload.operation, 'create');
-    assert.equal(payload.generator, 'javascript');
+    assert.equal(payload.generator, 'uno');
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -576,6 +577,10 @@ test('supports structured editor operations and unified patches', () => {
   assert.equal(applyUnoDraftLineEdits('same\nsame\nother\n', [
     { kind: 'replaceAll', oldText: 'same', newText: 'changed' },
   ]), 'changed\nchanged\nother\n');
+  assert.equal(applyUnoDraftLineEdits("style={'font_size': 1, 'background': 'card'}\n", [
+    { kind: 'replaceAll', oldText: ", 'background': 'card'", newText: '' },
+    { kind: 'replaceAll', oldText: ", 'background': 'card',", newText: ',' },
+  ]), "style={'font_size': 1}\n");
   assert.throws(() => applyUnoDraftLineEdits('same\nsame\n', [
     { kind: 'replaceText', oldText: 'same', occurrence: 10, newText: 'changed' },
   ]), /one-based match index, not the number of replacements/);
@@ -731,9 +736,23 @@ test('returns focused repair hints for common UNO runtime failures', () => {
   assert.equal(helperHints.some((hint) => hint.includes('Query unoApi')), false);
   const bridgeHints = officeValidationRepairHints([{ code: 'UNO_BRIDGE_DISPOSED', message: 'Binary URP bridge disposed', severity: 'error' }]);
   assert.ok(bridgeHints.some((hint) => hint.includes('retried once')));
+  const startupHints = officeValidationRepairHints([{ code: 'UNO_BRIDGE_STARTUP', message: "couldn't connect to pipe", severity: 'error' }]);
+  assert.ok(startupHints.some((hint) => hint.includes('Do not edit the Office source')));
 });
 
-test('infers unoApi document type and always returns the complete API catalog', async (context) => {
+test('retries drafts poisoned only by UNO startup or user interruption without hiding source errors', () => {
+  assert.equal(hasOnlyRetryableOfficeValidationFailure({
+    validationDiagnostics: [{ code: 'UNO_BRIDGE_STARTUP', message: "couldn't connect to pipe", severity: 'error' }],
+  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), true);
+  assert.equal(hasOnlyRetryableOfficeValidationFailure({
+    validationDiagnostics: [{ code: 'UNO_RUNTIME_ERROR', message: 'Browser chat operation interrupted by user.', severity: 'error' }],
+  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), true);
+  assert.equal(hasOnlyRetryableOfficeValidationFailure({
+    validationDiagnostics: [{ code: 'PYTHON_SYNTAX', message: "'[' was never closed", severity: 'error' }],
+  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), false);
+});
+
+test('infers unoApi document type and returns the complete cached facade cookbook', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
@@ -753,10 +772,26 @@ test('infers unoApi document type and always returns the complete API catalog', 
     assert.equal(planned.ok, true, planned.actual);
     const result = await getUnoApi({ documentId: 'uno-api-defaults', query: 'placeholder', runId: 'chat_test' });
     assert.equal(result.ok, true, result.actual);
-    const payload = JSON.parse(result.actual || '{}') as { documentType?: string; target?: string; complete?: boolean };
+    const payload = JSON.parse(result.actual || '{}') as {
+      documentType?: string;
+      target?: string;
+      nativeReflectionExposed?: boolean;
+      capabilities?: unknown[];
+      queryIgnored?: boolean;
+    };
     assert.equal(payload.documentType, 'presentation');
-    assert.equal(payload.target, 'all');
-    assert.equal(payload.complete, true);
+    assert.equal(payload.target, 'facade');
+    assert.equal(payload.nativeReflectionExposed, false);
+    assert.equal(payload.queryIgnored, true);
+    assert.ok((payload.capabilities || []).length > 10);
+    const repeated = await getUnoApi({ documentId: 'uno-api-defaults', query: 'chart', runId: 'chat_test' });
+    const repeatedPayload = JSON.parse(repeated.actual || '{}') as {
+      alreadyLoaded?: boolean; apiReference?: unknown[]; examples?: Record<string, string>; kind?: string;
+    };
+    assert.equal(repeatedPayload.kind, 'uno-api');
+    assert.equal(repeatedPayload.alreadyLoaded, true);
+    assert.ok((repeatedPayload.apiReference || []).length > 20);
+    assert.match(repeatedPayload.examples?.nativeColumnChart || '', /show_legend=True/);
   } finally {
     if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previousArtifacts;
@@ -902,16 +937,27 @@ test('reads and edits one marked page unit without changing other source units',
     assert.equal(generated.ok, true, generated.actual);
     const unitRead = await readUnoDraft({ documentId: 'unit-workflow', path: 'pages/page-002', runId: 'chat_test' });
     assert.equal(unitRead.ok, true, unitRead.actual);
-    const unitPayload = JSON.parse(unitRead.actual || '{}') as { lineCount?: number; program?: string; sourceUnitPath?: string };
+    const unitPayload = JSON.parse(unitRead.actual || '{}') as {
+      lineCount?: number; program?: string; sourceUnitPath?: string;
+      sourceLineRange?: { coordinateSpace?: string; startLine?: number; endLine?: number };
+    };
     assert.equal(unitPayload.sourceUnitPath, 'pages/page-002');
     assert.equal(unitPayload.lineCount, 1);
     assert.match(unitPayload.program || '', /page two/);
     assert.doesNotMatch(unitPayload.program || '', /page one/);
+    assert.deepEqual(unitPayload.sourceLineRange, {
+      startLine: 8,
+      endLine: 8,
+      coordinateSpace: 'global',
+      totalSourceLines: 11,
+      unitLineCount: 1,
+    });
+    assert.match(unitPayload.program || '', /^\s*8 \|/);
 
     const edited = await editUnoFileArtifact({
       documentId: 'unit-workflow',
       path: 'pages/page-002',
-      edits: [{ startLine: 1, endLine: 1, newText: "    document.Text.insertString(cursor, 'updated page two', False)" }],
+      edits: [{ startLine: 8, endLine: 8, newText: "    document.Text.insertString(cursor, 'updated page two', False)" }],
       render: false,
       runId: 'chat_test',
     });
@@ -967,7 +1013,12 @@ ${filler}
     const helperWindow = JSON.parse((await readUnoDraft({
       documentId: 'inferred-units', startLine: 150, endLine: 158, runId: 'chat_test',
     })).actual || '{}') as { program?: string; sourceLineRange?: { startLine?: number; endLine?: number } };
-    assert.deepEqual(helperWindow.sourceLineRange, { startLine: 150, endLine: 158, totalLines: 313 });
+    assert.deepEqual(helperWindow.sourceLineRange, {
+      startLine: 150,
+      endLine: 158,
+      coordinateSpace: 'global',
+      totalSourceLines: 313,
+    });
     assert.match(helperWindow.program || '', /^\s*150 \|/);
 
     const secondSlide = JSON.parse((await readUnoDraft({

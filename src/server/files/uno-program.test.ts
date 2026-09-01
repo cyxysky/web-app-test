@@ -3,11 +3,11 @@ import test from 'node:test';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import JSZip from 'jszip';
 import {
   generateUnoProgramDocument,
   inspectUnoApi,
+  isUnoBridgeStartupError,
   isTransientUnoBridgeError,
   resolveUnoProgramWorker,
 } from './uno-program';
@@ -20,8 +20,11 @@ test('forces UTF-8 for UNO worker diagnostics on Windows and other hosts', async
   assert.match(source, /PYTHONUTF8:\s*'1'/);
 });
 
-test('recognizes only disposed UNO bridge failures as isolated-worker retry candidates', () => {
+test('recognizes startup and disposed UNO bridge failures as isolated-worker retry candidates', () => {
   assert.equal(isTransientUnoBridgeError(new Error('com.sun.star.lang.DisposedException: Binary URP bridge disposed during call')), true);
+  assert.equal(isTransientUnoBridgeError(new Error("Unable to connect to LibreOffice UNO: Connector : couldn't connect to pipe \"webpilot_deadbeef\": 1")), true);
+  assert.equal(isUnoBridgeStartupError(new Error("Unable to connect to LibreOffice UNO: Connector : couldn't connect to pipe \"webpilot_deadbeef\": 1")), true);
+  assert.equal(isUnoBridgeStartupError(new Error('com.sun.star.lang.DisposedException: Binary URP bridge disposed during call')), false);
   assert.equal(isTransientUnoBridgeError(new Error("NameError: name 'slide2' is not defined")), false);
 });
 
@@ -175,25 +178,31 @@ test('presentation facade locks text bounds and rejects high-confidence text ove
     context.skip('LibreOffice is not installed.');
     return;
   }
-  const generated = await generateUnoProgramDocument({
-    documentType: 'presentation',
-    fileName: 'fixed-text-bounds.pptx',
-    sourceCode: `
+  const sourcePrefix = `
 def create_document(job):
     deck = job.presentation('deck')
     bounds = deck.bounds()
     page = deck.add_slide('slide-01')
     deck.add_text('slide-01/footer', page, 'Footer', 800, bounds['height'] - 1200, 6000, 1200, font_size=11)
     deck.add_text('slide-01/overlap-a', page, 'Alpha', 1200, 2000, 8000, 1800, font_size=20)
-    deck.add_text('slide-01/overlap-b', page, 'Beta', 1200, 2000, 8000, 1800, font_size=20)
+`;
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'fixed-text-bounds.pptx',
+    sourceCode: `${sourcePrefix}
     deck.save()
     deck.close()
 `,
   });
-  const verification = generated.report.verification as { issues?: Array<{ elementIds?: string[]; severity?: string; type?: string }> };
-  const overlap = verification.issues?.find((issue) => issue.type === 'text_overlap');
-  assert.equal(overlap?.severity, 'error');
-  assert.deepEqual(overlap?.elementIds, ['slide-01/overlap-a', 'slide-01/overlap-b']);
+  await assert.rejects(generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'rejected-text-overlap.pptx',
+    sourceCode: `${sourcePrefix}
+    deck.add_text('slide-01/overlap-b', page, 'Beta', 1200, 2000, 8000, 1800, font_size=20)
+    deck.save()
+    deck.close()
+`,
+  }), /PRESENTATION_OVERLAP[\s\S]*slide-01\/overlap-a[\s\S]*slide-01\/overlap-b/);
 
   const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-fixed-text-bounds-'));
   try {
@@ -269,7 +278,7 @@ def create_document(job):
   assert.equal(elements.some((entry) => entry.elementId === 'slide-07/footer/right'), true);
 });
 
-test('presentation facade serializes external and internal text hyperlinks and reports vector charts separately', async (context) => {
+test('presentation facade serializes hyperlinks and native editable charts', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
@@ -299,8 +308,7 @@ def create_document(job):
   const features = generated.report.featureCounts as Record<string, number>;
   assert.equal(features.externalHyperlink, 1);
   assert.equal(features.internalSlideHyperlink, 1);
-  assert.equal(features.vectorChart, 1);
-  assert.equal(features.vectorBarChart, 1);
+  assert.equal(features.nativeChart, 1);
   const archive = await JSZip.loadAsync(generated.buffer);
   const slideXml = await archive.file('ppt/slides/slide1.xml')!.async('text');
   assert.ok((slideXml.match(/<a:hlinkClick\b/g) || []).length >= 2, 'both links must survive PPTX serialization');
@@ -318,14 +326,18 @@ def create_document(job):
       featureCounts: features,
     });
     const presentationChecks = (validation.formatChecks as { presentation?: Record<string, number> } | undefined)?.presentation;
-    assert.deepEqual(presentationChecks, {
-      chartCount: 0,
-      nativeChartCount: 0,
-      vectorChartCount: 1,
-      totalChartCount: 1,
-      vectorBarChartCount: 1,
-      vectorLineChartCount: 0,
-      vectorDonutChartCount: 0,
+    assert.deepEqual(presentationChecks && {
+      chartCount: presentationChecks.chartCount,
+      nativeChartCount: presentationChecks.nativeChartCount,
+      authoredExternalHyperlinkCount: presentationChecks.authoredExternalHyperlinkCount,
+      authoredInternalSlideHyperlinkCount: presentationChecks.authoredInternalSlideHyperlinkCount,
+      serializedHyperlinkCount: presentationChecks.serializedHyperlinkCount,
+      imageCount: presentationChecks.imageCount,
+      slideCount: presentationChecks.slideCount,
+      tableCount: presentationChecks.tableCount,
+    }, {
+      chartCount: 1,
+      nativeChartCount: 1,
       authoredExternalHyperlinkCount: 1,
       authoredInternalSlideHyperlinkCount: 1,
       serializedHyperlinkCount: 2,
@@ -338,15 +350,67 @@ def create_document(job):
   }
 });
 
-test('presentation auto-layout keeps cells separate and diagnoses semantic shape collisions', async (context) => {
+test('presentation facade serializes every UNO chart family as native PPTX charts', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
   }
   const generated = await generateUnoProgramDocument({
     documentType: 'presentation',
-    fileName: 'auto-layout-collision.pptx',
+    fileName: 'all-native-chart-families.pptx',
     sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    chart_types = ['area', 'bar', 'bubble', 'donut', 'filled-radar', 'line', 'radar', 'pie', 'stock', 'scatter']
+    categories = ['A', 'B', 'C', 'D']
+    standard_series = [
+        {'name': 'Series 1', 'values': [12, 24, 18, 32]},
+        {'name': 'Series 2', 'values': [8, 18, 27, 21]},
+    ]
+    for index, chart_type in enumerate(chart_types):
+        sid = f'slide-{index + 1:02d}'
+        page = deck.add_slide(sid)
+        box = {'x': deck.mm(18), 'y': deck.mm(12), 'width': deck.mm(250), 'height': deck.mm(135)}
+        if chart_type in ('donut', 'pie'):
+            deck.add_chart(f'{sid}/chart', page, box, chart_type, categories, values=[12, 24, 18, 32])
+        elif chart_type == 'stock':
+            deck.add_chart(f'{sid}/chart', page, box, chart_type, categories, series=[
+                {'name': 'Open', 'values': [20, 22, 21, 25]},
+                {'name': 'High', 'values': [25, 26, 28, 30]},
+                {'name': 'Low', 'values': [17, 19, 18, 22]},
+                {'name': 'Close', 'values': [23, 21, 26, 28]},
+            ])
+        elif chart_type == 'bubble':
+            deck.add_chart(f'{sid}/chart', page, box, chart_type, categories, series=[
+                {'name': 'X', 'values': [1, 2, 3, 4]},
+                {'name': 'Y', 'values': [3, 5, 4, 7]},
+                {'name': 'Size', 'values': [10, 18, 14, 24]},
+            ])
+        else:
+            deck.add_chart(f'{sid}/chart', page, box, chart_type, categories, series=standard_series)
+    deck.save()
+    deck.close()
+`,
+  });
+  const features = generated.report.featureCounts as Record<string, number>;
+  assert.equal(features.nativeChart, 10);
+  assert.equal((generated.report.verification as { pages?: number }).pages, 10);
+  const archive = await JSZip.loadAsync(generated.buffer);
+  const chartFiles = Object.keys(archive.files).filter((name) => /^ppt\/charts\/chart\d+\.xml$/.test(name));
+  assert.equal(chartFiles.length, 10);
+  const chartXml = (await Promise.all(chartFiles.map((name) => archive.file(name)!.async('text')))).join('\n');
+  for (const tag of ['areaChart', 'barChart', 'bubbleChart', 'doughnutChart', 'lineChart', 'pieChart', 'stockChart', 'scatterChart']) {
+    assert.match(chartXml, new RegExp(`<c:${tag}\\b`), `${tag} must be serialized as native chart XML`);
+  }
+  assert.ok((chartXml.match(/<c:radarChart\b/g) || []).length >= 2, 'regular and filled radar charts must both serialize natively');
+});
+
+test('presentation auto-layout keeps cells separate and diagnoses semantic shape collisions', async (context) => {
+  if (!await resolveLibreOfficeExecutable()) {
+    context.skip('LibreOffice is not installed.');
+    return;
+  }
+  const sourcePrefix = `
 def create_document(job):
     deck = job.presentation('deck')
     bounds = deck.bounds()
@@ -354,7 +418,11 @@ def create_document(job):
     deck.add_shape('slide-01/background', page, 0, 0, bounds['width'], bounds['height'], fill=0xF8FAFC, layout_role='background')
     cells = deck.grid(2, 1, box=deck.content_box(margins=(1400, 1400, 1400, 1400)), gap=800)
     deck.add_shape('slide-01/data-mark', page, **cells[0], fill=0x2563EB, layout_role='content', allow_overlap=False)
-    deck.add_text('slide-01/data-label', page, 'Semantic label', **cells[0], font_size=20)
+`;
+  const generated = await generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'auto-layout-collision.pptx',
+    sourceCode: `${sourcePrefix}
     deck.add_text('slide-01/separate-copy', page, 'Separate cell', **cells[1], font_size=20)
     deck.save()
     deck.close()
@@ -367,20 +435,26 @@ def create_document(job):
       pageOccupancy?: Array<{ contentBoxes?: number }>;
     };
   };
-  const collision = verification.layout?.issues?.find((issue) => issue.type === 'content_overlap');
-  assert.equal(collision?.severity, 'error');
-  assert.deepEqual(collision?.elementIds, ['slide-01/data-mark', 'slide-01/data-label']);
-  assert.equal(verification.layout?.checkedContentShapes, 3);
-  assert.equal(verification.layout?.pageOccupancy?.[0]?.contentBoxes, 3);
+  assert.equal(verification.layout?.checkedContentShapes, 2);
+  assert.equal(verification.layout?.pageOccupancy?.[0]?.contentBoxes, 2);
   assert.equal(verification.layout?.issues?.some((issue) => issue.elementIds?.includes('slide-01/background')), false);
+  await assert.rejects(generateUnoProgramDocument({
+    documentType: 'presentation',
+    fileName: 'rejected-semantic-collision.pptx',
+    sourceCode: `${sourcePrefix}
+    deck.add_text('slide-01/data-label', page, 'Semantic label', **cells[0], font_size=20)
+    deck.save()
+    deck.close()
+`,
+  }), /PRESENTATION_OVERLAP[\s\S]*slide-01\/data-mark[\s\S]*slide-01\/data-label/);
 });
 
-test('raw expert shapes default to decoration and explicit semantic shapes remain collision checked', async (context) => {
+test('rejects raw expert shapes before LibreOffice execution', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
   }
-  const generated = await generateUnoProgramDocument({
+  await assert.rejects(generateUnoProgramDocument({
     documentType: 'presentation',
     fileName: 'expert-shape-layout-intent.pptx',
     sourceCode: `
@@ -413,15 +487,7 @@ def create_document(job):
     deck.save()
     deck.close()
 `,
-  });
-  const verification = generated.report.verification as {
-    layout?: { issues?: Array<{ elementIds?: string[]; type?: string }> };
-  };
-  const issues = verification.layout?.issues || [];
-  assert.equal(issues.some((issue) => issue.elementIds?.includes('slide-01/card')), false);
-  assert.equal(issues.some((issue) => issue.type === 'content_overlap'
-    && issue.elementIds?.includes('slide-01/data-mark')
-    && issue.elementIds?.includes('slide-01/data-label')), true);
+  }), /job\.expert\(\) is not model-facing|raw UNO imports are worker-owned/);
 });
 
 test('presentation layout maps reopened shapes by stable artifact name before mutable shape index', async (context) => {
@@ -482,12 +548,12 @@ def create_document(job):
   }
 });
 
-test('accepts LibreOffice factory aliases such as impress', async (context) => {
+test('rejects model-authored LibreOffice factory aliases and raw TextShape creation', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
   }
-  const generated = await generateUnoProgramDocument({
+  await assert.rejects(generateUnoProgramDocument({
     documentType: 'presentation',
     fileName: 'alias-smoke.pptx',
     sourceCode: `
@@ -507,11 +573,7 @@ def create_document(job):
     document.storeAsURL(job.output_url, (job.property('FilterName', 'Impress MS PowerPoint 2007 XML'),))
     job.close(document)
 `,
-  });
-  assert.ok(generated.buffer.byteLength > 64);
-  assert.equal((generated.report.verification as { pages?: number }).pages, 1);
-  const text = (generated.report.verification as { text?: { textCharacters?: number } }).text;
-  assert.ok((text?.textCharacters || 0) > 0, JSON.stringify(generated.report.verification));
+  }), /job\.expert\(\) is not model-facing|raw UNO imports are worker-owned/);
 });
 
 test('rejects Impress text assigned before the TextShape is attached', async (context) => {
@@ -539,34 +601,35 @@ def create_document(job):
     document.storeAsURL(job.output_url, (job.property('FilterName', 'Impress MS PowerPoint 2007 XML'),))
     job.close(document)
 `,
-  }), /must be attached before its text is assigned/);
+  }), /job\.expert\(\) is not model-facing|raw UNO imports are worker-owned/);
 });
 
-test('reflects the complete actual Impress API for document authors', async (context) => {
+test('returns only matching model-facing presentation capabilities', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
   }
-  const api = await inspectUnoApi({ documentType: 'presentation', query: 'Width', limit: 10 });
-  assert.equal(api.renderer, 'libreoffice-uno-api');
-  assert.equal(api.target, 'all');
-  const targets = api.targets as Record<string, { properties?: Array<{ name: string }> }>;
-  assert.ok(targets.page?.properties?.some((property) => property.name === 'Width'));
-  assert.ok(typeof api.example === 'string' && api.example.includes("job.presentation('deck')"));
+  const api = await inspectUnoApi({ documentType: 'presentation', query: 'chart', limit: 10 });
+  assert.equal(api.renderer, 'libreoffice-uno-facade');
+  assert.equal(api.target, 'facade');
+  assert.equal(api.nativeReflectionExposed, false);
+  const capabilities = api.capabilities as Array<{ id?: string }>;
+  assert.ok(capabilities.some((capability) => capability.id === 'presentation.chart@2'));
+  assert.equal('targets' in api, false);
 });
 
-test('returns the complete installed API for every valid presentation target', async (context) => {
+test('returns a compact facade blueprint instead of raw installed API targets', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
   }
   const api = await inspectUnoApi({ documentType: 'presentation' });
-  assert.equal(api.complete, true);
-  const targets = api.targets as Record<string, { pagination?: { complete?: boolean }; properties?: unknown[] }>;
-  for (const target of ['document', 'page', 'shape']) {
-    assert.equal(targets[target]?.pagination?.complete, true);
-    assert.ok(targets[target]?.properties?.length);
-  }
+  assert.equal(api.target, 'facade');
+  assert.equal(api.nativeReflectionExposed, false);
+  assert.equal('targets' in api, false);
+  const cookbook = api as unknown as { completeDocument?: string; capabilities?: unknown[] };
+  assert.match(cookbook.completeDocument || '', /deck\.slide\(/);
+  assert.ok((cookbook.capabilities || []).length > 0);
 });
 
 test('returns executable cookbooks for Writer, Calc, and Impress authoring', async (context) => {
@@ -578,22 +641,22 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
     {
       documentType: 'word' as const,
       fileName: 'writer-cookbook.docx',
-      operations: ['flowLayout', 'openExisting', 'bounds', 'appendParagraph', 'pageBreak', 'image', 'table', 'pageStyleAndHeader', 'save'],
+      operations: ['flow', 'table', 'page'],
     },
     {
       documentType: 'spreadsheet' as const,
       fileName: 'calc-cookbook.xlsx',
-      operations: ['openExisting', 'bounds', 'cellsAndFormula', 'mergeAndFreeze', 'image', 'secondSheet', 'save'],
+      operations: ['cells', 'table', 'freeze', 'merge'],
     },
     {
       documentType: 'presentation' as const,
       fileName: 'impress-cookbook.pptx',
-      operations: ['openExisting', 'bounds', 'autoLayout', 'connector', 'nativeTable', 'dataCharts', 'donutAndTimeline', 'imageContain', 'textShape', 'image', 'shape', 'newSlide', 'save'],
+      operations: ['slide', 'text', 'chart', 'transition'],
     },
   ];
   for (const item of cases) {
     const api = await inspectUnoApi({ documentType: item.documentType, limit: 1 });
-    const cookbook = api.cookbook as {
+    const cookbook = api as unknown as {
       completeDocument?: string;
       completeExistingDocumentModification?: string;
       coverage?: string[];
@@ -602,17 +665,16 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
       rules?: string[];
     };
     assert.ok(cookbook.completeDocument?.includes('def create_document(job):'));
-    assert.ok(cookbook.completeExistingDocumentModification?.includes('job.expert'));
+    assert.ok(cookbook.completeExistingDocumentModification?.includes('source_name='));
+    assert.doesNotMatch(cookbook.completeExistingDocumentModification || '', /job\.expert|com\.sun\.star|import uno/);
     assert.ok(cookbook.coverage?.length);
-    assert.ok(cookbook.rules?.some((rule) => rule.includes('Never substitute guessed integers')));
-    assert.ok(cookbook.rules?.some((rule) => rule.includes('CharHeight is always measured in typographic points')));
-    assert.ok(cookbook.rules?.some((rule) => rule.includes('never append create_document(None)')));
-    assert.doesNotMatch(cookbook.operations!.save, /store(?:To|As)URL/);
+    assert.ok(cookbook.rules?.some((rule) => rule.includes('high-level facade')));
+    assert.ok(cookbook.rules?.some((rule) => rule.includes('Never import')));
+    assert.doesNotMatch(JSON.stringify(cookbook.operations), /store(?:To|As)URL|createInstance|com\.sun\.star/);
     assert.doesNotMatch(cookbook.completeExistingDocumentModification || '', /store(?:To|As)URL/);
     if (item.documentType === 'word') {
-      assert.ok(cookbook.rules?.some((rule) => rule.includes('job.expert')));
-      assert.match(cookbook.operations!.flowLayout, /layout = job\.writer\('document'\)/);
-      assert.doesNotMatch(cookbook.operations!.flowLayout, /layout\.raw/);
+      assert.match(cookbook.completeDocument || '', /document = job\.writer\('report'\)/);
+      assert.match(cookbook.operations!.flow, /document\.add_paragraph/);
     }
     for (const operation of item.operations) assert.ok(cookbook.operations?.[operation], `${item.documentType} cookbook is missing ${operation}`);
 
@@ -625,39 +687,17 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
     assert.ok(generated.previewPdf && generated.previewPdf.byteLength > 64);
     assert.ok(Array.isArray(generated.report.elementMap));
     if (item.documentType === 'presentation') {
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.bounds()')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.grid(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.stack(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_connector(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_native_table(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_bar_chart(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_line_chart(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_donut_chart(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_timeline(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.add_image_contain(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.includes('add_text') && signature.includes('bold=False')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.includes('add_shape') && signature.includes('fill=None')));
-      assert.match(cookbook.operations!.autoLayout, /deck\.grid\(/);
-      assert.match(cookbook.operations!.autoLayout, /deck\.stack\(/);
-      assert.match(cookbook.completeDocument || '', /add_text\([^\n]+bold=True/);
-      assert.match(cookbook.completeDocument || '', /add_shape\([^\n]+fill=0x2563EB/);
-      assert.match(cookbook.completeDocument || '', /bounds = deck\.bounds\(\)/);
-      const textShape = cookbook.operations!.textShape;
-      assert.ok(textShape.indexOf('page.add(shape)') < textShape.indexOf("shape.String = 'Slide title'"));
-      assert.ok(textShape.indexOf("shape.String = 'Slide title'") < textShape.indexOf('shape.CharHeight'));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.slide(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.add_text(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.add_chart(')));
+      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.set_transition(')));
+      assert.match(cookbook.completeDocument || '', /deck\.slide\(/);
+      assert.match(cookbook.completeDocument || '', /slide\.add_chart\(/);
+      assert.doesNotMatch(cookbook.completeDocument || '', /com\.sun\.star|import uno|createInstance/);
       const text = (generated.report.verification as { text?: { textCharacters?: number } }).text;
       assert.ok((text?.textCharacters || 0) > 0, 'Impress cookbook must persist text after reopening');
     }
     if (item.documentType === 'word') {
-      const pdf = await getDocument({ data: new Uint8Array(generated.previewPdf!) }).promise;
-      try {
-        assert.ok(pdf.numPages >= 2, 'Writer cookbook page-break pattern must produce a second page');
-      } finally {
-        await pdf.cleanup();
-      }
-      assert.match(cookbook.operations!.image, /uno\.Enum\('com\.sun\.star\.text\.TextContentAnchorType', 'AS_CHARACTER'\)/);
-      assert.match(cookbook.operations!.pageBreak, /BreakType/);
-      assert.doesNotMatch(cookbook.operations!.pageBreak, /insertControlCharacter\([^\n]*,\s*2\s*,/);
       const content = (generated.report.verification as { content?: { layout?: { tables?: number; issues?: unknown[] } } }).content;
       assert.equal(content?.layout?.tables, 1);
       assert.deepEqual(content?.layout?.issues, []);

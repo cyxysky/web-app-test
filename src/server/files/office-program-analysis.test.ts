@@ -33,7 +33,7 @@ test('allows facade calls without statically requiring element IDs', async () =>
   assert.equal(result.passed, true);
 });
 
-test('keeps duplicate literal element IDs as a non-blocking source-quality warning', async () => {
+test('lets runtime scope and disambiguate repeated literal element IDs', async () => {
   const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     page = deck.add_slide('slide-01')
@@ -42,10 +42,8 @@ test('keeps duplicate literal element IDs as a non-blocking source-quality warni
     deck.save()
     deck.close()`, 'uno');
   if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
-  const diagnostic = result.diagnostics.find((item) => item.code === 'DUPLICATE_ELEMENT_ID');
   assert.equal(result.passed, true);
-  assert.equal(diagnostic?.severity, 'warning');
-  assert.match(diagnostic?.message || '', /disambiguate it deterministically/);
+  assert.equal(result.diagnostics.some((item) => item.code === 'DUPLICATE_ELEMENT_ID'), false);
 });
 
 test('rejects stable facade methods called on an expert raw UNO document', async () => {

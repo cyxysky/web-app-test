@@ -2269,6 +2269,7 @@
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row-corner-status {
     align-items: flex-start;
     background: var(--accent-strong);
+    border-radius: 0 var(--app-radius-sm) 0 0;
     clip-path: polygon(0 0, 100% 0, 100% 100%);
     color: #fff;
     display: inline-flex;

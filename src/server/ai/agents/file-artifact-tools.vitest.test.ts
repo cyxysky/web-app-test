@@ -121,6 +121,14 @@ describe('UNO file tool policies', () => {
     ])).toBe('one\nONE-DETAIL\ntwo\nTHREE\nfour\n');
   });
 
+  it('treats an already-satisfied replaceAll as an idempotent no-op inside an atomic batch', () => {
+    expect(applyUnoDraftLineEdits("style={'font_size': 1, 'background': 'card'}\n", [
+      { kind: 'replaceAll', oldText: ", 'background': 'card'", newText: '' },
+      { kind: 'replaceAll', oldText: ", 'background': 'card',", newText: ',' },
+      { kind: 'replaceAll', oldText: "'missing-background'", newText: "'clean'" },
+    ])).toBe("style={'font_size': 1}\n");
+  });
+
   it('keeps replaceRange indentation exact unless relative indentation is explicitly requested', () => {
     const source = [
       'def create_document(job):',
@@ -341,7 +349,7 @@ describe('UNO file tool policies', () => {
     }
   });
 
-  it('allows repeated complete UNO API inspections without a call-count limit', async () => {
+  it('returns the complete cached Office facade cookbook on recovery calls', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
     const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-api-unlimited-'));
     roots.push(root);
@@ -353,11 +361,23 @@ describe('UNO file tool policies', () => {
       await planFileArtifact({
         documentId: 'api-unlimited', documentType: 'presentation', fileName: 'api-unlimited.pptx', runId: 'chat_test',
       });
-      for (const query of ['shape', 'text', 'chart']) {
-        const result = await getUnoApi({ documentId: 'api-unlimited', query, runId: 'chat_test' });
-        expect(result.ok).toBe(true);
-        expect(JSON.parse(result.actual || '{}').kind).toBe('uno-api');
-      }
+      const first = await getUnoApi({ documentId: 'api-unlimited', query: 'shape', runId: 'chat_test' });
+      expect(first.ok).toBe(true);
+      const firstPayload = JSON.parse(first.actual || '{}') as {
+        kind?: string; nativeReflectionExposed?: boolean; target?: string; capabilities?: unknown[];
+      };
+      expect(firstPayload.kind).toBe('uno-api');
+      expect(firstPayload.target).toBe('facade');
+      expect(firstPayload.nativeReflectionExposed).toBe(false);
+      expect(firstPayload.capabilities?.length).toBeGreaterThan(10);
+      const repeated = await getUnoApi({ documentId: 'api-unlimited', query: 'chart', runId: 'chat_test' });
+      const repeatedPayload = JSON.parse(repeated.actual || '{}') as {
+        alreadyLoaded?: boolean; apiReference?: unknown[]; examples?: Record<string, string>; kind?: string;
+      };
+      expect(repeatedPayload.kind).toBe('uno-api');
+      expect(repeatedPayload.alreadyLoaded).toBe(true);
+      expect(repeatedPayload.apiReference?.length).toBeGreaterThan(20);
+      expect(repeatedPayload.examples?.nativeColumnChart).toContain('show_legend=True');
     } finally {
       if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = previousArtifacts;

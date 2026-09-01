@@ -65,14 +65,18 @@ test('browserCode conversation state persists across database reopen and isolate
       action: 'list',
       input: { prefix: 'task.' },
     }) as { count: number; items: Array<{ key: string }> };
-    assert.equal(listed.count, 2);
-    assert.deepEqual(listed.items.map((item) => item.key), ['task.note', 'task.progress']);
+    assert.equal(listed.count, 3);
+    assert.deepEqual(listed.items.map((item) => item.key), [
+      'task.large-image',
+      'task.note',
+      'task.progress',
+    ]);
 
     const cleared = stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
       action: 'clear',
       input: { prefix: 'task.' },
     }) as { deleted: number };
-    assert.equal(cleared.deleted, 2);
+    assert.equal(cleared.deleted, 3);
   } finally {
     databaseModule.closeSqliteDatabase();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

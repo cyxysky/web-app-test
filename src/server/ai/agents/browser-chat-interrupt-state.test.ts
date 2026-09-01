@@ -32,6 +32,35 @@ test('does not start waiting when the signal was already aborted', async () => {
   );
 });
 
+test('registered turns enforce an absolute hard timeout and clear it on completion', async () => {
+  const registry = new Map<string, RegisteredBrowserChatTurn<{ id: string }>>();
+  const session = { id: 'hard-timeout-session' };
+  const controller = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-timeout',
+    abortController: controller,
+  }, { timeoutMs: 15, timeoutMessage: 'hard timeout reached' });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(controller.signal.aborted, true);
+  assert.match(String(controller.signal.reason), /hard timeout reached/);
+
+  const completedController = new AbortController();
+  registerBrowserChatTurn(registry, session.id, {
+    session,
+    assistantMessageId: 'assistant-completed',
+    abortController: completedController,
+  }, { timeoutMs: 15 });
+  assert.equal(clearRegisteredBrowserChatTurn(
+    registry,
+    session.id,
+    'assistant-completed',
+    completedController,
+  ), true);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(completedController.signal.aborted, false);
+});
+
 test('revokes turn ownership before dispatching abort and does not await settlement', () => {
   const controller = new AbortController();
   const session = {

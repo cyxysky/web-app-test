@@ -12,7 +12,7 @@ import { fileFormatForExtension, fileFormatForMimeType, normalizedFileExtension 
 import {
   generateFileToPaths,
 } from './document-artifact-generators';
-import { inspectUnoApi } from '@/server/files/uno-program';
+import { inspectUnoApi, isUnoBridgeStartupError } from '@/server/files/uno-program';
 import { convertOfficeFile } from '@/server/files/libreoffice';
 import { validateOfficeArtifact, type OfficeElementMapEntry } from '@/server/files/office-artifact-validator';
 import { validateOfficeRendererMatrix } from '@/server/files/office-render-validation';
@@ -43,8 +43,23 @@ const downloadDomainCooldowns = new Map<string, number>();
 const DRAFT_LOCK_WAIT_MS = 120_000;
 const STALE_DRAFT_LOCK_MS = 10 * 60_000;
 const MODEL_DIAGNOSTIC_LIMIT = 24;
+
+function officeOperationWasInterrupted(error: unknown, abortSignal?: AbortSignal) {
+  if (abortSignal?.aborted) return true;
+  return /(?:Browser chat operation interrupted by user|AbortError|operation (?:was )?aborted)/i
+    .test(error instanceof Error ? error.message : String(error));
+}
+
+export function hasOnlyRetryableOfficeValidationFailure(draft: OfficeDocumentDraft) {
+  const diagnostics = draft.validationDiagnostics || [];
+  return diagnostics.length > 0 && diagnostics.every((diagnostic) => (
+    String(diagnostic.code || '') === 'UNO_BRIDGE_STARTUP'
+    || isUnoBridgeStartupError(diagnostic.message || '')
+    || officeOperationWasInterrupted(diagnostic.message || '')
+  ));
+}
 const TOOL_ERROR_MAX_CHARACTERS = 6_000;
-const OFFICE_PIPELINE_VERSION = 'office-pipeline-v8-visual-quality-links-and-features';
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v9-complete-facade-and-preservation';
 const VISUAL_QA_PAGE_CHECKS = [
   'overlap', 'clipping', 'alignment', 'spacing', 'typography', 'contrast',
   'visualHierarchy', 'chartTableLegibility', 'imageQuality',
@@ -121,7 +136,7 @@ export type FileGenerationProgress = {
 export type UnoDraftLineEdit = {
   /** Defaults to replaceRange for compatibility with existing calls. */
   kind?: 'deleteRange' | 'insertAfter' | 'insertBefore' | 'replaceAll' | 'replaceRange' | 'replaceText';
-  /** One-based, inclusive source line range from action=read. */
+  /** One-based, inclusive global source line range from action=read. */
   startLine?: number;
   endLine?: number;
   /** One-based anchor line for insertBefore/insertAfter. */
@@ -162,7 +177,7 @@ type ReadUnoDraftInput = {
   runId?: string;
   documentId?: string;
   path?: string;
-  /** Optional one-based source window. For a unit path, lines are local to that unit. */
+  /** Optional one-based global source window, including when path is supplied. */
   startLine?: number;
   endLine?: number;
 };
@@ -363,7 +378,7 @@ const javascriptOfficeExtensions = new Set(['.docx', '.pptx', '.xlsx', '.pdf']);
 function configuredOfficeGenerator(fileName: string, operation: 'create' | 'modify'):
   OfficeDocumentDraft['generator'] {
   if (operation === 'modify') return 'uno';
-  const configured = String(process.env.OFFICE_GENERATION_MODE || 'javascript').trim().toLowerCase();
+  const configured = String(process.env.OFFICE_GENERATION_MODE || 'uno').trim().toLowerCase();
   const extension = path.extname(fileName).toLowerCase();
   if (configured === 'javascript') {
     if (!javascriptOfficeExtensions.has(extension)) {
@@ -645,13 +660,16 @@ export function officeValidationRepairHints(
     hints.push('Define the reported name before first use or replace it with the intended existing variable. Repair the exact sourceExcerpt; do not use numbered batch replacement for a local name error.');
   }
   if (codes.has('UNO_PYTHON_IMPORT_UNSUPPORTED')) {
-    hints.push('Remove only the reported from com.sun.star... import. Keep import uno and replace imported enums, constants, or structs with the exact uno.Enum(...), uno.getConstantByName(...), or uno.createUnoStruct(...) form returned by unoApi; do not invent aliases such as _FS or _LS.');
+    hints.push('Remove the raw UNO import and replace the affected block with a method from the complete facade manifest already returned for this document. Never substitute enums, structs, constants, or service calls.');
+  }
+  if (codes.has('MODEL_RAW_UNO_FORBIDDEN')) {
+    hints.push('Raw UNO is worker-owned. Keep the current document facade and replace only the reported raw block with a supported call from the already-loaded manifest; preserve-only/unsupported features must not be recreated.');
   }
   if (codes.has('DRAFT_ENTRYPOINT_CALLED_DIRECTLY')) {
     hints.push('Delete the direct create_document(...) call. The LibreOffice worker invokes create_document(job) with the real job object; the draft must only define that function.');
   }
   if (codes.has('PRESENTATION_GEOMETRY_INVALID')) {
-    hints.push('Repair the exact reported add_text/add_shape/add_image call. Keep x/y >= 0, width/height > 0, and x+width/y+height inside deck.bounds(); for repeated elements, verify every loop iteration.');
+    hints.push('Move the reported element into a named slide slot, or repair only its explicit semantic box. Prefer deck.slide(...).add_* with slot=... over hand-calculated coordinates.');
   }
   if (codes.has('PRESENTATION_TEXT_OVERFLOW')) {
     hints.push('Increase the reported text box, shorten its copy, or redesign that local block. Use deck.text_height()/estimate_text_box() or add_text_box/card/footer so pt text is converted to 1/100 mm geometry safely. Do not auto-grow a shared helper without reflowing its dependent layout.');
@@ -659,29 +677,23 @@ export function officeValidationRepairHints(
   if (codes.has('PRESENTATION_TEXT_BOX_TOO_SHORT')) {
     hints.push('The source mixes point font sizes with an undersized 1/100 mm geometry box. Replace the hand-sized height with deck.text_height()/estimate_text_box(), or use add_text_box/card/footer; keep min_font_size readable.');
   }
-  if (codes.has('SOURCE_UNITS_REQUIRED')) {
-    hints.push('Add @webpilot-unit/@webpilot-endunit markers around independent pages, sections, or sheets. Direct presentation slides, Writer add_page_break page blocks, and sequential Calc add_worksheet sheet blocks are indexed automatically when recognizable. Then read and edit one path at a time.');
-  }
   if (codes.has('FACADE_METHOD_ON_RAW_UNO_DOCUMENT')) {
-    hints.push('Do not call presentation/writer/spreadsheet facade methods on expert.new_document/open_document results. Create a facade with job.presentation(..., component=rawDoc), job.writer(..., component=rawDoc), or job.spreadsheet(..., component=rawDoc), and make all stable layout calls on that facade variable. If this receiver mistake is repeated throughout the source, replace the failed draft atomically with action=generate instead of patching every call.');
+    hints.push('Replace the raw document receiver with job.presentation/job.writer/job.spreadsheet and keep every operation on its returned slide, flow-document, or A1 worksheet facade.');
   }
   if (codes.has('FACADE_COMPONENT_ACCESS_UNSUPPORTED')) {
-    hints.push('Do not guess facade internals or use getattr(layout, ...). Keep the existing facade, declare expert = job.expert(reason), and obtain its raw document with doc = expert.component(layout); use it only for the unmodeled feature and tag every created raw object.');
-  }
-  if (codes.has('DUPLICATE_ELEMENT_ID')) {
-    hints.push('The runtime deterministically disambiguates duplicate IDs so this warning no longer blocks generation. For durable source, repair the reusable helper once: accept a caller prefix and use distinct role suffixes such as /dot, /dot-inner, and /description. Do not regenerate the complete document for this warning.');
+    hints.push('Do not inspect facade internals. Reuse the complete facade manifest already returned for the planned document.');
   }
   if (codes.has('ELEMENT_ID_AUTO_DISAMBIGUATED')) {
     hints.push('The artifact was kept valid by deterministic runtime ID disambiguation. On the next relevant edit, update the shared helper namespace once instead of renaming only the last reported object or rewriting the complete source.');
   }
   if (codes.has('UNO_BRIDGE_DISPOSED')) {
-    hints.push('The runtime already retried once with a fresh isolated LibreOffice profile. If the bridge still disconnected at the same raw UNO call, replace only that expert helper with a stable facade operation or a simpler tagged object; do not rewrite unrelated pages.');
+    hints.push('The runtime already retried once with a fresh isolated LibreOffice profile. Preserve the current facade source and retry render; source edits cannot repair a disposed LibreOffice process.');
+  }
+  if (codes.has('UNO_BRIDGE_STARTUP')) {
+    hints.push('LibreOffice failed before the document source could run. Do not edit the Office source; retry render with the unchanged draft after the isolated startup retries complete.');
   }
   if (codes.has('RAW_CONNECTOR_SHAPE_UNSTABLE')) {
-    hints.push('Replace only the reported raw ConnectorShape helper with deck.add_connector(elementId, page, x1, y1, x2, y2, ...). Preserve the helper signature and caller IDs where possible; do not rewrite the document.');
-  }
-  if (codes.has('HELPER_FIXED_ELEMENT_ID')) {
-    hints.push('A reusable helper registers one fixed elementId for multiple objects. Add an id-prefix parameter and derive IDs such as f"{sid}/background"; update every helper call in the same focused edit.');
+    hints.push('Replace only the reported raw connector with slide.connect(elementId, sourceBox, targetBox, ...). Keep the existing named slide layout and child IDs.');
   }
   if (codes.has('HELPER_CALL_SIGNATURE_MISMATCH')) {
     hints.push('The local helper definition and its callers disagree. Read the helper symbol and update its signature plus every affected call together; this is not a UNO facade API error.');
@@ -690,7 +702,7 @@ export function officeValidationRepairHints(
     hints.push('Default reusable layout helpers to allow_overlap=False. Pass True only at explicit background, container, or decorative call sites so content overlap remains detectable.');
   }
   if (codes.has('PPTX_ELEMENT_ID_MISSING')) {
-    hints.push('A serialized slide object lacks a wp_ element marker. Create it through the presentation facade, or call expert.tag on the exact raw object immediately after adding it. Renaming unrelated IDs or page-number text cannot fix this diagnostic.');
+    hints.push('A serialized slide object lacks its stable element marker. Recreate only that object through the PresentationSlide facade; raw objects and expert tagging are not model-facing.');
   }
   if (codes.has('PPTX_OBJECT_OUT_OF_BOUNDS')) {
     hints.push('Repair only the reported elementId geometry using deck.bounds(); keep x/y non-negative and x+width/y+height inside those bounds with a small edge margin. Full-slide backgrounds must use bounds["width"] and bounds["height"].');
@@ -708,16 +720,16 @@ export function officeValidationRepairHints(
     hints.push('The registered element ID was not written onto the serialized artifact object. Tag the actual saved object rather than a wrapper, page collection, or temporary value.');
   }
   if (codes.has('EXPERT_ELEMENTS_NOT_TAGGED')) {
-    hints.push('Every raw object created through expert mode must be registered with expert.tag(target, element_id, kind, locator).');
+    hints.push('Expert mode is not model-facing. Replace the raw block with a returned facade call or versioned feature recipe.');
   }
   if (/unexpected keyword argument/i.test(errorText) && !/create_document\.<locals>\.[A-Za-z_][A-Za-z0-9_]*\(\)/i.test(errorText)) {
-    hints.push('The facade rejected a guessed keyword. Query unoApi for the planned document and copy its exact facadeSignatures before editing the failing call.');
+    hints.push('The facade rejected a guessed keyword. Copy the exact signature from the complete facade manifest already returned for this document; do not query one feature at a time.');
   }
   if (/create_document\.<locals>\.([A-Za-z_][A-Za-z0-9_]*)\(\).*unexpected keyword argument/i.test(errorText)) {
     hints.push('A locally defined helper rejected the keyword. Update that helper signature and all of its callers together; querying unoApi will not change a user-defined Python function.');
   }
   if (/Direct job\.(?:new_document|open_document)\(\) is expert-only/i.test(errorText)) {
-    hints.push('Use the matching stable job.writer/job.presentation/job.spreadsheet facade; use job.expert(reason) only for an unmodeled operation and tag every created raw object.');
+    hints.push('Use the matching job.writer/job.presentation/job.spreadsheet facade. For existing files, pass source_name directly to that facade; never open a raw document.');
   }
   const missingName = combinedError.match(/NameError:\s*name ['"]([^'"]+)['"] is not defined/i)?.[1];
   if (missingName) {
@@ -743,10 +755,10 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
           .map((asset) => typeof asset.assetName === 'string' ? asset.assetName : '')
           .filter(Boolean)
         : [];
-      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; operation=${payload.operation || 'create'}; generator=${payload.generator || 'javascript'}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with the returned cookbook asset API.`;
+      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; operation=${payload.operation || 'create'}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with the returned cookbook asset API.`;
     }
     if (payload.kind === 'uno-program' || payload.kind === 'office-program') {
-      return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'javascript'}; sourceCharacters=${payload.sourceCharacters || 0}`;
+      return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}`;
     }
     if (payload.kind === 'uno-draft-validation') {
       if (payload.validation === 'failed' || payload.validationStatus === 'failed') {
@@ -960,7 +972,7 @@ function draftPath(runId: string | undefined, documentId: string) {
   return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.json`);
 }
 
-function draftProgramPath(runId: string | undefined, documentId: string, generator: OfficeDocumentDraft['generator'] = 'javascript') {
+function draftProgramPath(runId: string | undefined, documentId: string, generator: OfficeDocumentDraft['generator'] = 'uno') {
   return path.join(
     artifactDir(runId, 'document-drafts'),
     `${sanitizeFileName(documentId, 'document')}${generator === 'javascript' ? '.mjs' : '.py'}`,
@@ -1390,7 +1402,7 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         documentId: draft.documentId,
         documentType: draft.documentType,
         fileName: draft.fileName,
-        generator: draft.generator || 'javascript',
+        generator: draft.generator || 'uno',
         sourceDigest: draft.sourceDigest || null,
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || null,
@@ -1893,6 +1905,29 @@ function sourceUnitForStructuredLineEdits(units: ParsedSourceUnit[], edits: UnoD
     ))[0];
 }
 
+function sourceUnitLocalEdits(unit: ParsedSourceUnit, edits: UnoDraftLineEdit[]) {
+  const offset = unit.startLine - 1;
+  return edits.map((edit, editIndex) => {
+    const kind = edit.kind || 'replaceRange';
+    if (kind === 'replaceText' || kind === 'replaceAll') return edit;
+    const isInsertion = kind === 'insertBefore' || kind === 'insertAfter';
+    const startLine = Number(isInsertion ? edit.line : edit.startLine);
+    const endLine = Number(isInsertion ? edit.line : edit.endLine);
+    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
+      throw new Error(`source edit ${editIndex + 1} requires global integer line coordinates copied from action=read.`);
+    }
+    if (startLine < unit.startLine || endLine < startLine || endLine > unit.endLine) {
+      throw new Error(
+        `source edit ${editIndex + 1} global range ${startLine}-${endLine} is outside unit ${unit.path} `
+        + `at global lines ${unit.startLine}-${unit.endLine}. Read that unit again and copy its displayed global line numbers.`,
+      );
+    }
+    return isInsertion
+      ? { ...edit, line: startLine - offset }
+      : { ...edit, startLine: startLine - offset, endLine: endLine - offset };
+  });
+}
+
 function isolateSourceUnit(
   source: string,
   requestedPath: string,
@@ -2160,6 +2195,13 @@ export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]
       if (occurrence !== undefined && (!Number.isInteger(occurrence) || occurrence < 1)) {
         throw new Error(`source edit ${editIndex + 1} occurrence must be a positive integer.`);
       }
+      if (!offsets.length && edit.kind === 'replaceAll') {
+        // replaceAll is intentionally idempotent. In a mixed atomic cleanup,
+        // an earlier replacement may already have removed every later search
+        // token. Treat that as an already-satisfied edit instead of rejecting
+        // the whole batch and forcing another read/retry cycle.
+        continue;
+      }
       if (!offsets.length) {
         throw new Error(`source edit ${editIndex + 1} could not find oldText after applying the preceding edits in this atomic batch.${sourceEditCandidateSummary(result, oldText)}`);
       }
@@ -2255,6 +2297,9 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
     const readableSource = requestedUnit?.content ?? draft.program;
     const readableLines = normalizedDraftSource(readableSource).split('\n');
     const totalReadableLines = draftSourceLineCount(readableSource);
+    const coordinateOffset = requestedUnit ? requestedUnit.startLine - 1 : 0;
+    const coordinateStart = coordinateOffset + 1;
+    const coordinateEnd = coordinateOffset + totalReadableLines;
     const requestedStart = input.startLine === undefined ? undefined : Number(input.startLine);
     const requestedEnd = input.endLine === undefined ? undefined : Number(input.endLine);
     if (requestedStart !== undefined && (!Number.isInteger(requestedStart) || requestedStart < 1)) {
@@ -2264,12 +2309,14 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
       return { ok: false, actual: 'Office draft read endLine must be a positive one-based integer.' };
     }
     const explicitRange = requestedStart !== undefined || requestedEnd !== undefined;
-    const rangeStart = requestedStart ?? (requestedEnd === undefined ? 1 : Math.max(1, requestedEnd - MAX_SOURCE_READ_LINES + 1));
+    const rangeStart = requestedStart ?? (requestedEnd === undefined
+      ? coordinateStart
+      : Math.max(coordinateStart, requestedEnd - MAX_SOURCE_READ_LINES + 1));
     const rangeEnd = requestedEnd ?? (requestedStart === undefined
-      ? Math.min(totalReadableLines, MAX_SOURCE_READ_LINES)
-      : Math.min(totalReadableLines, rangeStart + MAX_SOURCE_READ_LINES - 1));
-    if (rangeStart > rangeEnd || rangeEnd > totalReadableLines) {
-      return { ok: false, actual: `Office draft read range ${rangeStart}-${rangeEnd} is outside the current 1-${totalReadableLines} source lines.` };
+      ? Math.min(coordinateEnd, coordinateStart + MAX_SOURCE_READ_LINES - 1)
+      : Math.min(coordinateEnd, rangeStart + MAX_SOURCE_READ_LINES - 1));
+    if (rangeStart < coordinateStart || rangeStart > rangeEnd || rangeEnd > coordinateEnd) {
+      return { ok: false, actual: `Office draft read range ${rangeStart}-${rangeEnd} is outside the current global ${coordinateStart}-${coordinateEnd} source lines${requestedUnit ? ` for unit ${requestedUnit.path}` : ''}.` };
     }
     if (rangeEnd - rangeStart + 1 > MAX_SOURCE_READ_LINES) {
       return { ok: false, actual: `Office draft read ranges are limited to ${MAX_SOURCE_READ_LINES} lines. Request a smaller window around the diagnostic.` };
@@ -2279,9 +2326,11 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
         ? totalReadableLines > MAX_SOURCE_READ_LINES
         : totalReadableLines > LARGE_SOURCE_LINE_THRESHOLD
     );
+    const localRangeStart = rangeStart - coordinateOffset;
+    const localRangeEnd = rangeEnd - coordinateOffset;
     const returnedSource = omitLargeProgram
       ? ''
-      : readableLines.slice(rangeStart - 1, rangeEnd).join('\n');
+      : readableLines.slice(localRangeStart - 1, localRangeEnd).join('\n');
     return {
       ok: true,
       actual: JSON.stringify({
@@ -2290,7 +2339,7 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
         documentType: draft.documentType,
         fileName: draft.fileName,
         operation: draft.operation || 'create',
-        generator: draft.generator || 'javascript',
+        generator: draft.generator || 'uno',
         sourceFileName: path.basename(draftProgramPath(input.runId, documentId, draft.generator)),
         sourceDocument: draft.sourceDocument ? {
           attachmentId: draft.sourceDocument.attachmentId,
@@ -2322,7 +2371,9 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
         sourceLineRange: omitLargeProgram ? undefined : {
           startLine: rangeStart,
           endLine: rangeEnd,
-          totalLines: totalReadableLines,
+          coordinateSpace: 'global',
+          totalSourceLines: draftSourceLineCount(draft.program),
+          unitLineCount: requestedUnit ? totalReadableLines : undefined,
         },
         readGuidance: omitLargeProgram
           ? `This ${totalReadableLines}-line ${requestedUnit ? 'source unit' : 'draft'} is too large for an unbounded read. ${requestedUnit ? `Read the same path ${requestedUnit.path} with ` : 'Read one sourceUnits path, or use '}startLine/endLine around the reported diagnostic (maximum ${MAX_SOURCE_READ_LINES} lines).`
@@ -2342,7 +2393,7 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
   }
   try {
     const draft = await loadDraft(input.runId, documentId);
-    if ((draft.generator || 'javascript') === 'javascript') {
+    if ((draft.generator || 'uno') === 'javascript') {
       return {
         ok: false,
         actual: `Document ${documentId} uses JavaScript generation. UNO API guidance is unavailable for this draft; call action=jsApi for ${draft.documentType} instead.`,
@@ -2355,19 +2406,23 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
       };
     }
     const documentType = draft.documentType;
+    const catalog = await inspectUnoApi({ documentType, limit: 120 });
+    const catalogDigest = sourceDigest(JSON.stringify(catalog));
+    const alreadyLoaded = draft.unoApiCatalogDigest === catalogDigest;
+    draft.unoApiCatalogDigest = catalogDigest;
+    draft.unoApiCatalogLoadedAt ||= new Date().toISOString();
+    await saveDraft(input.runId, draft);
     return {
       ok: true,
       actual: JSON.stringify({
         kind: 'uno-api',
         documentId,
         documentType,
-        sourceUnitGuidance: `Sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines must be scoped. Presentation pages use authored slide IDs, reusable Python helpers use symbols/<function-name>, Writer page breaks and Calc worksheets are indexed semantically. Runtime-created pages are edited through their helper symbol instead of a guessed static page count. Other structures may use # @webpilot-unit and # @webpilot-endunit markers.`,
-        ...(await inspectUnoApi({
-          documentType,
-          query: input.query,
-          offset: input.offset,
-          limit: input.limit,
-        })),
+        catalogDigest,
+        delivery: 'complete-executable-cookbook',
+        alreadyLoaded,
+        queryIgnored: input.query ? true : undefined,
+        ...catalog,
       }),
     };
   } catch (error) {
@@ -2394,7 +2449,7 @@ export async function getOfficeJsApi(
     }
     return { ok: false, actual: `JavaScript Office API inspection failed: ${error instanceof Error ? error.message : String(error)}` };
   }
-  if ((draft.generator || 'javascript') !== 'javascript') {
+  if ((draft.generator || 'uno') !== 'javascript') {
     return {
       ok: false,
       actual: `Document ${documentId} uses UNO generation. JavaScript API guidance is unavailable for this draft; call action=unoApi instead.`,
@@ -2479,7 +2534,7 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
       rules: [
         'Export exactly one async or synchronous createDocument(job) function.',
         'Recommended workflow: action=generate may create a small runnable skeleton, then repeated action=edit calls can add pages, sections, assets, and layout incrementally. This is guidance, not a size restriction; a complete runnable initial program remains valid when appropriate.',
-        `Sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines require scoped editing. Add // @webpilot-unit and // @webpilot-endunit markers around independent pages, sections, or sheets; shared theme/helpers stay outside units and are read with startLine/endLine.`,
+        'Source units and bounded reads are optional editing aids for large programs, never a validation requirement.',
         'Write the final editable Office file to job.outputPath, or use await job.writeOutput(buffer) for docx buffers.',
         'job.listAssets() returns objects shaped exactly as { name, bytes }, never strings. Read asset.name; never call split() on an asset object.',
         'Use the exact availableAssets/listAssets name without URL encoding, decoding, basename guessing, or invented prefixes, then call await job.assetPath(exactName).',
@@ -2761,25 +2816,18 @@ async function prepareValidatedDraft(input: {
     input.draft.validationStatus = 'pending';
     input.draft.workflow = { state: 'validating', checkpointAt: new Date().toISOString() };
     await input.onProgress?.({ phase: 'static-analysis', message: '正在检查脚本语法和确定性错误' });
-    const staticAnalysis = await analyzeOfficeProgram(input.draft.program, input.draft.generator || 'javascript');
+    const staticAnalysis = await analyzeOfficeProgram(input.draft.program, input.draft.generator || 'uno');
     const parsedUnits = sourceUnitsForDraft(input.draft.program, input.draft);
-    if (draftSourceLineCount(input.draft.program) > LARGE_SOURCE_LINE_THRESHOLD && !parsedUnits.length) {
-      const diagnostic: OfficeProgramDiagnostic = {
-        code: 'SOURCE_UNITS_REQUIRED',
-        line: 1,
-        column: 1,
-        message: `Large Office sources over ${LARGE_SOURCE_LINE_THRESHOLD} lines require independently editable source units. Presentation pages are indexed by authored slide ID and reusable Python helpers by symbol range; Writer page breaks and Calc worksheets are indexed semantically. Other structures require @webpilot-unit markers.`,
-        severity: 'error',
-      };
-      const error = new Error(diagnostic.message);
-      Object.assign(error, { diagnostics: [diagnostic] });
-      throw error;
-    }
     const staticDiagnostics = staticAnalysis.diagnostics.map((diagnostic) => {
       const unit = diagnostic.line
         ? parsedUnits.find((candidate) => diagnostic.line! >= candidate.startLine && diagnostic.line! <= candidate.endLine)
         : undefined;
-      return unit ? { ...diagnostic, unitPath: unit.path } : diagnostic;
+      return unit ? {
+        ...diagnostic,
+        globalLine: diagnostic.line,
+        unitLine: diagnostic.line! - unit.startLine + 1,
+        unitPath: unit.path,
+      } : diagnostic;
     });
     input.draft.validationDiagnostics = staticDiagnostics;
     if (!staticAnalysis.passed) {
@@ -2794,8 +2842,12 @@ async function prepareValidatedDraft(input: {
     await input.onProgress?.({ phase: 'artifact-validation', message: '正在执行统一 Office、字体和嵌入图片检查' });
     const unoStrict = input.draft.generator === 'uno';
     const elementMap = unoStrict ? generatedElementMap(candidate.generated.diagnostics) : [];
+    const sourceAbsolutePath = input.draft.operation === 'modify' && input.draft.sourceDocument
+      ? path.join(artifactDir(input.runId, 'document-assets'), input.draft.sourceDocument.assetName)
+      : undefined;
     let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
       absolutePath: candidate.generated.outputPath,
+      sourceAbsolutePath,
       elementMap: unoStrict ? elementMap : undefined,
       featureCounts: unoStrict ? generatedFeatureCounts(candidate.generated.diagnostics) : undefined,
       extension: candidate.generated.extension,
@@ -2812,6 +2864,7 @@ async function prepareValidatedDraft(input: {
       candidate = await prepareValidatedDraftLegacy(input);
       validation = await validateOfficeArtifact({
         absolutePath: candidate.generated.outputPath,
+        sourceAbsolutePath,
         elementMap: unoStrict ? generatedElementMap(candidate.generated.diagnostics) : undefined,
         featureCounts: unoStrict ? generatedFeatureCounts(candidate.generated.diagnostics) : undefined,
         extension: candidate.generated.extension,
@@ -2890,6 +2943,10 @@ async function prepareValidatedDraft(input: {
     await saveDraft(input.runId, input.draft);
     return { ...candidate, validation };
   } catch (error) {
+    if ((input.draft.generator === 'uno' && isUnoBridgeStartupError(error))
+      || officeOperationWasInterrupted(error, input.abortSignal)) {
+      throw error;
+    }
     const explicitDiagnostics = error && typeof error === 'object' && 'diagnostics' in error
       ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
       : undefined;
@@ -2949,7 +3006,7 @@ async function validateDraft(input: {
         kind: 'uno-draft-validation',
         documentId: input.draft.documentId,
         fileName: input.draft.fileName,
-        generator: input.draft.generator || 'javascript',
+        generator: input.draft.generator || 'uno',
         sourceDigest: sourceDigest(input.draft.program || ''),
         sourceCharacters: input.draft.program?.length || 0,
         validationStatus: input.draft.validationStatus,
@@ -2976,6 +3033,7 @@ async function validateDraft(input: {
   } catch (error) {
     const source = input.draft.program || '';
     const validationError = error instanceof Error ? error.message : String(error);
+    const transientUnoFailure = input.draft.generator === 'uno' && isUnoBridgeStartupError(error);
     let saveError: string | undefined;
     try {
       await saveWorkingDraft(input.runId, input.draft);
@@ -2985,22 +3043,30 @@ async function validateDraft(input: {
     return {
       ok: false,
       actual: JSON.stringify({
-        kind: 'uno-draft-validation',
+        kind: transientUnoFailure ? 'uno-infrastructure-retry' : 'uno-draft-validation',
         documentId: input.draft.documentId,
         fileName: input.draft.fileName,
-        generator: input.draft.generator || 'javascript',
+        generator: input.draft.generator || 'uno',
         changed: input.documentChanged || false,
         saved: !saveError,
         sourceDigest: sourceDigest(source),
         sourceCharacters: source.length,
         lineCount: draftSourceLineCount(source),
-        validation: 'failed',
-        validationFailureCount: input.draft.validationFailureCount || 1,
-        requiredNextAction: 'edit',
-        diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
-        repairHints: officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
+        validation: transientUnoFailure ? 'pending' : 'failed',
+        validationFailureCount: transientUnoFailure ? input.draft.validationFailureCount || 0 : input.draft.validationFailureCount || 1,
+        requiredNextAction: transientUnoFailure ? 'render' : 'edit',
+        diagnostics: transientUnoFailure ? [{
+          code: 'UNO_BRIDGE_STARTUP',
+          severity: 'error',
+          message: compactToolText(validationError),
+        }] : compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
+        repairHints: transientUnoFailure
+          ? ['LibreOffice startup retries were exhausted. Do not edit the Office source; retry action=render for the unchanged current draft.']
+          : officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
         error: compactToolText(saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError),
-        recoverySuggestion: 'Continue editing this same current source. Read only the reported source unit or a small line window, then apply one focused structured edit to the exact diagnostic block. Do not use action=generate to repair a line-addressable validation error; generate is only for an intentional complete-draft replacement, not ordinary recovery.',
+        recoverySuggestion: transientUnoFailure
+          ? 'The current source was preserved and was not marked invalid. Retry render; source changes cannot repair a LibreOffice process startup failure.'
+          : 'Continue editing this same current source. Read only the reported source unit or a small line window, then apply one focused structured edit to the exact diagnostic block. Do not use action=generate to repair a line-addressable validation error; generate is only for an intentional complete-draft replacement, not ordinary recovery.',
         workflow: compactWorkflowForTool(input.draft.workflow),
       }),
     };
@@ -3029,7 +3095,7 @@ async function validateDraftSourceUnit(input: {
     if (!unit) throw new Error(`Office source unit ${input.sourceUnitPath} does not exist.`);
     const isolatedSource = isolateSourceUnit(input.draft.program, input.sourceUnitPath, input.draft.generator, units);
     await input.onProgress?.({ phase: 'unit-static-analysis', message: `正在检查 ${input.sourceUnitPath}` });
-    const staticAnalysis = await analyzeOfficeProgram(isolatedSource, input.draft.generator || 'javascript');
+    const staticAnalysis = await analyzeOfficeProgram(isolatedSource, input.draft.generator || 'uno');
     if (!staticAnalysis.passed) {
       const error = new Error(staticAnalysis.diagnostics.filter((item) => item.severity === 'error').map((item) => item.message).join('\n'));
       Object.assign(error, { diagnostics: staticAnalysis.diagnostics });
@@ -3052,8 +3118,12 @@ async function validateDraftSourceUnit(input: {
     });
     const unoStrict = input.draft.generator === 'uno';
     const elementMap = unoStrict ? generatedElementMap(generated.diagnostics) : [];
+    const sourceAbsolutePath = input.draft.operation === 'modify' && input.draft.sourceDocument
+      ? path.join(artifactDir(input.runId, 'document-assets'), input.draft.sourceDocument.assetName)
+      : undefined;
     let validation: ValidatedDraftCandidate['validation'] = await validateOfficeArtifact({
       absolutePath: generated.outputPath,
+      sourceAbsolutePath,
       elementMap: unoStrict ? elementMap : undefined,
       featureCounts: unoStrict ? generatedFeatureCounts(generated.diagnostics) : undefined,
       extension: generated.extension,
@@ -3154,9 +3224,39 @@ async function validateDraftSourceUnit(input: {
       ? (error as { diagnostics?: OfficeProgramDiagnostic[] }).diagnostics
       : undefined;
     const errorText = error instanceof Error ? error.message : String(error);
+    const transientUnoFailure = input.draft.generator === 'uno' && isUnoBridgeStartupError(error);
     const diagnostics = explicitDiagnostics || (input.draft.generator === 'uno'
       ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
       : undefined);
+    if (transientUnoFailure) {
+      input.draft.validationStatus = 'pending';
+      input.draft.validationDiagnostics = [];
+      input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
+      let saveError: string | undefined;
+      try {
+        await saveWorkingDraft(input.runId, input.draft);
+      } catch (workingSaveError) {
+        saveError = workingSaveError instanceof Error ? workingSaveError.message : String(workingSaveError);
+      }
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'uno-infrastructure-retry',
+          documentId: input.draft.documentId,
+          sourceUnitPath: input.sourceUnitPath,
+          validation: 'pending',
+          saved: !saveError,
+          renderable: true,
+          sourceDigest: sourceDigest(input.draft.program || ''),
+          requiredNextAction: 'render',
+          diagnostics: [{ code: 'UNO_BRIDGE_STARTUP', severity: 'error', message: compactToolText(errorText) }],
+          repairHints: ['LibreOffice startup retries were exhausted. Do not edit the Office source; retry action=render for the unchanged current draft.'],
+          error: compactToolText(saveError ? `${errorText}\nWorking source save failed: ${saveError}` : errorText),
+          recoverySuggestion: 'The edited source was preserved and was not marked invalid. Retry render; source changes cannot repair a LibreOffice process startup failure.',
+          workflow: compactWorkflowForTool(input.draft.workflow),
+        }),
+      };
+    }
     input.draft.validationStatus = 'failed';
     input.draft.validationFailureCount = (input.draft.validationFailureCount || 0) + 1;
     input.draft.validationDiagnostics = (diagnostics || [{ message: errorText, severity: 'error' as const }])
@@ -3209,6 +3309,13 @@ async function renderDraft(input: {
   let publishCandidatePath: string | undefined;
   try {
     const workingDigest = sourceDigest(input.draft.program || '');
+    if (input.draft.validationStatus === 'failed' && hasOnlyRetryableOfficeValidationFailure(input.draft)) {
+      input.draft.validationStatus = 'pending';
+      input.draft.validationFailureCount = 0;
+      input.draft.validationDiagnostics = [];
+      input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
+      await saveDraft(input.runId, input.draft);
+    }
     if (input.draft.validationStatus === 'failed') {
       return {
         ok: false,
@@ -3339,6 +3446,24 @@ async function renderDraft(input: {
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
   } catch (error) {
+    if (input.draft.generator === 'uno' && isUnoBridgeStartupError(error)) {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'office-render-infrastructure-retry',
+          documentId: input.draft.documentId,
+          sourceDigest: sourceDigest(input.draft.program || ''),
+          sourceUnchanged: true,
+          requiredNextAction: 'render',
+          diagnostics: [{
+            code: 'UNO_BRIDGE_STARTUP',
+            severity: 'error',
+            message: compactToolText(error instanceof Error ? error.message : String(error)),
+          }],
+          error: 'LibreOffice could not start after isolated retries. Retry render; do not edit the Office source.',
+        }),
+      };
+    }
     return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
   } finally {
     if (publishCandidatePath) await unlink(publishCandidatePath).catch(() => undefined);
@@ -3384,7 +3509,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
           fileName: existing.fileName,
           documentType: existing.documentType,
           operation: existing.operation || 'create',
-          generator: existing.generator || 'javascript',
+          generator: existing.generator || 'uno',
           sourceDocument: existing.sourceDocument,
           sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
           sourceCharacters: existing.program?.length || 0,
@@ -3424,7 +3549,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       sourceCharacters: 0,
       workflow: draft.workflow,
       instruction: draft.operation === 'modify'
-        ? `Open the existing file through the matching stable facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. If the facade cannot express the requested edit, use job.expert(reason).open_document(...) and tag every newly created raw object. Do not recreate the document.`
+        ? `Open the existing file through the matching high-level facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. Load unoApi once, then use its existing-object selectors and preserve-only policy; raw UNO and job.expert are not model-facing. Do not recreate the document.`
         : undefined,
     }) };
   } catch (error) {
@@ -3496,7 +3621,8 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     const inferredValidationUnit = requestedUnit
       ? undefined
       : sourceUnitForStructuredLineEdits(sourceUnits, input.edits);
-    const edited = applyUnoDraftLineEdits(editableSource, input.edits);
+    const editorEdits = requestedUnit ? sourceUnitLocalEdits(requestedUnit, input.edits) : input.edits;
+    const edited = applyUnoDraftLineEdits(editableSource, editorEdits);
     draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {

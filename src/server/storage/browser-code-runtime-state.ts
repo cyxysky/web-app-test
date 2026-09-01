@@ -1,5 +1,7 @@
 ﻿import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from './sqlite-database';
 
+import { publishBrowserChatRuntimeRecordsChanged } from './browser-chat-runtime-record-refresh';
+
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEYS = 100;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEY_CHARS = 120;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
@@ -198,7 +200,7 @@ export function executeBrowserCodeRuntimeStateOperation(
     const valueJson = serializeRuntimeStateValue(input.value);
     const expectedRevision = optionalRevision(input.expectedRevision);
     const ttlMs = optionalTtlMs(input.ttlMs);
-    return runSqliteTransaction((database) => {
+    const result = runSqliteTransaction((database) => {
       purgeExpiredState(database, timestamp);
       const existing = currentRow(sessionId, key);
       const currentRevision = Number(existing?.revision) || 0;
@@ -234,13 +236,15 @@ export function executeBrowserCodeRuntimeStateOperation(
         ...(expiresAt ? { expiresAt } : {}),
       };
     });
+    publishBrowserChatRuntimeRecordsChanged(sessionId, 'variables');
+    return result;
   }
 
   if (operation.action === 'delete') {
     rejectUnknownFields(input, 'agent.state.delete input', ['key', 'expectedRevision']);
     const key = normalizedKey(input.key);
     const expectedRevision = optionalRevision(input.expectedRevision);
-    return runSqliteTransaction((database) => {
+    const result = runSqliteTransaction((database) => {
       purgeExpiredState(database, timestamp);
       const existing = currentRow(sessionId, key);
       const currentRevision = Number(existing?.revision) || 0;
@@ -254,6 +258,8 @@ export function executeBrowserCodeRuntimeStateOperation(
       `).run(sessionId, runtimeStateNamespace, key);
       return { deleted: true, key, revision: currentRevision };
     });
+    if (result.deleted) publishBrowserChatRuntimeRecordsChanged(sessionId, 'variables');
+    return result;
   }
 
   if (operation.action === 'list') {
@@ -263,7 +269,7 @@ export function executeBrowserCodeRuntimeStateOperation(
     if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > BROWSER_CODE_RUNTIME_STATE_MAX_KEYS) {
       throw new Error(`agent.state list limit must be an integer between 1 and ${BROWSER_CODE_RUNTIME_STATE_MAX_KEYS}.`);
     }
-    return runSqliteTransaction((database) => {
+    const result = runSqliteTransaction((database) => {
       purgeExpiredState(database, timestamp);
       const matching = (database.prepare(`
         SELECT key, value_json, revision, updated_at, expires_at
@@ -278,12 +284,13 @@ export function executeBrowserCodeRuntimeStateOperation(
         truncated: matching.length > requestedLimit,
       };
     });
+    return result;
   }
 
   if (operation.action === 'clear') {
     rejectUnknownFields(input, 'agent.state.clear input', ['prefix']);
     const prefix = normalizedPrefix(input.prefix);
-    return runSqliteTransaction((database) => {
+    const result = runSqliteTransaction((database) => {
       purgeExpiredState(database, timestamp);
       const keys = (database.prepare(`
         SELECT key FROM browser_code_runtime_state
@@ -299,6 +306,8 @@ export function executeBrowserCodeRuntimeStateOperation(
       `).run(sessionId, runtimeStateNamespace, ...keys);
       return { deleted: keys.length, prefix };
     });
+    if (result.deleted) publishBrowserChatRuntimeRecordsChanged(sessionId, 'variables');
+    return result;
   }
 
   throw new Error(`Unsupported agent.state action: ${String(operation.action)}.`);

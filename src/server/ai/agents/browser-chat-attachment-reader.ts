@@ -401,7 +401,7 @@ export async function readBrowserChatFileVisuals(input: {
         warning: visuals.warning,
         automaticChecks: visuals.automaticChecks || [],
         automaticCheckScope: 'render-integrity-only: dimensions and near-blank detection; this is not a visual-quality verdict',
-        instruction: 'The requested screenshots are attached to the next model request. Inspect overlap, clipping, alignment, spacing, typography, contrast, hierarchy, chart/table legibility, and image quality. Report concrete page-specific observations; a bare passed result is invalid.',
+        instruction: 'The requested screenshots are attached to the next model request. Inspect the actual pixels at a useful size: overlap, clipping, alignment, spacing, typography, contrast, hierarchy, composition, chart/table legibility, and image quality. Every chart must identify what each mark represents; reject 1/2/3 placeholder categories, generic-only series names, and missing or unreadable legends, axes, or data labels. Images must be contextually identified or captioned and carry alt/source attribution when required. A known visible defect cannot be waived as a compatibility limitation, and a bare passed result is invalid.',
       }),
       referenceImagePaths: orderedImagePaths,
     };

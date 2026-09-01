@@ -84,6 +84,42 @@ test('browser chat history uses stable cursors and returns oldest-to-newest chun
       history.readAllBrowserChatSteps<{ index: number }>(defaultSnapshot.id).map((step) => step.index),
       Array.from({ length: 12 }, (_, index) => index + 1),
     );
+
+    const staleStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const staleSnapshot = {
+      id: 'chat_stale_turn',
+      userId: 'owner',
+      title: 'stale turn',
+      status: 'running',
+      busy: true,
+      turnState: 'running',
+      activeAssistantMessageId: 'stale-assistant',
+      createdAt: staleStartedAt,
+      updatedAt: new Date().toISOString(),
+    };
+    records.writeBrowserChatSessionRecord(
+      staleSnapshot,
+      staleSnapshot,
+      [{
+        id: 'stale-assistant', role: 'assistant', status: 'running', content: '',
+        createdAt: staleStartedAt, updatedAt: staleStartedAt, stepIndexes: [1],
+      }],
+      [{ index: 1, messageId: 'stale-assistant', status: 'running', actual: 'working' }],
+      [],
+    );
+    assert.equal(history.expireBrowserChatSessionTurnIfNeeded(staleSnapshot.id, 20 * 60_000), true);
+    const terminalHeader = history.readBrowserChatSessionHeader<{
+      busy?: boolean; error?: string; status?: string; turnState?: string;
+    }>(staleSnapshot.id);
+    assert.equal(terminalHeader?.busy, false);
+    assert.equal(terminalHeader?.status, 'idle');
+    assert.equal(terminalHeader?.turnState, 'failed');
+    assert.match(terminalHeader?.error || '', /20 minute hard limit/);
+    assert.equal(history.readBrowserChatMessageById<{ status?: string }>(
+      staleSnapshot.id,
+      'stale-assistant',
+    )?.status, 'failed');
+    assert.equal(history.readBrowserChatStepsByIndexes<{ status?: string }>(staleSnapshot.id, [1])[0]?.status, 'failed');
   } finally {
     databaseModule.getSqliteDatabase().close();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

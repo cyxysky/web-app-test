@@ -91,7 +91,7 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /Prefer `slide\.addTable\(\)` for standard tables/);
   assert.match(fileArtifactRuntimeSkillContent, /Use `slide\.addShape\(\)` to construct KPI progress bars, mini charts, and special infographics/);
   assert.match(fileArtifactRuntimeSkillContent, /job\.writer/);
-  assert.match(fileArtifactRuntimeSkillContent, /job\.expert/);
+  assert.doesNotMatch(fileArtifactRuntimeSkillContent, /job\.expert\(/);
   assert.match(fileArtifactRuntimeSkillContent, /elementId/);
   assert.match(fileArtifactRuntimeSkillContent, /Continue the original document workflow/);
   assert.match(fileArtifactRuntimeSkillContent, /## file API signatures/);
@@ -111,6 +111,10 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /## fileVisual API signatures and examples/);
   assert.match(fileArtifactRuntimeSkillContent, /declare function fileVisual\(input: FileVisualInput\)/);
   assert.match(fileArtifactRuntimeSkillContent, /screenshot-0001/);
+  assert.match(fileArtifactRuntimeSkillContent, /placeholder categories such as 1\/2\/3/);
+  assert.match(fileArtifactRuntimeSkillContent, /known visible defect is a failed review/i);
+  assert.match(fileArtifactRuntimeSkillContent, /four images is not at least five/i);
+  assert.match(fileArtifactRuntimeSkillContent, /Element IDs may use Unicode/);
 
   assert.match(subagentRuntimeSkillContent, /independent and useful in parallel/);
   assert.match(subagentRuntimeSkillContent, /same interactive page/);

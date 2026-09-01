@@ -545,3 +545,36 @@ const hiddenRuntimeSkillPolicies = {
 - 仍然存在的兼容性边界。
 
 现在直接开始执行，不要再次复述任务，也不要只输出计划。
+
+1.你不用一次性输出所有的unoApi，可以跟之前一样，支持模型一个模块一个模块查询，但是每个模型要有对应api的所有的示例，你要告诉模型实际上是怎么使用的
+2.你为什么还在搞兼容？？？你是弱智听不懂人话吗？？？你应该引导模型使用我们示例中的api，而不是让模型猜我们的api是怎么实现的  
+
+根因不是文件大，也不是 PNG 处理慢，而是 Wikimedia 限流触发了错误的长时间重试链。
+
+我刚实测这个 URL：
+
+1. `800px-...png` 首先返回 `400 Use thumbnail sizes listed`。
+2. 下载器自动回退到原始 SVG。
+3. 原始 SVG 返回 `429 Too many requests`，并要求 `Retry-After: 600` 秒。
+4. 当前代码把等待截为 30 秒，然后继续重试，最多产生约 `30 + 30 + 30` 秒无效等待，最终还可能失败。
+5. 所有 Wikimedia 下载还共享同一域名队列和冷却状态，因此前面连续下载十多张图会加重这个问题。
+
+所以截图中的 36.9 秒基本就是第一次 30 秒冷却加网络请求；继续等待可能接近 90–120 秒。
+
+相关代码在：
+
+- [下载超时及重试配置](/C:/Users/chenjf/Desktop/test2/web-app-test/src/server/ai/agents/file-artifact-tools.ts:34)
+- [Wikimedia 400 回退逻辑](/C:/Users/chenjf/Desktop/test2/web-app-test/src/server/ai/agents/file-artifact-tools.ts:1152)
+- [429 冷却和重试](/C:/Users/chenjf/Desktop/test2/web-app-test/src/server/ai/agents/file-artifact-tools.ts:1188)
+- [工具全局串行队列](/C:/Users/chenjf/Desktop/test2/web-app-test/src/server/ai/agents/browser-chat-executor.agent.ts:1346)
+
+还有一个问题：回退地址是原始 SVG，但请求声明的是 `fileType: png`。即使下载成功，当前逻辑也可能把输出改成 SVG，而不是生成真正的 PNG。
+
+合理修复应是：
+
+- Wikimedia 缩略图 `400` 后下载原始 SVG，并在本地一次性转成 PNG。
+- `429 Retry-After: 600` 不再每隔 30 秒盲目重试；直接快速失败或等待一次后返回明确错误。
+- UI 显示“Wikimedia 429，等待重试”，不只显示“正在执行工具”。
+- 下载任务使用独立的有限并发队列，不阻塞无关文件工具。
+
+本轮只做了诊断，没有修改代码。

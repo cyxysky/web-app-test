@@ -607,6 +607,21 @@ scheduleBrowserChatArtifactMaintenance(() => (
 scheduleSqliteMaintenance();
 const runningHydrationGraceMs = 2 * 60 * 1000;
 
+function browserChatTurnHardTimeoutMs() {
+  const configured = Number(process.env.AI_BROWSER_CHAT_TURN_HARD_TIMEOUT_MS || 20 * 60 * 1000);
+  return Number.isFinite(configured)
+    ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
+    : 20 * 60 * 1000;
+}
+
+function browserChatTurnTimeoutOptions() {
+  const timeoutMs = browserChatTurnHardTimeoutMs();
+  return {
+    timeoutMs,
+    timeoutMessage: `Browser chat turn exceeded the ${Math.round(timeoutMs / 60_000)} minute hard limit.`,
+  };
+}
+
 function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
   if (!template) return undefined;
@@ -3831,7 +3846,7 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
     session,
     assistantMessageId: assistantMessage.id,
     abortController,
-  });
+  }, browserChatTurnTimeoutOptions());
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: assistantMessage.id,
@@ -3976,7 +3991,7 @@ export async function sendBrowserChatMessage(
     session,
     assistantMessageId: assistantMessage.id,
     abortController,
-  });
+  }, browserChatTurnTimeoutOptions());
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: assistantMessage.id,
@@ -4083,7 +4098,7 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
     session,
     assistantMessageId: paused.message.id,
     abortController,
-  });
+  }, browserChatTurnTimeoutOptions());
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: paused.message.id,
@@ -5715,12 +5730,24 @@ async function runBrowserChatMessage(
       if (result.status !== 'blocked') scheduleBrowserChatUserIdleClose(session.userId);
       void enforceBrowserChatArtifactQuota(session.id).catch((error) => warnPersistFailure(error));
     } catch (error) {
-      const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController);
-      const interrupted = abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId);
+      const abortMessage = abortController.signal.reason instanceof Error
+        ? abortController.signal.reason.message
+        : String(abortController.signal.reason || '');
+      const timedOut = /Browser chat turn exceeded the \d+ minute hard limit/i.test(abortMessage);
+      const registeredTurn = activeTurns.get(session.id);
+      const stillActive = isActiveBrowserChatTurn(session, assistantMessageId, abortController)
+        || (timedOut
+          && registeredTurn?.session === session
+          && registeredTurn.assistantMessageId === assistantMessageId
+          && registeredTurn.abortController === abortController);
+      const interrupted = !timedOut
+        && (abortController.signal.aborted || interruptedAssistantMessageIds.has(assistantMessageId));
       if (!stillActive) return;
       const message = userFacingErrorMessage(error);
       const details = errorLogDetails(error);
-      const terminalReply = interrupted ? browserChatInterruptedReply : `执行异常：${message}`;
+      const terminalReply = timedOut
+        ? `This turn exceeded the ${Math.round(browserChatTurnHardTimeoutMs() / 60_000)} minute hard limit and was stopped.`
+        : interrupted ? browserChatInterruptedReply : `执行异常：${message}`;
       if (isDeadBrowserSessionError(error)) {
         await session.browser?.close({ keepOpen: true }).catch(() => undefined);
         session.browser = undefined;
@@ -5728,8 +5755,8 @@ async function runBrowserChatMessage(
       }
       appendLog(
         session,
-        interrupted ? 'chat:run:interrupted' : 'chat:run:error',
-        interrupted ? '用户主动中断了本轮对话。' : `本轮对话异常：${message}`,
+        interrupted ? 'chat:run:interrupted' : timedOut ? 'chat:run:timeout' : 'chat:run:error',
+        interrupted ? '用户主动中断了本轮对话。' : timedOut ? terminalReply : `本轮对话异常：${message}`,
         { details, deferPersist: true },
       );
       transitionBrowserChatSession(session, {

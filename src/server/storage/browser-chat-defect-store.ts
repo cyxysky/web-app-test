@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from './sqlite-database';
+import { publishBrowserChatRuntimeRecordsChanged } from './browser-chat-runtime-record-refresh';
 
 export type BrowserChatDefectSeverity = 'high' | 'medium' | 'low';
 
@@ -109,7 +110,7 @@ export function createBrowserChatDefectReport(
     createdAt,
   };
 
-  return runSqliteTransaction((database) => {
+  const stored = runSqliteTransaction((database) => {
     const count = database.prepare(`
       SELECT COUNT(*) AS count FROM browser_chat_defect WHERE session_id = ?
     `).get(sessionId) as { count?: number };
@@ -122,6 +123,8 @@ export function createBrowserChatDefectReport(
     `).run(sessionId, report.id, createdAt, JSON.stringify(report));
     return report;
   });
+  publishBrowserChatRuntimeRecordsChanged(sessionId, 'defects');
+  return stored;
 }
 
 export function readBrowserChatDefectReports(sessionId: string) {

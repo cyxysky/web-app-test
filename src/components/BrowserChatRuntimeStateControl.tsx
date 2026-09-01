@@ -5,6 +5,7 @@ import { Check, ChevronDown, ChevronUp, Copy, Loader2, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import { artifactApiUrl } from '@/lib/artifacts';
+import { subscribeRealtimeRefresh } from '@/lib/realtime-refresh';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 type BrowserChatRuntimeStateEntry = {
@@ -66,7 +67,6 @@ async function copyText(value: string) {
 }
 
 export function BrowserChatRuntimeStateControl({
-  active,
   children,
   sessionId,
 }: {
@@ -148,13 +148,20 @@ export function BrowserChatRuntimeStateControl({
       }
     };
     void refresh(open);
-    const refreshInterval = active ? 1_500 : open ? 5_000 : 0;
-    const timer = refreshInterval ? window.setInterval(() => void refresh(false), refreshInterval) : undefined;
+    const unsubscribe = subscribeRealtimeRefresh((event) => {
+      if (event.entityType !== 'browserChatSession' || event.id !== sessionId) return;
+      const patch = event.patch && typeof event.patch === 'object'
+        ? event.patch as Record<string, unknown>
+        : undefined;
+      if (patch?.runtimeRecordsChanged === true) void refresh(false);
+    }, {
+      onResync: () => refresh(false),
+    });
     return () => {
       disposed = true;
-      if (timer !== undefined) window.clearInterval(timer);
+      unsubscribe();
     };
-  }, [active, open, sessionId, t]);
+  }, [open, sessionId, t]);
 
   useEffect(() => {
     if (!open) return undefined;

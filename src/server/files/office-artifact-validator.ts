@@ -241,22 +241,26 @@ async function officePackageFormatChecks(zip: JSZip, extension: string, featureC
     const slides = Object.values(zip.files).filter((entry) => !entry.dir && /^ppt\/slides\/slide\d+\.xml$/i.test(entry.name));
     const slideXml = await Promise.all(slides.map((entry) => entry.async('string')));
     const nativeChartCount = fileNames.filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name)).length;
-    const vectorChartCount = Number(featureCounts.vectorChart || 0);
     return {
       presentation: {
+        animationCount: slideXml.reduce((count, xml) => count + (xml.match(/<p:anim(?:Effect|Motion|Rot|Scale|Clr)?\b/gi) || []).length, 0),
         chartCount: nativeChartCount,
+        commentCount: fileNames.filter((name) => /^ppt\/comments\/comment\d+\.xml$/i.test(name)).length,
+        customShowCount: ((await zip.file('ppt/presentation.xml')?.async('string')) || '').match(/<p:custShow\b/gi)?.length || 0,
+        embeddedObjectCount: fileNames.filter((name) => /^ppt\/embeddings\//i.test(name)).length,
+        layoutCount: fileNames.filter((name) => /^ppt\/slideLayouts\/slideLayout\d+\.xml$/i.test(name)).length,
+        masterCount: fileNames.filter((name) => /^ppt\/slideMasters\/slideMaster\d+\.xml$/i.test(name)).length,
+        mediaCount: fileNames.filter((name) => /^ppt\/media\//i.test(name)).length,
         nativeChartCount,
-        vectorChartCount,
-        totalChartCount: nativeChartCount + vectorChartCount,
-        vectorBarChartCount: Number(featureCounts.vectorBarChart || 0),
-        vectorLineChartCount: Number(featureCounts.vectorLineChart || 0),
-        vectorDonutChartCount: Number(featureCounts.vectorDonutChart || 0),
+        notesCount: fileNames.filter((name) => /^ppt\/notesSlides\/notesSlide\d+\.xml$/i.test(name)).length,
+        fieldCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:fld\b/gi) || []).length, 0),
         authoredExternalHyperlinkCount: Number(featureCounts.externalHyperlink || 0),
         authoredInternalSlideHyperlinkCount: Number(featureCounts.internalSlideHyperlink || 0),
         serializedHyperlinkCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:hlinkClick\b/gi) || []).length, 0),
         imageCount: fileNames.filter((name) => name.startsWith('ppt/media/')).length,
         slideCount: slides.length,
         tableCount: slideXml.reduce((count, xml) => count + (xml.match(/<a:tbl\b/gi) || []).length, 0),
+        transitionCount: slideXml.reduce((count, xml) => count + (xml.match(/<p:transition\b/gi) || []).length, 0),
       },
     };
   }
@@ -264,11 +268,19 @@ async function officePackageFormatChecks(zip: JSZip, extension: string, featureC
     const documentXml = await zip.file('word/document.xml')?.async('string') || '';
     return {
       word: {
+        bookmarkCount: (documentXml.match(/<w:bookmarkStart\b/gi) || []).length,
         chartCount: fileNames.filter((name) => /^word\/charts\/chart\d+\.xml$/i.test(name)).length,
+        commentCount: fileNames.filter((name) => /^word\/comments\.xml$/i.test(name)).length,
+        contentControlCount: (documentXml.match(/<w:sdt\b/gi) || []).length,
+        endnoteCount: fileNames.filter((name) => /^word\/endnotes\.xml$/i.test(name)).length,
+        fieldCount: (documentXml.match(/<w:(?:fldSimple|instrText)\b/gi) || []).length,
         floatingObjectCount: (documentXml.match(/<wp:anchor\b/gi) || []).length,
+        footnoteCount: fileNames.filter((name) => /^word\/footnotes\.xml$/i.test(name)).length,
+        hyperlinkCount: (documentXml.match(/<w:hyperlink\b/gi) || []).length,
         imageCount: fileNames.filter((name) => name.startsWith('word/media/')).length,
         inlineObjectCount: (documentXml.match(/<wp:inline\b/gi) || []).length,
         paragraphCount: (documentXml.match(/<w:p\b/gi) || []).length,
+        sectionCount: (documentXml.match(/<w:sectPr\b/gi) || []).length,
         tableCount: (documentXml.match(/<w:tbl\b/gi) || []).length,
       },
     };
@@ -283,14 +295,100 @@ async function officePackageFormatChecks(zip: JSZip, extension: string, featureC
     return {
       spreadsheet: {
         chartCount: fileNames.filter((name) => /^xl\/charts\/chart\d+\.xml$/i.test(name)).length,
+        commentCount: fileNames.filter((name) => /^xl\/comments\d+\.xml$/i.test(name)).length,
+        conditionalFormatCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<conditionalFormatting\b/gi) || []).length, 0),
+        dataValidationCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<dataValidation\b/gi) || []).length, 0),
+        drawingCount: fileNames.filter((name) => /^xl\/drawings\/drawing\d+\.xml$/i.test(name)).length,
         errorCellCount,
+        filterCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<autoFilter\b/gi) || []).length, 0),
         formulaCount,
+        freezePaneCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<pane\b[^>]*\bstate="frozen/i) || []).length, 0),
+        hyperlinkCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<hyperlink\b/gi) || []).length, 0),
         imageCount: fileNames.filter((name) => name.startsWith('xl/media/')).length,
+        mergedRangeCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<mergeCell\b/gi) || []).length, 0),
+        namedRangeCount: (((await zip.file('xl/workbook.xml')?.async('string')) || '').match(/<definedName\b/gi) || []).length,
+        outlineCount: worksheetXml.reduce((count, xml) => count + (xml.match(/\boutlineLevel="[1-9]/gi) || []).length, 0),
+        pivotTableCount: fileNames.filter((name) => /^xl\/pivotTables\/pivotTable\d+\.xml$/i.test(name)).length,
+        protectionCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<sheetProtection\b/gi) || []).length, 0),
+        structuredTableCount: fileNames.filter((name) => /^xl\/tables\/table\d+\.xml$/i.test(name)).length,
+        subtotalFormulaCount: worksheetXml.reduce((count, xml) => count + (xml.match(/<f\b[^>]*>[^<]*SUBTOTAL\s*\(/gi) || []).length, 0),
         worksheetCount: worksheets.length,
       },
     };
   }
   return { package: { partCount: fileNames.length } };
+}
+
+async function preserveOnlyFeatureCounts(zip: JSZip, extension: string) {
+  const files = Object.values(zip.files).filter((entry) => !entry.dir);
+  const names = files.map((entry) => entry.name);
+  const xmlFiles = files.filter((entry) => /\.xml$/i.test(entry.name));
+  const xml = (await Promise.all(xmlFiles.map((entry) => entry.async('string')))).join('\n');
+  const common = {
+    digitalSignatures: names.filter((name) => /^_xmlsignatures\//i.test(name)).length,
+    embeddedObjects: names.filter((name) => /\/(?:embeddings|oleObjects)\//i.test(name)).length,
+    macros: names.filter((name) => /(?:^|\/)vbaProject\.bin$/i.test(name)).length,
+  };
+  if (extension === '.pptx') {
+    return {
+      ...common,
+      activeX: names.filter((name) => /^ppt\/activeX\//i.test(name)).length,
+      comments: names.filter((name) => /^ppt\/comments\/comment\d+\.xml$/i.test(name)).length,
+      customShows: (xml.match(/<p:custShow\b/gi) || []).length,
+      morphTransitions: (xml.match(/<(?:p14|p159):morph\b/gi) || []).length,
+      smartArt: names.filter((name) => /^ppt\/diagrams\//i.test(name)).length,
+    };
+  }
+  if (extension === '.docx') {
+    return {
+      ...common,
+      comments: names.filter((name) => /^word\/comments(?:Extended)?\.xml$/i.test(name)).length,
+      contentControls: (xml.match(/<w:sdt\b/gi) || []).length,
+      endnotes: names.filter((name) => /^word\/endnotes\.xml$/i.test(name)).length,
+      footnotes: names.filter((name) => /^word\/footnotes\.xml$/i.test(name)).length,
+      trackedChanges: (xml.match(/<w:(?:ins|del|moveFrom|moveTo)\b/gi) || []).length,
+    };
+  }
+  if (extension === '.xlsx') {
+    return {
+      ...common,
+      activeX: names.filter((name) => /^xl\/activeX\//i.test(name)).length,
+      chartExtensions: names.filter((name) => /^xl\/chartsEx\//i.test(name)).length,
+      connections: names.filter((name) => /^xl\/connections\.xml$/i.test(name)).length,
+      externalLinks: names.filter((name) => /^xl\/externalLinks\//i.test(name)).length,
+      pivotCaches: names.filter((name) => /^xl\/pivotCache\//i.test(name)).length,
+      pivotTables: names.filter((name) => /^xl\/pivotTables\//i.test(name)).length,
+      slicers: names.filter((name) => /^xl\/slicers\//i.test(name)).length,
+      structuredTables: names.filter((name) => /^xl\/tables\/table\d+\.xml$/i.test(name)).length,
+      timelines: names.filter((name) => /^xl\/timelines\//i.test(name)).length,
+    };
+  }
+  return common;
+}
+
+async function validatePreserveOnlyFeatures(
+  sourceAbsolutePath: string,
+  outputZip: JSZip,
+  extension: string,
+  issues: OfficeArtifactIssue[],
+) {
+  const sourceZip = await JSZip.loadAsync(await readFile(sourceAbsolutePath));
+  const [before, after] = await Promise.all([
+    preserveOnlyFeatureCounts(sourceZip, extension),
+    preserveOnlyFeatureCounts(outputZip, extension),
+  ]);
+  for (const [feature, beforeCount] of Object.entries(before)) {
+    const afterCount = Number(after[feature as keyof typeof after] || 0);
+    if (Number(beforeCount) > afterCount) {
+      issues.push({
+        code: 'OFFICE_PRESERVE_ONLY_FEATURE_LOST',
+        message: `Existing-file edit lost preserve-only feature ${feature}: source=${beforeCount}, output=${afterCount}. LibreOffice may open this feature, but the high-level facade does not claim safe recreation.`,
+        severity: 'error',
+        target: feature,
+      });
+    }
+  }
+  return { before, after };
 }
 
 async function validatePdf(absolutePath: string, issues: OfficeArtifactIssue[]) {
@@ -315,6 +413,7 @@ async function validatePdf(absolutePath: string, issues: OfficeArtifactIssue[]) 
 
 export async function validateOfficeArtifact(input: {
   absolutePath: string;
+  sourceAbsolutePath?: string;
   elementMap?: OfficeElementMapEntry[] | undefined;
   extension: string;
   requireElementIds?: boolean;
@@ -360,6 +459,9 @@ export async function validateOfficeArtifact(input: {
   if (extension === '.pptx') await validatePresentationPackage(zip, issues, elementMap, strictUnoValidation && Boolean(input.requireElementIds));
   if (extension === '.docx') await validateWordPackage(zip, issues, elementMap);
   if (extension === '.xlsx') await validateSpreadsheetPackage(zip, issues);
+  const preservation = input.sourceAbsolutePath && ['.pptx', '.docx', '.xlsx'].includes(extension)
+    ? await validatePreserveOnlyFeatures(input.sourceAbsolutePath, zip, extension, issues)
+    : undefined;
   if (extension === '.docx') {
     const documentXml = await zip.file('word/document.xml')?.async('string') || '';
     const floatingObjectCount = (documentXml.match(/<wp:anchor\b/g) || []).length;
@@ -433,7 +535,10 @@ export async function validateOfficeArtifact(input: {
     missingFonts,
     media,
     platform: process.platform,
-    formatChecks: await officePackageFormatChecks(zip, extension, input.featureCounts),
+    formatChecks: {
+      ...(await officePackageFormatChecks(zip, extension, input.featureCounts)),
+      ...(preservation ? { preservation } : {}),
+    },
   };
 }
 

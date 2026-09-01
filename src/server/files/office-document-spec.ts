@@ -154,6 +154,10 @@ export type OfficeDocumentDraft = {
   operation?: 'create' | 'modify';
   /** Program runtime selected when the workspace is planned. Existing-file modification always uses UNO. */
   generator?: 'javascript' | 'uno';
+  /** Digest of the complete executable facade cookbook delivered for this draft. */
+  unoApiCatalogDigest?: string;
+  /** First delivery time; later recovery calls reuse the same cached complete cookbook. */
+  unoApiCatalogLoadedAt?: string;
   /** Bound source file for a real existing-document modification workspace. */
   sourceDocument?: {
     assetName: string;

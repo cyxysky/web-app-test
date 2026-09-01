@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { OfficeDocumentKind } from './office-document-spec';
 import { resolveLibreOfficeExecutable, resolveLibreOfficePythonExecutable } from './libreoffice';
 
@@ -13,6 +14,18 @@ const PROGRESS_PREFIX = '__WEBPILOT_PROGRESS__';
 const PROGRAM_ENTRYPOINT = /^\s*def\s+create_document\s*\(\s*job\s*\)\s*:/m;
 const OUTPUT_EXTENSIONS = new Set(['.doc', '.docx', '.odt', '.xls', '.xlsx', '.ods', '.ppt', '.pptx', '.odp', '.pdf']);
 const UNO_BRIDGE_DISPOSED_PATTERN = /(?:com\.sun\.star\.lang\.DisposedException|Binary URP bridge disposed|bridge disposed during call)/i;
+const UNO_BRIDGE_STARTUP_PATTERN = /(?:Unable to connect to LibreOffice UNO|couldn'?t connect to (?:pipe|socket))/i;
+
+type PersistentUnoHost = {
+  child: ChildProcess;
+  directory: string;
+  executable: string;
+  pipeName: string;
+};
+
+let persistentUnoHost: PersistentUnoHost | undefined;
+let persistentUnoQueue: Promise<void> = Promise.resolve();
+let persistentUnoExitHookInstalled = false;
 
 export type UnoGeneratedDocument = {
   buffer: Buffer;
@@ -34,7 +47,12 @@ export function assertControlledUnoProgram(sourceCode: string) {
 }
 
 export function isTransientUnoBridgeError(error: unknown) {
-  return UNO_BRIDGE_DISPOSED_PATTERN.test(error instanceof Error ? error.message : String(error));
+  const message = error instanceof Error ? error.message : String(error);
+  return UNO_BRIDGE_DISPOSED_PATTERN.test(message) || UNO_BRIDGE_STARTUP_PATTERN.test(message);
+}
+
+export function isUnoBridgeStartupError(error: unknown) {
+  return UNO_BRIDGE_STARTUP_PATTERN.test(error instanceof Error ? error.message : String(error));
 }
 
 export async function resolveUnoProgramWorker() {
@@ -197,7 +215,9 @@ function runWorker(input: {
   });
 }
 
-export async function inspectUnoApi(input: {
+const UNO_FACADE_CATALOG_CACHE = new Map<OfficeDocumentKind, Promise<Record<string, unknown>>>();
+
+async function inspectUnoApiUncached(input: {
   documentType: OfficeDocumentKind;
   query?: string;
   offset?: number;
@@ -215,12 +235,12 @@ export async function inspectUnoApi(input: {
       executable: python,
       args: [
         worker,
-        '--inspect-target', 'all',
+        '--inspect-target', 'facade',
         '--document-type', input.documentType,
         '--profile', path.join(directory, 'profile'),
         '--soffice', soffice,
         '--api-offset', String(Math.max(0, input.offset || 0)),
-        '--api-limit', String(2_000),
+        '--api-limit', String(Math.min(120, Math.max(1, input.limit || 40))),
         ...(input.query ? ['--api-query', input.query] : []),
       ],
       libreOfficeProgramDirectory: path.dirname(soffice),
@@ -229,6 +249,85 @@ export async function inspectUnoApi(input: {
   } finally {
     await rm(directory, { force: true, recursive: true, maxRetries: 3, retryDelay: 150 }).catch(() => undefined);
   }
+}
+
+async function stopPersistentUnoHost(host = persistentUnoHost) {
+  if (!host) return;
+  if (persistentUnoHost === host) persistentUnoHost = undefined;
+  await terminateWorkerProcessTree(host.child).catch(() => undefined);
+  await rm(host.directory, { force: true, recursive: true, maxRetries: 3, retryDelay: 150 }).catch(() => undefined);
+}
+
+async function ensurePersistentUnoHost(executable: string) {
+  const current = persistentUnoHost;
+  if (current && current.executable === executable && current.child.exitCode === null) return current;
+  if (current) await stopPersistentUnoHost(current);
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-uno-host-'));
+  const pipeName = `webpilot_host_${process.pid}_${randomUUID().replace(/-/g, '')}`;
+  const profile = path.join(directory, 'profile');
+  const accept = `pipe,name=${pipeName};urp;StarOffice.ComponentContext`;
+  const child = spawn(executable, [
+    '--headless', '--nologo', '--nodefault', '--nofirststartwizard', '--norestore', '--nolockcheck',
+    `-env:UserInstallation=${pathToFileURL(profile).href}`,
+    `--accept=${accept}`,
+  ], {
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  const host: PersistentUnoHost = { child, directory, executable, pipeName };
+  persistentUnoHost = host;
+  child.once('error', () => {
+    if (persistentUnoHost === host) persistentUnoHost = undefined;
+    void rm(directory, { force: true, recursive: true, maxRetries: 3, retryDelay: 150 }).catch(() => undefined);
+  });
+  child.once('exit', () => {
+    if (persistentUnoHost === host) persistentUnoHost = undefined;
+    void rm(directory, { force: true, recursive: true, maxRetries: 3, retryDelay: 150 }).catch(() => undefined);
+  });
+  if (!persistentUnoExitHookInstalled) {
+    persistentUnoExitHookInstalled = true;
+    process.once('exit', () => {
+      persistentUnoHost?.child.kill();
+    });
+  }
+  return host;
+}
+
+async function withPersistentUnoHost<T>(
+  executable: string,
+  operation: (host: PersistentUnoHost) => Promise<T>,
+) {
+  let release!: () => void;
+  const previous = persistentUnoQueue;
+  persistentUnoQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await operation(await ensurePersistentUnoHost(executable));
+  } finally {
+    release();
+  }
+}
+
+export async function inspectUnoApi(input: {
+  documentType: OfficeDocumentKind;
+  query?: string;
+  offset?: number;
+  limit?: number;
+}) {
+  // Facade inspection is independent of a document and its query. Cache the
+  // exact installed cookbook so recovery calls do not respawn Python or
+  // LibreOffice and always see the same complete contract.
+  let pending = UNO_FACADE_CATALOG_CACHE.get(input.documentType);
+  if (!pending) {
+    pending = inspectUnoApiUncached({ documentType: input.documentType, limit: 120 });
+    UNO_FACADE_CATALOG_CACHE.set(input.documentType, pending);
+    pending.catch(() => {
+      if (UNO_FACADE_CATALOG_CACHE.get(input.documentType) === pending) {
+        UNO_FACADE_CATALOG_CACHE.delete(input.documentType);
+      }
+    });
+  }
+  return pending;
 }
 
 export async function generateUnoProgramDocument(input: {
@@ -263,42 +362,50 @@ export async function generateUnoProgramDocument(input: {
     const previewPath = input.previewPath || path.join(directory, 'preview.pdf');
     const programPath = input.sourcePath || path.join(directory, 'draft.py');
     if (!input.sourcePath) await writeFile(programPath, sourceCode, 'utf8');
-    let report: Record<string, unknown> | undefined;
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
-      try {
-        report = await runWorker({
-          executable: python,
-          args: [
-            worker,
-            '--program', programPath,
-            '--output', outputPath,
-            '--preview', previewPath,
-            '--assets', input.assetsPath || directory,
-            '--document-type', input.documentType,
-            '--profile', path.join(directory, `profile-${attempt}`),
-            '--soffice', soffice,
-            '--expected-source-digest', expectedSourceDigest,
-            ...(input.requiredSourceAssetName ? ['--required-source-asset', input.requiredSourceAssetName] : []),
-          ],
-          libreOfficeProgramDirectory: path.dirname(soffice),
-          abortSignal: input.abortSignal,
-          onProgress: input.onProgress,
-        });
-        break;
-      } catch (error) {
-        if (attempt >= 2 || input.abortSignal?.aborted || !isTransientUnoBridgeError(error)) throw error;
-        await Promise.all([
-          rm(outputPath, { force: true }).catch(() => undefined),
-          rm(previewPath, { force: true }).catch(() => undefined),
-        ]);
-        await input.onProgress?.({
-          phase: 'bridge-retry',
-          message: 'LibreOffice UNO bridge disconnected; restarting an isolated office process and retrying once.',
-          current: attempt,
-          total: 2,
-        });
+    const report = await withPersistentUnoHost(soffice, async (initialHost) => {
+      let host = initialHost;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          return await runWorker({
+            executable: python,
+            args: [
+              worker,
+              '--program', programPath,
+              '--output', outputPath,
+              '--preview', previewPath,
+              '--assets', input.assetsPath || directory,
+              '--document-type', input.documentType,
+              '--profile', path.join(directory, `worker-profile-${attempt}`),
+              '--soffice', soffice,
+              '--uno-pipe', host.pipeName,
+              '--expected-source-digest', expectedSourceDigest,
+              ...(input.requiredSourceAssetName ? ['--required-source-asset', input.requiredSourceAssetName] : []),
+            ],
+            libreOfficeProgramDirectory: path.dirname(soffice),
+            abortSignal: input.abortSignal,
+            onProgress: input.onProgress,
+          });
+        } catch (error) {
+          // A failed worker may have left a document handle in the shared
+          // Desktop. Recycle the host before propagating or retrying so the
+          // next edit starts from a clean office process.
+          await stopPersistentUnoHost(host);
+          if (attempt >= 2 || input.abortSignal?.aborted || !isTransientUnoBridgeError(error)) throw error;
+          await Promise.all([
+            rm(outputPath, { force: true }).catch(() => undefined),
+            rm(previewPath, { force: true }).catch(() => undefined),
+          ]);
+          await input.onProgress?.({
+            phase: 'bridge-retry',
+            message: 'The persistent LibreOffice UNO bridge disconnected; rebuilding the host and retrying once.',
+            current: attempt,
+            total: 2,
+          });
+          host = await ensurePersistentUnoHost(soffice);
+        }
       }
-    }
+      throw new Error('LibreOffice UNO program worker completed without a report.');
+    });
     if (!report) throw new Error('LibreOffice UNO program worker completed without a report.');
     return {
       buffer: input.outputPath ? Buffer.alloc(0) : await readFile(outputPath),
