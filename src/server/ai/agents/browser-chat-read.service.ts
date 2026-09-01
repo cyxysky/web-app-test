@@ -20,8 +20,6 @@ import {
 import {
   BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   browserChatHistoryLimit,
-  expireBrowserChatSessionTurnIfNeeded,
-  expireStaleBrowserChatTurns,
   readBrowserChatLatestActiveAssistantMessage,
   readBrowserChatLogsPage,
   readBrowserChatMessageById,
@@ -36,13 +34,6 @@ import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-
 
 function belongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: string | number) {
   return normalizeApplicationUserId(session.userId) === normalizeApplicationUserId(userId);
-}
-
-function browserChatTurnHardTimeoutMs() {
-  const configured = Number(process.env.AI_BROWSER_CHAT_TURN_HARD_TIMEOUT_MS || 20 * 60 * 1000);
-  return Number.isFinite(configured)
-    ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
-    : 20 * 60 * 1000;
 }
 
 function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
@@ -115,10 +106,6 @@ export function listBrowserChatSessionSummaries(
   userId?: string | number,
   input: { beforeId?: string; beforeUpdatedAt?: string; limit?: number } = {},
 ) {
-  expireStaleBrowserChatTurns({
-    maxAgeMs: browserChatTurnHardTimeoutMs(),
-    userId: normalizeApplicationUserId(userId),
-  });
   return readBrowserChatSessionSummaries<BrowserChatPersistedHeader>({
     ...input,
     hasMessagesOnly: true,
@@ -129,7 +116,6 @@ export function listBrowserChatSessionSummaries(
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  expireBrowserChatSessionTurnIfNeeded(sessionId, browserChatTurnHardTimeoutMs());
   const persistedSession = readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
   if (!persistedSession || !belongsToUser(persistedSession, userId)) return undefined;
   const { modelContext: _modelContext, ...session } = persistedSession;

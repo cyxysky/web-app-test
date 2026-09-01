@@ -60,6 +60,24 @@ test('drops fields from the retired optimistic revision protocol', () => {
   assert.equal(repairBrowserChatToolCallInput('file', '{"action":"plan","outline":{"item":[]}}'), undefined);
 });
 
+test('normalizes legacy patch plus replace into Codex change lines without touching indentation', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', {
+    action: 'edit',
+    patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n def create_document(job):\n     title = "Old"\n*** End Patch',
+    replace: 'def create_document(job):\n    title = "New"',
+  }), {
+    action: 'edit',
+    patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n-def create_document(job):\n-    title = "Old"\n+def create_document(job):\n+    title = "New"\n*** End Patch',
+  });
+});
+
+test('drops an accidental replace field when a valid multi-hunk Codex patch is supplied', () => {
+  const patch = '*** Begin Patch\n*** Update File: draft.py\n@@\n-old\n+new\n@@\n-left\n+right\n*** End Patch';
+  assert.deepEqual(coerceBrowserChatToolInput('file', {
+    action: 'edit', patch, replace: 'ignored',
+  }), { action: 'edit', patch });
+});
+
 test('removes accidental outer Markdown or HTML wrappers from browserCode only', () => {
   assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
     reason: '读取标题',

@@ -105,6 +105,42 @@ test('browserCode sandbox executes ordinary Playwright code directly', async () 
   assert.equal(result.activity ? 'observation' in result.activity : false, false);
 });
 
+test('browserCode keeps the selected page when navigation clears its execution marker', async () => {
+  const raceKernel = new BrowserCodeKernel({ protocol: 'cdp', endpoint: cdpEndpoint });
+  const executeWithMarker = async (code: string) => {
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    return { executionId, pending: raceKernel.execute({ code, executionId }) };
+  };
+  try {
+    const primed = await executeWithMarker(`nodeRepl.write(await page.title());`);
+    assert.equal((await primed.pending).ok, true);
+
+    const executionId = randomUUID();
+    await page.evaluate((id) => {
+      Object.defineProperty(window, '__aiBrowserCodeExecutionId', {
+        configurable: true,
+        value: id,
+      });
+    }, executionId);
+    await page.goto('data:text/html,<title>Navigated during dispatch</title><main>Ready</main>');
+    const recovered = await raceKernel.execute({
+      code: `nodeRepl.write({ title: await page.title(), text: await page.locator('main').innerText() });`,
+      executionId,
+    });
+    assert.equal(recovered.ok, true, recovered.error);
+    assert.deepEqual(recovered.value, { title: 'Navigated during dispatch', text: 'Ready' });
+  } finally {
+    await raceKernel.close();
+    await page.setContent('<title>Editor</title><button onmouseenter="this.dataset.hovered=\'true\'" onclick="document.body.dataset.coordinateClicked=\'true\'">Save</button>');
+  }
+});
+
 test('page.getByUid resolves an exposed DOM UID to a governed Playwright locator', async () => {
   await page.setContent('<button id="uid-save" onclick="document.body.dataset.uidClicked=\'true\'">Save by UID</button>');
   await page.evaluate(() => {

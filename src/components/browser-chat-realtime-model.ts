@@ -30,6 +30,35 @@ export function mergeBrowserChatRealtimeRecords<T extends { id: string }>(
   return [...byId.values()];
 }
 
+function mergeRealtimeStepTools(current: unknown[] = [], incoming: unknown[] = []) {
+  const currentById = new Map<string, Record<string, unknown>>();
+  for (const tool of current) {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) continue;
+    const id = (tool as Record<string, unknown>).id;
+    if (typeof id === 'string' && id) currentById.set(id, tool as Record<string, unknown>);
+  }
+  const merged = incoming.map((tool, index) => {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) return tool;
+    const record = tool as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id : '';
+    const previous = (id ? currentById.get(id) : undefined)
+      || (current[index] && typeof current[index] === 'object' && !Array.isArray(current[index])
+        ? current[index] as Record<string, unknown>
+        : undefined);
+    if (!previous) return tool;
+    const next = { ...previous, ...record };
+    // Realtime events may arrive out of order. Once a tool is terminal, a stale
+    // "started" snapshot must never erase its result and make it look active again.
+    if (previous.ok !== undefined && record.ok === undefined) next.ok = previous.ok;
+    for (const key of ['elapsedMs', 'error', 'rawResult', 'result'] as const) {
+      if (previous[key] !== undefined && record[key] === undefined) next[key] = previous[key];
+    }
+    return next;
+  });
+  if (current.length > incoming.length) merged.push(...current.slice(incoming.length));
+  return merged;
+}
+
 export function mergeBrowserChatRealtimeCollections<
   TMessage extends { clientMessageId?: string; id: string; role?: string; createdAt?: string; updatedAt?: string },
   TStep extends { index: number },
@@ -67,9 +96,19 @@ export function mergeBrowserChatRealtimeCollections<
     const wouldRegressCompletedStep = existing
       && existing.status !== 'running'
       && incoming.status === 'running';
-    const wouldLoseToolDetails = existing
-      && (existing.tools?.length || 0) > (incoming.tools?.length || 0);
-    if (!wouldRegressCompletedStep && !wouldLoseToolDetails) steps.set(step.index, step);
+    if (wouldRegressCompletedStep) continue;
+    if (!existing) {
+      steps.set(step.index, step);
+      continue;
+    }
+    const mergedStep = {
+      ...existing,
+      ...incoming,
+    } as TStep & { tools?: unknown[] };
+    if (existing.tools || incoming.tools) {
+      mergedStep.tools = mergeRealtimeStepTools(existing.tools, incoming.tools);
+    }
+    steps.set(step.index, mergedStep as TStep);
   }
 
   const removedLogIds = new Set(patch.removedLogIds || []);

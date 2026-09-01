@@ -4,6 +4,7 @@ import { publishBrowserChatRuntimeRecordsChanged } from './browser-chat-runtime-
 
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEYS = 100;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_KEY_CHARS = 120;
+export const BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_BYTES = 256 * 1024;
 export const BROWSER_CODE_RUNTIME_STATE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 
 const runtimeStateNamespace = 'conversation';
@@ -115,6 +116,17 @@ function serializeRuntimeStateValue(value: unknown) {
   visit(value, 0);
   const serialized = JSON.stringify(value);
   if (serialized === undefined) throw new Error('agent.state value must be JSON-serializable.');
+  if (Buffer.byteLength(serialized, 'utf8') > BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_BYTES) {
+    throw new Error(
+      `agent.state values are limited to ${BROWSER_CODE_RUNTIME_STATE_MAX_VALUE_BYTES} UTF-8 bytes. `
+      + 'Store images and large text as workspace artifact files, not Base64 conversation state.',
+    );
+  }
+  const oversizedBase64 = /"(?:b64|base64|data)"\s*:\s*"(?:data:[^;"]+;base64,)?[A-Za-z0-9+/=]{65536,}"/i.test(serialized)
+    || /"data:[^;"]+;base64,[A-Za-z0-9+/=]{65536,}"/i.test(serialized);
+  if (oversizedBase64) {
+    throw new Error('agent.state must not store large Base64 payloads. Save the bytes as a workspace artifact file and store only its asset name.');
+  }
   return serialized;
 }
 

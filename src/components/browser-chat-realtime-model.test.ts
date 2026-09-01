@@ -46,3 +46,28 @@ test('browser-chat realtime patch parser rejects missing session identities', ()
   assert.equal(parseBrowserChatRealtimePatch({ session: {} }), undefined);
   assert.deepEqual(parseBrowserChatRealtimePatch({ session: { id: 'chat-1' } }), { session: { id: 'chat-1' } });
 });
+
+test('stale tool-start snapshots cannot regress a completed realtime tool', () => {
+  const merged = mergeBrowserChatRealtimeCollections({
+    messages: [],
+    logs: [],
+    steps: [{
+      index: 4,
+      status: 'running',
+      tools: [
+        { id: 'tool-1', name: 'file', ok: true, result: 'done', elapsedMs: 1200 },
+        { id: 'tool-2', name: 'file', ok: undefined },
+      ],
+    }],
+  }, {
+    steps: [{
+      index: 4,
+      status: 'running',
+      tools: [{ id: 'tool-1', name: 'file', ok: undefined }],
+    }],
+  });
+  assert.deepEqual(merged.steps[0].tools, [
+    { id: 'tool-1', name: 'file', ok: true, result: 'done', elapsedMs: 1200 },
+    { id: 'tool-2', name: 'file', ok: undefined },
+  ]);
+});

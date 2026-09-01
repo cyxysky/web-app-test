@@ -7,6 +7,7 @@ type ValidationIssue = {
 };
 
 type OfficeSourceDiagnostic = {
+  code?: string;
   column?: number;
   line?: number;
   message?: string;
@@ -70,11 +71,33 @@ function officeSourceDiagnostic(value: unknown): OfficeSourceDiagnostic | undefi
   const record = recordFromUnknown(value);
   if (!record) return undefined;
   return {
+    code: typeof record.code === 'string' ? record.code : undefined,
     column: typeof record.column === 'number' ? record.column : undefined,
     line: typeof record.line === 'number' ? record.line : undefined,
     message: typeof record.message === 'string' ? record.message.trim() : undefined,
     severity: typeof record.severity === 'string' ? record.severity : undefined,
   };
+}
+
+function officeSourceFailureLabel(code: string | undefined) {
+  switch (code) {
+    case 'PRESENTATION_OVERLAP':
+      return '布局重叠';
+    case 'PRESENTATION_TEXT_OVERFLOW':
+      return '文本溢出';
+    case 'PRESENTATION_GEOMETRY_INVALID':
+      return '几何边界错误';
+    case 'UNO_RUNTIME_ERROR':
+    case 'UNO_BRIDGE_STARTUP':
+    case 'UNO_BRIDGE_DISPOSED':
+      return 'UNO 运行错误';
+    case 'PYTHON_SYNTAX':
+    case 'JAVASCRIPT_SYNTAX':
+    case 'JS1005':
+      return '语法错误';
+    default:
+      return '校验错误';
+  }
 }
 
 function localizedOfficeSourceMessage(message: string) {
@@ -98,7 +121,8 @@ export function browserChatToolFailureSummary(value: unknown) {
   const location = line
     ? `第 ${line} 行${column ? `第 ${column} 列` : ''}`
     : '';
-  return `文件源码${location}语法错误：${localizedOfficeSourceMessage(message)}（草稿已保留）`;
+  const failureLabel = officeSourceFailureLabel(diagnostic?.code);
+  return `文件源码${location}${failureLabel}：${localizedOfficeSourceMessage(message)}（草稿已保留）`;
 }
 
 function validationIssue(value: unknown): ValidationIssue | undefined {

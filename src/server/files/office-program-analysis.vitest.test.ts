@@ -48,6 +48,77 @@ create_document(None)`, 'uno');
     expect(result.diagnostics.some((item) => item.code === 'DRAFT_ENTRYPOINT_CALLED_DIRECTLY')).toBe(true);
   });
 
+  it('collects independent Python syntax errors in one recoverable AST preflight', async () => {
+    const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    deck.set_doc_info(
+        title='JWST',
+        subject='Overview'
+    slide = deck.slide('cover', layout='title-cover', title='JWST')
+               box=(0.7, 1.4, 4.0, 0.5),
+               style={'font_size': 14})
+    deck.save()
+    deck.close()`, 'uno');
+    if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    const syntax = result.diagnostics.filter((item) => item.code === 'PYTHON_SYNTAX');
+    expect(result.passed).toBe(false);
+    expect(syntax.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(syntax.map((item) => item.line)).size, JSON.stringify(syntax)).toBeGreaterThanOrEqual(2);
+  });
+
+  it('validates installed facade signatures and nested shape parameters before execution', async () => {
+    const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('cover', layout='title-cover', title='JWST')
+    slide.set_notes('missing-element-id')
+    slide.add_shape('space', box=(0.7, 1.4, 4.0, 2.0), gradient={'type': 'linear', 'colors': [0x000000, 0xFFFFFF]})
+    deck.save()
+    deck.close()`, 'uno');
+    if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    expect(result.passed).toBe(false);
+    expect(result.diagnostics.find((item) => item.code === 'UNO_API_SIGNATURE_MISMATCH')?.message)
+      .toContain("missing required argument 'text'");
+    expect(result.diagnostics.find((item) => item.code === 'UNO_API_ARGUMENT_INVALID')?.message)
+      .toContain('colors, type');
+  });
+
+  it('collects all literal facade bounds defects and invalid grid-cell keys before execution', async () => {
+    const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('cover', layout='blank')
+    slide.add_shape('glow-left', box=(-2.0, -1.0, 6.0, 6.0), shape_type='ellipse')
+    slide.add_shape('glow-right', box=(9.0, 4.0, 7.0, 7.0), shape_type='ellipse')
+    cells = slide.grid(2, 1)
+    for cell in cells:
+        slide.add_text('metric', '42', box=(cell['x'], cell['y'], cell['w'], cell['h']))`, 'uno');
+    if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    expect(result.passed).toBe(false);
+    expect(result.diagnostics.filter((item) => item.code === 'PRESENTATION_GEOMETRY_INVALID').length)
+      .toBeGreaterThanOrEqual(2);
+    expect(result.diagnostics.some((item) => item.code === 'PRESENTATION_GEOMETRY_OUT_OF_BOUNDS')).toBe(true);
+    const cellKeyErrors = result.diagnostics.filter((item) => item.code === 'UNO_LAYOUT_CELL_KEY_INVALID');
+    expect(cellKeyErrors).toHaveLength(2);
+    expect(cellKeyErrors.map((item) => item.message).join(' ')).toContain("'width'");
+    expect(cellKeyErrors.map((item) => item.message).join(' ')).toContain("'height'");
+  });
+
+  it('validates facade option schemas hidden behind double-star keyword forwarding', async () => {
+    const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('cover', layout='blank')
+    slide.add_text('title', 'Rome', box=(0.7, 0.7, 4.0, 1.0), style=dict(font_size=40, letter_spacing=4))
+    slide.add_table('metrics', [['Metric', 'Value']], box=(0.7, 2.0, 5.0, 2.0), header=True, mystery=True)
+    deck.save()
+    deck.close()`, 'uno');
+    if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    expect(result.passed).toBe(false);
+    const messages = result.diagnostics
+      .filter((item) => item.code === 'UNO_API_ARGUMENT_INVALID')
+      .map((item) => item.message);
+    expect(messages.some((message) => message.includes('letter_spacing'))).toBe(true);
+    expect(messages.some((message) => message.includes('mystery'))).toBe(true);
+  });
+
   it('rejects com.sun.star imports before starting LibreOffice', async () => {
     const result = await analyzeOfficeProgram(`from com.sun.star.drawing import FillStyle as _FS
 
@@ -164,7 +235,7 @@ def create_document(job):
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     page = deck.add_slide('slide-01')
-    deck.add_text('slide-01/label', page, 'Label', 1000, 1000, 5000, deck.mm(3), font_size=12)
+    deck.add_text('slide-01/label', page, 'Label', 1000, 1000, 5000, deck.mm(3), font_size=12, min_font_size=12)
     deck.save()
     deck.close()`, 'uno');
     if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
@@ -264,5 +335,25 @@ def create_document(job):
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0].code).toBe('PRESENTATION_TEXT_OVERFLOW');
     expect(diagnostics[0].sourceExcerpt).toContain("deck.add_text('slide-01/title'");
+  });
+
+  it('preserves every distinct overlap pair reported from the layout pass', () => {
+    const source = `def create_document(job):
+    deck = job.presentation('deck')
+    page = deck.add_slide('slide-01')
+    deck.add_text('a', page, 'A', 0, 0, 1000, 400)
+    deck.add_text('b', page, 'B', 0, 0, 1000, 400)
+    deck.add_text('c', page, 'C', 0, 0, 1000, 400)`;
+    const issues = [
+      { code: 'PRESENTATION_OVERLAP', severity: 'error', line: 5, column: 1, elementId: 'b', elementIds: ['a', 'b'], message: 'b overlaps a' },
+      { code: 'PRESENTATION_OVERLAP', severity: 'error', line: 6, column: 1, elementId: 'c', elementIds: ['a', 'c'], message: 'c overlaps a' },
+      { code: 'PRESENTATION_OVERLAP', severity: 'error', line: 6, column: 1, elementId: 'c', elementIds: ['b', 'c'], message: 'c overlaps b' },
+    ];
+    const diagnostics = diagnoseOfficeProgramRuntimeError(
+      source,
+      `ValueError: __WEBPILOT_LAYOUT_DIAGNOSTICS__${JSON.stringify(issues)}`,
+    );
+    expect(diagnostics).toHaveLength(3);
+    expect(diagnostics.map((item) => item.elementIds)).toEqual([['a', 'b'], ['a', 'c'], ['b', 'c']]);
   });
 });

@@ -55,7 +55,6 @@ import {
   renderFileArtifact,
   verifyCurrentUnoRenderedArtifact,
   type FileGenerationProgress,
-  type UnoDraftLineEdit,
 } from './file-artifact-tools';
 import { browserChatCodeRules } from './runtime-prompt-rules';
 import {
@@ -1305,10 +1304,11 @@ function makeBrowserTools(
 ) {
   const imageInputAvailable = modelSupportsImageInput();
   const browserRuntimeSkillId = activeBrowserRuntimeSkillId();
-  // Models may return independent tool calls together. Execute every call in the response, but
-  // serialize them so browser/page state and a document draft cannot be mutated concurrently.
-  // This preserves tool-call order without silently dropping work from the same model step.
+  // Browser and document mutations stay ordered. Consecutive download calls are
+  // independent and run as one concurrent batch; the next stateful tool waits
+  // for that complete batch before it starts.
   let toolExecutionQueue = Promise.resolve();
+  const activeConcurrentDownloads = new Set<Promise<BrowserActionResult>>();
   const loadedHiddenRuntimeSkillIds = referenceOptions?.loadedHiddenRuntimeSkillIds || new Set<string>();
   for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
@@ -1407,7 +1407,19 @@ function makeBrowserTools(
         return compactToolResultForModel(name, resultForModel);
       });
     };
-    const queued = toolExecutionQueue.then(run, run);
+    const inputAction = input && typeof input === 'object' && 'action' in input
+      ? String((input as { action?: unknown }).action || '')
+      : '';
+    const concurrentDownload = name === 'downloadFile' || (name === 'file' && inputAction === 'download');
+    if (concurrentDownload) {
+      const pending = toolExecutionQueue.then(run, run);
+      activeConcurrentDownloads.add(pending);
+      pending.finally(() => activeConcurrentDownloads.delete(pending)).catch(() => undefined);
+      return pending;
+    }
+    const precedingDownloads = [...activeConcurrentDownloads];
+    const waitForDownloads = () => Promise.allSettled(precedingDownloads).then(() => undefined);
+    const queued = toolExecutionQueue.then(waitForDownloads, waitForDownloads).then(run, run);
     toolExecutionQueue = queued.then(() => undefined, () => undefined);
     return queued;
   }
@@ -1573,7 +1585,7 @@ function makeBrowserTools(
         (input) => coerceBrowserChatToolInput('file', input),
         z.object({
           reason: z.string().min(1).max(300).optional().describe('Optional concise reason; it never changes file behavior.'),
-          action: z.string().max(32).optional().describe('Exactly one action: list, read, download, convert, plan, generate, edit, unoApi, jsApi, or render. Call list before starting or resuming Office work. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. jsApi returns the cookbook for JavaScript generation mode.'),
+          action: z.string().max(32).optional().describe('Exactly one action: list, read, download, convert, plan, generate, edit, unoApi, jsApi, or render. Call list before starting or resuming Office work. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. unoApi without query returns its module index; query an exact module before using it. jsApi returns the cookbook for JavaScript generation mode.'),
           attachmentId: z.string().max(160).optional().describe('Exact user attachment id returned in conversation metadata. Example: "attachment-7f3a".'),
           artifactId: z.string().max(4_000).optional().describe('Exact Artifact ID returned by a previous successful file tool result; never invent it.'),
           sourceArtifactId: z.string().max(4_000).optional().describe('For action=convert: exact Artifact ID of the source Office file.'),
@@ -1586,30 +1598,24 @@ function makeBrowserTools(
           intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
           url: z.string().max(8_000).optional(),
           path: z.string().max(8_000).optional().describe('For draft read/edit, an optional semantic source-unit path returned by read, such as pages/s30-risk-matrix or symbols/add_bg; for download, a source path or URL as documented by that action.'),
-          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based global first source line. The coordinate remains global even when path selects a source unit.'),
-          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based inclusive global last source line; source windows are limited to 240 lines.'),
+          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based first line. It is draft-global without path and source-unit-relative when path is supplied.'),
+          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional inclusive last line. Values beyond the current draft/unit are clamped to its final line; source windows are limited to 240 lines.'),
           urlOrPath: z.string().max(8_000).optional(),
           program: z.string().optional(),
-          edits: z.array(z.object({
-            kind: z.enum(['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText']).optional().describe('Defaults to replaceRange. Use replaceAll once to replace every exact oldText match; do not emit one replaceText edit per occurrence.'),
-            startLine: z.number().int().min(1).optional().describe('One-based global first source line copied from action=read, including when path is supplied.'),
-            endLine: z.number().int().min(1).optional().describe('One-based inclusive global last source line copied from action=read, including when path is supplied.'),
-            line: z.number().int().min(1).optional().describe('One-based global anchor line for insertBefore/insertAfter.'),
-            oldText: z.string().min(1).optional().describe('Exact current source for replaceText.'),
-            occurrence: z.number().int().min(1).optional().describe('For replaceText only: one-based index of the oldText match, not a replacement count. Omit when oldText is unique; use replaceAll for every match.'),
-            preserveIndent: z.boolean().optional().describe('For replaceRange: defaults to false, so newText indentation is applied exactly. Set true only when newText is intentionally relative to the replaced block; never set it for source copied from read or mixed-indent Python blocks.'),
-            newText: z.string().optional().describe('Replacement or inserted source. Omit for deleteRange.'),
-          }).strict()).min(1).max(100).optional().describe('Structured edits may mix line ranges and exact-text replacements. Line edits use coordinates from the same read and merge first; replaceText/replaceAll then run in supplied order against that candidate. For a single Python indentation diagnostic, replace the exact offending line or minimal block and do not repeat unchanged neighboring lines.'),
+          baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Required for action=edit: exact patchBaseDigest from the latest read of the same documentId and optional path.'),
+          replaceExisting: z.boolean().optional().describe('For action=generate only: set true together with baseDigest solely when intentionally replacing an existing complete draft. Never use this for ordinary repair.'),
+          patch: z.string().max(200_000).optional().describe("Required for action=edit: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. Do not write unified-diff line numbers or file headers. Unchanged context keeps the source's original indentation; added lines are inserted exactly as written."),
           render: z.boolean().optional(),
           includeVisuals: z.boolean().optional(),
           offset: z.number().int().min(0).optional(),
           limit: z.number().int().min(1).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
           pages: z.array(z.number().int().min(1)).max(6).optional(),
-          query: z.string().max(1_000).optional().describe('Ignored. unoApi returns the complete executable high-level Office cookbook with exact signatures, value schemas, and examples; do not query one feature at a time.'),
+          query: z.string().max(1_000).optional().describe('For unoApi: omit once to list available modules, then pass an exact module query such as presentation.shape, presentation.professional, writer.table, or calc.chart-image. A module response includes every installed signature, accepted value schema, and registered example for all matched APIs.'),
         }).passthrough(),
       ), [
         { reason: 'Download the referenced JPEG image', action: 'download', urlOrPath: 'https://example.com/image', fileType: 'jpg' },
-        { reason: 'Load the complete planned presentation facade once', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation' },
+        { reason: 'List planned presentation API modules', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation' },
+        { reason: 'Load exact shape signatures and all shape examples', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation', query: 'presentation.shape' },
         {
           action: 'plan',
           reason: '规划西双版纳攻略演示文稿',
@@ -1620,7 +1626,7 @@ function makeBrowserTools(
           intent: '创建一份西双版纳5日游攻略演示文稿',
         },
         { reason: '读取当前文稿源文件', action: 'read', documentId: 'xsbn-5d-yxg-guide' },
-        { reason: '修改文稿中的行程页', action: 'edit', documentId: 'xsbn-5d-yxg-guide', edits: [{ kind: 'replaceRange', startLine: 120, endLine: 128, newText: '# replacement source' }] },
+        { reason: '修改文稿中的行程页', action: 'edit', documentId: 'xsbn-5d-yxg-guide', baseDigest: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n def create_document(job):\n-    title = "Old"\n+    title = "New"\n     deck = job.presentation("deck")\n*** End Patch' },
         { reason: '渲染当前文稿版本', action: 'render', documentId: 'xsbn-5d-yxg-guide' },
       ]),
       execute: (input, execution) => {
@@ -1675,21 +1681,12 @@ function makeBrowserTools(
           return record('file', input, (abortSignal, trace) => renderFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
         }
         if (input.action === 'edit') {
-          const edits: UnoDraftLineEdit[] | undefined = input.edits?.map((edit) => ({
-            kind: edit.kind,
-            startLine: edit.startLine,
-            endLine: edit.endLine,
-            line: edit.line,
-            oldText: edit.oldText,
-            occurrence: edit.occurrence,
-            preserveIndent: edit.preserveIndent,
-            newText: edit.newText || '',
-          }));
           return record('file', input, (abortSignal, trace) => editUnoFileArtifact({
             documentId: input.documentId,
             path: input.path,
             program: input.program,
-            edits,
+            baseDigest: input.baseDigest,
+            patch: input.patch,
             render: input.render,
             abortSignal,
             onProgress: fileProgressReporter(trace),
@@ -1836,7 +1833,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     screenshotAvailable && input.fileVisualAvailable
       ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
       : screenshotAvailable
-        ? '- A successful render is only a candidate. Inspect every returned preview and generationDiagnostics for clipping, overlap, hidden text, word/character wrapping, unexpectedly wrapped titles, covered captions, off-canvas content, empty pages, image distortion, broken tables/charts, contrast, and alignment. If a defect exists, read the line-numbered draft, edit its affected line ranges, render again, and inspect the replacement preview. Do not claim full visual verification when a complete screenshot-by-screenshot review was unavailable.'
+        ? '- A successful render is only a candidate. Inspect every returned preview and generationDiagnostics for clipping, overlap, hidden text, word/character wrapping, unexpectedly wrapped titles, covered captions, off-canvas content, empty pages, image distortion, broken tables/charts, contrast, and alignment. If a defect exists, read the exact current source, apply one Codex-format patch with its patchBaseDigest, render again, and inspect the replacement preview. Do not claim full visual verification when a complete screenshot-by-screenshot review was unavailable.'
       : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
     '- PDF is a first-class deliverable, never an unsupported format or a manual-save workaround. UNO can produce it directly; JavaScript mode authors the matching Office intermediate and the local worker converts that exact result to PDF.',
     ...browserChatCodeRules(screenshotAvailable),
@@ -2438,7 +2435,7 @@ async function executeRuntimeStep(input: {
         return;
       }
       const text = documentVisualQa
-      ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect the actual pixels at a useful size before finalizing. Use three passes: identify visible content and reading order; scan all page edges and object boundaries for clipping or overlap; then judge composition, hierarchy, typography, color, chart semantics, and image treatment. The page observation must name concrete visible anchors and locations, not paraphrase the rubric. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, weak hierarchy, poor composition, default-looking styling, and content outside the page. For every chart, verify that a reader can identify every bar, line, point, or sector: reject 1/2/3 placeholder categories, generic-only series names, and missing or unreadable legends, axis labels, or data labels. Verify that content images are contextually identified or captioned and have alt/source attribution when required. Never list a known visible defect as a compatibility boundary and then pass it; never claim that a count such as 4 satisfies a requirement of at least 5. Continue calling fileVisual action=read until every indexed screenshot has been inspected. After all pages, compare the complete ordered set and cite at least two concrete cross-page observations in deckReview. If a defect exists, read the draft and use focused file action=edit startLine/endLine edits, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
+      ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect the actual pixels at a useful size before finalizing. Use three passes: identify visible content and reading order; scan all page edges and object boundaries for clipping or overlap; then judge composition, hierarchy, typography, color, chart semantics, and image treatment. The page observation must name concrete visible anchors and locations, not paraphrase the rubric. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, weak hierarchy, poor composition, default-looking styling, and content outside the page. For every chart, verify that a reader can identify every bar, line, point, or sector: reject 1/2/3 placeholder categories, generic-only series names, and missing or unreadable legends, axis labels, or data labels. Verify that content images are contextually identified or captioned and have alt/source attribution when required. Never list a known visible defect as a compatibility boundary and then pass it; never claim that a count such as 4 satisfies a requirement of at least 5. Continue calling fileVisual action=read until every indexed screenshot has been inspected. After all pages, compare the complete ordered set and cite at least two concrete cross-page observations in deckReview. If a defect exists, read the exact draft source and patchBaseDigest, submit one focused Codex-format patch, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
         : source === 'file:read'
           ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
           : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';
@@ -3844,7 +3841,7 @@ The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered 
         : '';
       const requiredDocumentWorkInstruction = requiredDocumentWork
         ? `[Mandatory Office document completion gate]
-Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The current workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. If validation failed, repair the same saved current source; do not render a stale artifact. A final response is forbidden until the current validated source is rendered and any required visual QA is completed.`
+Continue the existing documentId=${requiredDocumentWork.documentId}; do not create a replacement document. The current workflow state is ${requiredDocumentWork.state} and the required next action is file action=${requiredDocumentWork.requiredNextAction}. Rendering will validate the current source before publishing it. A final response is forbidden until the current source is rendered and any required visual QA is completed.`
         : '';
       actionResult = await executeRuntimeStep({
         session: input.session,
@@ -4035,7 +4032,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
           await input.onDebug?.({
             phase: 'chat:file-document-completion-required',
             stepIndex,
-            message: 'An Office document has pending source, validation, render, or QA work; rejecting the final response.',
+            message: 'An Office document has pending source, render, or QA work; rejecting the final response.',
             details: { pendingDocumentWork },
           });
           continue;
@@ -4113,7 +4110,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         await input.onDebug?.({
           phase: 'chat:file-document-completion-required',
           stepIndex,
-          message: 'An Office document has pending source, validation, render, or QA work; rejecting the final response.',
+          message: 'An Office document has pending source, render, or QA work; rejecting the final response.',
           details: { pendingDocumentWork },
         });
         continue;
@@ -4433,27 +4430,10 @@ export async function executeRecordedBrowserOperation(
         return editUnoFileArtifact({
           runId,
           documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
+          path: typeof input.path === 'string' ? input.path : undefined,
           program: typeof input.program === 'string' ? input.program : undefined,
-          edits: Array.isArray(input.edits)
-            ? input.edits.reduce<UnoDraftLineEdit[]>((result, edit) => {
-              if (!edit || typeof edit !== 'object' || Array.isArray(edit)) return result;
-              const value = edit as Record<string, unknown>;
-              const kind = ['deleteRange', 'insertAfter', 'insertBefore', 'replaceAll', 'replaceRange', 'replaceText'].includes(String(value.kind || ''))
-                ? String(value.kind) as UnoDraftLineEdit['kind']
-                : undefined;
-              result.push({
-                kind,
-                startLine: Number.isInteger(value.startLine) ? Number(value.startLine) : undefined,
-                endLine: Number.isInteger(value.endLine) ? Number(value.endLine) : undefined,
-                line: Number.isInteger(value.line) ? Number(value.line) : undefined,
-                oldText: typeof value.oldText === 'string' ? value.oldText : undefined,
-                occurrence: Number.isInteger(value.occurrence) ? Number(value.occurrence) : undefined,
-                preserveIndent: typeof value.preserveIndent === 'boolean' ? value.preserveIndent : undefined,
-                newText: typeof value.newText === 'string' ? value.newText : '',
-              });
-              return result;
-            }, [])
-            : undefined,
+          baseDigest: typeof input.baseDigest === 'string' ? input.baseDigest : undefined,
+          patch: typeof input.patch === 'string' ? input.patch : undefined,
           render: input.render === false ? false : undefined,
           includeVisualVerification: false,
           attachmentBindings,

@@ -1,6 +1,6 @@
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { editUnoFileArtifact, renderFileArtifact } from '../../src/server/ai/agents/file-artifact-tools';
+import { editUnoFileArtifact, readUnoDraft, renderFileArtifact } from '../../src/server/ai/agents/file-artifact-tools';
 
 const validationRoot = path.resolve('validation', 'uno-stress');
 const artifactsRoot = path.join(validationRoot, 'artifacts');
@@ -39,10 +39,24 @@ async function main() {
       progress.push(entry);
       process.stdout.write(`[${item.documentId}] ${entry.phase}: ${entry.message}\n`);
     };
+    const current = payload((await readUnoDraft({ runId, documentId: item.documentId })).actual);
+    const program = String(current.program || '');
+    const targetIndex = program.indexOf(item.oldText);
+    if (targetIndex < 0) throw new Error(`Patch target not found for ${item.documentId}`);
+    const oldLines = item.oldText.split('\n');
+    const newLines = item.newText.split('\n');
     const edited = await editUnoFileArtifact({
       runId,
       documentId: item.documentId,
-      edits: [{ kind: 'replaceText', oldText: item.oldText, newText: item.newText }],
+      baseDigest: String(current.patchBaseDigest || ''),
+      patch: [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        ...oldLines.map((line) => `-${line}`),
+        ...newLines.map((line) => `+${line}`),
+        '*** End Patch',
+      ].join('\n'),
       includeVisualVerification: true,
       attachmentBindings,
       onProgress,

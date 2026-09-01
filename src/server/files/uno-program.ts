@@ -215,7 +215,7 @@ function runWorker(input: {
   });
 }
 
-const UNO_FACADE_CATALOG_CACHE = new Map<OfficeDocumentKind, Promise<Record<string, unknown>>>();
+const UNO_FACADE_CATALOG_CACHE = new Map<string, Promise<Record<string, unknown>>>();
 
 async function inspectUnoApiUncached(input: {
   documentType: OfficeDocumentKind;
@@ -314,16 +314,21 @@ export async function inspectUnoApi(input: {
   offset?: number;
   limit?: number;
 }) {
-  // Facade inspection is independent of a document and its query. Cache the
-  // exact installed cookbook so recovery calls do not respawn Python or
-  // LibreOffice and always see the same complete contract.
-  let pending = UNO_FACADE_CATALOG_CACHE.get(input.documentType);
+  // Cache each exact installed module independently. Repeating a module query
+  // is free, while unrelated modules stay out of the model context.
+  const normalizedQuery = String(input.query || '').trim().toLowerCase();
+  const cacheKey = `${input.documentType}:${normalizedQuery || '__index__'}`;
+  let pending = UNO_FACADE_CATALOG_CACHE.get(cacheKey);
   if (!pending) {
-    pending = inspectUnoApiUncached({ documentType: input.documentType, limit: 120 });
-    UNO_FACADE_CATALOG_CACHE.set(input.documentType, pending);
+    pending = inspectUnoApiUncached({
+      documentType: input.documentType,
+      query: normalizedQuery || undefined,
+      limit: 120,
+    });
+    UNO_FACADE_CATALOG_CACHE.set(cacheKey, pending);
     pending.catch(() => {
-      if (UNO_FACADE_CATALOG_CACHE.get(input.documentType) === pending) {
-        UNO_FACADE_CATALOG_CACHE.delete(input.documentType);
+      if (UNO_FACADE_CATALOG_CACHE.get(cacheKey) === pending) {
+        UNO_FACADE_CATALOG_CACHE.delete(cacheKey);
       }
     });
   }

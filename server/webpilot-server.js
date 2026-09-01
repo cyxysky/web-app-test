@@ -185,6 +185,15 @@ function runtimeApiRequest(pathname) {
   return pathname.startsWith('/api/') && pathname !== '/api/system/shutdown';
 }
 
+function splitRuntimeEnabled(dev, runtimeChildMode, environment = process.env) {
+  // Every Next development server rewrites the same next-env.d.ts file. Running
+  // the UI and API compilers together makes them invalidate each other while
+  // Webpack is emitting chunks, which can leave a runtime referring to vendor
+  // chunks that have not been written yet. Keep process isolation in production
+  // and use one compiler for all development routes.
+  return !dev && !runtimeChildMode && environment.WEBPILOT_SPLIT_RUNTIME !== 'false';
+}
+
 function availableInternalPort(hostname) {
   return new Promise((resolve, reject) => {
     const probe = net.createServer();
@@ -500,7 +509,7 @@ async function main() {
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
   const identityHeaderSecret = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
-  const apiRuntimeSupervisor = !runtimeChildMode && process.env.WEBPILOT_SPLIT_RUNTIME !== 'false'
+  const apiRuntimeSupervisor = splitRuntimeEnabled(dev, runtimeChildMode)
     ? createApiRuntimeSupervisor({ appDir, dev, externalPort: port })
     : undefined;
 
@@ -646,6 +655,7 @@ module.exports = {
   proxyRequestHeaders,
   requireRuntimeDependency,
   runtimeApiRequest,
+  splitRuntimeEnabled,
   stripBasePath,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,

@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  applyUnoDraftLineEdits,
   applyUnoDraftPatch,
   downloadFileArtifact,
   editUnoFileArtifact,
@@ -15,8 +14,8 @@ import {
   generateUnoFileArtifact,
   getOfficeJsApi,
   getUnoApi,
-  hasOnlyRetryableOfficeValidationFailure,
   listOfficeDrafts,
+  officeValidationCacheBaseName,
   officeValidationRepairHints,
   pendingOfficeDocumentWork,
   planFileArtifact,
@@ -39,6 +38,47 @@ const passedDeckVisualChecks = {
   templateConsistency: 'passed', typographyConsistency: 'passed', colorConsistency: 'passed',
   spacingRhythm: 'passed', componentConsistency: 'passed',
 } as const;
+
+async function editDraftText(input: {
+  documentId: string;
+  includeVisualVerification?: boolean;
+  newText: string;
+  oldText: string;
+  path?: string;
+  render?: boolean;
+  runId: string;
+}) {
+  const read = await readUnoDraft({ documentId: input.documentId, path: input.path, runId: input.runId });
+  const state = JSON.parse(read.actual || '{}') as { patchBaseDigest?: string; program?: string };
+  const program = state.program || '';
+  const index = program.indexOf(input.oldText);
+  if (index < 0) throw new Error(`Test patch target not found: ${input.oldText}`);
+  const oldLines = input.oldText.replace(/\r\n?/g, '\n').split('\n');
+  const newLines = input.newText.replace(/\r\n?/g, '\n').split('\n');
+  return editUnoFileArtifact({
+    documentId: input.documentId,
+    path: input.path,
+    baseDigest: state.patchBaseDigest,
+    patch: [
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@',
+      ...oldLines.map((line) => `-${line}`),
+      ...newLines.map((line) => `+${line}`),
+      '*** End Patch',
+    ].join('\n'),
+    includeVisualVerification: input.includeVisualVerification,
+    render: input.render,
+    runId: input.runId,
+  });
+}
+
+test('uses a LibreOffice-safe non-hidden basename for validation artifacts', () => {
+  const digest = 'a'.repeat(64);
+  const basename = officeValidationCacheBaseName('jwst-deck', digest);
+  assert.equal(basename, `validation-jwst-deck-${digest}`);
+  assert.doesNotMatch(basename, /^\./);
+});
 
 test('repairs artifact links by artifact ID without trusting the model hostname or link label', () => {
   const tools = [
@@ -209,7 +249,7 @@ test('deduplicates concurrent downloads and reuses the per-run URL cache', async
   }
 });
 
-test('serializes different downloads from the same domain', async () => {
+test('caps independent same-origin downloads at two concurrent requests', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-domain-queue-'));
   const previousRoot = process.env.ARTIFACTS_DIR;
   const previousFetch = globalThis.fetch;
@@ -224,13 +264,45 @@ test('serializes different downloads from the same domain', async () => {
     return new Response(`download:${String(input)}`, { status: 200, headers: { 'content-type': 'text/plain' } });
   };
   try {
-    const [first, second] = await Promise.all([
+    const downloads = await Promise.all([
       downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/a.txt', fileType: 'txt' }),
       downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/b.txt', fileType: 'txt' }),
+      downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/c.txt', fileType: 'txt' }),
+      downloadFileArtifact({ runId: 'chat_test', url: 'https://queue.example.test/d.txt', fileType: 'txt' }),
     ]);
-    assert.equal(first.ok, true, first.actual);
-    assert.equal(second.ok, true, second.actual);
-    assert.equal(maximumActive, 1);
+    assert.equal(downloads.every((result) => result.ok), true);
+    assert.equal(maximumActive, 2);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
+    else process.env.ARTIFACTS_DIR = previousRoot;
+    await rm(root, { force: true, recursive: true });
+  }
+});
+
+test('retries HTTP 429 once with a capped delay and rejects manual sleeping', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-rate-limit-'));
+  const previousRoot = process.env.ARTIFACTS_DIR;
+  const previousFetch = globalThis.fetch;
+  process.env.ARTIFACTS_DIR = root;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response('rate limited', {
+      status: 429,
+      headers: { 'retry-after': '30' },
+    });
+  };
+  try {
+    const downloaded = await downloadFileArtifact({
+      runId: 'chat_test',
+      url: 'https://rate-limit.example.test/image.jpg',
+      fileType: 'jpg',
+    });
+    assert.equal(downloaded.ok, false);
+    assert.match(downloaded.actual || '', /HTTP 429/);
+    assert.match(downloaded.actual || '', /instead of sleeping/);
+    assert.equal(calls, 2);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousRoot === undefined) delete process.env.ARTIFACTS_DIR;
@@ -477,13 +549,10 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
 
     const rerendered = await renderFileArtifact({ documentId: 'uno-report', includeVisualVerification: false, runId: 'chat_test' });
     assert.equal(rerendered.ok, true, rerendered.actual);
-    const replacement = await editUnoFileArtifact({
+    const replacement = await editDraftText({
       documentId: 'uno-report',
-      edits: [{
-        startLine: 3,
-        endLine: 3,
-        newText: "    document.add_paragraph('body', 'Generated through a replacement program')",
-      }],
+      oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+      newText: "    document.add_paragraph('body', 'Generated through a replacement program')",
       render: false,
       runId: 'chat_test',
     });
@@ -497,110 +566,77 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
   }
 });
 
-test('applies line edits against one stable line-numbered source', () => {
+test('supports Codex patches without numeric hunk counts', () => {
   const source = 'one\ntwo\nthree\nfour\n';
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { startLine: 2, endLine: 2, newText: 'TWO\nTWO-DETAIL' },
-    { startLine: 4, endLine: 4, newText: 'FOUR' },
-  ]), 'one\nTWO\nTWO-DETAIL\nthree\nFOUR\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { startLine: 1, endLine: 3, newText: 'one\nTWO\nthree' },
-    { startLine: 2, endLine: 4, newText: 'two\nthree\nFOUR' },
-  ]), 'one\nTWO\nthree\nFOUR\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { startLine: 2, endLine: 2, newText: 'first' },
-    { startLine: 2, endLine: 2, newText: 'second' },
-  ]), 'one\nsecond\nthree\nfour\n');
-  const nested = `def create_document(job):
-    def add_bg(page):
-        deck.add_shape('bg', page, 0, 0, 100, 100)
-    add_bg(page)
-`;
-  assert.equal(applyUnoDraftLineEdits(nested, [{
-    kind: 'replaceRange',
-    startLine: 2,
-    endLine: 3,
-    newText: `def add_bg(sid, page):
-        deck.add_shape(sid + '/bg', page, 0, 0, 100, 100)`,
-  }]), `def create_document(job):
-def add_bg(sid, page):
-        deck.add_shape(sid + '/bg', page, 0, 0, 100, 100)
-    add_bg(page)
-`);
-  assert.equal(applyUnoDraftLineEdits(nested, [{
-    kind: 'replaceRange',
-    startLine: 2,
-    endLine: 3,
-    preserveIndent: true,
-    newText: 'def nested_helper():\n    pass',
-  }]), `def create_document(job):
-    def nested_helper():
-        pass
-    add_bg(page)
-`);
-  assert.equal(applyUnoDraftLineEdits(nested, [{
-    kind: 'replaceRange',
-    startLine: 2,
-    endLine: 3,
-    newText: `# replacement copied with exact indentation
-    page = deck.add_slide('slide-08')
-    chart_box = deck.content_box()`,
-  }]), `def create_document(job):
-# replacement copied with exact indentation
-    page = deck.add_slide('slide-08')
-    chart_box = deck.content_box()
-    add_bg(page)
-`);
-});
-
-test('supports structured editor operations and unified patches', () => {
-  const source = 'one\ntwo\nthree\nfour\n';
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { kind: 'insertAfter', line: 1, newText: 'one-detail' },
-    { kind: 'deleteRange', startLine: 3, endLine: 3, newText: '' },
-  ]), 'one\none-detail\ntwo\nfour\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { kind: 'replaceText', oldText: 'two\nthree', newText: 'TWO\nTHREE' },
-  ]), 'one\nTWO\nTHREE\nfour\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { kind: 'replaceText', oldText: 'two', newText: 'TWO' },
-    { kind: 'replaceText', oldText: 'TWO\nthree', newText: 'middle' },
-  ]), 'one\nmiddle\nfour\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { kind: 'replaceText', oldText: 'one-detail', newText: 'ONE-DETAIL' },
-    { kind: 'insertAfter', line: 1, newText: 'one-detail' },
-    { kind: 'replaceRange', startLine: 3, endLine: 3, newText: 'THREE' },
-  ]), 'one\nONE-DETAIL\ntwo\nTHREE\nfour\n');
-  assert.equal(applyUnoDraftLineEdits(source, [
-    { kind: 'replaceText', oldText: 'two', occurrence: 50, newText: 'TWO' },
-  ]), 'one\nTWO\nthree\nfour\n');
-  assert.equal(applyUnoDraftLineEdits('same\nsame\nother\n', [
-    { kind: 'replaceAll', oldText: 'same', newText: 'changed' },
-  ]), 'changed\nchanged\nother\n');
-  assert.equal(applyUnoDraftLineEdits("style={'font_size': 1, 'background': 'card'}\n", [
-    { kind: 'replaceAll', oldText: ", 'background': 'card'", newText: '' },
-    { kind: 'replaceAll', oldText: ", 'background': 'card',", newText: ',' },
-  ]), "style={'font_size': 1}\n");
-  assert.throws(() => applyUnoDraftLineEdits('same\nsame\n', [
-    { kind: 'replaceText', oldText: 'same', occurrence: 10, newText: 'changed' },
-  ]), /one-based match index, not the number of replacements/);
-  assert.throws(() => applyUnoDraftLineEdits("deck.add_text('footer', page, 'x', 0, 0, 1000, 1400)\n", [
-    { kind: 'replaceText', oldText: "deck.add_text('footer', page, 'x', 0, 0, 1000, 1200)", newText: 'fixed' },
-  ]), /Closest current candidates: line 1: deck\.add_text/);
-  const largeSource = Array.from({ length: 180 }, (_, index) => `line-${index + 1}`).join('\n');
-  assert.throws(() => applyUnoDraftLineEdits(largeSource, [
-    { kind: 'replaceRange', startLine: 20, endLine: 160, newText: 'replacement' },
-  ]), /Near-complete source replacement is blocked/);
   assert.equal(applyUnoDraftPatch(source, [
-    '--- a/draft.py',
-    '+++ b/draft.py',
-    '@@ -1,4 +1,4 @@',
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    '@@',
     ' one',
     '-two',
     '+TWO',
     ' three',
     ' four',
+    '*** End Patch',
   ].join('\n')), 'one\nTWO\nthree\nfour\n');
+  const python = [
+    'def create_document(job):',
+    '    deck = job.presentation("deck")',
+    '    title = "Old"',
+    '    deck.save()',
+    '',
+  ].join('\n');
+  assert.equal(applyUnoDraftPatch(python, [
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    '@@ def create_document(job):',
+    '     deck = job.presentation("deck")',
+    '-    title = "Old"',
+    '+    title = "New"',
+    '     deck.save()',
+    '*** End Patch',
+  ].join('\n')), python.replace('"Old"', '"New"'));
+  assert.equal(applyUnoDraftPatch(python, [
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    '@@',
+    ' deck = job.presentation("deck")',
+    '-    title = "Old"',
+    '+    title = "New"',
+    ' deck.save()',
+    '*** End Patch',
+  ].join('\n')), python.replace('"Old"', '"New"'));
+  assert.equal(applyUnoDraftPatch('same\ntarget\nsame\ntarget\n', [
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    '@@',
+    '-target',
+    '+changed',
+    '*** End Patch',
+  ].join('\n')), 'same\nchanged\nsame\ntarget\n');
+});
+
+test('allows many distant atomic Codex patch hunks without treating their span as a full replacement', () => {
+  const source = Array.from({ length: 240 }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
+  const patch = [
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    ...Array.from({ length: 12 }, (_, index) => {
+      const lineNumber = 1 + index * 20;
+      return [
+        '@@',
+        `-line ${lineNumber}`,
+        `+LINE ${lineNumber}`,
+      ];
+    }).flat(),
+    '*** End Patch',
+  ].join('\n');
+
+  const patched = applyUnoDraftPatch(source, patch);
+  for (let index = 0; index < 12; index += 1) {
+    const lineNumber = 1 + index * 20;
+    assert.match(patched, new RegExp(`^LINE ${lineNumber}$`, 'm'));
+  }
 });
 
 test('keeps page and element IDs while deduplicating overlap diagnostics', () => {
@@ -641,7 +677,7 @@ test('preserves deterministic runtime ID disambiguation as a warning diagnostic'
   }]);
 });
 
-test('clusters pairwise presentation overlaps around the highest-degree source element', () => {
+test('returns every pairwise presentation overlap for one-pass layout repair', () => {
   const diagnostics = generatedVerificationIssues({
     elementMap: [
       { elementId: 'slide-2/oversized-copy', line: 120, locator: { slide: 2, shape: 3 } },
@@ -660,13 +696,13 @@ test('clusters pairwise presentation overlaps around the highest-degree source e
       })),
     },
   });
-  assert.equal(diagnostics.length, 1);
-  assert.equal(diagnostics[0].elementId, 'slide-2/oversized-copy');
-  assert.equal(diagnostics[0].line, 120);
-  assert.deepEqual(diagnostics[0].elementIds, [
-    'slide-2/oversized-copy', 'slide-2/card-a', 'slide-2/card-b', 'slide-2/card-c',
+  assert.equal(diagnostics.length, 3);
+  assert.deepEqual(diagnostics.map((diagnostic) => diagnostic.elementIds), [
+    ['slide-2/oversized-copy', 'slide-2/card-a'],
+    ['slide-2/oversized-copy', 'slide-2/card-b'],
+    ['slide-2/oversized-copy', 'slide-2/card-c'],
   ]);
-  assert.match(diagnostics[0].message, /primary overlap source/);
+  assert.deepEqual(diagnostics.map((diagnostic) => diagnostic.line), [120, 120, 120]);
 });
 
 test('infers editable page and sheet units from proven UNO authoring patterns', () => {
@@ -720,6 +756,24 @@ test('infers editable page and sheet units from proven UNO authoring patterns', 
   assert.match(presentationUnits[1].content, /def section_divider/);
   assert.match(presentationUnits[2].content, /section_divider\('s03-section'/);
   assert.doesNotMatch(presentationUnits[3].content, /def section_divider/);
+
+  const facadeUnits = sourceUnitsForDraft(`def create_document(job):
+    deck = job.presentation('deck')
+    s = deck.slide('cover', title='Cover')
+    s.add_text('title', 'Cover', box=(1, 1, 4, 1))
+    s = deck.slide('agenda', title='Agenda')
+    s.add_text('body', 'Agenda', box=(1, 2, 4, 1))
+    s = deck.slide('closing', title='Closing')
+    s.add_text('body', 'Closing', box=(1, 2, 4, 1))
+    deck.save()
+    deck.close()
+`, { documentType: 'presentation', generator: 'uno' });
+  assert.deepEqual(facadeUnits.map((unit) => unit.path), [
+    'pages/cover', 'pages/agenda', 'pages/closing',
+  ]);
+  assert.match(facadeUnits[1].content, /Agenda/);
+  assert.doesNotMatch(facadeUnits[1].content, /Cover/);
+  assert.doesNotMatch(facadeUnits[1].content, /Closing/);
 });
 
 test('returns focused repair hints for common UNO runtime failures', () => {
@@ -740,19 +794,7 @@ test('returns focused repair hints for common UNO runtime failures', () => {
   assert.ok(startupHints.some((hint) => hint.includes('Do not edit the Office source')));
 });
 
-test('retries drafts poisoned only by UNO startup or user interruption without hiding source errors', () => {
-  assert.equal(hasOnlyRetryableOfficeValidationFailure({
-    validationDiagnostics: [{ code: 'UNO_BRIDGE_STARTUP', message: "couldn't connect to pipe", severity: 'error' }],
-  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), true);
-  assert.equal(hasOnlyRetryableOfficeValidationFailure({
-    validationDiagnostics: [{ code: 'UNO_RUNTIME_ERROR', message: 'Browser chat operation interrupted by user.', severity: 'error' }],
-  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), true);
-  assert.equal(hasOnlyRetryableOfficeValidationFailure({
-    validationDiagnostics: [{ code: 'PYTHON_SYNTAX', message: "'[' was never closed", severity: 'error' }],
-  } as Parameters<typeof hasOnlyRetryableOfficeValidationFailure>[0]), false);
-});
-
-test('infers unoApi document type and returns the complete cached facade cookbook', async (context) => {
+test('infers unoApi document type and caches facade modules independently', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
@@ -770,28 +812,30 @@ test('infers unoApi document type and returns the complete cached facade cookboo
       runId: 'chat_test',
     });
     assert.equal(planned.ok, true, planned.actual);
-    const result = await getUnoApi({ documentId: 'uno-api-defaults', query: 'placeholder', runId: 'chat_test' });
+    const result = await getUnoApi({ documentId: 'uno-api-defaults', runId: 'chat_test' });
     assert.equal(result.ok, true, result.actual);
     const payload = JSON.parse(result.actual || '{}') as {
       documentType?: string;
       target?: string;
       nativeReflectionExposed?: boolean;
-      capabilities?: unknown[];
-      queryIgnored?: boolean;
+      moduleIndex?: unknown[];
+      delivery?: string;
     };
     assert.equal(payload.documentType, 'presentation');
     assert.equal(payload.target, 'facade');
     assert.equal(payload.nativeReflectionExposed, false);
-    assert.equal(payload.queryIgnored, true);
-    assert.ok((payload.capabilities || []).length > 10);
+    assert.equal(payload.delivery, 'module-index');
+    assert.ok((payload.moduleIndex || []).length > 10);
     const repeated = await getUnoApi({ documentId: 'uno-api-defaults', query: 'chart', runId: 'chat_test' });
     const repeatedPayload = JSON.parse(repeated.actual || '{}') as {
       alreadyLoaded?: boolean; apiReference?: unknown[]; examples?: Record<string, string>; kind?: string;
     };
     assert.equal(repeatedPayload.kind, 'uno-api');
-    assert.equal(repeatedPayload.alreadyLoaded, true);
-    assert.ok((repeatedPayload.apiReference || []).length > 20);
+    assert.equal(repeatedPayload.alreadyLoaded, false);
+    assert.ok((repeatedPayload.apiReference || []).length > 0);
     assert.match(repeatedPayload.examples?.nativeColumnChart || '', /show_legend=True/);
+    const chartAgain = await getUnoApi({ documentId: 'uno-api-defaults', query: 'chart', runId: 'chat_test' });
+    assert.equal(JSON.parse(chartAgain.actual || '{}').alreadyLoaded, true);
   } finally {
     if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previousArtifacts;
@@ -809,9 +853,10 @@ test('keeps one current source per documentId without revision history', async (
     await planFileArtifact({ documentId: 'single-source-workflow', documentType: 'word', fileName: 'single.docx', runId: 'chat_test' });
     const generated = await generateUnoFileArtifact({ documentId: 'single-source-workflow', program: wordProgram, render: false, runId: 'chat_test' });
     assert.equal(generated.ok, true, generated.actual);
-    const edited = await editUnoFileArtifact({
+    const edited = await editDraftText({
       documentId: 'single-source-workflow',
-      edits: [{ kind: 'replaceText', oldText: 'Generated through the UNO worker', newText: 'Current source edit' }],
+      oldText: 'Generated through the UNO worker',
+      newText: 'Current source edit',
       render: false,
       runId: 'chat_test',
     });
@@ -846,13 +891,10 @@ test('saves cumulative syntax repairs so multiple errors can be fixed across edi
       sourceDigest?: string;
     };
 
-    const failed = await editUnoFileArtifact({
+    const failed = await editDraftText({
       documentId: 'transactional-edit',
-      edits: [{
-        kind: 'replaceText',
-        oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
-        newText: '    if (\n    while (',
-      }],
+      oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+      newText: '    if (\n    while (',
       includeVisualVerification: false,
       runId: 'chat_test',
     });
@@ -879,13 +921,10 @@ test('saves cumulative syntax repairs so multiple errors can be fixed across edi
     assert.match(after.program || '', /while \(/);
     assert.equal(after.validationStatus, 'failed');
 
-    const firstRepair = await editUnoFileArtifact({
+    const firstRepair = await editDraftText({
       documentId: 'transactional-edit',
-      edits: [{
-        kind: 'replaceText',
-        oldText: '    if (',
-        newText: "    document.add_paragraph('body', 'First syntax error repaired')",
-      }],
+      oldText: '    if (',
+      newText: "    document.add_paragraph('body', 'First syntax error repaired')",
       includeVisualVerification: false,
       runId: 'chat_test',
     });
@@ -894,9 +933,10 @@ test('saves cumulative syntax repairs so multiple errors can be fixed across edi
     assert.match(afterFirstRepair.actual || '', /First syntax error repaired/);
     assert.match(afterFirstRepair.actual || '', /while \(/);
 
-    const repaired = await editUnoFileArtifact({
+    const repaired = await editDraftText({
       documentId: 'transactional-edit',
-      edits: [{ kind: 'replaceText', oldText: '    while (', newText: '    # Second syntax error repaired' }],
+      oldText: '    while (',
+      newText: '    # Second syntax error repaired',
       includeVisualVerification: false,
       runId: 'chat_test',
     });
@@ -938,7 +978,7 @@ test('reads and edits one marked page unit without changing other source units',
     const unitRead = await readUnoDraft({ documentId: 'unit-workflow', path: 'pages/page-002', runId: 'chat_test' });
     assert.equal(unitRead.ok, true, unitRead.actual);
     const unitPayload = JSON.parse(unitRead.actual || '{}') as {
-      lineCount?: number; program?: string; sourceUnitPath?: string;
+      lineCount?: number; patchBaseDigest?: string; program?: string; sourceUnitPath?: string;
       sourceLineRange?: { coordinateSpace?: string; startLine?: number; endLine?: number };
     };
     assert.equal(unitPayload.sourceUnitPath, 'pages/page-002');
@@ -952,12 +992,20 @@ test('reads and edits one marked page unit without changing other source units',
       totalSourceLines: 11,
       unitLineCount: 1,
     });
-    assert.match(unitPayload.program || '', /^\s*8 \|/);
+    assert.match(unitPayload.program || '', /^    document\.Text/);
 
     const edited = await editUnoFileArtifact({
       documentId: 'unit-workflow',
       path: 'pages/page-002',
-      edits: [{ startLine: 8, endLine: 8, newText: "    document.Text.insertString(cursor, 'updated page two', False)" }],
+      baseDigest: unitPayload.patchBaseDigest,
+      patch: [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        "-    document.Text.insertString(cursor, 'page two', False)",
+        "+    document.Text.insertString(cursor, 'updated page two', False)",
+        '*** End Patch',
+      ].join('\n'),
       render: false,
       runId: 'chat_test',
     });
@@ -1019,7 +1067,7 @@ ${filler}
       coordinateSpace: 'global',
       totalSourceLines: 313,
     });
-    assert.match(helperWindow.program || '', /^\s*150 \|/);
+    assert.match(helperWindow.program || '', /^    # shared helper note 148/);
 
     const secondSlide = JSON.parse((await readUnoDraft({
       documentId: 'inferred-units', path: 'pages/slide-002', runId: 'chat_test',
@@ -1027,6 +1075,19 @@ ${filler}
     assert.equal(secondSlide.sourceUnitPath, 'pages/slide-002');
     assert.match(secondSlide.program || '', /slide-02\/title/);
     assert.doesNotMatch(secondSlide.program || '', /slide-01\/title/);
+
+    const fallbackWindow = JSON.parse((await readUnoDraft({
+      documentId: 'inferred-units', path: 'inferred-units.py', startLine: 306, endLine: 9999, runId: 'chat_test',
+    })).actual || '{}') as {
+      program?: string;
+      readFallbackGuidance?: string;
+      requestedPathIgnored?: string;
+      sourceLineRange?: { endLine?: number };
+    };
+    assert.equal(fallbackWindow.requestedPathIgnored, 'inferred-units.py');
+    assert.equal(fallbackWindow.sourceLineRange?.endLine, 313);
+    assert.match(fallbackWindow.program || '', /deck\.save\(\)/);
+    assert.match(fallbackWindow.readFallbackGuidance || '', /complete draft/);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -1059,7 +1120,7 @@ test('recovers an interrupted validation checkpoint after a backend restart', as
   }
 });
 
-test('applies current line edits after the initial draft without a version handshake', async () => {
+test('applies a Codex patch only against the latest source digest', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-editor-'));
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
@@ -1082,22 +1143,62 @@ test('applies current line edits after the initial draft without a version hands
     const current = await readUnoDraft({ documentId: 'editor-workflow', runId: 'chat_test' });
     assert.equal(current.ok, true, current.actual);
     assert.match(current.actual || '', /generate retry/);
+    const currentPayload = JSON.parse(current.actual || '{}') as { patchBaseDigest?: string };
+    const stale = await editUnoFileArtifact({
+      documentId: 'editor-workflow',
+      baseDigest: '0'.repeat(64),
+      patch: [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        '-def create_document(job):',
+        '+def create_document(job):',
+        '*** End Patch',
+      ].join('\n'),
+      runId: 'chat_test',
+    });
+    assert.equal(stale.ok, false, stale.actual);
+    assert.equal(JSON.parse(stale.actual || '{}').code, 'PATCH_BASE_DIGEST_MISMATCH');
 
     const edited = await editUnoFileArtifact({
       documentId: 'editor-workflow',
-      edits: [{ startLine: 3, endLine: 3, newText: "    document.add_paragraph('body', 'targeted edit')" }],
+      baseDigest: currentPayload.patchBaseDigest,
+      patch: [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        "     document = job.writer('document')",
+        "-    document.add_paragraph('body', 'generate retry')",
+        "+    document.add_paragraph('body', 'targeted edit')",
+        '     document.save()',
+        '*** End Patch',
+      ].join('\n'),
       render: false,
       runId: 'chat_test',
     });
     assert.equal(edited.ok, true, edited.actual);
+    const afterEdit = JSON.parse((await readUnoDraft({ documentId: 'editor-workflow', runId: 'chat_test' })).actual || '{}') as {
+      patchBaseDigest?: string;
+    };
     const unchanged = await editUnoFileArtifact({
       documentId: 'editor-workflow',
-      edits: [{ startLine: 3, endLine: 3, newText: "    document.add_paragraph('body', 'targeted edit')" }],
+      baseDigest: afterEdit.patchBaseDigest,
+      patch: [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        "     document = job.writer('document')",
+        "-    document.add_paragraph('body', 'targeted edit')",
+        "+    document.add_paragraph('body', 'targeted edit')",
+        '     document.save()',
+        '*** End Patch',
+      ].join('\n'),
       render: false,
       runId: 'chat_test',
     });
-    assert.equal(unchanged.ok, true, unchanged.actual);
+    assert.equal(unchanged.ok, false, unchanged.actual);
     assert.equal(JSON.parse(unchanged.actual || '{}').changed, false);
+    assert.equal(JSON.parse(unchanged.actual || '{}').code, 'PATCH_NO_CHANGES');
 
     const replacementProgram = wordProgram.replace('Generated through the UNO worker', 'whole-file replacement');
     const replaced = await editUnoFileArtifact({
@@ -1191,7 +1292,11 @@ test('saves a rejected initial source so the model can read and edit it in place
     assert.match(readable.program || '', /wrong_entrypoint/);
     assert.equal(readable.validationStatus, 'failed');
     const pending = await pendingOfficeDocumentWork('chat_test', new Set(['rejected-program']));
-    assert.equal(pending[0]?.requiredNextAction, 'edit');
+    assert.equal(pending[0]?.requiredNextAction, 'render');
+    const retriedRender = await renderFileArtifact({ documentId: 'rejected-program', runId: 'chat_test' });
+    assert.equal(retriedRender.ok, false);
+    assert.match(retriedRender.actual || '', /must define create_document\(job\)/);
+    assert.doesNotMatch(retriedRender.actual || '', /office-render-blocked/);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;

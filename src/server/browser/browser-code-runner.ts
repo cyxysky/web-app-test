@@ -2958,13 +2958,22 @@ function browserCodeKernelMain() {
 
   const findExecutionPage = async (executionId: string) => {
     if (!browser) throw new Error('browserCode browser connection is not initialized.');
-    for (const candidate of browser.contexts().flatMap((browserContext) => browserContext.pages())) {
+    const candidates = browser.contexts()
+      .flatMap((browserContext) => browserContext.pages())
+      .filter((candidate) => !candidate.isClosed());
+    for (const candidate of candidates) {
       const matches = await candidate.evaluate((id) => {
         const win = window as Window & { __aiBrowserCodeExecutionId?: string };
         return win.__aiBrowserCodeExecutionId === id;
       }, executionId).catch(() => false);
       if (matches) return candidate;
     }
+    // A navigation can replace the document after the host writes the
+    // execution marker but before this Playwright client scans for it. The
+    // Page target itself remains stable, so reuse this kernel's last selected
+    // live page. A single live page is also unambiguous for a fresh kernel.
+    if (selectedRuntimePage && candidates.includes(selectedRuntimePage)) return selectedRuntimePage;
+    if (candidates.length === 1) return candidates[0];
     throw new Error('browserCode could not find the active Playwright page.');
   };
 

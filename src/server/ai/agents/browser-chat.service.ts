@@ -124,11 +124,13 @@ import {
 } from '@/lib/browser-chat-output-cycles';
 import type {
   BrowserChatAiOutputCycle,
+  BrowserChatAiOutputTool,
   BrowserChatSubagentMessage,
   BrowserChatSubagentRecord,
   ModelProvider,
   SkillRecord,
   StepExecutionResult,
+  StepToolCall,
 } from '@/server/ai/schemas/runtime.schema';
 import { store } from '@/server/db/store';
 import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
@@ -606,21 +608,6 @@ scheduleBrowserChatArtifactMaintenance(() => (
 ));
 scheduleSqliteMaintenance();
 const runningHydrationGraceMs = 2 * 60 * 1000;
-
-function browserChatTurnHardTimeoutMs() {
-  const configured = Number(process.env.AI_BROWSER_CHAT_TURN_HARD_TIMEOUT_MS || 20 * 60 * 1000);
-  return Number.isFinite(configured)
-    ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
-    : 20 * 60 * 1000;
-}
-
-function browserChatTurnTimeoutOptions() {
-  const timeoutMs = browserChatTurnHardTimeoutMs();
-  return {
-    timeoutMs,
-    timeoutMessage: `Browser chat turn exceeded the ${Math.round(timeoutMs / 60_000)} minute hard limit.`,
-  };
-}
 
 function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
@@ -1805,6 +1792,70 @@ function compactStepForClient(step: StepExecutionResult): StepExecutionResult {
   return clientStep;
 }
 
+const browserChatRealtimeInlineTextLimit = 12 * 1024;
+const browserChatRealtimeSourceTextLimit = 2 * 1024;
+
+function compactRealtimeText(value: string, limit = browserChatRealtimeInlineTextLimit) {
+  if (value.length <= limit) return value;
+  const edge = Math.max(256, Math.floor((limit - 96) / 2));
+  return `${value.slice(0, edge)}\n… [${value.length - edge * 2} chars omitted from realtime payload; full value is stored] …\n${value.slice(-edge)}`;
+}
+
+function compactRealtimeValue(value: unknown, depth = 0): unknown {
+  if (typeof value === 'string') return compactRealtimeText(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= 5) return '[nested value omitted from realtime payload]';
+  if (Array.isArray(value)) {
+    const retained = value.slice(0, 80).map((item) => compactRealtimeValue(item, depth + 1));
+    if (value.length > retained.length) retained.push(`[${value.length - retained.length} items omitted]`);
+    return retained;
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>).slice(0, 120)) {
+    if (
+      typeof item === 'string'
+      && ['code', 'content', 'patch', 'program', 'script', 'source'].includes(key)
+    ) {
+      result[key] = compactRealtimeText(item, browserChatRealtimeSourceTextLimit);
+      continue;
+    }
+    result[key] = compactRealtimeValue(item, depth + 1);
+  }
+  return result;
+}
+
+function compactRealtimeTool<T extends StepToolCall | BrowserChatAiOutputTool>(tool: T): T {
+  const realtimeTool = {
+    ...tool,
+    ...(tool.input === undefined ? {} : { input: compactRealtimeValue(tool.input) }),
+    ...(typeof tool.result === 'string' ? { result: compactRealtimeText(tool.result) } : {}),
+  } as T;
+  const input = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input)
+    ? tool.input as Record<string, unknown>
+    : undefined;
+  const keepModuleReference = tool.name === 'file' && input?.action === 'unoApi';
+  if (keepModuleReference && tool.rawResult !== undefined) {
+    realtimeTool.rawResult = typeof tool.rawResult === 'string'
+      ? compactRealtimeText(tool.rawResult, 128 * 1024)
+      : compactRealtimeValue(tool.rawResult);
+  } else {
+    delete realtimeTool.rawResult;
+  }
+  return realtimeTool;
+}
+
+function compactOutputCycleForRealtime(cycle: BrowserChatAiOutputCycle): BrowserChatAiOutputCycle {
+  return {
+    ...cycle,
+    output: {
+      ...cycle.output,
+      reasoning: cycle.output.reasoning.map((value) => compactRealtimeText(value)),
+      texts: cycle.output.texts.map((value) => compactRealtimeText(value)),
+      tools: cycle.output.tools.map(compactRealtimeTool),
+    },
+  };
+}
+
 const browserChatDetailedStepRetention = 8;
 
 function compactHistoricalAiRequest(
@@ -1851,8 +1902,12 @@ function compactBrowserChatSubagentSteps(steps: readonly StepExecutionResult[] =
 function compactBrowserChatSubagentRecord(record: BrowserChatSubagentRecord): BrowserChatSubagentRecord {
   return {
     ...record,
-    steps: compactBrowserChatSubagentSteps(record.steps),
-    outputCycles: trimBrowserChatOutputCycles(record.outputCycles || []),
+    steps: compactBrowserChatSubagentSteps(record.steps).map(compactStepForRealtime),
+    outputCycles: trimBrowserChatOutputCycles(record.outputCycles || []).map(compactOutputCycleForRealtime),
+    messages: record.messages.map((message) => ({
+      ...message,
+      content: compactRealtimeValue(message.content),
+    })),
   };
 }
 
@@ -1882,14 +1937,7 @@ function compactStepForRealtime(step: StepExecutionResult): StepExecutionResult 
   if (!clientStep.tools?.length) return clientStep;
   return {
     ...clientStep,
-    tools: clientStep.tools.map((tool) => {
-      const realtimeTool = { ...tool };
-      // `file action=unoApi` is a complete inspection result. Its full
-      // runtime reflection must reach the client-side result dialog rather
-      // than being reduced to a status-only tool card.
-      if (realtimeTool.name !== 'file') delete realtimeTool.rawResult;
-      return realtimeTool;
-    }),
+    tools: clientStep.tools.map(compactRealtimeTool),
   };
 }
 
@@ -2071,13 +2119,13 @@ function clientSnapshot(session: BrowserChatSessionRecord): BrowserChatClientSes
     steps: activeMessage
       ? session.steps
           .filter((step) => activeStepIndexes.has(step.index) && (!step.messageId || step.messageId === activeMessage.id))
-          .map(compactStepForClient)
+          .map(compactStepForRealtime)
       : [],
     logs: activeMessage
       ? compactBrowserChatLogsForClient(session.logs.filter((log) => log.messageId === activeMessage.id))
       : [],
-    outputCycles: records.outputCycles,
-    subagents: records.subagents,
+    outputCycles: records.outputCycles.map(compactOutputCycleForRealtime),
+    subagents: records.subagents.map(compactBrowserChatSubagentRecord),
     history: {
       messages: { hasMore: false },
       steps: { hasMore: false },
@@ -2529,8 +2577,8 @@ function writeSessionSnapshot(item: BrowserChatPersistedSessionSnapshot): Browse
     : { outputCycles: [], subagents: [] };
   const realtimeSession: BrowserChatSessionRealtimePatch['session'] = {
     ...session,
-    outputCycles: realtimeRecords.outputCycles,
-    subagents: realtimeRecords.subagents,
+    outputCycles: realtimeRecords.outputCycles.map(compactOutputCycleForRealtime),
+    subagents: realtimeRecords.subagents.map(compactBrowserChatSubagentRecord),
     pendingToolConfirmation: session.pendingToolConfirmation ?? null,
   };
   const summary = summaryFromSnapshot(persistedItem);
@@ -2581,8 +2629,8 @@ async function publishBrowserChatTextStreamSnapshot(sessionId: string, assistant
   const patch: BrowserChatSessionRealtimePatch = {
     session: {
       ...header,
-      outputCycles: realtimeRecords.outputCycles,
-      subagents: realtimeRecords.subagents,
+      outputCycles: realtimeRecords.outputCycles.map(compactOutputCycleForRealtime),
+      subagents: realtimeRecords.subagents.map(compactBrowserChatSubagentRecord),
       pendingToolConfirmation: header.pendingToolConfirmation ?? null,
     },
     messages: [{
@@ -3006,8 +3054,25 @@ async function persistAndNotifyTerminal(sessionId: string) {
   if (!persisted) return false;
   const pendingWrite = pendingSqliteWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
+  if (persisted !== true && !(await publishPersistedRealtimePatch(persisted))) return false;
   scheduleBrowserChatSessionEviction(sessionId);
   return true;
+}
+
+async function publishPersistedRealtimePatch(patch: BrowserChatSessionRealtimePatch) {
+  try {
+    await publishRealtimeRefreshEvent({
+      entityType: 'browserChatSession',
+      id: patch.session.id,
+      updatedAt: patch.session.updatedAt || now(),
+      userId: normalizeApplicationUserId(patch.session.userId),
+      patch,
+    });
+    return true;
+  } catch (error) {
+    warnPersistFailure(error);
+    return false;
+  }
 }
 
 async function persistBrowserChatCheckpoint(sessionId: string) {
@@ -3015,7 +3080,8 @@ async function persistBrowserChatCheckpoint(sessionId: string) {
   const persisted = persistSession(sessionId, { mergePersisted: false });
   if (!persisted) return false;
   const pendingWrite = pendingSqliteWrites.get(sessionId);
-  return pendingWrite ? pendingWrite : true;
+  if (pendingWrite && !(await pendingWrite)) return false;
+  return persisted === true ? true : publishPersistedRealtimePatch(persisted);
 }
 
 function persistDeletedSessions(items: Array<{ id: string; userId: string }>) {
@@ -3846,7 +3912,7 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
     session,
     assistantMessageId: assistantMessage.id,
     abortController,
-  }, browserChatTurnTimeoutOptions());
+  });
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: assistantMessage.id,
@@ -3991,7 +4057,7 @@ export async function sendBrowserChatMessage(
     session,
     assistantMessageId: assistantMessage.id,
     abortController,
-  }, browserChatTurnTimeoutOptions());
+  });
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: assistantMessage.id,
@@ -4098,7 +4164,7 @@ export function resumeBrowserChatHumanVerification(sessionId: string, userId?: s
     session,
     assistantMessageId: paused.message.id,
     abortController,
-  }, browserChatTurnTimeoutOptions());
+  });
   transitionBrowserChatSession(session, {
     type: 'turnStarted',
     assistantMessageId: paused.message.id,
@@ -5746,7 +5812,7 @@ async function runBrowserChatMessage(
       const message = userFacingErrorMessage(error);
       const details = errorLogDetails(error);
       const terminalReply = timedOut
-        ? `This turn exceeded the ${Math.round(browserChatTurnHardTimeoutMs() / 60_000)} minute hard limit and was stopped.`
+        ? abortMessage
         : interrupted ? browserChatInterruptedReply : `执行异常：${message}`;
       if (isDeadBrowserSessionError(error)) {
         await session.browser?.close({ keepOpen: true }).catch(() => undefined);

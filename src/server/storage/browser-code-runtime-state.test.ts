@@ -28,17 +28,10 @@ test('browserCode conversation state persists across database reopen and isolate
     assert.deepEqual(restored.value, { issueId: '30789', step: 2 });
 
     const largeValue = `data:image/png;base64,${'A'.repeat(1_100_000)}`;
-    stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
+    assert.throws(() => stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
       action: 'set',
       input: { key: 'task.large-image', value: largeValue },
-    });
-    databaseModule.closeSqliteDatabase();
-    const restoredLarge = stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-a', {
-      action: 'get',
-      input: { key: 'task.large-image' },
-    }) as { found: boolean; value: unknown };
-    assert.equal(restoredLarge.found, true);
-    assert.equal(restoredLarge.value, largeValue);
+    }), /workspace artifact file/i);
 
     const isolated = stateStore.executeBrowserCodeRuntimeStateOperation('chat-state-b', {
       action: 'get',
@@ -65,9 +58,8 @@ test('browserCode conversation state persists across database reopen and isolate
       action: 'list',
       input: { prefix: 'task.' },
     }) as { count: number; items: Array<{ key: string }> };
-    assert.equal(listed.count, 3);
+    assert.equal(listed.count, 2);
     assert.deepEqual(listed.items.map((item) => item.key), [
-      'task.large-image',
       'task.note',
       'task.progress',
     ]);
@@ -76,7 +68,7 @@ test('browserCode conversation state persists across database reopen and isolate
       action: 'clear',
       input: { prefix: 'task.' },
     }) as { deleted: number };
-    assert.equal(cleared.deleted, 3);
+    assert.equal(cleared.deleted, 2);
   } finally {
     databaseModule.closeSqliteDatabase();
     if (previousDataRoot === undefined) delete process.env.APP_DATA_DIR;

@@ -102,6 +102,42 @@ function browserCodeFromGeneratedMarkup(value: unknown) {
   return code;
 }
 
+function codexPatchHasChanges(value: string) {
+  return value.split(/\r?\n/).some((line) => (
+    (line.startsWith('+') && !line.startsWith('+++'))
+    || (line.startsWith('-') && !line.startsWith('---'))
+  ));
+}
+
+function legacyReplacementPatch(oldValue: string, newValue: string) {
+  let oldLines = oldValue.replace(/\r\n/g, '\n').trim().split('\n');
+  if (oldLines[0]?.trim() === '*** Begin Patch') {
+    oldLines = oldLines.filter((line) => (
+      line.trim() !== '*** Begin Patch'
+      && line.trim() !== '*** End Patch'
+      && line.trim() !== '*** End of File'
+      && !line.startsWith('*** Update File: ')
+      && line !== '@@'
+      && !line.startsWith('@@ ')
+    )).map((line) => line.startsWith(' ') ? line.slice(1) : line);
+  }
+  const replacement = newValue
+    .replace(/^```(?:python|py)?[ \t]*\r?\n/i, '')
+    .replace(/\r?\n```[ \t]*$/i, '')
+    .replace(/\r\n/g, '\n')
+    .trim()
+    .split('\n');
+  if (!oldLines.length || !oldLines.some((line) => line.length)) return undefined;
+  return [
+    '*** Begin Patch',
+    '*** Update File: draft.py',
+    '@@',
+    ...oldLines.map((line) => `-${line}`),
+    ...replacement.map((line) => `+${line}`),
+    '*** End Patch',
+  ].join('\n');
+}
+
 /** Scalar transport normalization only; never reshape a document or program. */
 export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
   if (toolName === 'browserCode') {
@@ -139,9 +175,21 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
   }
   if ('render' in input) input.render = booleanFromString(input.render);
   if ('includeVisuals' in input) input.includeVisuals = booleanFromString(input.includeVisuals);
+  if ('replaceExisting' in input) input.replaceExisting = booleanFromString(input.replaceExisting);
   for (const key of ['limit', 'offset']) if (key in input) input[key] = numberFromString(input[key]);
   // Compatibility with recorded/queued calls from the retired optimistic-lock protocol.
   delete input.expectedRevision;
+  // A few gateways/models put the old block in patch and the new block in an
+  // invented `replace` field. Normalize that deterministic two-block form into
+  // the exact Codex patch grammar before schema validation. Proper Codex
+  // patches remain untouched, and the compatibility-only field never leaks to
+  // the editor implementation.
+  if (input.action === 'edit' && typeof input.patch === 'string' && typeof input.replace === 'string') {
+    if (!codexPatchHasChanges(input.patch)) {
+      input.patch = legacyReplacementPatch(input.patch, input.replace) || input.patch;
+    }
+    delete input.replace;
+  }
   if ('pages' in input) input.pages = arrayFromJsonString(input.pages);
   if (Array.isArray(input.pages)) input.pages = input.pages.map(numberFromString);
   return input;

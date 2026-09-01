@@ -69,7 +69,7 @@ describe('Office native capability serialization contracts', () => {
   it('requires every full facade capability to have a real package contract', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
     for (const documentType of ['presentation', 'word', 'spreadsheet'] as const) {
-      const api = await inspectUnoApi({ documentType, limit: 1 }) as unknown as { capabilities?: Capability[] };
+      const api = await inspectUnoApi({ documentType, query: documentType === 'word' ? 'writer' : documentType === 'spreadsheet' ? 'calc' : 'presentation', limit: 1 }) as unknown as { capabilities?: Capability[] };
       const declared = (api.capabilities || [])
         .filter((capability) => capability.support === 'full')
         .map((capability) => capability.id)

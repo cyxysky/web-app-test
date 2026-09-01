@@ -24,13 +24,18 @@ test('keeps direct JavaScript Office libraries outside UNO-only layout restricti
   assert.equal(result.diagnostics.some((diagnostic) => diagnostic.severity === 'error'), false);
 });
 
-test('allows facade calls without statically requiring element IDs', async () => {
+test('validates required facade parameters before Office execution', async () => {
   const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     deck.add_slide()
     deck.save()
     deck.close()`, 'uno');
-  assert.equal(result.passed, true);
+  if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+  assert.equal(result.passed, false);
+  assert.match(
+    result.diagnostics.find((item) => item.code === 'UNO_API_SIGNATURE_MISMATCH')?.message || '',
+    /missing required argument 'element_id'/,
+  );
 });
 
 test('lets runtime scope and disambiguate repeated literal element IDs', async () => {

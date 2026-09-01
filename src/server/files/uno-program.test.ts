@@ -199,10 +199,20 @@ def create_document(job):
     fileName: 'rejected-text-overlap.pptx',
     sourceCode: `${sourcePrefix}
     deck.add_text('slide-01/overlap-b', page, 'Beta', 1200, 2000, 8000, 1800, font_size=20)
+    deck.add_text('slide-01/overlap-c', page, 'Gamma', 1200, 2000, 8000, 1800, font_size=20)
     deck.save()
     deck.close()
 `,
-  }), /PRESENTATION_OVERLAP[\s\S]*slide-01\/overlap-a[\s\S]*slide-01\/overlap-b/);
+  }), (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    const encoded = message.match(/__WEBPILOT_LAYOUT_DIAGNOSTICS__(\[[^\r\n]*\])/)?.[1];
+    assert.ok(encoded, message);
+    const overlaps = (JSON.parse(encoded) as Array<{ code?: string; elementIds?: string[] }>)
+      .filter((issue) => issue.code === 'PRESENTATION_OVERLAP');
+    assert.equal(overlaps.length, 3, message);
+    assert.ok(overlaps.some((issue) => issue.elementIds?.includes('slide-01/overlap-c')));
+    return true;
+  });
 
   const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-fixed-text-bounds-'));
   try {
@@ -618,7 +628,7 @@ test('returns only matching model-facing presentation capabilities', async (cont
   assert.equal('targets' in api, false);
 });
 
-test('returns a compact facade blueprint instead of raw installed API targets', async (context) => {
+test('returns a compact facade module index instead of all APIs at once', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
@@ -627,12 +637,13 @@ test('returns a compact facade blueprint instead of raw installed API targets', 
   assert.equal(api.target, 'facade');
   assert.equal(api.nativeReflectionExposed, false);
   assert.equal('targets' in api, false);
-  const cookbook = api as unknown as { completeDocument?: string; capabilities?: unknown[] };
-  assert.match(cookbook.completeDocument || '', /deck\.slide\(/);
-  assert.ok((cookbook.capabilities || []).length > 0);
+  const cookbook = api as unknown as { delivery?: string; moduleIndex?: unknown[]; capabilities?: unknown[] };
+  assert.equal(cookbook.delivery, 'module-index');
+  assert.ok((cookbook.moduleIndex || []).length > 0);
+  assert.equal(cookbook.capabilities, undefined);
 });
 
-test('returns executable cookbooks for Writer, Calc, and Impress authoring', async (context) => {
+test('returns exact signatures and all registered examples for a queried facade module', async (context) => {
   if (!await resolveLibreOfficeExecutable()) {
     context.skip('LibreOffice is not installed.');
     return;
@@ -640,67 +651,41 @@ test('returns executable cookbooks for Writer, Calc, and Impress authoring', asy
   const cases = [
     {
       documentType: 'word' as const,
-      fileName: 'writer-cookbook.docx',
-      operations: ['flow', 'table', 'page'],
+      query: 'writer.table',
+      expectedModule: 'writer.table@2',
+      expectedExample: 'tableAndMerge',
+      expectedMethod: 'document.add_table(',
     },
     {
       documentType: 'spreadsheet' as const,
-      fileName: 'calc-cookbook.xlsx',
-      operations: ['cells', 'table', 'freeze', 'merge'],
+      query: 'calc.cell-range',
+      expectedModule: 'calc.cell-range@2',
+      expectedExample: 'cellsRangesAndFormatting',
+      expectedMethod: 'sheet.set_cell(',
     },
     {
       documentType: 'presentation' as const,
-      fileName: 'impress-cookbook.pptx',
-      operations: ['slide', 'text', 'chart', 'transition'],
+      query: 'presentation.professional',
+      expectedModule: 'presentation.professional@1',
+      expectedExample: 'professionalFeatures',
+      expectedMethod: 'slide.set_notes(',
     },
   ];
   for (const item of cases) {
-    const api = await inspectUnoApi({ documentType: item.documentType, limit: 1 });
+    const api = await inspectUnoApi({ documentType: item.documentType, query: item.query, limit: 1 });
     const cookbook = api as unknown as {
-      completeDocument?: string;
-      completeExistingDocumentModification?: string;
-      coverage?: string[];
+      delivery?: string;
+      matchedModules?: string[];
       facadeSignatures?: string[];
-      operations?: Record<string, string>;
+      examples?: Record<string, string>;
       rules?: string[];
     };
-    assert.ok(cookbook.completeDocument?.includes('def create_document(job):'));
-    assert.ok(cookbook.completeExistingDocumentModification?.includes('source_name='));
-    assert.doesNotMatch(cookbook.completeExistingDocumentModification || '', /job\.expert|com\.sun\.star|import uno/);
-    assert.ok(cookbook.coverage?.length);
+    assert.equal(cookbook.delivery, 'module-executable-cookbook');
+    assert.ok(cookbook.matchedModules?.includes(item.expectedModule));
     assert.ok(cookbook.rules?.some((rule) => rule.includes('high-level facade')));
     assert.ok(cookbook.rules?.some((rule) => rule.includes('Never import')));
-    assert.doesNotMatch(JSON.stringify(cookbook.operations), /store(?:To|As)URL|createInstance|com\.sun\.star/);
-    assert.doesNotMatch(cookbook.completeExistingDocumentModification || '', /store(?:To|As)URL/);
-    if (item.documentType === 'word') {
-      assert.match(cookbook.completeDocument || '', /document = job\.writer\('report'\)/);
-      assert.match(cookbook.operations!.flow, /document\.add_paragraph/);
-    }
-    for (const operation of item.operations) assert.ok(cookbook.operations?.[operation], `${item.documentType} cookbook is missing ${operation}`);
-
-    const generated = await generateUnoProgramDocument({
-      documentType: item.documentType,
-      fileName: item.fileName,
-      sourceCode: cookbook.completeDocument!,
-    });
-    assert.ok(generated.buffer.byteLength > 64);
-    assert.ok(generated.previewPdf && generated.previewPdf.byteLength > 64);
-    assert.ok(Array.isArray(generated.report.elementMap));
-    if (item.documentType === 'presentation') {
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('deck.slide(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.add_text(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.add_chart(')));
-      assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith('slide.set_transition(')));
-      assert.match(cookbook.completeDocument || '', /deck\.slide\(/);
-      assert.match(cookbook.completeDocument || '', /slide\.add_chart\(/);
-      assert.doesNotMatch(cookbook.completeDocument || '', /com\.sun\.star|import uno|createInstance/);
-      const text = (generated.report.verification as { text?: { textCharacters?: number } }).text;
-      assert.ok((text?.textCharacters || 0) > 0, 'Impress cookbook must persist text after reopening');
-    }
-    if (item.documentType === 'word') {
-      const content = (generated.report.verification as { content?: { layout?: { tables?: number; issues?: unknown[] } } }).content;
-      assert.equal(content?.layout?.tables, 1);
-      assert.deepEqual(content?.layout?.issues, []);
-    }
+    assert.ok(cookbook.facadeSignatures?.some((signature) => signature.startsWith(item.expectedMethod)));
+    assert.ok(cookbook.examples?.[item.expectedExample]);
+    assert.doesNotMatch(JSON.stringify(cookbook.examples), /store(?:To|As)URL|createInstance|com\.sun\.star/);
   }
 });

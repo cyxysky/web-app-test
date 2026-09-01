@@ -17,6 +17,7 @@ const {
   proxyRequestHeaders,
   requireRuntimeDependency,
   runtimeApiRequest,
+  splitRuntimeEnabled,
   unsafeCrossOriginRequest,
   webSocketUpgradeTarget,
 } = require('./webpilot-server');
@@ -96,6 +97,13 @@ test('isolates API routes in the runtime process while keeping shutdown in the U
   assert.equal(runtimeApiRequest('/api/artifacts/chat-1/image.png'), true);
   assert.equal(runtimeApiRequest('/api/system/shutdown'), false);
   assert.equal(runtimeApiRequest('/browser-chat'), false);
+});
+
+test('uses one Next compiler in development and isolates the production API runtime', () => {
+  assert.equal(splitRuntimeEnabled(true, false, {}), false);
+  assert.equal(splitRuntimeEnabled(false, false, {}), true);
+  assert.equal(splitRuntimeEnabled(false, false, { WEBPILOT_SPLIT_RUNTIME: 'false' }), false);
+  assert.equal(splitRuntimeEnabled(false, true, {}), false);
 });
 
 test('restarts the API runtime after the child process exits', async () => {

@@ -191,6 +191,7 @@ import { ProgressiveBlur } from '@/components/ui/progressive-blur';
 import { RainbowButton } from '@/components/ui/rainbow-button';
 import {
   browserChatAiCycleAnchorsText,
+  browserChatAiCycleTextIsAccepted,
   browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
@@ -2089,11 +2090,16 @@ function mergeBrowserChatSessionRealtimePatch(
   current: BrowserChatSession,
   patch: BrowserChatSessionRealtimePatch,
 ): BrowserChatSession {
-  const collections = mergeBrowserChatRealtimeCollections(current, patch);
   const { pendingToolConfirmation, ...sessionPatch } = patch.session;
   const applySessionPatch = !sessionPatch.updatedAt
     || !current.updatedAt
     || sessionPatch.updatedAt >= current.updatedAt;
+  // A websocket publish is asynchronous and an older snapshot can arrive after
+  // a newer one. Ignore its collections as well as its header; otherwise an old
+  // tool-start record can overwrite a completed tool and remain "running" while
+  // later tools are already visible.
+  if (!applySessionPatch) return current;
+  const collections = mergeBrowserChatRealtimeCollections(current, patch);
   const outputCycles = applySessionPatch
     ? mergeBrowserChatRealtimeRecords(current.outputCycles, sessionPatch.outputCycles)
     : current.outputCycles;
@@ -4763,16 +4769,34 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const finalText = stringFromUnknown(message.content);
   const textStreaming = browserChatMessageIsTextStreaming(message);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
-  const aiOutputCycles = useMemo(() => sortBrowserChatAiOutputCycles(outputCycles.filter((cycle) => !cycle.subagentId)
-    .map((cycle) => (showReasoning ? cycle : {
-      ...cycle,
-      output: {
-        ...cycle.output,
-        parts: cycle.output.parts.filter((part) => part.kind !== 'reasoning'),
-        reasoning: [],
-      },
-    }))
-    .filter((cycle) => hasAiOutputView(cycle.output))), [outputCycles, showReasoning]);
+  const rawAiOutputCycles = useMemo(() => (
+    sortBrowserChatAiOutputCycles(outputCycles.filter((cycle) => !cycle.subagentId))
+  ), [outputCycles]);
+  const acceptedTerminalCycleId = message.status === 'passed'
+    ? rawAiOutputCycles[browserChatTerminalAnswerCycleIndex(rawAiOutputCycles)]?.id
+    : undefined;
+  const aiOutputCycles = useMemo(() => rawAiOutputCycles
+    .map((cycle) => {
+      const showCycleText = browserChatAiCycleTextIsAccepted(
+        message.status,
+        cycle,
+        cycle.id === acceptedTerminalCycleId,
+      );
+      if (showReasoning && showCycleText) return cycle;
+      return {
+        ...cycle,
+        output: {
+          ...cycle.output,
+          parts: cycle.output.parts.filter((part) => (
+            (showReasoning || part.kind !== 'reasoning')
+            && (showCycleText || part.kind !== 'text')
+          )),
+          reasoning: showReasoning ? cycle.output.reasoning : [],
+          texts: showCycleText ? cycle.output.texts : [],
+        },
+      };
+    })
+    .filter((cycle) => hasAiOutputView(cycle.output)), [acceptedTerminalCycleId, message.status, rawAiOutputCycles, showReasoning]);
   const terminalAnswerCycleIndex = message.status === 'passed'
     ? browserChatTerminalAnswerCycleIndex(aiOutputCycles)
     : -1;

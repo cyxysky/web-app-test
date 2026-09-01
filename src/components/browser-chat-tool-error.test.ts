@@ -40,6 +40,23 @@ test('summarizes nested office source validation failures and ignores secondary 
   );
 });
 
+test('labels presentation layout diagnostics by their actual failure category', () => {
+  assert.equal(
+    browserChatToolFailureSummary({
+      kind: 'uno-draft-validation',
+      validation: 'failed',
+      diagnostics: [{
+        code: 'PRESENTATION_OVERLAP',
+        line: 377,
+        column: 1,
+        message: "Presentation content 'p14/ft' overlaps existing 'p14/card'",
+        severity: 'error',
+      }],
+    }),
+    "文件源码第 377 行第 1 列布局重叠：Presentation content 'p14/ft' overlaps existing 'p14/card'（草稿已保留）",
+  );
+});
+
 test('does not relabel unrelated tool failures as source validation failures', () => {
   assert.equal(browserChatToolFailureSummary({ ok: false, error: 'network error' }), undefined);
 });

@@ -113,12 +113,18 @@ def presentation_text_line_count(value, width, font_size, padding=0):
     return max(1, sum(max(1, int(math.ceil(units / units_per_line))) for units in presentation_text_units(value)))
 
 
-def presentation_text_height(font_size, lines=1, padding=0, line_spacing=1.22):
-    """Return a safe TextShape height in 1/100 mm for a pt font size."""
-    return int(math.ceil(
-        max(1, int(lines)) * max(1.0, float(font_size)) * POINT_TO_100TH_MM * max(1.0, float(line_spacing))
-        + 2.0 * max(0.0, float(padding))
-    ))
+def presentation_text_height(font_size, lines=1, padding=0, line_spacing=1.15):
+    """Return a PowerPoint-calibrated TextShape height in 1/100 mm.
+
+    A single line needs its glyph box plus a small leading allowance, not a
+    complete 1.22 line-spacing interval. Treating it as 1.22 made ordinary
+    16pt/0.4in and 78pt/1.4in PptxGenJS-style boxes fail before rendering.
+    Additional wrapped lines use the requested line-spacing multiplier.
+    """
+    line_count = max(1, int(lines))
+    point_height = max(1.0, float(font_size)) * POINT_TO_100TH_MM
+    leading = 1.05 + (line_count - 1) * max(1.0, float(line_spacing))
+    return int(math.ceil(point_height * leading + 2.0 * max(0.0, float(padding))))
 
 
 def source_image_dimensions(path: Path):
@@ -180,7 +186,33 @@ def save_document(document, job):
     if suffix not in filters:
         raise ValueError(f'Unsupported output extension: {suffix}')
     properties = (job.property('FilterName', filters[suffix]), job.property('Overwrite', True))
-    (document.storeToURL if suffix == '.pdf' else document.storeAsURL)(job.output_url, properties)
+    output = job.output_path.resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    # storeAsURL mutates the component URL and intermittently aborts with
+    # 0x11b/Code 27 on Windows, even for a brand-new temp directory. Export a
+    # copy to a normal (non-dot-prefixed) candidate instead, then publish it by
+    # atomic rename. Each retry gets its own target and exact lock-file cleanup.
+    for attempt in range(3):
+        candidate = output.with_name(f'wp-save-{uuid.uuid4().hex}{suffix}')
+        lock_file = candidate.with_name(f'.~lock.{candidate.name}#')
+        try:
+            candidate.unlink(missing_ok=True)
+            lock_file.unlink(missing_ok=True)
+            document.storeToURL(candidate.as_uri(), properties)
+            if not candidate.is_file() or candidate.stat().st_size < 64:
+                raise RuntimeError('LibreOffice export produced no usable candidate file.')
+            output.unlink(missing_ok=True)
+            candidate.replace(output)
+            lock_file.unlink(missing_ok=True)
+            return
+        except Exception as error:
+            last_error = error
+            candidate.unlink(missing_ok=True)
+            lock_file.unlink(missing_ok=True)
+            if attempt < 2:
+                time.sleep(0.15 * (attempt + 1))
+    raise RuntimeError(f'LibreOffice could not save the isolated output after 3 attempts: {last_error}') from last_error
 
 
 def _excel_column_name(index):
@@ -972,7 +1004,7 @@ class WriterLayout:
             return self.set_header_footer(**params)
         raise ValueError(
             f'Unsupported Writer feature recipe {feature_name!r}. '
-            'Use a supported method from the complete facade manifest already returned for this document.'
+            'Query the corresponding unoApi module and use one of its installed facade examples.'
         )
 
     def add_table(self, element_id, rows, column_widths=None, header=True, font_size=10):
@@ -1578,8 +1610,7 @@ class WriterLayout:
         }
         if suffix not in filters:
             raise ValueError(f'Unsupported Writer output extension: {suffix}')
-        properties = (self.job.property('FilterName', filters[suffix]), self.job.property('Overwrite', True))
-        (self._component.storeToURL if suffix == '.pdf' else self._component.storeAsURL)(self.job.output_url, properties)
+        save_document(self._component, self.job)
         return self
 
     def close(self):
@@ -1770,9 +1801,57 @@ class PresentationSlide:
             return self.deck._rect(box, default_unit='in')
         return self.deck._rect(self.slot(slot or 'body'))
 
+    def _text_box(self, slot=None, box=None):
+        if box is None:
+            return self._box(slot, box)
+        if isinstance(box, dict) and 'height' not in box and 'h' not in box:
+            provisional = {**box, 'height': 1}
+            area = self.deck._rect(provisional, default_unit='in')
+            area.pop('height', None)
+            return area
+        return self._box(slot, box)
+
+    def grid(self, columns, rows, slot='body', box=None, gap=0.24,
+             column_weights=None, row_weights=None):
+        """PptxGenJS-like inch grid whose cells can be passed back unchanged."""
+        if isinstance(gap, (list, tuple)):
+            if len(gap) != 2:
+                raise ValueError('Slide grid gap must be inches or a two-item inch tuple.')
+            resolved_gap = tuple(self.deck.inch(value) for value in gap)
+        else:
+            resolved_gap = self.deck.inch(gap)
+        return self.deck.grid(
+            columns, rows, box=self._box(slot, box), gap=resolved_gap,
+            column_weights=column_weights, row_weights=row_weights,
+        )
+
+    def stack(self, count, slot='body', box=None, direction='vertical', gap=0.18, weights=None):
+        """PptxGenJS-like inch stack whose cells retain their geometry unit."""
+        return self.deck.stack(
+            count, box=self._box(slot, box), direction=direction,
+            gap=self.deck.inch(gap), weights=weights,
+        )
+
     def add_text(self, element_id, text, slot=None, box=None, style=None, **options):
+        auto_height = bool(options.pop('auto_height', options.pop('autoHeight', False)))
         resolved = self.deck._normalized_text_options({**dict(style or {}), **options})
-        area = self._box(slot, box)
+        if 'padding' in resolved:
+            padding_value = float(resolved['padding'])
+            # Slide facade geometry mirrors PptxGenJS and defaults to inches.
+            # Preserve explicit deck.mm(...) values, which are necessarily much
+            # larger than a practical inch padding value.
+            resolved['padding'] = self.deck.inch(padding_value) if abs(padding_value) <= 2 else int(padding_value)
+        area = self._text_box(slot, box)
+        if auto_height:
+            area.pop('height', None)
+        if 'height' not in area:
+            inset = self.deck.mm(1) if resolved.get('padding') is None else max(0, int(resolved['padding']))
+            minimum = resolved.get('min_font_size', resolved.get('font_size', 18))
+            metrics = self.deck.estimate_text_box(
+                text, area['width'], resolved.get('font_size', 18), inset, minimum,
+                resolved.get('line_spacing', 1.15),
+            )
+            area['height'] = metrics['height']
         background = resolved.pop('background', resolved.pop('fill', None))
         border = resolved.pop('border', resolved.pop('line', None))
         background_transparency = resolved.pop('background_transparency', resolved.pop('fill_transparency', 0))
@@ -1805,10 +1884,12 @@ class PresentationSlide:
                  style=None, **options):
         resolved = dict(style or {})
         resolved.update(options)
-        return self.deck.add_text_link(
-            self._id(element_id), self._page, text, self._box(slot, box),
-            url=url, target_slide_id=target_slide_id, **resolved,
-        )
+        resolved['link'] = {'url': url, 'target_slide_id': target_slide_id}
+        # Route through add_text so link cards receive the same normalized
+        # style, padding, optional background/border surface, and collision
+        # semantics as ordinary facade text. This mirrors PptxGenJS hyperlink
+        # text instead of leaking lower-level add_text_link parameters.
+        return self.add_text(element_id, text, slot=slot, box=box, style=resolved)
 
     def add_image(self, element_id, asset_name, slot=None, box=None, contain=True, padding=0, **options):
         area = self._box(slot, box)
@@ -1872,6 +1953,10 @@ class PresentationSlide:
         return image
 
     def add_table(self, element_id, rows, slot=None, box=None, **options):
+        if 'col_widths' in options:
+            if 'column_weights' in options:
+                raise ValueError("Presentation table accepts either 'column_weights' or its 'col_widths' alias, not both.")
+            options['column_weights'] = options.pop('col_widths')
         scoped_id = self._id(element_id)
         shape = self.deck.add_native_table(
             scoped_id, self._page, self._box(slot, box), rows, **options,
@@ -1968,11 +2053,41 @@ class PresentationSlide:
         self.deck.job.record_feature('bulletList')
         return shape
 
-    def set_background(self, color, transparency=0):
+    def set_background(self, color, *gradient_args, transparency=0, gradient=None):
+        """Set a solid or gradient slide background.
+
+        Supported forms are ``set_background('#F8FAFC', transparency=0)``,
+        ``set_background('linear', '#020617', '#1E3A8A', 135)``, and
+        ``set_background('#020617', gradient={...})``. The positional gradient
+        form is intentionally accepted because it is the natural counterpart
+        to PptxGenJS-style background recipes and avoids forcing a full-slide
+        decorative shape into user-authored layout calculations.
+        """
+        fill = color
+        gradient_values = dict(gradient or {}) if gradient is not None else None
+        if gradient_args:
+            style = str(color or '').strip().lower()
+            if style not in {'linear', 'axial', 'radial', 'elliptical', 'square', 'rectangular'}:
+                raise ValueError(
+                    'PresentationSlide.set_background positional gradient form requires '
+                    "style 'linear', 'axial', 'radial', 'elliptical', 'square', or 'rectangular'."
+                )
+            if len(gradient_args) not in {2, 3}:
+                raise ValueError(
+                    'PresentationSlide.set_background gradient form is '
+                    'set_background(style, start_color, end_color, angle=0).'
+                )
+            fill = gradient_args[0]
+            gradient_values = {
+                'style': style,
+                'start_color': gradient_args[0],
+                'end_color': gradient_args[1],
+                'angle': gradient_args[2] if len(gradient_args) == 3 else 0,
+            }
         bounds = self.deck.bounds()
         return self.deck.add_shape(
             self._id('background'), self._page, 0, 0, bounds['width'], bounds['height'],
-            fill=color, fill_transparency=transparency,
+            fill=fill, fill_transparency=transparency, gradient=gradient_values,
             layout_role='background', allow_overlap=True,
         )
 
@@ -2166,7 +2281,7 @@ class PresentationLayout:
         return int(round(float(value) * POINT_TO_100TH_MM))
 
     @staticmethod
-    def text_height(font_size, lines=1, padding=0, line_spacing=1.22):
+    def text_height(font_size, lines=1, padding=0, line_spacing=1.15):
         return presentation_text_height(font_size, lines=lines, padding=padding, line_spacing=line_spacing)
 
     @staticmethod
@@ -2363,7 +2478,7 @@ class PresentationLayout:
         return 1
 
     def estimate_text_box(self, text, width, font_size=18, padding=0, min_font_size=None,
-                          line_spacing=1.22):
+                          line_spacing=1.15):
         """Return safe text metrics without relying on TextShape minimum-frame noise."""
         requested_size = max(1.0, float(font_size))
         minimum_size = requested_size if min_font_size is None else max(1.0, float(min_font_size))
@@ -2416,7 +2531,7 @@ class PresentationLayout:
                 f'Presentation margins leave no usable content area: margins={resolved_margins}, '
                 f'slideWidth={int(bounds["width"])}, slideHeight={int(bounds["height"])}'
             )
-        return {'x': left, 'y': top, 'width': width, 'height': height}
+        return {'x': left, 'y': top, 'width': width, 'height': height, '_unit': 'hmm'}
 
     @staticmethod
     def _normalized_weights(count, weights):
@@ -2458,6 +2573,7 @@ class PresentationLayout:
                 cells.append({
                     'x': cell_x, 'y': cell_y,
                     'width': column_width, 'height': row_height,
+                    '_unit': 'hmm',
                 })
                 cell_x += column_width + gap_x
             cell_y += row_height + gap_y
@@ -2560,7 +2676,10 @@ class PresentationLayout:
                 'color': 0x172033, 'padding': 0, 'valign': 'CENTER',
             }
             style.update(title_style or {})
-            result.add_text('title', title, slot='title', style=style)
+            if 'title' in result._slots:
+                result.add_text('title', title, slot='title', style=style)
+            else:
+                result.add_text('title', title, box=(0.7, 0.5, 11.93, 0.72), style=style)
         return result
 
     def slides(self):
@@ -2639,7 +2758,7 @@ class PresentationLayout:
         if name != 'presentation.transition@1':
             raise ValueError(
                 f'Unsupported presentation feature recipe {feature_name!r}. '
-                'Use a supported method from the complete facade manifest already returned for this document.'
+                'Query the corresponding unoApi module and use one of its installed facade examples.'
             )
         if not isinstance(slide, PresentationSlide):
             raise ValueError('presentation.transition@1 requires the PresentationSlide returned by deck.slide().')
@@ -2724,7 +2843,6 @@ class PresentationLayout:
                     ),
                 }
                 self.job.layout_issues.append(issue)
-                raise ValueError('__WEBPILOT_LAYOUT_DIAGNOSTICS__' + json.dumps([issue], ensure_ascii=False))
         shape = self._component.createInstance(service)
         shape.Position, shape.Size = point(int(x), int(y)), size(int(width), int(height))
         page.add(shape)
@@ -2739,7 +2857,7 @@ class PresentationLayout:
     def add_text(self, element_id, page, text, x, y, width, height, font_size=18, color=0x000000,
                  bold=False, italic=False, align='LEFT', font_name=None, fit='shrink', min_font_size=8,
                  padding=0, valign='TOP', layout_role='content', allow_overlap=False,
-                 underline=False, strike=False, rotation=0, line_spacing=None):
+                 underline=False, strike=False, rotation=0, line_spacing=None, _unit=None):
         shape = self._add_shape(
             page, element_id, 'com.sun.star.drawing.TextShape', x, y, width, height, 'text',
             layout_role=layout_role, allow_overlap=allow_overlap,
@@ -2841,7 +2959,7 @@ class PresentationLayout:
         missing = [key for key in ('x', 'y', 'width') if key not in box]
         if missing:
             raise ValueError(f'Presentation text box is missing {missing[0]!r}.')
-        inset = self.mm(2) if padding is None else max(0, int(padding))
+        inset = self.mm(1) if padding is None else max(0, int(padding))
         minimum = float(font_size) if min_font_size is None else float(min_font_size)
         metrics = self.estimate_text_box(text, int(box['width']), font_size, inset, minimum)
         height = int(box.get('height', metrics['height']))
@@ -2988,7 +3106,7 @@ class PresentationLayout:
     def add_shape(self, element_id, page, x, y, width, height, service=None, shape_type='rectangle',
                   fill=None, line=None, line_width=0, fill_transparency=0,
                   layout_role='decoration', allow_overlap=True, rotation=0, gradient=None,
-                  transparency=None):
+                  transparency=None, _unit=None):
         services = {
             'rectangle': 'com.sun.star.drawing.RectangleShape',
             'round-rectangle': 'com.sun.star.drawing.RectangleShape',
@@ -3151,7 +3269,7 @@ class PresentationLayout:
     def add_image(self, element_id, page, asset_name, x, y, width, height,
                   layout_role='content', allow_overlap=False, crop=None,
                   rotation=0, transparency=0, alt_text=None, title=None,
-                  source=None):
+                  source=None, _unit=None):
         shape = self._add_shape(
             page, element_id, 'com.sun.star.drawing.GraphicObjectShape', x, y, width, height, 'image',
             layout_role=layout_role, allow_overlap=allow_overlap,
@@ -3201,7 +3319,7 @@ class PresentationLayout:
             pass
         return shape
 
-    def add_native_table(self, element_id, page, box, rows, column_weights=None,
+    def add_native_table(self, element_id, page, box, rows, column_weights=None, header=True,
                          header_fill=0x0F172A, header_color=0xFFFFFF,
                          body_fill=0xF8FAFC, alternate_fill=0xFFFFFF,
                          body_color=0x1E293B, font_size=11, font_name=None,
@@ -3238,8 +3356,9 @@ class PresentationLayout:
             for column_index, value in enumerate(values):
                 cell = table.getCellByPosition(column_index, row_index)
                 cell.String = '' if value is None else str(value)
+                is_header = bool(header) and row_index == 0
                 try:
-                    cell.FillColor = office_color(header_fill if row_index == 0 else (
+                    cell.FillColor = office_color(header_fill if is_header else (
                         body_fill if row_index % 2 else alternate_fill
                     ), 'table fill')
                 except Exception:
@@ -3247,11 +3366,11 @@ class PresentationLayout:
                 cursor = cell.createTextCursor()
                 cursor.gotoEnd(True)
                 cursor.CharHeight = float(font_size)
-                cursor.CharWeight = 150.0 if row_index == 0 else 100.0
-                cursor.CharColor = office_color(header_color if row_index == 0 else body_color, 'table text color')
+                cursor.CharWeight = 150.0 if is_header else 100.0
+                cursor.CharColor = office_color(header_color if is_header else body_color, 'table text color')
                 if font_name:
                     cursor.CharFontName = str(font_name)
-                alignment = 'CENTER' if row_index == 0 or column_index > 0 else str(first_column_align).upper()
+                alignment = 'CENTER' if is_header or column_index > 0 else str(first_column_align).upper()
                 cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', alignment)
                 try:
                     cell.TextVerticalAdjust = uno.Enum('com.sun.star.drawing.TextVerticalAdjust', 'CENTER')
@@ -4717,7 +4836,7 @@ class SpreadsheetLayout:
             return self.merge_cells(element_id, sheet._sheet, cell_range)
         raise ValueError(
             f'Unsupported Calc feature recipe {feature_name!r}. '
-            'Use a supported method from the complete facade manifest already returned for this document.'
+            'Query the corresponding unoApi module and use one of its installed facade examples.'
         )
 
     def save(self):
@@ -4781,7 +4900,7 @@ def validate_program(source: str):
             if name == 'expert':
                 diagnostics.append({
                     'code': 'MODEL_RAW_UNO_FORBIDDEN', 'line': node.lineno, 'column': node.col_offset + 1,
-                    'message': 'job.expert() is not model-facing. Use a supported method from the complete facade manifest already returned for this document.',
+                    'message': 'job.expert() is not model-facing. Query the corresponding unoApi module and use one of its installed facade examples.',
                     'severity': 'error',
                 })
         if isinstance(node, ast.Attribute) and node.attr in {'raw', '_component', '_page', '_sheet'}:
@@ -4916,13 +5035,16 @@ def facade_api_reference(document_type):
     """
     classes = {
         'word': (
+            ('job', DocumentJob),
             ('document', WriterLayout),
         ),
         'spreadsheet': (
+            ('job', DocumentJob),
             ('workbook', SpreadsheetLayout),
             ('sheet', SpreadsheetSheet),
         ),
         'presentation': (
+            ('job', DocumentJob),
             ('deck', PresentationLayout),
             ('slide', PresentationSlide),
             ('shape', PresentationShape),
@@ -4972,8 +5094,9 @@ def facade_value_schemas(document_type):
                     '[x, y, width, height]',
                     "{'x': x, 'y': y, 'width': width, 'height': height}",
                     "{'x': x, 'y': y, 'w': width, 'h': height}",
+                    "text only: {'x': x, 'y': y, 'w': width} with measured height",
                 ],
-                'rules': 'Positive fractional width/height are valid; values are not truncated to integers.',
+                'rules': 'Positive fractional width/height are valid; values are not truncated. Rectangles returned by deck/slide content_box, grid, stack, and slot retain _unit=hmm and can be passed directly without conversion.',
             },
             'textStyle': {
                 'keys': [
@@ -4994,6 +5117,16 @@ def facade_value_schemas(document_type):
                 ],
                 'line': "color or {'color': color, 'width': points, 'transparency': 0..100}",
                 'keys': ['fill', 'line', 'line_width', 'gradient', 'rotation', 'transparency', 'fill_transparency', 'allow_overlap', 'layout_role'],
+            },
+            'gradient': {
+                'keys': ['style', 'start_color', 'end_color', 'angle', 'border', 'x_offset', 'y_offset', 'start_intensity', 'end_intensity'],
+                'camelCaseAliases': ['startColor', 'endColor', 'xOffset', 'yOffset', 'startIntensity', 'endIntensity'],
+                'example': {'style': 'linear', 'start_color': '#0F172A', 'end_color': '#2563EB', 'angle': 45, 'border': 0, 'x_offset': 50, 'y_offset': 50, 'start_intensity': 100, 'end_intensity': 90},
+                'rejectedKeys': ['type', 'colors'],
+            },
+            'layoutRole': {
+                'values': ['content', 'container', 'decoration', 'background'],
+                'rule': 'Content participates in overlap validation. Containers, decoration, and backgrounds describe intentional non-content layers; do not use them to hide text/image collisions.',
             },
             'chartSeries': {
                 'singleSeries': "values=[12, 18, 27], series_name='Revenue'",
@@ -5029,12 +5162,25 @@ deck.set_doc_info(title='Annual review', author='WebPilot', keywords=['review', 
 # ... add every slide ...
 deck.save()
 deck.close()""",
+            'documentIntrospection': """slide_summaries = deck.slides()
+master_summaries = deck.masters()
+# Each returned item is plain metadata; continue authoring through deck/slide facade methods.""",
             'layouts': """cover = deck.slide('cover', layout='title-cover', title='Annual review')
 section = deck.slide('section', layout='title-section', title='02  Market')
 content = deck.slide('content', layout='title-content', title='Highlights')
 comparison = deck.slide('compare', layout='title-two-column', title='Actual vs plan')
 dashboard = deck.slide('dashboard', layout='title-three-column', title='Dashboard')
 blank = deck.slide('blank', layout='blank')""",
+            'allocatedLayout': """slide = deck.slide('kpis', layout='title-content', title='Key metrics')
+# Prefer slide.grid/stack for inch-first composition. Returned cells retain a
+# unit marker and can be passed directly to every slide.add_* call.
+cards = slide.grid(3, 1, slot='body', gap=0.25)
+for index, cell in enumerate(cards):
+    slide.add_card(f'kpi-{index + 1}', f'KPI {index + 1}', 'Measured body copy',
+        box=cell, title_size=20, body_size=16, fill='#EFF6FF', accent='#2563EB')
+rows = slide.stack(2, box=(0.8, 1.6, 5.6, 4.8), gap=0.20, weights=[1, 1])
+slide.add_text('row-1', 'Auto-height text', box={'x': 0.8, 'y': 1.6, 'w': 5.6},
+    auto_height=True, style={'font_size': 18, 'min_font_size': 16, 'padding': 0.04})""",
             'textAndPanel': """slide.add_text(
     'insight', 'Revenue grew 18% year over year.', box=(0.8, 1.4, 5.4, 1.1),
     style={'font_size': 24, 'min_font_size': 18, 'bold': True,
@@ -5051,20 +5197,40 @@ slide.add_link('source-link', 'Open source', box=(0.8, 6.6, 2.0, 0.35), url='htt
     'jwst', 'jwst.jpg', 'James Webb Space Telescope',
     source='NASA / ESA / CSA', alt_text='JWST in space',
     box=(0.8, 1.6, 5.7, 4.8), contain=True, caption_height=0.62)""",
+            'imagePlacementVariants': """slide.add_image(
+    'contained-photo', 'photo.jpg', box=(0.8, 1.5, 5.4, 3.4), contain=True,
+    padding=0.08, rotation=0, transparency=0,
+    title='Mission photograph', alt_text='Mission hardware in a clean room',
+    source='NASA')
+slide.add_image(
+    'cropped-photo', 'photo.jpg', box=(6.8, 1.5, 5.4, 3.4), contain=False,
+    crop={'left': 100, 'top': 50, 'right': 100, 'bottom': 50})""",
             'shapesAndConnector': """left = slide.add_shape('left-node', box=(0.8, 2.0, 2.2, 1.0),
     shape_type='round-rectangle', fill='#DBEAFE',
     line={'color': '#2563EB', 'width': 1.5})
 right = slide.add_shape('right-node', box={'x': 4.2, 'y': 2.0, 'w': 2.2, 'h': 1.0},
-    shape_type='diamond', fill='0xDCFCE7', transparency=5)
+    shape_type='diamond', gradient={'style': 'linear', 'start_color': '#DCFCE7',
+        'end_color': '#86EFAC', 'angle': 45, 'border': 0,
+        'x_offset': 50, 'y_offset': 50, 'start_intensity': 100, 'end_intensity': 85},
+    transparency=5)
 slide.connect('flow', 'left-node', 'right-node', color='#64748B', width=2,
     startArrow='none', endArrow='triangle')
 left.set_text('Input', {'font_size': 18, 'bold': True, 'valign': 'MIDDLE'})
-right.set_text('Decision', {'font_size': 18, 'bold': True, 'valign': 'CENTER'})""",
+right.set_text('Decision', {'font_size': 18, 'bold': True, 'valign': 'CENTER'})
+slide.set_background('#F8FAFC', transparency=0)
+group = slide.group('decision-flow', [left, right])""",
             'nativeTableAndEdit': """table = slide.add_table('metrics', [
     ['Metric', 'Actual', 'Plan'], ['Revenue', '190', '180'], ['Margin', '31%', '29%'],
-], box=(0.8, 1.6, 6.0, 3.2), header=True, font_size=14)
+], box=(0.8, 1.6, 6.0, 3.2), column_weights=[2, 1, 1], header=True,
+    header_fill='#0F172A', header_color='#FFFFFF', body_fill='#F8FAFC',
+    alternate_fill='#FFFFFF', body_color='#1E293B', font_size=14,
+    font_name='Calibri', first_column_align='LEFT')
 table.set_cell(1, 1, '195', bold=True, color='#166534')
-table.merge('A4', 'C4')""",
+table.merge('A4', 'C4')
+# Use header=False when the first row is ordinary body data. col_widths is a
+# compatibility alias for column_weights; never pass both names together.
+plain = slide.add_table('plain-data', [['A', '1'], ['B', '2']],
+    box=(7.2, 1.6, 4.8, 2.4), header=False, col_widths=[2, 1])""",
             'nativeColumnChart': """slide.add_chart(
     'revenue-chart', 'column', ['Q1', 'Q2', 'Q3', 'Q4'],
     box=(6.8, 1.5, 5.7, 4.8),
@@ -5084,10 +5250,24 @@ table.merge('A4', 'C4')""",
     {'title': '2027 H1', 'body': 'Scale'}, {'title': '2027 H2', 'body': 'Expand'},
     {'title': '2028', 'body': 'Optimize'},
 ], box=(0.7, 1.6, 12.0, 4.9), max_items_per_row=4)""",
-            'backgroundTransitionAndNotes': """slide.set_background('#F8FAFC')
+            'backgroundTransitionAndNotes': """slide.set_background('#F8FAFC', transparency=0)
+# Full-slide gradients are first-class and excluded from content-overlap checks.
+slide.set_background('linear', '#020617', '#1E3A8A', 135)
+# The equivalent explicit schema is also supported:
+slide.set_background('#020617', gradient={'style': 'linear',
+    'start_color': '#020617', 'end_color': '#1E3A8A', 'angle': 135})
 slide.set_transition('fade', speed='medium')
 slide.set_notes('speaker-notes', 'Explain the assumptions before discussing the forecast.')
 slide.add_comment('review-comment', 'Verify source date.', author='Reviewer')""",
+            'professionalFeatures': """media = slide.add_media(
+    'demo-video', 'demo.mp4', box=(0.8, 1.5, 5.4, 3.2), media_type='video')
+shape = slide.add_shape('animated-card', box=(6.7, 1.5, 5.2, 1.0),
+    shape_type='round-rectangle', fill='#DBEAFE')
+slide.animate(shape, effect='fade', speed='medium')
+slide.apply_master(index=0)
+slide.add_field('page-number', field_type='page-number',
+    box=(11.8, 7.0, 0.7, 0.25), style={'font_size': 10, 'align': 'RIGHT'})
+deck.add_custom_show('Executive review', [0])""",
             'existingDeckEdit': """deck = job.presentation('source', source_name='source.pptx')
 slide = deck.select_slide('target-slide', index=2)
 shape = slide.select_shape('target-title', text='Old title')
@@ -5096,6 +5276,26 @@ shape.set_box((0.8, 0.45, 11.7, 0.7))
 shape.set_style(font_size=28, color='#0F172A', bold=True)
 deck.save()
 deck.close()""",
+            'existingSlideOperations': """selected = deck.select_slide('selected-slide', name='Overview')
+copied = deck.duplicate_slide('copied-slide', index=1)
+deck.move_slide(from_index=2, to_index=0)
+deck.remove_slide(index=3)""",
+            'existingShapeOperations': """shape = slide.select_shape('selected-shape', name='Title 1')
+shape.set_text('Updated title', {'font_size': 28, 'bold': True})
+shape.replace_text('Updated', 'Final', replace_all=False)
+shape.set_box((0.8, 0.45, 11.7, 0.7))
+shape.set_style(fill='#EFF6FF', color='#0F172A', bold=True)
+shape.bring_to_front()
+shape.send_to_back()
+shape.remove()""",
+            'preserveOnlyDeck': """deck = job.presentation('source', source_name='source.pptx')
+# SmartArt, Morph, ActiveX, and OLE content is preserve-only: do not select,
+# recreate, rewrite, or emulate it. Make supported edits elsewhere, then save.
+deck.save()
+deck.close()""",
+            'unsupportedPresentationAuthoring': """# No facade call exists for authoring SmartArt, Morph, VBA, digital
+# signatures, or IRM policy. Do not guess a raw UNO fallback; report the
+# unsupported requirement or preserve existing package content unchanged.""",
         }
     if document_type == 'word':
         return {
@@ -5143,6 +5343,20 @@ document.add_page_break('next-page')""",
 document.replace_text('requested-change', 'Old exact text', 'New text', replace_all=False)
 document.save()
 document.close()""",
+            'contentControl': """document.add_content_control(
+    'customer-name', text='Enter customer name', tag='customer_name',
+    title='Customer name', locked=False)""",
+            'mailMergeProtection': """document.add_mail_merge_field(
+    'customer-email', database='Customers', table='Contacts', column='Email')
+document.protect(password='review-only')""",
+            'preserveOnlyDocument': """document = job.writer('source', source_name='source.docx')
+# Tracked changes and complex embedded OLE content are preserve-only. Do not
+# select, recreate, accept/reject, rewrite, or emulate them through guessed APIs.
+document.save()
+document.close()""",
+            'unsupportedWriterAuthoring': """# No facade call exists for authoring VBA, digital signatures, or IRM policy.
+# Do not guess a raw UNO fallback; report the unsupported requirement or
+# preserve existing package content unchanged.""",
         }
     return {
         'documentLifecycle': """workbook = job.spreadsheet('workbook')
@@ -5185,32 +5399,97 @@ sheet = workbook.select_sheet('summary', 'Summary')
 sheet.set_cell('updated-status', 'D2', 'Ready')
 workbook.save()
 workbook.close()""",
+        'preserveOnlyWorkbook': """workbook = job.spreadsheet('source', source_name='source.xlsx')
+# OOXML structured tables, slicers/timelines, modern charts, ActiveX, and
+# external links are preserve-only. Edit supported cells elsewhere, then save.
+workbook.save()
+workbook.close()""",
+        'unsupportedCalcAuthoring': """# No facade call exists for authoring slicers, VBA, digital signatures, or IRM.
+# Do not guess a raw UNO fallback; report the unsupported requirement or
+# preserve existing package content unchanged.""",
     }
 
 
+def facade_module_example_keys(document_type):
+    return {
+        'presentation': {
+            'presentation.document@2': ['documentLifecycle', 'documentIntrospection'],
+            'presentation.slide@2': ['documentLifecycle', 'layouts', 'allocatedLayout'],
+            'presentation.existing-slide@1': ['existingDeckEdit', 'existingSlideOperations'],
+            'presentation.existing-shape@1': ['existingDeckEdit', 'existingShapeOperations'],
+            'presentation.text@2': ['textAndPanel', 'richTextBulletsAndLink', 'allocatedLayout'],
+            'presentation.image@2': ['captionedImage', 'imagePlacementVariants'],
+            'presentation.shape@2': ['shapesAndConnector'],
+            'presentation.table@1': ['nativeTableAndEdit'],
+            'presentation.chart@2': ['nativeColumnChart', 'nativePieChart'],
+            'presentation.transition@1': ['backgroundTransitionAndNotes'],
+            'presentation.professional@1': ['backgroundTransitionAndNotes', 'professionalFeatures'],
+            'presentation.timeline@2': ['timeline'],
+            'presentation.smartart@1': ['preserveOnlyDeck'],
+            'presentation.morph@1': ['preserveOnlyDeck'],
+            'presentation.activex-ole@1': ['preserveOnlyDeck'],
+            'presentation.smartart-morph-vba-security-authoring@1': ['unsupportedPresentationAuthoring'],
+        },
+        'word': {
+            'writer.flow@2': ['documentLifecycle', 'flowAndStyles', 'existingDocumentEdit'],
+            'writer.styles@1': ['flowAndStyles'],
+            'writer.list@1': ['flowAndStyles'],
+            'writer.table@2': ['tableAndMerge'],
+            'writer.image-frame@1': ['imageAndFrame'],
+            'writer.page-style@1': ['documentLifecycle'],
+            'writer.header-footer@1': ['documentLifecycle'],
+            'writer.fields-navigation@1': ['navigationAndReview'],
+            'writer.notes-review@1': ['navigationAndReview'],
+            'writer.content-control@1': ['contentControl'],
+            'writer.objects@1': ['sectionsAndObjects'],
+            'writer.mail-merge-protection@1': ['mailMergeProtection'],
+            'writer.tracked-changes@1': ['preserveOnlyDocument'],
+            'writer.complex-ole@1': ['preserveOnlyDocument'],
+            'writer.vba-digital-signature-irm-authoring@1': ['unsupportedWriterAuthoring'],
+        },
+        'spreadsheet': {
+            'calc.sheet@2': ['documentLifecycle', 'existingWorkbookEdit'],
+            'calc.cell-range@2': ['cellsRangesAndFormatting'],
+            'calc.table@2': ['tableFilterAndFreeze'],
+            'calc.format@2': ['cellsRangesAndFormatting'],
+            'calc.freeze-merge@1': ['tableFilterAndFreeze'],
+            'calc.validation-conditional@1': ['validationAndConditionalFormatting'],
+            'calc.sort-filter-names-outline@1': ['tableFilterAndFreeze'],
+            'calc.chart-image@1': ['chartImageCommentAndLink'],
+            'calc.comments-links@1': ['chartImageCommentAndLink'],
+            'calc.print-protection@1': ['printProtectionAndAnalysis'],
+            'calc-pivot-scenario-goalseek@1': ['printProtectionAndAnalysis'],
+            'calc.structured-table@1': ['preserveOnlyWorkbook'],
+            'calc.slicer-timeline-modern-chart@1': ['preserveOnlyWorkbook'],
+            'calc.activex-external-link@1': ['preserveOnlyWorkbook'],
+            'calc.slicer-vba-signature-irm-authoring@1': ['unsupportedCalcAuthoring'],
+        },
+    }[document_type]
+
+
 def office_facade_cookbook(document_type, query=''):
-    """Return the complete model-facing Office API; raw UNO stays internal."""
+    """Return an exact, example-complete module from the model-facing facade."""
     shared_rules = [
         'Write exactly one synchronous create_document(job) function.',
         'Use only the returned high-level facade and versioned feature recipes. Never import uno or access com.sun.star services.',
         'Every document, slide, paragraph, table, chart, image, sheet, range, and feature call has a stable elementId.',
         'elementId accepts 1-128 non-whitespace Unicode characters, including Chinese. Child IDs on slide and worksheet facades are parent-scoped, so helpers may reuse role IDs across different parents.',
-        "Call unoApi once before authoring; this response contains the complete exact signature reference, value schemas, and copyable examples. Do not issue feature-by-feature API queries.",
+        "Query unoApi one module at a time before using that module. Each module response contains every matching installed signature, accepted value schema, and copyable example; copy these patterns instead of guessing.",
         "Presentation slide.add_* explicit box values default to inches, accept w/h aliases, and may set unit='in'|'mm'|'cm'|'pt'|'hmm'. Layout slots are already normalized.",
         'Use facade layout, flow, A1-address, style, and feature parameters; the worker owns UNO units, structs, enums, controllers, and output filters.',
         "A support level of preserve-only means existing content is package-compared and must survive unchanged; it is not an authoring API. unsupported means fail explicitly rather than emulating with raw UNO.",
-        'Call save() exactly once and close() exactly once. Failed validation keeps this same editable source for a focused edit.',
+        'Call save() exactly once and close() exactly once. Failed validation keeps this same editable source and may be repaired with multiple independent atomic edits in one call.',
     ]
     if document_type == 'presentation':
         capabilities = [
             {'id': 'presentation.document@2', 'support': 'full', 'kind': 'core', 'keywords': ['metadata', 'slides', 'master'], 'signature': "deck.set_doc_info(...); deck.slides(); deck.masters()", 'validation': ['package', 'reopen']},
-            {'id': 'presentation.slide@2', 'support': 'full', 'kind': 'core', 'keywords': ['slide', 'layout', 'slot'], 'signature': "deck.slide(element_id, layout='title-content', title=None, title_style=None); layouts: blank, cover/title-cover, section/title-section, title-only, title-content, title-two-column/comparison, title-three-column/dashboard", 'validation': ['bounds', 'overlap', 'text-fit']},
+            {'id': 'presentation.slide@2', 'support': 'full', 'kind': 'core', 'keywords': ['slide', 'layout', 'slot', 'grid', 'stack'], 'signature': "deck.slide(element_id, layout='title-content', title=None, title_style=None); slide.grid(columns,rows,slot='body',box=None,gap=0.24,...); slide.stack(count,slot='body',box=None,direction='vertical',gap=0.18,...); layouts: blank, cover/title-cover, section/title-section, title-only, title-content, title-two-column/comparison, title-three-column/dashboard", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.existing-slide@1', 'support': 'full', 'kind': 'edit', 'keywords': ['select', 'remove', 'move', 'duplicate'], 'signature': "deck.select_slide(element_id, index=None, name=None, text=None); deck.remove_slide(index); deck.move_slide(from_index, to_index); deck.duplicate_slide(element_id, index)", 'validation': ['slide-count', 'preservation']},
             {'id': 'presentation.existing-shape@1', 'support': 'full', 'kind': 'edit', 'keywords': ['shape', 'replace', 'resize', 'z-order'], 'signature': "slide.select_shape(element_id, index=None, name=None, text=None) -> shape.set_text/replace_text/set_box/set_style/remove/bring_to_front/send_to_back; slide.replace_text(...) ", 'validation': ['bounds', 'overlap', 'content']},
-            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link'], 'signature': "slide.add_text(...); slide.add_rich_text(element_id, runs,...); slide.add_bullets(element_id, items,...); style supports font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation", 'validation': ['bounds', 'overlap', 'text-fit']},
+            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link', 'auto-height'], 'signature': "slide.add_text(element_id,text,slot=None,box=None,style=None,auto_height=False); omit box h/height or set auto_height=True to derive measured height; slide.add_rich_text(...); slide.add_bullets(...); style supports font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.image@2', 'support': 'full', 'kind': 'core', 'keywords': ['image', 'crop', 'rotate', 'contain', 'caption', 'alt', 'source'], 'signature': "slide.add_image(element_id, asset_name, slot=None, box=None, contain=True, padding=0, crop=None, rotation=0, transparency=0, alt_text=None, title=None, source=None); slide.add_captioned_image(element_id, asset_name, caption, source=None, alt_text=None, ..., caption_height=0.62)", 'validation': ['bounds', 'aspect-ratio', 'embedded-media', 'accessibility-metadata', 'visible-identification']},
-            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(...); slide.set_background(color); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap']},
-            {'id': 'presentation.table@1', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'editable'], 'signature': "slide.add_table(element_id, rows, slot=None, box=None, **options)", 'validation': ['native-object', 'bounds', 'overlap']},
+            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(...); slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap']},
+            {'id': 'presentation.table@1', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'editable'], 'signature': "slide.add_table(element_id, rows, slot=None, box=None, column_weights=None, header=True, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT'); col_widths is accepted as an alias for column_weights", 'validation': ['native-object', 'bounds', 'overlap']},
             {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, **options); semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds']},
             {'id': 'presentation.transition@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['transition', 'fade', 'wipe'], 'signature': "slide.set_transition(effect='fade', speed='medium')", 'validation': ['feature-count', 'reopen']},
             {'id': 'presentation.professional@1', 'support': 'partial', 'kind': 'native', 'keywords': ['animation', 'notes', 'comments', 'media', 'custom-show', 'master', 'field'], 'signature': "slide.set_notes(element_id,text); slide.add_comment(...); slide.add_media(...); slide.animate(shape,...); slide.apply_master(...); slide.add_field(...); deck.add_custom_show(name, slide_indices)", 'validation': ['notes', 'comments', 'media', 'animation', 'master-layout', 'fields']},
@@ -5325,25 +5604,80 @@ def office_facade_cookbook(document_type, query=''):
         signatures = [item['signature'] for item in capabilities if item.get('signature')]
 
     normalized_query = str(query or '').strip().lower()
+    example_library = facade_example_library(document_type)
+    module_examples = facade_module_example_keys(document_type)
+    missing_example_modules = [
+        item['id'] for item in capabilities
+        if not module_examples.get(item['id'])
+        or any(key not in example_library for key in module_examples.get(item['id'], []))
+    ]
+    if missing_example_modules:
+        raise RuntimeError(
+            'Facade cookbook modules require complete installed examples: '
+            + ', '.join(missing_example_modules)
+        )
+    module_index = [{
+        'query': item['id'],
+        'support': item.get('support', 'full'),
+        'kind': item.get('kind'),
+        'keywords': item.get('keywords', []),
+        'exampleGroups': module_examples.get(item['id'], []),
+    } for item in capabilities]
+    query_terms = [term for term in re.split(r'[^a-z0-9_.-]+', normalized_query) if term]
+    selected = []
+    if normalized_query:
+        for item in capabilities:
+            identity = str(item.get('id', '')).lower()
+            identity_without_version = identity.split('@', 1)[0]
+            haystack = ' '.join([
+                identity,
+                identity_without_version,
+                str(item.get('kind', '')),
+                str(item.get('signature', '')),
+                *[str(value) for value in item.get('keywords', [])],
+            ]).lower()
+            if normalized_query in {identity, identity_without_version} or any(term in haystack for term in query_terms):
+                selected.append(item)
+    selected_example_keys = []
+    for item in selected:
+        for key in module_examples.get(item['id'], []):
+            if key in example_library and key not in selected_example_keys:
+                selected_example_keys.append(key)
+    selected_examples = {key: example_library[key] for key in selected_example_keys}
+    receiver_methods = set()
+    for text in [*[str(item.get('signature') or '') for item in selected], *selected_examples.values()]:
+        receiver_methods.update(re.findall(r'\b(job|document|workbook|sheet|deck|slide|shape|table)\.([A-Za-z_]\w*)\s*\(', text))
+    api_reference = [item for item in facade_api_reference(document_type) if (item['receiver'], item['method']) in receiver_methods]
     support_matrix = {
-        level: [item['id'] for item in capabilities if item.get('support', 'full') == level]
+        level: [item['id'] for item in selected if item.get('support', 'full') == level]
         for level in ('full', 'partial', 'preserve-only', 'unsupported')
     }
+    if not selected:
+        return {
+            'status': 'Choose one query from moduleIndex. Raw UNO reflection is intentionally not model-facing.',
+            'delivery': 'module-index',
+            'query': normalized_query or None,
+            'queryMatched': False,
+            'rules': shared_rules,
+            'moduleIndex': module_index,
+        }
     return {
         'status': 'Use only this installed high-level facade. Raw UNO reflection is intentionally not model-facing.',
-        'delivery': 'complete-executable-cookbook',
-        'queryIgnored': normalized_query or None,
-        'capabilities': capabilities,
-        'coverage': coverage,
+        'delivery': 'module-executable-cookbook',
+        'query': normalized_query,
+        'queryMatched': True,
+        'matchedModules': [item['id'] for item in selected],
+        'moduleIndex': module_index,
+        'capabilities': selected,
+        'coverage': sorted({value for item in selected for value in item.get('validation', [])}),
         'supportMatrix': support_matrix,
         'rules': shared_rules,
-        'facadeSignatures': signatures,
-        'apiReference': facade_api_reference(document_type),
+        'facadeSignatures': [item['signature'] for item in api_reference],
+        'apiReference': api_reference,
         'valueSchemas': facade_value_schemas(document_type),
-        'examples': facade_example_library(document_type),
-        'completeDocument': complete,
-        'completeExistingDocumentModification': modification,
-        'operations': operations,
+        'examples': selected_examples,
+        'examplesAreInstalledFacadeUsage': True,
+        'exampleCoverage': 'All example groups registered for every matched module are included without pagination.',
     }
 
 
@@ -5537,8 +5871,8 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
         facade_signatures = [
             "deck.bounds() -> {'kind': 'presentation', 'width': int, 'height': int}",
             "deck.mm(value), deck.cm(value), deck.inch(value), deck.pt(value) -> int geometry units",
-            "deck.text_height(font_size, lines=1, padding=0, line_spacing=1.22) -> safe height in 1/100 mm",
-            "deck.estimate_text_box(text, width, font_size=18, padding=0, min_font_size=None, line_spacing=1.22) -> text metrics",
+            "deck.text_height(font_size, lines=1, padding=0, line_spacing=1.15) -> safe height in 1/100 mm",
+            "deck.estimate_text_box(text, width, font_size=18, padding=0, min_font_size=None, line_spacing=1.15) -> text metrics",
             "deck.content_box(margins={'left': 1600, 'right': 1600, 'top': 1400, 'bottom': 1200}) -> {'x': int, 'y': int, 'width': int, 'height': int}; legacy tuple order is (left, right, top, bottom)",
             "deck.grid(columns, rows, box=None, gap=500, column_weights=None, row_weights=None) -> list[rect]",
             "deck.stack(count, box=None, direction='vertical', gap=400, weights=None) -> list[rect]",
@@ -6461,7 +6795,7 @@ def main():
             except AttributeError as error:
                 raise RuntimeError(
                     f'UNO draft attempted an unavailable member: {error}. '
-                    'Reuse the complete facade manifest already loaded for this document, copy its exact signature, '
+                    'Query the corresponding unoApi module, copy its exact installed signature and example, '
                     'and edit the current draft.py without another feature-discovery call.'
                 ) from error
         if args.required_source_asset and args.required_source_asset not in job.opened_documents:
@@ -6473,11 +6807,28 @@ def main():
             raise RuntimeError('create_document(job) did not create the requested output file')
         emit_progress('reopen', 'Reopening the saved Office artifact for structural verification')
         source = (assets / args.required_source_asset).resolve() if args.required_source_asset else None
-        verification = verify_and_preview(
-            soffice, profile.parent / 'verification-profile', output, preview,
-            args.document_type, source, job.element_map(),
-            context=context, desktop=desktop, existing_pipe=args.uno_pipe,
-        )
+        try:
+            verification = verify_and_preview(
+                soffice, profile.parent / 'verification-profile', output, preview,
+                args.document_type, source, job.element_map(),
+                context=context, desktop=desktop, existing_pipe=args.uno_pipe,
+            )
+        except Exception as error:
+            # Closing the authored component can occasionally dispose the
+            # shared Desktop after a shape-heavy Impress export. Re-running
+            # the complete draft is wasteful and can repeat non-idempotent
+            # work. Reopen the already-published candidate once in a fresh,
+            # isolated verifier instead.
+            message = str(error)
+            if ('DisposedException' not in message
+                    and 'Binary URP bridge already disposed' not in message
+                    and 'bridge disposed during call' not in message):
+                raise
+            emit_progress('bridge-retry', 'Reopening the saved artifact in a fresh LibreOffice verifier', 1, 1)
+            verification = verify_and_preview(
+                soffice, profile.parent / f'verification-profile-{uuid.uuid4().hex}', output, preview,
+                args.document_type, source, job.element_map(),
+            )
     finally:
         shutdown_office(process, desktop)
     emit_progress('visual', '结构验证完成，预览已生成')

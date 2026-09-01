@@ -88,6 +88,16 @@ export function browserChatAiCycleAnchorsText(
   return cycle.output.texts.some((candidate) => normalizedVisibleText(candidate) === normalizedText);
 }
 
+export function browserChatAiCycleTextIsAccepted(
+  messageStatus: string | undefined,
+  cycle: BrowserChatAiOutputCycleLike,
+  isTerminalAnswerCycle = false,
+) {
+  return messageStatus === undefined
+    || (messageStatus !== 'running' && Boolean(cycle.output.tools?.length))
+    || (messageStatus === 'passed' && isTerminalAnswerCycle);
+}
+
 export function browserChatTerminalAnswerCycleIndex(cycles: BrowserChatAiOutputCycleLike[]) {
   for (let index = cycles.length - 1; index >= 0; index -= 1) {
     const cycle = cycles[index];

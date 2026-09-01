@@ -7,47 +7,74 @@ import { resolveLibreOfficeExecutable } from './libreoffice';
 import { generateUnoProgramDocument, inspectUnoApi } from './uno-program';
 
 describe('UNO cookbook ownership boundaries', () => {
-  it('exposes only the compact presentation facade and versioned recipes', async () => {
+  it('registers at least one complete installed example for every facade module', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
-    const api = await inspectUnoApi({ documentType: 'presentation', limit: 1 });
+    for (const documentType of ['presentation', 'word', 'spreadsheet'] as const) {
+      const api = await inspectUnoApi({ documentType, query: '', limit: 1 });
+      const modules = (api as unknown as {
+        moduleIndex?: Array<{ exampleGroups?: string[]; query?: string }>;
+      }).moduleIndex || [];
+      expect(modules.length).toBeGreaterThan(0);
+      expect(modules.filter((module) => !module.exampleGroups?.length)).toEqual([]);
+    }
+  }, 120_000);
+
+  it('exposes only the queried presentation module with exact installed signatures and examples', async () => {
+    if (!await resolveLibreOfficeExecutable()) return;
+    const api = await inspectUnoApi({ documentType: 'presentation', query: 'presentation.professional', limit: 1 });
     const cookbook = api as unknown as {
-      completeExistingDocumentModification?: string;
       facadeSignatures?: string[];
-      operations?: Record<string, string>;
+      examples?: Record<string, string>;
+      matchedModules?: string[];
       rules?: string[];
     };
     expect(api.target).toBe('facade');
     expect(api.nativeReflectionExposed).toBe(false);
     expect(cookbook.rules?.some((rule) => rule.includes('Never import'))).toBe(true);
-    expect(JSON.stringify(cookbook.operations)).not.toMatch(/store(?:To|As)URL|createInstance|com\.sun\.star/);
-    expect(cookbook.completeExistingDocumentModification).not.toMatch(/store(?:To|As)URL/);
-    expect(cookbook.completeExistingDocumentModification).toContain('deck.save()');
-    expect(cookbook.completeExistingDocumentModification).not.toMatch(/job\.expert|import uno/);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('deck.slide'))).toBe(true);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('slide.add_text'))).toBe(true);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('slide.add_chart'))).toBe(true);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('slide.set_transition'))).toBe(true);
+    expect(cookbook.matchedModules).toContain('presentation.professional@1');
+    expect(JSON.stringify(cookbook.examples)).not.toMatch(/store(?:To|As)URL|createInstance|com\.sun\.star/);
+    expect(cookbook.examples?.backgroundTransitionAndNotes).toContain("slide.set_notes('speaker-notes',");
+    expect(cookbook.examples?.professionalFeatures).toContain('deck.add_custom_show');
+    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('slide.set_notes'))).toBe(true);
+    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('deck.add_custom_show'))).toBe(true);
   }, 60_000);
 
   it('executes the compact high-level presentation blueprint without raw UNO', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
-    const api = await inspectUnoApi({ documentType: 'presentation', limit: 1 });
-    const cookbook = api as unknown as { completeDocument?: string };
-    expect(cookbook.completeDocument).toContain('deck.slide');
-    expect(cookbook.completeDocument).toContain('slide.add_chart');
-    expect(cookbook.completeDocument).toContain('slide.set_transition');
-    expect(cookbook.completeDocument).not.toMatch(/com\.sun\.star|createInstance|import uno/);
+    const sourceCode = `def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('overview', layout='title-two-column', title='Quarterly overview')
+    slide.add_text('summary', 'Revenue and delivery remained on plan.', slot='left', style={'font_size': 20, 'min_font_size': 16, 'color': 0x334155})
+    slide.add_chart('revenue', 'column', ['Q1', 'Q2', 'Q3', 'Q4'], slot='right', values=[120, 145, 168, 190], series_name='Revenue', title='Quarterly revenue', x_axis_title='Quarter', y_axis_title='Revenue', show_legend=True)
+    slide.set_transition('fade', speed='medium')
+    grid_slide = deck.slide('grid', layout='title-content', title='Allocated layout')
+    left, right = grid_slide.grid(2, 1, slot='body', gap=0.3)
+    grid_slide.add_text('left', 'Unit-tagged grid cell', box=left, style={'font_size': 18, 'min_font_size': 16})
+    grid_slide.add_text('right', 'No double inch conversion', box=right, style={'font_size': 18, 'min_font_size': 16})
+    auto_slide = deck.slide('auto-text', layout='blank')
+    auto_slide.add_text('headline', 'Large auto-height title', box={'x': 0.8, 'y': 0.7, 'w': 11.7}, auto_height=True,
+                        style={'font_size': 78, 'min_font_size': 72, 'padding': 0})
+    auto_slide.add_link('overview-link', 'Back to overview', box=(0.8, 5.8, 3.2, 0.7), target_slide_id='overview',
+                        style={'font_size': 18, 'background': 0xE2E8F0, 'border': {'color': 0x64748B, 'width': 0.75}, 'padding': 0.12})
+    deck.save()
+    deck.close()`;
     const generated = await generateUnoProgramDocument({
       documentType: 'presentation',
       fileName: 'proven-high-level-blueprint.pptx',
-      sourceCode: cookbook.completeDocument!,
+      sourceCode,
     });
-    expect((generated.report.verification as { pages?: number }).pages).toBe(1);
+    expect((generated.report.verification as { pages?: number }).pages).toBe(3);
     const elements = generated.report.elementMap as Array<{ elementId?: string; kind?: string }>;
     expect(elements.some((entry) => entry.elementId === 'overview/title' && entry.kind === 'text')).toBe(true);
     expect(elements.some((entry) => entry.elementId === 'overview/summary' && entry.kind === 'text')).toBe(true);
     expect(elements.some((entry) => entry.elementId === 'overview/revenue' && entry.kind === 'chart')).toBe(true);
     expect(elements.some((entry) => entry.elementId === 'overview/transition' && entry.kind === 'slide-transition')).toBe(true);
+    expect(elements.some((entry) => entry.elementId === 'auto-text/overview-link' && entry.kind === 'text')).toBe(true);
+    const gridLeft = (generated.report.elementMap as Array<{
+      elementId?: string; layout?: { x?: number; width?: number };
+    }>).find((entry) => entry.elementId === 'grid/left');
+    expect(gridLeft?.layout?.x).toBeGreaterThan(0);
+    expect(gridLeft?.layout?.width).toBeLessThan(20_000);
     const archive = await JSZip.loadAsync(generated.buffer);
     expect(Object.keys(archive.files).filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name))).toHaveLength(1);
     const chartXml = await archive.file('ppt/charts/chart1.xml')?.async('string');
@@ -72,19 +99,21 @@ describe('UNO cookbook ownership boundaries', () => {
 
   it('executes the Writer flow facade as a native editable DOCX', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
-    const api = await inspectUnoApi({ documentType: 'word', limit: 1 });
-    const cookbook = api as unknown as { completeDocument?: string; facadeSignatures?: string[] };
-    expect(api.target).toBe('facade');
-    expect(api.nativeReflectionExposed).toBe(false);
-    expect(cookbook.completeDocument).toContain("document.feature('writer.page-style@1'");
-    expect(cookbook.completeDocument).toContain('document.add_numbered_list');
-    expect(cookbook.completeDocument).not.toMatch(/job\.expert|com\.sun\.star|createInstance|import uno/);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('document.add_table'))).toBe(true);
+    const sourceCode = `def create_document(job):
+    document = job.writer('report')
+    document.feature('writer.page-style@1', 'page', width=document.mm(210), height=document.mm(297), margins=(document.mm(20), document.mm(20), document.mm(18), document.mm(18)))
+    document.feature('writer.header-footer@1', 'chrome', header='Quarterly report', footer='Confidential')
+    document.add_title('title', 'Quarterly report')
+    document.add_paragraph('summary', 'Body content remains in native Writer flow.')
+    document.add_numbered_list('actions', ['Confirm scope', 'Publish result'])
+    document.add_table('metrics', [['Metric', 'Value'], ['Revenue', '190']], column_widths=[55, 45])
+    document.save()
+    document.close()`;
 
     const generated = await generateUnoProgramDocument({
       documentType: 'word',
       fileName: 'proven-writer-facade.docx',
-      sourceCode: cookbook.completeDocument!,
+      sourceCode,
     });
     expect((generated.report.verification as { format?: string }).format).toBe('word');
     const elements = generated.report.elementMap as Array<{ elementId?: string; kind?: string }>;
@@ -99,19 +128,20 @@ describe('UNO cookbook ownership boundaries', () => {
 
   it('executes the Calc A1 facade as a native editable XLSX', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
-    const api = await inspectUnoApi({ documentType: 'spreadsheet', limit: 1 });
-    const cookbook = api as unknown as { completeDocument?: string; facadeSignatures?: string[] };
-    expect(api.target).toBe('facade');
-    expect(api.nativeReflectionExposed).toBe(false);
-    expect(cookbook.completeDocument).toContain("workbook.sheet('summary', 'Summary')");
-    expect(cookbook.completeDocument).toContain('sheet.freeze(rows=1)');
-    expect(cookbook.completeDocument).not.toMatch(/job\.expert|com\.sun\.star|createInstance|import uno/);
-    expect(cookbook.facadeSignatures?.some((signature) => signature.includes('sheet.set_cell'))).toBe(true);
+    const sourceCode = `def create_document(job):
+    workbook = job.spreadsheet('workbook')
+    sheet = workbook.sheet('summary', 'Summary')
+    sheet.add_table('metrics', 'A1', [['Metric', 'Actual', 'Forecast'], ['Revenue', 1200, '=B2*1.2']])
+    sheet.column_width('metric-width', 'A', workbook.mm(42))
+    sheet.format('amounts', 'B2:C2', horizontal='RIGHT')
+    sheet.freeze(rows=1)
+    workbook.save()
+    workbook.close()`;
 
     const generated = await generateUnoProgramDocument({
       documentType: 'spreadsheet',
       fileName: 'proven-calc-facade.xlsx',
-      sourceCode: cookbook.completeDocument!,
+      sourceCode,
     });
     expect((generated.report.verification as { format?: string }).format).toBe('spreadsheet');
     const elements = generated.report.elementMap as Array<{ elementId?: string; kind?: string }>;
@@ -276,22 +306,31 @@ def create_document(job):
     expect(issues.filter((issue) => issue.severity === 'error')).toEqual([]);
   }, 120_000);
 
-  it('rejects unintended text overlap at the second add call', async () => {
+  it('collects every unintended text overlap before rejecting at save', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
-    await expect(generateUnoProgramDocument({
-      documentType: 'presentation',
-      fileName: 'immediate-overlap.pptx',
-      sourceCode: `
+    let failure = '';
+    try {
+      await generateUnoProgramDocument({
+        documentType: 'presentation',
+        fileName: 'batched-overlap.pptx',
+        sourceCode: `
 def create_document(job):
     deck = job.presentation('deck')
     slide = deck.slide('slide-01', layout='blank')
     box = {'x': 1, 'y': 1, 'w': 5, 'h': 1}
     slide.add_text('first', 'First label', box=box)
     slide.add_text('second', 'Second label', box=box)
+    slide.add_text('third', 'Third label', box=box)
     deck.save()
     deck.close()
 `,
-    })).rejects.toThrow(/overlaps existing 'slide-01\/first'/);
+      });
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+    expect(failure).toContain("slide-01/second' overlaps existing 'slide-01/first");
+    expect(failure).toContain("slide-01/third' overlaps existing 'slide-01/first");
+    expect(failure).toContain("slide-01/third' overlaps existing 'slide-01/second");
   }, 60_000);
 
   it('executes representative advanced Writer facade features', async () => {

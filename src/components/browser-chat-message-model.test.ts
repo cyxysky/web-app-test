@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   browserChatAiCycleAnchorsText,
+  browserChatAiCycleTextIsAccepted,
   browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
@@ -15,6 +16,20 @@ import {
   formatBrowserChatElapsedTime,
   isBrowserChatManualVerificationStatusText,
 } from './browser-chat-message-model';
+
+test('withholds text-only model cycles until the server accepts the terminal response', () => {
+  const textOnly = { id: 'answer', output: { texts: ['premature final'], tools: [] } };
+  const withTool = { id: 'progress', output: { texts: ['working'], tools: [{ name: 'file' }] } };
+
+  assert.equal(browserChatAiCycleTextIsAccepted('running', textOnly), false);
+  assert.equal(browserChatAiCycleTextIsAccepted('failed', textOnly), false);
+  assert.equal(browserChatAiCycleTextIsAccepted('blocked', textOnly), false);
+  assert.equal(browserChatAiCycleTextIsAccepted('passed', textOnly), false);
+  assert.equal(browserChatAiCycleTextIsAccepted('passed', textOnly, true), true);
+  assert.equal(browserChatAiCycleTextIsAccepted(undefined, textOnly), true);
+  assert.equal(browserChatAiCycleTextIsAccepted('running', withTool), false);
+  assert.equal(browserChatAiCycleTextIsAccepted('passed', withTool), true);
+});
 
 test('shows the streaming caret only while model text is actively streaming', () => {
   assert.equal(browserChatMessageIsTextStreaming({

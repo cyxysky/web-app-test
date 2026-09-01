@@ -34,15 +34,15 @@ import { racePromiseWithAbort } from './browser-chat-interrupt-state';
 const FILE_DOWNLOAD_TIMEOUT_MS = 120_000;
 const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
 const FILE_DOWNLOAD_RETRY_DELAYS_MS = [750, 1_500, 3_000] as const;
+const FILE_DOWNLOAD_MAX_RETRY_AFTER_MS = 2_000;
+const FILE_DOWNLOAD_MAX_CONCURRENT_PER_ORIGIN = 2;
 const FILE_DOWNLOAD_CACHE_VERSION = 'mime-extension-v1';
 const DOCUMENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const draftLocks = new Map<string, Promise<void>>();
 const activeDownloads = new Map<string, Promise<BrowserActionResult>>();
-const downloadDomainQueues = new Map<string, Promise<void>>();
-const downloadDomainCooldowns = new Map<string, number>();
+const downloadOriginStates = new Map<string, { active: number; waiters: Array<() => void> }>();
 const DRAFT_LOCK_WAIT_MS = 120_000;
 const STALE_DRAFT_LOCK_MS = 10 * 60_000;
-const MODEL_DIAGNOSTIC_LIMIT = 24;
 
 function officeOperationWasInterrupted(error: unknown, abortSignal?: AbortSignal) {
   if (abortSignal?.aborted) return true;
@@ -50,16 +50,8 @@ function officeOperationWasInterrupted(error: unknown, abortSignal?: AbortSignal
     .test(error instanceof Error ? error.message : String(error));
 }
 
-export function hasOnlyRetryableOfficeValidationFailure(draft: OfficeDocumentDraft) {
-  const diagnostics = draft.validationDiagnostics || [];
-  return diagnostics.length > 0 && diagnostics.every((diagnostic) => (
-    String(diagnostic.code || '') === 'UNO_BRIDGE_STARTUP'
-    || isUnoBridgeStartupError(diagnostic.message || '')
-    || officeOperationWasInterrupted(diagnostic.message || '')
-  ));
-}
 const TOOL_ERROR_MAX_CHARACTERS = 6_000;
-const OFFICE_PIPELINE_VERSION = 'office-pipeline-v9-complete-facade-and-preservation';
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v11-pptxgenjs-layout-units';
 const VISUAL_QA_PAGE_CHECKS = [
   'overlap', 'clipping', 'alignment', 'spacing', 'typography', 'contrast',
   'visualHierarchy', 'chartTableLegibility', 'imageQuality',
@@ -119,6 +111,9 @@ type GenerateUnoProgramInput = {
   runId?: string;
   documentId?: string;
   program?: string;
+  /** Required with baseDigest only for an intentional destructive replacement. */
+  replaceExisting?: boolean;
+  baseDigest?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
@@ -133,29 +128,15 @@ export type FileGenerationProgress = {
   total?: number;
 };
 
-export type UnoDraftLineEdit = {
-  /** Defaults to replaceRange for compatibility with existing calls. */
-  kind?: 'deleteRange' | 'insertAfter' | 'insertBefore' | 'replaceAll' | 'replaceRange' | 'replaceText';
-  /** One-based, inclusive global source line range from action=read. */
-  startLine?: number;
-  endLine?: number;
-  /** One-based anchor line for insertBefore/insertAfter. */
-  line?: number;
-  /** Exact current source text for replaceText. */
-  oldText?: string;
-  /** One-based occurrence for replaceText; omitted requires a unique match. */
-  occurrence?: number;
-  /** replaceRange applies newText exactly; opt in only when newText is relative to the replaced block. */
-  preserveIndent?: boolean;
-  newText: string;
-};
-
 type EditUnoProgramInput = {
   runId?: string;
   documentId?: string;
-  /** Optional @webpilot-unit path. Edits are scoped to that page/section source unit. */
+  /** Optional @webpilot-unit path. The patch is scoped to that page/section source unit. */
   path?: string;
-  edits?: UnoDraftLineEdit[];
+  /** Exact digest returned by the latest read for this draft or selected source unit. */
+  baseDigest?: string;
+  /** Codex apply_patch document. Each well-formed @@ hunk is applied independently. */
+  patch?: string;
   program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
@@ -212,6 +193,13 @@ type ArtifactToolPayload = {
   operation?: string;
   sourceCharacters?: number;
   cacheHit?: boolean;
+  changed?: boolean;
+  code?: string;
+  expectedBaseDigest?: string;
+  suppliedBaseDigest?: string;
+  patchBaseDigest?: string;
+  sourceDigest?: string;
+  sourceUnitPath?: string;
   validation?: string;
   validationStatus?: string;
   validationFailureCount?: number;
@@ -258,18 +246,10 @@ function compactValidationDiagnosticsForTool(
   diagnostics: OfficeDocumentDraft['validationDiagnostics'],
 ): NonNullable<OfficeDocumentDraft['validationDiagnostics']> {
   const values = diagnostics || [];
-  if (values.length <= MODEL_DIAGNOSTIC_LIMIT) {
-    return values.map((diagnostic) => ({ ...diagnostic, message: compactToolText(diagnostic.message, 1_500) }));
-  }
-  return [
-    ...values.slice(0, MODEL_DIAGNOSTIC_LIMIT - 1)
-      .map((diagnostic) => ({ ...diagnostic, message: compactToolText(diagnostic.message, 1_500) })),
-    {
-      code: 'DIAGNOSTICS_TRUNCATED',
-      message: `${values.length - (MODEL_DIAGNOSTIC_LIMIT - 1)} additional diagnostics are retained in the saved validation artifact. Repair the listed primary sources or replace the failed architecture; do not request the complete list repeatedly.`,
-      severity: 'warning',
-    },
-  ];
+  return values.map((diagnostic) => ({
+    ...diagnostic,
+    message: compactToolText(diagnostic.message, 1_500),
+  }));
 }
 
 function compactWorkflowForTool(workflow: OfficeDocumentDraft['workflow']) {
@@ -614,24 +594,56 @@ function compactVisualVerification(payload: ArtifactToolPayload) {
 }
 
 function compactOfficeFailure(payload: ArtifactToolPayload) {
-  const diagnostics = Array.isArray(payload.diagnostics)
-    ? payload.diagnostics.slice(0, 24).map((diagnostic) => {
+  type Diagnostic = NonNullable<ArtifactToolPayload['diagnostics']>[number];
+  const groupedDiagnostics = new Map<string, {
+    affectedCount: number;
+    diagnostic: Diagnostic;
+    elementIds: Set<string>;
+  }>();
+  for (const diagnostic of payload.diagnostics || []) {
+    const key = diagnostic.line
+      ? JSON.stringify([diagnostic.severity, diagnostic.code, diagnostic.line, diagnostic.column])
+      : JSON.stringify([
+        diagnostic.severity, diagnostic.code, diagnostic.page, diagnostic.target,
+        String(diagnostic.message || '').replace(/Affected runtime elements.*$/i, '').trim(),
+      ]);
+    const existing = groupedDiagnostics.get(key);
+    const elementIds = [
+      ...(diagnostic.elementIds || []),
+      ...(diagnostic.elementId ? [diagnostic.elementId] : []),
+    ];
+    if (existing) {
+      existing.affectedCount += 1;
+      elementIds.forEach((elementId) => existing.elementIds.add(elementId));
+    } else {
+      groupedDiagnostics.set(key, {
+        affectedCount: 1,
+        diagnostic,
+        elementIds: new Set(elementIds),
+      });
+    }
+  }
+  const diagnostics = Array.from(groupedDiagnostics.values())
+    .map(({ affectedCount, diagnostic, elementIds }) => {
       const location = diagnostic.line
           ? `@${diagnostic.line}${diagnostic.column ? `:${diagnostic.column}` : ''}`
           : diagnostic.page ? `@page-${diagnostic.page}`
             : diagnostic.target ? `@${diagnostic.target}` : '';
         const identity = [diagnostic.severity, diagnostic.code].filter(Boolean).join(':') || 'issue';
-        const message = String(diagnostic.message || '').replace(/\s+/g, ' ').trim().slice(0, 260);
-        const elements = Array.isArray(diagnostic.elementIds) && diagnostic.elementIds.length
-          ? `[elements=${diagnostic.elementIds.join(',')}]`
-          : diagnostic.elementId ? `[element=${diagnostic.elementId}]` : '';
+        const message = String(diagnostic.message || '')
+          .replace(/Affected runtime elements.*$/i, '')
+          .replace(/\s+/g, ' ').trim().slice(0, 260);
+        const visibleElementIds = Array.from(elementIds).slice(0, 8);
+        const elements = visibleElementIds.length
+          ? `[elements=${visibleElementIds.join(',')}${elementIds.size > visibleElementIds.length ? `,+${elementIds.size - visibleElementIds.length}` : ''}]`
+          : '';
+        const affected = affectedCount > 1 ? `[affected=${affectedCount}]` : '';
         const sourceExcerpt = String(diagnostic.sourceExcerpt || '').trim();
         const source = sourceExcerpt
-          ? ` [source=${sourceExcerpt.replace(/\s*\n\s*/g, ' ↵ ').slice(0, 1_200)}]`
+          ? ` [source=${sourceExcerpt.replace(/\s*\n\s*/g, ' ↵ ').slice(0, 700)}]`
           : '';
-        return `${identity}${location}${elements}${message ? `=${message}` : ''}${source}`;
-      })
-    : [];
+        return `${identity}${location}${affected}${elements}${message ? `=${message}` : ''}${source}`;
+      });
   const error = String(payload.error || 'validation failed').replace(/\s+/g, ' ').trim().slice(0, 1_200);
   const repairHints = Array.isArray(payload.repairHints)
     ? payload.repairHints.slice(0, 6).map((hint) => String(hint).replace(/\s+/g, ' ').trim().slice(0, 360)).filter(Boolean)
@@ -653,14 +665,17 @@ export function officeValidationRepairHints(
   const codes = new Set(diagnostics.map((diagnostic) => String(diagnostic.code || '')).filter(Boolean));
   const combinedError = [errorText, ...diagnostics.map((diagnostic) => diagnostic.message || '')].join('\n');
   const hints: string[] = [];
+  if (diagnostics.length > 1) {
+    hints.push(`The preflight returned ${diagnostics.length} diagnostics. Put every independent, non-overlapping repair into one Codex-format patch with separate @@ hunks; separate only repairs whose context or dependencies conflict.`);
+  }
   if (codes.has('PYTHON_SYNTAX')) {
-    hints.push('Repair only the exact block shown in the diagnostic sourceExcerpt. For unexpected indent, replace the exact offending line or smallest complete Python block and preserve the indentation copied from read; do not repeat unchanged neighboring lines or enable preserveIndent. The excerpt includes any opening-line reference from Python. Do not replace the complete source while a local syntax error remains.');
+    hints.push('Read every reported syntax block, then patch each smallest complete Python block. Copy context and indentation byte-for-byte from read; the patcher never adds or removes indentation implicitly. Do not replace the complete source for local syntax errors.');
   }
   if (codes.has('PYTHON_UNDEFINED_NAME')) {
     hints.push('Define the reported name before first use or replace it with the intended existing variable. Repair the exact sourceExcerpt; do not use numbered batch replacement for a local name error.');
   }
   if (codes.has('UNO_PYTHON_IMPORT_UNSUPPORTED')) {
-    hints.push('Remove the raw UNO import and replace the affected block with a method from the complete facade manifest already returned for this document. Never substitute enums, structs, constants, or service calls.');
+    hints.push('Remove the raw UNO import and replace the affected block with a method copied from the corresponding queried facade module. Never substitute enums, structs, constants, or service calls.');
   }
   if (codes.has('MODEL_RAW_UNO_FORBIDDEN')) {
     hints.push('Raw UNO is worker-owned. Keep the current document facade and replace only the reported raw block with a supported call from the already-loaded manifest; preserve-only/unsupported features must not be recreated.');
@@ -677,11 +692,14 @@ export function officeValidationRepairHints(
   if (codes.has('PRESENTATION_TEXT_BOX_TOO_SHORT')) {
     hints.push('The source mixes point font sizes with an undersized 1/100 mm geometry box. Replace the hand-sized height with deck.text_height()/estimate_text_box(), or use add_text_box/card/footer; keep min_font_size readable.');
   }
+  if (codes.has('PRESENTATION_OVERLAP')) {
+    hints.push('The layout preflight returned the complete overlap set for the document. Repair every independent reported pair in one patch, preserving exact source indentation; use allow_overlap=True only for a deliberate overlay.');
+  }
   if (codes.has('FACADE_METHOD_ON_RAW_UNO_DOCUMENT')) {
     hints.push('Replace the raw document receiver with job.presentation/job.writer/job.spreadsheet and keep every operation on its returned slide, flow-document, or A1 worksheet facade.');
   }
   if (codes.has('FACADE_COMPONENT_ACCESS_UNSUPPORTED')) {
-    hints.push('Do not inspect facade internals. Reuse the complete facade manifest already returned for the planned document.');
+    hints.push('Do not inspect facade internals. Query the corresponding unoApi module and use its installed signatures and examples.');
   }
   if (codes.has('ELEMENT_ID_AUTO_DISAMBIGUATED')) {
     hints.push('The artifact was kept valid by deterministic runtime ID disambiguation. On the next relevant edit, update the shared helper namespace once instead of renaming only the last reported object or rewriting the complete source.');
@@ -701,6 +719,9 @@ export function officeValidationRepairHints(
   if (codes.has('HELPER_OVERLAP_DEFAULT_ENABLED')) {
     hints.push('Default reusable layout helpers to allow_overlap=False. Pass True only at explicit background, container, or decorative call sites so content overlap remains detectable.');
   }
+  if (codes.has('UNO_API_METHOD_UNKNOWN') || codes.has('UNO_API_SIGNATURE_MISMATCH') || codes.has('UNO_API_ARGUMENT_INVALID')) {
+    hints.push('The AST preflight rejected a guessed facade method, signature, or nested value. Query the module named by the diagnostic and copy its installed signature and complete registered examples before editing every affected call site together.');
+  }
   if (codes.has('PPTX_ELEMENT_ID_MISSING')) {
     hints.push('A serialized slide object lacks its stable element marker. Recreate only that object through the PresentationSlide facade; raw objects and expert tagging are not model-facing.');
   }
@@ -711,10 +732,10 @@ export function officeValidationRepairHints(
     hints.push('Move or resize only the reported text element inside deck.bounds(). The stable facade now keeps text boxes at their requested size, so do not compensate with guessed page dimensions.');
   }
   if (codes.has('RUNTIME_TEXT_OVERLAP')) {
-    hints.push('Repair the primary reported element before its related elements, then validate again. Separate or resize only that local block; do not change a shared layout helper unless every caller is intentionally reflowed.');
+    hints.push('Repair every independent reported text-overlap pair in one patch. Separate or resize only those local blocks; do not change a shared layout helper unless every caller is intentionally reflowed.');
   }
   if (codes.has('RUNTIME_IMAGE_OVERLAP')) {
-    hints.push('Move or resize the reported images so they no longer overlap. If a collage is intentional, compose it as one image asset before placing it.');
+    hints.push('Move or resize every independently reported image-overlap pair in one patch. If a collage is intentional, compose it as one image asset before placing it.');
   }
   if (codes.has('ELEMENT_MAPPING_NOT_EMBEDDED')) {
     hints.push('The registered element ID was not written onto the serialized artifact object. Tag the actual saved object rather than a wrapper, page collection, or temporary value.');
@@ -723,7 +744,7 @@ export function officeValidationRepairHints(
     hints.push('Expert mode is not model-facing. Replace the raw block with a returned facade call or versioned feature recipe.');
   }
   if (/unexpected keyword argument/i.test(errorText) && !/create_document\.<locals>\.[A-Za-z_][A-Za-z0-9_]*\(\)/i.test(errorText)) {
-    hints.push('The facade rejected a guessed keyword. Copy the exact signature from the complete facade manifest already returned for this document; do not query one feature at a time.');
+    hints.push('The facade rejected a guessed keyword. Query that facade module and copy its exact installed signature and example.');
   }
   if (/create_document\.<locals>\.([A-Za-z_][A-Za-z0-9_]*)\(\).*unexpected keyword argument/i.test(errorText)) {
     hints.push('A locally defined helper rejected the keyword. Update that helper signature and all of its callers together; querying unoApi will not change a user-defined Python function.');
@@ -749,6 +770,28 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
   if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile' && toolName !== 'fillDocumentTemplate') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
+    if (payload.kind === 'uno-draft-patch-conflict') {
+      return [
+        `Office patch rejected: Document ID: ${payload.documentId}`,
+        `code=${payload.code || 'PATCH_BASE_DIGEST_MISMATCH'}`,
+        payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
+        payload.expectedBaseDigest ? `currentDigest=${payload.expectedBaseDigest}` : '',
+        payload.suppliedBaseDigest ? `suppliedDigest=${payload.suppliedBaseDigest}` : '',
+        `requiredNextAction=${payload.requiredNextAction || 'read'}`,
+        payload.error || 'Read the current source and prepare a new patch from the exact returned program.',
+      ].filter(Boolean).join('; ');
+    }
+    if (payload.kind === 'uno-draft-patch-no-changes') {
+      return [
+        `Office patch made no changes: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}`,
+        `code=${payload.code || 'PATCH_NO_CHANGES'}`,
+        payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
+        payload.patchBaseDigest ? `patchBaseDigest=${payload.patchBaseDigest}` : '',
+        payload.validationStatus ? `validationStatus=${payload.validationStatus}` : '',
+        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
+        payload.error || '',
+      ].filter(Boolean).join('; ');
+    }
     if (payload.kind === 'document-plan') {
       const assets = Array.isArray((payload as Record<string, unknown>).availableAssets)
         ? ((payload as Record<string, unknown>).availableAssets as Array<Record<string, unknown>>)
@@ -925,7 +968,10 @@ async function downloadFileArtifactUnlocked(input: DownloadArtifactInput, url: s
     try {
       const { response, resolvedUrl } = await fetchDownloadResponseWithRetry(url, abortController.signal);
       if (!response.ok) {
-        return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText} for ${resolvedUrl}` };
+        const guidance = response.status === 429
+          ? ' after bounded automatic retries; use a different source or origin instead of sleeping and retrying this URL'
+          : '';
+        return { ok: false, actual: `downloadFile failed: HTTP ${response.status} ${response.statusText}${guidance} for ${resolvedUrl}` };
       }
       const suggestedName = input.fileName
         || parseContentDispositionFileName(response.headers.get('content-disposition'))
@@ -1056,7 +1102,7 @@ export async function downloadFileArtifact(input: DownloadArtifactInput): Promis
   const activeKey = `${sanitizeFileName(input.runId, 'adhoc')}:${cacheKey}`;
   const existing = activeDownloads.get(activeKey);
   if (existing) return existing;
-  const pending = downloadFileArtifactUnlocked(input, url, cacheKey);
+  const pending = withDownloadOriginSlot(url, () => downloadFileArtifactUnlocked(input, url, cacheKey));
   activeDownloads.set(activeKey, pending);
   try {
     return await pending;
@@ -1149,27 +1195,54 @@ async function withDraftLock<T>(runId: string | undefined, documentId: string, o
 function canonicalWikimediaOriginalUrl(url: string) {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname !== 'upload.wikimedia.org') return undefined;
+    if (!['upload.wikimedia.org', 'thumb.wikimedia.org'].includes(parsed.hostname)) return undefined;
     const match = parsed.pathname.match(/^(\/wikipedia\/commons)\/thumb\/(.+)\/\d+px-[^/]+$/i);
     if (!match) return undefined;
     const segments = match[2].split('/');
     if (segments.length < 3) return undefined;
     const originalPath = match[2].replace(/^(.*)\/\d+px-[^/]+$/, '$1');
-    return `${parsed.origin}${match[1]}/${originalPath}${parsed.search}`;
+    return `https://upload.wikimedia.org${match[1]}/${originalPath}${parsed.search}`;
   } catch {
     return undefined;
   }
 }
 
+function preferredDownloadUrl(url: string) {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname === 'upload.wikimedia.org' && parsed.pathname.includes('/wikipedia/commons/thumb/')) {
+      parsed.hostname = 'thumb.wikimedia.org';
+      return parsed.toString();
+    }
+  } catch {
+    // Preserve the original value so the caller returns its normal URL error.
+  }
+  return url;
+}
+
+function downloadRequestInit(url: string, signal: AbortSignal): RequestInit {
+  const wikimedia = /(?:^|\.)wikimedia\.org$/i.test(new URL(url).hostname);
+  return {
+    signal,
+    redirect: 'follow',
+    headers: {
+      Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+      'User-Agent': 'WebPilot-Office-Artifact/1.0 (local user-requested media fetch)',
+      ...(wikimedia ? { Referer: 'https://commons.wikimedia.org/' } : {}),
+    },
+  };
+}
+
 async function fetchDownloadResponse(url: string, signal: AbortSignal) {
-  const response = await fetch(url, { signal, redirect: 'follow' });
-  if (response.ok || response.status !== 400) return { response, resolvedUrl: url };
+  const preferredUrl = preferredDownloadUrl(url);
+  const response = await fetch(preferredUrl, downloadRequestInit(preferredUrl, signal));
+  if (response.ok || response.status !== 400) return { response, resolvedUrl: preferredUrl };
   // Commons rejects made-up thumbnail widths. The original asset has the same
   // stable hash/file path, independent of a guessed `Npx-` segment.
-  const canonical = canonicalWikimediaOriginalUrl(url);
-  if (!canonical || canonical === url) return { response, resolvedUrl: url };
+  const canonical = canonicalWikimediaOriginalUrl(preferredUrl);
+  if (!canonical || canonical === preferredUrl) return { response, resolvedUrl: preferredUrl };
   await response.body?.cancel().catch(() => undefined);
-  return { response: await fetch(canonical, { signal, redirect: 'follow' }), resolvedUrl: canonical };
+  return { response: await fetch(canonical, downloadRequestInit(canonical, signal)), resolvedUrl: canonical };
 }
 
 function downloadCacheKey(input: DownloadArtifactInput, url: string) {
@@ -1178,71 +1251,83 @@ function downloadCacheKey(input: DownloadArtifactInput, url: string) {
     .digest('hex');
 }
 
-function downloadRetryDelay(response: Response, attempt: number) {
-  const retryAfter = response.headers.get('retry-after');
-  if (retryAfter) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(30_000, seconds * 1_000);
-    const dateDelay = Date.parse(retryAfter) - Date.now();
-    if (Number.isFinite(dateDelay) && dateDelay > 0) return Math.min(30_000, dateDelay);
+function downloadOriginKey(url: string) {
+  try {
+    return new URL(url).origin.toLowerCase();
+  } catch {
+    return url;
   }
+}
+
+async function acquireDownloadOriginSlot(url: string) {
+  const origin = downloadOriginKey(url);
+  const state = downloadOriginStates.get(origin) || { active: 0, waiters: [] };
+  downloadOriginStates.set(origin, state);
+  if (state.active >= FILE_DOWNLOAD_MAX_CONCURRENT_PER_ORIGIN) {
+    await new Promise<void>((resolve) => state.waiters.push(resolve));
+  } else {
+    state.active += 1;
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = state.waiters.shift();
+    if (next) {
+      // Transfer this reserved slot directly to the next waiter.
+      next();
+      return;
+    }
+    state.active -= 1;
+    if (state.active === 0) downloadOriginStates.delete(origin);
+  };
+}
+
+async function withDownloadOriginSlot<T>(url: string, operation: () => Promise<T>) {
+  const release = await acquireDownloadOriginSlot(url);
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+function downloadRetryDelay(attempt: number) {
   return FILE_DOWNLOAD_RETRY_DELAYS_MS[Math.min(attempt, FILE_DOWNLOAD_RETRY_DELAYS_MS.length - 1)];
+}
+
+function rateLimitRetryDelay(response: Response, attempt: number) {
+  const header = String(response.headers.get('retry-after') || '').trim();
+  const seconds = Number(header);
+  const parsed = Number.isFinite(seconds) && seconds >= 0
+    ? seconds * 1_000
+    : header
+      ? Date.parse(header) - Date.now()
+      : Number.NaN;
+  if (!Number.isFinite(parsed) || parsed < 0) return downloadRetryDelay(attempt);
+  return Math.max(downloadRetryDelay(attempt), Math.min(parsed, FILE_DOWNLOAD_MAX_RETRY_AFTER_MS));
 }
 
 async function waitForDownloadRetry(delayMs: number, signal: AbortSignal) {
   await racePromiseWithAbort(new Promise<void>((resolve) => setTimeout(resolve, delayMs)), signal);
 }
 
-function downloadHostname(url: string) {
-  try {
-    return new URL(url).hostname.toLowerCase();
-  } catch {
-    return '';
-  }
-}
-
-async function waitForDownloadDomainCooldown(hostname: string, signal: AbortSignal) {
-  const cooldownUntil = downloadDomainCooldowns.get(hostname) || 0;
-  const delayMs = cooldownUntil - Date.now();
-  if (delayMs > 0) await waitForDownloadRetry(delayMs, signal);
-  if ((downloadDomainCooldowns.get(hostname) || 0) <= Date.now()) downloadDomainCooldowns.delete(hostname);
-}
-
-async function withDownloadDomainQueue<T>(url: string, operation: (hostname: string) => Promise<T>) {
-  const hostname = downloadHostname(url);
-  if (!hostname) return operation('');
-  const previous = downloadDomainQueues.get(hostname) || Promise.resolve();
-  let release: (() => void) | undefined;
-  const gate = new Promise<void>((resolve) => { release = resolve; });
-  const tail = previous.then(() => gate);
-  downloadDomainQueues.set(hostname, tail);
-  try {
-    await previous;
-    return await operation(hostname);
-  } finally {
-    release?.();
-    if (downloadDomainQueues.get(hostname) === tail) downloadDomainQueues.delete(hostname);
-  }
-}
-
 async function fetchDownloadResponseWithRetry(url: string, signal: AbortSignal) {
-  return withDownloadDomainQueue(url, async (hostname) => {
-    const retryable = new Set([429, 502, 503, 504]);
-    for (let attempt = 0; ; attempt += 1) {
-      if (hostname) await waitForDownloadDomainCooldown(hostname, signal);
-      const result = await fetchDownloadResponse(url, signal);
-      if (!retryable.has(result.response.status) || attempt >= FILE_DOWNLOAD_RETRY_DELAYS_MS.length) return result;
-      const delayMs = downloadRetryDelay(result.response, attempt);
-      if (hostname && result.response.status === 429) {
-        downloadDomainCooldowns.set(hostname, Math.max(
-          downloadDomainCooldowns.get(hostname) || 0,
-          Date.now() + delayMs,
-        ));
-      }
-      await result.response.body?.cancel().catch(() => undefined);
-      await waitForDownloadRetry(delayMs, signal);
-    }
-  });
+  // Cross-origin downloads remain fully parallel. Same-origin calls pass
+  // through a small concurrency window before this bounded retry loop so a
+  // batch does not self-trigger a remote rate limit. Retry-After is capped;
+  // there is never a fixed 30-second sleep.
+  const retryable = new Set([429, 502, 503, 504]);
+  for (let attempt = 0; ; attempt += 1) {
+    const result = await fetchDownloadResponse(url, signal);
+    const retryLimit = result.response.status === 429 ? 1 : FILE_DOWNLOAD_RETRY_DELAYS_MS.length;
+    if (!retryable.has(result.response.status) || attempt >= retryLimit) return result;
+    const delayMs = result.response.status === 429
+      ? rateLimitRetryDelay(result.response, attempt)
+      : downloadRetryDelay(attempt);
+    await result.response.body?.cancel().catch(() => undefined);
+    await waitForDownloadRetry(delayMs, signal);
+  }
 }
 
 async function writeDraftJsonAtomically(target: string, draft: OfficeDocumentDraft) {
@@ -1454,11 +1539,10 @@ export async function pendingOfficeDocumentWork(
     requiredNextAction: 'edit' | 'generate' | 'render' | 'fileVisual';
   }>>((pending, draft) => {
     if (!draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'generate' });
-    else if (draft.validationStatus === 'failed') pending.push({
-      ...draft,
-      requiredNextAction: 'edit',
-    });
-    else if (draft.renderedDigest !== draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'render' });
+    else if (draft.validatedSourceDigest !== draft.sourceDigest
+      || draft.renderedDigest !== draft.sourceDigest) {
+      pending.push({ ...draft, requiredNextAction: 'render' });
+    }
     else if (draft.state === 'qa-pending' && options.requireVisualQa !== false) {
       pending.push({
         ...draft,
@@ -1734,7 +1818,7 @@ function inferredPresentationSourceUnits(
   const lines = normalizedDraftSource(source).split('\n');
   const slidePattern = generator === 'javascript'
     ? /^(\s*)(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.addSlide\s*\(/
-    : /^(\s*)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.add_slide\s*\(/;
+    : /^(\s*)(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*)?[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\.(?:add_slide|slide)\s*\(/;
   const starts = lines.flatMap((line, index) => {
     const match = slidePattern.exec(line);
     const insideSymbol = symbols.some((symbol) => index + 1 >= symbol.startLine && index + 1 <= symbol.endLine);
@@ -1758,7 +1842,7 @@ function inferredPresentationSourceUnits(
       if (terminal > start.index) endIndex = terminal - 1;
     }
     while (endIndex > start.index && !lines[endIndex].trim()) endIndex -= 1;
-    const authoredId = /\.(?:add_slide|addSlide)\s*\(\s*['"]([^'"]+)['"]/.exec(start.line)?.[1];
+    const authoredId = /\.(?:add_slide|addSlide|slide)\s*\(\s*['"]([^'"]+)['"]/.exec(start.line)?.[1];
     const numericId = authoredId?.match(/^slide[-_/]?(\d+)$/i)?.[1];
     const baseName = numericId
       ? `slide-${String(Number(numericId)).padStart(3, '0')}`
@@ -1879,55 +1963,6 @@ function replaceSourceUnit(source: string, unit: ParsedSourceUnit, content: stri
   return lines.join('\n');
 }
 
-function sourceUnitForStructuredLineEdits(units: ParsedSourceUnit[], edits: UnoDraftLineEdit[]) {
-  const ranges = edits.map((edit) => {
-    const kind = edit.kind || 'replaceRange';
-    if (kind === 'replaceText' || kind === 'replaceAll') return undefined;
-    const startLine = kind === 'insertBefore' || kind === 'insertAfter'
-      ? Number(edit.line)
-      : Number(edit.startLine);
-    const endLine = kind === 'insertBefore' || kind === 'insertAfter'
-      ? Number(edit.line)
-      : Number(edit.endLine);
-    if (!Number.isInteger(startLine) || !Number.isInteger(endLine) || startLine < 1 || endLine < startLine) {
-      return undefined;
-    }
-    return { startLine, endLine };
-  });
-  if (!ranges.length || ranges.some((range) => !range)) return undefined;
-  return units
-    .filter((unit) => unit.kind === 'page' || unit.kind === 'sheet')
-    .filter((unit) => ranges.every((range) => (
-      range!.startLine >= unit.startLine && range!.endLine <= unit.endLine
-    )))
-    .sort((left, right) => (
-      (left.endLine - left.startLine) - (right.endLine - right.startLine)
-    ))[0];
-}
-
-function sourceUnitLocalEdits(unit: ParsedSourceUnit, edits: UnoDraftLineEdit[]) {
-  const offset = unit.startLine - 1;
-  return edits.map((edit, editIndex) => {
-    const kind = edit.kind || 'replaceRange';
-    if (kind === 'replaceText' || kind === 'replaceAll') return edit;
-    const isInsertion = kind === 'insertBefore' || kind === 'insertAfter';
-    const startLine = Number(isInsertion ? edit.line : edit.startLine);
-    const endLine = Number(isInsertion ? edit.line : edit.endLine);
-    if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
-      throw new Error(`source edit ${editIndex + 1} requires global integer line coordinates copied from action=read.`);
-    }
-    if (startLine < unit.startLine || endLine < startLine || endLine > unit.endLine) {
-      throw new Error(
-        `source edit ${editIndex + 1} global range ${startLine}-${endLine} is outside unit ${unit.path} `
-        + `at global lines ${unit.startLine}-${unit.endLine}. Read that unit again and copy its displayed global line numbers.`,
-      );
-    }
-    return isInsertion
-      ? { ...edit, line: startLine - offset }
-      : { ...edit, startLine: startLine - offset, endLine: endLine - offset };
-  });
-}
-
 function isolateSourceUnit(
   source: string,
   requestedPath: string,
@@ -1972,313 +2007,253 @@ function draftSourceLineCount(source: string) {
   return (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized).split('\n').length;
 }
 
-function sourceEditCandidateSummary(source: string, oldText: string) {
-  const sourceLines = normalizedDraftSource(source).split('\n');
-  const needleLines = normalizedDraftSource(oldText).split('\n');
-  const windowSize = Math.max(1, needleLines.length);
-  const normalize = (value: string) => value.replace(/\s+/g, ' ').trim().toLowerCase();
-  const needle = normalize(needleLines.join('\n'));
-  const diceScore = (left: string, right: string) => {
-    const bigrams = (value: string) => {
-      const output = new Map<string, number>();
-      for (let index = 0; index < value.length - 1; index += 1) {
-        const gram = value.slice(index, index + 2);
-        output.set(gram, (output.get(gram) || 0) + 1);
-      }
-      return output;
-    };
-    if (!left || !right) return 0;
-    if (left === right) return 1;
-    const leftBigrams = bigrams(left);
-    const rightBigrams = bigrams(right);
-    let shared = 0;
-    for (const [gram, count] of leftBigrams) shared += Math.min(count, rightBigrams.get(gram) || 0);
-    const total = [...leftBigrams.values()].reduce((sum, count) => sum + count, 0)
-      + [...rightBigrams.values()].reduce((sum, count) => sum + count, 0);
-    return total ? (2 * shared) / total : 0;
-  };
-  const candidates = sourceLines
-    .map((_line, index) => {
-      const text = sourceLines.slice(index, index + windowSize).join('\n');
-      return { line: index + 1, score: diceScore(needle, normalize(text)), text };
-    })
-    .filter((candidate) => candidate.score >= 0.2)
-    .sort((left, right) => right.score - left.score || left.line - right.line)
-    .slice(0, 3)
-    .map((candidate) => {
-      const snippet = candidate.text.replace(/\s+/g, ' ').trim();
-      return `line ${candidate.line}: ${snippet.slice(0, 180)}${snippet.length > 180 ? '…' : ''}`;
-    });
-  return candidates.length
-    ? ` Closest current candidates: ${candidates.join(' | ')}. Copy exact current text from action=read before retrying.`
-    : ' No close current candidate was found. Call action=read and copy the exact current text before retrying.';
-}
-
-type SourceLineHunk = {
-  editIndex: number;
-  end: number;
+// TypeScript port of OpenAI Codex's Apache-2.0 apply-patch algorithm:
+// codex-rs/apply-patch/src/{parser,seek_sequence,file_update}.rs. The Office
+// tool uses the same grammar and matching order without invoking Codex itself.
+type CodexDraftPatchChunk = {
+  changeContext?: string;
+  contextLineIndices: Array<[number, number]>;
+  isEndOfFile: boolean;
   newLines: string[];
-  start: number;
+  oldLines: string[];
 };
 
-function editorReplacementLines(value: string) {
-  const normalized = normalizedDraftSource(value);
-  return normalized === '' ? [] : normalized.split('\n');
+function emptyCodexDraftPatchChunk(changeContext?: string): CodexDraftPatchChunk {
+  return { changeContext, contextLineIndices: [], isEndOfFile: false, newLines: [], oldLines: [] };
 }
 
-function replacementLinesWithPreservedIndent(
-  originalLines: string[],
-  replacementLines: string[],
-  preserveIndent = false,
-) {
-  if (!preserveIndent || !replacementLines.length) return replacementLines;
-  const originalFirst = originalLines.find((line) => line.trim());
-  const replacementFirst = replacementLines.find((line) => line.trim());
-  if (!originalFirst || !replacementFirst) return replacementLines;
-  const originalIndent = originalFirst.match(/^\s*/)?.[0] || '';
-  const replacementIndent = replacementFirst.match(/^\s*/)?.[0] || '';
-  if (replacementIndent.length >= originalIndent.length) return replacementLines;
-  const missingIndent = originalIndent.startsWith(replacementIndent)
-    ? originalIndent.slice(replacementIndent.length)
-    : originalIndent;
-  if (!missingIndent) return replacementLines;
-  return replacementLines.map((line) => line.trim() ? `${missingIndent}${line}` : line);
-}
-
-/**
- * Reduce a broad replacement to the smallest changed line hunks. Agent edits
- * often use overlapping context ranges even though the actual changed lines
- * are independent. A line-level LCS lets those edits merge like a mature code
- * editor instead of rejecting the complete atomic batch.
- */
-function minimalSourceLineHunks(
-  original: string[],
-  replacement: string[],
-  sourceOffset: number,
-  editIndex: number,
-): SourceLineHunk[] {
-  const rows = original.length;
-  const columns = replacement.length;
-  const lcs = Array.from({ length: rows + 1 }, () => new Uint32Array(columns + 1));
-  for (let row = rows - 1; row >= 0; row -= 1) {
-    for (let column = columns - 1; column >= 0; column -= 1) {
-      lcs[row][column] = original[row] === replacement[column]
-        ? lcs[row + 1][column + 1] + 1
-        : Math.max(lcs[row + 1][column], lcs[row][column + 1]);
-    }
+/** Port of Codex apply-patch's file-oriented grammar for one staged draft.py. */
+function parseCodexDraftPatch(patchText: string) {
+  const lines = normalizedDraftSource(String(patchText || '')).trim().split('\n');
+  if (lines[0]?.trim() !== '*** Begin Patch') {
+    throw new Error("The first line of the patch must be '*** Begin Patch'.");
   }
-  const hunks: SourceLineHunk[] = [];
-  let row = 0;
-  let column = 0;
-  while (row < rows || column < columns) {
-    if (row < rows && column < columns && original[row] === replacement[column]) {
-      row += 1;
-      column += 1;
+  if (lines.at(-1)?.trim() !== '*** End Patch') {
+    throw new Error("The last line of the patch must be '*** End Patch'.");
+  }
+  const updates: CodexDraftPatchChunk[][] = [];
+  let chunks: CodexDraftPatchChunk[] | undefined;
+  const currentChunk = () => {
+    if (!chunks) throw new Error("Expected an '*** Update File: draft.py' header before patch lines.");
+    if (!chunks.length) chunks.push(emptyCodexDraftPatchChunk());
+    return chunks[chunks.length - 1];
+  };
+
+  for (let index = 1; index < lines.length - 1; index += 1) {
+    const line = lines[index].replace(/\r$/, '');
+    const updatePath = line.startsWith('*** Update File: ')
+      ? line.slice('*** Update File: '.length).trim().replace(/^\.\//, '')
+      : undefined;
+    if (updatePath !== undefined) {
+      if (updatePath !== 'draft.py') throw new Error("Codex patch may update only the staged file named 'draft.py'.");
+      chunks = [];
+      updates.push(chunks);
       continue;
     }
-    const startRow = row;
-    const startColumn = column;
-    while (row < rows || column < columns) {
-      if (row < rows && column < columns && original[row] === replacement[column]) break;
-      if (column < columns && (row === rows || lcs[row][column + 1] >= lcs[row + 1][column])) column += 1;
-      else row += 1;
+    if (line.startsWith('*** Add File: ') || line.startsWith('*** Delete File: ') || line.startsWith('*** Move to: ')) {
+      throw new Error("Office draft patches may only use '*** Update File: draft.py'.");
     }
-    hunks.push({
-      editIndex,
-      start: sourceOffset + startRow,
-      end: sourceOffset + row,
-      newLines: replacement.slice(startColumn, column),
-    });
+    if (line === '@@') {
+      if (!chunks) throw new Error("Expected an '*** Update File: draft.py' header before '@@'.");
+      chunks.push(emptyCodexDraftPatchChunk());
+      continue;
+    }
+    if (line.startsWith('@@ ')) {
+      if (!chunks) throw new Error("Expected an '*** Update File: draft.py' header before '@@'.");
+      chunks.push(emptyCodexDraftPatchChunk(line.slice(3)));
+      continue;
+    }
+    if (line === '*** End of File') {
+      currentChunk().isEndOfFile = true;
+      continue;
+    }
+    const chunk = currentChunk();
+    if (chunk.isEndOfFile && line === '') continue;
+    if (chunk.isEndOfFile) throw new Error("Expected a new '@@' context marker after '*** End of File'.");
+    if (line === '') {
+      chunk.contextLineIndices.push([chunk.oldLines.length, chunk.newLines.length]);
+      chunk.oldLines.push('');
+      chunk.newLines.push('');
+      continue;
+    }
+    const marker = line[0];
+    const content = line.slice(1);
+    if (marker === ' ') {
+      chunk.contextLineIndices.push([chunk.oldLines.length, chunk.newLines.length]);
+      chunk.oldLines.push(content);
+      chunk.newLines.push(content);
+    } else if (marker === '+') chunk.newLines.push(content);
+    else if (marker === '-') chunk.oldLines.push(content);
+    else {
+      throw new Error(`Unexpected patch line ${index + 1}. Every update line must start with ' ', '+', or '-'.`);
+    }
   }
-  return hunks;
+  if (!updates.length) throw new Error("Patch requires at least one '*** Update File: draft.py' section.");
+  if (updates.some((update) => !update.length)) throw new Error("Update patch for 'draft.py' is empty.");
+  const allChunks = updates.flat();
+  if (!allChunks.length || allChunks.some((chunk) => !chunk.oldLines.length && !chunk.newLines.length)) {
+    throw new Error('Update patch contains an empty hunk.');
+  }
+  if (allChunks.length > 100) throw new Error('Office draft patch is limited to 100 atomic hunks.');
+  return updates;
 }
 
-function sourceLineHunksConflict(left: SourceLineHunk, right: SourceLineHunk) {
-  const leftInsertion = left.start === left.end;
-  const rightInsertion = right.start === right.end;
-  if (leftInsertion && rightInsertion) return false;
-  if (leftInsertion) return left.start > right.start && left.start < right.end;
-  if (rightInsertion) return right.start > left.start && right.start < left.end;
-  return Math.max(left.start, right.start) < Math.min(left.end, right.end);
+function normalizeCodexPatchMatchLine(value: string) {
+  return value.trim().replace(/[‐‑‒–—―−]/g, '-').replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"').replace(/[            　]/g, ' ');
 }
 
-/**
- * Apply editor-style source changes atomically. Line edits keep coordinates
- * anchored to the same read, minimize every replacement, merge independent
- * overlapping context, and use later edits for the same changed source lines.
- * Exact-text edits then run in their supplied order against that in-memory
- * candidate. This deterministic two-phase order lets callers safely combine
- * both edit styles without making line coordinates depend on earlier text
- * replacements.
- */
-export function applyUnoDraftLineEdits(source: string, edits: UnoDraftLineEdit[]) {
-  if (!Array.isArray(edits) || !edits.length) {
-    throw new Error('file action=edit requires at least one line edit.');
-  }
-  const normalized = normalizedDraftSource(source);
-  const indexedEdits = edits.map((edit, editIndex) => ({ edit, editIndex }));
-  const textEdits = indexedEdits.filter(({ edit }) => edit.kind === 'replaceText' || edit.kind === 'replaceAll');
-  const lineEdits = indexedEdits.filter(({ edit }) => edit.kind !== 'replaceText' && edit.kind !== 'replaceAll');
-  let result = normalized;
-  if (lineEdits.length) {
-    const hasFinalNewline = normalized.endsWith('\n');
-    const lines = hasFinalNewline ? normalized.slice(0, -1).split('\n') : normalized.split('\n');
-    const lineCount = lines.length;
-    const hunks: SourceLineHunk[] = [];
-    lineEdits.forEach(({ edit, editIndex }) => {
-      const kind = edit.kind || 'replaceRange';
-      const anchorLine = Number(edit.line);
-      const startLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.startLine);
-      const endLine = kind === 'insertBefore' || kind === 'insertAfter' ? anchorLine : Number(edit?.endLine);
-      if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) {
-        throw new Error(`source edit ${editIndex + 1} requires integer startLine and endLine from action=read.`);
-      }
-      if (startLine < 1 || endLine < startLine || endLine > lineCount) {
-        throw new Error(`source edit ${editIndex + 1} range ${startLine}-${endLine} is outside the current 1-${lineCount} source lines. Read the draft again.`);
-      }
-      if (typeof edit.newText !== 'string') {
-        throw new Error(`source edit ${editIndex + 1} requires string newText.`);
-      }
-      if (kind === 'insertBefore' || kind === 'insertAfter') {
-        hunks.push({
-          editIndex,
-          start: kind === 'insertBefore' ? startLine - 1 : startLine,
-          end: kind === 'insertBefore' ? startLine - 1 : startLine,
-          newLines: editorReplacementLines(edit.newText),
-        });
-        return;
-      }
-      const originalLines = lines.slice(startLine - 1, endLine);
-      const replacementLines = kind === 'deleteRange'
-        ? []
-        : kind === 'replaceRange'
-          ? replacementLinesWithPreservedIndent(originalLines, editorReplacementLines(edit.newText), edit.preserveIndent === true)
-          : editorReplacementLines(edit.newText);
-      const editHunks = minimalSourceLineHunks(originalLines, replacementLines, startLine - 1, editIndex);
-      const changedSourceLines = editHunks.reduce((total, hunk) => total + hunk.end - hunk.start, 0);
-      const insertedLines = editHunks.reduce((total, hunk) => total + hunk.newLines.length, 0);
-      if (kind === 'replaceRange' && Math.max(changedSourceLines, insertedLines) >= 100
-        && Math.max(changedSourceLines, insertedLines) / lineCount >= 0.6) {
-        throw new Error(`source edit ${editIndex + 1} changes most of the ${lineCount}-line source. Near-complete source replacement through edit is blocked because it commonly destroys valid indentation and identifiers. Use action=generate to atomically replace a failed draft, or edit one source-unit path.`);
-      }
-      hunks.push(...editHunks);
-    });
-
-    const merged: SourceLineHunk[] = [];
-    for (const hunk of hunks) {
-      for (let index = merged.length - 1; index >= 0; index -= 1) {
-        if (sourceLineHunksConflict(merged[index], hunk)) merged.splice(index, 1);
-      }
-      merged.push(hunk);
+/** Port of Codex apply-patch seek_sequence: exact, rstrip, trim, Unicode-normalized. */
+function seekCodexPatchSequence(lines: string[], pattern: string[], start: number, eof: boolean) {
+  if (!pattern.length) return start;
+  if (pattern.length > lines.length) return undefined;
+  const finalStart = Math.max(0, lines.length - pattern.length);
+  const searchStart = eof ? Math.max(start, finalStart) : start;
+  const upper = lines.length - pattern.length;
+  const find = (normalize: (value: string) => string) => {
+    for (let index = searchStart; index <= upper; index += 1) {
+      if (pattern.every((line, offset) => normalize(lines[index + offset]) === normalize(line))) return index;
     }
-    for (const hunk of merged.sort((left, right) => (
-      right.start - left.start || right.end - left.end || right.editIndex - left.editIndex
-    ))) {
-      lines.splice(hunk.start, hunk.end - hunk.start, ...hunk.newLines);
-    }
-    result = `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`;
-  }
-
-  if (textEdits.length) {
-    for (const { edit, editIndex } of textEdits) {
-      const oldText = normalizedDraftSource(String(edit.oldText || ''));
-      if (!oldText) throw new Error(`source edit ${editIndex + 1} ${edit.kind} requires non-empty oldText.`);
-      const offsets: number[] = [];
-      let cursor = 0;
-      while (cursor <= result.length - oldText.length) {
-        const found = result.indexOf(oldText, cursor);
-        if (found < 0) break;
-        offsets.push(found);
-        cursor = found + Math.max(1, oldText.length);
-      }
-      const occurrence = edit.occurrence === undefined ? undefined : Number(edit.occurrence);
-      if (occurrence !== undefined && (!Number.isInteger(occurrence) || occurrence < 1)) {
-        throw new Error(`source edit ${editIndex + 1} occurrence must be a positive integer.`);
-      }
-      if (!offsets.length && edit.kind === 'replaceAll') {
-        // replaceAll is intentionally idempotent. In a mixed atomic cleanup,
-        // an earlier replacement may already have removed every later search
-        // token. Treat that as an already-satisfied edit instead of rejecting
-        // the whole batch and forcing another read/retry cycle.
-        continue;
-      }
-      if (!offsets.length) {
-        throw new Error(`source edit ${editIndex + 1} could not find oldText after applying the preceding edits in this atomic batch.${sourceEditCandidateSummary(result, oldText)}`);
-      }
-      const newText = normalizedDraftSource(edit.newText);
-      if (edit.kind === 'replaceAll') {
-        if (occurrence !== undefined) throw new Error(`source edit ${editIndex + 1} replaceAll does not accept occurrence.`);
-        for (const start of offsets.reverse()) {
-          result = `${result.slice(0, start)}${newText}${result.slice(start + oldText.length)}`;
-        }
-        continue;
-      }
-      if (occurrence === undefined && offsets.length !== 1) {
-        throw new Error(`source edit ${editIndex + 1} oldText matched ${offsets.length} locations; occurrence means the one-based match index, not a replacement count. Provide an occurrence between 1 and ${offsets.length}, use a larger exact source region, or use replaceAll to replace every match.`);
-      }
-      const resolvedOccurrence = offsets.length === 1 ? 1 : (occurrence || 1);
-      const start = offsets[resolvedOccurrence - 1];
-      if (start === undefined) throw new Error(`source edit ${editIndex + 1} occurrence ${occurrence} does not exist; found ${offsets.length} matches. Use replaceAll when every exact match should change.`);
-      result = `${result.slice(0, start)}${newText}${result.slice(start + oldText.length)}`;
-    }
-  }
-  return result;
+    return undefined;
+  };
+  return find((value) => value)
+    ?? find((value) => value.trimEnd())
+    ?? find((value) => value.trim())
+    ?? find(normalizeCodexPatchMatchLine);
 }
 
+type CodexDraftReplacement = [start: number, oldLength: number, newLines: string[]];
+
+function codexDraftPatchReplacements(originalLines: string[], chunks: CodexDraftPatchChunk[]) {
+  const replacements: CodexDraftReplacement[] = [];
+  let lineIndex = 0;
+  for (const chunk of chunks) {
+    if (chunk.changeContext !== undefined) {
+      const contextIndex = seekCodexPatchSequence(originalLines, [chunk.changeContext], lineIndex, false);
+      if (contextIndex === undefined) throw new Error(`Failed to find patch context '${chunk.changeContext}' in draft.py.`);
+      lineIndex = contextIndex + 1;
+    }
+    if (!chunk.oldLines.length) {
+      replacements.push([originalLines.length, 0, [...chunk.newLines]]);
+      continue;
+    }
+    let pattern = chunk.oldLines;
+    let newLines = chunk.newLines;
+    let startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
+    if (startIndex === undefined && pattern.at(-1) === '') {
+      pattern = pattern.slice(0, -1);
+      if (newLines.at(-1) === '') newLines = newLines.slice(0, -1);
+      startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
+    }
+    if (startIndex === undefined) {
+      throw new Error(`Failed to find expected lines in draft.py:\n${chunk.oldLines.join('\n')}`);
+    }
+
+    // Codex's preserve-line-endings mode leaves context lines in place. This
+    // also guarantees that fuzzy context matching cannot rewrite indentation.
+    let oldStart = 0;
+    let newStart = 0;
+    for (const [oldContext, newContext] of chunk.contextLineIndices) {
+      if (oldContext >= pattern.length || newContext >= newLines.length) break;
+      if (oldStart !== oldContext || newStart !== newContext) {
+        replacements.push([
+          startIndex + oldStart,
+          oldContext - oldStart,
+          newLines.slice(newStart, newContext),
+        ]);
+      }
+      oldStart = oldContext + 1;
+      newStart = newContext + 1;
+    }
+    if (oldStart !== pattern.length || newStart !== newLines.length) {
+      replacements.push([startIndex + oldStart, pattern.length - oldStart, newLines.slice(newStart)]);
+    }
+    lineIndex = startIndex + pattern.length;
+  }
+  return replacements.sort((left, right) => left[0] - right[0]);
+}
+
+function applyCodexDraftPatchUpdate(source: string, chunks: CodexDraftPatchChunk[]) {
+  const hasFinalNewline = source.endsWith('\n');
+  const lines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
+  const replacements = codexDraftPatchReplacements(lines, chunks);
+  const changedLineCount = replacements.reduce(
+    (total, [, oldLength, newLines]) => total + Math.max(oldLength, newLines.length),
+    0,
+  );
+  for (const [start, oldLength, newLines] of [...replacements].reverse()) {
+    lines.splice(start, oldLength, ...newLines);
+  }
+  return {
+    changedLineCount,
+    source: `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`,
+  };
+}
+
+/** Apply Codex's file-oriented patch algorithm atomically in memory. */
 export function applyUnoDraftPatch(source: string, patchText: string) {
   const normalized = normalizedDraftSource(source);
-  const hasFinalNewline = normalized.endsWith('\n');
-  const sourceLines = (hasFinalNewline ? normalized.slice(0, -1) : normalized).split('\n');
-  const patchLines = normalizedDraftSource(String(patchText || '')).split('\n');
-  const output: string[] = [];
-  let sourceIndex = 0;
-  let patchIndex = 0;
-  let hunkCount = 0;
-  while (patchIndex < patchLines.length) {
-    const header = /^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/.exec(patchLines[patchIndex]);
-    if (!header) {
-      patchIndex += 1;
-      continue;
-    }
-    hunkCount += 1;
-    const oldStart = Number(header[1]) - 1;
-    if (oldStart < sourceIndex || oldStart > sourceLines.length) throw new Error(`patch hunk ${hunkCount} has an invalid or overlapping source range.`);
-    output.push(...sourceLines.slice(sourceIndex, oldStart));
-    sourceIndex = oldStart;
-    patchIndex += 1;
-    while (patchIndex < patchLines.length && !patchLines[patchIndex].startsWith('@@ ')) {
-      const line = patchLines[patchIndex];
-      patchIndex += 1;
-      if (line.startsWith('\\ No newline at end of file')) continue;
-      const marker = line[0];
-      const text = line.slice(1);
-      if (marker === ' ' || marker === '-') {
-        if (sourceLines[sourceIndex] !== text) {
-          throw new Error(`patch hunk ${hunkCount} no longer matches source line ${sourceIndex + 1}. Read the current draft and regenerate the patch.`);
-        }
-        if (marker === ' ') output.push(text);
-        sourceIndex += 1;
-      } else if (marker === '+') {
-        output.push(text);
-      } else if (line === '') {
-        // A trailing empty line outside a hunk is harmless.
-      } else {
-        throw new Error(`patch hunk ${hunkCount} contains an invalid line marker.`);
-      }
-    }
+  let edited = normalized;
+  let changedLineCount = 0;
+  for (const chunks of parseCodexDraftPatch(patchText)) {
+    const update = applyCodexDraftPatchUpdate(edited, chunks);
+    edited = update.source;
+    changedLineCount += update.changedLineCount;
   }
-  if (!hunkCount) throw new Error('file action=edit patch requires at least one unified diff hunk.');
-  output.push(...sourceLines.slice(sourceIndex));
-  return `${output.join('\n')}${hasFinalNewline ? '\n' : ''}`;
+  if (edited === normalized) throw new Error('Codex patch completed without changing draft.py.');
+  if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
+    throw new Error('Near-complete source replacement through edit is blocked. Use action=generate to replace the complete draft intentionally.');
+  }
+  return edited;
 }
 
-function numberedDraftSource(source: string, firstLine = 1) {
+export type UnoDraftPatchHunkFailure = {
+  hunk: number;
+  error: string;
+};
+
+export type UnoDraftPatchResult = {
+  source: string;
+  appliedHunks: number;
+  failedHunks: UnoDraftPatchHunkFailure[];
+  totalHunks: number;
+};
+
+/**
+ * Apply a syntactically valid Codex patch one @@ hunk at a time. This keeps the
+ * Codex parser, seek order, fuzzy matching, and whitespace-preserving replacement
+ * algorithm while preventing one stale independent hunk from rolling back every
+ * other repair in the model's batch.
+ */
+export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoDraftPatchResult {
   const normalized = normalizedDraftSource(source);
-  const lines = (normalized.endsWith('\n') ? normalized.slice(0, -1) : normalized)
-    .split('\n');
-  return lines
-    .map((line, index) => `${String(firstLine + index).padStart(5, ' ')} | ${line}`)
-    .join('\n');
+  let edited = normalized;
+  let changedLineCount = 0;
+  let appliedHunks = 0;
+  const failedHunks: UnoDraftPatchHunkFailure[] = [];
+  const chunks = parseCodexDraftPatch(patchText).flat();
+  chunks.forEach((chunk, index) => {
+    try {
+      const update = applyCodexDraftPatchUpdate(edited, [chunk]);
+      if (update.source === edited) throw new Error('Hunk completed without changing draft.py.');
+      edited = update.source;
+      changedLineCount += update.changedLineCount;
+      appliedHunks += 1;
+    } catch (error) {
+      failedHunks.push({
+        hunk: index + 1,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+  if (!appliedHunks) {
+    const detail = failedHunks.map((failure) => `hunk ${failure.hunk}: ${failure.error}`).join('\n');
+    throw new Error(detail || 'Codex patch completed without changing draft.py.');
+  }
+  if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
+    throw new Error('Near-complete source replacement through edit is blocked. Use action=generate to replace the complete draft intentionally.');
+  }
+  return { source: edited, appliedHunks, failedHunks, totalHunks: chunks.length };
 }
 
 async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserActionResult> {
@@ -2290,16 +2265,18 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
     const units = sourceUnitsForDraft(draft.program, draft);
     const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
     const requestedUnit = sourceUnitForRequestedPath(units, requestedPath);
-    if (requestedPath && !requestedUnit) {
+    const hasBoundedFallback = Boolean(
+      requestedPath
+      && !requestedUnit
+      && (input.startLine !== undefined || input.endLine !== undefined),
+    );
+    if (requestedPath && !requestedUnit && !hasBoundedFallback) {
       const available = units.map((unit) => unit.path).join(', ') || '(none)';
       return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. For shared helpers or unmarked sources, read a bounded startLine/endLine window instead.` };
     }
     const readableSource = requestedUnit?.content ?? draft.program;
     const readableLines = normalizedDraftSource(readableSource).split('\n');
     const totalReadableLines = draftSourceLineCount(readableSource);
-    const coordinateOffset = requestedUnit ? requestedUnit.startLine - 1 : 0;
-    const coordinateStart = coordinateOffset + 1;
-    const coordinateEnd = coordinateOffset + totalReadableLines;
     const requestedStart = input.startLine === undefined ? undefined : Number(input.startLine);
     const requestedEnd = input.endLine === undefined ? undefined : Number(input.endLine);
     if (requestedStart !== undefined && (!Number.isInteger(requestedStart) || requestedStart < 1)) {
@@ -2309,10 +2286,19 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
       return { ok: false, actual: 'Office draft read endLine must be a positive one-based integer.' };
     }
     const explicitRange = requestedStart !== undefined || requestedEnd !== undefined;
-    const rangeStart = requestedStart ?? (requestedEnd === undefined
+    // A bounded read of a named source unit uses unit-relative coordinates.
+    // Models naturally ask for symbols/foo startLine=1; requiring the unit's
+    // global offset made otherwise valid reads fail and encouraged stale edits.
+    // Unbounded unit reads keep their historical global range metadata.
+    const unitRelativeRange = Boolean(requestedUnit && explicitRange);
+    const coordinateOffset = requestedUnit && !unitRelativeRange ? requestedUnit.startLine - 1 : 0;
+    const coordinateStart = coordinateOffset + 1;
+    const coordinateEnd = coordinateOffset + totalReadableLines;
+    const boundedRequestedEnd = requestedEnd === undefined ? undefined : Math.min(requestedEnd, coordinateEnd);
+    const rangeStart = requestedStart ?? (boundedRequestedEnd === undefined
       ? coordinateStart
-      : Math.max(coordinateStart, requestedEnd - MAX_SOURCE_READ_LINES + 1));
-    const rangeEnd = requestedEnd ?? (requestedStart === undefined
+      : Math.max(coordinateStart, boundedRequestedEnd - MAX_SOURCE_READ_LINES + 1));
+    const rangeEnd = boundedRequestedEnd ?? (requestedStart === undefined
       ? Math.min(coordinateEnd, coordinateStart + MAX_SOURCE_READ_LINES - 1)
       : Math.min(coordinateEnd, rangeStart + MAX_SOURCE_READ_LINES - 1));
     if (rangeStart < coordinateStart || rangeStart > rangeEnd || rangeEnd > coordinateEnd) {
@@ -2347,12 +2333,18 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
           fileName: draft.sourceDocument.fileName,
         } : undefined,
         sourceDigest: sourceDigest(readableSource),
+        sourceUnitDigest: requestedUnit ? sourceDigest(readableSource) : undefined,
+        // A patch is optimistic-concurrency controlled against the complete
+        // draft, even when the read was scoped to one unit. edit accepts this
+        // digest both with and without the optional source-unit path.
+        patchBaseDigest: sourceDigest(draft.program),
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || 'pending',
         validationFailureCount: draft.validationFailureCount || 0,
         validationDiagnostics: compactValidationDiagnosticsForTool(draft.validationDiagnostics),
         workflow: compactWorkflowForTool(draft.workflow),
         sourceUnitPath: requestedUnit?.path,
+        requestedPathIgnored: hasBoundedFallback ? requestedPath : undefined,
         sourceUnitKind: requestedUnit?.kind,
         sourceUnitGlobalLines: requestedUnit ? { startLine: requestedUnit.startLine, endLine: requestedUnit.endLine } : undefined,
         sourceUnitCount: units.length,
@@ -2371,14 +2363,21 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
         sourceLineRange: omitLargeProgram ? undefined : {
           startLine: rangeStart,
           endLine: rangeEnd,
-          coordinateSpace: 'global',
+          coordinateSpace: unitRelativeRange ? 'unit' : 'global',
           totalSourceLines: draftSourceLineCount(draft.program),
           unitLineCount: requestedUnit ? totalReadableLines : undefined,
+          globalStartLine: requestedUnit && unitRelativeRange ? requestedUnit.startLine + rangeStart - 1 : undefined,
+          globalEndLine: requestedUnit && unitRelativeRange ? requestedUnit.startLine + rangeEnd - 1 : undefined,
         },
         readGuidance: omitLargeProgram
-          ? `This ${totalReadableLines}-line ${requestedUnit ? 'source unit' : 'draft'} is too large for an unbounded read. ${requestedUnit ? `Read the same path ${requestedUnit.path} with ` : 'Read one sourceUnits path, or use '}startLine/endLine around the reported diagnostic (maximum ${MAX_SOURCE_READ_LINES} lines).`
+          ? `This ${totalReadableLines}-line ${requestedUnit ? 'source unit' : 'draft'} is too large for an unbounded read. ${requestedUnit ? `Read the same path ${requestedUnit.path} with ` : 'Read one sourceUnits path, or use '}startLine/endLine around the reported diagnostic (maximum ${MAX_SOURCE_READ_LINES} lines). If endLine exceeds EOF it is automatically clamped. The returned program preserves exact whitespace for a Codex-format patch.`
           : undefined,
-        program: omitLargeProgram ? undefined : numberedDraftSource(returnedSource, rangeStart),
+        patchGuidance: omitLargeProgram ? undefined
+          : `program is exact unnumbered source. Submit a Codex patch using *** Begin Patch, *** Update File: draft.py, @@ hunks, and *** End Patch with patchBaseDigest${requestedUnit ? `; path=${requestedUnit.path} is optional because patchBaseDigest identifies the complete current draft` : ''}. Never emit unified-diff line counts. Unchanged context preserves the source's original indentation.`,
+        readFallbackGuidance: hasBoundedFallback
+          ? `The requested path ${requestedPath} is not a known source unit, so the supplied startLine/endLine were applied to the complete draft instead.`
+          : undefined,
+        program: omitLargeProgram ? undefined : returnedSource,
       }),
     };
   } catch (error) {
@@ -2406,9 +2405,14 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
       };
     }
     const documentType = draft.documentType;
-    const catalog = await inspectUnoApi({ documentType, limit: 120 });
+    const normalizedQuery = String(input.query || '').trim().toLowerCase();
+    const catalog = await inspectUnoApi({ documentType, query: normalizedQuery || undefined, limit: 120 });
     const catalogDigest = sourceDigest(JSON.stringify(catalog));
-    const alreadyLoaded = draft.unoApiCatalogDigest === catalogDigest;
+    const moduleKey = normalizedQuery || '__index__';
+    const moduleDigests = draft.unoApiModuleDigests || {};
+    const alreadyLoaded = moduleDigests[moduleKey] === catalogDigest;
+    moduleDigests[moduleKey] = catalogDigest;
+    draft.unoApiModuleDigests = moduleDigests;
     draft.unoApiCatalogDigest = catalogDigest;
     draft.unoApiCatalogLoadedAt ||= new Date().toISOString();
     await saveDraft(input.runId, draft);
@@ -2419,9 +2423,8 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
         documentId,
         documentType,
         catalogDigest,
-        delivery: 'complete-executable-cookbook',
+        query: normalizedQuery || undefined,
         alreadyLoaded,
-        queryIgnored: input.query ? true : undefined,
         ...catalog,
       }),
     };
@@ -2546,7 +2549,7 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
         'JavaScript mode creates PPTX, DOCX, or XLSX directly. A .pdf target is supported by creating the matching Office source for documentType and converting it with local LibreOffice.',
         'For PDF, still write to job.outputPath exactly as shown; its temporary extension is already the correct .pptx, .docx, or .xlsx source format.',
         'Existing-file modification remains UNO-based.',
-        'Every structured action=edit updates the documentId current source before validation. If errors remain, continue with another focused edit against that saved source; call action=read only when fresh line numbers are needed.',
+        'Every action=edit atomically applies one Codex-format patch before validation. Repair all independent non-overlapping diagnostics in one patch with separate @@ hunks; call action=read for the exact current source and patchBaseDigest.',
       ],
       recipes,
       completeDocument: examples[documentType],
@@ -2625,70 +2628,9 @@ export function generatedVerificationIssues(diagnostics: unknown) {
     seen.add(key);
     return true;
   });
-  const overlapCodes = new Set(['RUNTIME_TEXT_OVERLAP', 'RUNTIME_IMAGE_OVERLAP', 'RUNTIME_CONTENT_OVERLAP']);
-  const clustered: typeof unique = [];
-  const overlapByPage = new Map<number, typeof unique>();
-  for (const issue of unique) {
-    if (!overlapCodes.has(issue.code) || !issue.page || (issue.elementIds?.length || 0) < 2) {
-      clustered.push(issue);
-      continue;
-    }
-    const pageIssues = overlapByPage.get(issue.page) || [];
-    pageIssues.push(issue);
-    overlapByPage.set(issue.page, pageIssues);
-  }
-  for (const [page, pageIssues] of overlapByPage) {
-    if (pageIssues.length === 1) {
-      clustered.push(pageIssues[0]);
-      continue;
-    }
-    let remaining = [...pageIssues];
-    let emitted = 0;
-    while (remaining.length && emitted < 12) {
-      const degree = new Map<string, number>();
-      for (const issue of remaining) {
-        for (const elementId of issue.elementIds || []) {
-          degree.set(elementId, (degree.get(elementId) || 0) + 1);
-        }
-      }
-      const root = [...degree.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0];
-      if (!root) break;
-      const incident = remaining.filter((issue) => issue.elementIds?.includes(root));
-      const incidentSet = new Set(incident);
-      remaining = remaining.filter((issue) => !incidentSet.has(issue));
-      const related = [...new Set(incident.flatMap((issue) => issue.elementIds || []).filter((elementId) => elementId !== root))];
-      const codes = new Set(incident.map((issue) => issue.code));
-      const rootRecord = elementById.get(root);
-      clustered.push({
-        ...incident[0],
-        code: codes.size === 1 ? incident[0].code : 'RUNTIME_CONTENT_OVERLAP',
-        elementId: root,
-        elementIds: [root, ...related.slice(0, 19)],
-        line: rootRecord?.line || incident[0].line,
-        locator: rootRecord?.locator || { slide: page },
-        message: `Element ${root} is a primary overlap source on slide ${page}: it intersects ${incident.length} element(s) (${related.slice(0, 12).join(', ')}${related.length > 12 ? ', ...' : ''}). Repair this element first instead of applying a global layout-helper change. The full pairwise collision report remains in the validation artifact.`,
-        page,
-        severity: incident.some((issue) => issue.severity === 'error') ? 'error' : 'warning',
-        shapes: undefined,
-      });
-      emitted += 1;
-    }
-    if (remaining.length) {
-      const remainingIds = [...new Set(remaining.flatMap((issue) => issue.elementIds || []))];
-      clustered.push({
-        ...remaining[0],
-        code: 'RUNTIME_CONTENT_OVERLAP',
-        elementId: undefined,
-        elementIds: remainingIds.slice(0, 20),
-        locator: { slide: page },
-        message: `${remaining.length} additional overlap pair(s) remain on slide ${page} after the 12 highest-degree source clusters. Repair the listed clusters, validate again, and use the validation artifact for the complete pair list.`,
-        page,
-        severity: remaining.some((issue) => issue.severity === 'error') ? 'error' : 'warning',
-        shapes: undefined,
-      });
-    }
-  }
-  return clustered;
+  // Preserve every distinct pair. The model can batch independent fixes in one
+  // patch only when validation does not collapse the document at a root node.
+  return unique;
 }
 
 function generatedFeatureCounts(diagnostics: unknown): Record<string, number> {
@@ -2718,17 +2660,34 @@ export function generatedRuntimeDiagnostics(diagnostics: unknown): OfficeProgram
   }));
 }
 
+export function officeValidationCacheBaseName(documentId: string, digest: string) {
+  return `validation-${sanitizeFileName(documentId, 'document')}-${digest}`;
+}
+
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
   const digest = sourceDigest(draft.program || '');
+  // LibreOffice on Windows can create its lock descriptor for a dot-prefixed
+  // target and then abort storeAsURL with 0x11b. Keep validation artifacts
+  // private by directory, but use a normal basename that LibreOffice can save.
   const base = path.join(
     artifactDir(runId, 'document-drafts'),
-    `.${sanitizeFileName(draft.documentId, 'document')}.${digest}.validation`,
+    officeValidationCacheBaseName(draft.documentId, digest),
   );
   return {
     artifactPath: `${base}${extension}`,
+    lockPath: path.join(path.dirname(base), `.~lock.${path.basename(base)}${extension}#`),
     metadataPath: `${base}.json`,
     previewPath: `${base}.preview.pdf`,
   };
+}
+
+async function clearValidationCacheFiles(cache: ReturnType<typeof validationCachePaths>) {
+  await Promise.all([
+    unlink(cache.artifactPath).catch(() => undefined),
+    unlink(cache.lockPath).catch(() => undefined),
+    unlink(cache.metadataPath).catch(() => undefined),
+    unlink(cache.previewPath).catch(() => undefined),
+  ]);
 }
 
 function documentAssetsFingerprint(assets: DocumentAsset[]) {
@@ -2779,12 +2738,14 @@ async function prepareValidatedDraftLegacy(input: {
   } catch {
     // A missing or interrupted cache is not a document failure; regenerate it.
   }
+  await clearValidationCacheFiles(cache);
   await input.onProgress?.({ phase: 'execute', message: '正在执行文档脚本' });
   const candidateSourcePath = path.join(
     artifactDir(input.runId, 'document-drafts'),
     `.candidate-${sanitizeFileName(input.draft.documentId, 'document')}-${randomUUID()}${input.draft.generator === 'javascript' ? '.mjs' : '.py'}`,
   );
   await writeFile(candidateSourcePath, input.draft.program, { encoding: 'utf8', flag: 'wx' });
+  let cacheCompleted = false;
   try {
     const generated = await generateFileToPaths({
       ...input.draft,
@@ -2798,9 +2759,14 @@ async function prepareValidatedDraftLegacy(input: {
       onProgress: input.onProgress,
     });
     await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint, diagnostics: generated.diagnostics }), 'utf8');
+    cacheCompleted = true;
     return { assets, cacheHit: false, generated };
   } finally {
-    await unlink(candidateSourcePath).catch(() => undefined);
+    await Promise.all([
+      unlink(candidateSourcePath).catch(() => undefined),
+      unlink(cache.lockPath).catch(() => undefined),
+    ]);
+    if (!cacheCompleted) await clearValidationCacheFiles(cache);
   }
 }
 
@@ -2856,11 +2822,7 @@ async function prepareValidatedDraft(input: {
     });
     if (!validation.passed && candidate.cacheHit) {
       const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
-      await Promise.all([
-        unlink(cache.artifactPath).catch(() => undefined),
-        unlink(cache.metadataPath).catch(() => undefined),
-        unlink(cache.previewPath).catch(() => undefined),
-      ]);
+      await clearValidationCacheFiles(cache);
       candidate = await prepareValidatedDraftLegacy(input);
       validation = await validateOfficeArtifact({
         absolutePath: candidate.generated.outputPath,
@@ -3066,7 +3028,7 @@ async function validateDraft(input: {
         error: compactToolText(saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError),
         recoverySuggestion: transientUnoFailure
           ? 'The current source was preserved and was not marked invalid. Retry render; source changes cannot repair a LibreOffice process startup failure.'
-          : 'Continue editing this same current source. Read only the reported source unit or a small line window, then apply one focused structured edit to the exact diagnostic block. Do not use action=generate to repair a line-addressable validation error; generate is only for an intentional complete-draft replacement, not ordinary recovery.',
+          : 'Continue editing this same current source. Read the reported source units or bounded windows, then submit one Codex-format patch containing every independent repair with the returned patchBaseDigest. Use @@ hunks without numeric line counts; split only overlapping or dependent repairs. Do not use action=generate for local validation errors.',
         workflow: compactWorkflowForTool(input.draft.workflow),
       }),
     };
@@ -3094,8 +3056,11 @@ async function validateDraftSourceUnit(input: {
     const unit = units.find((candidate) => candidate.path === input.sourceUnitPath);
     if (!unit) throw new Error(`Office source unit ${input.sourceUnitPath} does not exist.`);
     const isolatedSource = isolateSourceUnit(input.draft.program, input.sourceUnitPath, input.draft.generator, units);
-    await input.onProgress?.({ phase: 'unit-static-analysis', message: `正在检查 ${input.sourceUnitPath}` });
-    const staticAnalysis = await analyzeOfficeProgram(isolatedSource, input.draft.generator || 'uno');
+    await input.onProgress?.({ phase: 'unit-static-analysis', message: '正在检查整份文档的语法与 API 调用' });
+    // Source-unit execution is an optimization only. Static preflight always
+    // sees the complete draft so one edit returns every discoverable syntax,
+    // facade method, signature, and supported nested-argument diagnostic.
+    const staticAnalysis = await analyzeOfficeProgram(input.draft.program, input.draft.generator || 'uno');
     if (!staticAnalysis.passed) {
       const error = new Error(staticAnalysis.diagnostics.filter((item) => item.severity === 'error').map((item) => item.message).join('\n'));
       Object.assign(error, { diagnostics: staticAnalysis.diagnostics });
@@ -3308,34 +3273,9 @@ async function renderDraft(input: {
 }): Promise<BrowserActionResult> {
   let publishCandidatePath: string | undefined;
   try {
-    const workingDigest = sourceDigest(input.draft.program || '');
-    if (input.draft.validationStatus === 'failed' && hasOnlyRetryableOfficeValidationFailure(input.draft)) {
-      input.draft.validationStatus = 'pending';
-      input.draft.validationFailureCount = 0;
-      input.draft.validationDiagnostics = [];
-      input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-      await saveDraft(input.runId, input.draft);
-    }
-    if (input.draft.validationStatus === 'failed') {
-      return {
-        ok: false,
-        actual: JSON.stringify({
-          kind: 'office-render-blocked',
-          documentId: input.draft.documentId,
-          sourceDigest: workingDigest,
-          validatedSourceDigest: input.draft.validatedSourceDigest || null,
-          validationStatus: input.draft.validationStatus,
-          validationFailureCount: input.draft.validationFailureCount || 1,
-          diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
-          requiredNextAction: 'edit',
-          error: 'The current working source failed validation. Continue editing this source or atomically replace it with action=generate before rendering.',
-          workflow: compactWorkflowForTool(input.draft.workflow),
-        }),
-      };
-    }
     const candidate = await prepareValidatedDraft(input);
     const digest = sourceDigest(input.draft.program || '');
-    if (input.draft.validatedSourceDigest !== digest || input.draft.validationStatus !== 'passed') {
+    if (input.draft.validatedSourceDigest !== digest) {
       throw new Error('The working source has not passed validation and cannot be rendered. Continue editing the saved current source until validation passes.');
     }
     input.draft.workflow = { state: 'rendering', checkpointAt: new Date().toISOString() };
@@ -3549,7 +3489,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
       sourceCharacters: 0,
       workflow: draft.workflow,
       instruction: draft.operation === 'modify'
-        ? `Open the existing file through the matching high-level facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. Load unoApi once, then use its existing-object selectors and preserve-only policy; raw UNO and job.expert are not model-facing. Do not recreate the document.`
+        ? `Open the existing file through the matching high-level facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. Query the unoApi existing-object module, then copy its selectors and preserve-only policy; raw UNO and job.expert are not model-facing. Do not recreate the document.`
         : undefined,
     }) };
   } catch (error) {
@@ -3574,6 +3514,32 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
         return { ok: false, actual: `Office draft ${documentId} is not planned. Call action=plan before action=generate.` };
       }
       throw error;
+    }
+    const existingProgram = persistedDraft.program || '';
+    const existingDigest = sourceDigest(existingProgram);
+    const removesEntrypoint = /\b(?:async\s+)?(?:def|function)\s+create_document\b/.test(existingProgram)
+      && !/\b(?:async\s+)?(?:def|function)\s+create_document\b/.test(program);
+    const drasticShrink = existingProgram.length >= 1_000
+      && program.length < Math.max(200, Math.floor(existingProgram.length * 0.35));
+    const replacingExistingSource = Boolean(existingProgram.trim());
+    const replacementAuthorized = input.replaceExisting === true
+      && String(input.baseDigest || '').toLowerCase() === existingDigest;
+    if (replacingExistingSource && !replacementAuthorized) {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'uno-draft-destructive-generate-blocked',
+          code: 'DESTRUCTIVE_GENERATE_REQUIRES_CONFIRMATION',
+          documentId,
+          changed: false,
+          saved: false,
+          sourceCharacters: existingProgram.length,
+          sourceDigest: existingDigest,
+          patchBaseDigest: existingDigest,
+          requiredNextAction: 'edit',
+          error: `action=generate is initial-source creation only once a draft source exists${drasticShrink || removesEntrypoint ? ' and this request would also discard most of that source or its create_document entrypoint' : ''}. Use action=edit for every repair. For an intentional full replacement only, read the current draft and call generate with replaceExisting=true and its exact patchBaseDigest as baseDigest.`,
+        }),
+      };
     }
     const draft = structuredClone(persistedDraft);
     draft.program = program;
@@ -3600,7 +3566,7 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     if (typeof input.program === 'string' && input.program.trim()) {
       return {
         ok: false,
-        actual: 'file action=edit does not accept a complete source replacement. Read the current line-numbered draft when needed and send edits=[{startLine,endLine,newText}].',
+        actual: 'file action=edit does not accept a complete source replacement. Read the current source and submit one Codex-format patch in patch; use action=generate only for an intentional complete replacement.',
       };
     }
     const persistedDraft = await loadDraft(input.runId, documentId);
@@ -3610,34 +3576,61 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     const requestedUnit = sourceUnitForRequestedPath(sourceUnits, requestedPath);
     if (requestedPath && !requestedUnit) {
       const available = sourceUnits.map((unit) => unit.path).join(', ') || '(none)';
-      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. Read a bounded startLine/endLine window for shared helpers, then use structured line edits.` };
+      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. Read the current source unit or a bounded window, then submit a Codex-format patch.` };
     }
     const editableSource = requestedUnit?.content ?? persistedDraft.program;
-    const currentDigest = sourceDigest(editableSource);
+    const editableDigest = sourceDigest(editableSource);
+    const draftDigest = sourceDigest(persistedDraft.program);
     const draft = structuredClone(persistedDraft);
-    if (!Array.isArray(input.edits) || !input.edits.length) {
-      return { ok: false, actual: 'file action=edit requires structured edits.' };
+    const patchText = typeof input.patch === 'string' ? input.patch : '';
+    const hasPatch = Boolean(patchText.trim());
+    if (!hasPatch) {
+      return { ok: false, actual: "file action=edit requires a Codex patch from '*** Begin Patch' through '*** End Patch'." };
     }
-    const inferredValidationUnit = requestedUnit
-      ? undefined
-      : sourceUnitForStructuredLineEdits(sourceUnits, input.edits);
-    const editorEdits = requestedUnit ? sourceUnitLocalEdits(requestedUnit, input.edits) : input.edits;
-    const edited = applyUnoDraftLineEdits(editableSource, editorEdits);
+    const baseDigest = String(input.baseDigest || '').trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(baseDigest)) {
+      return { ok: false, actual: 'file action=edit patch requires baseDigest copied from the latest action=read result.' };
+    }
+    // Unit-scoped reads return the complete draft digest so callers can omit
+    // path safely. Keep accepting the legacy unit digest when path is given.
+    const acceptedDigests = new Set(requestedUnit ? [draftDigest, editableDigest] : [draftDigest]);
+    if (!acceptedDigests.has(baseDigest)) {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'uno-draft-patch-conflict',
+          code: 'PATCH_BASE_DIGEST_MISMATCH',
+          documentId,
+          sourceUnitPath: requestedUnit?.path,
+          expectedBaseDigest: draftDigest,
+          expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
+          suppliedBaseDigest: baseDigest,
+          requiredNextAction: 'read',
+          error: 'The current source changed after the patch was prepared. Read it again and regenerate the patch from the exact returned program.',
+        }),
+      };
+    }
+    const patchResult = applyUnoDraftPatchHunks(editableSource, patchText);
+    const edited = patchResult.source;
     draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {
-        ok: true,
+        ok: false,
         actual: JSON.stringify({
-          kind: 'uno-draft-edit',
+          kind: 'uno-draft-patch-no-changes',
+          code: 'PATCH_NO_CHANGES',
           documentId,
           fileName: draft.fileName,
           changed: false,
           saved: false,
-          sourceCharacters: draft.program.length,
-          sourceDigest: currentDigest,
+          sourceCharacters: persistedDraft.program.length,
+          sourceDigest: sourceDigest(persistedDraft.program),
+          patchBaseDigest: draftDigest,
           sourceUnitPath: requestedUnit?.path,
           lineCount: draftSourceLineCount(editableSource),
-          validation: 'unchanged',
+          validationStatus: persistedDraft.validationStatus || 'pending',
+          requiredNextAction: persistedDraft.validatedSourceDigest === sourceDigest(persistedDraft.program) ? 'render' : 'read',
+          error: 'The patch made no changes. Its target is already satisfied or its change lines are identical to the current source; read the current source before retrying.',
         }),
       };
     }
@@ -3645,13 +3638,11 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     draft.validationDiagnostics = [];
     invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-    const currentValidationUnit = requestedUnit || (inferredValidationUnit
-      ? sourceUnitForRequestedPath(sourceUnitsForDraft(draft.program, draft), inferredValidationUnit.path)
-      : undefined);
+    const currentValidationUnit = requestedUnit;
     // The current source is the editor buffer. Validation failures keep that
     // exact buffer and diagnostics so the next edit can repair it in place.
-    // A line-only edit contained by one inferred page/sheet is validated in
-    // isolation automatically. Final render still validates the full source.
+    // A path-scoped patch may execute that source unit in isolation after the
+    // complete source passes AST preflight. Final render validates the full source.
     const validationResult = await (currentValidationUnit && currentValidationUnit.kind !== 'symbol'
       ? validateDraftSourceUnit({ ...input, draft, sourceUnitPath: currentValidationUnit.path })
       : validateDraft({ ...input, draft, documentChanged: true }));
@@ -3663,9 +3654,18 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
         failure = { error: validationResult.actual || 'validation failed' };
       }
       return {
-        ok: false,
+        // The edit transaction itself succeeded: the exact patch was applied
+        // and the new source checkpoint was saved. A later validation defect
+        // is workflow state for the next edit, not a patch-engine failure.
+        ok: failure.saved === true,
         actual: JSON.stringify({
           ...failure,
+          editStatus: failure.saved === true ? 'patch-applied' : 'save-failed',
+          patchHunks: {
+            applied: patchResult.appliedHunks,
+            failed: patchResult.failedHunks,
+            total: patchResult.totalHunks,
+          },
           changed: true,
           saved: failure.saved === true,
           sourceDigest: sourceDigest(draft.program || ''),
@@ -3674,8 +3674,30 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           validation: 'failed',
           requiredNextAction: failure.requiredNextAction || 'edit',
           recoverySuggestion: failure.recoverySuggestion
-            || 'The current working source and diagnostics were saved. Continue editing this same documentId; call action=read only when fresh line numbers or exact source text are needed. Rendering remains blocked until the current source passes validation.',
+            || 'The current working source and diagnostics were saved. Continue editing this same documentId; read the exact source and patchBaseDigest, then submit a Codex-format patch. Rendering remains blocked until the current source passes validation.',
           workflow: compactWorkflowForTool(draft.workflow),
+        }),
+      };
+    }
+    if (patchResult.failedHunks.length) {
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
+      } catch {
+        payload = { actual: validationResult.actual };
+      }
+      return {
+        ok: validationResult.ok,
+        actual: JSON.stringify({
+          ...payload,
+          editStatus: 'partial-patch-applied',
+          patchHunks: {
+            applied: patchResult.appliedHunks,
+            failed: patchResult.failedHunks,
+            total: patchResult.totalHunks,
+          },
+          requiredNextAction: 'read',
+          recoverySuggestion: 'Successful independent hunks were saved. Read the current source and use its new patchBaseDigest before retrying only the reported conflicting hunks.',
         }),
       };
     }
