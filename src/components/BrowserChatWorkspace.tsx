@@ -1235,9 +1235,10 @@ function browserChatToolPresentation(
   tool: BrowserChatToolCall | undefined,
   step: StepExecutionResult | undefined,
   turnRunning: boolean,
+  supersededByLaterRequest = false,
 ) {
   if (!tool || !step) return { isActive: false, stateClass: '', status: '已请求' };
-  const isActive = turnRunning && step.status === 'running' && tool.ok === undefined;
+  const isActive = turnRunning && step.status === 'running' && tool.ok === undefined && !supersededByLaterRequest;
   const inferredFailed = !isActive && tool.ok === undefined && step.status === 'failed';
   const failed = (tool.ok === false && !isRecoveredTransientTool(tool)) || inferredFailed;
   return {
@@ -2094,18 +2095,18 @@ function mergeBrowserChatSessionRealtimePatch(
   const applySessionPatch = !sessionPatch.updatedAt
     || !current.updatedAt
     || sessionPatch.updatedAt >= current.updatedAt;
-  // A websocket publish is asynchronous and an older snapshot can arrive after
-  // a newer one. Ignore its collections as well as its header; otherwise an old
-  // tool-start record can overwrite a completed tool and remain "running" while
-  // later tools are already visible.
-  if (!applySessionPatch) return current;
+  // A websocket publish is asynchronous and an older header can arrive after a
+  // newer checkpoint (context compression is a common example). Reject only
+  // stale header fields. Collection records carry their own identities/statuses
+  // and are merged monotonically below; dropping them with the header caused the
+  // UI to freeze after compression until another checkpoint arrived.
   const collections = mergeBrowserChatRealtimeCollections(current, patch);
-  const outputCycles = applySessionPatch
-    ? mergeBrowserChatRealtimeRecords(current.outputCycles, sessionPatch.outputCycles)
-    : current.outputCycles;
-  const subagents = applySessionPatch
-    ? mergeBrowserChatRealtimeRecords(current.subagents, sessionPatch.subagents)
-    : current.subagents;
+  // These are ID-addressed collections too. In particular, AI output cycles
+  // continue arriving after a compression checkpoint has advanced updatedAt.
+  // Gating them on the session header timestamp recreates the same apparent
+  // freeze even when messages/steps are merged correctly.
+  const outputCycles = mergeBrowserChatRealtimeRecords(current.outputCycles, sessionPatch.outputCycles);
+  const subagents = mergeBrowserChatRealtimeRecords(current.subagents, sessionPatch.subagents);
   return normalizeSession({
     ...current,
     ...(applySessionPatch ? sessionPatch : {}),
@@ -3801,7 +3802,12 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           ? browserChatToolValidationSummary(tool.error || tool.result)
           : compactText(failureMeta || tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
         const displayText = `${label}${meta ? `: ${meta}` : ''}`;
-        const presentation = browserChatToolPresentation(tool, step, running);
+        const requestCreatedAt = tool.contextBefore?.requestCreatedAt;
+        const supersededByLaterRequest = tool.ok === undefined && Boolean(requestCreatedAt) && allToolCalls
+          .slice(toolIndex + 1)
+          .some((candidate) => candidate.contextBefore?.requestCreatedAt
+            && candidate.contextBefore.requestCreatedAt !== requestCreatedAt);
+        const presentation = browserChatToolPresentation(tool, step, running, supersededByLaterRequest);
         const { isActive: isActiveTool, stateClass, status } = presentation;
         const translatedStatus = t(status);
         const pendingConfirmation = pendingConfirmationForTool({
@@ -5568,11 +5574,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     }
     if (earlierLoadInFlightRef.current) return undefined;
     if (!initialPositioning && !sessionChanged && !followLatestRef.current) return undefined;
-    let settleFrame = 0;
-    let readyFrame = 0;
-    let attempts = 0;
-    let stableFrames = 0;
-    let previousScrollHeight = -1;
     const scrollToBottom = () => {
       const container = getScrollContainer();
       if (!container) return;
@@ -5585,31 +5586,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     };
     scrollToBottom();
     if (!initialPositioning && !sessionChanged) return undefined;
-    messageList?.removeAttribute('data-scroll-ready');
-    const settleInitialPosition = () => {
-      const container = getScrollContainer();
-      if (!container) return;
-      scrollToBottom();
-      attempts += 1;
-      const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
-      const scrollHeightStable = Math.abs(container.scrollHeight - previousScrollHeight) < 1;
-      stableFrames = distanceFromBottom <= 1 && scrollHeightStable ? stableFrames + 1 : 0;
-      previousScrollHeight = container.scrollHeight;
-      if (stableFrames < 2 && attempts < 12) {
-        settleFrame = requestAnimationFrame(settleInitialPosition);
-        return;
-      }
-      messageList?.setAttribute('data-scroll-ready', 'true');
-      readyFrame = requestAnimationFrame(() => {
-        scrollToBottom();
-        onInitialPositioned?.(sessionId);
-      });
-    };
-    settleFrame = requestAnimationFrame(settleInitialPosition);
-    return () => {
-      if (settleFrame) cancelAnimationFrame(settleFrame);
-      if (readyFrame) cancelAnimationFrame(readyFrame);
-    };
+    // Streaming updates can render more frequently than animation frames. Waiting for
+    // several stable frames here allowed every update to cancel the ready callback,
+    // leaving the conversation permanently hidden behind the positioning overlay.
+    // The first bottom alignment is synchronous; ResizeObserver below keeps it pinned
+    // while images and streamed content continue changing height.
+    messageList?.setAttribute('data-scroll-ready', 'true');
+    onInitialPositioned?.(sessionId);
+    return undefined;
   }, [getScrollContainer, messages, onInitialPositioned, scrollKey, sessionId, settleHistoryHeight]);
 
   const trackScrollPosition = useCallback(() => {
@@ -10412,6 +10396,7 @@ export function BrowserChatWorkspace({
     const created = upsertSession(data.session as BrowserChatSession, { activate: true });
     activeSessionIdRef.current = created.id;
     mountedSessionActivationRef.current = created.id;
+    setMessageViewportReady(true);
     if (!mountedIdentityRef.current) {
       window.history.replaceState(null, '', browserChatSessionNavigationHref(window.location.href, created.id));
     }

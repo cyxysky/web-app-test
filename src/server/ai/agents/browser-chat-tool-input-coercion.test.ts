@@ -78,6 +78,45 @@ test('drops an accidental replace field when a valid multi-hunk Codex patch is s
   }), { action: 'edit', patch });
 });
 
+test('normalizes deletion-only pseudo-patch plus replace instead of discarding the replacement', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', {
+    action: 'edit',
+    patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n-    title = "Old"\n*** End Patch',
+    replace: '    title = "New"',
+  }), {
+    action: 'edit',
+    patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n-    title = "Old"\n+    title = "New"\n*** End Patch',
+  });
+});
+
+test('normalizes repeated Codex patch envelopes into one multi-update envelope', () => {
+  const coerced = coerceBrowserChatToolInput('file', {
+    action: 'edit',
+    documentId: 'deck',
+    patch: [
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@',
+      '-first',
+      '+FIRST',
+      '*** End Patch',
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@',
+      '-second',
+      '+SECOND',
+      '*** End Patch',
+      '*** End Patch',
+    ].join('\n'),
+  }) as { patch: string };
+
+  assert.equal((coerced.patch.match(/\*\*\* Begin Patch/g) || []).length, 1);
+  assert.equal((coerced.patch.match(/\*\*\* End Patch/g) || []).length, 1);
+  assert.equal((coerced.patch.match(/\*\*\* Update File: draft\.py/g) || []).length, 2);
+  assert.match(coerced.patch, /-first\n\+FIRST/);
+  assert.match(coerced.patch, /-second\n\+SECOND/);
+});
+
 test('removes accidental outer Markdown or HTML wrappers from browserCode only', () => {
   assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
     reason: '读取标题',

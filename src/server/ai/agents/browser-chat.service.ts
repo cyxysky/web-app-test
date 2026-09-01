@@ -607,8 +607,6 @@ scheduleBrowserChatArtifactMaintenance(() => (
   readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>().map((session) => session.id)
 ));
 scheduleSqliteMaintenance();
-const runningHydrationGraceMs = 2 * 60 * 1000;
-
 function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
   if (!template) return undefined;
@@ -2153,11 +2151,6 @@ function isTransientBrowserChatProgress(value?: string) {
     || text === 'AI is choosing the next browser action from the current page.';
 }
 
-function isRecentTimestamp(value?: string, maxAgeMs = runningHydrationGraceMs) {
-  const timestamp = value ? Date.parse(value) : NaN;
-  return Number.isFinite(timestamp) && Date.now() - timestamp < maxAgeMs;
-}
-
 function parseLogDetails(details?: string) {
   if (!details) return undefined;
   try {
@@ -2262,15 +2255,22 @@ function finalizeIdleRunningAssistantMessages(session: BrowserChatSessionRecord)
   return changed;
 }
 
-function markRecoveredRunningAssistantMessagesDirty(
+function markRecoveredRunningRecordsDirty(
   session: BrowserChatSessionRecord,
-  persisted: Pick<BrowserChatSessionSnapshot, 'messages'>,
+  persisted: Pick<BrowserChatSessionSnapshot, 'messages' | 'steps'>,
 ) {
   const persistedMessages = new Map(persisted.messages.map((message) => [message.id, message]));
   for (const message of session.messages) {
     const previous = persistedMessages.get(message.id);
     if (previous?.role !== 'assistant' || previous.status !== 'running' || message.status === 'running') continue;
     markMessageDirty(session, message);
+  }
+  const recoveredSteps = new Map(session.steps.map((step) => [step.index, step]));
+  for (const previous of persisted.steps) {
+    if (previous.status !== 'queued' && previous.status !== 'running') continue;
+    const recovered = recoveredSteps.get(previous.index);
+    if (recovered) markStepDirty(session, recovered);
+    else dirtyRecordsFor(session.id).removedStepIndexes.add(previous.index);
   }
 }
 
@@ -2354,18 +2354,36 @@ function recordFromSnapshot(
   options: { preserveRunningState?: boolean } = {},
 ): BrowserChatSessionRecord {
   const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
-  const preserveRecentRunningState = (session.busy || session.status === 'running' || options.preserveRunningState)
-    && (options.preserveRunningState || isRecentTimestamp(session.updatedAt));
+  // A persisted running flag cannot prove that work survived a server restart:
+  // model/tool promises and AbortControllers are process-local. Preserve it only
+  // when the caller verified the matching live runtime turn. The former two-
+  // minute timestamp grace left restarted sessions permanently "running" once
+  // they entered the in-memory map.
+  const preserveRecentRunningState = options.preserveRunningState === true;
+  const recoveredInterruptedTurn = !preserveRecentRunningState && (session.busy || session.status === 'running');
   const status = preserveRecentRunningState ? session.status : (session.status === 'running' ? 'idle' : session.status);
   const transientStepIndexes = new Set(
     (session.steps || [])
       .filter((step) => step.status === 'running' && isTransientBrowserChatProgress(step.actual))
       .map((step) => step.index),
   );
-  const steps = attachBrowserChatStepOwners(
+  const persistedSteps = attachBrowserChatStepOwners(
     (session.steps || []).filter((step) => !transientStepIndexes.has(step.index)),
     session.logs || [],
   );
+  const steps = preserveRecentRunningState
+    ? persistedSteps
+    : persistedSteps.map((step) => {
+      if (step.status !== 'queued' && step.status !== 'running') return step;
+      return {
+        ...step,
+        status: 'blocked' as const,
+        actual: [
+          step.actual,
+          'This turn was interrupted by a server restart; completed tool results were preserved.',
+        ].filter(Boolean).join('\n\n'),
+      };
+    });
   const messages = alignBrowserChatMessageStepIndexes((session.messages || []).map((rawMessage) => {
     const safeMessage: BrowserChatMessage = {
       ...rawMessage,
@@ -2413,12 +2431,58 @@ function recordFromSnapshot(
     status,
     turnState: preserveRecentRunningState
       ? normalizeBrowserChatTurnState(session)
-      : normalizeBrowserChatTurnState({ ...session, busy: false, status }),
+      : recoveredInterruptedTurn
+        ? 'interrupted'
+        : normalizeBrowserChatTurnState({ ...session, busy: false, status }),
     busy: preserveRecentRunningState ? session.busy : false,
+    activeAssistantMessageId: undefined,
+    activeAbortController: undefined,
     logs: trimBrowserChatLogs(session.logs || []),
     started: false,
     browser: undefined,
   };
+}
+
+export function recoverOrphanedBrowserChatSession(
+  persistedSummary: BrowserChatSessionSnapshot,
+): BrowserChatSessionSnapshot {
+  const persistedLifecycleNeedsReview = persistedSummary.busy
+    || persistedSummary.status === 'running'
+    || persistedSummary.turnState === 'interrupted';
+  if (!persistedLifecycleNeedsReview || activeTurns.has(persistedSummary.id)) {
+    return persistedSummary;
+  }
+  const persisted = readRuntimeSessionSnapshot(persistedSummary.id);
+  if (!persisted) {
+    return {
+      ...persistedSummary,
+      busy: false,
+      status: 'idle',
+      turnState: 'interrupted',
+      pendingToolConfirmation: undefined,
+    };
+  }
+  const hasOrphanedRuntimeRecords = persisted.busy
+    || persisted.status === 'running'
+    || persisted.messages.some((message) => message.role === 'assistant' && message.status === 'running')
+    || persisted.steps.some((step) => step.status === 'queued' || step.status === 'running');
+  if (!hasOrphanedRuntimeRecords) return persistedSummary;
+  const existing = sessions.get(persistedSummary.id);
+  const recovered = recordFromSnapshot(persisted);
+  recovered.updatedAt = now();
+  if (existing) {
+    Object.assign(existing, recovered, {
+      browser: existing.browser,
+      started: existing.started,
+    });
+  } else {
+    sessions.set(persistedSummary.id, recovered);
+  }
+  const runtime = sessions.get(persistedSummary.id)!;
+  seedPersistenceCursor(runtime, persisted);
+  markRecoveredRunningRecordsDirty(runtime, persisted);
+  persistSession(runtime.id);
+  return snapshot(runtime);
 }
 
 function appendLog(
@@ -2477,6 +2541,7 @@ function readSessionSummaries(userId?: string | number): BrowserChatSessionSnaps
     userId: userId === undefined ? undefined : normalizeApplicationUserId(userId),
   })
     .filter(isBrowserChatSessionSnapshot)
+    .map(recoverOrphanedBrowserChatSession)
     .map(summaryFromSnapshot);
 }
 
@@ -2945,7 +3010,7 @@ function restoreCompactedBrowserChatSession(session: BrowserChatSessionRecord) {
     targetUrl: targetUrl || restored.targetUrl,
   });
   seedPersistenceCursor(session, persisted);
-  markRecoveredRunningAssistantMessagesDirty(session, persisted);
+  markRecoveredRunningRecordsDirty(session, persisted);
   return session;
 }
 
@@ -2962,7 +3027,7 @@ function hydrateSession(sessionId: string) {
   const session = sessions.get(sessionId);
   if (session && persisted && applied) {
     seedPersistenceCursor(session, persisted);
-    markRecoveredRunningAssistantMessagesDirty(session, persisted);
+    markRecoveredRunningRecordsDirty(session, persisted);
   }
   else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
   if (session) {

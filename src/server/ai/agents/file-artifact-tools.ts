@@ -205,6 +205,7 @@ type ArtifactToolPayload = {
   validationFailureCount?: number;
   requiredNextAction?: string;
   saved?: boolean;
+  message?: string;
   error?: string;
   recoverySuggestion?: string;
   repairHints?: string[];
@@ -722,6 +723,9 @@ export function officeValidationRepairHints(
   if (codes.has('UNO_API_METHOD_UNKNOWN') || codes.has('UNO_API_SIGNATURE_MISMATCH') || codes.has('UNO_API_ARGUMENT_INVALID')) {
     hints.push('The AST preflight rejected a guessed facade method, signature, or nested value. Query the module named by the diagnostic and copy its installed signature and complete registered examples before editing every affected call site together.');
   }
+  if (codes.has('UNO_REQUIRED_CAPABILITY_MISSING')) {
+    hints.push('Query presentation.shape and copy its specialized-shape example. Add each missing real facade capability with a unique elementId; do not infer semantic coverage from a lookalike, from visual QA, or from another shape type. Revalidate until every explicitly requested capability has a non-zero generated featureCounts entry.');
+  }
   if (codes.has('PPTX_ELEMENT_ID_MISSING')) {
     hints.push('A serialized slide object lacks its stable element marker. Recreate only that object through the PresentationSlide facade; raw objects and expert tagging are not model-facing.');
   }
@@ -783,13 +787,13 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
     }
     if (payload.kind === 'uno-draft-patch-no-changes') {
       return [
-        `Office patch made no changes: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}`,
+        `Office patch already satisfied: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}`,
         `code=${payload.code || 'PATCH_NO_CHANGES'}`,
         payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
         payload.patchBaseDigest ? `patchBaseDigest=${payload.patchBaseDigest}` : '',
         payload.validationStatus ? `validationStatus=${payload.validationStatus}` : '',
         payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
-        payload.error || '',
+        payload.message || payload.error || '',
       ].filter(Boolean).join('; ');
     }
     if (payload.kind === 'document-plan') {
@@ -1041,6 +1045,29 @@ function requireDocumentId(value: string | undefined, action: 'read' | 'generate
   return documentId;
 }
 
+async function resolveEditDocumentId(
+  runId: string | undefined,
+  value: string | undefined,
+  baseDigest: string | undefined,
+) {
+  const supplied = String(value || '').trim();
+  if (supplied) return requireDocumentId(supplied, 'edit');
+
+  const drafts = (await listOfficeDraftCatalog(runId)).filter((draft) => Boolean(draft.sourceDigest));
+  const normalizedDigest = String(baseDigest || '').trim().toLowerCase();
+  const digestMatches = /^[a-f0-9]{64}$/.test(normalizedDigest)
+    ? drafts.filter((draft) => String(draft.sourceDigest || '').toLowerCase() === normalizedDigest)
+    : [];
+  if (digestMatches.length === 1) return digestMatches[0].documentId;
+  if (drafts.length === 1) return drafts[0].documentId;
+
+  const candidates = drafts.map((draft) => draft.documentId).join(', ') || '(none)';
+  throw new Error(
+    `file action=edit could not infer documentId because this conversation has ${drafts.length} editable drafts: ${candidates}. `
+    + 'Copy documentId from the latest action=read result.',
+  );
+}
+
 async function acquireFilesystemDraftLock(runId: string | undefined, documentId: string, abortSignal?: AbortSignal) {
   const lockPath = draftLockPath(runId, documentId);
   await mkdir(path.dirname(lockPath), { recursive: true });
@@ -1192,16 +1219,24 @@ async function withDraftLock<T>(runId: string | undefined, documentId: string, o
   }
 }
 
-function canonicalWikimediaOriginalUrl(url: string) {
+function alternateWikimediaThumbnailUrls(url: string) {
   try {
     const parsed = new URL(url);
     if (!['upload.wikimedia.org', 'thumb.wikimedia.org'].includes(parsed.hostname)) return undefined;
-    const match = parsed.pathname.match(/^(\/wikipedia\/commons)\/thumb\/(.+)\/\d+px-[^/]+$/i);
+    const match = parsed.pathname.match(/^(.*\/)(\d+)px-([^/]+)$/i);
     if (!match) return undefined;
-    const segments = match[2].split('/');
-    if (segments.length < 3) return undefined;
-    const originalPath = match[2].replace(/^(.*)\/\d+px-[^/]+$/, '$1');
-    return `https://upload.wikimedia.org${match[1]}/${originalPath}${parsed.search}`;
+    const requestedWidth = Number(match[2]);
+    const supportedWidths = [250, 330, 500, 640, 800, 1024, 1280];
+    return supportedWidths
+      .filter((width) => width !== requestedWidth)
+      .sort((left, right) => Math.abs(left - requestedWidth) - Math.abs(right - requestedWidth))
+      .slice(0, 3)
+      .map((width) => {
+        const candidate = new URL(parsed);
+        candidate.hostname = 'thumb.wikimedia.org';
+        candidate.pathname = `${match[1]}${width}px-${match[3]}`;
+        return candidate.toString();
+      });
   } catch {
     return undefined;
   }
@@ -1235,14 +1270,19 @@ function downloadRequestInit(url: string, signal: AbortSignal): RequestInit {
 
 async function fetchDownloadResponse(url: string, signal: AbortSignal) {
   const preferredUrl = preferredDownloadUrl(url);
-  const response = await fetch(preferredUrl, downloadRequestInit(preferredUrl, signal));
-  if (response.ok || response.status !== 400) return { response, resolvedUrl: preferredUrl };
-  // Commons rejects made-up thumbnail widths. The original asset has the same
-  // stable hash/file path, independent of a guessed `Npx-` segment.
-  const canonical = canonicalWikimediaOriginalUrl(preferredUrl);
-  if (!canonical || canonical === preferredUrl) return { response, resolvedUrl: preferredUrl };
-  await response.body?.cancel().catch(() => undefined);
-  return { response: await fetch(canonical, downloadRequestInit(canonical, signal)), resolvedUrl: canonical };
+  let resolvedUrl = preferredUrl;
+  let response = await fetch(resolvedUrl, downloadRequestInit(resolvedUrl, signal));
+  if (response.ok || response.status !== 400) return { response, resolvedUrl };
+  // Commons rejects arbitrary thumbnail widths. Try a few documented CDN
+  // widths nearest the requested size on thumb.wikimedia.org. Falling back to
+  // the original upload URL caused both huge transfers and 429s.
+  for (const candidate of alternateWikimediaThumbnailUrls(preferredUrl) || []) {
+    await response.body?.cancel().catch(() => undefined);
+    resolvedUrl = candidate;
+    response = await fetch(resolvedUrl, downloadRequestInit(resolvedUrl, signal));
+    if (response.ok || response.status !== 400) break;
+  }
+  return { response, resolvedUrl };
 }
 
 function downloadCacheKey(input: DownloadArtifactInput, url: string) {
@@ -2098,6 +2138,11 @@ function parseCodexDraftPatch(patchText: string) {
   return updates;
 }
 
+function codexDraftPatchChunkHasChange(chunk: CodexDraftPatchChunk) {
+  return chunk.oldLines.length !== chunk.newLines.length
+    || chunk.oldLines.some((line, index) => line !== chunk.newLines[index]);
+}
+
 function normalizeCodexPatchMatchLine(value: string) {
   return value.trim().replace(/[‐‑‒–—―−]/g, '-').replace(/[‘’‚‛]/g, "'")
     .replace(/[“”„‟]/g, '"').replace(/[            　]/g, ' ');
@@ -2195,7 +2240,15 @@ export function applyUnoDraftPatch(source: string, patchText: string) {
   const normalized = normalizedDraftSource(source);
   let edited = normalized;
   let changedLineCount = 0;
-  for (const chunks of parseCodexDraftPatch(patchText)) {
+  const updates = parseCodexDraftPatch(patchText);
+  const noOpHunkIndex = updates.flat().findIndex((chunk) => !codexDraftPatchChunkHasChange(chunk));
+  if (noOpHunkIndex >= 0) {
+    throw new Error(
+      `Patch hunk ${noOpHunkIndex + 1} contains only context and no change. `
+      + "Replacement requires at least one '-old' line and one '+new' line; insertion requires a '+new' line; deletion requires a '-old' line.",
+    );
+  }
+  for (const chunks of updates) {
     const update = applyCodexDraftPatchUpdate(edited, chunks);
     edited = update.source;
     changedLineCount += update.changedLineCount;
@@ -2215,9 +2268,31 @@ export type UnoDraftPatchHunkFailure = {
 export type UnoDraftPatchResult = {
   source: string;
   appliedHunks: number;
+  alreadyAppliedHunks: number;
   failedHunks: UnoDraftPatchHunkFailure[];
+  ignoredHunks: number;
   totalHunks: number;
 };
+
+function codexDraftPatchChunkAlreadyApplied(source: string, chunk: CodexDraftPatchChunk) {
+  const hasFinalNewline = source.endsWith('\n');
+  const lines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
+  let searchStart = 0;
+  if (chunk.changeContext !== undefined) {
+    const contextIndex = seekCodexPatchSequence(lines, [chunk.changeContext], 0, false);
+    if (contextIndex === undefined) return false;
+    searchStart = contextIndex + 1;
+  }
+  let oldPattern = chunk.oldLines;
+  if (oldPattern.at(-1) === '') oldPattern = oldPattern.slice(0, -1);
+  if (oldPattern.length && seekCodexPatchSequence(lines, oldPattern, searchStart, chunk.isEndOfFile) !== undefined) {
+    return false;
+  }
+  let newPattern = chunk.newLines;
+  if (newPattern.at(-1) === '') newPattern = newPattern.slice(0, -1);
+  if (!newPattern.length) return false;
+  return seekCodexPatchSequence(lines, newPattern, searchStart, chunk.isEndOfFile) !== undefined;
+}
 
 /**
  * Apply a syntactically valid Codex patch one @@ hunk at a time. This keeps the
@@ -2230,9 +2305,15 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
   let edited = normalized;
   let changedLineCount = 0;
   let appliedHunks = 0;
+  let alreadyAppliedHunks = 0;
+  let ignoredHunks = 0;
   const failedHunks: UnoDraftPatchHunkFailure[] = [];
   const chunks = parseCodexDraftPatch(patchText).flat();
   chunks.forEach((chunk, index) => {
+    if (!codexDraftPatchChunkHasChange(chunk)) {
+      ignoredHunks += 1;
+      return;
+    }
     try {
       const update = applyCodexDraftPatchUpdate(edited, [chunk]);
       if (update.source === edited) throw new Error('Hunk completed without changing draft.py.');
@@ -2240,20 +2321,31 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
       changedLineCount += update.changedLineCount;
       appliedHunks += 1;
     } catch (error) {
+      if (codexDraftPatchChunkAlreadyApplied(edited, chunk)) {
+        alreadyAppliedHunks += 1;
+        return;
+      }
       failedHunks.push({
         hunk: index + 1,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   });
-  if (!appliedHunks) {
+  if (!appliedHunks && !alreadyAppliedHunks && !ignoredHunks) {
     const detail = failedHunks.map((failure) => `hunk ${failure.hunk}: ${failure.error}`).join('\n');
     throw new Error(detail || 'Codex patch completed without changing draft.py.');
   }
   if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
     throw new Error('Near-complete source replacement through edit is blocked. Use action=generate to replace the complete draft intentionally.');
   }
-  return { source: edited, appliedHunks, failedHunks, totalHunks: chunks.length };
+  return {
+    source: edited,
+    appliedHunks,
+    alreadyAppliedHunks,
+    failedHunks,
+    ignoredHunks,
+    totalHunks: chunks.length,
+  };
 }
 
 async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserActionResult> {
@@ -2294,18 +2386,17 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
     const coordinateOffset = requestedUnit && !unitRelativeRange ? requestedUnit.startLine - 1 : 0;
     const coordinateStart = coordinateOffset + 1;
     const coordinateEnd = coordinateOffset + totalReadableLines;
+    const boundedRequestedStart = requestedStart === undefined ? undefined : Math.min(requestedStart, coordinateEnd);
     const boundedRequestedEnd = requestedEnd === undefined ? undefined : Math.min(requestedEnd, coordinateEnd);
-    const rangeStart = requestedStart ?? (boundedRequestedEnd === undefined
+    const rangeStart = boundedRequestedStart ?? (boundedRequestedEnd === undefined
       ? coordinateStart
       : Math.max(coordinateStart, boundedRequestedEnd - MAX_SOURCE_READ_LINES + 1));
-    const rangeEnd = boundedRequestedEnd ?? (requestedStart === undefined
+    const requestedRangeEnd = boundedRequestedEnd ?? (boundedRequestedStart === undefined
       ? Math.min(coordinateEnd, coordinateStart + MAX_SOURCE_READ_LINES - 1)
       : Math.min(coordinateEnd, rangeStart + MAX_SOURCE_READ_LINES - 1));
+    const rangeEnd = Math.min(requestedRangeEnd, rangeStart + MAX_SOURCE_READ_LINES - 1);
     if (rangeStart < coordinateStart || rangeStart > rangeEnd || rangeEnd > coordinateEnd) {
       return { ok: false, actual: `Office draft read range ${rangeStart}-${rangeEnd} is outside the current global ${coordinateStart}-${coordinateEnd} source lines${requestedUnit ? ` for unit ${requestedUnit.path}` : ''}.` };
-    }
-    if (rangeEnd - rangeStart + 1 > MAX_SOURCE_READ_LINES) {
-      return { ok: false, actual: `Office draft read ranges are limited to ${MAX_SOURCE_READ_LINES} lines. Request a smaller window around the diagnostic.` };
     }
     const omitLargeProgram = !explicitRange && (
       requestedUnit
@@ -2388,34 +2479,50 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<BrowserAc
 export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult> {
   const documentId = String(input.documentId || '').trim();
   if (!documentId) {
-    return { ok: false, actual: 'file action=unoApi requires the documentId returned by action=plan, so the selected generator can be verified.' };
+    return { ok: false, actual: 'file action=unoApi requires a stable documentId. It may be queried before plan only when documentType is also provided.' };
   }
   try {
-    const draft = await loadDraft(input.runId, documentId);
-    if ((draft.generator || 'uno') === 'javascript') {
+    let draft: OfficeDocumentDraft | undefined;
+    try {
+      draft = await loadDraft(input.runId, documentId);
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code || '')
+        : '';
+      if (code !== 'ENOENT') throw error;
+    }
+    if (!draft && !input.documentType) {
+      return {
+        ok: false,
+        actual: `Office draft ${documentId} is not planned. Provide documentType to inspect the unbound UNO catalog, or call action=plan first.`,
+      };
+    }
+    if (draft && (draft.generator || 'uno') === 'javascript') {
       return {
         ok: false,
         actual: `Document ${documentId} uses JavaScript generation. UNO API guidance is unavailable for this draft; call action=jsApi for ${draft.documentType} instead.`,
       };
     }
-    if (input.documentType && input.documentType !== draft.documentType) {
+    if (draft && input.documentType && input.documentType !== draft.documentType) {
       return {
         ok: false,
         actual: `Document ${documentId} is planned as ${draft.documentType}, not ${input.documentType}. Omit documentType or use the planned value.`,
       };
     }
-    const documentType = draft.documentType;
+    const documentType = draft?.documentType || input.documentType!;
     const normalizedQuery = String(input.query || '').trim().toLowerCase();
     const catalog = await inspectUnoApi({ documentType, query: normalizedQuery || undefined, limit: 120 });
     const catalogDigest = sourceDigest(JSON.stringify(catalog));
     const moduleKey = normalizedQuery || '__index__';
-    const moduleDigests = draft.unoApiModuleDigests || {};
-    const alreadyLoaded = moduleDigests[moduleKey] === catalogDigest;
-    moduleDigests[moduleKey] = catalogDigest;
-    draft.unoApiModuleDigests = moduleDigests;
-    draft.unoApiCatalogDigest = catalogDigest;
-    draft.unoApiCatalogLoadedAt ||= new Date().toISOString();
-    await saveDraft(input.runId, draft);
+    const moduleDigests = draft?.unoApiModuleDigests || {};
+    const alreadyLoaded = Boolean(draft && moduleDigests[moduleKey] === catalogDigest);
+    if (draft) {
+      moduleDigests[moduleKey] = catalogDigest;
+      draft.unoApiModuleDigests = moduleDigests;
+      draft.unoApiCatalogDigest = catalogDigest;
+      draft.unoApiCatalogLoadedAt ||= new Date().toISOString();
+      await saveDraft(input.runId, draft);
+    }
     return {
       ok: true,
       actual: JSON.stringify({
@@ -2425,6 +2532,8 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
         catalogDigest,
         query: normalizedQuery || undefined,
         alreadyLoaded,
+        boundToPlannedDraft: Boolean(draft),
+        nextAction: draft ? undefined : 'plan',
         ...catalog,
       }),
     };
@@ -2664,6 +2773,47 @@ export function officeValidationCacheBaseName(documentId: string, digest: string
   return `validation-${sanitizeFileName(documentId, 'document')}-${digest}`;
 }
 
+const PRESENTATION_CAPABILITY_REQUIREMENTS = [
+  ['RectangleShape', 'RectangleShape'],
+  ['EllipseShape', 'EllipseShape'],
+  ['CustomShape', 'CustomShape'],
+  ['CaptionShape', 'CaptionShape'],
+  ['ConnectorShape', 'ConnectorShape'],
+  ['LineShape', 'LineShape'],
+  ['MeasureShape', 'MeasureShape'],
+  ['TextShape', 'TextShape'],
+  ['GraphicObjectShape', 'GraphicObject'],
+  ['GraphicObject', 'GraphicObject'],
+] as const;
+
+export function requestedPresentationCapabilities(intent: string | undefined) {
+  const requested = String(intent || '');
+  const seen = new Set<string>();
+  return PRESENTATION_CAPABILITY_REQUIREMENTS.flatMap(([label, feature]) => {
+    if (seen.has(feature) || !new RegExp(`\\b${label}\\b`, 'i').test(requested)) return [];
+    seen.add(feature);
+    return [{ label, feature }];
+  });
+}
+
+function missingRequestedPresentationCapabilityDiagnostics(
+  draft: OfficeDocumentDraft,
+  diagnostics: unknown,
+): OfficeProgramDiagnostic[] {
+  if (draft.documentType !== 'presentation' || draft.generator !== 'uno') return [];
+  const counts = generatedFeatureCounts(diagnostics);
+  return requestedPresentationCapabilities(draft.intent)
+    .filter(({ feature }) => (counts[feature] || 0) < 1)
+    .map(({ label, feature }) => ({
+      code: 'UNO_REQUIRED_CAPABILITY_MISSING',
+      severity: 'error' as const,
+      message: (
+        `The plan explicitly requires ${label}, but generated featureCounts.${feature}=0. `
+        + 'Author the real capability with the installed presentation facade example; a visually similar shape does not satisfy this requirement.'
+      ),
+    }));
+}
+
 function validationCachePaths(runId: string | undefined, draft: OfficeDocumentDraft, extension: string) {
   const digest = sourceDigest(draft.program || '');
   // LibreOffice on Windows can create its lock descriptor for a dot-prefixed
@@ -2833,6 +2983,16 @@ async function prepareValidatedDraft(input: {
         requireElementIds: unoStrict && input.draft.operation !== 'modify',
         validationProfile: unoStrict ? 'uno-strict' : 'basic',
       });
+    }
+    const capabilityIssues = unoStrict
+      ? missingRequestedPresentationCapabilityDiagnostics(input.draft, candidate.generated.diagnostics)
+      : [];
+    if (capabilityIssues.length) {
+      validation = {
+        ...validation,
+        issues: [...validation.issues, ...capabilityIssues],
+        passed: false,
+      };
     }
     if (!validation.passed) {
       const error = new Error(validation.issues
@@ -3422,25 +3582,26 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
     if (!String(input.fileName || '').trim()) return { ok: false, actual: 'file action=plan requires fileName.' };
     if (!input.documentType) return { ok: false, actual: 'file action=plan requires documentType.' };
     const requestedFileName = sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`);
-    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
-    const sourcePlan = await plannedSourceDocument(input, assets);
-    const generator = configuredOfficeGenerator(requestedFileName, sourcePlan.operation);
+    let existing: OfficeDocumentDraft | undefined;
     try {
-      const existing = await loadDraft(input.runId, documentId);
+      existing = await loadDraft(input.runId, documentId);
       if (existing.documentType !== input.documentType) {
         return {
           ok: false,
           actual: `documentId ${documentId} already belongs to a ${existing.documentType} document. Reuse it only for that logical document or choose a different stable documentId for a genuinely different output.`,
         };
       }
-      if (!existing.program && !existing.renderedFileName) {
-        existing.fileName = requestedFileName;
-        existing.intent = input.intent ?? existing.intent;
-        existing.operation = sourcePlan.operation;
-        existing.generator = generator;
-        existing.sourceDocument = sourcePlan.sourceDocument;
-        await saveDraft(input.runId, existing);
-      }
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error
+        ? String((error as { code?: unknown }).code || '')
+        : '';
+      if (code !== 'ENOENT') throw error;
+    }
+    // Re-planning an already-authored documentId is idempotent. In particular,
+    // a recovery call must not be rejected merely because the model supplied
+    // operation=modify without an Office attachment: the existing workspace,
+    // source identity, and original operation remain authoritative.
+    if (existing?.program || existing?.renderedFileName) {
       return {
         ok: true,
         actual: JSON.stringify({
@@ -3457,11 +3618,33 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<Brows
           reused: true,
         }),
       };
-    } catch (error) {
-      const code = error && typeof error === 'object' && 'code' in error
-        ? String((error as { code?: unknown }).code || '')
-        : '';
-      if (code !== 'ENOENT') throw error;
+    }
+    const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
+    const sourcePlan = await plannedSourceDocument(input, assets);
+    const generator = configuredOfficeGenerator(requestedFileName, sourcePlan.operation);
+    if (existing) {
+      existing.fileName = requestedFileName;
+      existing.intent = input.intent ?? existing.intent;
+      existing.operation = sourcePlan.operation;
+      existing.generator = generator;
+      existing.sourceDocument = sourcePlan.sourceDocument;
+      await saveDraft(input.runId, existing);
+      return {
+        ok: true,
+        actual: JSON.stringify({
+          kind: 'document-plan',
+          documentId: existing.documentId,
+          fileName: existing.fileName,
+          documentType: existing.documentType,
+          operation: existing.operation || 'create',
+          generator: existing.generator || 'uno',
+          sourceDocument: existing.sourceDocument,
+          sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
+          sourceCharacters: 0,
+          workflow: existing.workflow,
+          reused: true,
+        }),
+      };
     }
     const now = new Date().toISOString();
     const draft: OfficeDocumentDraft = {
@@ -3594,7 +3777,12 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     // Unit-scoped reads return the complete draft digest so callers can omit
     // path safely. Keep accepting the legacy unit digest when path is given.
     const acceptedDigests = new Set(requestedUnit ? [draftDigest, editableDigest] : [draftDigest]);
-    if (!acceptedDigests.has(baseDigest)) {
+    const rebased = !acceptedDigests.has(baseDigest);
+    let patchResult: UnoDraftPatchResult;
+    try {
+      patchResult = applyUnoDraftPatchHunks(editableSource, patchText);
+    } catch (error) {
+      if (!rebased) throw error;
       return {
         ok: false,
         actual: JSON.stringify({
@@ -3606,23 +3794,54 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
           suppliedBaseDigest: baseDigest,
           requiredNextAction: 'read',
-          error: 'The current source changed after the patch was prepared. Read it again and regenerate the patch from the exact returned program.',
+          error: `The current source changed after the patch was prepared and the exact-context patch could not be rebased safely: ${error instanceof Error ? error.message : String(error)}. Read it again and regenerate only the conflicting hunks from the exact returned program.`,
         }),
       };
     }
-    const patchResult = applyUnoDraftPatchHunks(editableSource, patchText);
+    if (rebased && patchResult.failedHunks.length) {
+      return {
+        ok: false,
+        actual: JSON.stringify({
+          kind: 'uno-draft-patch-conflict',
+          code: 'PATCH_BASE_DIGEST_MISMATCH',
+          documentId,
+          sourceUnitPath: requestedUnit?.path,
+          expectedBaseDigest: draftDigest,
+          expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
+          suppliedBaseDigest: baseDigest,
+          patchHunks: {
+            applied: 0,
+            alreadyApplied: patchResult.alreadyAppliedHunks,
+            failed: patchResult.failedHunks,
+            ignored: patchResult.ignoredHunks,
+            total: patchResult.totalHunks,
+          },
+          requiredNextAction: 'read',
+          error: 'The source changed after this patch was prepared. Some hunks still conflict, so no part of the stale patch was saved. Read the current source and retry only those conflicts.',
+        }),
+      };
+    }
     const edited = patchResult.source;
     draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {
-        ok: false,
+        ok: true,
         actual: JSON.stringify({
           kind: 'uno-draft-patch-no-changes',
           code: 'PATCH_NO_CHANGES',
+          editStatus: 'already-applied',
           documentId,
           fileName: draft.fileName,
           changed: false,
-          saved: false,
+          saved: true,
+          rebased,
+          patchHunks: {
+            applied: patchResult.appliedHunks,
+            alreadyApplied: patchResult.alreadyAppliedHunks,
+            failed: patchResult.failedHunks,
+            ignored: patchResult.ignoredHunks,
+            total: patchResult.totalHunks,
+          },
           sourceCharacters: persistedDraft.program.length,
           sourceDigest: sourceDigest(persistedDraft.program),
           patchBaseDigest: draftDigest,
@@ -3630,7 +3849,7 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           lineCount: draftSourceLineCount(editableSource),
           validationStatus: persistedDraft.validationStatus || 'pending',
           requiredNextAction: persistedDraft.validatedSourceDigest === sourceDigest(persistedDraft.program) ? 'render' : 'read',
-          error: 'The patch made no changes. Its target is already satisfied or its change lines are identical to the current source; read the current source before retrying.',
+          message: 'The patch target is already satisfied. No source bytes needed to change.',
         }),
       };
     }
@@ -3653,21 +3872,26 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
       } catch {
         failure = { error: validationResult.actual || 'validation failed' };
       }
+      const patchWasSaved = failure.saved === true;
       return {
-        // The edit transaction itself succeeded: the exact patch was applied
-        // and the new source checkpoint was saved. A later validation defect
-        // is workflow state for the next edit, not a patch-engine failure.
-        ok: failure.saved === true,
+        // Editing and validation are separate outcomes. A saved patch is a
+        // successful mutation even when automatic validation discovers the
+        // next repair. The requiredNextAction gate still prevents rendering or
+        // final delivery until those diagnostics are fixed.
+        ok: patchWasSaved,
         actual: JSON.stringify({
           ...failure,
           editStatus: failure.saved === true ? 'patch-applied' : 'save-failed',
           patchHunks: {
             applied: patchResult.appliedHunks,
+            alreadyApplied: patchResult.alreadyAppliedHunks,
             failed: patchResult.failedHunks,
+            ignored: patchResult.ignoredHunks,
             total: patchResult.totalHunks,
           },
+          rebased,
           changed: true,
-          saved: failure.saved === true,
+          saved: patchWasSaved,
           sourceDigest: sourceDigest(draft.program || ''),
           sourceCharacters: draft.program?.length || 0,
           diagnostics: failure.diagnostics || draft.validationDiagnostics || [],
@@ -3687,21 +3911,45 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
         payload = { actual: validationResult.actual };
       }
       return {
-        ok: validationResult.ok,
+        ok: true,
         actual: JSON.stringify({
           ...payload,
           editStatus: 'partial-patch-applied',
           patchHunks: {
             applied: patchResult.appliedHunks,
+            alreadyApplied: patchResult.alreadyAppliedHunks,
             failed: patchResult.failedHunks,
+            ignored: patchResult.ignoredHunks,
             total: patchResult.totalHunks,
           },
+          rebased,
           requiredNextAction: 'read',
           recoverySuggestion: 'Successful independent hunks were saved. Read the current source and use its new patchBaseDigest before retrying only the reported conflicting hunks.',
         }),
       };
     }
-    return validationResult;
+    if (!rebased && !patchResult.alreadyAppliedHunks && !patchResult.ignoredHunks) return validationResult;
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
+    } catch {
+      payload = { actual: validationResult.actual };
+    }
+    return {
+      ...validationResult,
+      actual: JSON.stringify({
+        ...payload,
+        editStatus: 'patch-applied',
+        rebased,
+        patchHunks: {
+          applied: patchResult.appliedHunks,
+          alreadyApplied: patchResult.alreadyAppliedHunks,
+          failed: patchResult.failedHunks,
+          ignored: patchResult.ignoredHunks,
+          total: patchResult.totalHunks,
+        },
+      }),
+    };
   } catch (error) {
     return { ok: false, actual: `Office draft edit failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -4042,7 +4290,7 @@ export async function generateUnoFileArtifact(input: GenerateUnoProgramInput): P
 
 export async function editUnoFileArtifact(input: EditUnoProgramInput): Promise<BrowserActionResult> {
   try {
-    const documentId = requireDocumentId(input.documentId, 'edit');
+    const documentId = await resolveEditDocumentId(input.runId, input.documentId, input.baseDigest);
     return await withDraftLock(input.runId, documentId, () => editUnoFileArtifactUnlocked({ ...input, documentId }), input.abortSignal);
   } catch (error) {
     return { ok: false, actual: `Office draft edit failed: ${error instanceof Error ? error.message : String(error)}` };

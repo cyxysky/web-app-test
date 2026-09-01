@@ -321,8 +321,8 @@ export async function readBrowserChatFileVisuals(input: {
     if (request.action === 'read' && !requestedScreenshotIds.length) {
       return { ok: false, actual: 'fileVisual action=read requires at least one screenshotId returned by action=index.' };
     }
-    if (requestedScreenshotIds.length > 6) {
-      return { ok: false, actual: 'fileVisual action=read accepts at most 6 screenshotIds per call. Read larger documents in ordered batches.' };
+    if (requestedScreenshotIds.length > 8) {
+      return { ok: false, actual: 'fileVisual action=read accepts at most 8 screenshotIds per call. Read larger documents in ordered batches.' };
     }
     const requestedPages = requestedScreenshotIds.map(screenshotPage);
     if (request.action === 'read' && requestedPages.some((page) => page === undefined)) {
@@ -367,7 +367,7 @@ export async function readBrowserChatFileVisuals(input: {
           warning: visuals.warning,
           automaticChecks: visuals.automaticChecks || [],
           automaticCheckScope: 'render-integrity-only: dimensions and near-blank detection; this is not a visual-quality verdict',
-          instruction: 'Call fileVisual action=read with one to six exact screenshotIds. Continue in ordered batches until every required page has been inspected.',
+          instruction: 'Call fileVisual action=read with one to eight exact screenshotIds. Continue in ordered batches until every required page has been inspected.',
         }),
       };
     }

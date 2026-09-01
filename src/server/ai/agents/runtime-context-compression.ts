@@ -50,13 +50,63 @@ function modelMessageContainsToolCall(message: ModelMessage) {
     && message.content.some((part) => part.type === 'tool-call');
 }
 
-export function atomicRuntimeModelMessageBlocks(messages: ModelMessage[]) {
-  const blocks: ModelMessage[][] = [];
+function modelMessageToolCallIds(message: ModelMessage) {
+  if (!modelMessageContainsToolCall(message) || !Array.isArray(message.content)) return new Set<string>();
+  return new Set(message.content.flatMap((part) => (
+    part.type === 'tool-call' && typeof part.toolCallId === 'string' ? [part.toolCallId] : []
+  )));
+}
+
+/**
+ * Keep the provider transcript protocol valid after compression/merging.
+ * Assistant tool calls and their immediately following tool results form one
+ * indivisible block. Orphan results are discarded, while an incomplete call
+ * block is reduced to any non-tool assistant content it also carried.
+ */
+export function completeRuntimeModelToolChain(messages: ModelMessage[]) {
+  const complete: ModelMessage[] = [];
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
+    const callIds = modelMessageToolCallIds(message);
+    if (callIds.size) {
+      const toolMessages: ModelMessage[] = [];
+      const resultIds = new Set<string>();
+      let nextIndex = index + 1;
+      while (messages[nextIndex]?.role === 'tool') {
+        const toolMessage = messages[nextIndex];
+        const content = Array.isArray(toolMessage.content)
+          ? toolMessage.content.filter((part) => {
+              if (part.type !== 'tool-result' || typeof part.toolCallId !== 'string') return false;
+              if (!callIds.has(part.toolCallId)) return false;
+              resultIds.add(part.toolCallId);
+              return true;
+            })
+          : [];
+        if (content.length) toolMessages.push({ ...toolMessage, content } as ModelMessage);
+        nextIndex += 1;
+      }
+      if ([...callIds].every((toolCallId) => resultIds.has(toolCallId))) {
+        complete.push(message, ...toolMessages);
+      } else if (Array.isArray(message.content)) {
+        const nonToolContent = message.content.filter((part) => part.type !== 'tool-call');
+        if (nonToolContent.length) complete.push({ ...message, content: nonToolContent } as ModelMessage);
+      }
+      index = nextIndex - 1;
+      continue;
+    }
+    if (message.role !== 'tool') complete.push(message);
+  }
+  return complete;
+}
+
+export function atomicRuntimeModelMessageBlocks(messages: ModelMessage[]) {
+  const blocks: ModelMessage[][] = [];
+  const completeMessages = completeRuntimeModelToolChain(messages);
+  for (let index = 0; index < completeMessages.length; index += 1) {
+    const message = completeMessages[index];
     if (modelMessageContainsToolCall(message)) {
       const block = [message];
-      while (messages[index + 1]?.role === 'tool') block.push(messages[++index]);
+      while (completeMessages[index + 1]?.role === 'tool') block.push(completeMessages[++index]);
       blocks.push(block);
       continue;
     }
@@ -78,16 +128,12 @@ export function mergeRuntimeModelMessageChain(
   response: ModelMessage[],
   responsePrefixLength?: number,
 ) {
-  const stableBase = stableRuntimeModelMessages(base);
+  const stableBase = completeRuntimeModelToolChain(stableRuntimeModelMessages(base));
   const responseTail = responsePrefixLength === undefined
     ? response
-    : response.slice(Math.max(0, Math.min(response.length, responsePrefixLength)));
-  const stableResponse = stableRuntimeModelMessages(responseTail);
+    : undefined;
+  const stableResponse = completeRuntimeModelToolChain(stableRuntimeModelMessages(response));
   if (!stableResponse.length) return stableBase;
-  // The executor knows exactly how much of the SDK response transcript was
-  // present before the final model call. Prefer that boundary over content
-  // matching because compression replaces the matching prefix with a summary.
-  if (responsePrefixLength !== undefined) return [...stableBase, ...stableResponse];
   const baseFingerprints = stableBase.map(runtimeModelMessageFingerprint);
   const responseFingerprints = stableResponse.map(runtimeModelMessageFingerprint);
   let bestOverlap = 0;
@@ -111,8 +157,17 @@ export function mergeRuntimeModelMessageChain(
       bestResponseEnd = responseEnd;
     }
   }
-  if (bestOverlap) return [...stableBase, ...stableResponse.slice(bestResponseEnd)];
-  return [...stableBase, ...stableResponse];
+  if (bestOverlap) {
+    return completeRuntimeModelToolChain([...stableBase, ...stableResponse.slice(bestResponseEnd)]);
+  }
+  if (responsePrefixLength !== undefined) {
+    const start = Math.max(0, Math.min(response.length, responsePrefixLength));
+    return completeRuntimeModelToolChain([
+      ...stableBase,
+      ...stableRuntimeModelMessages(response.slice(start)),
+    ]);
+  }
+  return completeRuntimeModelToolChain([...stableBase, ...(responseTail || stableResponse)]);
 }
 
 export function selectRecentRuntimeMessageBlocks(

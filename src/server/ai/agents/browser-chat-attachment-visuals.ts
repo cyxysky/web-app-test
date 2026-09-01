@@ -25,14 +25,14 @@ export type BrowserChatAttachmentVisualResult = {
 type VisualCacheManifest = Pick<BrowserChatAttachmentVisualResult, 'automaticChecks' | 'pageCount' | 'renderer' | 'warning'>;
 
 const defaultPreviewPages = [1, 2, 3, 4];
-const maxPreviewPagesPerRead = 6;
+export const maxPreviewPagesPerRead = 8;
 const htmlPageWidth = 960;
 const htmlPageHeight = 1_358;
 const officeExtensions = officePreviewExtensions();
 const docxExtensions = new Set(['.docx']);
 const spreadsheetExtensions = readableFileExtensions('spreadsheet');
 
-function normalizedPages(value: unknown, pageCount?: number) {
+export function normalizeBrowserChatAttachmentPreviewPages(value: unknown, pageCount?: number) {
   const representative = pageCount && pageCount > maxPreviewPagesPerRead
     ? [1, 2, Math.max(3, Math.round(pageCount / 2)), Math.max(1, pageCount - 1), pageCount]
     : pageCount
@@ -69,7 +69,7 @@ function pageImagePath(directory: string, pageNumber: number) {
 async function existingCache(directory: string, requestedPages: unknown) {
   try {
     const manifest = JSON.parse(await readFile(path.join(directory, 'manifest.json'), 'utf8')) as VisualCacheManifest;
-    const renderedPages = normalizedPages(requestedPages, manifest.pageCount);
+    const renderedPages = normalizeBrowserChatAttachmentPreviewPages(requestedPages, manifest.pageCount);
     const imagePaths = renderedPages.map((pageNumber) => pageImagePath(directory, pageNumber));
     await Promise.all(imagePaths.map((filePath) => access(filePath, constants.R_OK)));
     return {
@@ -110,7 +110,7 @@ async function renderPdfPages(buffer: Buffer, directory: string, requestedPages:
   const parser = new PDFParse({ data: Buffer.from(buffer) });
   try {
     const info = await parser.getInfo();
-    const renderedPages = normalizedPages(requestedPages, info.total);
+    const renderedPages = normalizeBrowserChatAttachmentPreviewPages(requestedPages, info.total);
     const screenshots = await parser.getScreenshot({
       desiredWidth: 1_400,
       imageBuffer: true,
@@ -188,7 +188,7 @@ async function renderHtmlPages(input: {
       document.body.scrollHeight,
     ));
     const pageCount = Math.max(1, Math.ceil(contentHeight / htmlPageHeight));
-    const renderedPages = normalizedPages(input.requestedPages, pageCount);
+    const renderedPages = normalizeBrowserChatAttachmentPreviewPages(input.requestedPages, pageCount);
     await page.evaluate((minimumHeight) => { document.body.style.minHeight = `${minimumHeight}px`; }, pageCount * htmlPageHeight);
     await mkdir(input.directory, { recursive: true });
     const imagePaths: string[] = [];

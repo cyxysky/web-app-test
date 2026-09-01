@@ -82,7 +82,28 @@ create_document(None)`, 'uno');
       .toContain('colors, type');
   });
 
-  it('collects all literal facade bounds defects and invalid grid-cell keys before execution', async () => {
+  it('rejects guessed timeline options while accepting the installed text_color option', async () => {
+    const rejected = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('timeline', layout='title-content', title='Timeline')
+    slide.add_timeline('events', [{'title': '2026', 'body': 'Launch'}], body_color='#CBD5E1')
+    deck.save()
+    deck.close()`, 'uno');
+    if (rejected.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    expect(rejected.passed).toBe(false);
+    expect(rejected.diagnostics.find((item) => item.code === 'UNO_API_SIGNATURE_MISMATCH')?.message)
+      .toContain("does not accept keyword 'body_color'");
+
+    const accepted = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('timeline', layout='title-content', title='Timeline')
+    slide.add_timeline('events', [{'title': '2026', 'body': 'Launch'}], text_color='#CBD5E1')
+    deck.save()
+    deck.close()`, 'uno');
+    expect(accepted.diagnostics.some((item) => item.code === 'UNO_API_SIGNATURE_MISMATCH')).toBe(false);
+  });
+
+  it('collects all literal bounds defects while accepting PptxGenJS w/h grid aliases', async () => {
     const result = await analyzeOfficeProgram(`def create_document(job):
     deck = job.presentation('deck')
     slide = deck.slide('cover', layout='blank')
@@ -96,10 +117,22 @@ create_document(None)`, 'uno');
     expect(result.diagnostics.filter((item) => item.code === 'PRESENTATION_GEOMETRY_INVALID').length)
       .toBeGreaterThanOrEqual(2);
     expect(result.diagnostics.some((item) => item.code === 'PRESENTATION_GEOMETRY_OUT_OF_BOUNDS')).toBe(true);
-    const cellKeyErrors = result.diagnostics.filter((item) => item.code === 'UNO_LAYOUT_CELL_KEY_INVALID');
-    expect(cellKeyErrors).toHaveLength(2);
-    expect(cellKeyErrors.map((item) => item.message).join(' ')).toContain("'width'");
-    expect(cellKeyErrors.map((item) => item.message).join(' ')).toContain("'height'");
+    expect(result.diagnostics.some((item) => item.code.startsWith('UNO_LAYOUT_CELL_'))).toBe(false);
+  });
+
+  it('reports grid flattening and tuple indexing before execution', async () => {
+    const result = await analyzeOfficeProgram(`def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('cover', layout='blank')
+    cells = slide.grid(2, 1)
+    flat = []
+    for cell in cells:
+        flat.extend(cell)
+        slide.add_text('metric', '42', box=(cell[0], cell['y'], cell['w'], cell['h']))`, 'uno');
+    if (result.diagnostics.some((item) => item.code === 'PYTHON_AST_UNAVAILABLE')) return;
+    expect(result.passed).toBe(false);
+    expect(result.diagnostics.some((item) => item.code === 'UNO_LAYOUT_GRID_FLATTEN_INVALID')).toBe(true);
+    expect(result.diagnostics.some((item) => item.code === 'UNO_LAYOUT_CELL_INDEX_INVALID')).toBe(true);
   });
 
   it('validates facade option schemas hidden behind double-star keyword forwarding', async () => {

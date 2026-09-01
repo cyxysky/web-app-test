@@ -3,11 +3,14 @@ import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
   compactBrowserChatLogsForClient,
 } from '@/server/ai/agents/browser-chat-log-client';
-import type {
-  BrowserChatLogRecord,
-  BrowserChatMessage,
-  BrowserChatSessionSnapshot,
+import {
+  recoverOrphanedBrowserChatSession,
+  type BrowserChatLogRecord,
+  type BrowserChatMessage,
+  type BrowserChatSessionSnapshot,
 } from '@/server/ai/agents/browser-chat.service';
+// Session list/detail reads use SQLite projections rather than the in-memory
+// service list, so reconcile persisted `running` flags with the live registry.
 import type { BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';
 import {
   estimateRuntimeMessageContext,
@@ -112,11 +115,15 @@ export function listBrowserChatSessionSummaries(
     userId: normalizeApplicationUserId(userId),
   })
     .filter((session) => session?.id && belongsToUser(session, userId))
+    .map(recoverOrphanedBrowserChatSession)
     .map(compactSessionSummary);
 }
 
 export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  const persistedSession = readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
+  const storedSession = readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
+  const persistedSession = storedSession
+    ? recoverOrphanedBrowserChatSession(storedSession) as BrowserChatPersistedHeader
+    : undefined;
   if (!persistedSession || !belongsToUser(persistedSession, userId)) return undefined;
   const { modelContext: _modelContext, ...session } = persistedSession;
   void _modelContext;

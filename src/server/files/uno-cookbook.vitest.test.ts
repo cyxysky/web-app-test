@@ -39,6 +39,32 @@ describe('UNO cookbook ownership boundaries', () => {
     expect(cookbook.facadeSignatures?.some((signature) => signature.includes('deck.add_custom_show'))).toBe(true);
   }, 60_000);
 
+  it('returns one complete example covering every specialized presentation shape capability', async () => {
+    if (!await resolveLibreOfficeExecutable()) return;
+    const api = await inspectUnoApi({ documentType: 'presentation', query: 'presentation.shape', limit: 1 });
+    const cookbook = api as unknown as { examples?: Record<string, string>; rules?: string[] };
+    const example = cookbook.examples?.specializedShapeCapabilities || '';
+    for (const capability of [
+      'RectangleShape', 'EllipseShape', 'CustomShape', 'CaptionShape', 'ConnectorShape',
+      'LineShape', 'MeasureShape', 'TextShape', 'GraphicObject',
+    ]) {
+      expect(example).toContain(capability);
+    }
+    expect(example).toContain("shape_type='caption'");
+    expect(example).toContain("shape_type='measure'");
+    expect(example).toContain("slide.connect('connector-shape'");
+    expect(cookbook.rules?.some((rule) => rule.includes('featureCounts'))).toBe(true);
+  }, 60_000);
+
+  it('publishes the complete timeline color and layout contract without a catch-all signature', async () => {
+    if (!await resolveLibreOfficeExecutable()) return;
+    const api = await inspectUnoApi({ documentType: 'presentation', query: 'presentation.timeline', limit: 1 });
+    const cookbook = api as unknown as { examples?: Record<string, string> };
+    expect(cookbook.examples?.timeline).toContain("text_color='#CBD5E1'");
+    expect(JSON.stringify(api)).toContain('text_color=0x334155');
+    expect(JSON.stringify(api)).not.toContain('max_items_per_row=6, **options');
+  }, 60_000);
+
   it('executes the compact high-level presentation blueprint without raw UNO', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
     const sourceCode = `def create_document(job):
@@ -48,10 +74,13 @@ describe('UNO cookbook ownership boundaries', () => {
     slide.add_chart('revenue', 'column', ['Q1', 'Q2', 'Q3', 'Q4'], slot='right', values=[120, 145, 168, 190], series_name='Revenue', title='Quarterly revenue', x_axis_title='Quarter', y_axis_title='Revenue', show_legend=True)
     slide.set_transition('fade', speed='medium')
     grid_slide = deck.slide('grid', layout='title-content', title='Allocated layout')
+    grid_slide.add_header('header', left='Layout', accent='#F59E0B')
+    grid_slide.add_footer('footer', left='UNO', center='Allocated', right='02')
     left, right = grid_slide.grid(2, 1, slot='body', gap=0.3)
-    grid_slide.add_text('left', 'Unit-tagged grid cell', box=left, style={'font_size': 18, 'min_font_size': 16})
+    grid_slide.add_text('left', 'Unit-tagged grid cell', box={'x': left['x'], 'y': left['y'], 'w': left['w'], 'h': left['h'], '_unit': left['_unit']}, style={'font_size': 18, 'min_font_size': 16})
     grid_slide.add_text('right', 'No double inch conversion', box=right, style={'font_size': 18, 'min_font_size': 16})
     auto_slide = deck.slide('auto-text', layout='blank')
+    auto_slide.set_background('linear', '#020617', '#1E3A8A', 135)
     auto_slide.add_text('headline', 'Large auto-height title', box={'x': 0.8, 'y': 0.7, 'w': 11.7}, auto_height=True,
                         style={'font_size': 78, 'min_font_size': 72, 'padding': 0})
     auto_slide.add_link('overview-link', 'Back to overview', box=(0.8, 5.8, 3.2, 0.7), target_slide_id='overview',
@@ -218,6 +247,51 @@ def create_document(job):
     expect(issues.some((issue) => issue.type === 'geometry_invalid')).toBe(false);
   }, 60_000);
 
+  it('records exact non-zero feature counts for every specialized presentation shape capability', async () => {
+    if (!await resolveLibreOfficeExecutable()) return;
+    const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-shape-capabilities-'));
+    try {
+      await writeFile(
+        path.join(directory, 'sample.svg'),
+        '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect width="200" height="100" fill="#2563eb"/></svg>',
+        'utf8',
+      );
+      const generated = await generateUnoProgramDocument({
+        assetsPath: directory,
+        documentType: 'presentation',
+        fileName: 'specialized-shape-capabilities.pptx',
+        sourceCode: `
+def create_document(job):
+    deck = job.presentation('deck')
+    slide = deck.slide('capabilities', layout='blank')
+    slide.add_shape('rectangle', box=(0.6, 0.6, 1.3, 0.7), shape_type='rectangle', fill='#DBEAFE')
+    slide.add_shape('ellipse', box=(2.1, 0.6, 1.3, 0.7), shape_type='ellipse', fill='#DCFCE7')
+    slide.add_shape('custom', box=(3.6, 0.6, 1.3, 0.7), shape_type='diamond', fill='#FEF3C7')
+    caption = slide.add_shape('caption', box=(5.1, 0.5, 2.0, 0.9), shape_type='caption', fill='#FCE7F3')
+    caption.set_text('Caption', {'font_size': 14, 'valign': 'CENTER'})
+    slide.add_shape('measure', box=(7.5, 0.8, 1.8, 0.25), shape_type='measure', line='#7C3AED', line_width=2)
+    slide.add_shape('line', box=(9.8, 0.8, 1.8, 0.1), shape_type='line', line='#475569', line_width=2)
+    slide.add_text('text', 'Text shape', box=(0.6, 2.0, 2.0, 0.6), style={'font_size': 16, 'min_font_size': 16})
+    slide.add_image('image', 'sample.svg', box=(3.0, 1.8, 2.2, 1.1), contain=True)
+    slide.add_shape('source', box=(6.0, 2.0, 1.5, 0.7), shape_type='round-rectangle', fill='#E0E7FF')
+    slide.add_shape('target', box=(9.0, 2.0, 1.5, 0.7), shape_type='round-rectangle', fill='#E0E7FF')
+    slide.connect('connector', 'source', 'target', color='#4F46E5', width=2, endArrow='triangle')
+    deck.save()
+    deck.close()
+`,
+      });
+      const features = generated.report.featureCounts as Record<string, number>;
+      for (const capability of [
+        'RectangleShape', 'EllipseShape', 'CustomShape', 'CaptionShape', 'ConnectorShape',
+        'LineShape', 'MeasureShape', 'TextShape', 'GraphicObject',
+      ]) {
+        expect(features[capability], capability).toBeGreaterThan(0);
+      }
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  }, 120_000);
+
   it('keeps crop and accessibility metadata on the default contained-image path', async () => {
     if (!await resolveLibreOfficeExecutable()) return;
     const directory = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-image-metadata-'));
@@ -263,6 +337,10 @@ def create_document(job):
     slide.set_background(0x0F172A)
     slide.add_text('headline', 'Stable high-level layout', box={'x': 0.7, 'y': 0.5, 'w': 12, 'h': 0.8}, style={'font_size': 30, 'min_font_size': 24, 'color': 0xFFFFFF, 'background': 0x1E293B, 'underline': True})
     slide.set_transition('wipe')
+    layered = deck.slide('layered', layout='title-content', title='Title stays above background')
+    layered.set_background(0xF8FAFC)
+    cells = layered.grid(2, 1, slot='body', gap=0.3)
+    layered.add_text('cell', 'Arithmetic-safe grid', box=(cells[0]['x'] + 0.15, cells[0]['y'] + 0.15, cells[0]['w'] - 0.3, 0.6), style={'font_size': 18})
     section = deck.slide('章节页', layout='title-section', title='Native section layout')
     section.add_text('中文标识', 'Unicode element IDs are supported', box={'x': 1, 'y': 4.8, 'w': 5, 'h': 0.7}, style={'fontSize': 18, 'fontColor': 0xFFFFFF, 'backgroundColor': 0x2563EB, 'borderColor': 0x93C5FD, 'borderWidth': 0.04})
     deck.save()
@@ -275,9 +353,17 @@ def create_document(job):
     expect(headline?.layout?.width).toBe(30480);
     expect(headline?.layout?.height).toBe(2032);
     expect((generated.report.featureCounts as { slideTransition?: number }).slideTransition).toBe(1);
+    const gridCell = (generated.report.elementMap as Array<{
+      elementId?: string; layout?: { x?: number; width?: number };
+    }>).find((entry) => entry.elementId === 'layered/cell');
+    expect(gridCell?.layout?.x).toBeLessThan(33866);
+    expect(gridCell?.layout?.width).toBeGreaterThan(1000);
     expect((generated.report.elementMap as Array<{ elementId?: string }>).some((entry) => entry.elementId === '章节页/中文标识')).toBe(true);
     const archive = await JSZip.loadAsync(generated.buffer);
-    const sectionXml = await archive.file('ppt/slides/slide2.xml')?.async('string');
+    const layeredXml = await archive.file('ppt/slides/slide2.xml')?.async('string') || '';
+    expect(layeredXml).toContain('Title stays above background');
+    expect(layeredXml.indexOf('background')).toBeLessThan(layeredXml.indexOf('Title stays above background'));
+    const sectionXml = await archive.file('ppt/slides/slide3.xml')?.async('string');
     expect(sectionXml).toContain('Unicode element IDs are supported');
   }, 60_000);
 

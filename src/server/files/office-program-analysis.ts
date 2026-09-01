@@ -137,8 +137,8 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       'p = pathlib.Path(sys.argv[1])',
       'diagnostics = []',
       'high_risk_properties = {"Position", "Size", "Width", "Height", "AnchorType", "Surround", "FrameStyleName", "IsAutoHeight", "RowHeight", "OptimalHeight", "ParaLineSpacing", "BreakType"}',
-      'facade_methods = {"feature","slide","sheet","slot","set_page","add_slide","bounds","content_box","grid","stack","mm","cm","inch","pt","text_height","estimate_text_box","add_text","add_link","add_text_box","add_card","add_footer","add_shape","connect","add_connector","add_image","add_image_contain","add_table","add_native_table","add_chart","add_bar_chart","add_line_chart","add_donut_chart","add_timeline","set_transition","add_paragraph","add_title","add_heading","add_bullets","add_numbered_list","add_inline_image","add_page_break","add_worksheet","set_cell","set_range","format","merge","freeze","column_width","row_height"}',
-      'element_methods = {"slide","sheet","add_slide","add_text","add_link","add_text_box","add_card","add_footer","add_shape","connect","add_connector","add_image","add_image_contain","add_table","add_native_table","add_chart","add_bar_chart","add_line_chart","add_donut_chart","add_timeline","add_paragraph","add_title","add_heading","add_bullets","add_numbered_list","add_inline_image","add_page_break","add_worksheet","set_cell","set_range","format","merge","freeze","column_width","row_height"}',
+      'facade_methods = {"feature","slide","sheet","slot","set_page","add_slide","bounds","content_box","grid","stack","mm","cm","inch","pt","text_height","estimate_text_box","add_text","add_link","add_text_box","add_card","add_header","add_footer","add_shape","connect","add_connector","add_image","add_image_contain","add_table","add_native_table","add_chart","add_bar_chart","add_line_chart","add_donut_chart","add_timeline","set_transition","add_paragraph","add_title","add_heading","add_bullets","add_numbered_list","add_inline_image","add_page_break","add_worksheet","set_cell","set_range","format","merge","freeze","column_width","row_height"}',
+      'element_methods = {"slide","sheet","add_slide","add_text","add_link","add_text_box","add_card","add_header","add_footer","add_shape","connect","add_connector","add_image","add_image_contain","add_table","add_native_table","add_chart","add_bar_chart","add_line_chart","add_donut_chart","add_timeline","add_paragraph","add_title","add_heading","add_bullets","add_numbered_list","add_inline_image","add_page_break","add_worksheet","set_cell","set_range","format","merge","freeze","column_width","row_height"}',
       'def add(code, node, message, severity="warning"):',
       ' diagnostics.append({"code":code,"line":getattr(node,"lineno",None),"column":(getattr(node,"col_offset",0)+1),"message":message,"severity":severity})',
       'def callable_name(node):',
@@ -509,11 +509,12 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       '   self.grid_cell_vars.difference_update(introduced)',
       '  def visit_Subscript(self,node):',
       '   key = node.slice.value if isinstance(node.slice,ast.Constant) else None',
-      '   if isinstance(node.value,ast.Name) and node.value.id in self.grid_cell_vars and key in {"w","h"}:',
-      '    replacement = "width" if key == "w" else "height"',
-      '    add("UNO_LAYOUT_CELL_KEY_INVALID",node,f"Grid/stack cells use {replacement!r}, not {key!r}; copy the returned presentation.layout example and preserve the cell _unit tag.","error")',
+      '   if isinstance(node.value,ast.Name) and node.value.id in self.grid_cell_vars and isinstance(key,int):',
+      '    add("UNO_LAYOUT_CELL_INDEX_INVALID",node,"Grid/stack cells are mappings, not tuples. Use x/y/width/height or PptxGenJS-compatible w/h keys, or pass the complete cell directly as box=cell.","error")',
       '   self.generic_visit(node)',
       '  def visit_Call(self,node):',
+      '   if isinstance(node.func,ast.Attribute) and node.func.attr == "extend" and any(isinstance(arg,ast.Name) and arg.id in self.grid_cell_vars for arg in node.args):',
+      '    add("UNO_LAYOUT_GRID_FLATTEN_INVALID",node,"slide.grid/stack already returns a flat row-major list of cell mappings. Do not extend/flatten a cell; iterate the returned list directly and pass box=cell.","error")',
       '   if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name):',
       '    receiver_name, method = node.func.value.id, node.func.attr',
       '    receiver_type = self.types.get(receiver_name)',
@@ -715,7 +716,7 @@ export function diagnoseOfficeProgramRuntimeError(source: string, errorText: str
   else if (/Presentation geometry (?:requires non-negative position and positive size|exceeds slide bounds)/i.test(errorText)) code = 'PRESENTATION_GEOMETRY_INVALID';
   else if (/Presentation text cannot fit without becoming unreadable/i.test(errorText)) code = 'PRESENTATION_TEXT_OVERFLOW';
   else if (/Duplicate elementId/i.test(errorText)) code = 'DUPLICATE_ELEMENT_ID';
-  else if (/AttributeError:.*has no attribute ['"](?:add_slide|bounds|content_box|grid|stack|mm|cm|inch|pt|text_height|estimate_text_box|add_text|add_text_box|add_card|add_footer|add_shape|add_connector|add_image|add_image_contain|add_native_table|add_bar_chart|add_line_chart|add_donut_chart|add_timeline)['"]/i.test(errorText)) code = 'FACADE_METHOD_ON_RAW_UNO_DOCUMENT';
+  else if (/AttributeError:.*has no attribute ['"](?:add_slide|bounds|content_box|grid|stack|mm|cm|inch|pt|text_height|estimate_text_box|add_text|add_text_box|add_card|add_header|add_footer|add_shape|add_connector|add_image|add_image_contain|add_native_table|add_bar_chart|add_line_chart|add_donut_chart|add_timeline)['"]/i.test(errorText)) code = 'FACADE_METHOD_ON_RAW_UNO_DOCUMENT';
   else if (/create_document\(None\)|NoneType.*presentation/i.test(errorText)) code = 'DRAFT_ENTRYPOINT_CALLED_DIRECTLY';
   const elementId = errorText.match(/elementId=['"]([^'"]+)['"]/i)?.[1];
   const diagnostic: OfficeProgramDiagnostic = {

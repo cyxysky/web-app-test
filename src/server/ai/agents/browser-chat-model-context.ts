@@ -1,5 +1,6 @@
 import { modelMessageSchema, type ModelMessage } from 'ai';
 import { browserChatInterruptedTurnContextMarker } from './browser-chat-reply-text';
+import { completeRuntimeModelToolChain } from './runtime-context-compression';
 
 export type BrowserChatModelContextCompression = {
   compressedAt: string;
@@ -38,7 +39,7 @@ export function serializableBrowserChatModelMessages(messages: ModelMessage[]) {
 }
 
 export function compactBrowserChatModelTranscript(messages: ModelMessage[]) {
-  return [...messages];
+  return completeRuntimeModelToolChain(messages);
 }
 
 function modelMessageText(message: ModelMessage) {

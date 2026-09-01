@@ -15,6 +15,7 @@ import {
   planFileArtifact,
   readUnoDraft,
   recordOfficeVisualQaProgress,
+  requestedPresentationCapabilities,
   sourceUnitsForDraft,
 } from './file-artifact-tools';
 import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
@@ -160,7 +161,7 @@ describe('UNO file tool policies', () => {
         render: false,
         runId: 'chat_test',
       });
-      expect(edited.ok).toBe(true);
+      expect(edited.ok, edited.actual).toBe(true);
       expect(edited.actual).not.toContain('PATCH_BASE_DIGEST_MISMATCH');
       const after = await readUnoDraft({ documentId: 'unit-relative-read', runId: 'chat_test' });
       expect(after.actual).toContain('return (');
@@ -372,6 +373,34 @@ describe('UNO file tool policies', () => {
     expect(result.failedHunks[0]).toMatchObject({ hunk: 2 });
   });
 
+  it('treats already-applied and context-only hunks as satisfied without changing indentation', () => {
+    const source = [
+      'def create_document(job):',
+      '    title = "New"',
+      '    body = "Current"',
+      '',
+    ].join('\n');
+    const result = applyUnoDraftPatchHunks(source, [
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@ def create_document(job):',
+      '-    title = "Old"',
+      '+    title = "New"',
+      '@@',
+      '     body = "Current"',
+      '*** End Patch',
+    ].join('\n'));
+
+    expect(result.source).toBe(source);
+    expect(result).toMatchObject({
+      appliedHunks: 0,
+      alreadyAppliedHunks: 1,
+      ignoredHunks: 1,
+      totalHunks: 2,
+    });
+    expect(result.failedHunks).toEqual([]);
+  });
+
   it('allows distant atomic hunks without treating their span as a full replacement', () => {
     const source = Array.from({ length: 240 }, (_, index) => `line ${index + 1}`).join('\n') + '\n';
     const patch = [
@@ -406,6 +435,35 @@ describe('UNO file tool policies', () => {
     expect(patched).toBe(['def create_document(job):', ...newLines, ''].join('\n'));
   });
 
+  it('rejects context-only patch hunks with an actionable Codex grammar error', () => {
+    expect(() => applyUnoDraftPatch('def create_document(job):\n    return 1\n', [
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@ def create_document(job):',
+      '     return 1',
+      '*** End Patch',
+    ].join('\n'))).toThrow(
+      "Patch hunk 1 contains only context and no change. Replacement requires at least one '-old' line and one '+new' line",
+    );
+  });
+
+  it('deduplicates exact presentation capability requirements from plan intent', () => {
+    expect(requestedPresentationCapabilities(
+      'Use RectangleShape, EllipseShape, CustomShape, CaptionShape, ConnectorShape, '
+      + 'LineShape, MeasureShape, TextShape, GraphicObject and GraphicObjectShape.',
+    )).toEqual([
+      { label: 'RectangleShape', feature: 'RectangleShape' },
+      { label: 'EllipseShape', feature: 'EllipseShape' },
+      { label: 'CustomShape', feature: 'CustomShape' },
+      { label: 'CaptionShape', feature: 'CaptionShape' },
+      { label: 'ConnectorShape', feature: 'ConnectorShape' },
+      { label: 'LineShape', feature: 'LineShape' },
+      { label: 'MeasureShape', feature: 'MeasureShape' },
+      { label: 'TextShape', feature: 'TextShape' },
+      { label: 'GraphicObjectShape', feature: 'GraphicObject' },
+    ]);
+  });
+
   it('clamps a bounded read endLine to the current source EOF', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'webpilot-read-eof-clamp-'));
     roots.push(root);
@@ -436,6 +494,97 @@ describe('UNO file tool policies', () => {
       };
       expect(payload.sourceLineRange).toMatchObject({ startLine: 8, endLine: 10, totalSourceLines: 10 });
       expect(payload.program).toBe('# source line 8\n# source line 9\n# source line 10');
+    } finally {
+      if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = previousArtifacts;
+    }
+  });
+
+  it('caps oversized read windows and clamps a start beyond EOF to the final line', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'webpilot-read-window-clamp-'));
+    roots.push(root);
+    const previousArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = root;
+    try {
+      await planFileArtifact({
+        documentId: 'read-window-clamp', documentType: 'presentation', fileName: 'window.pptx', runId: 'chat_test',
+      });
+      const metadataPath = path.join(root, 'chat_test', 'document-drafts', 'read-window-clamp.json');
+      const draft = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
+      const program = Array.from({ length: 300 }, (_, index) => `# source line ${index + 1}`).join('\n');
+      await writeFile(metadataPath, JSON.stringify({
+        ...draft,
+        program,
+        sourceDigest: createHash('sha256').update(program).digest('hex'),
+        workflow: { state: 'authoring', checkpointAt: new Date().toISOString() },
+      }), 'utf8');
+
+      const oversized = JSON.parse((await readUnoDraft({
+        documentId: 'read-window-clamp', startLine: 1, endLine: 999, runId: 'chat_test',
+      })).actual || '{}') as { program?: string; sourceLineRange?: { startLine?: number; endLine?: number } };
+      expect(oversized.sourceLineRange).toMatchObject({ startLine: 1, endLine: 240 });
+      expect(oversized.program?.split('\n')).toHaveLength(240);
+
+      const afterEof = JSON.parse((await readUnoDraft({
+        documentId: 'read-window-clamp', startLine: 500, endLine: 520, runId: 'chat_test',
+      })).actual || '{}') as { program?: string; sourceLineRange?: { startLine?: number; endLine?: number } };
+      expect(afterEof.sourceLineRange).toMatchObject({ startLine: 300, endLine: 300 });
+      expect(afterEof.program).toBe('# source line 300');
+    } finally {
+      if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = previousArtifacts;
+    }
+  });
+
+  it('rebases exact stale patches and returns already-satisfied retries as success', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'webpilot-stale-patch-rebase-'));
+    roots.push(root);
+    const previousArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = root;
+    try {
+      await planFileArtifact({
+        documentId: 'stale-patch-rebase', documentType: 'word', fileName: 'stale.docx', runId: 'chat_test',
+      });
+      await generateUnoFileArtifact({
+        documentId: 'stale-patch-rebase',
+        program: 'def wrong_entrypoint(job):\n    return 1',
+        runId: 'chat_test',
+      });
+      const initial = JSON.parse((await readUnoDraft({
+        documentId: 'stale-patch-rebase', runId: 'chat_test',
+      })).actual || '{}') as { patchBaseDigest?: string };
+      const patch = (oldValue: number, newValue: number) => [
+        '*** Begin Patch',
+        '*** Update File: draft.py',
+        '@@',
+        `-    return ${oldValue}`,
+        `+    return ${newValue}`,
+        '*** End Patch',
+      ].join('\n');
+      expect((await editUnoFileArtifact({
+        documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
+        patch: patch(1, 2), runId: 'chat_test',
+      })).ok).toBe(true);
+
+      const rebased = await editUnoFileArtifact({
+        documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
+        patch: patch(2, 3), runId: 'chat_test',
+      });
+      expect(rebased.ok, rebased.actual).toBe(true);
+      expect(JSON.parse(rebased.actual || '{}')).toMatchObject({ rebased: true, saved: true });
+
+      const repeated = await editUnoFileArtifact({
+        documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
+        patch: patch(2, 3), runId: 'chat_test',
+      });
+      expect(repeated.ok, repeated.actual).toBe(true);
+      expect(JSON.parse(repeated.actual || '{}')).toMatchObject({
+        editStatus: 'already-applied',
+        changed: false,
+        saved: true,
+        rebased: true,
+      });
+      expect((await readUnoDraft({ documentId: 'stale-patch-rebase', runId: 'chat_test' })).actual).toContain('return 3');
     } finally {
       if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = previousArtifacts;
@@ -541,6 +690,40 @@ describe('UNO file tool policies', () => {
     }
   });
 
+  it('retries a made-up Wikimedia thumbnail width on supported thumb CDN sizes without fetching the original', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'webpilot-download-wikimedia-width-'));
+    roots.push(root);
+    const previousArtifacts = process.env.ARTIFACTS_DIR;
+    const previousFetch = globalThis.fetch;
+    process.env.ARTIFACTS_DIR = root;
+    const seenUrls: string[] = [];
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      seenUrls.push(url);
+      return url.includes('/330px-')
+        ? new Response('image-bytes', { status: 200, headers: { 'content-type': 'image/jpeg' } })
+        : new Response('unsupported width', { status: 400 });
+    };
+    try {
+      const downloaded = await downloadFileArtifact({
+        runId: 'chat_test',
+        fileName: 'webb.jpg',
+        fileType: 'jpg',
+        url: 'https://upload.wikimedia.org/wikipedia/commons/thumb/b/bf/Webb.jpg/320px-Webb.jpg',
+      });
+      expect(downloaded.ok, downloaded.actual).toBe(true);
+      expect(seenUrls).toEqual([
+        'https://thumb.wikimedia.org/wikipedia/commons/thumb/b/bf/Webb.jpg/320px-Webb.jpg',
+        'https://thumb.wikimedia.org/wikipedia/commons/thumb/b/bf/Webb.jpg/330px-Webb.jpg',
+      ]);
+      expect(seenUrls.every((url) => url.includes('/thumb/'))).toBe(true);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = previousArtifacts;
+    }
+  });
+
   it('persists partial syntax repairs while other source errors remain', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-cumulative-syntax-'));
     roots.push(root);
@@ -565,7 +748,7 @@ describe('UNO file tool policies', () => {
         newText: '    pass  # first repair',
         runId: 'chat_test',
       });
-      expect(firstRepair.ok).toBe(true);
+      expect(firstRepair.ok, firstRepair.actual).toBe(true);
       expect(JSON.parse(firstRepair.actual || '{}')).toMatchObject({ editStatus: 'patch-applied', changed: true, saved: true });
       const afterFirstRepair = await readUnoDraft({ documentId: 'cumulative-syntax', runId: 'chat_test' });
       expect(afterFirstRepair.actual).toContain('first repair');
@@ -577,7 +760,7 @@ describe('UNO file tool policies', () => {
         newText: '    pass  # second repair',
         runId: 'chat_test',
       });
-      expect(secondRepair.ok).toBe(true);
+      expect(secondRepair.ok, secondRepair.actual).toBe(true);
       expect(JSON.parse(secondRepair.actual || '{}')).toMatchObject({ editStatus: 'patch-applied', changed: true, saved: true });
       const afterSecondRepair = await readUnoDraft({ documentId: 'cumulative-syntax', runId: 'chat_test' });
       expect(afterSecondRepair.actual).toContain('first repair');
@@ -641,10 +824,72 @@ describe('UNO file tool policies', () => {
         newText: '    return 3',
         runId: 'chat_test',
       });
-      expect(edited.ok).toBe(true);
+      expect(edited.ok, edited.actual).toBe(true);
       expect(JSON.parse(edited.actual || '{}').kind).toBe('uno-draft-validation');
       const afterEdit = await readUnoDraft({ documentId: 'single-source', runId: 'chat_test' });
       expect(afterEdit.actual).toContain('return 3');
+    } finally {
+      if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = previousArtifacts;
+      if (previousMode === undefined) delete process.env.OFFICE_GENERATION_MODE;
+      else process.env.OFFICE_GENERATION_MODE = previousMode;
+    }
+  });
+
+  it('recovers a missing edit documentId from the unique patch digest and keeps re-planning idempotent', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-edit-id-recovery-'));
+    roots.push(root);
+    const previousArtifacts = process.env.ARTIFACTS_DIR;
+    const previousMode = process.env.OFFICE_GENERATION_MODE;
+    process.env.ARTIFACTS_DIR = root;
+    process.env.OFFICE_GENERATION_MODE = 'uno';
+    try {
+      await planFileArtifact({
+        documentId: 'recover-edit-id', documentType: 'word', fileName: 'recover-edit-id.docx', runId: 'chat_test',
+      });
+      await generateUnoFileArtifact({
+        documentId: 'recover-edit-id',
+        program: 'def wrong_entrypoint(job):\n    return 1',
+        runId: 'chat_test',
+      });
+      const read = await readUnoDraft({ documentId: 'recover-edit-id', runId: 'chat_test' });
+      const state = JSON.parse(read.actual || '{}') as { patchBaseDigest?: string };
+      const edited = await editUnoFileArtifact({
+        baseDigest: state.patchBaseDigest,
+        patch: [
+          '*** Begin Patch',
+          '*** Update File: draft.py',
+          '@@',
+          '-    return 1',
+          '+    return 2',
+          '*** End Patch',
+        ].join('\n'),
+        runId: 'chat_test',
+      });
+      expect(edited.ok, edited.actual).toBe(true);
+      expect(JSON.parse(edited.actual || '{}')).toMatchObject({
+        documentId: 'recover-edit-id',
+        editStatus: 'patch-applied',
+        saved: true,
+        validation: 'failed',
+      });
+      expect((await readUnoDraft({ documentId: 'recover-edit-id', runId: 'chat_test' })).actual).toContain('return 2');
+
+      const replan = await planFileArtifact({
+        documentId: 'recover-edit-id',
+        documentType: 'word',
+        fileName: 'ignored-recovery-name.docx',
+        operation: 'modify',
+        sourceAttachmentId: 'not-an-office-attachment',
+        runId: 'chat_test',
+      });
+      expect(replan.ok, replan.actual).toBe(true);
+      expect(JSON.parse(replan.actual || '{}')).toMatchObject({
+        documentId: 'recover-edit-id',
+        fileName: 'recover-edit-id.docx',
+        operation: 'create',
+        reused: true,
+      });
     } finally {
       if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = previousArtifacts;
@@ -742,6 +987,66 @@ describe('UNO file tool policies', () => {
     }
   }, 60_000);
 
+  it('blocks render readiness until every exact capability named by the plan is authored', async () => {
+    if (!await resolveLibreOfficeExecutable()) return;
+    const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-required-capabilities-'));
+    roots.push(root);
+    const previousArtifacts = process.env.ARTIFACTS_DIR;
+    const previousMode = process.env.OFFICE_GENERATION_MODE;
+    process.env.ARTIFACTS_DIR = root;
+    process.env.OFFICE_GENERATION_MODE = 'uno';
+    try {
+      await planFileArtifact({
+        documentId: 'required-capabilities',
+        documentType: 'presentation',
+        fileName: 'required-capabilities.pptx',
+        intent: 'The presentation must include CaptionShape and MeasureShape.',
+        runId: 'chat_test',
+      });
+      const generated = await generateUnoFileArtifact({
+        documentId: 'required-capabilities',
+        program: [
+          'def create_document(job):',
+          "    deck = job.presentation('deck')",
+          "    slide = deck.slide('capabilities', layout='blank')",
+          "    slide.add_text('body', 'Capability gate', box=(0.8, 0.8, 3.0, 0.7), style={'font_size': 18})",
+          '    deck.save()',
+          '    deck.close()',
+        ].join('\n'),
+        runId: 'chat_test',
+      });
+      expect(generated.ok).toBe(false);
+      const failed = JSON.parse(generated.actual || '{}') as {
+        diagnostics?: Array<{ code?: string; message?: string }>;
+        requiredNextAction?: string;
+      };
+      expect(failed.requiredNextAction).toBe('edit');
+      expect(failed.diagnostics?.filter((item) => item.code === 'UNO_REQUIRED_CAPABILITY_MISSING'))
+        .toHaveLength(2);
+
+      const repaired = await editDraftText({
+        documentId: 'required-capabilities',
+        oldText: '    deck.save()',
+        newText: [
+          "    slide.add_shape('caption', box=(4.2, 0.8, 2.2, 0.9), shape_type='caption', fill='#FCE7F3')",
+          "    slide.add_shape('measure', box=(7.0, 1.0, 2.2, 0.3), shape_type='measure', line='#7C3AED', line_width=2)",
+          '    deck.save()',
+        ].join('\n'),
+        runId: 'chat_test',
+      });
+      expect(repaired.ok, repaired.actual).toBe(true);
+      expect(JSON.parse(repaired.actual || '{}')).toMatchObject({
+        validationStatus: 'passed',
+        requiredNextAction: 'render',
+      });
+    } finally {
+      if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = previousArtifacts;
+      if (previousMode === undefined) delete process.env.OFFICE_GENERATION_MODE;
+      else process.env.OFFICE_GENERATION_MODE = previousMode;
+    }
+  }, 120_000);
+
   it('keeps failed drafts editable regardless of consecutive failure count', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-edit-without-fuse-'));
     roots.push(root);
@@ -766,7 +1071,7 @@ describe('UNO file tool policies', () => {
           newText: `    return ${attempt}`,
           runId: 'chat_test',
         });
-        expect(edited.ok).toBe(true);
+        expect(edited.ok, edited.actual).toBe(true);
         const payload = JSON.parse(edited.actual || '{}') as {
           editStatus?: string;
           kind?: string;
@@ -795,6 +1100,17 @@ describe('UNO file tool policies', () => {
     process.env.ARTIFACTS_DIR = root;
     process.env.OFFICE_GENERATION_MODE = 'uno';
     try {
+      const early = await getUnoApi({
+        documentId: 'api-before-plan', documentType: 'presentation', query: 'shape', runId: 'chat_test',
+      });
+      expect(early.ok).toBe(true);
+      expect(JSON.parse(early.actual || '{}')).toMatchObject({
+        boundToPlannedDraft: false,
+        documentId: 'api-before-plan',
+        documentType: 'presentation',
+        kind: 'uno-api',
+        nextAction: 'plan',
+      });
       await planFileArtifact({
         documentId: 'api-unlimited', documentType: 'presentation', fileName: 'api-unlimited.pptx', runId: 'chat_test',
       });

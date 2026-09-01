@@ -1589,7 +1589,7 @@ function makeBrowserTools(
           attachmentId: z.string().max(160).optional().describe('Exact user attachment id returned in conversation metadata. Example: "attachment-7f3a".'),
           artifactId: z.string().max(4_000).optional().describe('Exact Artifact ID returned by a previous successful file tool result; never invent it.'),
           sourceArtifactId: z.string().max(4_000).optional().describe('For action=convert: exact Artifact ID of the source Office file.'),
-          documentId: z.string().max(96).optional().describe('Stable model-chosen id reused across plan, API lookup, generate, edit, render, and visual correction. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. Example: "xsbn-5d-yxg-guide".'),
+          documentId: z.string().max(96).optional().describe('Required for plan, API lookup, generate, read, edit, render, and visual correction: the stable model-chosen id reused for the logical document. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. If edit accidentally omits it, the backend can recover only when baseDigest uniquely identifies one current draft. Example: "xsbn-5d-yxg-guide".'),
           fileName: z.string().max(180).optional().describe('Optional output file name including the target extension. Examples: "西双版纳5日游攻略-野象谷周边.pptx", "项目复盘.docx", or "预算明细.xlsx".'),
           fileType: z.string().regex(/^[a-z0-9]{1,10}$/).optional().describe('Required for action=download: the expected file extension without a dot, such as jpg, png, pdf, docx, xlsx, or pptx. Always infer and provide it even when fileName is omitted.'),
           documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('Required for plan. For unoApi it is inferred from the planned documentId when omitted; if provided it must match the plan. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
@@ -1604,7 +1604,7 @@ function makeBrowserTools(
           program: z.string().optional(),
           baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Required for action=edit: exact patchBaseDigest from the latest read of the same documentId and optional path.'),
           replaceExisting: z.boolean().optional().describe('For action=generate only: set true together with baseDigest solely when intentionally replacing an existing complete draft. Never use this for ordinary repair.'),
-          patch: z.string().max(200_000).optional().describe("Required for action=edit: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. Do not write unified-diff line numbers or file headers. Unchanged context keeps the source's original indentation; added lines are inserted exactly as written."),
+          patch: z.string().max(200_000).optional().describe("Required for action=edit: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. BEFORE CALLING, verify every hunk has a real change: at least one line beginning literally '-' or '+'. A replacement needs both '-old' and '+new'; context-only hunks are invalid. Do not write unified-diff line numbers or file headers. Unchanged context keeps the source's original indentation; added lines are inserted exactly as written."),
           render: z.boolean().optional(),
           includeVisuals: z.boolean().optional(),
           offset: z.number().int().min(0).optional(),
@@ -1709,14 +1709,14 @@ function makeBrowserTools(
           browserToolInput({
             action: z.enum(['index', 'read', 'report']),
             artifactId: z.string().min(1).max(4_000).describe('Exact current-conversation Artifact ID returned by a successful file generation or download.'),
-            screenshotIds: z.array(z.string().min(1).max(40)).min(1).max(6).optional().describe('For action=read only: one to six exact screenshot-NNNN ids returned by action=index.'),
+            screenshotIds: z.array(z.string().min(1).max(40)).min(1).max(8).optional().describe('For action=read only: one to eight exact screenshot-NNNN ids returned by action=index.'),
             reviews: z.array(z.object({
               screenshotId: z.string().min(1).max(40),
               status: z.enum(['failed', 'passed']),
               observation: z.string().trim().min(20).max(1_000).describe('Concrete page-specific visual evidence covering composition and readability; a generic pass statement is invalid.'),
               checks: visualQaPageChecksSchema,
               issues: visualQaIssuesSchema,
-            }).strict()).min(1).max(6).optional().describe('For action=report: evidence-backed conclusions for screenshots already read from this artifact.'),
+            }).strict()).min(1).max(100).optional().describe('For action=report: evidence-backed conclusions for any already-read screenshots from this artifact; one report may cover the complete document.'),
             deckReview: z.object({
               status: z.enum(['failed', 'passed']),
               observation: z.string().trim().min(30).max(2_000).describe('Concrete cross-page comparison of the complete rendered artifact.'),
@@ -4603,7 +4603,7 @@ async function executeCodexRuntimeObject(input: {
         ? Array.from(new Set(normalizedParams.screenshotIds
             .filter((value): value is string => typeof value === 'string')
             .map((value) => value.trim())
-            .filter(Boolean))).slice(0, 6)
+            .filter(Boolean))).slice(0, 8)
         : undefined;
       if (!action || !artifactId) {
         return { ok: false, actual: 'fileVisual requires action=index|read|report and the exact Artifact ID returned by file.' };
@@ -4638,7 +4638,7 @@ async function executeCodexRuntimeObject(input: {
               }];
             }) : [];
             return [{ screenshotId, status, observation, checks, issues }];
-          }).slice(0, 6)
+          }).slice(0, 100)
         : undefined;
       if (action === 'report' && !reviews?.length) {
         return { ok: false, actual: 'fileVisual action=report requires reviews for pages already read.' };

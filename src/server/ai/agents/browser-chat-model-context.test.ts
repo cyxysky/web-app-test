@@ -159,6 +159,26 @@ test('does not separate a large tool result from its tool call', () => {
   assert.deepEqual(compacted, messages);
 });
 
+test('drops a persisted orphan tool result before the next provider request', () => {
+  const context = normalizeBrowserChatModelContext({
+    version: 1,
+    transcript: [],
+    activeMessages: [
+      { role: 'user', content: 'continue' },
+      {
+        role: 'tool',
+        content: [{ type: 'tool-result', toolCallId: 'missing-call', toolName: 'file', output: { type: 'text', value: 'stale result' } }],
+      },
+      { role: 'assistant', content: 'ready' },
+    ],
+  });
+
+  assert.deepEqual(context.activeMessages, [
+    { role: 'user', content: 'continue' },
+    { role: 'assistant', content: 'ready' },
+  ]);
+});
+
 test('an interrupted turn keeps completed tool messages and the partial assistant response in the native chain', () => {
   const messages: ModelMessage[] = [
     { role: 'user', content: '读取需求 31471' },

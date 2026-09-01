@@ -3367,9 +3367,9 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
 }
 
 .browser-chat-tool-meta {
-  align-items: center;
+  align-self: center;
   color: var(--muted-strong);
-  display: inline-flex;
+  display: block;
   flex: 1 1 0;
   font-size: 11.5px;
   font-weight: 450;

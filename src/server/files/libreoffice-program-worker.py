@@ -678,7 +678,11 @@ class DocumentJob:
                 try:
                     if hasattr(target, property_name) and (force_artifact_name or not str(getattr(target, property_name, '') or '')):
                         setattr(target, property_name, artifact_name)
-                        break
+                        # Default drawing-service names can reappear during
+                        # PPTX export. For newly authored shapes, mirror the
+                        # stable marker into Title as a second DrawingML path.
+                        if not force_artifact_name:
+                            break
                 except Exception:
                     pass
         return record
@@ -1820,17 +1824,39 @@ class PresentationSlide:
             resolved_gap = tuple(self.deck.inch(value) for value in gap)
         else:
             resolved_gap = self.deck.inch(gap)
-        return self.deck.grid(
+        cells = self.deck.grid(
             columns, rows, box=self._box(slot, box), gap=resolved_gap,
             column_weights=column_weights, row_weights=row_weights,
         )
+        # The low-level deck allocator works in UNO 1/100-mm units. The slide
+        # facade is deliberately PptxGenJS-like, so callers must receive inch
+        # floats as well as passable unit tags. Otherwise harmless arithmetic
+        # such as cell['x'] + 0.15 is interpreted as millions of inches.
+        return [{
+            'x': cell['x'] / 2540.0,
+            'y': cell['y'] / 2540.0,
+            'width': cell['width'] / 2540.0,
+            'height': cell['height'] / 2540.0,
+            'w': cell['width'] / 2540.0,
+            'h': cell['height'] / 2540.0,
+            '_unit': 'in',
+        } for cell in cells]
 
     def stack(self, count, slot='body', box=None, direction='vertical', gap=0.18, weights=None):
-        """PptxGenJS-like inch stack whose cells retain their geometry unit."""
-        return self.deck.stack(
+        """PptxGenJS-like inch stack whose cells can be used in arithmetic."""
+        cells = self.deck.stack(
             count, box=self._box(slot, box), direction=direction,
             gap=self.deck.inch(gap), weights=weights,
         )
+        return [{
+            'x': cell['x'] / 2540.0,
+            'y': cell['y'] / 2540.0,
+            'width': cell['width'] / 2540.0,
+            'height': cell['height'] / 2540.0,
+            'w': cell['width'] / 2540.0,
+            'h': cell['height'] / 2540.0,
+            '_unit': 'in',
+        } for cell in cells]
 
     def add_text(self, element_id, text, slot=None, box=None, style=None, **options):
         auto_height = bool(options.pop('auto_height', options.pop('autoHeight', False)))
@@ -1973,9 +1999,48 @@ class PresentationSlide:
             self._id(element_id), self._page, self._box(slot, box), title, body, **options,
         )
 
-    def add_timeline(self, element_id, events, slot=None, box=None, **options):
+    def add_timeline(self, element_id, events, slot=None, box=None, colors=None,
+                     title_size=14, body_size=10, text_color=0x334155,
+                     max_items_per_row=6):
+        """Add a timeline using the complete installed option contract."""
         return self.deck.add_timeline(
-            self._id(element_id), self._page, self._box(slot, box), events, **options,
+            self._id(element_id), self._page, self._box(slot, box), events,
+            colors=colors, title_size=title_size, body_size=body_size,
+            text_color=text_color, max_items_per_row=max_items_per_row,
+        )
+
+    def add_header(self, element_id, left='', center='', right='', height=None,
+                   background=None, accent=None, font_size=10, color=0x64748B,
+                   padding=None, left_url=None, center_url=None, right_url=None):
+        """Add header chrome inside the layout's reserved top margin."""
+        resolved_height = None if height is None else (
+            self.deck.inch(height) if abs(float(height)) <= 2 else int(height)
+        )
+        resolved_padding = None if padding is None else (
+            self.deck.inch(padding) if abs(float(padding)) <= 2 else int(padding)
+        )
+        return self.deck.add_header(
+            self._id(element_id), self._page, left=left, center=center, right=right,
+            height=resolved_height, background=background, accent=accent,
+            font_size=font_size, color=color, padding=resolved_padding,
+            left_url=left_url, center_url=center_url, right_url=right_url,
+        )
+
+    def add_footer(self, element_id, left='', center='', right='', height=None,
+                   background=None, accent=None, font_size=10, color=0x64748B,
+                   padding=None, left_url=None, center_url=None, right_url=None):
+        """Add footer chrome inside the layout's reserved bottom margin."""
+        resolved_height = None if height is None else (
+            self.deck.inch(height) if abs(float(height)) <= 2 else int(height)
+        )
+        resolved_padding = None if padding is None else (
+            self.deck.inch(padding) if abs(float(padding)) <= 2 else int(padding)
+        )
+        return self.deck.add_footer(
+            self._id(element_id), self._page, left=left, center=center, right=right,
+            height=resolved_height, background=background, accent=accent,
+            font_size=font_size, color=color, padding=resolved_padding,
+            left_url=left_url, center_url=center_url, right_url=right_url,
         )
 
     def add_shape(self, element_id, slot=None, box=None, **options):
@@ -2085,11 +2150,19 @@ class PresentationSlide:
                 'angle': gradient_args[2] if len(gradient_args) == 3 else 0,
             }
         bounds = self.deck.bounds()
-        return self.deck.add_shape(
+        background = self.deck.add_shape(
             self._id('background'), self._page, 0, 0, bounds['width'], bounds['height'],
             fill=fill, fill_transparency=transparency, gradient=gradient_values,
             layout_role='background', allow_overlap=True,
         )
+        # slide(..., title=...) creates the title before callers normally set
+        # the background. A newly added full-slide shape otherwise covers that
+        # title and every earlier object in LibreOffice's paint order.
+        try:
+            background.ZOrder = 0
+        except Exception:
+            pass
+        return background
 
     def shapes(self):
         result = []
@@ -2846,7 +2919,13 @@ class PresentationLayout:
         shape = self._component.createInstance(service)
         shape.Position, shape.Size = point(int(x), int(y)), size(int(width), int(height))
         page.add(shape)
-        record = self.job.register_element(element_id, kind, shape, {'slide': page_index, 'shape': int(page.getCount())})
+        # Newly authored drawing services may arrive with LibreOffice default
+        # names (notably CaptionShape and MeasureShape). Always replace that
+        # transient name with the stable artifact marker before serialization.
+        record = self.job.register_element(
+            element_id, kind, shape, {'slide': page_index, 'shape': int(page.getCount())},
+            force_artifact_name=True,
+        )
         record['layout'] = {
             'role': role,
             'allowOverlap': bool(allow_overlap),
@@ -2947,6 +3026,7 @@ class PresentationLayout:
                 shape.TextFitToSize = uno.Enum('com.sun.star.drawing.TextFitToSizeType', 'PROPORTIONAL')
         shape.TextAutoGrowHeight = False
         shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
+        self.job.record_feature('TextShape')
         return shape
 
     def add_text_box(self, element_id, page, text, box, font_size=18, color=0x000000,
@@ -3062,6 +3142,54 @@ class PresentationLayout:
             )
         return {'surface': self.job.element_records.get(f'{element_id}/surface'), 'body': body_shape, 'box': area}
 
+    def add_header(self, element_id, page, left='', center='', right='', height=None,
+                   background=None, accent=None, font_size=10, color=0x64748B, padding=None,
+                   left_url=None, center_url=None, right_url=None):
+        """Add measured header chrome above the standard title slot."""
+        bounds = self.bounds()
+        inset = self.mm(2) if padding is None else max(0, int(padding))
+        safe_height = max(self.mm(7), self.text_height(font_size, padding=inset)) if height is None else int(height)
+        # Standard facade layouts begin at y=10 mm. Keep a deterministic gap
+        # so an accent rule can never cut through a title as manual y=0.55 in
+        # decorations commonly did.
+        safe_height = min(safe_height, self.mm(8))
+        side = self.mm(16)
+        area = {'x': side, 'y': 0, 'width': int(bounds['width']) - side * 2, 'height': safe_height}
+        if background is not None:
+            self.add_shape(
+                f'{element_id}/surface', page, 0, 0, int(bounds['width']), safe_height,
+                fill=background, layout_role='background', allow_overlap=True,
+            )
+        text_height = safe_height - (self.mm(0.4) if accent is not None else 0)
+        cells = self.grid(3, 1, box={**area, 'height': text_height}, gap=0)
+        values = (
+            (left, 'LEFT', 'left', left_url),
+            (center, 'CENTER', 'center', center_url),
+            (right, 'RIGHT', 'right', right_url),
+        )
+        for cell, (value, align, suffix, link) in zip(cells, values):
+            if not str(value or '').strip():
+                continue
+            if str(link or '').strip():
+                self.add_text_link(
+                    f'{element_id}/{suffix}', page, value, cell, url=link,
+                    font_size=font_size, min_font_size=font_size, color=color,
+                    align=align, padding=0, valign='CENTER',
+                )
+            else:
+                self.add_text_box(
+                    f'{element_id}/{suffix}', page, value, cell, font_size=font_size,
+                    min_font_size=font_size, color=color, align=align,
+                    padding=0, valign='CENTER',
+                )
+        if accent is not None:
+            self.add_shape(
+                f'{element_id}/accent', page, area['x'], safe_height - self.mm(0.4),
+                area['width'], self.mm(0.4), fill=accent,
+                layout_role='decoration', allow_overlap=True,
+            )
+        return area
+
     def add_footer(self, element_id, page, left='', center='', right='', height=None,
                    background=None, accent=None, font_size=10, color=0x64748B, padding=None,
                    left_url=None, center_url=None, right_url=None):
@@ -3112,7 +3240,10 @@ class PresentationLayout:
             'round-rectangle': 'com.sun.star.drawing.RectangleShape',
             'rounded-rectangle': 'com.sun.star.drawing.RectangleShape',
             'ellipse': 'com.sun.star.drawing.EllipseShape',
+            'circle': 'com.sun.star.drawing.EllipseShape',
             'line': 'com.sun.star.drawing.LineShape',
+            'caption': 'com.sun.star.drawing.CaptionShape',
+            'measure': 'com.sun.star.drawing.MeasureShape',
         }
         custom_shape_types = {
             'diamond': 'diamond',
@@ -3132,6 +3263,65 @@ class PresentationLayout:
         if not resolved_service:
             supported = sorted(set(services) | set(custom_shape_types))
             raise ValueError(f'Unsupported presentation shape_type {shape_type!r}; expected one of {supported}.')
+        if resolved_service in {
+            'com.sun.star.drawing.CaptionShape',
+            'com.sun.star.drawing.MeasureShape',
+        }:
+            # LibreOffice can author these native UNO services, but its PPTX
+            # exporter drops both objects entirely. Exercise the requested
+            # native capability in the live document and add one named,
+            # editable DrawingML fallback at the same geometry so the saved
+            # presentation remains visible, mappable, and repairable.
+            native_shape = self._component.createInstance(resolved_service)
+            native_shape.Position, native_shape.Size = (
+                point(int(x), int(y)), size(int(width), int(height))
+            )
+            page.add(native_shape)
+            self._apply_shape_style(
+                native_shape, fill=fill, line=line, line_width=line_width,
+                fill_transparency=fill_transparency, transparency=transparency,
+                rotation=rotation,
+            )
+            if fill is not None and line is None:
+                native_shape.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+            if gradient:
+                self._apply_shape_gradient(native_shape, gradient)
+
+            fallback_service = (
+                'com.sun.star.drawing.CustomShape'
+                if resolved_service.endswith('CaptionShape')
+                else 'com.sun.star.drawing.LineShape'
+            )
+            shape = self._add_shape(
+                page, element_id, fallback_service, x, y, width, height, 'shape',
+                layout_role=layout_role, allow_overlap=allow_overlap,
+            )
+            if resolved_service.endswith('CaptionShape'):
+                shape.CustomShapeGeometry = (
+                    property_value('Type', 'rectangular-callout'),
+                )
+            self._apply_shape_style(
+                shape, fill=fill, line=line, line_width=line_width,
+                fill_transparency=fill_transparency, transparency=transparency,
+                rotation=rotation,
+            )
+            if fill is not None and line is None:
+                shape.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+            if gradient:
+                self._apply_shape_gradient(shape, gradient)
+            if resolved_service.endswith('MeasureShape'):
+                for property_name in ('LineStartName', 'LineEndName'):
+                    try:
+                        setattr(shape, property_name, 'Arrow')
+                    except Exception:
+                        pass
+            self.job.record_feature(
+                'CaptionShape' if resolved_service.endswith('CaptionShape') else 'MeasureShape'
+            )
+            self.job.record_feature(
+                'CustomShape' if fallback_service.endswith('CustomShape') else 'LineShape'
+            )
+            return shape
         shape = self._add_shape(
             page, element_id, resolved_service, x, y, width, height, 'shape',
             layout_role=layout_role, allow_overlap=allow_overlap,
@@ -3154,6 +3344,16 @@ class PresentationLayout:
                 shape.CornerRadius = min(int(width), int(height)) // 8
             except Exception:
                 pass
+        shape_features = {
+            'com.sun.star.drawing.RectangleShape': 'RectangleShape',
+            'com.sun.star.drawing.EllipseShape': 'EllipseShape',
+            'com.sun.star.drawing.CustomShape': 'CustomShape',
+            'com.sun.star.drawing.CaptionShape': 'CaptionShape',
+            'com.sun.star.drawing.LineShape': 'LineShape',
+            'com.sun.star.drawing.MeasureShape': 'MeasureShape',
+        }
+        if resolved_service in shape_features:
+            self.job.record_feature(shape_features[resolved_service])
         return shape
 
     def add_connector(self, element_id, page, x1, y1, x2, y2, color=0x64748B,
@@ -3192,6 +3392,10 @@ class PresentationLayout:
                 shape.LineEndName = 'Arrow'
             except Exception:
                 pass
+        # ConnectorShape is the verified facade capability. Its serialized
+        # implementation is intentionally PolyLineShape because LibreOffice's
+        # raw ConnectorShape can dispose the bridge in large presentations.
+        self.job.record_feature('ConnectorShape')
         return shape
 
     def add_connector_between(self, element_id, page, source_box, target_box, color=0x64748B,
@@ -3282,6 +3486,7 @@ class PresentationLayout:
             shape.Transparency = max(0, min(100, int(transparency)))
         except Exception:
             pass
+        self.job.record_feature('GraphicObject')
         return shape
 
     def add_image_contain(self, element_id, page, asset_name, box, padding=0,
@@ -3317,6 +3522,7 @@ class PresentationLayout:
             shape.Transparency = max(0, min(100, int(transparency)))
         except Exception:
             pass
+        self.job.record_feature('GraphicObject')
         return shape
 
     def add_native_table(self, element_id, page, box, rows, column_weights=None, header=True,
@@ -3828,12 +4034,25 @@ class PresentationLayout:
                     'width': track['width'],
                     'height': band['height'] // 2 - self.mm(4),
                 }
-                if event_box['height'] <= self.text_height(title_size, lines=1):
+                title_height = self.estimate_text_box(
+                    title, track['width'], title_size, 0, title_size
+                )['height']
+                body_height = self.estimate_text_box(
+                    body, track['width'], body_size, 0, body_size
+                )['height'] if body else 0
+                text_gap = self.mm(1) if body else 0
+                if event_box['height'] < title_height + body_height + text_gap:
                     raise ValueError(
-                        f'Presentation timeline {element_id!r} needs a taller box for {len(items)} events. '
-                        'Increase its height or raise max_items_per_row.'
+                        f'Presentation timeline {element_id!r} needs a taller box for event {index + 1} '
+                        f'({title!r}). Increase its height, shorten the event text, or lower '
+                        'max_items_per_row so each track is wider.'
                     )
-                text_rows = self.stack(2, box=event_box, gap=self.mm(1), weights=(1, 2))
+                text_rows = self.stack(
+                    2 if body else 1,
+                    box=event_box,
+                    gap=text_gap,
+                    weights=(title_height, body_height) if body else (title_height,),
+                )
                 stem_end_y = event_box['y'] + event_box['height'] if top else event_box['y']
                 self.add_connector(
                     f'{element_id}/event-{index + 1}/stem', page,
@@ -5114,6 +5333,7 @@ def facade_value_schemas(document_type):
                     'rectangle', 'round-rectangle', 'rounded-rectangle', 'ellipse',
                     'circle', 'diamond', 'triangle', 'right-triangle', 'parallelogram',
                     'trapezoid', 'pentagon', 'hexagon', 'octagon', 'star', 'line',
+                    'caption', 'measure',
                 ],
                 'line': "color or {'color': color, 'width': points, 'transparency': 0..100}",
                 'keys': ['fill', 'line', 'line_width', 'gradient', 'rotation', 'transparency', 'fill_transparency', 'allow_overlap', 'layout_role'],
@@ -5172,17 +5392,26 @@ comparison = deck.slide('compare', layout='title-two-column', title='Actual vs p
 dashboard = deck.slide('dashboard', layout='title-three-column', title='Dashboard')
 blank = deck.slide('blank', layout='blank')""",
             'allocatedLayout': """slide = deck.slide('kpis', layout='title-content', title='Key metrics')
-# Prefer slide.grid/stack for inch-first composition. Returned cells retain a
-# unit marker and can be passed directly to every slide.add_* call.
+# Header/footer use layout-reserved margins. Do not draw a manual rule through
+# the title slot.
+slide.add_header('header', left='Performance', accent='#F59E0B')
+slide.add_footer('footer', left='Brand', center='Metrics', right='01')
+# Prefer slide.grid/stack for inch-first composition. grid returns one FLAT
+# list in row-major order (not nested rows). Each cell is a mapping with
+# x/y/width/height plus PptxGenJS-compatible w/h aliases and a unit marker.
+# Pass cells directly to slide.add_*; never flatten/extend or tuple-index them.
 cards = slide.grid(3, 1, slot='body', gap=0.25)
 for index, cell in enumerate(cards):
     slide.add_card(f'kpi-{index + 1}', f'KPI {index + 1}', 'Measured body copy',
         box=cell, title_size=20, body_size=16, fill='#EFF6FF', accent='#2563EB')
 rows = slide.stack(2, box=(0.8, 1.6, 5.6, 4.8), gap=0.20, weights=[1, 1])
+row_x, row_y, row_w, row_h = rows[0]['x'], rows[0]['y'], rows[0]['w'], rows[0]['h']
 slide.add_text('row-1', 'Auto-height text', box={'x': 0.8, 'y': 1.6, 'w': 5.6},
     auto_height=True, style={'font_size': 18, 'min_font_size': 16, 'padding': 0.04})""",
             'textAndPanel': """slide.add_text(
     'insight', 'Revenue grew 18% year over year.', box=(0.8, 1.4, 5.4, 1.1),
+    # This is the exact style vocabulary. Common guessed keys such as
+    # letter_spacing, tracking, margin, and autofit are not supported.
     style={'font_size': 24, 'min_font_size': 18, 'bold': True,
            'color': '#0F172A', 'background': '#EFF6FF',
            'border': {'color': '#93C5FD', 'width': 1.25},
@@ -5218,7 +5447,37 @@ slide.connect('flow', 'left-node', 'right-node', color='#64748B', width=2,
 left.set_text('Input', {'font_size': 18, 'bold': True, 'valign': 'MIDDLE'})
 right.set_text('Decision', {'font_size': 18, 'bold': True, 'valign': 'CENTER'})
 slide.set_background('#F8FAFC', transparency=0)
+# Gradient background shorthand is first-class; do not emulate it with a
+# full-slide content shape.
+slide.set_background('linear', '#020617', '#1E3A8A', 135)
 group = slide.group('decision-flow', [left, right])""",
+            'specializedShapeCapabilities': """# These calls are distinct semantic capabilities. A lookalike does not count.
+rectangle = slide.add_shape('rectangle', box=(0.7, 1.5, 1.4, 0.7),
+    shape_type='rectangle', fill='#DBEAFE', line='#2563EB')
+ellipse = slide.add_shape('ellipse', box=(2.3, 1.5, 1.4, 0.7),
+    shape_type='ellipse', fill='#DCFCE7', line='#16A34A')
+custom = slide.add_shape('custom', box=(3.9, 1.5, 1.4, 0.7),
+    shape_type='diamond', fill='#FEF3C7', line='#D97706')
+caption = slide.add_shape('caption', box=(5.5, 1.5, 2.0, 0.9),
+    shape_type='caption', fill='#FCE7F3', line='#DB2777')
+caption.set_text('Native caption', {'font_size': 14, 'valign': 'CENTER'})
+measure = slide.add_shape('measure', box=(7.8, 1.7, 2.0, 0.35),
+    shape_type='measure', line='#7C3AED', line_width=2)
+line = slide.add_shape('line', box=(10.1, 1.7, 1.8, 0.15),
+    shape_type='line', line='#475569', line_width=2)
+slide.add_text('text-shape', 'Native TextShape', box=(0.7, 3.0, 2.4, 0.6),
+    style={'font_size': 16, 'min_font_size': 16})
+slide.add_image('graphic-object', 'photo.jpg', box=(3.4, 2.7, 2.4, 1.4),
+    contain=True, alt_text='Embedded GraphicObject')
+source = slide.add_shape('source-node', box=(6.3, 3.0, 1.8, 0.7),
+    shape_type='round-rectangle', fill='#E0E7FF')
+target = slide.add_shape('target-node', box=(9.1, 3.0, 1.8, 0.7),
+    shape_type='round-rectangle', fill='#E0E7FF')
+slide.connect('connector-shape', 'source-node', 'target-node',
+    color='#4F46E5', width=2, endArrow='triangle')
+# Validation reports exact generated featureCounts keys: RectangleShape,
+# EllipseShape, CustomShape, CaptionShape, MeasureShape, LineShape, TextShape,
+# GraphicObject, and ConnectorShape.""",
             'nativeTableAndEdit': """table = slide.add_table('metrics', [
     ['Metric', 'Actual', 'Plan'], ['Revenue', '190', '180'], ['Margin', '31%', '29%'],
 ], box=(0.8, 1.6, 6.0, 3.2), column_weights=[2, 1, 1], header=True,
@@ -5249,7 +5508,8 @@ plain = slide.add_table('plain-data', [['A', '1'], ['B', '2']],
     {'title': 'Q3', 'body': 'Pilot'}, {'title': 'Q4', 'body': 'Launch'},
     {'title': '2027 H1', 'body': 'Scale'}, {'title': '2027 H2', 'body': 'Expand'},
     {'title': '2028', 'body': 'Optimize'},
-], box=(0.7, 1.6, 12.0, 4.9), max_items_per_row=4)""",
+], box=(0.7, 1.6, 12.0, 4.9), colors=['#2563EB', '#10B981'],
+    title_size=16, body_size=11, text_color='#CBD5E1', max_items_per_row=4)""",
             'backgroundTransitionAndNotes': """slide.set_background('#F8FAFC', transparency=0)
 # Full-slide gradients are first-class and excluded from content-overlap checks.
 slide.set_background('linear', '#020617', '#1E3A8A', 135)
@@ -5419,7 +5679,7 @@ def facade_module_example_keys(document_type):
             'presentation.existing-shape@1': ['existingDeckEdit', 'existingShapeOperations'],
             'presentation.text@2': ['textAndPanel', 'richTextBulletsAndLink', 'allocatedLayout'],
             'presentation.image@2': ['captionedImage', 'imagePlacementVariants'],
-            'presentation.shape@2': ['shapesAndConnector'],
+            'presentation.shape@2': ['shapesAndConnector', 'specializedShapeCapabilities'],
             'presentation.table@1': ['nativeTableAndEdit'],
             'presentation.chart@2': ['nativeColumnChart', 'nativePieChart'],
             'presentation.transition@1': ['backgroundTransitionAndNotes'],
@@ -5473,8 +5733,11 @@ def office_facade_cookbook(document_type, query=''):
         'Write exactly one synchronous create_document(job) function.',
         'Use only the returned high-level facade and versioned feature recipes. Never import uno or access com.sun.star services.',
         'Every document, slide, paragraph, table, chart, image, sheet, range, and feature call has a stable elementId.',
+        'When the plan names an exact presentation capability such as CaptionShape, MeasureShape, or ConnectorShape, use the matching presentation.shape example and confirm its exact generated featureCounts key is non-zero. A visually similar shape never satisfies a semantic capability requirement.',
+        'CaptionShape and MeasureShape are authored as native UNO services by the facade. Because LibreOffice drops those two services during PPTX export, the facade also emits one named editable DrawingML fallback at the same geometry; do not create a second manual lookalike.',
         'elementId accepts 1-128 non-whitespace Unicode characters, including Chinese. Child IDs on slide and worksheet facades are parent-scoped, so helpers may reuse role IDs across different parents.',
         "Query unoApi one module at a time before using that module. Each module response contains every matching installed signature, accepted value schema, and copyable example; copy these patterns instead of guessing.",
+        "For presentation text, use only the exact style keys returned by presentation.text. letter_spacing/tracking/margin/autofit are deliberately unsupported; use padding, line_spacing, box geometry, or auto_height instead.",
         "Presentation slide.add_* explicit box values default to inches, accept w/h aliases, and may set unit='in'|'mm'|'cm'|'pt'|'hmm'. Layout slots are already normalized.",
         'Use facade layout, flow, A1-address, style, and feature parameters; the worker owns UNO units, structs, enums, controllers, and output filters.',
         "A support level of preserve-only means existing content is package-compared and must survive unchanged; it is not an authoring API. unsupported means fail explicitly rather than emulating with raw UNO.",
@@ -5483,17 +5746,17 @@ def office_facade_cookbook(document_type, query=''):
     if document_type == 'presentation':
         capabilities = [
             {'id': 'presentation.document@2', 'support': 'full', 'kind': 'core', 'keywords': ['metadata', 'slides', 'master'], 'signature': "deck.set_doc_info(...); deck.slides(); deck.masters()", 'validation': ['package', 'reopen']},
-            {'id': 'presentation.slide@2', 'support': 'full', 'kind': 'core', 'keywords': ['slide', 'layout', 'slot', 'grid', 'stack'], 'signature': "deck.slide(element_id, layout='title-content', title=None, title_style=None); slide.grid(columns,rows,slot='body',box=None,gap=0.24,...); slide.stack(count,slot='body',box=None,direction='vertical',gap=0.18,...); layouts: blank, cover/title-cover, section/title-section, title-only, title-content, title-two-column/comparison, title-three-column/dashboard", 'validation': ['bounds', 'overlap', 'text-fit']},
+            {'id': 'presentation.slide@2', 'support': 'full', 'kind': 'core', 'keywords': ['slide', 'layout', 'slot', 'grid', 'stack', 'header', 'footer'], 'signature': "deck.slide(element_id, layout='title-content', title=None, title_style=None); slide.grid(columns,rows,slot='body',box=None,gap=0.24,...); slide.stack(count,slot='body',box=None,direction='vertical',gap=0.18,...); slide.add_header(element_id,left='',center='',right='',accent=None,...); slide.add_footer(element_id,left='',center='',right='',accent=None,...); layouts: blank, cover/title-cover, section/title-section, title-only, title-content, title-two-column/comparison, title-three-column/dashboard", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.existing-slide@1', 'support': 'full', 'kind': 'edit', 'keywords': ['select', 'remove', 'move', 'duplicate'], 'signature': "deck.select_slide(element_id, index=None, name=None, text=None); deck.remove_slide(index); deck.move_slide(from_index, to_index); deck.duplicate_slide(element_id, index)", 'validation': ['slide-count', 'preservation']},
             {'id': 'presentation.existing-shape@1', 'support': 'full', 'kind': 'edit', 'keywords': ['shape', 'replace', 'resize', 'z-order'], 'signature': "slide.select_shape(element_id, index=None, name=None, text=None) -> shape.set_text/replace_text/set_box/set_style/remove/bring_to_front/send_to_back; slide.replace_text(...) ", 'validation': ['bounds', 'overlap', 'content']},
-            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link', 'auto-height'], 'signature': "slide.add_text(element_id,text,slot=None,box=None,style=None,auto_height=False); omit box h/height or set auto_height=True to derive measured height; slide.add_rich_text(...); slide.add_bullets(...); style supports font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation", 'validation': ['bounds', 'overlap', 'text-fit']},
+            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link', 'auto-height'], 'signature': "slide.add_text(element_id,text,slot=None,box=None,style=None,auto_height=False); omit box h/height or set auto_height=True to derive measured height; slide.add_rich_text(...); slide.add_bullets(...); exact style keys: font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation; unsupported: letter_spacing,tracking,margin,autofit", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.image@2', 'support': 'full', 'kind': 'core', 'keywords': ['image', 'crop', 'rotate', 'contain', 'caption', 'alt', 'source'], 'signature': "slide.add_image(element_id, asset_name, slot=None, box=None, contain=True, padding=0, crop=None, rotation=0, transparency=0, alt_text=None, title=None, source=None); slide.add_captioned_image(element_id, asset_name, caption, source=None, alt_text=None, ..., caption_height=0.62)", 'validation': ['bounds', 'aspect-ratio', 'embedded-media', 'accessibility-metadata', 'visible-identification']},
-            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(...); slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap']},
+            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'caption', 'measure', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(element_id, source_box_or_child_id, target_box_or_child_id, ...); slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap', 'featureCounts']},
             {'id': 'presentation.table@1', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'editable'], 'signature': "slide.add_table(element_id, rows, slot=None, box=None, column_weights=None, header=True, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT'); col_widths is accepted as an alias for column_weights", 'validation': ['native-object', 'bounds', 'overlap']},
             {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, **options); semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds']},
             {'id': 'presentation.transition@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['transition', 'fade', 'wipe'], 'signature': "slide.set_transition(effect='fade', speed='medium')", 'validation': ['feature-count', 'reopen']},
             {'id': 'presentation.professional@1', 'support': 'partial', 'kind': 'native', 'keywords': ['animation', 'notes', 'comments', 'media', 'custom-show', 'master', 'field'], 'signature': "slide.set_notes(element_id,text); slide.add_comment(...); slide.add_media(...); slide.animate(shape,...); slide.apply_master(...); slide.add_field(...); deck.add_custom_show(name, slide_indices)", 'validation': ['notes', 'comments', 'media', 'animation', 'master-layout', 'fields']},
-            {'id': 'presentation.timeline@2', 'support': 'full', 'kind': 'component', 'keywords': ['timeline', 'process'], 'signature': "slide.add_timeline(element_id, events, slot=None, box=None, title_size=14, body_size=10, max_items_per_row=6, **options); dense timelines automatically wrap to multiple rows", 'validation': ['bounds', 'overlap']},
+            {'id': 'presentation.timeline@2', 'support': 'full', 'kind': 'component', 'keywords': ['timeline', 'process'], 'signature': "slide.add_timeline(element_id, events, slot=None, box=None, colors=None, title_size=14, body_size=10, text_color=0x334155, max_items_per_row=6); dense timelines automatically wrap to multiple rows", 'validation': ['bounds', 'overlap']},
             {'id': 'presentation.smartart@1', 'support': 'preserve-only', 'kind': 'policy', 'keywords': ['smartart'], 'signature': None, 'validation': ['package-preservation']},
             {'id': 'presentation.morph@1', 'support': 'preserve-only', 'kind': 'policy', 'keywords': ['morph'], 'signature': None, 'validation': ['package-preservation']},
             {'id': 'presentation.activex-ole@1', 'support': 'preserve-only', 'kind': 'policy', 'keywords': ['activex', 'ole'], 'signature': None, 'validation': ['package-preservation']},
@@ -5502,8 +5765,10 @@ def office_facade_cookbook(document_type, query=''):
         complete = '''def create_document(job):
     deck = job.presentation('deck')
     slide = deck.slide('overview', layout='title-two-column', title='Quarterly overview')
+    slide.add_header('header', left='Quarterly review', accent=0xF59E0B)
     slide.add_text('summary', 'Revenue and delivery remained on plan.', slot='left', style={'font_size': 20, 'min_font_size': 16, 'color': 0x334155})
     slide.add_chart('revenue', 'column', ['Q1', 'Q2', 'Q3', 'Q4'], slot='right', values=[120, 145, 168, 190], series_name='Revenue', title='Quarterly revenue', x_axis_title='Quarter', y_axis_title='Revenue', show_legend=True)
+    slide.add_footer('footer', left='Confidential', center='Finance', right='01')
     slide.set_transition('fade', speed='medium')
     deck.save()
     deck.close()'''
@@ -5515,6 +5780,7 @@ def office_facade_cookbook(document_type, query=''):
     deck.close()'''
         operations = {
             'slide': "slide = deck.slide('overview', layout='title-two-column', title='Quarterly overview')",
+            'chrome': "slide.add_header('header', left='Section', accent=0xF59E0B)\nslide.add_footer('footer', left='Brand', center='Section', right='01')",
             'text': "slide.add_text('summary', 'Body copy', slot='left', style={'font_size': 18, 'min_font_size': 16})",
             'chart': "slide.add_chart('trend', 'line', ['Q1', 'Q2', 'Q3'], slot='right', values=[12, 18, 27])",
             'transition': "slide.set_transition('fade', speed='medium')",
@@ -5868,6 +6134,12 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
         common_rules.append(
             'Raw expert shape tags use the same rule: expert.tag(shape, element_id, "shape") is decorative by default. For a semantic bar, node, table cell, or chart mark, pass layout_role="content", allow_overlap=False. Text and image tags remain collision-checked content by default.'
         )
+        common_rules.append(
+            'Exact requested shape capabilities are validated by generated featureCounts. Use shape_type="caption" for CaptionShape, shape_type="measure" for MeasureShape, and add_connector/add_connector_between for the stable ConnectorShape facade capability; a visual substitute does not count.'
+        )
+        common_rules.append(
+            'The caption/measure facade call creates the native UNO service and automatically pairs it with one stable editable export fallback because LibreOffice omits raw CaptionShape and MeasureShape from PPTX. Do not add another manual fallback.'
+        )
         facade_signatures = [
             "deck.bounds() -> {'kind': 'presentation', 'width': int, 'height': int}",
             "deck.mm(value), deck.cm(value), deck.inch(value), deck.pt(value) -> int geometry units",
@@ -5881,7 +6153,7 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
             "deck.add_text_box(element_id, page, text, box, font_size=18, color=0x000000, bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None, padding=None, valign='TOP', layout_role='content', allow_overlap=False)",
             "deck.add_card(element_id, page, box, title, body='', fill=0xFFFFFF, line=None, accent=None, title_size=20, body_size=14, title_color=0x0F172A, body_color=0x334155, padding=None, gap=None)",
             "deck.add_footer(element_id, page, left='', center='', right='', height=None, background=None, accent=None, font_size=10, color=0x64748B, padding=None, left_url=None, center_url=None, right_url=None)",
-            "deck.add_shape(element_id, page, x, y, width, height, service='com.sun.star.drawing.RectangleShape', fill=None, line=None, line_width=0, fill_transparency=0, layout_role='decoration', allow_overlap=True)",
+            "deck.add_shape(element_id, page, x, y, width, height, shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure', fill=None, line=None, line_width=0, fill_transparency=0, layout_role='decoration', allow_overlap=True)",
             "deck.add_connector(element_id, page, x1, y1, x2, y2, color=0x64748B, line_width=100, start_arrow=False, end_arrow=False, layout_role='decoration', allow_overlap=True)",
             "deck.add_connector_between(element_id, page, source_box, target_box, color=0x64748B, line_width=100, start_arrow=False, end_arrow=True, axis='auto', source_inset=0, target_inset=0, layout_role='decoration', allow_overlap=True)",
             "deck.add_image(element_id, page, asset_name, x, y, width, height, layout_role='content', allow_overlap=False)",
@@ -5921,6 +6193,14 @@ deck.add_connector_between(
     'slide-01/flow-arrow', page, source_box, target_box,
     color=0x2563EB, line_width=deck.mm(0.8), end_arrow=True,
 )''',
+            'specializedShapes': '''deck.add_shape('slide-01/caption', page, deck.mm(20), deck.mm(40), deck.mm(48), deck.mm(18),
+    shape_type='caption', fill=0xFCE7F3, line=0xDB2777)
+deck.add_shape('slide-01/measure', page, deck.mm(78), deck.mm(45), deck.mm(48), deck.mm(8),
+    shape_type='measure', line=0x7C3AED, line_width=deck.mm(0.6))
+deck.add_shape('slide-01/line', page, deck.mm(136), deck.mm(45), deck.mm(48), deck.mm(3),
+    shape_type='line', line=0x475569, line_width=deck.mm(0.6))
+# Use deck.add_connector_between(...) for the stable ConnectorShape capability.
+# Validation exposes exact non-zero featureCounts for every used capability.''',
             'nativeTable': '''table_box = deck.content_box(margins={'left': deck.mm(16), 'right': deck.mm(16), 'top': deck.mm(34), 'bottom': deck.mm(18)})
 deck.add_native_table(
     'slide-01/data-table', page, table_box,

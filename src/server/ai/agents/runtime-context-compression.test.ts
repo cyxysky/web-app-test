@@ -4,6 +4,7 @@ import type { ModelMessage } from 'ai';
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
+  completeRuntimeModelToolChain,
   ensureRuntimeContinuationSummaryMessage,
   fallbackRuntimeContinuationSummary,
   mergeRuntimeModelMessageChain,
@@ -147,6 +148,47 @@ test('terminal merge keeps only the new response when compression retains no raw
     [oldCall, oldResult, finalAnswer],
     2,
   ), [summary, finalAnswer]);
+});
+
+test('terminal merge repairs a stale explicit prefix at an atomic tool boundary', () => {
+  const summary: ModelMessage = {
+    role: 'user',
+    content: `${runtimeContinuationSummaryMarker}\n{"remaining":["finish review"]}`,
+  };
+  const oldCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'old', toolName: 'file', input: {} }],
+  };
+  const oldResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'old', toolName: 'file', output: { type: 'text', value: 'old' } }],
+  };
+  const latestCall: ModelMessage = {
+    role: 'assistant',
+    content: [{ type: 'tool-call', toolCallId: 'latest', toolName: 'fileVisual', input: {} }],
+  };
+  const latestResult: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'latest', toolName: 'fileVisual', output: { type: 'text', value: 'reviewed' } }],
+  };
+  const finalAnswer: ModelMessage = { role: 'assistant', content: 'done' };
+
+  const merged = mergeRuntimeModelMessageChain(
+    [summary, latestCall, latestResult],
+    [oldCall, oldResult, latestCall, latestResult, finalAnswer],
+    1,
+  );
+
+  assert.deepEqual(merged, [summary, latestCall, latestResult, finalAnswer]);
+});
+
+test('orphan tool results never survive transcript normalization', () => {
+  const orphan: ModelMessage = {
+    role: 'tool',
+    content: [{ type: 'tool-result', toolCallId: 'missing', toolName: 'file', output: { type: 'text', value: 'orphan' } }],
+  };
+  const finalAnswer: ModelMessage = { role: 'assistant', content: 'done' };
+  assert.deepEqual(completeRuntimeModelToolChain([orphan, finalAnswer]), [finalAnswer]);
 });
 
 test('compression keeps only complete recent blocks that fit the ten-percent raw-tail budget', () => {
