@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   applyUnoDraftPatch,
+  applyUnoDraftPatchHunks,
   downloadFileArtifact,
   editUnoFileArtifact,
   formatFileArtifactResult,
@@ -338,6 +339,37 @@ describe('UNO file tool policies', () => {
       '',
     ].join('\n'));
     expect(source).toContain('        title = "Old"');
+  });
+
+  it('keeps successful independent hunks when one hunk has stale context', () => {
+    const source = [
+      'def create_document(job):',
+      '    title = "Old"',
+      '    body = "Current"',
+      '    deck.save()',
+      '',
+    ].join('\n');
+    const result = applyUnoDraftPatchHunks(source, [
+      '*** Begin Patch',
+      '*** Update File: draft.py',
+      '@@',
+      '-    title = "Old"',
+      '+    title = "New"',
+      '@@',
+      '-    body = "Stale"',
+      '+    body = "Replacement"',
+      '@@',
+      '-    deck.save()',
+      '+    deck.save(validate=True)',
+      '*** End Patch',
+    ].join('\n'));
+
+    expect(result.source).toContain('    title = "New"');
+    expect(result.source).toContain('    body = "Current"');
+    expect(result.source).toContain('    deck.save(validate=True)');
+    expect(result).toMatchObject({ appliedHunks: 2, totalHunks: 3 });
+    expect(result.failedHunks).toHaveLength(1);
+    expect(result.failedHunks[0]).toMatchObject({ hunk: 2 });
   });
 
   it('allows distant atomic hunks without treating their span as a full replacement', () => {
