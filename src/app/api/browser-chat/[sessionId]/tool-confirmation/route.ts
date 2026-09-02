@@ -19,7 +19,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await parseJsonRequest(request, browserChatToolConfirmationRequestSchema, { maxBytes: 16 * 1024 });
-    const session = resolveBrowserChatToolConfirmation(sessionId, body.confirmationId, body.action, requestUserId(request));
+    const session = await resolveBrowserChatToolConfirmation(sessionId, body.confirmationId, body.action, requestUserId(request));
     return apiJson(request, { session });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to resolve tool confirmation';

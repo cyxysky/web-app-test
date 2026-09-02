@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { getSqliteDatabase, parseSqliteJson, runSqliteTransaction } from './sqlite-database';
+import { executeDatabase, parseDatabaseJson, queryDatabase, queryDatabaseOne, runDatabaseTransaction } from '@/server/db/database';
 import { publishBrowserChatRuntimeRecordsChanged } from './browser-chat-runtime-record-refresh';
 
 export type BrowserChatDefectSeverity = 'high' | 'medium' | 'low';
@@ -86,10 +86,10 @@ function normalizeDefectReport(value: unknown) {
   return report;
 }
 
-export function createBrowserChatDefectReport(
+export async function createBrowserChatDefectReport(
   rawSessionId: string,
   input: CreateBrowserChatDefectInput,
-): BrowserChatDefectReport {
+): Promise<BrowserChatDefectReport> {
   const sessionId = normalizedText(rawSessionId, 'sessionId', 240);
   const problemDescription = normalizedText(input.problemDescription, 'problemDescription', 800);
   const whyItIsAProblem = normalizedText(input.whyItIsAProblem, 'whyItIsAProblem', 1_200);
@@ -110,33 +110,33 @@ export function createBrowserChatDefectReport(
     createdAt,
   };
 
-  const stored = runSqliteTransaction((database) => {
-    const count = database.prepare(`
+  const stored = await runDatabaseTransaction(async (database) => {
+    const count = await queryDatabaseOne<{ count?: number }>(`
       SELECT COUNT(*) AS count FROM browser_chat_defect WHERE session_id = ?
-    `).get(sessionId) as { count?: number };
-    if ((Number(count.count) || 0) >= MAX_DEFECTS_PER_SESSION) {
+    `, [sessionId], database);
+    if ((Number(count?.count) || 0) >= MAX_DEFECTS_PER_SESSION) {
       throw new Error(`A conversation can store at most ${MAX_DEFECTS_PER_SESSION} defect reports.`);
     }
-    database.prepare(`
+    await executeDatabase(`
       INSERT INTO browser_chat_defect (session_id, id, created_at, record_json)
       VALUES (?, ?, ?, ?)
-    `).run(sessionId, report.id, createdAt, JSON.stringify(report));
+    `, [sessionId, report.id, createdAt, JSON.stringify(report)], database);
     return report;
   });
   publishBrowserChatRuntimeRecordsChanged(sessionId, 'defects');
   return stored;
 }
 
-export function readBrowserChatDefectReports(sessionId: string) {
-  const rows = getSqliteDatabase().prepare(`
+export async function readBrowserChatDefectReports(sessionId: string) {
+  const rows = await queryDatabase<BrowserChatDefectRow>(`
     SELECT record_json
     FROM browser_chat_defect
     WHERE session_id = ?
     ORDER BY created_at DESC, id DESC
     LIMIT ?
-  `).all(sessionId, MAX_DEFECTS_PER_SESSION) as BrowserChatDefectRow[];
+  `, [sessionId, MAX_DEFECTS_PER_SESSION]);
   return rows.flatMap((row) => {
-    const report = normalizeDefectReport(parseSqliteJson<unknown>(row.record_json, undefined));
+    const report = normalizeDefectReport(parseDatabaseJson<unknown>(row.record_json, undefined));
     return report ? [report] : [];
   });
 }

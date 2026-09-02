@@ -12,7 +12,7 @@ type RouteContext = {
 export async function GET(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
-    const result = readBrowserChatRuntimeState(sessionId, requestApplicationUserId(request));
+    const result = await readBrowserChatRuntimeState(sessionId, requestApplicationUserId(request));
     if (!result) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, result);
   } catch (error) {

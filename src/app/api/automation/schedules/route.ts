@@ -52,7 +52,7 @@ function normalizedTimezone(value: unknown) {
 export async function GET(request: NextRequest) {
   const enabled = request.nextUrl.searchParams.get('enabled');
   return apiJson(request, {
-    schedules: listAutomationSchedules({
+    schedules: await listAutomationSchedules({
       userId: requestApplicationUserId(request),
       caseId: request.nextUrl.searchParams.get('caseId')?.trim() || undefined,
       enabled: enabled === null ? undefined : enabled !== 'false' && enabled !== '0',
@@ -77,8 +77,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'automation_schedule.create',
       userId,
-    }, () => {
-      const schedule = createAutomationSchedule({
+    }, async () => {
+      const schedule = await createAutomationSchedule({
         userId,
         caseId: text(body.caseId),
         title: text(body.title ?? body.name) || '自动执行计划',
@@ -91,7 +91,7 @@ export async function POST(request: NextRequest) {
         overlap: automationScheduleOverlapSchema.parse(body.overlap ?? 'skip'),
         misfire: automationScheduleMisfireSchema.parse(body.misfire ?? 'run-once'),
       });
-      return apiJson(request, { ok: true, schedule, schedules: listAutomationSchedules({ userId }) }, { status: 201 });
+      return apiJson(request, { ok: true, schedule, schedules: await listAutomationSchedules({ userId }) }, { status: 201 });
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : '';
@@ -112,11 +112,11 @@ export async function DELETE(request: NextRequest) {
       fingerprint: idempotencyFingerprint({ scheduleId }),
       scope: 'automation_schedule.delete',
       userId,
-    }, () => {
-      if (!deleteAutomationSchedule(scheduleId, userId)) {
+    }, async () => {
+      if (!await deleteAutomationSchedule(scheduleId, userId)) {
         throw new ApiRequestError('自动化计划不存在', { code: 'not_found', status: 404 });
       }
-      return apiJson(request, { ok: true, deleted: { id: scheduleId }, schedules: listAutomationSchedules({ userId }) });
+      return apiJson(request, { ok: true, deleted: { id: scheduleId }, schedules: await listAutomationSchedules({ userId }) });
     });
   } catch (error) {
     return apiError(request, error, { fallback: '删除自动化计划失败' });

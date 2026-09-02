@@ -1,4 +1,5 @@
 export const runtimeToolLoopStopToolNames = [
+  'finalResponse',
   'waitForHumanVerification',
   'subagent',
 ] as const;

@@ -17,7 +17,7 @@ const selectionSchema = z.object({
 }).strict();
 
 export async function GET(request: NextRequest) {
-  return apiJson(request, readModelSettingsState());
+  return apiJson(request, await readModelSettingsState());
 }
 
 export async function POST(request: NextRequest) {
@@ -28,8 +28,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(selection),
       scope: 'settings.model_selection',
       userId,
-    }, () => {
-      const saved = store.getModelConfig();
+    }, async () => {
+      const saved = await store.getModelConfig();
       const definition = modelProviderDefinition(selection.provider);
       const currentProvider = saved?.providers?.[selection.provider];
       if (currentProvider?.enabled !== true) {
@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
         models: [...(currentProvider?.models || []), selection.model],
       });
       const model = defaultModelForProvider(definition, { ...currentProvider, defaultModel: selection.model, model: selection.model, models });
-      store.saveModelConfig({
+      await store.saveModelConfig({
         provider: selection.provider,
         providers: {
           ...(saved?.providers || {}),
@@ -54,8 +54,8 @@ export async function POST(request: NextRequest) {
           },
         },
       });
-      store.applyRuntimeEnv();
-      return apiJson(request, { ok: true, ...readModelSettingsState() });
+      await store.applyRuntimeEnv();
+      return apiJson(request, { ok: true, ...await readModelSettingsState() });
     });
   } catch (error) {
     return apiError(request, error, { fallback: '保存模型选择失败' });

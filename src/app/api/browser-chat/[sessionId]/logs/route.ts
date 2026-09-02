@@ -17,7 +17,7 @@ export async function GET(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
     const url = new URL(request.url);
-    const result = readBrowserChatSessionLogs(sessionId, requestUserId(request), {
+    const result = await readBrowserChatSessionLogs(sessionId, requestUserId(request), {
       cursor: url.searchParams.get('cursor') || undefined,
       limit: boundedQueryInteger(url.searchParams.get('limit'), { fallback: 200, max: 500 }),
       messageId: url.searchParams.get('messageId') || undefined,

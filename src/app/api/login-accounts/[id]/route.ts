@@ -31,8 +31,8 @@ function accountError(error: unknown) {
   });
 }
 
-function editableAccount(id: string, userId: string) {
-  const account = getLoginAccountById(id, userId);
+async function editableAccount(id: string, userId: string) {
+  const account = await getLoginAccountById(id, userId);
   if (!account) throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
   if (account.userId !== userId) {
     throw new ApiRequestError('只有账号创建者可以修改或删除共享账号', { code: 'forbidden', status: 403 });
@@ -49,9 +49,9 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ id, ...body }),
       scope: 'login_account.update',
       userId,
-    }, () => {
-      editableAccount(id, userId);
-      const account = updateLoginAccount(id, body, userId);
+    }, async () => {
+      await editableAccount(id, userId);
+      const account = await updateLoginAccount(id, body, userId);
       if (!account) throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
       return apiJson(request, { account });
     });
@@ -68,9 +68,9 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ id }),
       scope: 'login_account.delete',
       userId,
-    }, () => {
-      editableAccount(id, userId);
-      if (!deleteLoginAccount(id, userId)) {
+    }, async () => {
+      await editableAccount(id, userId);
+      if (!await deleteLoginAccount(id, userId)) {
         throw new ApiRequestError('登录账号不存在', { code: 'not_found', status: 404 });
       }
       return apiJson(request, { ok: true });

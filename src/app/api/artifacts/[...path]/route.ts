@@ -27,12 +27,12 @@ function contentDispositionHeader(filePath: string) {
   return path.basename(filePath).replace(/["\r\n]/g, '_');
 }
 
-function artifactBelongsToUser(segments: string[], userId: string) {
+async function artifactBelongsToUser(segments: string[], userId: string) {
   if (segments[0] === 'uploads') {
     return segments.length >= 3 ? segments[1] === userId : userId === normalizeApplicationUserId(undefined);
   }
   if (segments[0]?.startsWith('chat_')) {
-    const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(segments[0]);
+    const session = await readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(segments[0]);
     return Boolean(session && normalizeApplicationUserId(session.userId) === userId);
   }
   return userId === normalizeApplicationUserId(undefined);
@@ -55,7 +55,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     const filePath = resolveArtifactPath(pathSegments || []);
     if (!filePath) throw new ApiRequestError('Invalid artifact path');
     const userId = requestApplicationUserId(request);
-    if (!artifactBelongsToUser(pathSegments, userId)) {
+    if (!await artifactBelongsToUser(pathSegments, userId)) {
       throw new ApiRequestError('Artifact not found', { code: 'not_found', status: 404 });
     }
     const fileStat = await stat(/*turbopackIgnore: true*/ filePath);

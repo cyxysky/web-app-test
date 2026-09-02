@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { runtimeMetricsSnapshot } from '@/server/observability/runtime-observability';
-import { sqliteWriteQueueSnapshot } from '@/server/storage/sqlite-write-queue';
+import { databaseWriteQueueSnapshot } from '@/server/storage/database-write-queue';
 import { cpuWorkerPoolSnapshot } from '@/server/runtime/cpu-worker-pool';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 
@@ -17,7 +17,7 @@ export async function GET(request: NextRequest) {
       metrics: runtimeMetricsSnapshot(),
       queues: {
         cpuWorkers: cpuWorkerPoolSnapshot(),
-        sqliteWrites: sqliteWriteQueueSnapshot(),
+        databaseWrites: databaseWriteQueueSnapshot(),
       },
     });
   } catch (error) {

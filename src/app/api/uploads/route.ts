@@ -9,7 +9,7 @@ import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { artifactPath } from '@/server/storage/paths';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
-import { readReferencedUploadPaths } from '@/server/storage/sqlite-record-store';
+import { readReferencedUploadPaths } from '@/server/storage/database-record-store';
 import {
   enforceUserUploadQuota,
   scheduleUploadArtifactMaintenance,
@@ -115,7 +115,7 @@ export async function POST(request: NextRequest) {
       throw error;
     }
 
-    const quota = await enforceUserUploadQuota(userId, readReferencedUploadPaths(userId), { protectedPath: filePath });
+    const quota = await enforceUserUploadQuota(userId, await readReferencedUploadPaths(userId), { protectedPath: filePath });
     if (quota.overQuota) {
       await unlink(filePath).catch(() => undefined);
       throw new ApiRequestError('Upload storage quota exceeded', { code: 'storage_quota_exceeded', status: 413 });

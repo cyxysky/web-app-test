@@ -32,7 +32,7 @@ export async function GET(request: NextRequest) {
     if (serverPause) {
       debugger;
     }
-    store.applyRuntimeEnv();
+    await store.applyRuntimeEnv();
     if (!reuse && debugState.session) {
       await debugState.session.close({ keepOpen: false }).catch(() => undefined);
       debugState.session = undefined;

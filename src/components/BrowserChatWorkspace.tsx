@@ -26,6 +26,8 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
+import { DefaultChatTransport } from 'ai';
+import { Chat, useChat } from '@ai-sdk/react';
 import { Button, Checkbox, Popover, TextArea } from '@heroui/react';
 import dynamic from 'next/dynamic';
 import {
@@ -128,7 +130,10 @@ import { browserChatCurrentTurnAssistantMessageId } from '@/components/browser-c
 import {
   normalizeBrowserChatMarkdown,
   remarkBrowserChatCjkStrong,
+  splitBrowserChatChartBlocks,
 } from '@/components/browser-chat-markdown';
+import { BrowserChatChart } from '@/components/BrowserChatChart';
+import { BrowserChatDataUI } from '@/components/BrowserChatDataUI';
 import { browserChatGenerationPreviewText } from '@/components/browser-chat-message-generation-preview';
 import {
   mergeBrowserChatRealtimeCollections,
@@ -241,6 +246,11 @@ import {
 import { modelCapabilities } from '@/lib/model-capabilities';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { artifactApiUrl } from '@/lib/artifacts';
+import type {
+  BrowserChatUIMessage,
+  BrowserChatUIMessageMetadata,
+  BrowserChatUIMessagePart,
+} from '@/lib/browser-chat-ui-message';
 import { useTheme } from '@/theme/ThemeProvider';
 import type {
   BrowserChatAiOutputCycle,
@@ -257,6 +267,7 @@ type BrowserChatMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  parts?: BrowserChatUIMessagePart[];
   createdAt: string;
   updatedAt?: string;
   clientMessageId?: string;
@@ -1282,6 +1293,7 @@ function browserChatToolLabel(name: string, input: unknown, t: (value: string) =
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
     contextCompression: '压缩上下文',
+    chart: '生成图表',
     file: '文件操作',
     fileVisual: '视觉检查',
     memory: '记忆管理',
@@ -1344,6 +1356,7 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
       ? t('读取 {count} 张页面截图', { count: screenshotCount })
       : t('读取页面截图');
   }
+  if (name === 'chart') return toolInputValue(record, ['title', 'description', 'reason']);
   if (name === 'subagent') {
     return record.action === 'spawn' && Array.isArray(record.tasks)
       ? t('{count} 个任务', { count: record.tasks.length })
@@ -2025,6 +2038,69 @@ function normalizeToolConfirmation(value?: BrowserChatToolConfirmation): Browser
   };
 }
 
+function browserChatUIMessageText(message: BrowserChatUIMessage) {
+  return message.parts.map((part) => {
+    if (part.type === 'text') return part.text;
+    if (part.type === 'data-chart') return part.data.chartId;
+    return '';
+  }).filter(Boolean).join('\n\n');
+}
+
+function browserChatUIMessageSteps(messages: BrowserChatUIMessage[], sessionId: string) {
+  return messages
+    .filter((message) => message.role === 'assistant' && message.metadata?.sessionId === sessionId)
+    .flatMap((message) => message.parts.flatMap((part) => part.type === 'data-step' ? [part.data] : []));
+}
+
+function overlayBrowserChatUIMessages(
+  messages: BrowserChatMessage[],
+  uiMessages: BrowserChatUIMessage[],
+  sessionId: string,
+) {
+  const result = [...messages];
+  for (const uiMessage of uiMessages) {
+    if ((uiMessage.role !== 'assistant' && uiMessage.role !== 'user') || uiMessage.metadata?.sessionId !== sessionId) continue;
+    const clientMessageId = uiMessage.metadata.clientMessageId;
+    if (uiMessage.role === 'user') {
+      const streamedUser: BrowserChatMessage = {
+        id: uiMessage.id,
+        role: 'user',
+        content: browserChatUIMessageText(uiMessage),
+        parts: uiMessage.parts,
+        createdAt: uiMessage.metadata.createdAt,
+        clientMessageId,
+        attachments: uiMessage.metadata.attachments as BrowserChatAttachment[] | undefined,
+        skillIds: uiMessage.metadata.skillIds,
+      };
+      const userIndex = result.findIndex((message) => (
+        message.role === 'user' && clientMessageId && message.clientMessageId === clientMessageId
+      ));
+      if (userIndex >= 0) result[userIndex] = { ...result[userIndex], ...streamedUser };
+      else result.push(streamedUser);
+      continue;
+    }
+    const streamed: BrowserChatMessage = {
+      id: uiMessage.id,
+      role: 'assistant',
+      content: browserChatUIMessageText(uiMessage),
+      parts: uiMessage.parts,
+      createdAt: uiMessage.metadata.createdAt,
+      updatedAt: uiMessage.metadata.updatedAt,
+      clientMessageId,
+      status: uiMessage.metadata.status,
+      stepIndexes: uiMessage.parts.flatMap((part) => part.type === 'data-step' ? [part.data.index] : []),
+      activity: [...uiMessage.parts].reverse().find((part) => part.type === 'data-activity')?.data,
+    };
+    const index = result.findIndex((message) => (
+      message.id === uiMessage.id
+      || (clientMessageId && message.role === 'assistant' && message.clientMessageId === clientMessageId)
+    ));
+    if (index >= 0) result[index] = { ...result[index], ...streamed };
+    else result.push(streamed);
+  }
+  return result.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
 function normalizeSession(session: BrowserChatSession): BrowserChatSession {
   const modelSelection = resolveRuntimeModelSelection(null, { model: session.model, provider: session.modelProvider });
   return {
@@ -2038,6 +2114,11 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
       content: message.role === 'assistant' && message.status === 'interrupted'
         ? browserChatInterruptedReply
         : stringFromUnknown(message.content),
+      parts: Array.isArray(message.parts)
+        ? message.parts
+        : stringFromUnknown(message.content).trim()
+          ? [{ type: 'text', text: stringFromUnknown(message.content) }]
+          : [],
       role: message.role === 'assistant' ? 'assistant' : 'user',
       stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
     })),
@@ -2408,38 +2489,75 @@ function BrowserChatMarkdownTable({ children }: { children: ReactNode }) {
   );
 }
 
+const BrowserChatSessionIdContext = createContext<string | undefined>(undefined);
+
 const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
+  const sessionId = useContext(BrowserChatSessionIdContext);
   const normalizedMarkdown = useMemo(() => normalizeBrowserChatMarkdown(markdown), [markdown]);
+  const blocks = useMemo(() => splitBrowserChatChartBlocks(normalizedMarkdown), [normalizedMarkdown]);
   return (
     <div className="browser-chat-agent-markdown">
-      <ReactMarkdown
-        rehypePlugins={[rehypeKatex]}
-        remarkPlugins={[remarkGfm, remarkMath, remarkBrowserChatCjkStrong]}
-        components={{
-          a: ({ href, onClick, ...props }) => (
-            <a
-              {...props}
-              href={href}
-              onClick={(event) => {
-                onClick?.(event);
-                handleBrowserChatMarkdownLinkClick(event, href);
-              }}
-              target="_blank"
-              rel="noopener noreferrer"
-            />
-          ),
-          table: ({ children }) => <BrowserChatMarkdownTable>{children}</BrowserChatMarkdownTable>,
-          thead: ({ children }) => <thead className="table__header">{children}</thead>,
-          tbody: ({ children }) => <tbody className="table__body">{children}</tbody>,
-          tr: ({ children }) => <tr className="table__row">{children}</tr>,
-          th: ({ children }) => <th className="table__column">{children}</th>,
-          td: ({ children }) => <td className="table__cell">{children}</td>,
-        }}
-      >
-        {normalizedMarkdown}
-      </ReactMarkdown>
+      {blocks.map((block, index) => block.kind === 'chart' ? (
+        <BrowserChatChart chartId={block.chartId} key={`${block.chartId}:${index}`} sessionId={sessionId} />
+      ) : (
+        <ReactMarkdown
+          key={`markdown:${index}`}
+          rehypePlugins={[rehypeKatex]}
+          remarkPlugins={[remarkGfm, remarkMath, remarkBrowserChatCjkStrong]}
+          components={{
+            a: ({ href, onClick, ...props }) => (
+              <a
+                {...props}
+                href={href}
+                onClick={(event) => {
+                  onClick?.(event);
+                  handleBrowserChatMarkdownLinkClick(event, href);
+                }}
+                target="_blank"
+                rel="noopener noreferrer"
+              />
+            ),
+            table: ({ children }) => <BrowserChatMarkdownTable>{children}</BrowserChatMarkdownTable>,
+            thead: ({ children }) => <thead className="table__header">{children}</thead>,
+            tbody: ({ children }) => <tbody className="table__body">{children}</tbody>,
+            tr: ({ children }) => <tr className="table__row">{children}</tr>,
+            th: ({ children }) => <th className="table__column">{children}</th>,
+            td: ({ children }) => <td className="table__cell">{children}</td>,
+          }}
+        >
+          {block.markdown}
+        </ReactMarkdown>
+      ))}
     </div>
   );
+});
+
+const BrowserChatOrderedResponse = memo(function BrowserChatOrderedResponse({
+  fallbackText,
+  parts,
+}: {
+  fallbackText: string;
+  parts?: BrowserChatUIMessagePart[];
+}) {
+  const sessionId = useContext(BrowserChatSessionIdContext);
+  const responseParts = (parts || []).filter((part) => (
+    part.type === 'text' || part.type === 'data-chart' || part.type === 'data-ui'
+  ));
+  if (!responseParts.length) return fallbackText.trim() ? <BrowserChatMarkdown markdown={fallbackText} /> : null;
+  return <div className="browser-chat-ordered-response">{responseParts.map((part, index) => {
+    if (part.type === 'text') return <BrowserChatMarkdown key={`text:${index}`} markdown={part.text} />;
+    if (part.type === 'data-chart') {
+      return <BrowserChatChart chartId={part.data.chartId} key={part.id || `${part.data.chartId}:${index}`} sessionId={sessionId} />;
+    }
+    if (part.type === 'data-ui') {
+      return <BrowserChatDataUI
+        key={part.id || `ui:${index}`}
+        renderMarkdown={(markdown) => <BrowserChatMarkdown markdown={markdown} />}
+        tree={part.data.tree}
+      />;
+    }
+    return null;
+  })}</div>;
 });
 
 const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
@@ -4984,6 +5102,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     || pairedAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'))
   ));
   const hasFinalText = Boolean(finalText.trim());
+  const hasStructuredResponse = Boolean(message.parts?.some((part) => (
+    part.type === 'text' || part.type === 'data-chart' || part.type === 'data-ui'
+  )));
+  const hasFinalResponse = hasFinalText || hasStructuredResponse;
   const hideManualVerificationStatusText = manualVerificationPaused && isBrowserChatManualVerificationStatusText(finalText);
   const hasHistoricalAiOutput = aiOutputCycleEntries.length > 0;
   const hasPersistedProcess = Boolean(message.stepIndexes?.length);
@@ -5102,14 +5224,12 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           resuming={resumingHumanVerification}
         />
       ) : null}
-      {!running && hasFinalText && (message.status === 'passed' || !finalTextAnchoredToToolCycle) ? (
-        <BrowserChatStreamingAnswer
-          hidden={hideManualVerificationStatusText}
-          running={false}
-          text={finalText}
-        />
+      {!running && hasFinalResponse && (message.status === 'passed' || !finalTextAnchoredToToolCycle) ? (
+        <div className="browser-chat-answer">
+          <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : finalText} parts={message.parts} />
+        </div>
       ) : null}
-      {!hasFinalText && !hasProcessContent && !manualVerificationPaused ? (
+      {!hasFinalResponse && !hasProcessContent && !manualVerificationPaused ? (
         <p className="browser-chat-agent-empty">{t('AI 已完成本轮操作，未返回额外文本。')}</p>
       ) : null}
       {!running ? (
@@ -5770,8 +5890,9 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   }, []);
 
   return (
-    <BrowserChatSubagentPanelContext.Provider value={subagentPanelContext}>
-      <BrowserChatScreenshotPreviewContext.Provider value={screenshotPreviewContext}>
+    <BrowserChatSessionIdContext.Provider value={sessionId}>
+      <BrowserChatSubagentPanelContext.Provider value={subagentPanelContext}>
+        <BrowserChatScreenshotPreviewContext.Provider value={screenshotPreviewContext}>
         <div className="browser-chat-message-scroll-shell">
           <div
             className="browser-chat-message-list"
@@ -5870,8 +5991,9 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           onClose={closeScreenshotPreview}
           preview={screenshotPreview}
         />
-      </BrowserChatScreenshotPreviewContext.Provider>
-    </BrowserChatSubagentPanelContext.Provider>
+        </BrowserChatScreenshotPreviewContext.Provider>
+      </BrowserChatSubagentPanelContext.Provider>
+    </BrowserChatSessionIdContext.Provider>
   );
 });
 
@@ -9618,10 +9740,62 @@ export function BrowserChatWorkspace({
   const [savingConversationTitle, setSavingConversationTitle] = useState(false);
   const [shareLinkCopied, setShareLinkCopied] = useState(false);
   const shareLinkFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const uiChatTransport = useMemo(() => new DefaultChatTransport<BrowserChatUIMessage>({
+    api: browserChatApiUrl('/api/browser-chat/unbound/message'),
+    prepareSendMessagesRequest: ({ body, messages: requestMessages }) => {
+      const latest = [...requestMessages].reverse().find((message) => message.role === 'user');
+      const metadata = latest?.metadata as BrowserChatUIMessageMetadata | undefined;
+      if (!latest || !metadata?.sessionId) throw new Error('Browser chat session is not ready');
+      return {
+        api: browserChatApiUrl(`/api/browser-chat/${encodeURIComponent(metadata.sessionId)}/message`),
+        body: {
+          ...body,
+          content: latest.parts.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n'),
+          clientMessageId: metadata.clientMessageId || latest.id,
+          attachments: metadata.attachments || [],
+          skillIds: metadata.skillIds || [],
+        },
+      };
+    },
+  }), [browserChatApiUrl]);
+  const uiChatsRef = useRef(new Map<string, Chat<BrowserChatUIMessage>>());
+  const uiChatForSession = useCallback((sessionId: string) => {
+    const existing = uiChatsRef.current.get(sessionId);
+    if (existing) return existing;
+    const chat = new Chat<BrowserChatUIMessage>({
+      id: `browser-chat:${sessionId}`,
+      transport: uiChatTransport,
+      onError: (chatError) => setError(chatError.message),
+    });
+    uiChatsRef.current.set(sessionId, chat);
+    return chat;
+  }, [uiChatTransport]);
+  const currentUIChat = useMemo(() => uiChatForSession(session?.id || 'unbound'), [session?.id, uiChatForSession]);
+  const {
+    messages: currentRequestUIMessages,
+    status: currentUIMessageStatus,
+    stop: stopCurrentUIMessage,
+  } = useChat<BrowserChatUIMessage>({
+    chat: currentUIChat,
+    throttle: 50,
+  });
+  const currentUIMessageOwnerRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    const owners = new Map<string, string>();
+    for (const message of currentRequestUIMessages) {
+      const sessionId = message.metadata?.sessionId;
+      const clientMessageId = message.metadata?.clientMessageId;
+      const requestActive = currentUIMessageStatus === 'submitted' || currentUIMessageStatus === 'streaming';
+      if (sessionId && clientMessageId && (requestActive || message.metadata?.status === 'running' || message.metadata?.status === 'queued')) {
+        owners.set(sessionId, clientMessageId);
+      }
+    }
+    currentUIMessageOwnerRef.current = owners;
+  }, [currentRequestUIMessages, currentUIMessageStatus]);
   const sessionUiKey = `${session?.userId || requestUserId}:${session?.id || 'new'}`;
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
-  const currentBusy = busy || selectedSessionRunning || interrupting;
+  const currentBusy = busy || currentUIMessageStatus === 'submitted' || currentUIMessageStatus === 'streaming' || selectedSessionRunning || interrupting;
   const interruptSessionId = selectedRunningSession?.id || (busy ? pendingMessageSessionId || session?.id : undefined);
   const canInterruptConversation = Boolean(interruptSessionId && (busy || selectedSessionRunning));
   const messages = useMemo(() => session?.messages || [], [session?.messages]);
@@ -9629,7 +9803,13 @@ export function BrowserChatWorkspace({
     () => new Set((session?.queuedTurns || []).map((turn) => turn.userMessageId)),
     [session?.queuedTurns],
   );
-  const steps = useMemo(() => session?.steps || [], [session?.steps]);
+  const steps = useMemo(() => {
+    const persisted = session?.steps || [];
+    const streamed = browserChatUIMessageSteps(currentRequestUIMessages, session?.id || '');
+    const byIndex = new Map(persisted.map((step) => [step.index, step]));
+    for (const step of streamed) byIndex.set(step.index, step);
+    return [...byIndex.values()].sort((left, right) => left.index - right.index);
+  }, [currentRequestUIMessages, session?.id, session?.steps]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
   const generationSkillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
   const liveToolDialog = useMemo(() => {
@@ -9655,7 +9835,11 @@ export function BrowserChatWorkspace({
       confirmationScreenshotUrl: confirmation?.screenshotUrl || toolDialog.confirmationScreenshotUrl,
     };
   }, [logs, steps, toolDialog]);
-  const visibleMessages = messages;
+  const visibleMessages = useMemo(() => overlayBrowserChatUIMessages(
+    messages,
+    currentRequestUIMessages,
+    session?.id || '',
+  ), [currentRequestUIMessages, messages, session?.id]);
   const generatableMessageOptions = useMemo(() => visibleMessages.flatMap((message, messageIndex) => {
     if (message.role !== 'assistant' || message.status === 'running') return [];
     const declaredStepIndexes = new Set(message.stepIndexes || []);
@@ -10347,7 +10531,22 @@ export function BrowserChatWorkspace({
     if (activeSessionIdRef.current === event.id) {
       setSession((current) => {
         if (current?.id !== event.id) return current;
-        const merged = mergeBrowserChatSessionRealtimePatch(current, patch);
+        const ownedClientMessageId = currentUIMessageOwnerRef.current.get(event.id);
+        const ownedMessageIds = new Set([
+          ...current.messages.filter((message) => (
+            ownedClientMessageId && message.clientMessageId === ownedClientMessageId
+          )).map((message) => message.id),
+          ...(patch.messages || []).filter((message) => (
+            ownedClientMessageId && message.clientMessageId === ownedClientMessageId
+          )).map((message) => message.id),
+        ]);
+        const sessionPatch = ownedClientMessageId ? {
+          ...patch,
+          messages: patch.messages?.filter((message) => message.clientMessageId !== ownedClientMessageId),
+          steps: patch.steps?.filter((step) => !step.messageId || !ownedMessageIds.has(step.messageId)),
+          removedMessageIds: patch.removedMessageIds?.filter((messageId) => !ownedMessageIds.has(messageId)),
+        } : patch;
+        const merged = mergeBrowserChatSessionRealtimePatch(current, sessionPatch);
         const guarded = applyBrowserChatInterruptGuard(merged, interruptGuardsRef.current.get(event.id));
         if (guarded.release) interruptGuardsRef.current.delete(event.id);
         return guarded.session;
@@ -10406,16 +10605,6 @@ export function BrowserChatWorkspace({
   async function ensureSession() {
     if (session && session.status !== 'closed') return session;
     return createSession();
-  }
-
-  async function postMessageToSession(sessionId: string, content: string, clientMessageId: string, nextAttachments: BrowserChatAttachment[], skillIds: string[]) {
-    const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/message`), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ attachments: nextAttachments, clientMessageId, content, safetyMode, modelProvider, model: modelId, skillIds }),
-    });
-    const data = await readApiJson<Record<string, unknown>>(response, '发送消息失败');
-    return data.session as BrowserChatSession;
   }
 
   async function deleteQueuedMessage(messageId: string) {
@@ -10521,6 +10710,7 @@ export function BrowserChatWorkspace({
         id: `${clientMessageId}:user`,
         role: 'user',
         content: trimmedContent,
+        parts: [{ type: 'text', text: trimmedContent }],
         createdAt: optimisticTimestamp,
         updatedAt: optimisticTimestamp,
         clientMessageId,
@@ -10532,6 +10722,7 @@ export function BrowserChatWorkspace({
         id: `${clientMessageId}:assistant`,
         role: 'assistant',
         content: '',
+        parts: [],
         createdAt: optimisticTimestamp,
         updatedAt: optimisticTimestamp,
         clientMessageId,
@@ -10550,19 +10741,26 @@ export function BrowserChatWorkspace({
           ...(optimisticAssistantMessage ? [optimisticAssistantMessage] : []),
         ],
       }, { activate: true });
-      let posted: BrowserChatSession;
-      try {
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
-      } catch (firstError) {
-        const firstMessage = firstError instanceof Error ? firstError.message : String(firstError);
-        if (!/Browser chat session not found/i.test(firstMessage)) throw firstError;
-        active = await createSession();
-        setPendingMessageSessionId(active.id);
-        posted = await postMessageToSession(active.id, trimmedContent, clientMessageId, nextAttachments, skillIds);
-      }
-      upsertSession(posted, { activate: true });
       attachmentsRef.current = [];
       setAttachments([]);
+      void uiChatForSession(active.id).sendMessage({
+        id: `${clientMessageId}:user`,
+        role: 'user',
+        parts: [{ type: 'text', text: trimmedContent }],
+        metadata: {
+          sessionId: active.id,
+          clientMessageId,
+          createdAt: optimisticTimestamp,
+          attachments: nextAttachments,
+          skillIds,
+        },
+      }, {
+        body: { safetyMode, modelProvider, model: modelId },
+      }).catch((chatError) => {
+        setError(chatError instanceof Error ? chatError.message : '发送消息失败');
+        attachmentsRef.current = nextAttachments;
+        setAttachments(nextAttachments);
+      });
       return true;
     } catch (sendError) {
       const sendMessageText = sendError instanceof Error ? sendError.message : '发送消息失败';
@@ -10593,6 +10791,7 @@ export function BrowserChatWorkspace({
     }
     interruptingRef.current = true;
     setInterrupting(true);
+    await stopCurrentUIMessage().catch(() => undefined);
     setError('');
     const timestamp = new Date().toISOString();
     interruptGuardsRef.current.set(targetId, {

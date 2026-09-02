@@ -162,3 +162,36 @@ export function normalizeBrowserChatMarkdown(markdown: string) {
     .join('')
     .trim();
 }
+
+export type BrowserChatMarkdownBlock =
+  | { chartId: string; kind: 'chart' }
+  | { kind: 'markdown'; markdown: string };
+
+export function splitBrowserChatChartBlocks(markdown: string): BrowserChatMarkdownBlock[] {
+  const blocks: BrowserChatMarkdownBlock[] = [];
+  const bufferedLines: string[] = [];
+  let fence: '`' | '~' | undefined;
+  const flushMarkdown = () => {
+    const value = bufferedLines.join('\n').trim();
+    bufferedLines.length = 0;
+    if (value) blocks.push({ kind: 'markdown', markdown: value });
+  };
+  for (const line of markdown.split('\n')) {
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1][0] as '`' | '~';
+      fence = fence === marker ? undefined : fence || marker;
+      bufferedLines.push(line);
+      continue;
+    }
+    const chartId = fence ? undefined : line.match(/^\s*(chart_\d{6})\s*$/)?.[1];
+    if (!chartId) {
+      bufferedLines.push(line);
+      continue;
+    }
+    flushMarkdown();
+    blocks.push({ kind: 'chart', chartId });
+  }
+  flushMarkdown();
+  return blocks;
+}

@@ -12,7 +12,7 @@ export default async function SettingsPage() {
       <SettingsWorkspace
         adminSettingsPasswordRequired={adminPasswordRequired}
         defaultUserId={context.userId}
-        initialData={adminPasswordRequired ? undefined : readEnvironmentSettingsSnapshot()}
+        initialData={adminPasswordRequired ? undefined : await readEnvironmentSettingsSnapshot()}
         initialSidebarCollapsed={context.sidebarCollapsed}
       />
     </main>

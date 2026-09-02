@@ -136,9 +136,9 @@ function recordedCredentialRefs(automationCase: AutomationCaseRecord) {
   return Array.from(refs);
 }
 
-function credentialContextForCase(automationCase: AutomationCaseRecord): AutomationCredentialContext {
+async function credentialContextForCase(automationCase: AutomationCaseRecord): Promise<AutomationCredentialContext> {
   const target = httpUrl(automationCase.targetUrl);
-  const activeAccounts = listLoginAccounts({ userId: automationCase.userId })
+  const activeAccounts = (await listLoginAccounts({ userId: automationCase.userId }))
     .filter((account) => account.status === 'active' && account.hasPassword);
   const domainAccounts = target
     ? activeAccounts.filter((account) => account.domain === target.hostname.toLowerCase())
@@ -153,7 +153,7 @@ function credentialContextForCase(automationCase: AutomationCaseRecord): Automat
         : undefined;
   if (!account) return { bindings: [], operationalContext: '' };
 
-  const resolved = resolveLoginAccountCredentialById(account.id, automationCase.userId);
+  const resolved = await resolveLoginAccountCredentialById(account.id, automationCase.userId);
   if (!resolved) return { bindings: [], operationalContext: '' };
   const allowedOrigins: string[] = [];
 
@@ -190,14 +190,14 @@ function throwIfAborted(signal?: AbortSignal) {
   throw signal.reason instanceof Error ? signal.reason : new Error('Automation run was cancelled.');
 }
 
-function throwIfRunCannotContinue(
+async function throwIfRunCannotContinue(
   runId: string,
   runUserId: string,
   leaseOwner: string,
   signal?: AbortSignal,
 ) {
   throwIfAborted(signal);
-  const persistedRun = getAutomationRun(runId, runUserId);
+  const persistedRun = await getAutomationRun(runId, runUserId);
   if (persistedRun?.status === 'cancelled') {
     throw new AutomationRunCancelledError();
   }
@@ -310,7 +310,7 @@ async function persistRunProgress(
   leaseOwner: string,
   entry?: AutomationRunLogEntry,
 ) {
-  const transition = updateAutomationRunIfStatus(run.id, ['running'], {
+  const transition = await updateAutomationRunIfStatus(run.id, ['running'], {
     steps,
     ...(entry ? { appendLog: [entry] } : {}),
   }, run.userId, leaseOwner);
@@ -380,14 +380,14 @@ async function repairFailedOperation(input: {
 
 async function executeAutomationRunNow(runId: string, options: ExecuteAutomationRunOptions): Promise<AutomationRunRecord> {
   const requestedUserId = options.userId === undefined ? undefined : userId(options.userId);
-  const initialRun = getAutomationRun(runId, requestedUserId);
+  const initialRun = await getAutomationRun(runId, requestedUserId);
   if (!initialRun) throw new Error('Automation run not found.');
-  const automationCase = getAutomationCase(initialRun.caseId, initialRun.userId);
+  const automationCase = await getAutomationCase(initialRun.caseId, initialRun.userId);
   if (!automationCase) throw new Error('Automation case not found.');
 
   const owner = options.leaseOwner?.trim() || `automation-runner:${process.pid}:${randomUUID()}`;
   const leaseTtlMs = Math.max(60_000, Math.floor(options.leaseTtlMs || 60 * 60_000));
-  const claimedRun = claimAutomationRunLease(initialRun.id, owner, leaseTtlMs, initialRun.userId);
+  const claimedRun = await claimAutomationRunLease(initialRun.id, owner, leaseTtlMs, initialRun.userId);
   if (!claimedRun) throw new Error('Automation run is already claimed by another runner.');
 
   const stepRecords: AutomationRunStepRecord[] = [];
@@ -395,11 +395,11 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
   let aiStepIndex = 0;
   let run = claimedRun;
   const heartbeatIntervalMs = Math.max(5_000, Math.min(30_000, Math.floor(leaseTtlMs / 3)));
-  const leaseHeartbeat = setInterval(() => {
+  const leaseHeartbeat = setInterval(async () => {
     try {
-      const renewedRun = claimAutomationRunLease(run.id, owner, leaseTtlMs, run.userId);
+      const renewedRun = await claimAutomationRunLease(run.id, owner, leaseTtlMs, run.userId);
       if (!renewedRun || renewedRun.lease?.owner !== owner) {
-        const persistedRun = getAutomationRun(run.id, run.userId);
+        const persistedRun = await getAutomationRun(run.id, run.userId);
         abortActiveRun(
           run.id,
           persistedRun?.status === 'cancelled'
@@ -416,9 +416,9 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
   }, heartbeatIntervalMs);
   leaseHeartbeat.unref?.();
 
-  const durableStatePoll = setInterval(() => {
+  const durableStatePoll = setInterval(async () => {
     try {
-      const persistedRun = getAutomationRun(run.id, run.userId);
+      const persistedRun = await getAutomationRun(run.id, run.userId);
       if (persistedRun?.status === 'cancelled') {
         abortActiveRun(run.id);
       } else if (
@@ -446,7 +446,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       finishedAt: null,
       appendLog: [logEntry('info', 'Automation run started in a headless browser with the user browser profile.')],
     };
-    const runningTransition = updateAutomationRunIfStatus(
+    const runningTransition = await updateAutomationRunIfStatus(
       claimedRun.id,
       ['queued', 'running'],
       runningPatch,
@@ -459,8 +459,8 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       if (run.status === 'cancelled') throw new AutomationRunCancelledError();
       return run;
     }
-    const credentialContext = credentialContextForCase(automationCase);
-    throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+    const credentialContext = await credentialContextForCase(automationCase);
+    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     const browserProfileKey = `user_${automationCase.userId}`;
     browser = new BrowserSession({
       browserSurface: 'external',
@@ -472,7 +472,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       runId: run.id,
     });
     await browser.start();
-    throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     if (automationCase.targetUrl && automationCase.targetUrl !== 'about:blank') {
       let initialOpen: BrowserActionResult;
       try {
@@ -493,7 +493,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
 
     const operations = [...automationCase.operations].sort((left, right) => left.index - right.index);
     for (const operation of operations) {
-      throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
       await waitBeforeOperation(operation.delayBeforeMs, options.abortSignal);
       const startedAt = now();
       let fixedResult: BrowserActionResult;
@@ -518,7 +518,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
         }
       }
 
-      throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
       if (fixedResult.ok) {
         const evidence = await captureAutomationStepEvidence({
           browser,
@@ -559,7 +559,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
         credentialContext,
         abortSignal: options.abortSignal,
       });
-      throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
       const evidence = await captureAutomationStepEvidence({
         browser,
         runId: run.id,
@@ -610,7 +610,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       );
     }
 
-    throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     let verification: InteractiveBrowserTurnResult | undefined;
     let verificationError = '';
     const verificationStartedAt = now();
@@ -629,7 +629,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       verificationError = errorMessage(error);
     }
 
-    throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     const verificationEvidence = await captureAutomationStepEvidence({
       browser,
       runId: run.id,
@@ -667,7 +667,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
         },
       )],
     };
-    const completion = updateAutomationRunIfStatus(
+    const completion = await updateAutomationRunIfStatus(
       run.id,
       ['running'],
       completedPatch,
@@ -681,7 +681,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
     }
     return run;
   } catch (error) {
-    const persistedRun = getAutomationRun(run.id, run.userId);
+    const persistedRun = await getAutomationRun(run.id, run.userId);
     const leaseLost = Boolean(
       error instanceof AutomationRunLeaseLostError
       || options.abortSignal?.reason instanceof AutomationRunLeaseLostError,
@@ -699,7 +699,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       run = persistedRun;
       return run;
     }
-    const failureTransition = updateAutomationRunIfStatus(run.id, ['queued', 'running'], {
+    const failureTransition = await updateAutomationRunIfStatus(run.id, ['queued', 'running'], {
       status: cancelled ? 'cancelled' : 'failed',
       steps: stepRecords,
       error: errorMessage(error),
@@ -712,16 +712,16 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
     clearInterval(leaseHeartbeat);
     clearInterval(durableStatePoll);
     await browser?.close().catch(() => undefined);
-    releaseAutomationRunLease(run.id, owner, run.userId);
+    await releaseAutomationRunLease(run.id, owner, run.userId);
   }
 }
 
 /** Create a durable queued run and start its in-process worker immediately. */
-export function enqueueAutomationCaseRun(input: EnqueueAutomationCaseRunInput): AutomationRunRecord {
+export async function enqueueAutomationCaseRun(input: EnqueueAutomationCaseRunInput): Promise<AutomationRunRecord> {
   const normalizedUserId = userId(input.userId);
-  const automationCase = getAutomationCase(input.caseId, normalizedUserId);
+  const automationCase = await getAutomationCase(input.caseId, normalizedUserId);
   if (!automationCase) throw new Error('Automation case not found.');
-  const run = createAutomationRun({
+  const run = await createAutomationRun({
     userId: automationCase.userId,
     caseId: automationCase.id,
     scheduleId: input.scheduleId,
@@ -742,12 +742,12 @@ export type CancelAutomationRunResult = {
 };
 
 /** Persist cancellation first, then interrupt an in-process worker if this process owns it. */
-export function cancelAutomationRun(
+export async function cancelAutomationRun(
   runId: string,
   requestedUserId: string | number,
-): CancelAutomationRunResult | undefined {
+): Promise<CancelAutomationRunResult | undefined> {
   const normalizedUserId = userId(requestedUserId);
-  const transition = updateAutomationRunIfStatus(runId, ['queued', 'running'], {
+  const transition = await updateAutomationRunIfStatus(runId, ['queued', 'running'], {
     status: 'cancelled',
     error: 'Cancelled by the user.',
     finishedAt: now(),

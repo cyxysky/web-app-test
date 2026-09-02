@@ -1665,7 +1665,7 @@ class PresentationShape:
             'font_size', 'fontSize', 'min_font_size', 'minFontSize', 'font_name',
             'fontFamily', 'fontFace', 'color', 'fontColor', 'fontColour', 'bold',
             'fontWeight', 'italic', 'underline', 'strike', 'strikeout', 'align',
-            'textAlign', 'padding', 'margin', 'valign', 'verticalAlign', 'line_spacing',
+            'textAlign', 'padding', 'valign', 'verticalAlign', 'line_spacing',
             'lineSpacing', 'layout_role', 'layoutRole', 'allow_overlap', 'allowOverlap',
             'link',
         }
@@ -1787,9 +1787,14 @@ class PresentationSlide:
 
     def _id(self, value):
         child = str(value or '').strip().strip('/')
+        child = re.sub(r'[\s\x00-\x1f\x7f]+', '-', child).strip('-')
         if not child:
             raise ValueError('Slide child elementId must be non-empty.')
-        return f'{self.element_id}/{child}'
+        prefix = f'{self.element_id}/'
+        child = child[:max(0, 128 - len(prefix))].rstrip('-')
+        if not child:
+            raise ValueError('Slide child elementId is too long for its slide prefix.')
+        return f'{prefix}{child}'
 
     def slot(self, name='body'):
         key = str(name or 'body').strip().lower().replace('_', '-')
@@ -1994,9 +1999,14 @@ class PresentationSlide:
             self._id(element_id), self._page, self._box(slot, box), chart_type, categories, **options,
         )
 
-    def add_card(self, element_id, title, body='', slot=None, box=None, **options):
+    def add_card(self, element_id, title, body='', slot=None, box=None, fill=0xFFFFFF,
+                 line=None, accent=None, title_size=20, body_size=14,
+                 title_color=0x0F172A, body_color=0x334155, padding=None, gap=None):
         return self.deck.add_card(
-            self._id(element_id), self._page, self._box(slot, box), title, body, **options,
+            self._id(element_id), self._page, self._box(slot, box), title, body,
+            fill=fill, line=line, accent=accent, title_size=title_size,
+            body_size=body_size, title_color=title_color, body_color=body_color,
+            padding=padding, gap=gap,
         )
 
     def add_timeline(self, element_id, events, slot=None, box=None, colors=None,
@@ -2241,12 +2251,21 @@ class PresentationSlide:
         aliases = {
             'width': 'line_width', 'lineWidth': 'line_width',
             'startArrow': 'start_arrow', 'endArrow': 'end_arrow',
+            'startArrowWidth': 'start_arrow_width', 'endArrowWidth': 'end_arrow_width',
         }
         resolved_options = {
             aliases.get(key, key): value
             for key, value in options.items()
             if key != 'kind'
         }
+        for key in ('line_width', 'start_arrow_width', 'end_arrow_width'):
+            if key not in resolved_options or resolved_options[key] is None:
+                continue
+            numeric = float(resolved_options[key])
+            resolved_options[key] = self.deck.pt(numeric) if abs(numeric) <= 24 else int(numeric)
+        for key in ('start_arrow', 'end_arrow'):
+            if key in resolved_options and isinstance(resolved_options[key], str):
+                resolved_options[key] = resolved_options[key].strip().lower() not in {'', 'none', 'false', '0', 'no'}
         return self.deck.add_connector_between(
             self._id(element_id), self._page,
             resolved_box(source_box), resolved_box(target_box), **resolved_options,
@@ -2399,7 +2418,7 @@ class PresentationLayout:
             'fontSize': 'font_size', 'minFontSize': 'min_font_size',
             'fontFamily': 'font_name', 'fontFace': 'font_name',
             'fontColor': 'color', 'fontColour': 'color',
-            'margin': 'padding', 'verticalAlign': 'valign',
+            'verticalAlign': 'valign',
             'textAlign': 'align', 'lineSpacing': 'line_spacing',
             'backgroundColor': 'background', 'fillColor': 'fill',
             'borderColor': 'border', 'lineColor': 'line',
@@ -3358,6 +3377,7 @@ class PresentationLayout:
 
     def add_connector(self, element_id, page, x1, y1, x2, y2, color=0x64748B,
                       line_width=100, start_arrow=False, end_arrow=False,
+                      start_arrow_width=None, end_arrow_width=None,
                       layout_role='decoration', allow_overlap=True):
         """Add a stable straight connector without exposing raw ConnectorShape lifecycle.
 
@@ -3385,11 +3405,23 @@ class PresentationLayout:
         if start_arrow:
             try:
                 shape.LineStartName = 'Arrow'
+                shape.LineStartWidth = max(
+                    self.mm(1.6), min(self.mm(3.2), int(
+                        start_arrow_width if start_arrow_width is not None else max(1, int(line_width)) * 3
+                    ))
+                )
+                shape.LineStartCenter = False
             except Exception:
                 pass
         if end_arrow:
             try:
                 shape.LineEndName = 'Arrow'
+                shape.LineEndWidth = max(
+                    self.mm(1.6), min(self.mm(3.2), int(
+                        end_arrow_width if end_arrow_width is not None else max(1, int(line_width)) * 3
+                    ))
+                )
+                shape.LineEndCenter = False
             except Exception:
                 pass
         # ConnectorShape is the verified facade capability. Its serialized
@@ -3400,8 +3432,8 @@ class PresentationLayout:
 
     def add_connector_between(self, element_id, page, source_box, target_box, color=0x64748B,
                               line_width=100, start_arrow=False, end_arrow=True, axis='auto',
-                              source_inset=0, target_inset=0, layout_role='decoration',
-                              allow_overlap=True):
+                              source_inset=0, target_inset=0, start_arrow_width=None,
+                              end_arrow_width=None, layout_role='decoration', allow_overlap=True):
         """Connect two allocated layout boxes without hand-authored endpoint arithmetic."""
         source, target = self._rect(source_box), self._rect(target_box)
         source_center = (
@@ -3434,6 +3466,7 @@ class PresentationLayout:
         return self.add_connector(
             element_id, page, x1, y1, x2, y2, color=color, line_width=line_width,
             start_arrow=start_arrow, end_arrow=end_arrow,
+            start_arrow_width=start_arrow_width, end_arrow_width=end_arrow_width,
             layout_role=layout_role, allow_overlap=allow_overlap,
         )
 
@@ -3645,7 +3678,8 @@ class PresentationLayout:
                           series=None, colors=None, font_size=12, show_legend=False,
                           series_name='Values', color_points=False, title=None,
                           x_axis_title=None, y_axis_title=None, show_values=False,
-                          show_category_name=False, show_percent=False):
+                          show_category_name=False, show_percent=False,
+                          background=None, legend_position='right'):
         """Insert one native editable Impress chart with its own embedded data table."""
         area = self._rect(box)
         labels, series_names, rows = self._chart_series(
@@ -3668,11 +3702,32 @@ class PresentationLayout:
                     f'slideWidth={int(page_bounds["width"])}, slideHeight={int(page_bounds["height"])}'
                 ),
             })
+        is_circular = diagram_service.endswith(('PieDiagram', 'DonutDiagram'))
+        minimum_width = self.mm(120 if show_legend else 90)
+        minimum_height = self.mm(72 if (title or x_axis_title or y_axis_title) else 56)
+        if is_circular:
+            minimum_width = self.mm(125 if show_legend else 90)
+            minimum_height = self.mm(82 if (show_values or show_category_name or show_percent) else 65)
+        if area['width'] < minimum_width or area['height'] < minimum_height:
+            self.job.layout_issues.append({
+                'code': 'PRESENTATION_CHART_BOX_TOO_SMALL', 'severity': 'error',
+                'elementId': str(element_id), **self.job._source_location(),
+                'message': (
+                    f'Chart box {area["width"]}x{area["height"]} is too small for its title, axes, labels, and legend; '
+                    f'use at least {minimum_width}x{minimum_height} (1/100 mm), or remove nonessential chart text.'
+                ),
+            })
 
         chart = self._component.createInstance('com.sun.star.drawing.OLE2Shape')
         chart.CLSID = '12DCAE26-281F-416F-A234-C3086127382E'
         chart.Position, chart.Size = point(area['x'], area['y']), size(area['width'], area['height'])
         page.add(chart)
+        try:
+            chart.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'NONE')
+            chart.FillTransparence = 100
+            chart.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+        except Exception:
+            pass
         page_name = str(getattr(page, 'Name', '') or '')
         page_record = next((item for item in self.job.element_records.values() if item.get('artifactName') == page_name), None)
         page_index = int((page_record or {}).get('locator', {}).get('slide') or 1)
@@ -3728,23 +3783,50 @@ class PresentationLayout:
                     break
                 except Exception:
                     continue
+        def style_chart_surface(target):
+            try:
+                target.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+            except Exception:
+                pass
+            if background is None:
+                try:
+                    target.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'NONE')
+                except Exception:
+                    pass
+                try:
+                    target.FillTransparence = 100
+                except Exception:
+                    pass
+            else:
+                try:
+                    target.FillStyle = uno.Enum('com.sun.star.drawing.FillStyle', 'SOLID')
+                    target.FillColor = office_color(background, 'chart background')
+                    target.FillTransparence = 0
+                except Exception:
+                    pass
+
         try:
-            chart_document.Area.FillColor = 0xFFFFFF
-            chart_document.Area.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+            style_chart_surface(chart_document.Area)
         except Exception:
             pass
         if show_legend:
+            normalized_legend_position = str(legend_position or 'right').strip().upper()
+            if normalized_legend_position not in {'LEFT', 'RIGHT', 'TOP', 'BOTTOM'}:
+                raise ValueError("Presentation chart legend_position must be left, right, top, or bottom.")
             try:
-                chart_document.Legend.FillColor = 0xFFFFFF
-                chart_document.Legend.FillTransparence = 0
-                chart_document.Legend.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+                chart_document.Legend.Alignment = uno.Enum(
+                    'com.sun.star.chart.ChartLegendPosition', normalized_legend_position
+                )
+            except Exception:
+                pass
+            style_chart_surface(chart_document.Legend)
+            try:
+                chart_document.Legend.CharHeight = float(max(8, min(14, font_size)))
             except Exception:
                 pass
         try:
             wall = diagram.Wall
-            wall.FillColor = 0xFFFFFF
-            wall.FillTransparence = 0
-            wall.LineStyle = uno.Enum('com.sun.star.drawing.LineStyle', 'NONE')
+            style_chart_surface(wall)
         except Exception:
             pass
         caption = 0
@@ -3766,6 +3848,17 @@ class PresentationLayout:
             try:
                 axis = getattr(diagram, axis_getter)()
                 axis.CharHeight = float(font_size)
+            except Exception:
+                pass
+        for property_name, text_size in (
+            ('Title', max(10, float(font_size) + 2)),
+            ('XAxisTitle', max(9, float(font_size))),
+            ('YAxisTitle', max(9, float(font_size))),
+        ):
+            try:
+                text_target = getattr(chart_document, property_name)
+                if text_target is not None:
+                    text_target.CharHeight = float(text_size)
             except Exception:
                 pass
         series_palette = self._chart_palette(len(rows), colors)
@@ -3796,7 +3889,8 @@ class PresentationLayout:
                   percent=False, vertical=None, lines=True, symbols=True, dim3d=False,
                   color_by_point=None, series_name='Values', title=None,
                   x_axis_title=None, y_axis_title=None, show_values=None,
-                  show_category_name=None, show_percent=None):
+                  show_category_name=None, show_percent=None, background=None,
+                  legend_position='right'):
         """Add any chart family natively supported by LibreOffice's UNO chart module."""
         aliases = {
             'area': 'AreaDiagram',
@@ -3818,19 +3912,31 @@ class PresentationLayout:
         if show_legend is None:
             show_legend = series is not None or normalized in ('pie', 'donut', 'doughnut')
         color_points = normalized in ('pie', 'donut', 'doughnut') if color_by_point is None else bool(color_by_point)
-        if show_values is None:
-            show_values = normalized not in ('bubble', 'scatter', 'xy', 'stock')
-        if show_category_name is None:
-            show_category_name = normalized in ('pie', 'donut', 'doughnut')
         if show_percent is None:
             show_percent = bool(percent) or normalized in ('pie', 'donut', 'doughnut')
+        if show_values is None:
+            show_values = normalized not in ('bubble', 'scatter', 'xy', 'stock', 'pie', 'donut', 'doughnut')
+        if show_category_name is None:
+            show_category_name = normalized in ('pie', 'donut', 'doughnut') and not bool(show_legend)
+        if normalized in ('pie', 'donut', 'doughnut'):
+            crowded_labels = sum(bool(value) for value in (show_values, show_category_name, show_percent))
+            if crowded_labels > 1:
+                self.job.layout_issues.append({
+                    'code': 'PRESENTATION_CHART_LABEL_DENSITY', 'severity': 'error',
+                    'elementId': str(element_id), **self.job._source_location(),
+                    'message': (
+                        'Pie/donut labels request more than one of value, category name, and percent. '
+                        'Use a legend plus percent-only labels, or category labels without a legend; combined labels clip at chart edges.'
+                    ),
+                })
         chart = self._add_native_chart(
             element_id, page, box, f'com.sun.star.chart.{service_name}', categories,
             values=values, series=series, colors=colors, font_size=font_size,
             show_legend=show_legend, series_name=series_name, color_points=color_points,
             title=title, x_axis_title=x_axis_title, y_axis_title=y_axis_title,
             show_values=bool(show_values), show_category_name=bool(show_category_name),
-            show_percent=bool(show_percent),
+            show_percent=bool(show_percent), background=background,
+            legend_position=legend_position,
         )
         diagram = chart['diagram']
         for property_name, property_value in (
@@ -5069,11 +5175,60 @@ class SpreadsheetLayout:
 def validate_program(source: str):
     tree = ast.parse(source, filename='draft.py', mode='exec')
     entrypoints = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == 'create_document']
-    if len(entrypoints) != 1 or len(entrypoints[0].args.args) != 1:
+    if len(entrypoints) != 1 or len(entrypoints[0].args.args) != 1 or entrypoints[0].args.args[0].arg != 'job':
         raise ValueError('Draft must define exactly one synchronous create_document(job) function')
     if isinstance(entrypoints[0], ast.AsyncFunctionDef):
         raise ValueError('create_document(job) must be synchronous')
     diagnostics = []
+    entrypoint = entrypoints[0]
+    facade_vars = set()
+    for node in ast.walk(entrypoint):
+        value = node.value if isinstance(node, (ast.Assign, ast.AnnAssign)) else None
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, ast.AnnAssign) else []
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) \
+                and isinstance(value.func.value, ast.Name) and value.func.value.id == 'job' \
+                and value.func.attr in {'presentation', 'writer', 'spreadsheet'}:
+            facade_vars.update(target.id for target in targets if isinstance(target, ast.Name))
+    if not facade_vars:
+        diagnostics.append({
+            'code': 'PYTHON_DOCUMENT_FACADE_MISSING',
+            'line': entrypoint.lineno, 'column': entrypoint.col_offset + 1,
+            'message': 'create_document(job) must create the requested Office document with '
+                       'job.presentation(...), job.writer(...), or job.spreadsheet(...).',
+            'severity': 'error',
+        })
+    lifecycle_calls = [
+        (node.func.value.id, node.func.attr, node)
+        for node in ast.walk(entrypoint)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name) and node.func.value.id in facade_vars
+    ]
+    for facade_var in sorted(facade_vars):
+        save_calls = [node for receiver, method, node in lifecycle_calls if receiver == facade_var and method == 'save']
+        close_calls = [node for receiver, method, node in lifecycle_calls if receiver == facade_var and method == 'close']
+        if len(save_calls) != 1:
+            diagnostics.append({
+                'code': 'PYTHON_OUTPUT_SAVE_MISSING' if not save_calls else 'PYTHON_OUTPUT_SAVE_DUPLICATE',
+                'line': entrypoint.lineno, 'column': entrypoint.col_offset + 1,
+                'message': f'create_document(job) must call {facade_var}.save() exactly once; found {len(save_calls)}. '
+                           'Without save(), the requested Office output file is never created.',
+                'severity': 'error',
+            })
+        if len(close_calls) != 1:
+            diagnostics.append({
+                'code': 'PYTHON_OUTPUT_CLOSE_MISSING' if not close_calls else 'PYTHON_OUTPUT_CLOSE_DUPLICATE',
+                'line': entrypoint.lineno, 'column': entrypoint.col_offset + 1,
+                'message': f'create_document(job) must call {facade_var}.close() exactly once after save(); found {len(close_calls)}.',
+                'severity': 'error',
+            })
+        if len(save_calls) == 1 and len(close_calls) == 1 \
+                and (save_calls[0].lineno, save_calls[0].col_offset) >= (close_calls[0].lineno, close_calls[0].col_offset):
+            diagnostics.append({
+                'code': 'PYTHON_OUTPUT_LIFECYCLE_ORDER_INVALID',
+                'line': close_calls[0].lineno, 'column': close_calls[0].col_offset + 1,
+                'message': f'{facade_var}.save() must appear before {facade_var}.close() so the output is written before the component is closed.',
+                'severity': 'error',
+            })
     def visit_module_level(node):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             return
@@ -5306,6 +5461,15 @@ def facade_value_schemas(document_type):
     }
     if document_type == 'presentation':
         shared.update({
+            'canvas': {
+                'newDeckSizeInches': {'width': 13.333, 'height': 7.5},
+                'horizontalCenterInches': 6.6665,
+                'rules': [
+                    'Blank slides still use the full 13.333 x 7.5 inch wide-screen canvas; never author them against a 10 x 7.5 inch coordinate system.',
+                    "align='CENTER' centers text inside its box only and does not center the box on the slide.",
+                    'Prefer named slots or grid/stack without an explicit box. For freeform inch geometry, center with x = (13.333 - width) / 2 or derive the region from deck.bounds()/deck.content_box().',
+                ],
+            },
             'box': {
                 'defaultUnit': 'inches on slide.add_* methods',
                 'accepted': [
@@ -5411,7 +5575,7 @@ slide.add_text('row-1', 'Auto-height text', box={'x': 0.8, 'y': 1.6, 'w': 5.6},
             'textAndPanel': """slide.add_text(
     'insight', 'Revenue grew 18% year over year.', box=(0.8, 1.4, 5.4, 1.1),
     # This is the exact style vocabulary. Common guessed keys such as
-    # letter_spacing, tracking, margin, and autofit are not supported.
+    # letter_spacing, tracking, margin, autofit, and word_wrap are not supported.
     style={'font_size': 24, 'min_font_size': 18, 'bold': True,
            'color': '#0F172A', 'background': '#EFF6FF',
            'border': {'color': '#93C5FD', 'width': 1.25},
@@ -5731,14 +5895,16 @@ def office_facade_cookbook(document_type, query=''):
     """Return an exact, example-complete module from the model-facing facade."""
     shared_rules = [
         'Write exactly one synchronous create_document(job) function.',
+        'Create the Office facade inside create_document(job), keep all authored calls inside it, then call facade.save() exactly once followed by facade.close() exactly once.',
         'Use only the returned high-level facade and versioned feature recipes. Never import uno or access com.sun.star services.',
         'Every document, slide, paragraph, table, chart, image, sheet, range, and feature call has a stable elementId.',
         'When the plan names an exact presentation capability such as CaptionShape, MeasureShape, or ConnectorShape, use the matching presentation.shape example and confirm its exact generated featureCounts key is non-zero. A visually similar shape never satisfies a semantic capability requirement.',
         'CaptionShape and MeasureShape are authored as native UNO services by the facade. Because LibreOffice drops those two services during PPTX export, the facade also emits one named editable DrawingML fallback at the same geometry; do not create a second manual lookalike.',
         'elementId accepts 1-128 non-whitespace Unicode characters, including Chinese. Child IDs on slide and worksheet facades are parent-scoped, so helpers may reuse role IDs across different parents.',
         "Query unoApi one module at a time before using that module. Each module response contains every matching installed signature, accepted value schema, and copyable example; copy these patterns instead of guessing.",
-        "For presentation text, use only the exact style keys returned by presentation.text. letter_spacing/tracking/margin/autofit are deliberately unsupported; use padding, line_spacing, box geometry, or auto_height instead.",
+        "For presentation text, use only the exact style keys returned by presentation.text. letter_spacing/tracking/margin/autofit/word_wrap are deliberately unsupported; use padding, line_spacing, min_font_size, box geometry, or auto_height instead.",
         "Presentation slide.add_* explicit box values default to inches, accept w/h aliases, and may set unit='in'|'mm'|'cm'|'pt'|'hmm'. Layout slots are already normalized.",
+        "New presentation decks are always 13.333 x 7.5 inches with horizontal center x=6.6665. Never use a 10 x 7.5 inch canvas; align='CENTER' affects text inside a box, not the box position. Prefer named slots or derive freeform boxes from deck.bounds()/deck.content_box().",
         'Use facade layout, flow, A1-address, style, and feature parameters; the worker owns UNO units, structs, enums, controllers, and output filters.',
         "A support level of preserve-only means existing content is package-compared and must survive unchanged; it is not an authoring API. unsupported means fail explicitly rather than emulating with raw UNO.",
         'Call save() exactly once and close() exactly once. Failed validation keeps this same editable source and may be repaired with multiple independent atomic edits in one call.',
@@ -5749,11 +5915,11 @@ def office_facade_cookbook(document_type, query=''):
             {'id': 'presentation.slide@2', 'support': 'full', 'kind': 'core', 'keywords': ['slide', 'layout', 'slot', 'grid', 'stack', 'header', 'footer'], 'signature': "deck.slide(element_id, layout='title-content', title=None, title_style=None); slide.grid(columns,rows,slot='body',box=None,gap=0.24,...); slide.stack(count,slot='body',box=None,direction='vertical',gap=0.18,...); slide.add_header(element_id,left='',center='',right='',accent=None,...); slide.add_footer(element_id,left='',center='',right='',accent=None,...); layouts: blank, cover/title-cover, section/title-section, title-only, title-content, title-two-column/comparison, title-three-column/dashboard", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.existing-slide@1', 'support': 'full', 'kind': 'edit', 'keywords': ['select', 'remove', 'move', 'duplicate'], 'signature': "deck.select_slide(element_id, index=None, name=None, text=None); deck.remove_slide(index); deck.move_slide(from_index, to_index); deck.duplicate_slide(element_id, index)", 'validation': ['slide-count', 'preservation']},
             {'id': 'presentation.existing-shape@1', 'support': 'full', 'kind': 'edit', 'keywords': ['shape', 'replace', 'resize', 'z-order'], 'signature': "slide.select_shape(element_id, index=None, name=None, text=None) -> shape.set_text/replace_text/set_box/set_style/remove/bring_to_front/send_to_back; slide.replace_text(...) ", 'validation': ['bounds', 'overlap', 'content']},
-            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link', 'auto-height'], 'signature': "slide.add_text(element_id,text,slot=None,box=None,style=None,auto_height=False); omit box h/height or set auto_height=True to derive measured height; slide.add_rich_text(...); slide.add_bullets(...); exact style keys: font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation; unsupported: letter_spacing,tracking,margin,autofit", 'validation': ['bounds', 'overlap', 'text-fit']},
+            {'id': 'presentation.text@2', 'support': 'full', 'kind': 'core', 'keywords': ['text', 'rich-text', 'bullets', 'link', 'auto-height'], 'signature': "slide.add_text(element_id,text,slot=None,box=None,style=None,auto_height=False); omit box h/height or set auto_height=True to derive measured height; slide.add_rich_text(...); slide.add_bullets(...); exact style keys: font_size,min_font_size,bold,italic,underline,strike,color,font_name,align,valign,padding,line_spacing,background,border,link,rotation; unsupported: letter_spacing,tracking,margin,autofit,word_wrap", 'validation': ['bounds', 'overlap', 'text-fit']},
             {'id': 'presentation.image@2', 'support': 'full', 'kind': 'core', 'keywords': ['image', 'crop', 'rotate', 'contain', 'caption', 'alt', 'source'], 'signature': "slide.add_image(element_id, asset_name, slot=None, box=None, contain=True, padding=0, crop=None, rotation=0, transparency=0, alt_text=None, title=None, source=None); slide.add_captioned_image(element_id, asset_name, caption, source=None, alt_text=None, ..., caption_height=0.62)", 'validation': ['bounds', 'aspect-ratio', 'embedded-media', 'accessibility-metadata', 'visible-identification']},
-            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'caption', 'measure', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(element_id, source_box_or_child_id, target_box_or_child_id, ...); slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap', 'featureCounts']},
+            {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'caption', 'measure', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(element_id, source_box_or_child_id, target_box_or_child_id, end_arrow=True, start_arrow_width=None, end_arrow_width=None, ...); never emulate an arrowhead with a separate triangle because the triangle box touching a target does not place its apex on the connector endpoint; slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap', 'featureCounts']},
             {'id': 'presentation.table@1', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'editable'], 'signature': "slide.add_table(element_id, rows, slot=None, box=None, column_weights=None, header=True, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT'); col_widths is accepted as an alias for column_weights", 'validation': ['native-object', 'bounds', 'overlap']},
-            {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, **options); semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds']},
+            {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right', **options); background defaults transparent; pie/donut must not combine multiple label modes; semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds', 'reopen-size']},
             {'id': 'presentation.transition@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['transition', 'fade', 'wipe'], 'signature': "slide.set_transition(effect='fade', speed='medium')", 'validation': ['feature-count', 'reopen']},
             {'id': 'presentation.professional@1', 'support': 'partial', 'kind': 'native', 'keywords': ['animation', 'notes', 'comments', 'media', 'custom-show', 'master', 'field'], 'signature': "slide.set_notes(element_id,text); slide.add_comment(...); slide.add_media(...); slide.animate(shape,...); slide.apply_master(...); slide.add_field(...); deck.add_custom_show(name, slide_indices)", 'validation': ['notes', 'comments', 'media', 'animation', 'master-layout', 'fields']},
             {'id': 'presentation.timeline@2', 'support': 'full', 'kind': 'component', 'keywords': ['timeline', 'process'], 'signature': "slide.add_timeline(element_id, events, slot=None, box=None, colors=None, title_size=14, body_size=10, text_color=0x334155, max_items_per_row=6); dense timelines automatically wrap to multiple rows", 'validation': ['bounds', 'overlap']},
@@ -6154,13 +6320,13 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
             "deck.add_card(element_id, page, box, title, body='', fill=0xFFFFFF, line=None, accent=None, title_size=20, body_size=14, title_color=0x0F172A, body_color=0x334155, padding=None, gap=None)",
             "deck.add_footer(element_id, page, left='', center='', right='', height=None, background=None, accent=None, font_size=10, color=0x64748B, padding=None, left_url=None, center_url=None, right_url=None)",
             "deck.add_shape(element_id, page, x, y, width, height, shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure', fill=None, line=None, line_width=0, fill_transparency=0, layout_role='decoration', allow_overlap=True)",
-            "deck.add_connector(element_id, page, x1, y1, x2, y2, color=0x64748B, line_width=100, start_arrow=False, end_arrow=False, layout_role='decoration', allow_overlap=True)",
-            "deck.add_connector_between(element_id, page, source_box, target_box, color=0x64748B, line_width=100, start_arrow=False, end_arrow=True, axis='auto', source_inset=0, target_inset=0, layout_role='decoration', allow_overlap=True)",
+            "deck.add_connector(element_id, page, x1, y1, x2, y2, color=0x64748B, line_width=100, start_arrow=False, end_arrow=False, start_arrow_width=None, end_arrow_width=None, layout_role='decoration', allow_overlap=True)",
+            "deck.add_connector_between(element_id, page, source_box, target_box, color=0x64748B, line_width=100, start_arrow=False, end_arrow=True, axis='auto', source_inset=0, target_inset=0, start_arrow_width=None, end_arrow_width=None, layout_role='decoration', allow_overlap=True)",
             "deck.add_image(element_id, page, asset_name, x, y, width, height, layout_role='content', allow_overlap=False)",
             "deck.add_image_contain(element_id, page, asset_name, box, padding=0, layout_role='content', allow_overlap=False)",
             "deck.add_text_link(element_id, page, text, box, url=None, target_slide_id=None, font_size=18, color=0x2563EB, bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None, padding=0, valign='CENTER', layout_role='content', allow_overlap=False)",
             "deck.add_native_table(element_id, page, box, rows, column_weights=None, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT')",
-            "deck.add_chart(element_id, page, box, chart_type, categories, values=None, series=None, colors=None, font_size=12, show_legend=None, stacked=False, percent=False, vertical=None, lines=True, symbols=True, dim3d=False, color_by_point=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=None, show_category_name=None, show_percent=None); chart_type: area, bar, column, bubble, donut/doughnut, filled-radar, line, radar, pie, stock, xy/scatter",
+            "deck.add_chart(element_id, page, box, chart_type, categories, values=None, series=None, colors=None, font_size=12, show_legend=None, stacked=False, percent=False, vertical=None, lines=True, symbols=True, dim3d=False, color_by_point=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right'); transparent background is default; chart_type: area, bar, column, bubble, donut/doughnut, filled-radar, line, radar, pie, stock, xy/scatter",
             "deck.add_bar_chart(element_id, page, box, categories, values, colors=None, font_size=12, color=0x334155, baseline_color=0xCBD5E1, value_format='{value:g}', series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=True, show_legend=False)",
             "deck.add_line_chart(element_id, page, box, categories, values, color=0x2563EB, point_fill=0xFFFFFF, label_color=0x334155, font_size=12, value_format='{value:g}', series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=True, show_legend=False)",
             "deck.add_area_chart(element_id, page, box, categories, values=None, series=None, colors=None, font_size=10, show_legend=None, stacked=False, percent=False)",
@@ -6539,6 +6705,7 @@ def verify_and_preview(soffice, profile, output, preview, document_type, source=
             fidelity['package'] = package_fidelity
         image_verification = verify_embedded_images(component, document_type, element_map)
         text_verification = verify_presentation_text(component, element_map) if document_type == 'presentation' else None
+        chart_verification = verify_presentation_charts(component, element_map) if document_type == 'presentation' else None
         layout_verification = verify_presentation_layout(component, element_map) if document_type == 'presentation' else None
         spreadsheet_verification = verify_spreadsheet_content(component, element_map) if document_type == 'spreadsheet' else None
         word_layout_verification = verify_word_layout(component, element_map) if document_type == 'word' else None
@@ -6546,11 +6713,11 @@ def verify_and_preview(soffice, profile, output, preview, document_type, source=
         component.storeToURL(preview.as_uri(), (property_value('FilterName', PDF_FILTERS[document_type]), property_value('Overwrite', True)))
         if not preview.is_file() or preview.stat().st_size < 64:
             raise RuntimeError('LibreOffice could not export a PDF preview')
-        checks = [item for item in (image_verification, layout_verification, spreadsheet_verification, word_layout_verification) if item]
+        checks = [item for item in (image_verification, chart_verification, layout_verification, spreadsheet_verification, word_layout_verification) if item]
         issues = [issue for check in checks for issue in check.get('issues', [])]
         common = {'issues': issues, 'passed': not any(item.get('severity') == 'error' for item in issues)}
         if document_type == 'presentation':
-            return {**common, 'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification, 'layout': layout_verification, 'fidelity': fidelity}
+            return {**common, 'format': 'presentation', 'pages': component.DrawPages.Count, 'images': image_verification, 'text': text_verification, 'charts': chart_verification, 'layout': layout_verification, 'fidelity': fidelity}
         if document_type == 'spreadsheet':
             return {**common, 'format': 'spreadsheet', 'sheets': list(component.Sheets.getElementNames()), 'content': spreadsheet_verification, 'fidelity': fidelity}
         return {**common, 'format': 'word', 'textCharacters': len(str(component.Text.String or '')), 'images': image_verification, 'content': word_verification, 'fidelity': fidelity}
@@ -6630,6 +6797,79 @@ def verify_presentation_text(component, element_map=None):
     }
 
 
+def verify_presentation_charts(component, element_map=None):
+    """Reject native chart OLE objects that collapse or detach after PPTX reopen."""
+    issues, checked, seen_element_ids = [], 0, set()
+    expected_charts = [
+        entry for entry in (element_map or [])
+        if str(entry.get('kind') or '').strip().lower() == 'chart'
+    ]
+    element_lookup = {
+        (entry.get('locator', {}).get('slide'), entry.get('locator', {}).get('shape')): entry
+        for entry in (element_map or [])
+    }
+    element_by_artifact_name = {
+        str(entry.get('artifactName')): entry
+        for entry in (element_map or [])
+        if entry.get('artifactName')
+    }
+    for page_index in range(component.DrawPages.Count):
+        page = component.DrawPages.getByIndex(page_index)
+        for shape_index in range(page.getCount()):
+            shape = page.getByIndex(shape_index)
+            shape_name = str(getattr(shape, 'Name', '') or '')
+            mapped = element_by_artifact_name.get(shape_name) or element_lookup.get(
+                (page_index + 1, shape_index + 1), {}
+            )
+            if str(mapped.get('kind') or '').strip().lower() != 'chart':
+                continue
+            checked += 1
+            if mapped.get('elementId'):
+                seen_element_ids.add(str(mapped.get('elementId')))
+            try:
+                position, chart_size = shape.Position, shape.Size
+                width, height = int(chart_size.Width), int(chart_size.Height)
+            except Exception:
+                width = height = 0
+            problem = ''
+            if width <= 0 or height <= 0:
+                problem = f'native chart reopened with non-positive size {width}x{height}'
+            else:
+                try:
+                    chart_model = shape.Model
+                    if chart_model is None or getattr(chart_model, 'Diagram', None) is None:
+                        problem = 'native chart reopened without its embedded chart model or diagram'
+                except Exception:
+                    problem = 'native chart reopened without a readable embedded chart model'
+            if problem:
+                issues.append(map_issue({
+                    'severity': 'error', 'type': 'presentation_chart_degenerated',
+                    'description': (
+                        f'{problem}. The OLE2 chart did not survive the LibreOffice PPTX round trip; '
+                        'replace it with a stable facade chart configuration or a deliberate vector-chart component.'
+                    ),
+                }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
+    for expected in expected_charts:
+        element_id = str(expected.get('elementId') or '')
+        if element_id and element_id not in seen_element_ids:
+            issues.append({
+                'severity': 'error', 'type': 'presentation_chart_missing_after_reopen',
+                'elementId': element_id,
+                'line': expected.get('line'), 'column': expected.get('column'),
+                'locator': expected.get('locator'),
+                'description': (
+                    'Native chart is missing after the LibreOffice PPTX round trip. '
+                    'Replace the unstable OLE2 chart with a deliberate vector-chart component.'
+                ),
+            })
+    return {
+        'checked': checked,
+        'expected': len(expected_charts),
+        'issues': issues,
+        'passed': not any(issue.get('severity') == 'error' for issue in issues),
+    }
+
+
 def verify_presentation_layout(component, element_map=None):
     """Reject objective slide defects and non-intentional content collisions.
 
@@ -6640,7 +6880,7 @@ def verify_presentation_layout(component, element_map=None):
     ``layoutRole=content``. This keeps card/background underlays out of the
     collision graph without making text or image collisions invisible.
     """
-    issues, page_occupancy = [], []
+    issues, page_occupancy, ten_inch_canvas_pages = [], [], []
     checked_text_shapes = checked_content_shapes = 0
     element_lookup = {
         (entry.get('locator', {}).get('slide'), entry.get('locator', {}).get('shape')): entry
@@ -6675,7 +6915,7 @@ def verify_presentation_layout(component, element_map=None):
         if page.getCount() == 0:
             issues.append({'severity': 'error', 'type': 'empty_page', 'page': page_index + 1, 'description': 'Page has no shapes.'})
             continue
-        content_boxes = []
+        content_boxes, visible_boxes = [], []
         for shape_index in range(page.getCount()):
             shape = page.getByIndex(shape_index)
             position, shape_size = shape.Position, shape.Size
@@ -6715,6 +6955,17 @@ def verify_presentation_layout(component, element_map=None):
             default_role = 'decoration' if kind == 'shape' else 'content'
             role = str(explicit_role or default_role).strip().lower()
             allow_overlap = bool(layout.get('allowOverlap', locator.get('allowOverlap', False)))
+            if role != 'background' and width > 0 and height > 0:
+                visible_boxes.append({
+                    'shape': shape_index + 1,
+                    'elementId': mapped.get('elementId'),
+                    'kind': kind,
+                    'role': role,
+                    'x': x,
+                    'y': y,
+                    'width': width,
+                    'height': height,
+                })
             if role in {'background', 'container', 'decoration'} or allow_overlap:
                 continue
             if kind not in {'text', 'image', 'shape', 'chart', 'table', 'diagram', 'expert-element'}:
@@ -6733,6 +6984,21 @@ def verify_presentation_layout(component, element_map=None):
                     'description': f'{kind} content is outside slide bounds: x={x}, y={y}, width={width}, height={height}, slideWidth={page_width}, slideHeight={page_height}.',
                     'repairHint': 'Move or resize only the reported elementId so every edge remains inside deck.bounds().',
                 })
+        is_wide_screen = abs((page_width / max(1, page_height)) - (16.0 / 9.0)) <= 0.02
+        ten_inch_right_edge = int(round(10.05 * 2540))
+        centered_on_ten_inches = [
+            item for item in content_boxes
+            if item['width'] >= int(round(7.0 * 2540))
+            and abs((item['x'] + item['width'] / 2.0) - (5.0 * 2540)) <= int(round(0.15 * 2540))
+        ]
+        if (
+            is_wide_screen
+            and len(visible_boxes) >= 3
+            and max((item['x'] + item['width'] for item in visible_boxes), default=page_width) <= ten_inch_right_edge
+            and centered_on_ten_inches
+        ):
+            ten_inch_canvas_pages.append(page_index + 1)
+
         occupied_area = sum(max(0, item['width']) * max(0, item['height']) for item in content_boxes)
         occupancy = occupied_area / max(1, page_width * page_height)
         page_occupancy.append({'page': page_index + 1, 'contentBoxes': len(content_boxes), 'ratio': round(occupancy, 4)})
@@ -6771,6 +7037,25 @@ def verify_presentation_layout(component, element_map=None):
                         'If the overlap is deliberate, set allow_overlap=True on that authored element.'
                     ),
                 })
+    minimum_canvas_mismatch_pages = max(2, int(math.ceil(component.DrawPages.Count * 0.6)))
+    if len(ten_inch_canvas_pages) >= minimum_canvas_mismatch_pages:
+        page_list = ', '.join(str(page) for page in ten_inch_canvas_pages)
+        issues.append({
+            'severity': 'error',
+            'type': 'presentation_canvas_width_mismatch',
+            'page': ten_inch_canvas_pages[0],
+            'description': (
+                f'Slides {page_list} appear to be composed on a 10 x 7.5 inch coordinate system, '
+                'but this presentation uses a 13.333 x 7.5 inch wide-screen canvas. Their visible '
+                'content stops near x=10in and wide content is centered near x=5in, leaving a '
+                'systematic empty band on the right.'
+            ),
+            'repairHint': (
+                "Do not rely on align='CENTER' to position a box. Use named layout slots or "
+                'slide.grid/stack without an explicit box; otherwise derive freeform geometry from '
+                'deck.bounds()/deck.content_box() and center inch boxes with x = (13.333 - width) / 2.'
+            ),
+        })
     return {
         'checkedTextShapes': checked_text_shapes,
         'checkedContentShapes': checked_content_shapes,
@@ -7084,7 +7369,10 @@ def main():
                 'Creating a replacement document is not allowed for this plan.'
             )
         if not output.is_file() or output.stat().st_size < 64:
-            raise RuntimeError('create_document(job) did not create the requested output file')
+            raise RuntimeError(
+                'create_document(job) did not create the requested output file. '
+                'Ensure the facade returned by job.presentation/job.writer/job.spreadsheet calls save() exactly once before close().'
+            )
         emit_progress('reopen', 'Reopening the saved Office artifact for structural verification')
         source = (assets / args.required_source_asset).resolve() if args.required_source_asset else None
         try:

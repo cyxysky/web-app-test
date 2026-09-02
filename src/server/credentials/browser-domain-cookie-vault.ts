@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
-import { getSqliteDatabase } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabase } from '@/server/db/database';
 import { appDataRoot } from '@/server/storage/paths';
 
 export type BrowserDomainCookie = {
@@ -207,29 +207,29 @@ export function parseBrowserCookieHeader(value: string, domainValue: unknown): B
   return [...cookies.values()];
 }
 
-export function saveBrowserDomainCookie(userIdValue: unknown, domainValue: unknown, cookie: string) {
+export async function saveBrowserDomainCookie(userIdValue: unknown, domainValue: unknown, cookie: string) {
   const userId = normalizeApplicationUserId(userIdValue);
   const domain = normalizeBrowserCookieDomain(domainValue);
   const cookies = parseBrowserCookieHeader(cookie, domain);
   const timestamp = now();
-  getSqliteDatabase().prepare(`
+  await executeDatabase(`
     INSERT INTO browser_domain_cookie (
       user_id, domain, cookie_envelope, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(user_id, domain) DO UPDATE SET
       cookie_envelope = excluded.cookie_envelope,
       updated_at = excluded.updated_at
-  `).run(userId, domain, encryptCookie(cookie, userId, domain), timestamp, timestamp);
+  `, [userId, domain, encryptCookie(cookie, userId, domain), timestamp, timestamp]);
   return { cookieCount: cookies.length, domain, updatedAt: timestamp, userId };
 }
 
-export function readBrowserDomainCookies(userIdValue: unknown) {
+export async function readBrowserDomainCookies(userIdValue: unknown) {
   const userId = normalizeApplicationUserId(userIdValue);
-  const rows = getSqliteDatabase().prepare(`
+  const rows = await queryDatabase<CookieRow>(`
     SELECT user_id, domain, cookie_envelope, created_at, updated_at
     FROM browser_domain_cookie
     WHERE user_id = ?
     ORDER BY updated_at DESC
-  `).all(userId) as CookieRow[];
+  `, [userId]);
   return rows.flatMap((row) => parseBrowserCookieHeader(decryptCookie(row), row.domain));
 }

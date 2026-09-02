@@ -27,7 +27,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
     const userId = requestApplicationUserId(request);
-    if (!getBrowserChatSession(sessionId, userId)) {
+    if (!await getBrowserChatSession(sessionId, userId)) {
       throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     }
     return apiJson(request, { cases: listAutomationCases({ userId, sourceSessionId: sessionId }) });
@@ -45,8 +45,8 @@ export async function POST(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ sessionId, ...body }),
       scope: 'browser_chat.compile_automation_case',
       userId,
-    }, () => {
-      const session = getBrowserChatSession(sessionId, userId);
+    }, async () => {
+      const session = await getBrowserChatSession(sessionId, userId);
       if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
       const compiled = compileConversationMessagesCase({
         session,
@@ -55,13 +55,13 @@ export async function POST(request: NextRequest, context: RouteContext) {
         title: text(body.title ?? body.name) || undefined,
         description: text(body.description) || undefined,
       });
-      const automationCase = createAutomationCase(compiled);
+      const automationCase = await createAutomationCase(compiled);
       return apiJson(request, {
         ok: true,
         case: automationCase,
         automationCase,
         sourceMessageIds: body.messageIds,
-        cases: listAutomationCases({ userId, sourceSessionId: sessionId }),
+        cases: await listAutomationCases({ userId, sourceSessionId: sessionId }),
       }, { status: 201 });
     });
   } catch (error) {

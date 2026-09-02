@@ -17,9 +17,9 @@ export async function POST(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ caseId }),
       scope: 'automation_run.enqueue',
       userId,
-    }, () => apiJson(request, {
+    }, async () => apiJson(request, {
       ok: true,
-      run: enqueueAutomationCaseRun({ caseId, userId, trigger: 'manual' }),
+      run: await enqueueAutomationCaseRun({ caseId, userId, trigger: 'manual' }),
     }, { status: 202 }));
   } catch (error) {
     const message = error instanceof Error ? error.message : '';

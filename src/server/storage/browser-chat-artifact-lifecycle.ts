@@ -146,12 +146,13 @@ export async function maintainBrowserChatArtifacts(retainedSessionIds: Iterable<
   for (const sessionId of retained) await enforceBrowserChatArtifactQuota(sessionId);
 }
 
-export function scheduleBrowserChatArtifactMaintenance(retainedSessionIds: () => Iterable<string>) {
+export function scheduleBrowserChatArtifactMaintenance(retainedSessionIds: () => Promise<Iterable<string>>) {
   if (runtimeState.timer) return;
   const run = () => {
     if (runtimeState.running) return;
     runtimeState.running = Promise.resolve()
-      .then(() => maintainBrowserChatArtifacts(retainedSessionIds()))
+      .then(retainedSessionIds)
+      .then(maintainBrowserChatArtifacts)
       .catch((error) => structuredLog({ event: 'browser_chat.artifact_maintenance_failed', level: 'warn', error }))
       .finally(() => { runtimeState.running = undefined; });
   };

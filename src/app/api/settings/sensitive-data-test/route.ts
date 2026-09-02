@@ -15,7 +15,7 @@ export async function POST(request: NextRequest) {
       throw new ApiRequestError('请先输入管理员设置密码。', { code: 'admin_access_required', status: 401 });
     }
     const body = await parseJsonRequest(request, testRequestSchema, { maxBytes: 256 * 1024 });
-    store.applyRuntimeEnv();
+    await store.applyRuntimeEnv();
     const result = await redactSensitiveTexts([body.text], request.signal);
     return apiJson(request, {
       text: result.texts[0] || '',

@@ -10,7 +10,7 @@ export const revalidate = 0;
 export async function GET(request: NextRequest) {
   const parsedStatus = automationRunStatusSchema.safeParse(request.nextUrl.searchParams.get('status'));
   return apiJson(request, {
-    runs: listAutomationRuns({
+    runs: await listAutomationRuns({
       userId: requestApplicationUserId(request),
       caseId: request.nextUrl.searchParams.get('caseId')?.trim() || undefined,
       scheduleId: request.nextUrl.searchParams.get('scheduleId')?.trim() || undefined,

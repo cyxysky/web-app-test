@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { getSqliteDatabase, runSqliteTransaction } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabase, queryDatabaseOne, runDatabaseTransaction } from '@/server/db/database';
 import { ApiRequestError, apiJson } from './api-request';
 import { incrementMetric } from '@/server/observability/runtime-observability';
-import { queueSqliteWrite } from '@/server/storage/sqlite-write-queue';
+import { queueDatabaseWrite } from '@/server/storage/database-write-queue';
 
 type IdempotencyRow = {
   request_hash: string;
@@ -18,7 +18,7 @@ const cleanupState = ((globalThis as typeof globalThis & {
 function scheduleExpiredClaimCleanup(timestamp: string) {
   if (Date.now() - cleanupState.lastAt < 60 * 60 * 1000) return;
   cleanupState.lastAt = Date.now();
-  void queueSqliteWrite([{
+  void queueDatabaseWrite([{
     sql: 'DELETE FROM api_idempotency WHERE expires_at <= ?',
     params: [timestamp],
   }]).catch(() => {
@@ -57,22 +57,24 @@ export async function runIdempotentJson(
   }
   const timestamp = new Date();
   const expiresAt = new Date(timestamp.getTime() + idempotencyTtlMs()).toISOString();
-  const claim = runSqliteTransaction((database) => {
-    database.prepare(`
+  const claim = await runDatabaseTransaction(async (database) => {
+    await executeDatabase(`
       DELETE FROM api_idempotency
       WHERE user_id = ? AND scope = ? AND idempotency_key = ? AND expires_at <= ?
-    `).run(input.userId, input.scope, key, timestamp.toISOString());
-    const inserted = database.prepare(`
-      INSERT OR IGNORE INTO api_idempotency (
+    `, [input.userId, input.scope, key, timestamp.toISOString()], database);
+    const inserted = await queryDatabase<{ user_id: string }>(`
+      INSERT INTO api_idempotency (
         user_id, scope, idempotency_key, request_hash, state, expires_at, created_at, updated_at
       ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
-    `).run(input.userId, input.scope, key, input.fingerprint, expiresAt, timestamp.toISOString(), timestamp.toISOString());
-    if (Number(inserted.changes) > 0) return { owned: true as const };
-    const row = database.prepare(`
+      ON CONFLICT(user_id, scope, idempotency_key) DO NOTHING
+      RETURNING user_id
+    `, [input.userId, input.scope, key, input.fingerprint, expiresAt, timestamp.toISOString(), timestamp.toISOString()], database);
+    if (inserted.length) return { owned: true as const };
+    const row = await queryDatabaseOne<IdempotencyRow>(`
       SELECT request_hash, response_json, state, status_code
       FROM api_idempotency
       WHERE user_id = ? AND scope = ? AND idempotency_key = ?
-    `).get(input.userId, input.scope, key) as IdempotencyRow | undefined;
+    `, [input.userId, input.scope, key], database);
     return { owned: false as const, row };
   });
   if (!claim.owned) {
@@ -101,11 +103,11 @@ export async function runIdempotentJson(
     const response = await operation();
     if (response.ok && response.headers.get('content-type')?.includes('application/json')) {
       const responseJson = await response.clone().text();
-      getSqliteDatabase().prepare(`
+      await executeDatabase(`
         UPDATE api_idempotency
         SET state = 'completed', status_code = ?, response_json = ?, updated_at = ?
         WHERE user_id = ? AND scope = ? AND idempotency_key = ? AND request_hash = ?
-      `).run(
+      `, [
         response.status,
         responseJson,
         new Date().toISOString(),
@@ -113,18 +115,18 @@ export async function runIdempotentJson(
         input.scope,
         key,
         input.fingerprint,
-      );
+      ]);
     } else {
-      getSqliteDatabase().prepare(`
+      await executeDatabase(`
         DELETE FROM api_idempotency WHERE user_id = ? AND scope = ? AND idempotency_key = ?
-      `).run(input.userId, input.scope, key);
+      `, [input.userId, input.scope, key]);
     }
     scheduleExpiredClaimCleanup(timestamp.toISOString());
     return response;
   } catch (error) {
-    getSqliteDatabase().prepare(`
+    await executeDatabase(`
       DELETE FROM api_idempotency WHERE user_id = ? AND scope = ? AND idempotency_key = ?
-    `).run(input.userId, input.scope, key);
+    `, [input.userId, input.scope, key]);
     scheduleExpiredClaimCleanup(timestamp.toISOString());
     throw error;
   }

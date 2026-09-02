@@ -12,7 +12,7 @@ import {
 import { modelProviderDefinition } from '@/config/settings';
 import { modelCapabilities } from '@/lib/model-capabilities';
 import { enabledModelProviders } from '@/lib/model-selection';
-import { getSqliteDatabase } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabaseOne } from '@/server/db/database';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 import {
   resolveLibreOfficeExecutable,
@@ -51,9 +51,8 @@ function stateFromRow(row: OnboardingRow): WebPilotOnboardingState {
   };
 }
 
-function userHasExistingWork(userId: string) {
-  const database = getSqliteDatabase();
-  const row = database.prepare(`
+async function userHasExistingWork(userId: string) {
+  const row = await queryDatabaseOne<{ has_automation: boolean | number; has_messages: boolean | number }>(`
     SELECT
       EXISTS(
         SELECT 1 FROM browser_chat_message AS message
@@ -64,37 +63,36 @@ function userHasExistingWork(userId: string) {
       EXISTS(
         SELECT 1 FROM automation_case WHERE user_id = ? LIMIT 1
       ) AS has_automation
-  `).get(userId, userId) as { has_automation: number; has_messages: number };
-  return Boolean(row.has_messages || row.has_automation);
+  `, [userId, userId]);
+  return Boolean(row?.has_messages || row?.has_automation);
 }
 
-export function readOnboardingState(userId: string): WebPilotOnboardingState {
-  const database = getSqliteDatabase();
-  const existing = database.prepare(`
+export async function readOnboardingState(userId: string): Promise<WebPilotOnboardingState> {
+  const existing = await queryDatabaseOne<OnboardingRow>(`
     SELECT tutorial_version, status, completed_steps_json, dismissed_at, updated_at
     FROM user_onboarding_state
     WHERE user_id = ?
-  `).get(userId) as OnboardingRow | undefined;
+  `, [userId]);
   if (existing) {
     if (existing.tutorial_version === WEBPILOT_ONBOARDING_VERSION) return stateFromRow(existing);
     return writeOnboardingState(userId, { completedSteps: [], status: 'not_started' });
   }
 
   const timestamp = new Date().toISOString();
-  const legacyComplete = userHasExistingWork(userId);
+  const legacyComplete = await userHasExistingWork(userId);
   const completedSteps = legacyComplete ? [...webPilotOnboardingSteps] : [];
-  database.prepare(`
+  await executeDatabase(`
     INSERT INTO user_onboarding_state (
       user_id, tutorial_version, status, completed_steps_json, dismissed_at, created_at, updated_at
     ) VALUES (?, ?, ?, ?, NULL, ?, ?)
-  `).run(
+  `, [
     userId,
     WEBPILOT_ONBOARDING_VERSION,
     legacyComplete ? 'completed' : 'not_started',
     JSON.stringify(completedSteps),
     timestamp,
     timestamp,
-  );
+  ]);
   return {
     completedSteps,
     status: legacyComplete ? 'completed' as const : 'not_started' as const,
@@ -103,13 +101,13 @@ export function readOnboardingState(userId: string): WebPilotOnboardingState {
   };
 }
 
-function writeOnboardingState(userId: string, input: {
+async function writeOnboardingState(userId: string, input: {
   completedSteps: WebPilotOnboardingStep[];
   dismissedAt?: string;
   status: WebPilotOnboardingStatus;
-}): WebPilotOnboardingState {
+}): Promise<WebPilotOnboardingState> {
   const timestamp = new Date().toISOString();
-  getSqliteDatabase().prepare(`
+  await executeDatabase(`
     INSERT INTO user_onboarding_state (
       user_id, tutorial_version, status, completed_steps_json, dismissed_at, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -119,7 +117,7 @@ function writeOnboardingState(userId: string, input: {
       completed_steps_json = excluded.completed_steps_json,
       dismissed_at = excluded.dismissed_at,
       updated_at = excluded.updated_at
-  `).run(
+  `, [
     userId,
     WEBPILOT_ONBOARDING_VERSION,
     input.status,
@@ -127,15 +125,15 @@ function writeOnboardingState(userId: string, input: {
     input.dismissedAt || null,
     timestamp,
     timestamp,
-  );
+  ]);
   return readOnboardingState(userId);
 }
 
-export function updateOnboardingState(userId: string, input: {
+export async function updateOnboardingState(userId: string, input: {
   action: 'complete' | 'complete_step' | 'reset' | 'skip' | 'start';
   step?: WebPilotOnboardingStep;
 }) {
-  const current = readOnboardingState(userId);
+  const current = await readOnboardingState(userId);
   if (input.action === 'reset') return writeOnboardingState(userId, { completedSteps: [], status: 'not_started' });
   if (input.action === 'skip') return writeOnboardingState(userId, {
     completedSteps: current.completedSteps,
@@ -159,8 +157,8 @@ export function updateOnboardingState(userId: string, input: {
 }
 
 export async function readOnboardingReadiness(): Promise<WebPilotOnboardingReadiness> {
-  store.applyRuntimeEnv();
-  const modelState = readModelSettingsState();
+  await store.applyRuntimeEnv();
+  const modelState = await readModelSettingsState();
   const configuredProvider = modelState.config.provider;
   const provider = modelState.config.providers?.[configuredProvider]?.enabled
     ? configuredProvider

@@ -102,7 +102,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
 export async function GET(request: NextRequest) {
   try {
     requireAdmin(request);
-    return apiJson(request, readModelSettingsState());
+    return apiJson(request, await readModelSettingsState());
   } catch (error) {
     return apiError(request, error, { fallback: '读取模型配置失败' });
   }
@@ -117,7 +117,7 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'settings.model',
       userId,
-    }, () => {
+    }, async () => {
       const provider = normalizeProvider(body.provider);
       const providersInput = readProviderSettings(body.providers);
       if (!Object.keys(providersInput).length) {
@@ -136,9 +136,9 @@ export async function POST(request: NextRequest) {
           extraRequestParameters: normalizeExtraRequestParameters(body.extraRequestParameters),
         };
       }
-      store.saveModelConfig({ provider, providers: providersInput });
-      store.applyRuntimeEnv();
-      return apiJson(request, { ok: true, ...readModelSettingsState() });
+      await store.saveModelConfig({ provider, providers: providersInput });
+      await store.applyRuntimeEnv();
+      return apiJson(request, { ok: true, ...await readModelSettingsState() });
     });
   } catch (error) {
     return apiError(request, error, { fallback: '保存模型配置失败' });

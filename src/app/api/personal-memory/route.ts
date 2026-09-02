@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
   const includeDisabled = url.searchParams.get('includeDisabled') === 'true';
   const limit = boundedQueryInteger(url.searchParams.get('limit'), { fallback: 200, max: 500 });
   return apiJson(request, {
-    items: listPersonalMemoryItems({ userId, domain, includeDisabled, limit }),
+    items: await listPersonalMemoryItems({ userId, domain, includeDisabled, limit }),
     diagnostics: personalMemoryDiagnostics(),
   });
 }
@@ -36,8 +36,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'personal-memory.create',
       userId,
-    }, () => {
-      const item = savePersonalMemoryItem({ ...body, userId });
+    }, async () => {
+      const item = await savePersonalMemoryItem({ ...body, userId });
       return apiJson(request, { item });
     });
   } catch (error) {

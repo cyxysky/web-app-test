@@ -18,8 +18,8 @@ function requestUserId(request: Request) {
 export async function GET(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
-    selectBrowserChatSessionRuntime(sessionId, requestUserId(request));
-    const session = readBrowserChatSessionPage(sessionId, requestUserId(request));
+    await selectBrowserChatSessionRuntime(sessionId, requestUserId(request));
+    const session = await readBrowserChatSessionPage(sessionId, requestUserId(request));
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {
@@ -31,7 +31,7 @@ export async function PUT(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
     const body = await parseJsonRequest(request, updateBrowserChatSessionRequestSchema, { maxBytes: 16 * 1024 });
-    const session = updateBrowserChatSessionTitle(sessionId, body.title, requestUserId(request));
+    const session = await updateBrowserChatSessionTitle(sessionId, body.title, requestUserId(request));
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {

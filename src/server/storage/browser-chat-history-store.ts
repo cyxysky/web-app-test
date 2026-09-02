@@ -1,4 +1,4 @@
-import { getSqliteDatabase } from './sqlite-database';
+import { queryDatabase, queryDatabaseOne } from '@/server/db/database';
 
 export type BrowserChatHistoryKind = 'logs' | 'messages' | 'steps';
 
@@ -81,10 +81,10 @@ function jsonPage<T>(rows: JsonHistoryRow[], kind: BrowserChatHistoryKind, limit
   };
 }
 
-export function readBrowserChatMessagesPage<T>(
+export async function readBrowserChatMessagesPage<T>(
   sessionId: string,
   options: { cursor?: string; limit?: number } = {},
-): BrowserChatHistoryPage<T> {
+): Promise<BrowserChatHistoryPage<T>> {
   const limit = browserChatHistoryLimit(options.limit, BROWSER_CHAT_MESSAGE_PAGE_SIZE);
   const cursor = decodeBrowserChatHistoryCursor(options.cursor, 'messages');
   const params: Array<string | number> = [sessionId];
@@ -94,56 +94,58 @@ export function readBrowserChatMessagesPage<T>(
     params.push(cursor.value, cursor.value, cursor.id);
   }
   params.push(limit + 1);
-  const rows = getSqliteDatabase().prepare(`
+  const rows = await queryDatabase<JsonHistoryRow>(`
     SELECT id, time AS sort_value, record_json
     FROM browser_chat_message
     WHERE session_id = ? ${cursorWhere}
     ORDER BY time DESC, id DESC
     LIMIT ?
-  `).all(...params) as JsonHistoryRow[];
+  `, params);
   return jsonPage<T>(rows, 'messages', limit);
 }
 
-export function readBrowserChatMessageById<T>(sessionId: string, messageId: string) {
+export async function readBrowserChatMessageById<T>(sessionId: string, messageId: string) {
   const normalizedMessageId = messageId.trim();
   if (!normalizedMessageId) return undefined;
-  const row = getSqliteDatabase().prepare(`
+  const row = await queryDatabaseOne<{ record_json?: string }>(`
     SELECT record_json
     FROM browser_chat_message
     WHERE session_id = ? AND id = ?
-  `).get(sessionId, normalizedMessageId) as { record_json?: string } | undefined;
+  `, [sessionId, normalizedMessageId]);
   return row?.record_json ? parseJson<T>(row.record_json) : undefined;
 }
 
-export function readAllBrowserChatMessages<T>(sessionId: string) {
-  const rows = getSqliteDatabase().prepare(`
+export async function readAllBrowserChatMessages<T>(sessionId: string) {
+  const rows = await queryDatabase<{ record_json: string }>(`
     SELECT record_json
     FROM browser_chat_message
     WHERE session_id = ?
     ORDER BY time ASC, id ASC
-  `).all(sessionId) as Array<{ record_json: string }>;
+  `, [sessionId]);
   return rows
     .map((row) => parseJson<T>(row.record_json))
     .filter((item): item is T => item !== undefined);
 }
 
-export function readBrowserChatLatestActiveAssistantMessage<T>(sessionId: string) {
-  const row = getSqliteDatabase().prepare(`
+export async function readBrowserChatLatestActiveAssistantMessage<T>(sessionId: string) {
+  const rows = await queryDatabase<{ record_json: string }>(`
     SELECT record_json
     FROM browser_chat_message
     WHERE session_id = ?
-      AND json_extract(record_json, '$.role') = 'assistant'
-      AND json_extract(record_json, '$.status') IN ('running', 'blocked')
     ORDER BY time DESC, id DESC
-    LIMIT 1
-  `).get(sessionId) as { record_json?: string } | undefined;
-  return row?.record_json ? parseJson<T>(row.record_json) : undefined;
+    LIMIT 100
+  `, [sessionId]);
+  for (const row of rows) {
+    const message = parseJson<T & { role?: unknown; status?: unknown }>(row.record_json);
+    if (message?.role === 'assistant' && (message.status === 'running' || message.status === 'blocked')) return message;
+  }
+  return undefined;
 }
 
-export function readBrowserChatStepsPage<T>(
+export async function readBrowserChatStepsPage<T>(
   sessionId: string,
   options: { cursor?: string; limit?: number } = {},
-): BrowserChatHistoryPage<T> {
+): Promise<BrowserChatHistoryPage<T>> {
   const limit = browserChatHistoryLimit(options.limit, 120);
   const cursor = decodeBrowserChatHistoryCursor(options.cursor, 'steps');
   const params: Array<string | number> = [sessionId];
@@ -153,17 +155,17 @@ export function readBrowserChatStepsPage<T>(
     params.push(cursor.value);
   }
   params.push(limit + 1);
-  const rows = getSqliteDatabase().prepare(`
+  const rows = await queryDatabase<JsonHistoryRow>(`
     SELECT CAST(step_index AS TEXT) AS id, step_index AS sort_value, record_json
     FROM browser_chat_step
     WHERE session_id = ? ${cursorWhere}
     ORDER BY step_index DESC
     LIMIT ?
-  `).all(...params) as JsonHistoryRow[];
+  `, params);
   return jsonPage<T>(rows, 'steps', limit);
 }
 
-export function readBrowserChatStepsByIndexes<T>(sessionId: string, stepIndexes: readonly number[]) {
+export async function readBrowserChatStepsByIndexes<T>(sessionId: string, stepIndexes: readonly number[]) {
   const normalizedIndexes = Array.from(new Set(stepIndexes.filter((index) => (
     Number.isInteger(index) && index >= 0
   )))).sort((left, right) => left - right);
@@ -174,34 +176,34 @@ export function readBrowserChatStepsByIndexes<T>(sessionId: string, stepIndexes:
   for (let offset = 0; offset < normalizedIndexes.length; offset += chunkSize) {
     const chunk = normalizedIndexes.slice(offset, offset + chunkSize);
     const placeholders = chunk.map(() => '?').join(', ');
-    rows.push(...getSqliteDatabase().prepare(`
+    rows.push(...await queryDatabase<{ record_json: string }>(`
       SELECT record_json
       FROM browser_chat_step
       WHERE session_id = ? AND step_index IN (${placeholders})
       ORDER BY step_index ASC
-    `).all(sessionId, ...chunk) as Array<{ record_json: string }>);
+    `, [sessionId, ...chunk]));
   }
   return rows
     .map((row) => parseJson<T>(row.record_json))
     .filter((item): item is T => item !== undefined);
 }
 
-export function readAllBrowserChatSteps<T>(sessionId: string) {
-  const rows = getSqliteDatabase().prepare(`
+export async function readAllBrowserChatSteps<T>(sessionId: string) {
+  const rows = await queryDatabase<{ record_json: string }>(`
     SELECT record_json
     FROM browser_chat_step
     WHERE session_id = ?
     ORDER BY step_index ASC
-  `).all(sessionId) as Array<{ record_json: string }>;
+  `, [sessionId]);
   return rows
     .map((row) => parseJson<T>(row.record_json))
     .filter((item): item is T => item !== undefined);
 }
 
-export function readBrowserChatLogsPage<T>(
+export async function readBrowserChatLogsPage<T>(
   sessionId: string,
   options: { cursor?: string; limit?: number; messageId?: string } = {},
-): BrowserChatHistoryPage<T> {
+): Promise<BrowserChatHistoryPage<T>> {
   const limit = browserChatHistoryLimit(options.limit, 200);
   const cursor = decodeBrowserChatHistoryCursor(options.cursor, 'logs');
   const params: Array<string | number> = [sessionId];
@@ -216,30 +218,32 @@ export function readBrowserChatLogsPage<T>(
     params.push(cursor.value, cursor.value, cursor.id);
   }
   params.push(limit + 1);
-  const rows = getSqliteDatabase().prepare(`
+  const rows = await queryDatabase<JsonHistoryRow>(`
     SELECT id, time AS sort_value, record_json
     FROM browser_chat_log
     WHERE session_id = ? ${messageWhere} ${cursorWhere}
     ORDER BY time DESC, id DESC
     LIMIT ?
-  `).all(...params) as JsonHistoryRow[];
+  `, params);
   return jsonPage<T>(rows, 'logs', limit);
 }
 
-export function readBrowserChatSessionWindow<
+export async function readBrowserChatSessionWindow<
   TSession extends { logs?: unknown[]; messages?: unknown[]; steps?: unknown[] },
   TMessage,
   TStep,
   TLog,
 >(sessionId: string, options: { logLimit?: number; messageLimit?: number; stepLimit?: number } = {}) {
-  const row = getSqliteDatabase().prepare(`
+  const row = await queryDatabaseOne<{ snapshot_json?: string }>(`
     SELECT snapshot_json FROM browser_chat_session WHERE id = ?
-  `).get(sessionId) as { snapshot_json?: string } | undefined;
+  `, [sessionId]);
   const snapshot = row?.snapshot_json ? parseJson<TSession>(row.snapshot_json) : undefined;
   if (!snapshot) return undefined;
-  const messages = readBrowserChatMessagesPage<TMessage>(sessionId, { limit: options.messageLimit });
-  const steps = readBrowserChatStepsPage<TStep>(sessionId, { limit: options.stepLimit });
-  const logs = readBrowserChatLogsPage<TLog>(sessionId, { limit: options.logLimit });
+  const [messages, steps, logs] = await Promise.all([
+    readBrowserChatMessagesPage<TMessage>(sessionId, { limit: options.messageLimit }),
+    readBrowserChatStepsPage<TStep>(sessionId, { limit: options.stepLimit }),
+    readBrowserChatLogsPage<TLog>(sessionId, { limit: options.logLimit }),
+  ]);
   return {
     ...snapshot,
     messages: messages.items,
@@ -253,16 +257,16 @@ export function readBrowserChatSessionWindow<
   };
 }
 
-export function readBrowserChatSessionHeader<TSession>(sessionId: string) {
-  const row = getSqliteDatabase().prepare(`
+export async function readBrowserChatSessionHeader<TSession>(sessionId: string) {
+  const row = await queryDatabaseOne<{ snapshot_json?: string }>(`
     SELECT snapshot_json FROM browser_chat_session WHERE id = ?
-  `).get(sessionId) as { snapshot_json?: string } | undefined;
+  `, [sessionId]);
   return row?.snapshot_json ? parseJson<TSession>(row.snapshot_json) : undefined;
 }
 
-export function readBrowserChatSessionOwner(sessionId: string) {
-  const row = getSqliteDatabase().prepare(`
+export async function readBrowserChatSessionOwner(sessionId: string) {
+  const row = await queryDatabaseOne<{ user_id?: string | null }>(`
     SELECT user_id FROM browser_chat_session WHERE id = ?
-  `).get(sessionId) as { user_id?: string | null } | undefined;
+  `, [sessionId]);
   return row ? { userId: row.user_id || undefined } : undefined;
 }

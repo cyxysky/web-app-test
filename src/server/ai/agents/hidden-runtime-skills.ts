@@ -14,6 +14,11 @@ import {
   subagentRuntimeSkillId,
   subagentRuntimeSkillSummary,
 } from './subagent-runtime-skill';
+import {
+  chartRuntimeSkillContent,
+  chartRuntimeSkillId,
+  chartRuntimeSkillSummary,
+} from './chart-runtime-skill';
 
 type HiddenRuntimeSkillPolicy = {
   skillId: string;
@@ -39,6 +44,10 @@ export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSk
     skillId: fileArtifactRuntimeSkillId,
     requires: () => true,
   },
+  chart: {
+    skillId: chartRuntimeSkillId,
+    requires: () => true,
+  },
   subagent: {
     skillId: subagentRuntimeSkillId,
     requires: (input) => actionFromInput(input) === 'spawn',
@@ -58,6 +67,10 @@ const hiddenRuntimeSkills = Object.freeze({
     content: subagentRuntimeSkillContent,
     summary: subagentRuntimeSkillSummary,
   },
+  [chartRuntimeSkillId]: {
+    content: chartRuntimeSkillContent,
+    summary: chartRuntimeSkillSummary,
+  },
 });
 
 export function activeBrowserRuntimeSkillId() {
@@ -69,6 +82,7 @@ export function hiddenRuntimeSkillSummaries() {
     hiddenRuntimeSkills[browserCodeRuntimeSkillId].summary,
     hiddenRuntimeSkills[fileArtifactRuntimeSkillId].summary,
     hiddenRuntimeSkills[subagentRuntimeSkillId].summary,
+    hiddenRuntimeSkills[chartRuntimeSkillId].summary,
   ].join('\n');
 }
 

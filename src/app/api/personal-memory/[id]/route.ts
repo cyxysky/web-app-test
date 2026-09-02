@@ -33,10 +33,10 @@ export async function PATCH(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ id, ...body }),
       scope: 'personal_memory.update',
       userId,
-    }, () => {
-      const visibleItem = getPersonalMemoryItem(id, userId);
+    }, async () => {
+      const visibleItem = await getPersonalMemoryItem(id, userId);
       if (visibleItem && visibleItem.userId !== userId) throw new ApiRequestError('Only the memory creator can edit this shared memory', { code: 'forbidden', status: 403 });
-      const item = updatePersonalMemoryItem(id, body, userId);
+      const item = await updatePersonalMemoryItem(id, body, userId);
       if (!item) throw new ApiRequestError('Personal memory item not found', { code: 'not_found', status: 404 });
       return apiJson(request, { item });
     });
@@ -53,10 +53,10 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ id }),
       scope: 'personal_memory.delete',
       userId,
-    }, () => {
-      const visibleItem = getPersonalMemoryItem(id, userId);
+    }, async () => {
+      const visibleItem = await getPersonalMemoryItem(id, userId);
       if (visibleItem && visibleItem.userId !== userId) throw new ApiRequestError('Only the memory creator can delete this shared memory', { code: 'forbidden', status: 403 });
-      const deleted = deletePersonalMemoryItem(id, userId);
+      const deleted = await deletePersonalMemoryItem(id, userId);
       if (!deleted) throw new ApiRequestError('Personal memory item not found', { code: 'not_found', status: 404 });
       return apiJson(request, { ok: true, deleted });
     });

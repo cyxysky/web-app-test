@@ -1,4 +1,5 @@
 import { fileArtifactRuntimeSkillId } from './file-artifact-runtime-skill';
+import { chartRuntimeSkillId } from './chart-runtime-skill';
 import {
   activeBrowserRuntimeSkillId,
   hiddenRuntimeSkillSummaries,
@@ -25,6 +26,7 @@ export function browserCodeRules() {
     '- Every session Playwright Page exposes setTextSelection. For precise text editing in an input, textarea, or contenteditable, including frame locators, call await targetPage.setTextSelection(locator, selection) on the Page that owns the locator. Use { start: { afterText | beforeText | offset, occurrence? } } for a caret, { exactText, occurrence? } or { start, end } for a range, then use targetPage.keyboard.insertText()/press() in the same cell to insert, replace, delete, or extend the selection through the real keyboard. Verify the resulting value/text afterward.',
     '- DOM code belongs inside page.evaluate. The surrounding JavaScript module runs in an isolated Node process.',
     `- The first file or fileVisual call atomically loads hidden Skill ${fileArtifactRuntimeSkillId}, returns it in loadedRuntimeSkill, and continues the original call.`,
+    `- The first chart call atomically loads hidden Skill ${chartRuntimeSkillId}. Read the indexed ECharts catalog with chart action=api before action=create. After a successful create, copy its exact chartId as a standalone unwrapped line in the final reply where the chart belongs.`,
     '- file action=read preserves the original registered attachment and derives semantic text/Office structure plus visual pages on demand. On the first content read, omit pages; request later 1-based pages explicitly.',
     '- User attachments are already registered by attachmentId. For an upload-only request, do not call file and do not reconstruct bytes, base64, Blob, File, or Buffer. Place and verify the editor caret first when needed, then call attachmentVault.setInputFiles(exactFileInputLocator, attachmentId); direct Locator/Page.setInputFiles(), FileChooser.setFiles(), and local paths are forbidden. Verify exactly one attachment remains at the requested destination.',
     '- Do not import modules or access Node globals, local files, environment variables, cookies, browser storage, or raw credential values. When the prompt supplies a credential reference, use only await credentialVault.fill(locator, ref); never read the filled field value or write credentials/references to outputs or logs.',
@@ -50,6 +52,7 @@ export function browserChatCodeRules(screenshotAvailable = true) {
       : '- Image input is unavailable, but rect-derived coordinate targeting is supported. From exact current DOM/Playwright evidence, resolve one unique visible actionable Locator, call const rect = await locator.boundingBox(), require a non-null rect, and click a point inside it with page.mouse.click or tab.cua.click. The rect may be obtained and used in the same cell or returned and reused in a later cell while page geometry remains unchanged. Never guess x/y.',
     '- For tabs/windows, use context.pages() or the available browser.tabs/browser.user/tab.playwright/tab.cua APIs. browser.user.openTabs() exposes active and group metadata for continuation. When given a credential reference, use credentialVault.fill(locator, ref) only; never read or output credential values or references.',
     `- The first file or fileVisual call atomically loads hidden Skill ${fileArtifactRuntimeSkillId}, returns it in loadedRuntimeSkill, and continues the original call. Copy each Artifact downloadUrl exactly from a successful tool result; never construct or absolutize one from a hostname, sessionId, artifactId, or file name. browserCode may discover a direct remote asset URL, but it cannot download that asset into the file workspace; use file action=download for the URL.`,
+    `- The first chart call atomically loads hidden Skill ${chartRuntimeSkillId}. Read the indexed ECharts catalog with chart action=api before action=create. After a successful create, copy its exact chartId as a standalone unwrapped line in the final reply where the chart belongs.`,
   ];
 }
 

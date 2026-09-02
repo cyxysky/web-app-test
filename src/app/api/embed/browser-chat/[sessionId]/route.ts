@@ -1,10 +1,10 @@
 import { NextRequest } from 'next/server';
 import {
   closeBrowserChatSession,
-  getBrowserChatSession,
   releaseBrowserChatSessionRuntime,
   selectBrowserChatSessionRuntime,
 } from '@/server/ai/agents/browser-chat.service';
+import { readBrowserChatSessionPage } from '@/server/ai/agents/browser-chat-read.service';
 import {
   embedErrorJson,
   embedJson,
@@ -27,8 +27,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const auth = readEmbedAuth(request, sessionId);
-    selectBrowserChatSessionRuntime(sessionId, auth.userId);
-    const session = getBrowserChatSession(sessionId, auth.userId);
+    await selectBrowserChatSessionRuntime(sessionId, auth.userId);
+    const session = await readBrowserChatSessionPage(sessionId, auth.userId);
     if (!session) return embedJson({ error: 'Browser chat session not found' }, { status: 404 });
     return embedJson({ session });
   } catch (error) {

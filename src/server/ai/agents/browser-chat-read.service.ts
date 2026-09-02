@@ -9,7 +9,7 @@ import {
   type BrowserChatMessage,
   type BrowserChatSessionSnapshot,
 } from '@/server/ai/agents/browser-chat.service';
-// Session list/detail reads use SQLite projections rather than the in-memory
+// Session list/detail reads use database projections rather than the in-memory
 // service list, so reconcile persisted `running` flags with the live registry.
 import type { BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';
 import {
@@ -33,7 +33,7 @@ import {
 } from '@/server/storage/browser-chat-history-store';
 import { executeBrowserCodeRuntimeStateOperation } from '@/server/storage/browser-code-runtime-state';
 import { readBrowserChatDefectReports } from '@/server/storage/browser-chat-defect-store';
-import { readBrowserChatSessionSummaries } from '@/server/storage/sqlite-record-store';
+import { readBrowserChatSessionSummaries } from '@/server/storage/database-record-store';
 
 function belongsToUser(session: Pick<BrowserChatSessionSnapshot, 'userId'>, userId?: string | number) {
   return normalizeApplicationUserId(session.userId) === normalizeApplicationUserId(userId);
@@ -105,43 +105,43 @@ function resolvedContextUsage(
   };
 }
 
-export function listBrowserChatSessionSummaries(
+export async function listBrowserChatSessionSummaries(
   userId?: string | number,
   input: { beforeId?: string; beforeUpdatedAt?: string; limit?: number } = {},
 ) {
-  return readBrowserChatSessionSummaries<BrowserChatPersistedHeader>({
+  return (await readBrowserChatSessionSummaries<BrowserChatPersistedHeader>({
     ...input,
     hasMessagesOnly: true,
     userId: normalizeApplicationUserId(userId),
-  })
+  }))
     .filter((session) => session?.id && belongsToUser(session, userId))
     .map(recoverOrphanedBrowserChatSession)
     .map(compactSessionSummary);
 }
 
-export function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
-  const storedSession = readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
+export async function readBrowserChatSessionPage(sessionId: string, userId?: string | number) {
+  const storedSession = await readBrowserChatSessionHeader<BrowserChatPersistedHeader>(sessionId);
   const persistedSession = storedSession
     ? recoverOrphanedBrowserChatSession(storedSession) as BrowserChatPersistedHeader
     : undefined;
   if (!persistedSession || !belongsToUser(persistedSession, userId)) return undefined;
   const { modelContext: _modelContext, ...session } = persistedSession;
   void _modelContext;
-  let messages = readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+  let messages = await readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
     limit: BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   });
   const pendingMessage = session.pendingToolConfirmation?.messageId
-    ? readBrowserChatMessageById<BrowserChatMessage>(sessionId, session.pendingToolConfirmation.messageId)
+    ? await readBrowserChatMessageById<BrowserChatMessage>(sessionId, session.pendingToolConfirmation.messageId)
     : undefined;
   const persistedActiveMessage = session.busy || session.status === 'running'
     ? pendingMessage?.role === 'assistant'
       ? pendingMessage
-      : readBrowserChatLatestActiveAssistantMessage<BrowserChatMessage>(sessionId)
+      : await readBrowserChatLatestActiveAssistantMessage<BrowserChatMessage>(sessionId)
     : undefined;
   const activeMessage = persistedActiveMessage
     || activeBrowserChatAssistantMessage({ ...session, messages: messages.items });
   if (activeMessage && !messages.items.some((message) => message.id === activeMessage.id)) {
-    const latestMessages = readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+    const latestMessages = await readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
       limit: BROWSER_CHAT_MESSAGE_PAGE_SIZE - 1,
     });
     messages = {
@@ -151,11 +151,11 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
     };
   }
   const activeSteps = activeMessage
-    ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, activeMessage.stepIndexes || [])
+    ? (await readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, activeMessage.stepIndexes || []))
         .filter((step) => !step.messageId || step.messageId === activeMessage.id)
     : [];
   const activeLogs = activeMessage
-    ? readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { limit: 500, messageId: activeMessage.id }).items
+    ? (await readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { limit: 500, messageId: activeMessage.id })).items
     : [];
   const activeRecords = activeMessage
     ? browserChatClientRecordsForMessage(
@@ -181,20 +181,20 @@ export function readBrowserChatSessionPage(sessionId: string, userId?: string | 
   };
 }
 
-export function readBrowserChatRuntimeState(sessionId: string, userId?: string | number) {
-  const session = readBrowserChatSessionOwner(sessionId);
+export async function readBrowserChatRuntimeState(sessionId: string, userId?: string | number) {
+  const session = await readBrowserChatSessionOwner(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
-  const runtimeState = executeBrowserCodeRuntimeStateOperation(sessionId, {
+  const runtimeState = await executeBrowserCodeRuntimeStateOperation(sessionId, {
     action: 'list',
     input: {},
   });
   return {
     ...runtimeState,
-    defects: readBrowserChatDefectReports(sessionId),
+    defects: await readBrowserChatDefectReports(sessionId),
   };
 }
 
-export function readBrowserChatSessionHistoryPage(
+export async function readBrowserChatSessionHistoryPage(
   sessionId: string,
   userId: string | number | undefined,
   input: {
@@ -202,10 +202,10 @@ export function readBrowserChatSessionHistoryPage(
     messageLimit?: number;
   },
 ) {
-  const session = readBrowserChatSessionOwner(sessionId);
+  const session = await readBrowserChatSessionOwner(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
   const messages = input.messageCursor
-      ? readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
+      ? await readBrowserChatMessagesPage<BrowserChatMessage>(sessionId, {
         cursor: input.messageCursor,
         limit: Math.min(
           BROWSER_CHAT_MESSAGE_PAGE_SIZE,
@@ -223,12 +223,12 @@ export function readBrowserChatSessionHistoryPage(
   };
 }
 
-export function readBrowserChatSessionLogs(
+export async function readBrowserChatSessionLogs(
   sessionId: string,
   userId?: string | number,
   input: { cursor?: string; limit?: number; messageId?: string; subagentsOnly?: boolean } = {},
 ) {
-  const session = readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
+  const session = await readBrowserChatSessionHeader<BrowserChatSessionSnapshot>(sessionId);
   if (!session || !belongsToUser(session, userId)) return undefined;
   if (input.subagentsOnly) {
     return {
@@ -240,12 +240,12 @@ export function readBrowserChatSessionLogs(
     };
   }
   const messageId = input.messageId?.trim();
-  const page = readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { ...input, messageId });
+  const page = await readBrowserChatLogsPage<BrowserChatLogRecord>(sessionId, { ...input, messageId });
   const message = messageId && !input.cursor
-    ? readBrowserChatMessageById<BrowserChatMessage>(sessionId, messageId)
+    ? await readBrowserChatMessageById<BrowserChatMessage>(sessionId, messageId)
     : undefined;
   const steps = message
-    ? readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, message.stepIndexes || [])
+    ? (await readBrowserChatStepsByIndexes<StepExecutionResult>(sessionId, message.stepIndexes || []))
         .filter((step) => !step.messageId || step.messageId === messageId)
     : [];
   const records = messageId && !input.cursor

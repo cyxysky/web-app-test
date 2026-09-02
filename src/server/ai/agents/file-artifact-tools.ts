@@ -111,7 +111,7 @@ type GenerateUnoProgramInput = {
   runId?: string;
   documentId?: string;
   program?: string;
-  /** Required with baseDigest only for an intentional destructive replacement. */
+  /** Required with baseDigest for an intentional complete source replacement. */
   replaceExisting?: boolean;
   baseDigest?: string;
   render?: boolean;
@@ -631,7 +631,11 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
           : diagnostic.page ? `@page-${diagnostic.page}`
             : diagnostic.target ? `@${diagnostic.target}` : '';
         const identity = [diagnostic.severity, diagnostic.code].filter(Boolean).join(':') || 'issue';
-        const message = String(diagnostic.message || '')
+        const rawMessage = String(diagnostic.message || '');
+        const terminalMessage = diagnostic.code === 'UNO_RUNTIME_ERROR'
+          ? rawMessage.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) || rawMessage
+          : rawMessage;
+        const message = terminalMessage
           .replace(/Affected runtime elements.*$/i, '')
           .replace(/\s+/g, ' ').trim().slice(0, 260);
         const visibleElementIds = Array.from(elementIds).slice(0, 8);
@@ -645,7 +649,11 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
           : '';
         return `${identity}${location}${affected}${elements}${message ? `=${message}` : ''}${source}`;
       });
-  const error = String(payload.error || 'validation failed').replace(/\s+/g, ' ').trim().slice(0, 1_200);
+  const rawError = String(payload.error || 'validation failed');
+  const error = rawError.includes('__WEBPILOT_LAYOUT_DIAGNOSTICS__')
+    ? `${payload.diagnostics?.length || 0} structured layout diagnostics returned by validation.`
+    : (rawError.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) || rawError)
+      .replace(/\s+/g, ' ').trim().slice(0, 500);
   const repairHints = Array.isArray(payload.repairHints)
     ? payload.repairHints.slice(0, 6).map((hint) => String(hint).replace(/\s+/g, ' ').trim().slice(0, 360)).filter(Boolean)
     : [];
@@ -2124,8 +2132,16 @@ function parseCodexDraftPatch(patchText: string) {
       chunk.newLines.push(content);
     } else if (marker === '+') chunk.newLines.push(content);
     else if (marker === '-') chunk.oldLines.push(content);
-    else {
-      throw new Error(`Unexpected patch line ${index + 1}. Every update line must start with ' ', '+', or '-'.`);
+    else if (line.startsWith('*** ') || line.startsWith('@@')) {
+      throw new Error(`Unexpected patch control line ${index + 1}. Use one Codex-format Update File section with @@ hunks.`);
+    } else {
+      // Models occasionally omit the one-character context marker while
+      // preserving the exact source line. Inside a hunk, an otherwise bare
+      // non-control line is unambiguously unchanged context, so normalize it
+      // instead of failing the entire edit and encouraging a full rewrite.
+      chunk.contextLineIndices.push([chunk.oldLines.length, chunk.newLines.length]);
+      chunk.oldLines.push(line);
+      chunk.newLines.push(line);
     }
   }
   if (!updates.length) throw new Error("Patch requires at least one '*** Update File: draft.py' section.");
@@ -2255,7 +2271,7 @@ export function applyUnoDraftPatch(source: string, patchText: string) {
   }
   if (edited === normalized) throw new Error('Codex patch completed without changing draft.py.');
   if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
-    throw new Error('Near-complete source replacement through edit is blocked. Use action=generate to replace the complete draft intentionally.');
+    throw new Error('Near-complete source replacement through one edit is blocked. Keep the same draft and split the repair into focused Codex-format hunks based on the latest read.');
   }
   return edited;
 }
@@ -2273,6 +2289,61 @@ export type UnoDraftPatchResult = {
   ignoredHunks: number;
   totalHunks: number;
 };
+
+type ExecutableCodexDraftPatchChunk = {
+  chunk: CodexDraftPatchChunk;
+  hunk: number;
+};
+
+function recoverContextPairDraftPatchChunks(
+  source: string,
+  chunks: CodexDraftPatchChunk[],
+): ExecutableCodexDraftPatchChunk[] | undefined {
+  if (!chunks.length || chunks.length % 2 !== 0) return undefined;
+  const hasFinalNewline = source.endsWith('\n');
+  const sourceLines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
+  const recovered: ExecutableCodexDraftPatchChunk[] = [];
+  for (let index = 0; index < chunks.length; index += 2) {
+    const before = chunks[index];
+    const after = chunks[index + 1];
+    if (codexDraftPatchChunkHasChange(before) || codexDraftPatchChunkHasChange(after)) return undefined;
+    if (!before.oldLines.length || !after.oldLines.length) return undefined;
+    if (
+      before.oldLines.length === after.oldLines.length
+      && before.oldLines.every((line, lineIndex) => line === after.oldLines[lineIndex])
+    ) return undefined;
+    let searchStart = 0;
+    if (before.changeContext !== undefined) {
+      const contextIndex = seekCodexPatchSequence(sourceLines, [before.changeContext], 0, false);
+      if (contextIndex === undefined) return undefined;
+      searchStart = contextIndex + 1;
+    }
+    const beforeExists = seekCodexPatchSequence(
+      sourceLines,
+      before.oldLines,
+      searchStart,
+      before.isEndOfFile,
+    ) !== undefined;
+    const afterExists = seekCodexPatchSequence(
+      sourceLines,
+      after.oldLines,
+      searchStart,
+      after.isEndOfFile,
+    ) !== undefined;
+    if (!beforeExists && !afterExists) return undefined;
+    recovered.push({
+      chunk: {
+        changeContext: before.changeContext,
+        contextLineIndices: [],
+        isEndOfFile: before.isEndOfFile || after.isEndOfFile,
+        oldLines: [...before.oldLines],
+        newLines: [...after.oldLines],
+      },
+      hunk: index + 1,
+    });
+  }
+  return recovered;
+}
 
 function codexDraftPatchChunkAlreadyApplied(source: string, chunk: CodexDraftPatchChunk) {
   const hasFinalNewline = source.endsWith('\n');
@@ -2306,14 +2377,24 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
   let changedLineCount = 0;
   let appliedHunks = 0;
   let alreadyAppliedHunks = 0;
-  let ignoredHunks = 0;
   const failedHunks: UnoDraftPatchHunkFailure[] = [];
-  const chunks = parseCodexDraftPatch(patchText).flat();
-  chunks.forEach((chunk, index) => {
-    if (!codexDraftPatchChunkHasChange(chunk)) {
-      ignoredHunks += 1;
-      return;
-    }
+  const parsedChunks = parseCodexDraftPatch(patchText).flat();
+  const changedChunks = parsedChunks
+    .map((chunk, index) => ({ chunk, hunk: index + 1 }))
+    .filter(({ chunk }) => codexDraftPatchChunkHasChange(chunk));
+  const recoveredContextPairs = changedChunks.length
+    ? undefined
+    : recoverContextPairDraftPatchChunks(normalized, parsedChunks);
+  if (!changedChunks.length && !recoveredContextPairs) {
+    throw new Error(
+      'Patch contains only matching context and no unambiguous source change. '
+      + "Use '-old' plus '+new' for replacement, '+new' for insertion, or '-old' for deletion; "
+      + 'the editor also accepts consecutive context-only @@ blocks when they form complete old/new pairs.',
+    );
+  }
+  const executableChunks = recoveredContextPairs || changedChunks;
+  const ignoredHunks = recoveredContextPairs ? 0 : parsedChunks.length - executableChunks.length;
+  executableChunks.forEach(({ chunk, hunk }) => {
     try {
       const update = applyCodexDraftPatchUpdate(edited, [chunk]);
       if (update.source === edited) throw new Error('Hunk completed without changing draft.py.');
@@ -2326,7 +2407,7 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
         return;
       }
       failedHunks.push({
-        hunk: index + 1,
+        hunk,
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -2336,7 +2417,7 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
     throw new Error(detail || 'Codex patch completed without changing draft.py.');
   }
   if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
-    throw new Error('Near-complete source replacement through edit is blocked. Use action=generate to replace the complete draft intentionally.');
+    throw new Error('Near-complete source replacement through one edit is blocked. Keep the same draft and split the repair into focused Codex-format hunks based on the latest read.');
   }
   return {
     source: edited,
@@ -2344,7 +2425,7 @@ export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoD
     alreadyAppliedHunks,
     failedHunks,
     ignoredHunks,
-    totalHunks: chunks.length,
+    totalHunks: parsedChunks.length,
   };
 }
 
@@ -2523,6 +2604,9 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
       draft.unoApiCatalogLoadedAt ||= new Date().toISOString();
       await saveDraft(input.runId, draft);
     }
+    const catalogForModel = normalizedQuery && catalog.queryMatched === true
+      ? Object.fromEntries(Object.entries(catalog).filter(([key]) => key !== 'moduleIndex' && key !== 'rules'))
+      : catalog;
     return {
       ok: true,
       actual: JSON.stringify({
@@ -2534,7 +2618,7 @@ export async function getUnoApi(input: UnoApiInput): Promise<BrowserActionResult
         alreadyLoaded,
         boundToPlannedDraft: Boolean(draft),
         nextAction: draft ? undefined : 'plan',
-        ...catalog,
+        ...catalogForModel,
       }),
     };
   } catch (error) {
@@ -3720,7 +3804,7 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
           sourceDigest: existingDigest,
           patchBaseDigest: existingDigest,
           requiredNextAction: 'edit',
-          error: `action=generate is initial-source creation only once a draft source exists${drasticShrink || removesEntrypoint ? ' and this request would also discard most of that source or its create_document entrypoint' : ''}. Use action=edit for every repair. For an intentional full replacement only, read the current draft and call generate with replaceExisting=true and its exact patchBaseDigest as baseDigest.`,
+          error: `action=generate found an existing working source${drasticShrink || removesEntrypoint ? ' and this replacement would discard most of it or its create_document entrypoint' : ''}. Existing drafts must be repaired with action=edit. Read the current source and patchBaseDigest, then submit a focused Codex-format patch; formatting or context failures must also be retried as edit.`,
         }),
       };
     }
@@ -3733,9 +3817,8 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     delete draft.rendererValidation;
     invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
-    // A documentId owns exactly one editable source buffer. Calling generate
-    // for that id atomically replaces its current source, regardless of the
-    // previous validation state.
+    // A documentId owns exactly one editable source buffer. An explicitly
+    // authorized generate atomically replaces that same buffer.
     return validateDraft({ ...input, draft, documentChanged: true });
   } catch (error) {
     return { ok: false, actual: `Office source generation failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -3749,7 +3832,7 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     if (typeof input.program === 'string' && input.program.trim()) {
       return {
         ok: false,
-        actual: 'file action=edit does not accept a complete source replacement. Read the current source and submit one Codex-format patch in patch; use action=generate only for an intentional complete replacement.',
+        actual: 'file action=edit requires a Codex-format patch rather than a complete program. Read the current source and patchBaseDigest, then submit or correct the focused patch; do not switch to generate for an edit or validation failure.',
       };
     }
     const persistedDraft = await loadDraft(input.runId, documentId);

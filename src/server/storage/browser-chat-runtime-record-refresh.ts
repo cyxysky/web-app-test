@@ -2,13 +2,13 @@ import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { publishRealtimeRefreshEvent } from '@/server/realtime/ws-refresh';
 import { readBrowserChatSessionOwner } from './browser-chat-history-store';
 
-export function publishBrowserChatRuntimeRecordsChanged(
+export async function publishBrowserChatRuntimeRecordsChanged(
   sessionId: string,
   kind: 'defects' | 'variables',
 ) {
-  const owner = readBrowserChatSessionOwner(sessionId);
+  const owner = await readBrowserChatSessionOwner(sessionId);
   if (!owner) return;
-  void publishRealtimeRefreshEvent({
+  await publishRealtimeRefreshEvent({
     entityType: 'browserChatSession',
     id: sessionId,
     userId: normalizeApplicationUserId(owner.userId),

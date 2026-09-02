@@ -46,8 +46,8 @@ function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSe
   return result;
 }
 
-export function readRuntimeSettingsItems() {
-  const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
+export async function readRuntimeSettingsItems() {
+  const savedByKey = new Map((await store.listRuntimeEnv()).map((item) => [item.key, item]));
   return runtimeEnvDefinitions.map((definition) => {
     const saved = savedByKey.get(definition.key);
     const secret = saved?.secret ?? Boolean(definition.secret);
@@ -66,8 +66,8 @@ export function readRuntimeSettingsItems() {
   });
 }
 
-export function readModelSettingsState() {
-  const saved = store.getModelConfig();
+export async function readModelSettingsState() {
+  const saved = await store.getModelConfig();
   const providers = completeProviders(saved?.providers);
   for (const provider of Object.keys(providers) as ModelProvider[]) {
     const current = providers[provider];
@@ -88,9 +88,9 @@ export function readModelSettingsState() {
   };
 }
 
-export function readEnvironmentSettingsSnapshot() {
+export async function readEnvironmentSettingsSnapshot() {
   return {
-    envItems: readRuntimeSettingsItems(),
-    modelConfig: readModelSettingsState().config,
+    envItems: await readRuntimeSettingsItems(),
+    modelConfig: (await readModelSettingsState()).config,
   };
 }

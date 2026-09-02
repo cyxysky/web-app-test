@@ -36,7 +36,7 @@ function requireAdmin(request: NextRequest) {
 export async function GET(request: NextRequest) {
   try {
     requireAdmin(request);
-    return apiJson(request, { cases: store.listSensitiveDataEvaluationCases() });
+    return apiJson(request, { cases: await store.listSensitiveDataEvaluationCases() });
   } catch (error) {
     return apiError(request, error, { fallback: '读取脱敏评测集失败' });
   }
@@ -46,7 +46,7 @@ export async function PUT(request: NextRequest) {
   try {
     requireAdmin(request);
     const body = await parseJsonRequest(request, evaluationRequestSchema, { maxBytes: 4 * 1024 * 1024 });
-    const cases = store.saveSensitiveDataEvaluationCases(normalizeSensitiveDataEvaluationCases(body.cases));
+    const cases = await store.saveSensitiveDataEvaluationCases(normalizeSensitiveDataEvaluationCases(body.cases));
     return apiJson(request, { ok: true, cases });
   } catch (error) {
     return apiError(request, error, { fallback: '保存脱敏评测集失败' });
@@ -62,7 +62,7 @@ export async function POST(request: NextRequest) {
       throw new ApiRequestError('请至少添加一个有效评测用例。', { code: 'evaluation_set_empty', status: 400 });
     }
 
-    store.applyRuntimeEnv();
+    await store.applyRuntimeEnv();
     const redaction = await redactSensitiveTexts(cases.map((item) => item.text), request.signal);
     let truePositiveCount = 0;
     let falsePositiveCount = 0;

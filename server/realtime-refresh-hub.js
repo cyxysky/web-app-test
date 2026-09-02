@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const { createHash } = require('node:crypto');
 const path = require('node:path');
-const { DatabaseSync } = require('node:sqlite');
+const { DataSource } = require('typeorm');
 
 const REFRESH_SERVICE_NAME = 'webpilot-refresh-websocket';
 const REFRESH_SERVICE_HEADER = 'x-webpilot-refresh-service';
@@ -93,6 +93,7 @@ function parseRefreshEvent(value) {
 function createRealtimeRefreshHub(options) {
   const clients = new Set();
   let database;
+  let databaseInitialization;
   const pending = [];
   const databasePath = path.join(
     path.resolve(process.env.APP_DATA_DIR || path.join(options.appDir, 'runtime')),
@@ -100,11 +101,37 @@ function createRealtimeRefreshHub(options) {
     'webpilot.db',
   );
 
-  const databaseConnection = () => {
-    if (database) return database;
-    database = new DatabaseSync(databasePath);
-    database.exec('PRAGMA busy_timeout = 5000');
-    return database;
+  const databaseConnection = async () => {
+    if (database?.isInitialized) return database;
+    if (databaseInitialization) return databaseInitialization;
+    const usePostgres = ['postgres', 'postgresql', 'pg'].includes(String(process.env.DATABASE_DRIVER || '').toLowerCase())
+      || (!process.env.DATABASE_DRIVER && /^postgres(?:ql)?:\/\//i.test(String(process.env.DATABASE_URL || '')));
+    if (usePostgres && !String(process.env.DATABASE_URL || '').trim()) {
+      throw new Error('DATABASE_URL is required when DATABASE_DRIVER=postgres.');
+    }
+    database = new DataSource(usePostgres ? {
+      type: 'postgres',
+      url: process.env.DATABASE_URL,
+      poolSize: Math.max(1, Math.min(100, Number(process.env.DATABASE_POOL_SIZE) || 10)),
+      ssl: /^(?:1|true|yes|on|require)$/i.test(String(process.env.DATABASE_SSL || ''))
+        ? { rejectUnauthorized: !/^(?:0|false|no|off)$/i.test(String(process.env.DATABASE_SSL_REJECT_UNAUTHORIZED || 'true')) }
+        : false,
+    } : {
+      type: 'better-sqlite3',
+      database: process.env.SQLITE_DATABASE_PATH || databasePath,
+      timeout: Math.max(1_000, Number(process.env.DATABASE_BUSY_TIMEOUT_MS) || 5_000),
+      enableWAL: true,
+    });
+    const candidate = database;
+    databaseInitialization = candidate.initialize()
+      .catch((error) => {
+        if (database === candidate) database = undefined;
+        throw error;
+      })
+      .finally(() => {
+        databaseInitialization = undefined;
+      });
+    return databaseInitialization;
   };
 
   const removeClient = (client) => {
@@ -145,16 +172,21 @@ function createRealtimeRefreshHub(options) {
     flushPending();
   };
 
-  const consumeTicket = (ticket, origin) => {
+  const consumeTicket = async (ticket, origin) => {
     if (!ticket) return undefined;
-    const connection = databaseConnection();
+    const connection = await databaseConnection();
     const tokenHash = createHash('sha256').update(ticket, 'utf8').digest('hex');
-    connection.exec('BEGIN IMMEDIATE');
-    try {
-      const row = connection.prepare(`
+    return connection.transaction(async (manager) => {
+      const postgres = connection.options.type === 'postgres';
+      const sql = (value) => {
+        let index = 0;
+        return postgres ? value.replace(/\?/g, () => `$${++index}`) : value;
+      };
+      const rows = await manager.query(sql(`
         SELECT id, user_id, scope, origin, expires_at, consumed_at
         FROM websocket_ticket WHERE token_hash = ?
-      `).get(tokenHash);
+      `), [tokenHash]);
+      const row = rows[0];
       const current = new Date().toISOString();
       if (
         !row
@@ -163,25 +195,21 @@ function createRealtimeRefreshHub(options) {
         || row.scope !== 'realtime-refresh'
         || (row.origin && row.origin !== normalizedOrigin(origin))
       ) {
-        connection.exec('ROLLBACK');
         return undefined;
       }
-      const updated = connection.prepare(`
+      const updated = await manager.query(sql(`
         UPDATE websocket_ticket SET consumed_at = ?
         WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
-      `).run(current, row.id, current);
-      connection.exec('COMMIT');
-      return Number(updated.changes || 0) === 1 ? { userId: row.user_id } : undefined;
-    } catch (error) {
-      connection.exec('ROLLBACK');
-      throw error;
-    }
+        RETURNING id
+      `), [current, row.id, current]);
+      return updated.length === 1 ? { userId: row.user_id } : undefined;
+    });
   };
 
-  const acceptUpgrade = (request, socket, requestUrl) => {
+  const acceptUpgrade = async (request, socket, requestUrl) => {
     let auth;
     try {
-      auth = consumeTicket(requestUrl.searchParams.get('ticket') || '', request.headers.origin);
+      auth = await consumeTicket(requestUrl.searchParams.get('ticket') || '', request.headers.origin);
     } catch {
       socket.destroy();
       return;
@@ -265,12 +293,16 @@ function createRealtimeRefreshHub(options) {
 
   return {
     acceptUpgrade,
-    close() {
+    async close() {
       clearInterval(heartbeat);
       for (const client of clients) client.socket.destroy();
       clients.clear();
-      database?.close();
+      const activeDatabase = databaseInitialization
+        ? await databaseInitialization.catch(() => undefined)
+        : database;
+      if (activeDatabase?.isInitialized) await activeDatabase.destroy();
       database = undefined;
+      databaseInitialization = undefined;
     },
     handlePublish,
   };

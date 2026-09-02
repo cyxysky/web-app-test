@@ -12,7 +12,7 @@ type RouteContext = {
 export async function DELETE(request: Request, context: RouteContext) {
   const { messageId, sessionId } = await context.params;
   try {
-    const session = deleteQueuedBrowserChatMessage(
+    const session = await deleteQueuedBrowserChatMessage(
       sessionId,
       messageId,
       requestApplicationUserId(request),

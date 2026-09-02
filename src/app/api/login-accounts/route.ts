@@ -30,7 +30,7 @@ function accountError(error: unknown) {
 export async function GET(request: NextRequest) {
   try {
     return apiJson(request, {
-      accounts: listLoginAccounts({
+      accounts: await listLoginAccounts({
         userId: requestApplicationUserId(request),
         domain: request.nextUrl.searchParams.get('domain') || '',
       }),
@@ -48,8 +48,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'login_account.create',
       userId,
-    }, () => {
-      const account = createLoginAccount({ userId, ...body });
+    }, async () => {
+      const account = await createLoginAccount({ userId, ...body });
       return apiJson(request, { account }, { status: 201 });
     });
   } catch (error) {

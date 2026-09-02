@@ -18,7 +18,7 @@ export async function GET(request: Request, context: RouteContext) {
   try {
     const { sessionId } = await context.params;
     const url = new URL(request.url);
-    const result = readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
+    const result = await readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
       messageCursor: url.searchParams.get('messageCursor') || undefined,
       messageLimit: boundedQueryInteger(url.searchParams.get('messageLimit'), {
         fallback: BROWSER_CHAT_MESSAGE_PAGE_SIZE,

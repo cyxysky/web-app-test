@@ -105,12 +105,12 @@ export async function maintainUserUploads(retainedPaths: ReadonlySet<string>) {
   }
 }
 
-export function scheduleUploadArtifactMaintenance(retainedUploadPaths: () => ReadonlySet<string>) {
+export function scheduleUploadArtifactMaintenance(retainedUploadPaths: () => Promise<ReadonlySet<string>>) {
   if (state.timer || process.env.UPLOAD_MAINTENANCE_ENABLED === 'false') return;
   const run = () => {
     if (state.running) return;
     try {
-      state.running = maintainUserUploads(retainedUploadPaths())
+      state.running = retainedUploadPaths().then(maintainUserUploads)
         .catch((error) => structuredLog({ event: 'uploads.maintenance.failed', level: 'warn', error }))
         .finally(() => { state.running = undefined; });
     } catch (error) {

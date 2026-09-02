@@ -7,7 +7,7 @@ import {
 } from '@/lib/sidebar-collapse';
 
 export async function readWorkspacePageContext() {
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   const requestHeaders = await headers();
   const requestCookies = await cookies();
   return {

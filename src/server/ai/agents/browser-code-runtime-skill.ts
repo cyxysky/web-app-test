@@ -123,7 +123,7 @@ agent.state.clear({prefix?:string} = {}): Promise<{deleted:number;prefix:string}
 get/delete also accept a key string, while list/clear also accept a prefix string. Object input remains the canonical form; the string overloads are safe convenience forms for ordinary browserCode cells.
 \`\`\`
 
-State is stored by the host in SQLite under the current browser conversation. It survives JavaScript-kernel recycling, browser idle release, later conversation turns, and backend restart. The parent Agent and its child Agents share the conversation state, which is deleted with the conversation.
+State is stored by the host database under the current browser conversation. It survives JavaScript-kernel recycling, browser idle release, later conversation turns, and backend restart. The parent Agent and its child Agents share the conversation state, which is deleted with the conversation.
 
 Keys contain 1-120 printable characters and a conversation stores at most 100 keys. Values may contain JSON-safe primitives, arrays, and plain records with at most 30 nested levels and at most 256 KiB of UTF-8 JSON. Large Base64 payloads are rejected: images, downloads, and large extracted text belong in workspace artifact files, while state stores only their asset names, URLs, compact metadata, and progress. Avoid echoing large restored values through nodeRepl.write unless they are needed in model context. Optional ttlMs accepts 1000 milliseconds through 30 days. set increments revision; expectedRevision provides optimistic concurrency, where 0 requires a missing key.
 

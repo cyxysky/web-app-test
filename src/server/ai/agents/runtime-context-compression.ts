@@ -59,9 +59,11 @@ function modelMessageToolCallIds(message: ModelMessage) {
 
 /**
  * Keep the provider transcript protocol valid after compression/merging.
- * Assistant tool calls and their immediately following tool results form one
- * indivisible block. Orphan results are discarded, while an incomplete call
- * block is reduced to any non-tool assistant content it also carried.
+ * Assistant tool calls and their results form one indivisible block. AI SDK
+ * may keep provider-executed results in the same assistant content array or
+ * put local results in immediately following tool messages; both are valid.
+ * Orphan results are discarded, while an incomplete call block is reduced to
+ * any non-tool assistant content it also carried.
  */
 export function completeRuntimeModelToolChain(messages: ModelMessage[]) {
   const complete: ModelMessage[] = [];
@@ -71,6 +73,14 @@ export function completeRuntimeModelToolChain(messages: ModelMessage[]) {
     if (callIds.size) {
       const toolMessages: ModelMessage[] = [];
       const resultIds = new Set<string>();
+      const assistantContent = Array.isArray(message.content)
+        ? message.content.filter((part) => {
+            if (part.type !== 'tool-result' || typeof part.toolCallId !== 'string') return true;
+            if (!callIds.has(part.toolCallId)) return false;
+            resultIds.add(part.toolCallId);
+            return true;
+          })
+        : message.content;
       let nextIndex = index + 1;
       while (messages[nextIndex]?.role === 'tool') {
         const toolMessage = messages[nextIndex];
@@ -86,17 +96,48 @@ export function completeRuntimeModelToolChain(messages: ModelMessage[]) {
         nextIndex += 1;
       }
       if ([...callIds].every((toolCallId) => resultIds.has(toolCallId))) {
-        complete.push(message, ...toolMessages);
-      } else if (Array.isArray(message.content)) {
-        const nonToolContent = message.content.filter((part) => part.type !== 'tool-call');
+        complete.push({ ...message, content: assistantContent } as ModelMessage, ...toolMessages);
+      } else if (Array.isArray(assistantContent)) {
+        const nonToolContent = assistantContent.filter((part) => (
+          part.type !== 'tool-call' && part.type !== 'tool-result'
+        ));
         if (nonToolContent.length) complete.push({ ...message, content: nonToolContent } as ModelMessage);
       }
       index = nextIndex - 1;
       continue;
     }
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      const nonToolResultContent = message.content.filter((part) => part.type !== 'tool-result');
+      if (nonToolResultContent.length) {
+        complete.push({ ...message, content: nonToolResultContent } as ModelMessage);
+      }
+      continue;
+    }
     if (message.role !== 'tool') complete.push(message);
   }
   return complete;
+}
+
+/**
+ * Remove one provider-rejected tool exchange without discarding unrelated
+ * text or sibling tool calls/results that share the same SDK message.
+ */
+export function omitRuntimeModelToolExchange(messages: ModelMessage[], toolCallId: string) {
+  const normalizedToolCallId = toolCallId.trim();
+  if (!normalizedToolCallId) return completeRuntimeModelToolChain(messages);
+  const filtered = messages.flatMap((message) => {
+    if (!Array.isArray(message.content)) return [message];
+    const content = message.content.filter((part) => {
+      if (!part || typeof part !== 'object') return true;
+      const record = part as { type?: unknown; toolCallId?: unknown };
+      return !(
+        (record.type === 'tool-call' || record.type === 'tool-result')
+        && record.toolCallId === normalizedToolCallId
+      );
+    });
+    return content.length ? [{ ...message, content } as ModelMessage] : [];
+  });
+  return completeRuntimeModelToolChain(filtered);
 }
 
 export function atomicRuntimeModelMessageBlocks(messages: ModelMessage[]) {

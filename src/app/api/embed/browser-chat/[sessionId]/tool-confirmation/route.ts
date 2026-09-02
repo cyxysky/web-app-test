@@ -30,7 +30,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
   try {
     const auth = readEmbedAuth(request, sessionId);
     const body = await parseJsonRequest(request, confirmationSchema, { maxBytes: 8 * 1024 });
-    const session = resolveBrowserChatToolConfirmation(sessionId, body.confirmationId, body.action, auth.userId);
+    const session = await resolveBrowserChatToolConfirmation(sessionId, body.confirmationId, body.action, auth.userId);
     return embedJson({ session });
   } catch (error) {
     return embedErrorJson(error, 'Failed to resolve tool confirmation');

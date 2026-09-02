@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
-import { getBrowserChatSession, listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
+import { listBrowserChatSessions } from '@/server/ai/agents/browser-chat.service';
+import { readBrowserChatSessionPage } from '@/server/ai/agents/browser-chat-read.service';
 import { store } from '@/server/db/store';
 import { joinWebPilotUrl } from '@/lib/webpilot-base-path';
 import { selectEmbeddedBrowserChatSessionId } from '@/server/embed/browser-chat-init';
@@ -37,7 +38,7 @@ export function OPTIONS() {
 export async function POST(request: NextRequest) {
   try {
     const body = await parseJsonRequest(request, initSchema, { maxBytes: 64 * 1024 });
-    store.applyRuntimeEnv();
+    await store.applyRuntimeEnv();
 
     const mountedIdentity = createMountIdentityTicket({
       origin: requestOrigin(request),
@@ -46,10 +47,10 @@ export async function POST(request: NextRequest) {
     const userId = mountedIdentity.userId;
     const requestedSessionId = normalizeString(body.sessionId);
     const initialSessionId = selectEmbeddedBrowserChatSessionId(
-      listBrowserChatSessions({ userId }),
+      await listBrowserChatSessions({ userId }),
       requestedSessionId,
     );
-    const session = initialSessionId ? getBrowserChatSession(initialSessionId, userId) : undefined;
+    const session = initialSessionId ? await readBrowserChatSessionPage(initialSessionId, userId) : undefined;
     if (requestedSessionId && !session) throw new Error('Browser chat session not found');
     const ttlSeconds = Number.isFinite(Number(body.tokenTtlSeconds))
       ? Number(body.tokenTtlSeconds)

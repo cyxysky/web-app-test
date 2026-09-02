@@ -696,7 +696,7 @@ function createBrowserPreviewServer() {
     response.end(JSON.stringify({ ok: true }));
   });
 
-  server.on('upgrade', (request, socket) => {
+  server.on('upgrade', async (request, socket) => {
     const netSocket = socket as Socket;
     const url = new URL(request.url || '/', 'http://127.0.0.1');
     if (url.pathname !== '/browser-preview') {
@@ -704,7 +704,7 @@ function createBrowserPreviewServer() {
       return;
     }
     const sessionId = (url.searchParams.get('sessionId') || '').trim();
-    const auth = consumeWebSocketTicket({
+    const auth = await consumeWebSocketTicket({
       origin: String(request.headers.origin || '').trim(),
       scope: 'browser-preview',
       sessionId,

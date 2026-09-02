@@ -11,7 +11,7 @@ export async function GET(request: NextRequest) {
   try {
     const userId = requestApplicationUserId(request);
     const [state, readiness] = await Promise.all([
-      Promise.resolve(readOnboardingState(userId)),
+      readOnboardingState(userId),
       readOnboardingReadiness(),
     ]);
     return apiJson(request, { readiness, state });
@@ -23,7 +23,7 @@ export async function GET(request: NextRequest) {
 export async function PATCH(request: NextRequest) {
   try {
     const body = await parseJsonRequest(request, onboardingRequestSchema, { maxBytes: 8 * 1024 });
-    const state = updateOnboardingState(requestApplicationUserId(request), body);
+    const state = await updateOnboardingState(requestApplicationUserId(request), body);
     return apiJson(request, { state });
   } catch (error) {
     return apiError(request, error, { fallback: 'Unable to update onboarding state' });

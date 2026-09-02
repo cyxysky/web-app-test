@@ -8,7 +8,7 @@ export const dynamic = 'force-dynamic';
 export async function POST(request: Request) {
   try {
     const userId = requestApplicationUserId(request);
-    const auth = createWebSocketTicket({ origin: requestPublicOrigin(request), scope: 'realtime-refresh', userId });
+    const auth = await createWebSocketTicket({ origin: requestPublicOrigin(request), scope: 'realtime-refresh', userId });
     const publicOrigin = new URL(requestPublicOrigin(request));
     publicOrigin.protocol = publicOrigin.protocol === 'https:' ? 'wss:' : 'ws:';
     const url = new URL(withWebPilotBasePath('/refresh'), publicOrigin);

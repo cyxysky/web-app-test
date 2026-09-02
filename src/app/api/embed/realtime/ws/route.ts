@@ -12,7 +12,7 @@ export function OPTIONS() {
 export async function GET(request: Request) {
   try {
     const auth = readEmbedAuth(request);
-    const ticket = createWebSocketTicket({
+    const ticket = await createWebSocketTicket({
       origin: auth.origin || request.headers.get('origin') || requestPublicOrigin(request),
       scope: 'realtime-refresh',
       userId: auth.userId,

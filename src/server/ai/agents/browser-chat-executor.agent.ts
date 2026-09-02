@@ -32,6 +32,13 @@ import {
   runtimeToolTypesWithAutomaticSkills,
 } from './hidden-runtime-skills';
 import { subagentRuntimeSkillId } from './subagent-runtime-skill';
+import { chartRuntimeSkillId } from './chart-runtime-skill';
+import { createBrowserChatChart, readBrowserChatChartApi } from './chart-artifact-tools';
+import {
+  browserChatFinalBlocksToText,
+  browserChatFinalResponseSchema,
+  type BrowserChatFinalBlock,
+} from '@/lib/browser-chat-ui-message';
 import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
   BROWSER_CHAT_FILE_READ_MAX_CHARS,
@@ -62,6 +69,7 @@ import {
   isRuntimePromptCacheMetadataMessage,
   runtimeCurrentTimeMarker,
   runtimeOperationalContextMarker,
+  withoutRuntimePromptCacheMetadata,
 } from './runtime-prompt-cache';
 import { readScreenshotForAi } from './browser-chat-image-input';
 import { summarizeRuntimeLogTimings } from './runtime-log-timings';
@@ -74,6 +82,7 @@ import {
 import {
   classifyRuntimeRetry,
   isProviderBillingLimitMessage,
+  runtimeMissingToolCallId,
   runtimeExecutionDetails,
   runtimeExecutionIdentity,
   runtimeRetryDelayMs,
@@ -107,10 +116,12 @@ import {
 import {
   atomicRuntimeModelMessageBlocks,
   buildRuntimeContinuationSummaryPrompt,
+  completeRuntimeModelToolChain,
   ensureRuntimeContinuationSummaryMessage,
   fallbackRuntimeContinuationSummary,
   mergeRuntimeModelMessageChain,
   normalizeRuntimeContinuationSummary,
+  omitRuntimeModelToolExchange,
   sanitizeRuntimeContinuationSummary,
   selectRecentRuntimeMessageBlocks,
   runtimeContinuationDirectiveMarker,
@@ -501,6 +512,33 @@ function compactToolResultForModel(
   // payloads and stack traces quickly dominate the conversation context.
   const fileResult = formatFileArtifactResult(name, modelResult.actual);
   if (fileResult) return { ...modelResult, actual: fileResult };
+  if (name === 'fileVisual') {
+    try {
+      const payload = JSON.parse(modelResult.actual) as Record<string, unknown>;
+      const kind = String(payload.kind || '');
+      if (kind === 'file-visual-report') {
+        const reviews = Array.isArray(payload.reviews) ? payload.reviews : [];
+        return {
+          ...modelResult,
+          actual: JSON.stringify({
+            kind,
+            artifactId: payload.artifactId,
+            fileName: payload.fileName,
+            reportedScreenshotIds: reviews.flatMap((review) => (
+              review && typeof review === 'object' && typeof (review as { screenshotId?: unknown }).screenshotId === 'string'
+                ? [(review as { screenshotId: string }).screenshotId]
+                : []
+            )),
+            reportedCount: reviews.length,
+            instruction: payload.instruction,
+            visualQa: payload.visualQa,
+          }),
+        };
+      }
+    } catch {
+      // Keep the original result when this is not a structured fileVisual payload.
+    }
+  }
   return modelResult;
 }
 
@@ -711,6 +749,27 @@ function summarizeToolTraces(traces: ToolTrace[]): StepToolCall[] {
       screenshots: trace.screenshots,
     };
   });
+}
+
+const codexFinalResponsePrefix = '__WEBPILOT_FINAL_RESPONSE__:';
+
+function finalResponseFromTraces(traces: ToolTrace[]) {
+  for (const trace of [...traces].reverse()) {
+    if (trace.name !== 'finalResponse' || trace.result?.ok !== true) continue;
+    const parsed = browserChatFinalResponseSchema.safeParse(trace.input);
+    if (parsed.success) return parsed.data;
+  }
+  return undefined;
+}
+
+function finalResponseFromText(value: string) {
+  if (!value.startsWith(codexFinalResponsePrefix)) return undefined;
+  try {
+    const parsed = browserChatFinalResponseSchema.safeParse(JSON.parse(value.slice(codexFinalResponsePrefix.length)));
+    return parsed.success ? parsed.data : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function subagentUuidsFromToolResult(result?: BrowserActionResult) {
@@ -1167,11 +1226,11 @@ function resolveDefectScreenshotEvidence(traces: ToolTrace[], requestedFileNames
   };
 }
 
-function reportBrowserChatDefect(
+async function reportBrowserChatDefect(
   sessionId: string | undefined,
   traces: ToolTrace[],
   input: ReportDefectInput,
-): BrowserActionResult {
+): Promise<BrowserActionResult> {
   if (!sessionId) return { ok: false, actual: 'reportDefect is unavailable because the conversation id is missing.' };
   const evidence = resolveDefectScreenshotEvidence(traces, input.screenshotFileNames);
   if (evidence.missing.length) {
@@ -1180,7 +1239,7 @@ function reportBrowserChatDefect(
       actual: `Screenshot evidence rejected because these files were not emitted by a successful browserCode call in this Agent run: ${evidence.missing.join(', ')}. Available screenshot file names: ${evidence.availableFileNames.join(', ') || '[none]'}.`,
     };
   }
-  const report = createBrowserChatDefectReport(sessionId, {
+  const report = await createBrowserChatDefectReport(sessionId, {
     problemDescription: input.problemDescription,
     whyItIsAProblem: input.whyItIsAProblem,
     reasons: input.reasons,
@@ -1389,17 +1448,25 @@ function makeBrowserTools(
         const imagePaths = result.referenceImagePaths?.length
           ? result.referenceImagePaths
           : result.referenceImagePath ? [result.referenceImagePath] : [];
-        const source = (name === 'file' || name === 'fileVisual') && input && typeof input === 'object' && 'action' in input
-          ? `${name}:${String((input as { action?: unknown }).action || 'unknown')}`
+        const action = input && typeof input === 'object' && 'action' in input
+          ? String((input as { action?: unknown }).action || '')
+          : '';
+        const source = (name === 'file' || name === 'fileVisual') && action
+          ? `${name}:${action}`
           : name;
         const screenshotIds = name === 'fileVisual' && input && typeof input === 'object' && 'screenshotIds' in input
           ? (input as { screenshotIds?: unknown }).screenshotIds
           : undefined;
-        for (const [index, path] of [...new Set(imagePaths)].entries()) {
-          const screenshotId = Array.isArray(screenshotIds) && typeof screenshotIds[index] === 'string'
-            ? screenshotIds[index]
-            : undefined;
-          referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
+        // A render can produce every page preview at once. Those files are
+        // indexed evidence, not implicit model attachments: fileVisual reads
+        // only the requested pages in bounded batches.
+        if (!(name === 'file' && action === 'render')) {
+          for (const [index, path] of [...new Set(imagePaths)].entries()) {
+            const screenshotId = Array.isArray(screenshotIds) && typeof screenshotIds[index] === 'string'
+              ? screenshotIds[index]
+              : undefined;
+            referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
+          }
         }
         const resultForModel = name === 'browserCode' && imagePaths.length
           ? { ...result, screenshotFileNames: browserCodeScreenshotFileNames(imagePaths) }
@@ -1478,7 +1545,7 @@ function makeBrowserTools(
       execute: (input, execution) => record(
         'reportDefect',
         input,
-        () => Promise.resolve(reportBrowserChatDefect(referenceOptions?.runId, traces, input)),
+        () => reportBrowserChatDefect(referenceOptions?.runId, traces, input),
         execution,
       ),
     }),
@@ -1548,8 +1615,60 @@ function makeBrowserTools(
         },
       }),
     } : {}),
+    chart: tool({
+      description: `Read modular Apache ECharts API guidance or create one persistent inline ECharts chart. Use action=api without query for the module index, action=api with an exact module id for focused signatures/examples, then action=create with a complete JSON-serializable ECharts option. The full echarts package is loaded and no series-type whitelist is imposed. The first call automatically loads hidden Skill ${chartRuntimeSkillId}. A successful create returns an exact chartId; reference it from a finalResponse chart block.`,
+      inputSchema: browserToolInput({
+        action: z.enum(['api', 'create']).describe('api reads the indexed ECharts capability catalog; create persists and renders a complete ECharts option.'),
+        query: z.string().trim().min(1).max(120).optional().describe('For action=api only. Omit to list modules, or pass one exact module id returned by the index.'),
+        offset: z.number().int().min(0).optional().describe('For action=api index pagination.'),
+        limit: z.number().int().min(1).max(50).optional().describe('For action=api index pagination.'),
+        title: z.string().trim().min(1).max(200).optional().describe('Accessible chart title shown above the canvas.'),
+        description: z.string().trim().min(1).max(1_000).optional().describe('Accessible plain-language summary of the chart and its main point.'),
+        height: z.number().int().min(240).max(720).optional().describe('Rendered chart height in pixels. Defaults to 380.'),
+        renderer: z.enum(['canvas', 'svg']).optional().describe('ECharts renderer for action=create. Defaults to canvas.'),
+        option: z.record(z.string(), z.unknown()).optional().describe('For action=create: complete native ECharts option. Series may use any type registered by the full echarts package. Values must be JSON-serializable.'),
+        maps: z.array(z.object({
+          name: z.string().trim().min(1).max(160),
+          geoJson: z.union([z.record(z.string(), z.unknown()), z.string().min(1)]),
+          specialAreas: z.record(z.string(), z.unknown()).optional(),
+        })).max(12).optional().describe('Optional GeoJSON or SVG maps registered with echarts.registerMap before rendering.'),
+      }, [
+        { action: 'api', reason: '查看 ECharts API 模块索引' },
+        { action: 'api', reason: '读取直角坐标系列配置说明', query: 'series.cartesian' },
+        {
+          action: 'create',
+          reason: '展示最近六个月收入趋势',
+          title: '最近六个月收入趋势',
+          option: {
+            tooltip: { trigger: 'axis' },
+            xAxis: { type: 'category', data: ['1月', '2月', '3月', '4月', '5月', '6月'] },
+            yAxis: { type: 'value' },
+            series: [{ name: '收入（万元）', type: 'line', smooth: true, areaStyle: {}, data: [120, 138, 151, 149, 182, 205] }],
+          },
+        },
+      ]),
+      execute: (input, execution) => record('chart', input, () => input.action === 'api'
+        ? readBrowserChatChartApi({ limit: input.limit, offset: input.offset, query: input.query })
+        : createBrowserChatChart({
+            description: input.description,
+            height: input.height,
+            maps: input.maps,
+            option: input.option,
+            renderer: input.renderer,
+            runId: referenceOptions?.runId || '',
+            title: input.title,
+          }), execution),
+    }),
+    finalResponse: tool({
+      description: 'Finish the request with ordered UI blocks. Use markdown for prose, chart for a successful chart id, and ui for declarative cards/layout. The client preserves this exact order in UIMessage.parts.',
+      inputSchema: browserChatFinalResponseSchema,
+      execute: (input, execution) => record('finalResponse', input, () => Promise.resolve({
+        ok: true,
+        actual: JSON.stringify({ accepted: true, blockCount: input.blocks.length }),
+      }), execution),
+    }),
     skill: tool({
-      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${browserRuntimeSkillId}, ${fileArtifactRuntimeSkillId}, and ${subagentRuntimeSkillId}; successful reads remain loaded only for the current Agent run.`,
+      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${browserRuntimeSkillId}, ${fileArtifactRuntimeSkillId}, ${chartRuntimeSkillId}, and ${subagentRuntimeSkillId}; successful reads remain loaded only for the current Agent run.`,
       inputSchema: withToolInputExamples(z.preprocess((value) => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
         const record = value as Record<string, unknown>;
@@ -1563,6 +1682,7 @@ function makeBrowserTools(
       })), [
         { reason: '读取浏览器代码运行规范', action: 'read', skillId: browserRuntimeSkillId },
         { reason: '读取文件产物运行规范', action: 'read', skillId: fileArtifactRuntimeSkillId },
+        { reason: '读取图表生成运行规范', action: 'read', skillId: chartRuntimeSkillId },
         { reason: '读取子 Agent 运行规范', action: 'read', skillId: subagentRuntimeSkillId },
       ]),
       execute: (input, execution) => record('skill', input, async () => {
@@ -1601,10 +1721,10 @@ function makeBrowserTools(
           startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based first line. It is draft-global without path and source-unit-relative when path is supplied.'),
           endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional inclusive last line. Values beyond the current draft/unit are clamped to its final line; source windows are limited to 240 lines.'),
           urlOrPath: z.string().max(8_000).optional(),
-          program: z.string().optional(),
-          baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Required for action=edit: exact patchBaseDigest from the latest read of the same documentId and optional path.'),
-          replaceExisting: z.boolean().optional().describe('For action=generate only: set true together with baseDigest solely when intentionally replacing an existing complete draft. Never use this for ordinary repair.'),
-          patch: z.string().max(200_000).optional().describe("Required for action=edit: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. BEFORE CALLING, verify every hunk has a real change: at least one line beginning literally '-' or '+'. A replacement needs both '-old' and '+new'; context-only hunks are invalid. Do not write unified-diff line numbers or file headers. Unchanged context keeps the source's original indentation; added lines are inserted exactly as written."),
+          program: z.string().optional().describe('Required for the initial action=generate. If a working source already exists, use action=edit first. UNO source must define exactly one top-level synchronous def create_document(job):, keep job.presentation/job.writer/job.spreadsheet and all authoring inside it, then call that facade save() exactly once followed by close() exactly once.'),
+          baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Required for action=edit and for generate with replaceExisting=true: exact patchBaseDigest from the latest read of the same documentId and optional path.'),
+          replaceExisting: z.boolean().optional().describe('Exceptional last resort for action=generate only, after reading the complete current source: use only when bounded edit patches cannot coherently perform a near-total rebuild. Never use it for local validation errors, patch formatting errors, context conflicts, or ordinary revisions.'),
+          patch: z.string().max(200_000).optional().describe("Required for action=edit, which is always the first choice when a source exists: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. BEFORE CALLING, verify every hunk has a real change: at least one line beginning literally '-' or '+'. A replacement needs both '-old' and '+new'; context-only hunks are invalid. Do not write unified-diff line numbers or file headers. Unchanged context should begin with one literal space and keep the source's original indentation. If a patch fails formatting or context matching, correct and retry action=edit; do not switch to generate/replaceExisting."),
           render: z.boolean().optional(),
           includeVisuals: z.boolean().optional(),
           offset: z.number().int().min(0).optional(),
@@ -1819,7 +1939,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
     '',
     'Operating rules:',
-    '- Simple knowledge questions and other requests that do not need the live browser may be answered directly without any browser tool. When browser evidence or interaction is needed, call the relevant browser tool directly. The execution layer runs any pending prerequisite tools first, then runs the requested tool, and returns every prerequisite result in prerequisiteResults alongside the requested tool result in one tool response. Do not issue separate prerequisite tool calls unless their result alone is desired. In one model step either answer in Chinese Markdown without a tool or call at most one relevant tool.',
+    '- Simple knowledge questions and other requests that do not need the live browser may be answered directly. When browser evidence or interaction is needed, call the relevant browser tool directly. The execution layer runs any pending prerequisite tools first, then runs the requested tool, and returns every prerequisite result in prerequisiteResults alongside the requested tool result in one tool response. Do not issue separate prerequisite tool calls unless their result alone is desired. In one model step call at most one relevant tool.',
     '- The latest user message is the scope authority. If it explicitly narrows the current turn to one action (for example, "just click Search"), perform and verify only that action, then stop. Do not silently resume a broader goal from an earlier message unless the latest message explicitly asks you to continue it.',
     '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. Use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. A pending readBrowserState prerequisite is executed internally and returned in prerequisiteResults while the requested browserCode still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
@@ -1829,6 +1949,8 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
     '- Copy every delivered Artifact downloadUrl exactly from the successful tool result. Never construct, absolutize, repair, or infer an Artifact URL from a sessionId, artifactId, hostname, or file name, and never call a URL an absolute filesystem path. Before finalizing Office/PDF work, reconcile the original requirements with automaticValidation.formatChecks, validation issues, and visual-QA scope. Visual QA proves page layout only; it does not prove requested native charts, formulas, images, comments, footnotes, or other semantic features. A missing, zero-count, unsupported, failed, or unverified required feature must be reported as a limitation, never as fully passed.',
     '- If agent.state tracks task stage, coverage, status, issues, or artifacts, update those records before the final answer so no pending/generated/failed field contradicts a complete claim. Do not set an overall complete/passed state while any required item remains pending, unsupported, failed, or unverified unless the user explicitly accepted a partial result.',
+    `- Use chart when an Apache ECharts visualization materially improves the answer. Its first call atomically loads hidden Skill ${chartRuntimeSkillId}. Read its indexed API with action=api before action=create. After every successful create, reference the exact returned chartId from a finalResponse chart block. Never invent a chart id or use one from a failed call.`,
+    '- Complete every terminal response by calling finalResponse with ordered blocks. Use markdown blocks for normal prose, chart blocks for generated ECharts artifacts, and ui blocks for declarative cards/layout. Never serialize these blocks into assistant text. The UI renders blocks in the exact array order.',
     '- Defect reporting is a mandatory part of every interface or product testing task. As soon as live browser evidence reveals a real defect or reproducible product problem (including functional, data, interaction, visual/layout, or compatibility problems), proactively reproduce it, use browserCode to emit a screenshot that visibly proves it, and call reportDefect in the immediately following model step with the exact screenshotFileNames returned by browserCode before continuing unrelated test cases. Never wait for the user to ask, defer reporting until the final answer, or merely describe the problem in test notes or the final report. Create one report for each unique confirmed problem. Investigate permission, configuration, version, requirement, and environment explanations first; report only an observed product problem, never speculation or expected behavior, and do not report duplicates. Recording a defect does not end the requested test unless its full scope is complete.',
     screenshotAvailable && input.fileVisualAvailable
       ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
@@ -1845,7 +1967,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
     '',
-    'Finish with Chinese Markdown when the request is satisfied, blocked, failed, or needs clarification. Do not return standalone JSON.',
+    'When the request is satisfied, blocked, failed, or needs clarification, call finalResponse. Write user-facing prose inside Chinese Markdown blocks and do not return standalone JSON as assistant text.',
   ].filter(Boolean).join('\n');
 }
 
@@ -1858,6 +1980,8 @@ function runtimeToolNames(includeVisualTools = true) {
     'subagent',
     'file',
     ...(includeVisualTools ? ['fileVisual'] : []),
+    'chart',
+    'finalResponse',
     'skill',
   ];
 }
@@ -2419,44 +2543,45 @@ async function executeRuntimeStep(input: {
     const reportedDocumentVisualSources = new Set<string>();
     const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
       const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('fileVisual:read');
+      const normalizedSource = source.startsWith('fileVisual:read:') ? 'fileVisual:read' : source;
       const referenceKey = `${source}\u0000${path}`;
       if (queuedReferenceImageKeys.has(referenceKey)) return;
       queuedReferenceImageKeys.add(referenceKey);
       if (!modelSupportsImageInput()) {
-        if (documentVisualQa && !reportedDocumentVisualSources.has(source)) {
-          reportedDocumentVisualSources.add(source);
+        if (documentVisualQa && !reportedDocumentVisualSources.has(normalizedSource)) {
+          reportedDocumentVisualSources.add(normalizedSource);
           void onAttemptDebug?.({
             phase: 'ai:document-visual-qa:unavailable',
             stepIndex,
             message: 'Selected model has no image input: document output passed structural rendering checks only; no visual layout review was performed.',
-            details: { source, verification: 'structural-only' },
+            details: { source: normalizedSource, verification: 'structural-only' },
           });
         }
         return;
       }
       const text = documentVisualQa
-      ? `[Document visual QA${source.startsWith('fileVisual:read:') ? ` | ${source.slice('fileVisual:read:'.length)}` : ''}]\nThis image is a requested page screenshot from the current generated document. Inspect the actual pixels at a useful size before finalizing. Use three passes: identify visible content and reading order; scan all page edges and object boundaries for clipping or overlap; then judge composition, hierarchy, typography, color, chart semantics, and image treatment. The page observation must name concrete visible anchors and locations, not paraphrase the rubric. Check clipping, overlap, unreadable contrast, empty areas, distorted images, broken tables or charts, inconsistent alignment, weak hierarchy, poor composition, default-looking styling, and content outside the page. For every chart, verify that a reader can identify every bar, line, point, or sector: reject 1/2/3 placeholder categories, generic-only series names, and missing or unreadable legends, axis labels, or data labels. Verify that content images are contextually identified or captioned and have alt/source attribution when required. Never list a known visible defect as a compatibility boundary and then pass it; never claim that a count such as 4 satisfies a requirement of at least 5. Continue calling fileVisual action=read until every indexed screenshot has been inspected. After all pages, compare the complete ordered set and cite at least two concrete cross-page observations in deckReview. If a defect exists, read the exact draft source and patchBaseDigest, submit one focused Codex-format patch, render again, and inspect only the new Artifact ID. Do not present this preview image as the final downloadable document.`
+      ? '[Document visual QA]\nThe attached images are the exact pages returned by the latest fileVisual read. Inspect the pixels for clipping, overlap, hierarchy, typography, contrast, alignment, chart/table legibility, image quality, and page-edge defects. Use the screenshot IDs from the tool result when reporting evidence. If any page fails, patch the same current source, render a replacement artifact, and inspect only that new artifact.'
         : source === 'file:read'
           ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
           : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';
       const existingObservation = pendingObservationMessages.find((observation) => observation.text === text);
       if (existingObservation) existingObservation.imagePaths.push(path);
       else pendingObservationMessages.push({ text, imagePaths: [path] });
-      if (documentVisualQa && !reportedDocumentVisualSources.has(source)) {
-        reportedDocumentVisualSources.add(source);
+      if (documentVisualQa && !reportedDocumentVisualSources.has(normalizedSource)) {
+        reportedDocumentVisualSources.add(normalizedSource);
         void onAttemptDebug?.({
           phase: 'ai:document-visual-qa:queued',
           stepIndex,
           message: 'Rendered document preview queued for model visual inspection and targeted correction.',
-          details: { source },
+          details: { source: normalizedSource },
         });
       }
     };
     const durableContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
-    const historyMessages = ensureRuntimeContinuationSummaryMessage(
+    const historyMessages = completeRuntimeModelToolChain(ensureRuntimeContinuationSummaryMessage(
       [...(input.conversation || [])] as RuntimeModelMessage[],
       durableContinuationSummary,
-    );
+    ));
     const initialImagePaths = [...initialVisualPaths, ...initialUserReferenceImagePaths];
     const initialImages: Awaited<ReturnType<typeof readScreenshotForAi>>[] = [];
     for (const imagePath of initialImagePaths) {
@@ -2720,7 +2845,18 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
-      const sourceMessages = previousMessages?.length ? [...previousMessages] : [...initialMessages];
+      const sourceMessages = completeRuntimeModelToolChain(previousMessages?.length
+        ? previousMessages.filter((message) => {
+            if (message.role !== 'user' || !Array.isArray(message.content)) return true;
+            const text = message.content.flatMap((part) => (
+              part.type === 'text' && typeof part.text === 'string' ? [part.text] : []
+            )).join('\n');
+            return !text.startsWith('[Document visual QA]')
+              && !text.startsWith('[Attachment visual content]')
+              && !text.startsWith('[Explicit visual evidence]');
+          })
+        : [...initialMessages]);
+      if (previousMessages?.length) messageImagePaths = [...initialUserReferenceImagePaths];
       lastPreparedResponsePrefixLength = previousMessages?.length
         ? Math.max(0, sourceMessages.length - initialMessages.length)
         : 0;
@@ -2739,11 +2875,12 @@ async function executeRuntimeStep(input: {
       const operationalContext = runtimeOperationalContextText(requiredSubagentDirective);
       requestSystemPrompt = baseSystemPrompt;
       const runtimeMetadata = appendRuntimePromptCacheMetadata({
-        messages: messagesToSend,
+        messages: withoutRuntimePromptCacheMetadata(messagesToSend),
         operationalContext,
         currentTimeLine: runtimeTimeLine,
       });
       messagesToSend = runtimeMetadata.messages;
+      messagesToSend = completeRuntimeModelToolChain(messagesToSend);
       let requestMessages = [...messagesToSend];
       let attachedImagePaths = [...messageImagePaths];
       let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
@@ -2851,11 +2988,12 @@ async function executeRuntimeStep(input: {
           afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         }
         const compressedRuntimeMetadata = appendRuntimePromptCacheMetadata({
-          messages: messagesToSend,
+          messages: withoutRuntimePromptCacheMetadata(messagesToSend),
           operationalContext,
           currentTimeLine: runtimeTimeLine,
         });
         messagesToSend = compressedRuntimeMetadata.messages;
+        messagesToSend = completeRuntimeModelToolChain(messagesToSend);
         requestMessages = [...messagesToSend];
         afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
         const retainedMessageCount = Math.max(0, messagesToSend.filter((message) => (
@@ -3478,8 +3616,9 @@ async function executeRuntimeStep(input: {
   }
 
   // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
-  // disconnects with the exact model messages prepared for the failed request. The
-  // limit is consecutive failures; only a resolved SDK response resets the counter.
+  // disconnects with the prepared model messages. A provider-rejected tool exchange
+  // is removed before retry because replaying that identical invalid chain cannot work.
+  // The limit is consecutive failures; only a resolved SDK response resets the counter.
   const consecutiveFailureLimit = runtimeRequestConsecutiveFailureLimit();
   let lastError: unknown;
   let retryingAfterFailure = false;
@@ -3595,6 +3734,13 @@ async function executeRuntimeStep(input: {
       lastError = error;
       consecutiveRequestFailures += 1;
       lastRetryDecision = classifyRuntimeRetry(error, abortSignal);
+      const missingToolCallId = runtimeMissingToolCallId(error);
+      if (missingToolCallId && lastRetryState?.messages.length) {
+        lastRetryState = {
+          ...lastRetryState,
+          messages: omitRuntimeModelToolExchange(lastRetryState.messages, missingToolCallId),
+        };
+      }
       const retryExhausted = lastRetryDecision.retryable
         && consecutiveRequestFailures >= consecutiveFailureLimit;
       const willRetry = lastRetryDecision.retryable && !retryExhausted;
@@ -3627,6 +3773,12 @@ async function executeRuntimeStep(input: {
           finalFailure: !willRetry,
           execution: executionIdentity,
           retryDecision: lastRetryDecision,
+          ...(missingToolCallId ? {
+            protocolRepair: {
+              action: 'removed rejected tool call/result exchange from preserved context',
+              toolCallId: missingToolCallId,
+            },
+          } : {}),
         },
       });
       structuredLog({
@@ -3682,6 +3834,7 @@ export type InteractiveBrowserTurnMessage = ModelMessage;
 export type InteractiveBrowserTurnResult = {
   status: 'passed' | 'failed' | 'blocked';
   reply: string;
+  blocks: BrowserChatFinalBlock[];
   steps: StepExecutionResult[];
   newSteps: StepExecutionResult[];
   consoleErrors: string[];
@@ -3785,6 +3938,7 @@ export async function executeInteractiveBrowserTurn(input: {
   });
   let finalStatus: InteractiveBrowserTurnResult['status'] = 'passed';
   let reply = '';
+  let finalBlocks: BrowserChatFinalBlock[] = [];
   let endedWithFinalAnswer = false;
   let browserStatePreflightComplete = false;
   // Runtime Skills are scoped to this Agent run. Every model step and both
@@ -3985,6 +4139,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       });
       finalStatus = 'failed';
       reply = userFacingRecoverableRuntimeError(error);
+      finalBlocks = [{ type: 'markdown', text: reply }];
       activeModelMessages = appendTerminalBrowserChatTurn(
         activeModelMessages,
         input.modelInstruction || input.instruction,
@@ -4009,6 +4164,41 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
 
     ensureActive();
     const browserChatReply = textFromUnknown(actionResult.text).trim();
+    const structuredFinalResponse = finalResponseFromTraces(actionResult.traces)
+      || finalResponseFromText(browserChatReply);
+    if (structuredFinalResponse?.blocks.length) {
+      const pendingVisualQa = requiresOfficeVisualQa
+        ? await pendingOfficeVisualQa(input.runId, turnRenderedArtifactIds)
+        : [];
+      if (pendingVisualQa.length) {
+        await input.onDebug?.({
+          phase: 'chat:file-visual-qa-required',
+          stepIndex,
+          message: 'A rendered Office artifact has not completed full-page visual QA; rejecting the structured final response.',
+          details: { pendingVisualQa },
+        });
+        continue;
+      }
+      const pendingDocumentWork = await pendingOfficeDocumentWork(input.runId, turnDocumentIds, {
+        requireVisualQa: requiresOfficeVisualQa,
+      });
+      if (pendingDocumentWork.length) {
+        await input.onDebug?.({
+          phase: 'chat:file-document-completion-required',
+          stepIndex,
+          message: 'An Office document has pending source, render, or QA work; rejecting the structured final response.',
+          details: { pendingDocumentWork },
+        });
+        continue;
+      }
+      const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
+      if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      finalBlocks = structuredFinalResponse.blocks;
+      reply = browserChatFinalBlocksToText(finalBlocks);
+      finalStatus = structuredFinalResponse.status;
+      endedWithFinalAnswer = true;
+      break;
+    }
     if (!actionResult.traces.length) {
       const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
       if (runningIndex >= 0) steps.splice(runningIndex, 1);
@@ -4048,6 +4238,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         });
         await flushWithheldText();
         reply = browserChatReply || aiSdkFinishMessage(actionResult.finishReason);
+        finalBlocks = [{ type: 'markdown', text: reply }];
         finalStatus = actionResult.responseStatus;
         endedWithFinalAnswer = true;
         break;
@@ -4127,6 +4318,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       });
       await flushWithheldText();
       reply = browserChatReply || aiSdkFinishMessage(actionResult.finishReason);
+      finalBlocks = [{ type: 'markdown', text: reply }];
       finalStatus = actionResult.responseStatus === 'passed'
         ? decision.status === 'failed' || decision.status === 'blocked' ? decision.status : 'passed'
         : actionResult.responseStatus;
@@ -4136,6 +4328,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
     if (lastToolName === 'waitForHumanVerification') {
       finalStatus = 'blocked';
       if (!reply) reply = browserChatReplyFromDecision(decision);
+      finalBlocks = [{ type: 'markdown', text: reply }];
       endedWithFinalAnswer = true;
       break;
     }
@@ -4143,17 +4336,24 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
 
   if (!endedWithFinalAnswer) reply = '';
 
-  reply = repairFileArtifactDownloadLinks(
-    reply,
-    newSteps.flatMap((step) => (step.tools || []).map((toolCall) => ({
+  const completedTools = newSteps.flatMap((step) => (step.tools || []).map((toolCall) => ({
       name: toolCall.name,
       result: toolCall.rawResult,
-    }))),
-  );
+    })));
+  reply = repairFileArtifactDownloadLinks(reply, completedTools);
+  if (finalBlocks.length) {
+    finalBlocks = finalBlocks.map((block) => block.type === 'markdown'
+      ? { ...block, text: repairFileArtifactDownloadLinks(block.text, completedTools) }
+      : block);
+    reply = browserChatFinalBlocksToText(finalBlocks);
+  } else if (reply) {
+    finalBlocks = [{ type: 'markdown', text: reply }];
+  }
   ensureActive();
   return {
     status: finalStatus,
     reply,
+    blocks: finalBlocks,
     steps,
     newSteps,
     consoleErrors: [],
@@ -4515,6 +4715,20 @@ async function executeCodexRuntimeObject(input: {
     };
   }
 
+  if (type === 'finalResponse') {
+    const parsed = browserChatFinalResponseSchema.safeParse(params);
+    if (!parsed.success) {
+      return {
+        text: `finalResponse input is invalid: ${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`,
+        executed: true,
+      };
+    }
+    return {
+      text: `${codexFinalResponsePrefix}${JSON.stringify(parsed.data)}`,
+      executed: false,
+    };
+  }
+
   const normalizedParams = {
     ...(coerceBrowserChatToolInput(type, params) as Record<string, unknown>),
   };
@@ -4537,6 +4751,24 @@ async function executeCodexRuntimeObject(input: {
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
   const runTool = async (toolCallId?: string) => {
+    if (type === 'chart') {
+      if (normalizedParams.action === 'api') {
+        return readBrowserChatChartApi({
+          limit: normalizedParams.limit,
+          offset: normalizedParams.offset,
+          query: normalizedParams.query,
+        });
+      }
+      return createBrowserChatChart({
+        description: normalizedParams.description,
+        height: normalizedParams.height,
+        maps: normalizedParams.maps,
+        option: normalizedParams.option,
+        renderer: normalizedParams.renderer,
+        runId,
+        title: normalizedParams.title,
+      });
+    }
     if (type === 'subagent' && normalizedParams.action === 'spawn') {
       if (!runSubagents) return { ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' };
       const tasks = normalizeBrowserChatSubagentTasks(normalizedParams.tasks ?? normalizedParams);
@@ -4569,7 +4801,7 @@ async function executeCodexRuntimeObject(input: {
           actual: `reportDefect input is invalid: ${parsed.error.issues.map((issue) => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`,
         };
       }
-      return reportBrowserChatDefect(runId, traces, parsed.data);
+      return await reportBrowserChatDefect(runId, traces, parsed.data);
     }
     if (type === 'file' && normalizedParams.action === 'read') {
       const documentId = typeof normalizedParams.documentId === 'string' ? normalizedParams.documentId.trim() : undefined;

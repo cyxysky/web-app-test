@@ -131,6 +131,26 @@ function errorMessage(error: unknown, records: Record<string, unknown>[]) {
   return firstString(records, ['message', 'statusText', 'error']) || String(error || 'Unknown runtime error');
 }
 
+function missingToolCallIdFromMessage(message: string) {
+  const direct = message.match(/tool result(?:'s)?\s+tool id\s*\(\s*([^)\s]+)\s*\)\s+not found/i);
+  if (direct?.[1]) return direct[1];
+  const functionOutput = message.match(/no tool call found for (?:function call )?output(?:\s+with)?\s+call[_ ]id\s*[:=]?\s*["'(]?([\w.:-]+)/i);
+  return functionOutput?.[1];
+}
+
+export function runtimeMissingToolCallId(error: unknown) {
+  const records = errorRecords(error);
+  return missingToolCallIdFromMessage(errorMessage(error, records));
+}
+
+export function isRuntimeToolResultCallMismatch(error: unknown) {
+  const records = errorRecords(error);
+  const message = errorMessage(error, records);
+  return Boolean(missingToolCallIdFromMessage(message))
+    || /tool result.{0,80}tool(?:[_ ]call)? id.{0,80}not found/i.test(message)
+    || /no tool call found for (?:function call )?output/i.test(message);
+}
+
 export function isProviderBillingLimitMessage(value: string) {
   const message = value.trim();
   if (!message) return false;
@@ -160,6 +180,14 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
       category: 'protocol',
       reason: 'provider emitted a private textual tool protocol',
       retryable: privateToolProtocolRetryable,
+      statusCode,
+    };
+  }
+  if (isRuntimeToolResultCallMismatch(error)) {
+    return {
+      category: 'protocol',
+      reason: 'tool result references a tool call missing from the provider request',
+      retryable: true,
       statusCode,
     };
   }

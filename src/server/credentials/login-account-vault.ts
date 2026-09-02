@@ -13,9 +13,9 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
-import { getSqliteDatabase, runSqliteTransaction, sqliteDatabasePath } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabase, queryDatabaseOne, runDatabaseTransaction, type DatabaseExecutor } from '@/server/db/database';
 import { appDataRoot } from '@/server/storage/paths';
-import { queueSqliteWrite, type SqliteWriteStatement } from '@/server/storage/sqlite-write-queue';
+import { queueDatabaseWrite, type DatabaseWriteStatement } from '@/server/storage/database-write-queue';
 
 export type LoginAccountStatus = 'active' | 'disabled';
 
@@ -74,7 +74,7 @@ export type UpdateLoginAccountInput = {
 type LoginAccountRow = {
   id: string;
   user_id: string;
-  shared: number;
+  shared: boolean | number;
   domain: string;
   username: string;
   label: string;
@@ -104,7 +104,6 @@ const metadataColumns = `
 `;
 const keyFileName = 'credential-master.key';
 let cachedMasterKey: Buffer | undefined;
-const migratedDatabasePaths = new Set<string>();
 
 function now() {
   return new Date().toISOString();
@@ -295,47 +294,6 @@ function decryptPassword(row: LoginAccountRow) {
   }
 }
 
-function ensureLoginAccountUserMigration() {
-  const databasePath = sqliteDatabasePath();
-  if (migratedDatabasePaths.has(databasePath)) return;
-  runSqliteTransaction((database) => {
-    const migrationKey = 'login-account-default-user-migrated';
-    const applied = database.prepare('SELECT 1 FROM runtime_meta WHERE key = ?').get(migrationKey);
-    if (applied) return;
-    const legacyRows = database.prepare(`
-      SELECT * FROM login_account WHERE user_id = 'default' OR TRIM(user_id) = ''
-    `).all() as LoginAccountRow[];
-    for (const row of legacyRows) {
-      const password = decryptPassword(row);
-      const existing = database.prepare(`
-        SELECT * FROM login_account
-        WHERE user_id = '0' AND domain = ? AND username = ?
-      `).get(row.domain, row.username) as LoginAccountRow | undefined;
-      if (existing && existing.updated_at >= row.updated_at) {
-        database.prepare('DELETE FROM login_account WHERE id = ?').run(row.id);
-        continue;
-      }
-      if (existing) database.prepare('DELETE FROM login_account WHERE id = ?').run(existing.id);
-      const migratedIdentity = {
-        id: row.id,
-        user_id: '0',
-        domain: row.domain,
-        username: row.username,
-      };
-      database.prepare(`
-        UPDATE login_account
-        SET user_id = '0', password_envelope = ?
-        WHERE id = ?
-      `).run(encryptPassword(password, migratedIdentity), row.id);
-    }
-    database.prepare(`
-      INSERT INTO runtime_meta (key, value, updated_at)
-      VALUES (?, 'complete', ?)
-    `).run(migrationKey, now());
-  });
-  migratedDatabasePaths.add(databasePath);
-}
-
 function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {
   return {
     id: row.id,
@@ -354,52 +312,48 @@ function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {
   };
 }
 
-function metadataById(id: string, userId: string) {
-  ensureLoginAccountUserMigration();
-  return getSqliteDatabase().prepare(`
+function metadataById(id: string, userId: string, database?: DatabaseExecutor) {
+  return queryDatabaseOne<LoginAccountRow>(`
     SELECT ${metadataColumns}
     FROM login_account
-    WHERE id = ? AND (user_id = ? OR shared = 1)
-  `).get(id, userId) as LoginAccountRow | undefined;
+    WHERE id = ? AND (user_id = ? OR shared = ?)
+  `, [id, userId, true], database);
 }
 
-function fullRowById(id: string, userId: string) {
-  ensureLoginAccountUserMigration();
-  return getSqliteDatabase().prepare(`
-    SELECT * FROM login_account WHERE id = ? AND (user_id = ? OR shared = 1)
-  `).get(id, userId) as LoginAccountRow | undefined;
+function fullRowById(id: string, userId: string, database?: DatabaseExecutor) {
+  return queryDatabaseOne<LoginAccountRow>(`
+    SELECT * FROM login_account WHERE id = ? AND (user_id = ? OR shared = ?)
+  `, [id, userId, true], database);
 }
 
-export function listLoginAccounts(input: { userId?: unknown; domain?: unknown } = {}) {
-  ensureLoginAccountUserMigration();
+export async function listLoginAccounts(input: { userId?: unknown; domain?: unknown } = {}) {
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = typeof input.domain === 'string' && input.domain.trim()
     ? normalizeLoginAccountDomain(input.domain)
     : '';
-  const rows = (domain
-    ? getSqliteDatabase().prepare(`
+  const rows = domain
+    ? await queryDatabase<LoginAccountRow>(`
         SELECT ${metadataColumns}
         FROM login_account
-        WHERE (user_id = ? OR shared = 1) AND domain = ?
+        WHERE (user_id = ? OR shared = ?) AND domain = ?
         ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
-      `).all(userId, domain, userId)
-    : getSqliteDatabase().prepare(`
+      `, [userId, true, domain, userId])
+    : await queryDatabase<LoginAccountRow>(`
         SELECT ${metadataColumns}
         FROM login_account
-        WHERE user_id = ? OR shared = 1
+        WHERE user_id = ? OR shared = ?
         ORDER BY CASE WHEN user_id = ? THEN 0 ELSE 1 END, updated_at DESC
-      `).all(userId, userId)) as LoginAccountRow[];
+      `, [userId, true, userId]);
   return rows.map(metadataFromRow);
 }
 
-export function exportLoginAccountCredentials(userId?: unknown): LoginAccountPortableRecord[] {
-  ensureLoginAccountUserMigration();
+export async function exportLoginAccountCredentials(userId?: unknown): Promise<LoginAccountPortableRecord[]> {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  const rows = getSqliteDatabase().prepare(`
+  const rows = await queryDatabase<LoginAccountRow>(`
     SELECT * FROM login_account
     WHERE user_id = ?
     ORDER BY updated_at DESC
-  `).all(normalizedUserId) as LoginAccountRow[];
+  `, [normalizedUserId]);
   return rows.map((row) => ({
     domain: row.domain,
     username: row.username,
@@ -411,14 +365,13 @@ export function exportLoginAccountCredentials(userId?: unknown): LoginAccountPor
   }));
 }
 
-export function getLoginAccountById(id: string, userId?: unknown) {
+export async function getLoginAccountById(id: string, userId?: unknown) {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  const row = metadataById(id.trim(), normalizedUserId);
+  const row = await metadataById(id.trim(), normalizedUserId);
   return row ? metadataFromRow(row) : undefined;
 }
 
-export function createLoginAccount(input: CreateLoginAccountInput) {
-  ensureLoginAccountUserMigration();
+export async function createLoginAccount(input: CreateLoginAccountInput) {
   const userId = normalizeLoginAccountUserId(input.userId);
   const domain = normalizeLoginAccountDomain(input.domain);
   const username = normalizeUsername(input.username);
@@ -436,15 +389,15 @@ export function createLoginAccount(input: CreateLoginAccountInput) {
   };
   const passwordEnvelope = encryptPassword(input.password, identity);
   try {
-    getSqliteDatabase().prepare(`
+    await executeDatabase(`
       INSERT INTO login_account (
         id, user_id, shared, domain, username, label, login_url, status,
         password_envelope, created_at, updated_at, last_used_at, use_count
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0)
-    `).run(
+    `, [
       id,
       userId,
-      shared ? 1 : 0,
+      shared,
       domain,
       username,
       label,
@@ -453,23 +406,22 @@ export function createLoginAccount(input: CreateLoginAccountInput) {
       passwordEnvelope,
       timestamp,
       timestamp,
-    );
+    ]);
   } catch (error) {
-    if (/UNIQUE constraint failed/i.test(error instanceof Error ? error.message : String(error))) {
+    if (/unique|duplicate/i.test(error instanceof Error ? error.message : String(error))) {
       throw new Error('该域名和登录账号已经存在');
     }
     throw error;
   }
-  return getLoginAccountById(id, userId)!;
+  return (await getLoginAccountById(id, userId))!;
 }
 
-export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, userId?: unknown) {
-  ensureLoginAccountUserMigration();
+export async function updateLoginAccount(id: string, input: UpdateLoginAccountInput, userId?: unknown) {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  return runSqliteTransaction((database) => {
-    const previous = database.prepare(`
+  return runDatabaseTransaction(async (database) => {
+    const previous = await queryDatabaseOne<LoginAccountRow>(`
       SELECT * FROM login_account WHERE id = ? AND user_id = ?
-    `).get(id.trim(), normalizedUserId) as LoginAccountRow | undefined;
+    `, [id.trim(), normalizedUserId], database);
     if (!previous) return undefined;
 
     const domain = input.domain === undefined ? previous.domain : normalizeLoginAccountDomain(input.domain);
@@ -494,46 +446,46 @@ export function updateLoginAccount(id: string, input: UpdateLoginAccountInput, u
     }
     const timestamp = now();
     try {
-      database.prepare(`
+      await executeDatabase(`
         UPDATE login_account
         SET domain = ?, username = ?, label = ?, login_url = ?, status = ?, shared = ?,
             password_envelope = ?, updated_at = ?
         WHERE id = ? AND user_id = ?
-      `).run(
+      `, [
         domain,
         username,
         label,
         loginUrl,
         status,
-        shared ? 1 : 0,
+        shared,
         passwordEnvelope,
         timestamp,
         previous.id,
         previous.user_id,
-      );
+      ], database);
     } catch (error) {
-      if (/UNIQUE constraint failed/i.test(error instanceof Error ? error.message : String(error))) {
+      if (/unique|duplicate/i.test(error instanceof Error ? error.message : String(error))) {
         throw new Error('该域名和登录账号已经存在');
       }
       throw error;
     }
-    const updated = database.prepare(`
+    const updated = await queryDatabaseOne<LoginAccountRow>(`
       SELECT ${metadataColumns}
       FROM login_account
       WHERE id = ? AND user_id = ?
-    `).get(previous.id, previous.user_id) as LoginAccountRow;
+    `, [previous.id, previous.user_id], database);
+    if (!updated) return undefined;
     return metadataFromRow(updated);
   });
 }
 
 export async function importLoginAccountsQueued(items: CreateLoginAccountInput[], userId?: unknown) {
-  ensureLoginAccountUserMigration();
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  const existing = getSqliteDatabase().prepare(`
+  const existing = await queryDatabase<LoginAccountRow>(`
     SELECT * FROM login_account WHERE user_id = ?
-  `).all(normalizedUserId) as LoginAccountRow[];
+  `, [normalizedUserId]);
   const byIdentity = new Map(existing.map((row) => [`${row.domain}\u0001${row.username}`, row]));
-  const statements: SqliteWriteStatement[] = [];
+  const statements: DatabaseWriteStatement[] = [];
   let created = 0;
   let updated = 0;
   for (const input of items) {
@@ -566,7 +518,7 @@ export async function importLoginAccountsQueued(items: CreateLoginAccountInput[]
       params: [
         id,
         normalizedUserId,
-        input.shared === true ? 1 : 0,
+        input.shared === true,
         domain,
         username,
         normalizeLabel(input.label, username),
@@ -582,7 +534,7 @@ export async function importLoginAccountsQueued(items: CreateLoginAccountInput[]
     byIdentity.set(identityKey, {
       id,
       user_id: normalizedUserId,
-      shared: input.shared === true ? 1 : 0,
+      shared: input.shared === true,
       domain,
       username,
       label: normalizeLabel(input.label, username),
@@ -594,22 +546,21 @@ export async function importLoginAccountsQueued(items: CreateLoginAccountInput[]
       use_count: 0,
     });
   }
-  await queueSqliteWrite(statements);
+  await queueDatabaseWrite(statements);
   return { created, updated };
 }
 
-export function deleteLoginAccount(id: string, userId?: unknown) {
-  ensureLoginAccountUserMigration();
+export async function deleteLoginAccount(id: string, userId?: unknown) {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  const result = getSqliteDatabase().prepare(`
-    DELETE FROM login_account WHERE id = ? AND user_id = ?
-  `).run(id.trim(), normalizedUserId);
-  return Number(result.changes) > 0;
+  const rows = await queryDatabase<{ id: string }>(`
+    DELETE FROM login_account WHERE id = ? AND user_id = ? RETURNING id
+  `, [id.trim(), normalizedUserId]);
+  return rows.length > 0;
 }
 
 type ResolveCredentialOptions = { trackUsage?: boolean };
 
-function resolveCredentialRow(row: LoginAccountRow, options: ResolveCredentialOptions = {}): LoginAccountCredential | undefined {
+async function resolveCredentialRow(row: LoginAccountRow, options: ResolveCredentialOptions = {}): Promise<LoginAccountCredential | undefined> {
   if (row.status !== 'active') return undefined;
   const password = decryptPassword(row);
   if (options.trackUsage === false) {
@@ -619,11 +570,11 @@ function resolveCredentialRow(row: LoginAccountRow, options: ResolveCredentialOp
     };
   }
   const timestamp = now();
-  getSqliteDatabase().prepare(`
+  await executeDatabase(`
     UPDATE login_account
     SET last_used_at = ?, use_count = use_count + 1
     WHERE id = ? AND user_id = ?
-  `).run(timestamp, row.id, row.user_id);
+  `, [timestamp, row.id, row.user_id]);
   return {
     account: metadataFromRow({
       ...row,
@@ -635,8 +586,8 @@ function resolveCredentialRow(row: LoginAccountRow, options: ResolveCredentialOp
   };
 }
 
-export function resolveLoginAccountCredentialById(id: string, userId?: unknown, options: ResolveCredentialOptions = {}) {
+export async function resolveLoginAccountCredentialById(id: string, userId?: unknown, options: ResolveCredentialOptions = {}) {
   const normalizedUserId = normalizeLoginAccountUserId(userId);
-  const row = fullRowById(id.trim(), normalizedUserId);
+  const row = await fullRowById(id.trim(), normalizedUserId);
   return row ? resolveCredentialRow(row, options) : undefined;
 }

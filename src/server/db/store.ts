@@ -36,7 +36,7 @@ import {
   writeSkillRecord,
   writeSkillRecords,
   writeSkillRecordsQueued,
-} from '@/server/storage/sqlite-record-store';
+} from '@/server/storage/database-record-store';
 
 type ConfigStoreData = {
   runtimeEnv: RuntimeEnvRecord[];
@@ -243,39 +243,39 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   };
 }
 
-function readConfigData(): ConfigStoreData {
-  const stored = readConfigRecord() as Partial<ConfigStoreData>;
+async function readConfigData(): Promise<ConfigStoreData> {
+  const stored = await readConfigRecord() as Partial<ConfigStoreData>;
   return {
     runtimeEnv: stored.runtimeEnv || [],
     modelConfig: stored.modelConfig,
   };
 }
 
-function writeConfigData(data: ConfigStoreData) {
-  writeConfigRecord(data);
+async function writeConfigData(data: ConfigStoreData) {
+  await writeConfigRecord(data);
 }
 
 export const store = {
-  listSkills(
+  async listSkills(
     query?: string,
     userId?: string | number,
     limit?: number,
     cursor: { beforeId?: string; beforeUpdatedAt?: string } = {},
   ) {
-    return readSkills(normalizeApplicationUserId(userId), { ...cursor, query, limit })
+    return (await readSkills(normalizeApplicationUserId(userId), { ...cursor, query, limit }))
       .map(normalizeSkillRecord);
   },
-  getSkill(skillId: string, userId?: string | number) {
-    const skill = readSkillById(skillId, normalizeApplicationUserId(userId));
+  async getSkill(skillId: string, userId?: string | number) {
+    const skill = await readSkillById(skillId, normalizeApplicationUserId(userId));
     return skill ? normalizeSkillRecord(skill) : undefined;
   },
-  getSkills(skillIds: string[] = [], userId?: string | number) {
-    const byId = new Map(readSkillsByIds(skillIds, normalizeApplicationUserId(userId))
+  async getSkills(skillIds: string[] = [], userId?: string | number) {
+    const byId = new Map((await readSkillsByIds(skillIds, normalizeApplicationUserId(userId)))
       .map(normalizeSkillRecord)
       .map((skill) => [skill.id, skill]));
     return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
   },
-  upsertSkill(input: {
+  async upsertSkill(input: {
     id?: string;
     title: string;
     description: string;
@@ -288,7 +288,7 @@ export const store = {
   }) {
     const userId = normalizeApplicationUserId(input.userId);
     const timestamp = now();
-    const storedExisting = input.id ? readSkillById(input.id) : undefined;
+    const storedExisting = input.id ? await readSkillById(input.id) : undefined;
     if (storedExisting && normalizeApplicationUserId(storedExisting.userId) !== userId) {
       throw new Error('Only the Skill creator can edit this shared Skill.');
     }
@@ -307,10 +307,10 @@ export const store = {
       createdAt: existing?.createdAt || timestamp,
       updatedAt: timestamp,
     });
-    writeSkillRecord(skill, userId);
+    await writeSkillRecord(skill, userId);
     return skill;
   },
-  upsertSkillsBatch(inputs: Array<{
+  async upsertSkillsBatch(inputs: Array<{
     id?: string;
     title: string;
     description: string;
@@ -321,7 +321,7 @@ export const store = {
     shared?: boolean;
     userId?: string | number;
   }>, options: { queued?: boolean } = {}) {
-    const existingById = new Map(readSkills().map((skill) => [skill.id, normalizeSkillRecord(skill)]));
+    const existingById = new Map((await readSkills()).map((skill) => [skill.id, normalizeSkillRecord(skill)]));
     const records = inputs.map((input) => {
       const userId = normalizeApplicationUserId(input.userId);
       const existing = input.id ? existingById.get(input.id) : undefined;
@@ -347,19 +347,20 @@ export const store = {
       return { skill, userId };
     });
     if (options.queued) {
-      return writeSkillRecordsQueued(records).then(() => records.map((item) => item.skill));
+      await writeSkillRecordsQueued(records);
+      return records.map((item) => item.skill);
     }
-    writeSkillRecords(records);
+    await writeSkillRecords(records);
     return records.map((item) => item.skill);
   },
-  deleteSkill(skillId: string, userId?: string | number) {
+  async deleteSkill(skillId: string, userId?: string | number) {
     return deleteSkillRecord(skillId, normalizeApplicationUserId(userId));
   },
-  listRuntimeEnv() {
-    return readConfigData().runtimeEnv;
+  async listRuntimeEnv() {
+    return (await readConfigData()).runtimeEnv;
   },
-  listSensitiveDataEvaluationCases() {
-    const serialized = readRuntimeMeta(sensitiveDataEvaluationCasesMetaKey);
+  async listSensitiveDataEvaluationCases() {
+    const serialized = await readRuntimeMeta(sensitiveDataEvaluationCasesMetaKey);
     if (!serialized) return normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
     try {
       const storedCases = normalizeSensitiveDataEvaluationCases(JSON.parse(serialized));
@@ -373,16 +374,16 @@ export const store = {
       return normalizeSensitiveDataEvaluationCases(DEFAULT_SENSITIVE_DATA_EVALUATION_CASES);
     }
   },
-  saveSensitiveDataEvaluationCases(cases: SensitiveDataEvaluationCase[]) {
+  async saveSensitiveDataEvaluationCases(cases: SensitiveDataEvaluationCase[]) {
     const sensitiveDataEvaluationCases = normalizeSensitiveDataEvaluationCases(cases);
-    writeRuntimeMeta(sensitiveDataEvaluationCasesMetaKey, JSON.stringify(sensitiveDataEvaluationCases));
+    await writeRuntimeMeta(sensitiveDataEvaluationCasesMetaKey, JSON.stringify(sensitiveDataEvaluationCases));
     return sensitiveDataEvaluationCases;
   },
-  getModelConfig() {
-    return normalizeStoredModelConfig(readConfigData().modelConfig);
+  async getModelConfig() {
+    return normalizeStoredModelConfig((await readConfigData()).modelConfig);
   },
-  saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers'>) {
-    const data = readConfigData();
+  async saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers'>) {
+    const data = await readConfigData();
     const existing = normalizeStoredModelConfig(data.modelConfig);
     const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
     const timestamp = now();
@@ -411,12 +412,12 @@ export const store = {
       };
     }
     const config: ModelConfigRecord = { provider: input.provider, providers, updatedAt: timestamp };
-    writeConfigData({ ...data, modelConfig: config });
+    await writeConfigData({ ...data, modelConfig: config });
     applyModelConfig(config);
     return config;
   },
-  saveRuntimeEnv(items: Array<Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'>>) {
-    const data = readConfigData();
+  async saveRuntimeEnv(items: Array<Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secret'>>) {
+    const data = await readConfigData();
     const runtimeEnv = items.filter((item) => item.key.trim()).map((item) => ({
       key: item.key.trim(),
       value: item.value,
@@ -424,11 +425,11 @@ export const store = {
       secret: item.secret,
       updatedAt: now(),
     }));
-    writeConfigData({ ...data, runtimeEnv });
+    await writeConfigData({ ...data, runtimeEnv });
     return runtimeEnv;
   },
-  applyRuntimeEnv() {
-    const data = readConfigData();
+  async applyRuntimeEnv() {
+    const data = await readConfigData();
     const allowedKeys = new Set(runtimeEnvKeys);
     const savedByKey = new Map(data.runtimeEnv.filter((item) => allowedKeys.has(item.key)).map((item) => [item.key, item]));
     for (const definition of runtimeEnvDefinitions) {

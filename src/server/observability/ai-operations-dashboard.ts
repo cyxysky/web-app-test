@@ -1,6 +1,6 @@
-import { getSqliteDatabase } from '@/server/storage/sqlite-database';
+import { queryDatabase, queryDatabaseOne } from '@/server/db/database';
 import { runtimeMetricsSnapshot } from '@/server/observability/runtime-observability';
-import { sqliteWriteQueueSnapshot } from '@/server/storage/sqlite-write-queue';
+import { databaseWriteQueueSnapshot } from '@/server/storage/database-write-queue';
 import { cpuWorkerPoolSnapshot } from '@/server/runtime/cpu-worker-pool';
 import { readArchivedAiOperationsChatSessions } from '@/server/observability/ai-operations-chat-archive';
 
@@ -95,7 +95,7 @@ export type AiOperationsDashboardData = {
   rangeDays: number;
   runtime: {
     cpuWorkers: ReturnType<typeof cpuWorkerPoolSnapshot>;
-    sqliteWrites: ReturnType<typeof sqliteWriteQueueSnapshot>;
+    databaseWrites: ReturnType<typeof databaseWriteQueueSnapshot>;
   };
   systems: AiOperationsSystemMetric[];
   timezone: string;
@@ -372,59 +372,62 @@ function boundedRangeDays(value: number) {
   return 90;
 }
 
-export function readAiOperationsDashboard(
+export async function readAiOperationsDashboard(
   rangeDaysValue = 30,
   trendUserIdValue?: unknown,
-): AiOperationsDashboardData {
+): Promise<AiOperationsDashboardData> {
   const rangeDays = boundedRangeDays(rangeDaysValue);
   const trendUserId = text(trendUserIdValue) || undefined;
   const now = new Date();
   const since = new Date(now.getTime() - (rangeDays - 1) * 24 * 60 * 60 * 1000);
   since.setUTCHours(0, 0, 0, 0);
   const sinceIso = since.toISOString();
-  const database = getSqliteDatabase();
-
-  const sessions = database.prepare(`
+  const [sessions, allLiveSessions, archivedChatSessions, messages, steps, logs,
+    automationRuns, automationCases, scheduleCount] = await Promise.all([
+    queryDatabase<SessionRow>(`
     SELECT id, user_id, title, status, summary_json, created_at, updated_at
     FROM browser_chat_session
     WHERE updated_at >= ?
-  `).all(sinceIso) as SessionRow[];
-  const liveSessionIds = new Set((database.prepare(`
+  `, [sinceIso]),
+    queryDatabase<{ id: string }>(`
     SELECT id FROM browser_chat_session
-  `).all() as Array<{ id: string }>).map((row) => row.id));
-  const archivedChatSessions = readArchivedAiOperationsChatSessions();
-  const messages = database.prepare(`
+  `),
+    readArchivedAiOperationsChatSessions(),
+    queryDatabase<MessageRow>(`
     SELECT message.session_id, message.time, message.record_json, session.user_id
     FROM browser_chat_message AS message
     JOIN browser_chat_session AS session ON session.id = message.session_id
     WHERE message.time >= ?
     ORDER BY message.time ASC
-  `).all(sinceIso) as MessageRow[];
-  const steps = database.prepare(`
+  `, [sinceIso]),
+    queryDatabase<StepRow>(`
     SELECT step.session_id, step.record_json, session.user_id
     FROM browser_chat_step AS step
     JOIN browser_chat_session AS session ON session.id = step.session_id
     WHERE session.updated_at >= ?
-  `).all(sinceIso) as StepRow[];
-  const logs = database.prepare(`
+  `, [sinceIso]),
+    queryDatabase<LogRow>(`
     SELECT log.session_id, log.time, log.record_json, session.user_id
     FROM browser_chat_log AS log
     JOIN browser_chat_session AS session ON session.id = log.session_id
     WHERE log.time >= ?
     ORDER BY log.time ASC
-  `).all(sinceIso) as LogRow[];
-  const automationRuns = database.prepare(`
+  `, [sinceIso]),
+    queryDatabase<AutomationRunRow>(`
     SELECT id, user_id, case_id, status, record_json, created_at, updated_at
     FROM automation_run
     WHERE updated_at >= ?
     ORDER BY updated_at DESC
-  `).all(sinceIso) as AutomationRunRow[];
-  const automationCases = database.prepare(`
+  `, [sinceIso]),
+    queryDatabase<AutomationCaseRow>(`
     SELECT id, title, record_json FROM automation_case
-  `).all() as AutomationCaseRow[];
-  const enabledSchedules = numberValue((database.prepare(`
-    SELECT COUNT(*) AS count FROM automation_schedule WHERE enabled = 1
-  `).get() as { count?: number } | undefined)?.count);
+  `),
+    queryDatabaseOne<{ count?: number }>(`
+      SELECT COUNT(*) AS count FROM automation_schedule WHERE enabled = ?
+    `, [true]),
+  ]);
+  const liveSessionIds = new Set(allLiveSessions.map((row) => row.id));
+  const enabledSchedules = numberValue(scheduleCount?.count);
 
   const sessionById = new Map(sessions.map((row) => [row.id, {
     ...row,
@@ -723,7 +726,7 @@ export function readAiOperationsDashboard(
     rangeDays,
     runtime: {
       cpuWorkers: cpuWorkerPoolSnapshot(),
-      sqliteWrites: sqliteWriteQueueSnapshot(),
+      databaseWrites: databaseWriteQueueSnapshot(),
     },
     systems: [...systems.values()]
       .map((item) => ({ ...item, successRate: successRate(item.passed, item.failed, item.blocked) }))

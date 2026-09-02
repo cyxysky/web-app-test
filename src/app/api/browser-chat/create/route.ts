@@ -16,8 +16,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'browser-chat.create',
       userId,
-    }, () => {
-      const session = createBrowserChatSession({
+    }, async () => {
+      const session = await createBrowserChatSession({
         targetUrl: body.targetUrl,
         safetyMode: body.safetyMode,
         modelProvider: body.modelProvider,

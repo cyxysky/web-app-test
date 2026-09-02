@@ -36,7 +36,7 @@ export async function POST(request: NextRequest) {
         status: 413,
       });
     }
-    const saved = saveBrowserDomainCookie(authenticatedUserId, body.domain, cookie);
+    const saved = await saveBrowserDomainCookie(authenticatedUserId, body.domain, cookie);
     return apiJson(request, saved, { status: 201 });
   } catch (error) {
     const normalized = error instanceof ApiRequestError

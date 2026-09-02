@@ -14,7 +14,7 @@ export async function PUT(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await parseJsonRequest(request, setBrowserChatGroupRequestSchema, { maxBytes: 16 * 1024 });
-    const session = setBrowserChatSessionGroup(sessionId, body.groupId, requestApplicationUserId(request));
+    const session = await setBrowserChatSessionGroup(sessionId, body.groupId, requestApplicationUserId(request));
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {

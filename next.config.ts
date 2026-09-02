@@ -28,7 +28,19 @@ export default function nextConfig(phase: string): NextConfig {
       webpackMemoryOptimizations: true,
       preloadEntriesOnStart: false,
     },
+    webpack(config, { dev }) {
+      if (dev && config.cache && typeof config.cache === 'object' && config.cache.type === 'filesystem') {
+        // The browser-chat UI produces very large persistent cache packs. Copy
+        // deserialized slices into right-sized buffers so a small cached value
+        // cannot keep an entire decompressed pack alive in the Node heap.
+        config.cache.allowCollectingMemory = true;
+      }
+      return config;
+    },
     serverExternalPackages: [
+      'typeorm',
+      'better-sqlite3',
+      'pg',
       'playwright',
       'pdf-parse',
       'ai-sdk-provider-gemini-cli',

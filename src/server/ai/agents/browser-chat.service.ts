@@ -37,6 +37,12 @@ import {
 import { browserChatFirstMessageTitle } from '@/server/ai/agents/browser-chat-message-title';
 import { browserChatSessionTitleParts } from '@/lib/browser-chat-title';
 import {
+  browserChatExecutionParts,
+  browserChatFinalBlocksToParts,
+  type BrowserChatFinalBlock,
+  type BrowserChatUIMessagePart,
+} from '@/lib/browser-chat-ui-message';
+import {
   browserChatArtifactsFromSteps,
   mergeBrowserChatArtifactSummaries,
   type BrowserChatArtifactSummary,
@@ -140,11 +146,10 @@ import {
   readBrowserChatSessionRecord,
   readBrowserChatSessionSummaries,
   writeBrowserChatSessionDeltaQueued,
-} from '@/server/storage/sqlite-record-store';
+} from '@/server/storage/database-record-store';
 import {
   BROWSER_CHAT_MESSAGE_PAGE_SIZE,
   readAllBrowserChatMessages,
-  readAllBrowserChatSteps,
   readBrowserChatSessionHeader,
   readBrowserChatSessionOwner,
   readBrowserChatSessionWindow,
@@ -155,7 +160,7 @@ import {
   enforceBrowserChatArtifactQuota,
   scheduleBrowserChatArtifactMaintenance,
 } from '@/server/storage/browser-chat-artifact-lifecycle';
-import { scheduleSqliteMaintenance } from '@/server/storage/sqlite-maintenance';
+import { scheduleDatabaseMaintenance } from '@/server/storage/database-maintenance';
 import {
   applyBrowserChatPersistenceDelta,
   collectBrowserChatPersistenceDelta,
@@ -177,6 +182,7 @@ export type BrowserChatMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  parts?: BrowserChatUIMessagePart[];
   createdAt: string;
   updatedAt?: string;
   clientMessageId?: string;
@@ -359,7 +365,7 @@ type BrowserChatRuntimeState = {
   }>;
   pendingPersistTimers: Map<string, ReturnType<typeof setTimeout>>;
   streamPublisher?: LatestOnlyAsyncScheduler<string, string>;
-  pendingSqliteWrites: Map<string, Promise<boolean>>;
+  pendingDatabaseWrites: Map<string, Promise<boolean>>;
   sessionEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
   selectedSessionIds: Map<string, string>;
   persistenceCursors: Map<string, BrowserChatPersistenceCursor>;
@@ -371,8 +377,16 @@ type BrowserChatRuntimeState = {
   browserIdleEpochs: Map<string, number>;
   browserIdleTimers: Map<string, ReturnType<typeof setTimeout>>;
   browserPreviewCounts: Map<string, number>;
+  uiStreamListeners: Map<string, Set<BrowserChatUIStreamListener>>;
   lastPersistWarningAt: number;
 };
+
+export type BrowserChatUIStreamUpdate = {
+  message?: BrowserChatMessage;
+  steps: StepExecutionResult[];
+};
+
+type BrowserChatUIStreamListener = (update: BrowserChatUIStreamUpdate) => void;
 
 const browserChatRuntimeState: BrowserChatRuntimeState = ((globalThis as typeof globalThis & {
   __browserChatRuntimeState?: BrowserChatRuntimeState;
@@ -389,7 +403,7 @@ const browserChatRuntimeState: BrowserChatRuntimeState = ((globalThis as typeof 
     promise: Promise<BrowserToolConfirmationDecision>;
   }>(),
   pendingPersistTimers: new Map<string, ReturnType<typeof setTimeout>>(),
-  pendingSqliteWrites: new Map<string, Promise<boolean>>(),
+  pendingDatabaseWrites: new Map<string, Promise<boolean>>(),
   sessionEvictionTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   selectedSessionIds: new Map<string, string>(),
   persistenceCursors: new Map<string, BrowserChatPersistenceCursor>(),
@@ -401,6 +415,7 @@ const browserChatRuntimeState: BrowserChatRuntimeState = ((globalThis as typeof 
   browserIdleEpochs: new Map<string, number>(),
   browserIdleTimers: new Map<string, ReturnType<typeof setTimeout>>(),
   browserPreviewCounts: new Map<string, number>(),
+  uiStreamListeners: new Map<string, Set<BrowserChatUIStreamListener>>(),
   lastPersistWarningAt: 0,
 });
 browserChatRuntimeState.sessions ??= new Map();
@@ -411,7 +426,7 @@ browserChatRuntimeState.subagentResults ??= new Map();
 browserChatRuntimeState.interruptedAssistantMessageIds ??= new Set();
 browserChatRuntimeState.toolConfirmations ??= new Map();
 browserChatRuntimeState.pendingPersistTimers ??= new Map();
-browserChatRuntimeState.pendingSqliteWrites ??= new Map();
+browserChatRuntimeState.pendingDatabaseWrites ??= new Map();
 browserChatRuntimeState.sessionEvictionTimers ??= new Map();
 browserChatRuntimeState.selectedSessionIds ??= new Map();
 browserChatRuntimeState.persistenceCursors ??= new Map();
@@ -423,6 +438,7 @@ browserChatRuntimeState.memoryExtractionQueue ??= [];
 browserChatRuntimeState.browserIdleEpochs ??= new Map();
 browserChatRuntimeState.browserIdleTimers ??= new Map();
 browserChatRuntimeState.browserPreviewCounts ??= new Map();
+browserChatRuntimeState.uiStreamListeners ??= new Map();
 
 const sessions = browserChatRuntimeState.sessions;
 const activeTurns = browserChatRuntimeState.activeTurns;
@@ -432,7 +448,7 @@ const subagentResults = browserChatRuntimeState.subagentResults;
 const interruptedAssistantMessageIds = browserChatRuntimeState.interruptedAssistantMessageIds;
 const toolConfirmations = browserChatRuntimeState.toolConfirmations;
 const pendingPersistTimers = browserChatRuntimeState.pendingPersistTimers;
-const pendingSqliteWrites = browserChatRuntimeState.pendingSqliteWrites;
+const pendingDatabaseWrites = browserChatRuntimeState.pendingDatabaseWrites;
 const sessionEvictionTimers = browserChatRuntimeState.sessionEvictionTimers;
 const selectedSessionIds = browserChatRuntimeState.selectedSessionIds;
 const persistenceCursors = browserChatRuntimeState.persistenceCursors;
@@ -440,6 +456,7 @@ const dirtyRecords = browserChatRuntimeState.dirtyRecords;
 const browserIdleEpochs = browserChatRuntimeState.browserIdleEpochs;
 const browserIdleTimers = browserChatRuntimeState.browserIdleTimers;
 const browserPreviewCounts = browserChatRuntimeState.browserPreviewCounts;
+const uiStreamListeners = browserChatRuntimeState.uiStreamListeners;
 
 type BrowserChatMemoryEstimate = {
   bytes: number;
@@ -524,7 +541,7 @@ function browserChatMemoryDiagnostics() {
     subagentResultSessions: subagentResults.size,
     pendingToolConfirmations: toolConfirmations.size,
     pendingPersistTimers: pendingPersistTimers.size,
-    pendingSqliteWrites: pendingSqliteWrites.size,
+    pendingDatabaseWrites: pendingDatabaseWrites.size,
     persistenceCursors: persistenceCursors.size,
     dirtyRecordSets: dirtyRecords.size,
     memoryExtractionActive: browserChatRuntimeState.memoryExtractionActive,
@@ -603,10 +620,10 @@ const memoryDiagnosticProviders = ((globalThis as typeof globalThis & {
 }).__webpilotMemoryDiagnosticProviders ??= new Map());
 memoryDiagnosticProviders.set('browserChat', browserChatMemoryDiagnostics);
 
-scheduleBrowserChatArtifactMaintenance(() => (
-  readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>().map((session) => session.id)
+scheduleBrowserChatArtifactMaintenance(async () => (
+  (await readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>()).map((session) => session.id)
 ));
-scheduleSqliteMaintenance();
+scheduleDatabaseMaintenance();
 function browserChatNoVncUrl(session: Pick<BrowserChatSessionSnapshot, 'id' | 'userId'>) {
   const template = String(process.env.BROWSER_CHAT_NOVNC_URL || process.env.NEXT_PUBLIC_BROWSER_CHAT_NOVNC_URL || '').trim();
   if (!template) return undefined;
@@ -662,7 +679,7 @@ function browserChatSessionHasRuntimeWork(session: BrowserChatSessionRecord) {
 
 function evictBrowserChatSessionRuntime(sessionId: string) {
   const session = sessions.get(sessionId);
-  if (!session || browserChatSessionHasRuntimeWork(session) || pendingPersistTimers.has(sessionId) || pendingSqliteWrites.has(sessionId)) return false;
+  if (!session || browserChatSessionHasRuntimeWork(session) || pendingPersistTimers.has(sessionId) || pendingDatabaseWrites.has(sessionId)) return false;
   browserChatRuntimeState.streamPublisher?.cancel(sessionId);
   sessions.delete(sessionId);
   persistenceCursors.delete(sessionId);
@@ -676,7 +693,7 @@ function evictBrowserChatSessionRuntime(sessionId: string) {
 function compactIdleBrowserChatSessionRuntime(sessionId: string) {
   const session = sessions.get(sessionId);
   if (!session || browserChatSessionHasActiveRuntimeWork(session)) return false;
-  if (pendingPersistTimers.has(sessionId) || pendingSqliteWrites.has(sessionId)) return false;
+  if (pendingPersistTimers.has(sessionId) || pendingDatabaseWrites.has(sessionId)) return false;
   session.runtimeHasPersistedMessages = session.runtimeHasPersistedMessages || session.messages.length > 0;
   session.messages = [];
   session.steps = [];
@@ -712,9 +729,9 @@ async function releaseInactiveBrowserChatSessionRuntime(sessionId: string) {
     session.started = false;
     await browser.close({ preservePages: true }).catch(() => undefined);
   }
-  const persisted = persistSession(sessionId, { mergePersisted: false });
+  const persisted = await persistSession(sessionId, { mergePersisted: false });
   if (!persisted) return false;
-  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  const pendingWrite = pendingDatabaseWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
   if (browserChatSessionIsSelected(session) || browserChatSessionHasActiveRuntimeWork(session)) return false;
   session.logs = [];
@@ -931,7 +948,7 @@ function replaceSessionLogs(session: BrowserChatSessionRecord, nextLogs: Browser
     }
   }
   // Trimming is only an in-memory ring-buffer operation. Older logs remain in
-  // SQLite and are read through the paginated history endpoint when requested.
+  // the backend database and are read through the paginated history endpoint when requested.
 }
 
 function browserChatLogStorageLimit() {
@@ -961,7 +978,7 @@ function browserChatMemoryUrl(browser: BrowserSession | undefined, session: Pick
   return currentUrl || session.targetUrl || '';
 }
 
-function browserChatPersonalMemoryContext(input: {
+async function browserChatPersonalMemoryContext(input: {
   session: BrowserChatSessionRecord;
   browser: BrowserSession;
   text: string;
@@ -975,13 +992,13 @@ function browserChatPersonalMemoryContext(input: {
   const currentUrl = input.currentUrl || browserChatMemoryUrl(input.browser, input.session);
   const currentDomain = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
   if (!personalMemoryEnabled()) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  const results = searchPersonalMemory({
+  const results = (await searchPersonalMemory({
     userId: input.session.userId,
     query: input.retrievalQueries?.length
       ? input.retrievalQueries
       : [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
     domain: currentUrl || input.session.targetUrl,
-  }).filter((result) => (
+  })).filter((result) => (
     (!input.domainOnly || result.item.scope === 'domain')
     && !input.excludedIds?.has(result.item.id)
   ));
@@ -1158,9 +1175,9 @@ function normalizeSafetyMode(value: unknown): BrowserChatSafetyMode {
   return value === 'full' ? 'full' : 'strict';
 }
 
-function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
-  store.applyRuntimeEnv();
-  const config = store.getModelConfig();
+async function browserChatModelSettings(providerInput?: unknown, modelInput?: unknown) {
+  await store.applyRuntimeEnv();
+  const config = await store.getModelConfig();
   if (!enabledModelProviders(config).length) {
     throw new Error('尚未启用模型服务商，请先在模型配置中开启至少一个服务商。');
   }
@@ -1509,18 +1526,18 @@ type BrowserChatCredentialDescriptor = {
   passwordRef: string;
 };
 
-function browserChatCredentialContext(
+async function browserChatCredentialContext(
   session: BrowserChatSessionRecord,
   references: Map<string, { passwordRef: string; usernameRef: string }>,
 ) {
   const credentials: BrowserChatCredentialDescriptor[] = [];
   const bindings: BrowserCodeCredentialBinding[] = [];
-  const accounts = listLoginAccounts({ userId: session.userId })
+  const accounts = (await listLoginAccounts({ userId: session.userId }))
     .filter((account) => account.status === 'active' && account.hasPassword);
   for (const account of accounts) {
     // Provisioning a binding only makes the account available to browserCode; it
     // is not evidence that the page actually consumed the credential.
-    const credential = resolveLoginAccountCredentialById(account.id, session.userId, { trackUsage: false });
+    const credential = await resolveLoginAccountCredentialById(account.id, session.userId, { trackUsage: false });
     if (!credential) continue;
     let refs = references.get(account.id);
     if (!refs) {
@@ -1576,7 +1593,6 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   explicitlySelectedSkills?: SkillRecord[];
   usedMemoryIds?: Set<string>;
   historicalMessages?: BrowserChatMessage[];
-  historicalSteps?: StepExecutionResult[];
 }) {
   const loadedSkills = new Map<string, SkillRecord>();
   const credentialReferences = new Map<string, { passwordRef: string; usernameRef: string }>();
@@ -1587,7 +1603,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   let availableSkillIds = new Set<string>();
   const getContext = async () => {
     const currentUrl = browserChatMemoryUrl(input.browser, input.session);
-    const allSkills = store.listSkills(undefined, input.session.userId).filter((skill) => skill.status === 'ready');
+    const allSkills = (await store.listSkills(undefined, input.session.userId)).filter((skill) => skill.status === 'ready');
     const activeLoadedSkills = [...loadedSkills.values()];
     const activeLoadedSkillIds = new Set(activeLoadedSkills.map((skill) => skill.id));
     const explicitlySelectedSkills = allSkills.filter((skill) => explicitlySelectedSkillIds.has(skill.id));
@@ -1598,7 +1614,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
       retrievalQueries,
     );
     availableSkillIds = new Set(skills.map((skill) => skill.id));
-    const memory = browserChatPersonalMemoryContext({
+    const memory = await browserChatPersonalMemoryContext({
       session: input.session,
       browser: input.browser,
       text: input.text,
@@ -1609,10 +1625,10 @@ async function createBrowserChatRuntimeOperationalContext(input: {
     });
     const unusedMemoryIds = memory.itemIds.filter((memoryId) => !usedMemoryIds.has(memoryId));
     if (unusedMemoryIds.length) {
-      markPersonalMemoryItemsUsed(unusedMemoryIds);
+      await markPersonalMemoryItemsUsed(unusedMemoryIds);
       unusedMemoryIds.forEach((memoryId) => usedMemoryIds.add(memoryId));
     }
-    const credentials = browserChatCredentialContext(
+    const credentials = await browserChatCredentialContext(
       input.session,
       credentialReferences,
     );
@@ -1622,7 +1638,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
         formatLoadedSkillsForPrompt(activeLoadedSkills),
         formatSkillSummariesForPrompt(skills),
         memory.context,
-        conversationFileRegistry(input.session, input.historicalMessages, input.historicalSteps),
+        conversationFileRegistry(input.session, input.historicalMessages),
         officeDraftCatalog,
         browserChatCredentialPrompt(credentials.credentials),
       ].filter(Boolean).join('\n\n'),
@@ -1632,7 +1648,7 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   return Object.assign(getContext, {
     readSkill: async (skillId: string): Promise<BrowserActionResult> => {
       const normalizedSkillId = skillId.trim();
-      const skill = store.getSkill(normalizedSkillId, input.session.userId);
+      const skill = await store.getSkill(normalizedSkillId, input.session.userId);
       if (!availableSkillIds.has(normalizedSkillId) || !skill || skill.status !== 'ready') {
         return { ok: false, actual: 'Skill is not available in the current runtime candidate list.' };
       }
@@ -1715,10 +1731,8 @@ async function readFileVisualsForSession(
 function conversationFileRegistry(
   session: BrowserChatSessionRecord,
   historicalMessages: BrowserChatMessage[] = [],
-  historicalSteps: StepExecutionResult[] = [],
 ) {
   const messages = mergePersistedMessages(historicalMessages, session.messages);
-  const steps = mergePersistedSteps(historicalSteps, session.steps);
   const uploads = new Map<string, BrowserChatAttachment>();
   for (const message of [...messages].reverse()) {
     for (const attachment of message.attachments || []) {
@@ -1730,7 +1744,7 @@ function conversationFileRegistry(
   }
   const artifacts = mergeBrowserChatArtifactSummaries(
     ...messages.map((message) => message.artifacts),
-    browserChatArtifactsFromSteps(steps),
+    browserChatArtifactsFromSteps(session.steps),
   ).reverse();
   const lines = [
     ...[...uploads.values()].map((attachment) => (
@@ -2058,7 +2072,7 @@ function sessionSnapshotHeader(
     noVncUrl: browserChatNoVncUrl(session),
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: normalizeModelProvider(session.modelProvider),
-    model: browserChatModelSettings(session.modelProvider, session.model).model,
+    model: session.model,
     status: session.status,
     turnState: normalizeBrowserChatTurnState(session),
     busy: session.busy,
@@ -2129,6 +2143,70 @@ function clientSnapshot(session: BrowserChatSessionRecord): BrowserChatClientSes
       steps: { hasMore: false },
       logs: { hasMore: false },
     },
+  };
+}
+
+function browserChatMessageSteps(session: BrowserChatSessionRecord, message: BrowserChatMessage) {
+  const indexes = new Set(message.stepIndexes || []);
+  return session.steps.filter((step) => step.messageId === message.id || indexes.has(step.index));
+}
+
+function browserChatAssistantParts(
+  session: BrowserChatSessionRecord,
+  message: BrowserChatMessage,
+  blocks?: BrowserChatFinalBlock[],
+) {
+  const executionParts = browserChatExecutionParts(
+    browserChatMessageSteps(session, message).map(compactStepForRealtime),
+  );
+  const finalParts = blocks?.length
+    ? browserChatFinalBlocksToParts(blocks)
+    : message.content.trim()
+      ? [{ type: 'text' as const, text: message.content }]
+      : [];
+  return [...executionParts, ...finalParts];
+}
+
+function publishBrowserChatUIStreamUpdate(sessionId: string) {
+  const listeners = uiStreamListeners.get(sessionId);
+  const session = sessions.get(sessionId);
+  if (!listeners?.size || !session) return;
+  for (const listener of listeners) {
+    try {
+      listener({ steps: session.steps, message: activeBrowserChatAssistantMessage(session) });
+    } catch {
+      // A disconnected HTTP stream must not affect the Agent runtime.
+    }
+  }
+}
+
+export function subscribeBrowserChatUIStream(
+  sessionId: string,
+  clientMessageId: string,
+  listener: BrowserChatUIStreamListener,
+) {
+  const wrapped: BrowserChatUIStreamListener = (update) => {
+    const message = update.message?.clientMessageId === clientMessageId
+      ? update.message
+      : sessions.get(sessionId)?.messages.find((item) => (
+          item.role === 'assistant' && item.clientMessageId === clientMessageId
+        ));
+    listener({
+      message,
+      steps: message
+        ? (sessions.get(sessionId)
+            ? browserChatMessageSteps(sessions.get(sessionId)!, message).map(compactStepForRealtime)
+            : update.steps.map(compactStepForRealtime))
+        : [],
+    });
+  };
+  const listeners = uiStreamListeners.get(sessionId) || new Set<BrowserChatUIStreamListener>();
+  listeners.add(wrapped);
+  uiStreamListeners.set(sessionId, listeners);
+  publishBrowserChatUIStreamUpdate(sessionId);
+  return () => {
+    listeners.delete(wrapped);
+    if (!listeners.size) uiStreamListeners.delete(sessionId);
   };
 }
 
@@ -2353,7 +2431,10 @@ function recordFromSnapshot(
   session: BrowserChatPersistedSessionSnapshot,
   options: { preserveRunningState?: boolean } = {},
 ): BrowserChatSessionRecord {
-  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
+  const modelSettings = {
+    provider: normalizeModelProvider(session.modelProvider),
+    model: session.model,
+  };
   // A persisted running flag cannot prove that work survived a server restart:
   // model/tool promises and AbortControllers are process-local. Preserve it only
   // when the caller verified the matching live runtime turn. The former two-
@@ -2389,6 +2470,11 @@ function recordFromSnapshot(
       ...rawMessage,
       role: rawMessage.role === 'assistant' ? 'assistant' : 'user',
       content: textFromUnknown(rawMessage.content),
+      parts: Array.isArray(rawMessage.parts)
+        ? rawMessage.parts
+        : textFromUnknown(rawMessage.content).trim()
+          ? [{ type: 'text', text: textFromUnknown(rawMessage.content) }]
+          : [],
       attachments: Array.isArray(rawMessage.attachments) ? rawMessage.attachments : [],
       stepIndexes: Array.isArray(rawMessage.stepIndexes) ? rawMessage.stepIndexes : [],
     };
@@ -2452,37 +2538,13 @@ export function recoverOrphanedBrowserChatSession(
   if (!persistedLifecycleNeedsReview || activeTurns.has(persistedSummary.id)) {
     return persistedSummary;
   }
-  const persisted = readRuntimeSessionSnapshot(persistedSummary.id);
-  if (!persisted) {
-    return {
-      ...persistedSummary,
-      busy: false,
-      status: 'idle',
-      turnState: 'interrupted',
-      pendingToolConfirmation: undefined,
-    };
-  }
-  const hasOrphanedRuntimeRecords = persisted.busy
-    || persisted.status === 'running'
-    || persisted.messages.some((message) => message.role === 'assistant' && message.status === 'running')
-    || persisted.steps.some((step) => step.status === 'queued' || step.status === 'running');
-  if (!hasOrphanedRuntimeRecords) return persistedSummary;
-  const existing = sessions.get(persistedSummary.id);
-  const recovered = recordFromSnapshot(persisted);
-  recovered.updatedAt = now();
-  if (existing) {
-    Object.assign(existing, recovered, {
-      browser: existing.browser,
-      started: existing.started,
-    });
-  } else {
-    sessions.set(persistedSummary.id, recovered);
-  }
-  const runtime = sessions.get(persistedSummary.id)!;
-  seedPersistenceCursor(runtime, persisted);
-  markRecoveredRunningRecordsDirty(runtime, persisted);
-  persistSession(runtime.id);
-  return snapshot(runtime);
+  return {
+    ...persistedSummary,
+    busy: false,
+    status: 'idle',
+    turnState: 'interrupted',
+    pendingToolConfirmation: undefined,
+  };
 }
 
 function appendLog(
@@ -2535,11 +2597,11 @@ function appendLog(
   persistAndNotify(session.id, { defer: input.deferPersist === true });
 }
 
-function readSessionSummaries(userId?: string | number): BrowserChatSessionSnapshot[] {
-  return readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
+async function readSessionSummaries(userId?: string | number): Promise<BrowserChatSessionSnapshot[]> {
+  return (await readBrowserChatSessionSummaries<BrowserChatSessionSnapshot>({
     hasMessagesOnly: true,
     userId: userId === undefined ? undefined : normalizeApplicationUserId(userId),
-  })
+  }))
     .filter(isBrowserChatSessionSnapshot)
     .map(recoverOrphanedBrowserChatSession)
     .map(summaryFromSnapshot);
@@ -2552,8 +2614,8 @@ function isBrowserChatSessionSnapshot(value: unknown): value is BrowserChatSessi
     && typeof (value as { id?: unknown }).id === 'string';
 }
 
-function readSessionSnapshot(sessionId: string) {
-  const item = readBrowserChatSessionRecord<BrowserChatPersistedSessionSnapshot>(sessionId);
+async function readSessionSnapshot(sessionId: string) {
+  const item = await readBrowserChatSessionRecord<BrowserChatPersistedSessionSnapshot>(sessionId);
   if (!isBrowserChatSessionSnapshot(item)) return undefined;
   return { ...item, logs: trimBrowserChatLogs(item.logs || []) };
 }
@@ -2562,8 +2624,8 @@ const browserChatRuntimeMessageLimit = 96;
 const browserChatRuntimeStepLimit = 128;
 const browserChatRuntimeLogLimit = 256;
 
-function readRuntimeSessionSnapshot(sessionId: string) {
-  const item = readBrowserChatSessionWindow<
+async function readRuntimeSessionSnapshot(sessionId: string) {
+  const item = await readBrowserChatSessionWindow<
     BrowserChatPersistedSessionSnapshot,
     BrowserChatMessage,
     StepExecutionResult,
@@ -2603,7 +2665,7 @@ function seedPersistenceCursor(
   persistenceCursors.set(item.id, seedBrowserChatPersistenceCursor(item, persisted));
 }
 
-function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
+function trackSessionDatabaseWrite(sessionId: string, operation: Promise<void>) {
   const tracked: Promise<boolean> = operation
     .then(() => {
       return true;
@@ -2615,9 +2677,9 @@ function trackSessionSqliteWrite(sessionId: string, operation: Promise<void>) {
       return false;
     })
     .finally(() => {
-      if (pendingSqliteWrites.get(sessionId) === tracked) pendingSqliteWrites.delete(sessionId);
+      if (pendingDatabaseWrites.get(sessionId) === tracked) pendingDatabaseWrites.delete(sessionId);
     });
-  pendingSqliteWrites.set(sessionId, tracked);
+  pendingDatabaseWrites.set(sessionId, tracked);
   return tracked;
 }
 
@@ -2664,12 +2726,12 @@ function writeSessionSnapshot(item: BrowserChatPersistedSessionSnapshot): Browse
     userId: normalizeApplicationUserId(item.userId),
     patch,
   };
-  const sqliteWrite = writeBrowserChatSessionDeltaQueued(
+  const databaseWrite = writeBrowserChatSessionDeltaQueued(
     { ...persistedSession, messages: [], steps: [], logs: [] },
     summary,
     persistenceChanges,
   );
-  trackSessionSqliteWrite(item.id, sqliteWrite);
+  trackSessionDatabaseWrite(item.id, databaseWrite);
   void publishRealtimeRefreshEvent(realtimeEvent).catch(() => undefined);
   if (dirtyRecords.has(item.id)) {
     advancePersistenceCursor(persistedItem, persistenceChanges);
@@ -2733,7 +2795,7 @@ function deleteSessionSnapshot(sessionId: string, userId: string) {
     userId: normalizeApplicationUserId(userId),
     deleted: true,
   } as const;
-  void trackSessionSqliteWrite(sessionId, deleteBrowserChatSessionRecordQueued(sessionId))
+  void trackSessionDatabaseWrite(sessionId, deleteBrowserChatSessionRecordQueued(sessionId))
     .then((stored) => stored ? publishRealtimeRefreshEvent(event) : undefined)
     .catch(() => undefined);
   persistenceCursors.delete(sessionId);
@@ -2974,7 +3036,7 @@ function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatPersisted
     return true;
   }
   // Deferred progress writes and immediate interruption both make the in-memory
-  // record newer than SQLite for a short period. A GET during that window must
+  // record newer than the database for a short period. A GET during that window must
   // not revive an older running turn or replace its live AbortController.
   if (runtimeSnapshotIsNewer(existing.updatedAt, persistedSnapshot.updatedAt)) return false;
   const preserveRuntimeTurn = shouldPreserveRuntimeTurn(existing, persistedSnapshot);
@@ -2992,9 +3054,9 @@ function applyPersistedSnapshotToRuntime(persistedSnapshot: BrowserChatPersisted
   return true;
 }
 
-function restoreCompactedBrowserChatSession(session: BrowserChatSessionRecord) {
+async function restoreCompactedBrowserChatSession(session: BrowserChatSessionRecord) {
   if (!session.runtimeCompacted) return session;
-  const persisted = readRuntimeSessionSnapshot(session.id);
+  const persisted = await readRuntimeSessionSnapshot(session.id);
   if (!persisted) return session;
   const restored = recordFromSnapshot(persisted);
   const browser = session.browser;
@@ -3014,15 +3076,15 @@ function restoreCompactedBrowserChatSession(session: BrowserChatSessionRecord) {
   return session;
 }
 
-function hydrateSession(sessionId: string) {
+async function hydrateSession(sessionId: string) {
   const existing = sessions.get(sessionId);
   if (existing) {
-    restoreCompactedBrowserChatSession(existing);
+    await restoreCompactedBrowserChatSession(existing);
     scheduleBrowserChatSessionEviction(sessionId);
-    startNextQueuedBrowserChatTurn(existing);
+    void startNextQueuedBrowserChatTurn(existing);
     return existing;
   }
-  const persisted = readRuntimeSessionSnapshot(sessionId);
+  const persisted = await readRuntimeSessionSnapshot(sessionId);
   const applied = persisted ? applyPersistedSnapshotToRuntime(persisted) : false;
   const session = sessions.get(sessionId);
   if (session && persisted && applied) {
@@ -3032,16 +3094,16 @@ function hydrateSession(sessionId: string) {
   else if (persisted && !persistenceCursors.has(sessionId)) seedPersistenceCursor(persisted);
   if (session) {
     scheduleBrowserChatSessionEviction(sessionId);
-    startNextQueuedBrowserChatTurn(session);
+    void startNextQueuedBrowserChatTurn(session);
   }
   return session;
 }
 
-function persistSession(sessionId: string, options: { deletedUserId?: string; mergePersisted?: boolean } = {}): BrowserChatSessionRealtimePatch | true | false {
+async function persistSession(sessionId: string, options: { deletedUserId?: string; mergePersisted?: boolean } = {}): Promise<BrowserChatSessionRealtimePatch | true | false> {
   try {
     const currentSession = sessions.get(sessionId);
     const persistedHeader = currentSession?.runtimeCompacted
-      ? readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId)
+      ? await readBrowserChatSessionHeader<BrowserChatPersistedSessionSnapshot>(sessionId)
       : undefined;
     const incoming: BrowserChatPersistedSessionSnapshot | undefined = currentSession ? {
       ...snapshot(currentSession, { fullSteps: true }),
@@ -3060,7 +3122,7 @@ function persistSession(sessionId: string, options: { deletedUserId?: string; me
       return true;
     }
     const shouldMergePersisted = options.mergePersisted === true;
-    const persistedSnapshot = shouldMergePersisted ? readSessionSnapshot(sessionId) : undefined;
+    const persistedSnapshot = shouldMergePersisted ? await readSessionSnapshot(sessionId) : undefined;
     const writtenSnapshot = shouldMergePersisted ? mergePersistedSessionSnapshot(persistedSnapshot, incoming) : incoming;
     const patch = writeSessionSnapshot(writtenSnapshot);
     if (shouldMergePersisted) {
@@ -3086,25 +3148,26 @@ function schedulePersistAndNotify(sessionId: string) {
   if (pendingPersistTimers.has(sessionId)) return;
   const timer = setTimeout(() => {
     pendingPersistTimers.delete(sessionId);
-    persistAndNotify(sessionId, { mergePersisted: false });
+    void persistAndNotify(sessionId, { mergePersisted: false });
   }, browserChatProgressPersistDelayMs());
   pendingPersistTimers.set(sessionId, timer);
 }
 
 function persistInterruptedSessionInBackground(sessionId: string) {
-  setTimeout(() => {
-    if (persistAndNotify(sessionId, { mergePersisted: false })) return;
+  setTimeout(async () => {
+    if (await persistAndNotify(sessionId, { mergePersisted: false })) return;
     schedulePersistAndNotify(sessionId);
   }, 0);
 }
 
-function persistAndNotify(sessionId: string, options: { defer?: boolean; deletedUserId?: string; mergePersisted?: boolean } = {}) {
+async function persistAndNotify(sessionId: string, options: { defer?: boolean; deletedUserId?: string; mergePersisted?: boolean } = {}) {
+  publishBrowserChatUIStreamUpdate(sessionId);
   if (options.defer) {
     schedulePersistAndNotify(sessionId);
     return true;
   }
   clearPendingPersist(sessionId);
-  const persisted = persistSession(sessionId, {
+  const persisted = await persistSession(sessionId, {
     deletedUserId: options.deletedUserId,
     mergePersisted: options.mergePersisted,
   });
@@ -3114,10 +3177,11 @@ function persistAndNotify(sessionId: string, options: { defer?: boolean; deleted
 }
 
 async function persistAndNotifyTerminal(sessionId: string) {
+  publishBrowserChatUIStreamUpdate(sessionId);
   clearPendingPersist(sessionId);
-  const persisted = persistSession(sessionId);
+  const persisted = await persistSession(sessionId);
   if (!persisted) return false;
-  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  const pendingWrite = pendingDatabaseWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
   if (persisted !== true && !(await publishPersistedRealtimePatch(persisted))) return false;
   scheduleBrowserChatSessionEviction(sessionId);
@@ -3142,9 +3206,9 @@ async function publishPersistedRealtimePatch(patch: BrowserChatSessionRealtimePa
 
 async function persistBrowserChatCheckpoint(sessionId: string) {
   clearPendingPersist(sessionId);
-  const persisted = persistSession(sessionId, { mergePersisted: false });
+  const persisted = await persistSession(sessionId, { mergePersisted: false });
   if (!persisted) return false;
-  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  const pendingWrite = pendingDatabaseWrites.get(sessionId);
   if (pendingWrite && !(await pendingWrite)) return false;
   return persisted === true ? true : publishPersistedRealtimePatch(persisted);
 }
@@ -3252,7 +3316,7 @@ async function ensureStartedNow(
     return browser;
   }
   assertTurnActive?.();
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   const startedAt = Date.now();
   appendLog(session, 'browser:start', '正在启动或连接浏览器');
   const hasPriorConversation = session.steps.length > 0
@@ -3266,7 +3330,7 @@ async function ensureStartedNow(
   try {
     await browser.start();
     assertTurnActive?.();
-    const savedCookies = readBrowserDomainCookies(session.userId);
+    const savedCookies = await readBrowserDomainCookies(session.userId);
     if (savedCookies.length) {
       const injectedCount = await browser.injectCookies(savedCookies);
       assertTurnActive?.();
@@ -3329,7 +3393,7 @@ async function ensureStartedNow(
   return browser;
 }
 
-export function createBrowserChatSession(input: {
+export async function createBrowserChatSession(input: {
   targetUrl?: string;
   safetyMode?: BrowserChatSafetyMode;
   modelProvider?: unknown;
@@ -3337,8 +3401,8 @@ export function createBrowserChatSession(input: {
   title?: string;
   userId?: string | number;
 } = {}) {
-  store.applyRuntimeEnv();
-  const modelSettings = browserChatModelSettings(input.modelProvider, input.model);
+  await store.applyRuntimeEnv();
+  const modelSettings = await browserChatModelSettings(input.modelProvider, input.model);
   const timestamp = now();
   const session: BrowserChatSessionRecord = {
     id: id('chat'),
@@ -3379,8 +3443,8 @@ export function createBrowserChatSession(input: {
   return clientSnapshot(session);
 }
 
-function durableBrowserChatSnapshot(session: BrowserChatSessionRecord) {
-  const persisted = readSessionSnapshot(session.id);
+async function durableBrowserChatSnapshot(session: BrowserChatSessionRecord) {
+  const persisted = await readSessionSnapshot(session.id);
   const runtimeSnapshot: BrowserChatPersistedSessionSnapshot = {
     ...snapshot(session, { fullSteps: true }),
     modelContext: normalizeBrowserChatModelContext(session.modelContext),
@@ -3388,9 +3452,9 @@ function durableBrowserChatSnapshot(session: BrowserChatSessionRecord) {
   return mergePersistedSessionSnapshot(persisted, runtimeSnapshot);
 }
 
-export function selectBrowserChatSessionRuntime(sessionId: string, userId?: string | number) {
+export async function selectBrowserChatSessionRuntime(sessionId: string, userId?: string | number) {
   const runtimeSession = sessions.get(sessionId);
-  const owner = runtimeSession || readBrowserChatSessionOwner(sessionId);
+  const owner = runtimeSession || await readBrowserChatSessionOwner(sessionId);
   if (!owner || !sessionBelongsToUser(owner, userId)) return false;
   const userKey = browserChatUserRuntimeKey(owner.userId);
   const previouslySelectedSessionId = selectedSessionIds.get(userKey);
@@ -3408,7 +3472,7 @@ export function selectBrowserChatSessionRuntime(sessionId: string, userId?: stri
 
 export async function releaseBrowserChatSessionRuntime(sessionId: string, userId?: string | number) {
   const runtimeSession = sessions.get(sessionId);
-  const owner = runtimeSession || readBrowserChatSessionOwner(sessionId);
+  const owner = runtimeSession || await readBrowserChatSessionOwner(sessionId);
   if (!owner || !sessionBelongsToUser(owner, userId)) return false;
   const userKey = browserChatUserRuntimeKey(owner.userId);
   if (selectedSessionIds.get(userKey) === sessionId) selectedSessionIds.delete(userKey);
@@ -3420,11 +3484,11 @@ export async function releaseBrowserChatSessionRuntime(sessionId: string, userId
   return releaseInactiveBrowserChatSessionRuntime(sessionId);
 }
 
-export function getBrowserChatSession(sessionId: string, userId?: string | number) {
+export async function getBrowserChatSession(sessionId: string, userId?: string | number) {
   const runtimeSession = sessions.get(sessionId);
   const persisted = runtimeSession
-    ? durableBrowserChatSnapshot(runtimeSession)
-    : readSessionSnapshot(sessionId);
+    ? await durableBrowserChatSnapshot(runtimeSession)
+    : await readSessionSnapshot(sessionId);
   if (!persisted || !sessionBelongsToUser(persisted, userId)) return undefined;
   const { modelContext: _modelContext, ...clientSession } = persisted;
   void _modelContext;
@@ -3435,8 +3499,8 @@ export function getBrowserChatSession(sessionId: string, userId?: string | numbe
   };
 }
 
-export function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+export async function setBrowserChatSessionGroup(sessionId: string, groupId: string, userId?: string | number) {
+  const session = await hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) return undefined;
   const normalized = groupId.trim();
   if (!/^[a-zA-Z0-9:_-]{1,160}$/.test(normalized)) throw new Error('Invalid browser group id');
@@ -3446,8 +3510,8 @@ export function setBrowserChatSessionGroup(sessionId: string, groupId: string, u
   return clientSnapshot(session);
 }
 
-export function updateBrowserChatSessionTitle(sessionId: string, title: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+export async function updateBrowserChatSessionTitle(sessionId: string, title: string, userId?: string | number) {
+  const session = await hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) return undefined;
   const normalized = title.trim();
   if (!normalized || normalized.length > 240) throw new Error('Invalid browser chat session title');
@@ -3458,8 +3522,8 @@ export function updateBrowserChatSessionTitle(sessionId: string, title: string, 
   return clientSnapshot(session);
 }
 
-export function listBrowserChatSessions(input: { userId?: string | number } = {}) {
-  const summaries = new Map(readSessionSummaries(input.userId).map((session) => [session.id, session]));
+export async function listBrowserChatSessions(input: { userId?: string | number } = {}) {
+  const summaries = new Map((await readSessionSummaries(input.userId)).map((session) => [session.id, session]));
   for (const session of sessions.values()) summaries.set(session.id, summarySnapshot(session));
   return [...summaries.values()]
     .filter((session) => session.hasMessages && sessionBelongsToUser(session, input.userId))
@@ -3539,7 +3603,7 @@ function preserveInterruptedSubagents(sessionId: string, assistantMessageId?: st
 }
 
 export async function closeBrowserChatSession(sessionId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   await stopBrowserChatRuntime(session, new Error('Browser chat session closed by user.'));
@@ -3585,13 +3649,13 @@ export async function closeBrowserChatRuntimeBrowser(browserId: string) {
 }
 
 export async function deleteBrowserChatSession(sessionId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (session && !sessionBelongsToUser(session, userId)) return undefined;
   const removed = await deleteBrowserChatSessionFromMemory(sessionId);
   if (!removed) return undefined;
-  const durableSnapshot = durableBrowserChatSnapshot(removed.session);
+  const durableSnapshot = await durableBrowserChatSnapshot(removed.session);
   try {
-    archiveAiOperationsChatSession({
+    await archiveAiOperationsChatSession({
       ...durableSnapshot,
       logs: [...(durableSnapshot.logs || [])],
     });
@@ -3599,8 +3663,8 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
     sessions.set(sessionId, removed.session);
     throw error;
   }
-  const persisted = persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) });
-  const pendingWrite = pendingSqliteWrites.get(sessionId);
+  const persisted = await persistAndNotify(sessionId, { deletedUserId: normalizeApplicationUserId(removed.session.userId) });
+  const pendingWrite = pendingDatabaseWrites.get(sessionId);
   if (!persisted || (pendingWrite && !(await pendingWrite))) {
     sessions.set(sessionId, removed.session);
     throw new Error('Browser chat session was removed from memory, but the database could not be updated.');
@@ -3610,7 +3674,7 @@ export async function deleteBrowserChatSession(sessionId: string, userId?: strin
 }
 
 export async function switchBrowserChatTab(sessionId: string, tabId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const normalizedTabId = String(tabId || '').trim();
@@ -3646,7 +3710,7 @@ export async function startBrowserChatScreencast(
     video?: boolean;
   },
 ) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
 
@@ -3702,7 +3766,7 @@ export async function dispatchBrowserChatPreviewInput(
   userId: string | number | undefined,
   input: BrowserLiveInput,
 ) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session || session.status === 'closed') return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const browser = restoreBrowserSessionPrototype(session.browser);
@@ -3777,18 +3841,18 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
     session: BrowserChatSessionRecord;
   }> = [];
   for (const sessionId of uniqueIds) {
-    const session = hydrateSession(sessionId);
+    const session = await hydrateSession(sessionId);
     if (session && !sessionBelongsToUser(session, userId)) continue;
     const result = await deleteBrowserChatSessionFromMemory(sessionId);
     if (result) {
-      removed.push({ ...result, durableSnapshot: durableBrowserChatSnapshot(result.session) });
+      removed.push({ ...result, durableSnapshot: await durableBrowserChatSnapshot(result.session) });
       deleted.push(result.deleted);
     }
   }
   if (removed.length) {
     try {
       for (const item of removed) {
-        archiveAiOperationsChatSession({
+        await archiveAiOperationsChatSession({
           ...item.durableSnapshot,
           logs: [...(item.durableSnapshot.logs || [])],
         });
@@ -3802,7 +3866,7 @@ export async function deleteBrowserChatSessions(sessionIds: string[], userId?: s
       userId: normalizeApplicationUserId(item.session.userId),
     })));
     const pendingWrites = removed
-      .map((item) => pendingSqliteWrites.get(item.deleted.id))
+      .map((item) => pendingDatabaseWrites.get(item.deleted.id))
       .filter((item): item is Promise<boolean> => Boolean(item));
     const writesSucceeded = persisted && (await Promise.all(pendingWrites)).every(Boolean);
     if (!writesSucceeded) {
@@ -3822,8 +3886,8 @@ export async function generateBrowserChatMessagesSkill(
 ) {
   const runtimeSession = sessions.get(sessionId);
   const persistedSession = runtimeSession
-    ? durableBrowserChatSnapshot(runtimeSession)
-    : readSessionSnapshot(sessionId);
+    ? await durableBrowserChatSnapshot(runtimeSession)
+    : await readSessionSnapshot(sessionId);
   const session = persistedSession ? recordFromSnapshot(persistedSession) : undefined;
   if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   const uniqueMessageIds = Array.from(new Set(messageIds.map((item) => item.trim()).filter(Boolean)));
@@ -3876,7 +3940,7 @@ export async function generateBrowserChatMessagesSkill(
     targetUrl,
     title: `对话 Skill - ${compactText(titleSeed, 36)}`,
   });
-  const skill = store.upsertSkill({
+  const skill = await store.upsertSkill({
     title: generated.title,
     description: generated.description,
     triggerPhrases: generated.triggerPhrases,
@@ -3898,7 +3962,7 @@ function nextBrowserChatMessageTimestamp(session: BrowserChatSessionRecord) {
   return new Date(Math.max(Date.now(), latestCreatedAt + 1)).toISOString();
 }
 
-function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
+async function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
   if (
     session.status === 'closed'
     || session.busy
@@ -3923,17 +3987,17 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
   }
   if (!queued || userMessageIndex < 0) return false;
 
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   transitionBrowserChatSession(session, { type: 'confirmationCleared' });
   session.safetyMode = normalizeSafetyMode(queued.safetyMode);
-  const modelSettings = browserChatModelSettings(queued.modelProvider, queued.model);
+  const modelSettings = await browserChatModelSettings(queued.modelProvider, queued.model);
   session.modelProvider = modelSettings.provider;
   session.model = modelSettings.model;
 
   const queuedUserMessage = session.messages[userMessageIndex];
-  const selectedSkills = store.getSkills(queuedUserMessage.skillIds || [], session.userId)
+  const selectedSkills = (await store.getSkills(queuedUserMessage.skillIds || [], session.userId))
     .filter((skill) => skill.status === 'ready');
   const attachments = queuedUserMessage.attachments || [];
   const messageText = queuedUserMessage.content;
@@ -3946,6 +4010,7 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
   const timestamp = now();
   const userMessage: BrowserChatMessage = {
     ...queuedUserMessage,
+    parts: [{ type: 'text', text: queuedUserMessage.content }],
     status: undefined,
     skillIds: selectedSkills.map((skill) => skill.id),
     updatedAt: timestamp,
@@ -3957,6 +4022,7 @@ function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord) {
     id: id('msg'),
     role: 'assistant',
     content: '',
+    parts: [],
     createdAt: userMessage.createdAt,
     updatedAt: timestamp,
     clientMessageId: userMessage.clientMessageId,
@@ -4011,14 +4077,14 @@ export async function sendBrowserChatMessage(
   skillIdsInput?: unknown,
   userId?: string | number,
 ) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
   const text = textFromUnknown(content).trim();
   const attachments = normalizeAttachments(attachmentsInput, session.userId);
   const skillIds = normalizeSkillIds(skillIdsInput);
-  const selectedSkills = store.getSkills(skillIds, session.userId).filter((skill) => skill.status === 'ready');
+  const selectedSkills = (await store.getSkills(skillIds, session.userId)).filter((skill) => skill.status === 'ready');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
   const firstMessageTitleText = text || (attachments.length ? '' : messageText);
@@ -4032,7 +4098,7 @@ export async function sendBrowserChatMessage(
     return clientSnapshot(session);
   }
   const requestedSafetyMode = normalizeSafetyMode(safetyMode ?? session.safetyMode);
-  const requestedModelSettings = browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
+  const requestedModelSettings = await browserChatModelSettings(modelProvider ?? session.modelProvider, model ?? session.model);
   if (attachments.some(isBrowserChatImageAttachment) && !requestedModelSettings.supportsImageInput) {
     throw new ApiRequestError(
       `模型 ${requestedModelSettings.model} 未配置图片输入能力，请在“模型配置”中启用后再上传图片。`,
@@ -4055,6 +4121,7 @@ export async function sendBrowserChatMessage(
       id: id('msg'),
       role: 'user',
       content: messageText,
+      parts: [{ type: 'text', text: messageText }],
       createdAt: queuedAt,
       updatedAt: queuedAt,
       clientMessageId: normalizedClientMessageId,
@@ -4080,7 +4147,7 @@ export async function sendBrowserChatMessage(
     return clientSnapshot(session);
   }
   finalizeIdleRunningAssistantMessages(session);
-  store.applyRuntimeEnv();
+  await store.applyRuntimeEnv();
   cancelPendingToolConfirmation(session);
   cancelOrphanToolConfirmationsForSession(session.id);
   transitionBrowserChatSession(session, { type: 'confirmationCleared' });
@@ -4097,6 +4164,7 @@ export async function sendBrowserChatMessage(
     id: id('msg'),
     role: 'user',
     content: messageText,
+    parts: [{ type: 'text', text: messageText }],
     createdAt: timestamp,
     updatedAt: timestamp,
     clientMessageId: normalizedClientMessageId,
@@ -4107,6 +4175,7 @@ export async function sendBrowserChatMessage(
     id: id('msg'),
     role: 'assistant',
     content: '',
+    parts: [],
     createdAt: timestamp,
     updatedAt: timestamp,
     clientMessageId: normalizedClientMessageId,
@@ -4150,12 +4219,12 @@ export async function sendBrowserChatMessage(
   return clientSnapshot(session);
 }
 
-export function deleteQueuedBrowserChatMessage(
+export async function deleteQueuedBrowserChatMessage(
   sessionId: string,
   messageId: string,
   userId?: string | number,
 ) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) return undefined;
 
   const normalizedMessageId = messageId.trim();
@@ -4206,8 +4275,8 @@ function latestManualVerificationAssistant(session: BrowserChatSessionRecord) {
   return undefined;
 }
 
-export function resumeBrowserChatHumanVerification(sessionId: string, userId?: string | number) {
-  const session = hydrateSession(sessionId);
+export async function resumeBrowserChatHumanVerification(sessionId: string, userId?: string | number) {
+  const session = await hydrateSession(sessionId);
   if (!session || !sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   if (session.status === 'closed') throw new Error('Browser chat session is closed');
   if (session.busy) throw new Error('Browser chat session is already running');
@@ -4725,13 +4794,13 @@ async function requestBrowserChatToolConfirmation(
   return decisionPromise;
 }
 
-export function resolveBrowserChatToolConfirmation(
+export async function resolveBrowserChatToolConfirmation(
   sessionId: string,
   confirmationId: string,
   action: 'confirm' | 'cancel',
   userId?: string | number,
 ) {
-  const session = hydrateSession(sessionId);
+  const session = await hydrateSession(sessionId);
   if (!session) throw new Error('Browser chat session not found');
   if (!sessionBelongsToUser(session, userId)) throw new Error('Browser chat session not found');
   const normalizedConfirmationId = confirmationId.trim();
@@ -4757,7 +4826,7 @@ export function resolveBrowserChatToolConfirmation(
   return clientSnapshot(session);
 }
 
-export function interruptBrowserChatSession(
+export async function interruptBrowserChatSession(
   sessionId: string,
   targetClientMessageId: string,
   userId?: string | number,
@@ -4767,7 +4836,7 @@ export function interruptBrowserChatSession(
   // Prefer the live runtime record. Interrupt must not wait for persistence
   // rehydration while an AI request is actively running.
   const registeredCandidate = activeTurns.get(sessionId);
-  const session = sessions.get(sessionId) || registeredCandidate?.session || hydrateSession(sessionId);
+  const session = sessions.get(sessionId) || registeredCandidate?.session || await hydrateSession(sessionId);
   if (!session) return undefined;
   if (!sessionBelongsToUser(session, userId)) return undefined;
   const registeredTurn = registeredCandidate && assistantMessageMatchesClientTurn(
@@ -4851,7 +4920,7 @@ export function interruptBrowserChatSession(
   ]);
 
   // The stop response must never wait for the old AI/browser request. Persist
-  // this finalized snapshot immediately after the response; if SQLite is
+  // this finalized snapshot immediately after the response; if the database is
   // briefly unavailable, keep retrying the current in-memory snapshot.
   persistInterruptedSessionInBackground(session.id);
   return clientSnapshot(session);
@@ -5380,7 +5449,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
   const { session, binding, userMessage, assistantMessageId, fromStepIndex, abortController } = input;
   const ownsTurn = () => isActiveBrowserChatTurn(session, assistantMessageId, abortController);
   const getRuntimeOperationalContext = await withModelSettings(
-    browserChatModelSettings(session.modelProvider, session.model),
+    await browserChatModelSettings(session.modelProvider, session.model),
     () => createBrowserChatRuntimeOperationalContext({
       session,
       browser: binding.browser,
@@ -5406,7 +5475,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     preservedMessages: browserChatSubagentSessionRegistry(session.id).get(binding.id)?.messages || [],
   });
   try {
-    const result = await withModelSettings(browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
+    const result = await withModelSettings(await browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
       runId: `${session.id}_${binding.id}_verification_resume`,
       turnId: `${assistantMessageId}:subagent:${binding.id}:verification-resume`,
@@ -5590,7 +5659,7 @@ async function runBrowserChatMessage(
   attachments: BrowserChatAttachment[],
   skills: SkillRecord[] = [],
 ) {
-  const modelSettings = browserChatModelSettings(session.modelProvider, session.model);
+  const modelSettings = await browserChatModelSettings(session.modelProvider, session.model);
   return withModelSettings(modelSettings, async () => {
     session.contextUsage = undefined;
     const assertTurnActive = () => {
@@ -5606,8 +5675,7 @@ async function runBrowserChatMessage(
       // acquiring a shared child page; ordinary chat, file, and skill work does not.
       const browser = await browserForTurnDecision(session, assertTurnActive, { preferExistingPage: true });
       assertTurnActive();
-      const historicalMessages = readAllBrowserChatMessages<BrowserChatMessage>(session.id);
-      const historicalSteps = readAllBrowserChatSteps<StepExecutionResult>(session.id);
+      const historicalMessages = await readAllBrowserChatMessages<BrowserChatMessage>(session.id);
       const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
@@ -5617,7 +5685,6 @@ async function runBrowserChatMessage(
         explicitlySelectedSkills: skills,
         usedMemoryIds,
         historicalMessages,
-        historicalSteps,
       });
       const initialRuntimeContext = await getRuntimeOperationalContext();
       appendLog(session, 'ai:prepare', '正在请求 AI 判断是否需要浏览器工具');
@@ -5673,17 +5740,20 @@ async function runBrowserChatMessage(
         onTextStream: ({ text: streamedText }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const timestamp = now();
-          updateAssistantMessage(session, assistantMessageId, (message) => ({
-            ...message,
-            content: streamedText,
-            activity: {
-              phase: 'ai:text:streaming',
-              label: 'AI 正在生成回复',
+          updateAssistantMessage(session, assistantMessageId, (message) => {
+            const updated: BrowserChatMessage = {
+              ...message,
+              content: streamedText,
+              activity: {
+                phase: 'ai:text:streaming',
+                label: 'AI 正在生成回复',
+                updatedAt: timestamp,
+              },
+              status: 'running',
               updatedAt: timestamp,
-            },
-            status: 'running',
-            updatedAt: timestamp,
-          }));
+            };
+            return { ...updated, parts: browserChatAssistantParts(session, updated) };
+          });
           session.updatedAt = timestamp;
           scheduleBrowserChatTextStreamPublish(session.id, assistantMessageId);
           persistAndNotify(session.id, { defer: true, mergePersisted: false });
@@ -5735,13 +5805,16 @@ async function runBrowserChatMessage(
           replaceSessionSteps(session, nextSteps);
           if (step.index >= fromStepIndex) {
             const timestamp = now();
-            updateAssistantMessage(session, assistantMessageId, (message) => ({
-              ...message,
-              activity: runningAssistantActivity(step, timestamp),
-              status: 'running',
-              updatedAt: timestamp,
-              stepIndexes: Array.from(new Set([...(message.stepIndexes || []), step.index])).sort((a, b) => a - b),
-            }));
+            updateAssistantMessage(session, assistantMessageId, (message) => {
+              const updated: BrowserChatMessage = {
+                ...message,
+                activity: runningAssistantActivity(step, timestamp),
+                status: 'running',
+                updatedAt: timestamp,
+                stepIndexes: Array.from(new Set([...(message.stepIndexes || []), step.index])).sort((a, b) => a - b),
+              };
+              return { ...updated, parts: browserChatAssistantParts(session, updated) };
+            });
           }
           session.updatedAt = now();
           // Tool progress is cumulative: the latest step contains every trace
@@ -5807,17 +5880,20 @@ async function runBrowserChatMessage(
       session.networkErrors = result.networkErrors;
       queuePersonalMemoryExtraction({ session, browser, text, result, userMessageId, assistantMessageId });
       const finishedAt = now();
-      updateAssistantMessage(session, assistantMessageId, (message) => ({
-        ...message,
-        content: result.reply,
-        updatedAt: finishedAt,
-        stepIndexes: Array.from(new Set([
-          ...(message.stepIndexes || []),
-          ...result.newSteps.map((step) => step.index),
-        ])).sort((a, b) => a - b),
-        status: result.status,
-        activity: undefined,
-      }));
+      updateAssistantMessage(session, assistantMessageId, (message) => {
+        const updated: BrowserChatMessage = {
+          ...message,
+          content: result.reply,
+          updatedAt: finishedAt,
+          stepIndexes: Array.from(new Set([
+            ...(message.stepIndexes || []),
+            ...result.newSteps.map((step) => step.index),
+          ])).sort((a, b) => a - b),
+          status: result.status,
+          activity: undefined,
+        };
+        return { ...updated, parts: browserChatAssistantParts(session, updated, result.blocks) };
+      });
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       const completedAt = now();
       const browserWasStarted = session.started || browser.isUsable();
@@ -5896,13 +5972,16 @@ async function runBrowserChatMessage(
         error: message,
         interrupted,
       });
-      updateAssistantMessage(session, assistantMessageId, (item) => ({
-        ...item,
-        content: terminalReply,
-        updatedAt: session.updatedAt,
-        status: interrupted ? 'interrupted' : 'failed',
-        activity: undefined,
-      }));
+      updateAssistantMessage(session, assistantMessageId, (item) => {
+        const updated: BrowserChatMessage = {
+          ...item,
+          content: terminalReply,
+          updatedAt: session.updatedAt,
+          status: interrupted ? 'interrupted' : 'failed',
+          activity: undefined,
+        };
+        return { ...updated, parts: browserChatAssistantParts(session, updated) };
+      });
       if (!interrupted) {
         session.modelContext = normalizeBrowserChatModelContext({
           ...session.modelContext,

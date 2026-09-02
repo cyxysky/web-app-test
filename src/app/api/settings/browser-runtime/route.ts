@@ -9,6 +9,6 @@ const browserChatRuntimeKeys = new Set(['BROWSER_CHAT_SHOW_REASONING', 'ELECTRON
 
 export async function GET(request: NextRequest) {
   return apiJson(request, {
-    saved: readRuntimeSettingsItems().filter((item) => browserChatRuntimeKeys.has(item.key)),
+    saved: (await readRuntimeSettingsItems()).filter((item) => browserChatRuntimeKeys.has(item.key)),
   });
 }

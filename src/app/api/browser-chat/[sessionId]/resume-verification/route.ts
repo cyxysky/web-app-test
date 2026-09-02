@@ -16,7 +16,7 @@ function requestUserId(request: Request) {
 export async function POST(request: Request, context: RouteContext) {
   const { sessionId } = await context.params;
   try {
-    return apiJson(request, { session: resumeBrowserChatHumanVerification(sessionId, requestUserId(request)) });
+    return apiJson(request, { session: await resumeBrowserChatHumanVerification(sessionId, requestUserId(request)) });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to resume browser chat verification';
     return apiError(request, error instanceof ApiRequestError ? error : new ApiRequestError(message, {

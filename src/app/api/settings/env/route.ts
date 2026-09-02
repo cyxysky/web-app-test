@@ -25,7 +25,7 @@ function requireAdmin(request: NextRequest) {
 export async function GET(request: NextRequest) {
   try {
     requireAdmin(request);
-    return apiJson(request, { saved: readRuntimeSettingsItems() });
+    return apiJson(request, { saved: await readRuntimeSettingsItems() });
   } catch (error) {
     return apiError(request, error, { fallback: '读取环境配置失败' });
   }
@@ -40,11 +40,11 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'settings.environment',
       userId,
-    }, () => {
+    }, async () => {
       const incomingByKey = new Map(body.items
         .filter((item) => allowedKeys.has(item.key))
         .map((item) => [item.key, item]));
-      const savedByKey = new Map(store.listRuntimeEnv().map((item) => [item.key, item]));
+      const savedByKey = new Map((await store.listRuntimeEnv()).map((item) => [item.key, item]));
       const sanitized = runtimeEnvDefinitions.map((definition) => {
         const item = incomingByKey.get(definition.key);
         const secret = Boolean(definition.secret);
@@ -58,9 +58,9 @@ export async function POST(request: NextRequest) {
           secret,
         };
       });
-      store.saveRuntimeEnv(sanitized);
-      store.applyRuntimeEnv();
-      return apiJson(request, { ok: true, saved: readRuntimeSettingsItems() });
+      await store.saveRuntimeEnv(sanitized);
+      await store.applyRuntimeEnv();
+      return apiJson(request, { ok: true, saved: await readRuntimeSettingsItems() });
     });
   } catch (error) {
     return apiError(request, error, { fallback: '保存环境配置失败' });

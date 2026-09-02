@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { getSqliteDatabase, runSqliteTransaction } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabase, queryDatabaseOne, runDatabaseTransaction } from '@/server/db/database';
 
 export type WebSocketTicketScope = 'browser-preview' | 'realtime-refresh';
 
@@ -52,7 +52,7 @@ export function requestPublicOrigin(request: Request) {
   return new URL(`${protocol}://${host}`).origin;
 }
 
-export function createWebSocketTicket(input: {
+export async function createWebSocketTicket(input: {
   origin: string;
   scope: WebSocketTicketScope;
   sessionId?: string;
@@ -63,12 +63,11 @@ export function createWebSocketTicket(input: {
   const token = randomBytes(32).toString('base64url');
   const createdAt = nowIso();
   const expiresAt = new Date(Date.now() + ticketLifetimeMs()).toISOString();
-  const database = getSqliteDatabase();
-  database.prepare(`
+  await executeDatabase(`
     INSERT INTO websocket_ticket (
       id, token_hash, user_id, session_id, scope, origin, expires_at, created_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+  `, [
     randomUUID(),
     ticketHash(token),
     input.userId,
@@ -77,12 +76,12 @@ export function createWebSocketTicket(input: {
     origin,
     expiresAt,
     createdAt,
-  );
-  database.prepare('DELETE FROM websocket_ticket WHERE expires_at <= ? OR consumed_at IS NOT NULL').run(createdAt);
+  ]);
+  await executeDatabase('DELETE FROM websocket_ticket WHERE expires_at <= ? OR consumed_at IS NOT NULL', [createdAt]);
   return { expiresAt, ticket: token };
 }
 
-export function consumeWebSocketTicket(input: {
+export async function consumeWebSocketTicket(input: {
   origin?: string;
   scope: WebSocketTicketScope;
   sessionId?: string;
@@ -90,11 +89,11 @@ export function consumeWebSocketTicket(input: {
 }) {
   const token = input.ticket.trim();
   if (!token) return undefined;
-  return runSqliteTransaction((database) => {
-    const row = database.prepare(`
+  return runDatabaseTransaction(async (database) => {
+    const row = await queryDatabaseOne<WebSocketTicketRow>(`
       SELECT id, user_id, session_id, scope, origin, expires_at, consumed_at
       FROM websocket_ticket WHERE token_hash = ?
-    `).get(ticketHash(token)) as WebSocketTicketRow | undefined;
+    `, [ticketHash(token)], database);
     const current = nowIso();
     const expectedOrigin = normalizedOrigin(String(input.origin || '').trim());
     if (
@@ -105,11 +104,12 @@ export function consumeWebSocketTicket(input: {
       || String(row.session_id || '') !== String(input.sessionId || '')
       || (row.origin && row.origin !== expectedOrigin)
     ) return undefined;
-    const updated = database.prepare(`
+    const updated = await queryDatabase<{ id: string }>(`
       UPDATE websocket_ticket SET consumed_at = ?
       WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
-    `).run(current, row.id, current);
-    if (Number(updated.changes || 0) !== 1) return undefined;
+      RETURNING id
+    `, [current, row.id, current], database);
+    if (updated.length !== 1) return undefined;
     return {
       userId: row.user_id,
       sessionId: row.session_id || undefined,

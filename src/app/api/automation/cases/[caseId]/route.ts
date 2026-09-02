@@ -12,7 +12,7 @@ type RouteContext = { params: Promise<{ caseId: string }> };
 export async function GET(request: NextRequest, context: RouteContext) {
   try {
     const { caseId } = await context.params;
-    const automationCase = getAutomationCase(caseId, requestApplicationUserId(request));
+    const automationCase = await getAutomationCase(caseId, requestApplicationUserId(request));
     if (!automationCase) throw new ApiRequestError('自动化用例不存在', { code: 'not_found', status: 404 });
     if (request.nextUrl.searchParams.get('download') === '1') {
       return apiJson(request, automationCase, {
@@ -33,9 +33,9 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ caseId }),
       scope: 'automation_case.delete',
       userId,
-    }, () => {
-      const automationCase = getAutomationCase(caseId, userId);
-      if (!automationCase || !deleteAutomationCase(caseId, userId)) {
+    }, async () => {
+      const automationCase = await getAutomationCase(caseId, userId);
+      if (!automationCase || !await deleteAutomationCase(caseId, userId)) {
         throw new ApiRequestError('自动化用例不存在', { code: 'not_found', status: 404 });
       }
       return apiJson(request, { ok: true, deleted: { id: automationCase.id }, case: automationCase, automationCase });

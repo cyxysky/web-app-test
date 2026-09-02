@@ -25,7 +25,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const body = await request.json().catch(() => ({})) as { clientMessageId?: unknown };
     const clientMessageId = typeof body.clientMessageId === 'string' ? body.clientMessageId.trim() : '';
     if (!clientMessageId) return embedJson({ error: 'Browser chat turn id is required' }, { status: 400 });
-    const session = interruptBrowserChatSession(sessionId, clientMessageId, auth.userId);
+    const session = await interruptBrowserChatSession(sessionId, clientMessageId, auth.userId);
     if (!session) return embedJson({ error: 'Browser chat session not found' }, { status: 404 });
     return embedJson({ session });
   } catch (error) {

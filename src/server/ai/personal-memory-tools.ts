@@ -152,7 +152,7 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
       execute: async (input) => {
         if (input.action === 'search') {
           const { query, limit } = input;
-          const results = searchPersonalMemory({
+          const results = await searchPersonalMemory({
             userId,
             query,
             domain: currentDomain(),
@@ -175,7 +175,7 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
           if (draft.scope === 'domain' && !domain) {
             throw new Error('Domain-scoped memory requires a current URL or an explicit domain.');
           }
-          const item = savePersonalMemoryItem({
+          const item = await savePersonalMemoryItem({
             ...draft,
             userId,
             domain,
@@ -193,11 +193,11 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
           if (!explicitMemoryManagementRequest(context, evidence)) {
             throw new Error('Memory update rejected: the current user must explicitly request the memory change.');
           }
-          const existing = getPersonalMemoryItem(id, userId);
+          const existing = await getPersonalMemoryItem(id, userId);
           if (!existing || (existing.userId !== userId && existing.shared)) {
             throw new Error('Personal memory was not found or is not editable by the current user.');
           }
-          const item = updatePersonalMemoryItem(id, patch, userId);
+          const item = await updatePersonalMemoryItem(id, patch, userId);
           if (!item) throw new Error('Personal memory was not found.');
           return { item: toolMemoryItem(item) };
         }
@@ -207,11 +207,11 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
         if (!explicitMemoryManagementRequest(context, evidence)) {
           throw new Error('Memory disable rejected: the current user must explicitly ask to forget or disable it.');
         }
-        const existing = getPersonalMemoryItem(id, userId);
+        const existing = await getPersonalMemoryItem(id, userId);
         if (!existing || (existing.userId !== userId && existing.shared)) {
           throw new Error('Personal memory was not found or is not editable by the current user.');
         }
-        const item = updatePersonalMemoryItem(id, { status: 'disabled' }, userId);
+        const item = await updatePersonalMemoryItem(id, { status: 'disabled' }, userId);
         if (!item) throw new Error('Personal memory was not found.');
         return { item: toolMemoryItem(item) };
       },

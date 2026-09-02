@@ -18,7 +18,7 @@ function requestUserId(request: NextRequest) {
 
 export async function GET(request: NextRequest, context: RouteContext) {
   const { skillId } = await context.params;
-  const skill = store.getSkill(skillId, requestUserId(request));
+  const skill = await store.getSkill(skillId, requestUserId(request));
   if (!skill) return apiError(request, new ApiRequestError('Skill not found', { code: 'not_found', status: 404 }), { fallback: 'Skill not found' });
   return apiJson(request, { skill });
 }
@@ -32,11 +32,11 @@ export async function PUT(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ skillId, ...body }),
       scope: 'skill.update',
       userId,
-    }, () => {
-      const current = store.getSkill(skillId, userId);
+    }, async () => {
+      const current = await store.getSkill(skillId, userId);
       if (!current) throw new ApiRequestError('Skill not found', { code: 'not_found', status: 404 });
       if (current.userId !== userId) throw new ApiRequestError('Only the Skill creator can edit this shared Skill', { code: 'forbidden', status: 403 });
-      const skill = store.upsertSkill({ id: skillId, ...body, userId });
+      const skill = await store.upsertSkill({ id: skillId, ...body, userId });
       return apiJson(request, { skill });
     });
   } catch (error) {
@@ -52,10 +52,10 @@ export async function DELETE(request: NextRequest, context: RouteContext) {
       fingerprint: idempotencyFingerprint({ skillId }),
       scope: 'skill.delete',
       userId,
-    }, () => {
-      const current = store.getSkill(skillId, userId);
+    }, async () => {
+      const current = await store.getSkill(skillId, userId);
       if (current && current.userId !== userId) throw new ApiRequestError('Only the Skill creator can delete this shared Skill', { code: 'forbidden', status: 403 });
-      if (!store.deleteSkill(skillId, userId)) throw new ApiRequestError('Skill not found', { code: 'not_found', status: 404 });
+      if (!await store.deleteSkill(skillId, userId)) throw new ApiRequestError('Skill not found', { code: 'not_found', status: 404 });
       return apiJson(request, { ok: true });
     });
   } catch (error) {

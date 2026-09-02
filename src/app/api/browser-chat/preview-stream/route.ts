@@ -3,7 +3,7 @@ import { browserReachableUrl } from '@/server/realtime/browser-preview-url';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { createWebSocketTicket, requestPublicOrigin } from '@/server/auth/websocket-ticket';
-import { getBrowserChatSession } from '@/server/ai/agents/browser-chat.service';
+import { selectBrowserChatSessionRuntime } from '@/server/ai/agents/browser-chat.service';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -12,11 +12,11 @@ export async function POST(request: Request) {
   try {
     const userId = requestApplicationUserId(request);
     const sessionId = new URL(request.url).searchParams.get('sessionId')?.trim() || '';
-    if (!sessionId || !getBrowserChatSession(sessionId, userId)) {
+    if (!sessionId || !await selectBrowserChatSessionRuntime(sessionId, userId)) {
       throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     }
     const info = await ensureBrowserPreviewWebSocketServer();
-    const auth = createWebSocketTicket({
+    const auth = await createWebSocketTicket({
       origin: requestPublicOrigin(request),
       scope: 'browser-preview',
       sessionId,

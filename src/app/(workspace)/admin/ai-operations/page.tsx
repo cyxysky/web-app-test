@@ -13,7 +13,7 @@ export default async function AiOperationsPage() {
   return (
     <main className="browser-chat-shell ai-operations-page-shell">
       <AiOperationsWorkspace
-        initialData={readAiOperationsDashboard(30)}
+        initialData={await readAiOperationsDashboard(30)}
         initialSidebarCollapsed={context.sidebarCollapsed}
       />
     </main>

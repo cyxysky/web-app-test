@@ -190,15 +190,15 @@ function launchRun(runId: string, userId: string) {
   });
 }
 
-function recoverDurableRuns(now: Date) {
+async function recoverDurableRuns(now: Date) {
   let recovered = 0;
-  const queued = listAutomationRuns({ status: 'queued', limit: MAX_DUE_PER_TICK });
+  const queued = await listAutomationRuns({ status: 'queued', limit: MAX_DUE_PER_TICK });
   for (const run of queued) {
     launchRun(run.id, run.userId);
     recovered += 1;
   }
 
-  const running = listAutomationRuns({ status: 'running', limit: MAX_DUE_PER_TICK });
+  const running = await listAutomationRuns({ status: 'running', limit: MAX_DUE_PER_TICK });
   for (const run of running) {
     const leaseExpiry = run.lease ? Date.parse(run.lease.expiresAt) : Number.NaN;
     if (run.lease && Number.isFinite(leaseExpiry) && leaseExpiry > now.getTime()) continue;
@@ -224,14 +224,14 @@ export async function runAutomationSchedulerTick(
   };
 
   try {
-    result.recovered = recoverDurableRuns(tickTime);
+    result.recovered = await recoverDurableRuns(tickTime);
   } catch (error) {
     result.errors += 1;
     incrementMetric('automation_scheduler_errors_total', { phase: 'recovery' });
     structuredLog({ event: 'automation.scheduler.recovery_failed', level: 'warn', error });
   }
 
-  const schedules = listDueAutomationSchedules({
+  const schedules = await listDueAutomationSchedules({
     at: triggeredAt,
     limit: MAX_DUE_PER_TICK,
   });
@@ -250,7 +250,7 @@ export async function runAutomationSchedulerTick(
         tickTime,
         occurrenceLocalDate,
       );
-      const occurrence = createAutomationScheduleOccurrence({
+      const occurrence = await createAutomationScheduleOccurrence({
         scheduleId: schedule.id,
         userId: schedule.userId,
         expectedNextRunAt: schedule.nextRunAt,

@@ -1,5 +1,5 @@
 import type { BrowserChatSessionSnapshot } from '@/server/ai/agents/browser-chat.service';
-import { getSqliteDatabase } from '@/server/storage/sqlite-database';
+import { executeDatabase, queryDatabase } from '@/server/db/database';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -103,7 +103,7 @@ function usageFromLog(value: unknown): ArchivedAiOperationsChatUsage | undefined
   return totalTokens && time ? { inputTokens, outputTokens, time, totalTokens } : undefined;
 }
 
-export function archiveAiOperationsChatSession(session: BrowserChatSessionSnapshot) {
+export async function archiveAiOperationsChatSession(session: BrowserChatSessionSnapshot) {
   const archivedAt = new Date().toISOString();
   const messages = session.messages.flatMap<ArchivedAiOperationsChatMessage>((message) => {
     if (message.role !== 'user' && message.role !== 'assistant') return [];
@@ -143,7 +143,7 @@ export function archiveAiOperationsChatSession(session: BrowserChatSessionSnapsh
     usages,
     userId: String(session.userId || '').trim() || 'unknown',
   };
-  getSqliteDatabase().prepare(`
+  await executeDatabase(`
     INSERT INTO ai_operations_chat_archive (
       session_id, user_id, record_json, first_event_at, last_event_at, archived_at
     ) VALUES (?, ?, ?, ?, ?, ?)
@@ -153,21 +153,21 @@ export function archiveAiOperationsChatSession(session: BrowserChatSessionSnapsh
       first_event_at = excluded.first_event_at,
       last_event_at = excluded.last_event_at,
       archived_at = excluded.archived_at
-  `).run(
+  `, [
     record.sessionId,
     record.userId,
     JSON.stringify(record),
     eventTimes[0] || session.createdAt || archivedAt,
     eventTimes[eventTimes.length - 1] || session.updatedAt || archivedAt,
     archivedAt,
-  );
+  ]);
 }
 
-export function readArchivedAiOperationsChatSessions() {
-  const rows = getSqliteDatabase().prepare(`
+export async function readArchivedAiOperationsChatSessions() {
+  const rows = await queryDatabase<ArchiveRow>(`
     SELECT record_json FROM ai_operations_chat_archive
     ORDER BY last_event_at DESC
-  `).all() as ArchiveRow[];
+  `);
   return rows.flatMap<ArchivedAiOperationsChatSession>((row) => {
     try {
       const parsed = JSON.parse(row.record_json) as ArchivedAiOperationsChatSession;

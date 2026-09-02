@@ -24,7 +24,7 @@ function text(value: unknown) {
 
 export async function GET(request: NextRequest) {
   const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 10, max: 100 });
-  const records = listAutomationCases({
+  const records = await listAutomationCases({
     userId: requestApplicationUserId(request),
     sourceSessionId: request.nextUrl.searchParams.get('sourceSessionId')?.trim() || undefined,
     beforeId: request.nextUrl.searchParams.get('beforeId')?.trim() || undefined,
@@ -56,8 +56,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'automation_case.create',
       userId,
-    }, () => {
-      const automationCase = createAutomationCase({
+    }, async () => {
+      const automationCase = await createAutomationCase({
         userId,
         title,
         description: text(body.description) || undefined,
@@ -71,7 +71,7 @@ export async function POST(request: NextRequest) {
         ok: true,
         case: automationCase,
         automationCase,
-        cases: listAutomationCases({ userId, limit: 10 }),
+        cases: await listAutomationCases({ userId, limit: 10 }),
       }, { status: 201 });
     });
   } catch (error) {

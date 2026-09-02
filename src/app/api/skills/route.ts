@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
   const limit = boundedQueryInteger(request.nextUrl.searchParams.get('limit'), { fallback: 50, max: 100 });
   const userId = requestUserId(request);
   const page = query
-    ? store.listSkills(undefined, userId, 2_000)
+    ? (await store.listSkills(undefined, userId, 2_000))
       .map((skill) => ({
         skill,
         score: fuzzyRetrievalScore(query, [skill.title, skill.description, ...skill.triggerPhrases]),
@@ -27,7 +27,7 @@ export async function GET(request: NextRequest) {
       .sort((left, right) => right.score - left.score || right.skill.updatedAt.localeCompare(left.skill.updatedAt))
       .slice(0, limit + 1)
       .map((item) => item.skill)
-    : store.listSkills(undefined, userId, limit + 1, {
+    : await store.listSkills(undefined, userId, limit + 1, {
       beforeId: request.nextUrl.searchParams.get('beforeId') || undefined,
       beforeUpdatedAt: request.nextUrl.searchParams.get('beforeUpdatedAt') || undefined,
     });
@@ -52,8 +52,8 @@ export async function POST(request: NextRequest) {
       fingerprint: idempotencyFingerprint(body),
       scope: 'skills.create',
       userId,
-    }, () => {
-      const skill = store.upsertSkill({ ...body, userId });
+    }, async () => {
+      const skill = await store.upsertSkill({ ...body, userId });
       return apiJson(request, { skill });
     });
   } catch (error) {

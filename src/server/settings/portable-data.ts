@@ -197,7 +197,7 @@ async function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, 
   }
 }
 
-function parseModelConfig(value: unknown): Pick<ReturnType<typeof store.saveModelConfig>, 'provider' | 'providers'> {
+function parseModelConfig(value: unknown): Pick<Awaited<ReturnType<typeof store.saveModelConfig>>, 'provider' | 'providers'> {
   const parsed = rawModelConfigSchema.parse(value);
   if (!modelProviderValues.includes(parsed.provider as ModelProvider)) throw new Error('模型服务商无效');
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
@@ -224,7 +224,7 @@ export async function exportPortableData(input: {
   const exportedAt = new Date().toISOString();
   const suffix = fileTimestamp(exportedAt);
   if (input.kind === 'credentials') {
-    const items = z.array(credentialItemSchema).parse(exportLoginAccountCredentials(input.userId));
+    const items = z.array(credentialItemSchema).parse(await exportLoginAccountCredentials(input.userId));
     return {
       fileName: `webpilot-credentials-${suffix}.json`,
       bundle: await encryptSecretPayload('credentials', { items }, input.passphrase, exportedAt),
@@ -232,7 +232,7 @@ export async function exportPortableData(input: {
     };
   }
   if (input.kind === 'model') {
-    const saved = store.getModelConfig();
+    const saved = await store.getModelConfig();
     if (!saved) throw new Error('请先保存模型配置再导出');
     const providers = Object.fromEntries(modelProviderDefinitions.map((definition) => {
       const current = saved.providers[definition.value];
@@ -257,7 +257,7 @@ export async function exportPortableData(input: {
   }
   if (input.kind === 'skills') {
     const ownerUserId = normalizeApplicationUserId(input.userId);
-    const items = z.array(skillItemSchema).parse(store.listSkills(undefined, ownerUserId)
+    const items = z.array(skillItemSchema).parse((await store.listSkills(undefined, ownerUserId))
       .filter((skill) => skill.userId === ownerUserId)
       .map((skill) => ({
         id: skill.id,
@@ -275,10 +275,10 @@ export async function exportPortableData(input: {
     };
   }
   const ownerUserId = normalizeApplicationUserId(input.userId);
-  const items = z.array(memoryItemSchema).parse(listPersonalMemoryItems({
+  const items = z.array(memoryItemSchema).parse((await listPersonalMemoryItems({
     userId: ownerUserId,
     includeDisabled: true,
-  }).filter((item) => item.userId === ownerUserId).map((item) => ({
+  })).filter((item) => item.userId === ownerUserId).map((item) => ({
     scope: item.scope,
     domain: item.domain,
     type: item.type,
@@ -303,7 +303,7 @@ function importCredentials(items: CredentialItem[], userId: unknown) {
 
 async function importSkills(items: SkillItem[], userId: unknown) {
   const normalizedUserId = normalizeApplicationUserId(userId);
-  const existingSkills = store.listSkills(undefined, normalizedUserId)
+  const existingSkills = (await store.listSkills(undefined, normalizedUserId))
     .filter((skill) => skill.userId === normalizedUserId);
   const byId = new Map(existingSkills.map((skill) => [skill.id, skill]));
   const targetIdByIdentity = new Map(existingSkills.map((skill) => [skillIdentity(skill), skill.id]));
@@ -352,9 +352,9 @@ export async function importPortableData(input: {
   } else if (input.kind === 'model') {
     const payload = z.object({ config: z.unknown() }).strict()
       .parse(await decryptSecretPayload(input.bundle, 'model', input.passphrase));
-    const existing = Boolean(store.getModelConfig());
+    const existing = Boolean(await store.getModelConfig());
     const config = parseModelConfig(payload.config);
-    store.saveModelConfig(config);
+    await store.saveModelConfig(config);
     counts = existing ? { created: 0, updated: 1 } : { created: 1, updated: 0 };
   } else {
     const bundle = plainBundleSchema.parse(input.bundle);
