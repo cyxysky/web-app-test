@@ -25,6 +25,84 @@
     "paths": {
       "@/*": [
         "./src/*"
+      ],
+      "@webpilot/capability-sdk": [
+        "./packages/capability-sdk/src/index.ts"
+      ],
+      "@webpilot/capability-adapter-ai-sdk": [
+        "./packages/capability-adapter-ai-sdk/src/index.ts"
+      ],
+      "@webpilot/capability-adapter-mcp": [
+        "./packages/capability-adapter-mcp/src/index.ts"
+      ],
+      "@webpilot/capability-browser": [
+        "./packages/capability-browser/src/index.ts"
+      ],
+      "@webpilot/capability-browser/node": [
+        "./packages/capability-browser/src/node.ts"
+      ],
+      "@webpilot/capability-browser/runtime-skill": [
+        "./packages/capability-browser/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-browser/mcp": [
+        "./packages/capability-browser/src/mcp.ts"
+      ],
+      "@webpilot/capability-chart": [
+        "./packages/capability-chart/src/index.ts"
+      ],
+      "@webpilot/capability-chart/node": [
+        "./packages/capability-chart/src/node.ts"
+      ],
+      "@webpilot/capability-chart/react": [
+        "./packages/capability-chart/src/react.tsx"
+      ],
+      "@webpilot/capability-chart/runtime-skill": [
+        "./packages/capability-chart/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-chart/mcp": [
+        "./packages/capability-chart/src/mcp.ts"
+      ],
+      "@webpilot/capability-file": [
+        "./packages/capability-file/src/index.ts"
+      ],
+      "@webpilot/capability-file/node": [
+        "./packages/capability-file/src/node.ts"
+      ],
+      "@webpilot/capability-file/formats": [
+        "./packages/capability-file/src/formats.ts"
+      ],
+      "@webpilot/capability-file/office": [
+        "./packages/capability-file/src/office/types.ts"
+      ],
+      "@webpilot/capability-file/runtime-skill": [
+        "./packages/capability-file/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-file/mcp": [
+        "./packages/capability-file/src/mcp.ts"
+      ],
+      "@webpilot/capability-file/node/artifacts": [
+        "./packages/capability-file/src/node/artifacts.ts"
+      ],
+      "@webpilot/capability-file/node/convert": [
+        "./packages/capability-file/src/node/convert.ts"
+      ],
+      "@webpilot/capability-file/node/download": [
+        "./packages/capability-file/src/node/download.ts"
+      ],
+      "@webpilot/capability-file/node/generate": [
+        "./packages/capability-file/src/node/generate.ts"
+      ],
+      "@webpilot/capability-file/node/office": [
+        "./packages/capability-file/src/node/office.ts"
+      ],
+      "@webpilot/capability-file/node/read": [
+        "./packages/capability-file/src/node/read.ts"
+      ],
+      "@webpilot/capability-file/node/text-extraction": [
+        "./packages/capability-file/src/node/text-extraction.ts"
+      ],
+      "@webpilot/capability-file/node/workspace": [
+        "./packages/capability-file/src/node/workspace.ts"
       ]
     }
   },

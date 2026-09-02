@@ -1,14 +1,17 @@
-import type { BrowserActionResult } from '@/server/browser/browser-session';
+import type { BrowserActionResult } from '@webpilot/capability-browser/node';
+import { browserCapabilityToolNames } from '@webpilot/capability-browser';
+import { fileCapabilityToolNames } from '@webpilot/capability-file';
+import { chartCapabilityToolNames } from '@webpilot/capability-chart';
 import {
   browserCodeRuntimeSkillContent,
   browserCodeRuntimeSkillId,
   browserCodeRuntimeSkillSummary,
-} from './browser-code-runtime-skill';
+} from '@webpilot/capability-browser/runtime-skill';
 import {
   fileArtifactRuntimeSkillContent,
   fileArtifactRuntimeSkillId,
   fileArtifactRuntimeSkillSummary,
-} from './file-artifact-runtime-skill';
+} from '@webpilot/capability-file/runtime-skill';
 import {
   subagentRuntimeSkillContent,
   subagentRuntimeSkillId,
@@ -18,7 +21,7 @@ import {
   chartRuntimeSkillContent,
   chartRuntimeSkillId,
   chartRuntimeSkillSummary,
-} from './chart-runtime-skill';
+} from '@webpilot/capability-chart/runtime-skill';
 
 type HiddenRuntimeSkillPolicy = {
   skillId: string;
@@ -32,19 +35,15 @@ function actionFromInput(input: unknown) {
 }
 
 export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSkillPolicy>> = Object.freeze({
-  browserCode: {
+  [browserCapabilityToolNames.browser]: {
     skillId: browserCodeRuntimeSkillId,
-    requires: () => true,
+    requires: (input) => actionFromInput(input) === 'code',
   },
-  file: {
+  [fileCapabilityToolNames.file]: {
     skillId: fileArtifactRuntimeSkillId,
     requires: () => true,
   },
-  fileVisual: {
-    skillId: fileArtifactRuntimeSkillId,
-    requires: () => true,
-  },
-  chart: {
+  [chartCapabilityToolNames.chart]: {
     skillId: chartRuntimeSkillId,
     requires: () => true,
   },

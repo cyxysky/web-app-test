@@ -1,0 +1,63 @@
+{
+  "name": "@webpilot/capability-chart",
+  "version": "0.1.0",
+  "description": "Framework-neutral Apache ECharts capability with Node and React adapters.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js"
+    },
+    "./runtime-skill": {
+      "types": "./dist/runtime-skill.d.ts",
+      "import": "./dist/runtime-skill.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    }
+  },
+  "bin": {
+    "webpilot-chart-mcp": "./dist/bin/mcp.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@webpilot/capability-adapter-mcp": "0.1.0",
+    "@webpilot/capability-sdk": "0.1.0",
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "echarts": ">=6.0.0 <7",
+    "react": ">=19.0.0 <20"
+  },
+  "peerDependenciesMeta": {
+    "echarts": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

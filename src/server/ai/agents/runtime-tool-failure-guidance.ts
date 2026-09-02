@@ -1,4 +1,4 @@
-import type { BrowserActionResult } from '@/server/browser/browser-session';
+import type { BrowserActionResult } from '@webpilot/capability-browser/node';
 
 export type RuntimeToolFailureCategory =
   | 'actionability'
@@ -38,9 +38,9 @@ export function classifyRuntimeToolFailure(
   if (name === 'skill' || /requiredSkillId|hidden built-in Skill|runtime Skill .* not loaded/i.test(actual)) {
     return 'skill-gate';
   }
-  if (name === 'file' || name === 'fileVisual') return 'file-workflow';
+  if (name === 'file') return 'file-workflow';
   if (name === 'subagent') return 'subagent-workflow';
-  if (name === 'readBrowserState' || /browser session has not started|browser unavailable|page has been closed|target page, context or browser has been closed/i.test(actual)) {
+  if (/browser session has not started|browser unavailable|page has been closed|target page, context or browser has been closed/i.test(actual)) {
     return 'browser-unavailable';
   }
   if (/ACTIONABILITY_FAILED|coveredBySurfaceId|activeSurfaceId|covered by|viewport-blocking|strict mode violation|(?:resolved to|matched) \d+ (?:rendered )?elements|element is not visible|element is outside|zero (?:matches|actionable)|no actionable/i.test(actual)) {

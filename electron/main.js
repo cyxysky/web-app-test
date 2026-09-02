@@ -2630,6 +2630,12 @@ async function startServer(appDataDir) {
     ELECTRON_EMBEDDED_BROWSER_CDP_PORT: String(EMBEDDED_BROWSER_CDP_PORT),
     HOSTNAME: '127.0.0.1',
     LIBREOFFICE_PATH: packagedLibreOfficeExecutable(),
+    CAPABILITY_FILE_RUNTIME_DIR: app.isPackaged
+      ? path.join(serverDir, 'capability-runtime', 'file')
+      : process.env.CAPABILITY_FILE_RUNTIME_DIR,
+    CAPABILITY_BROWSER_RUNTIME_DIR: app.isPackaged
+      ? path.join(serverDir, 'capability-runtime', 'browser')
+      : process.env.CAPABILITY_BROWSER_RUNTIME_DIR,
     NODE_PATH: app.isPackaged ? path.join(serverDir, 'node_modules') : process.env.NODE_PATH,
     NODE_ENV: 'production',
     PORT: String(port),

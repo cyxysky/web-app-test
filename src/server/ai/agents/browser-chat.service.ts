@@ -1,16 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserTabSnapshot } from '@/server/browser/browser-session';
+import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserTabSnapshot } from '@webpilot/capability-browser/node';
 import type {
   BrowserCodeAttachmentBinding,
   BrowserCodeCredentialBinding,
-} from '@/server/browser/browser-code-runner';
+} from '@webpilot/capability-browser/node';
+import { createWebPilotBrowserSession } from '@/server/capabilities/webpilot-browser';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { readBrowserDomainCookies } from '@/server/credentials/browser-domain-cookie-vault';
 import { incrementMetric, structuredLog } from '@/server/observability/runtime-observability';
 import { archiveAiOperationsChatSession } from '@/server/observability/ai-operations-chat-archive';
-import { artifactContentType } from '@/server/files/file-format-registry';
+import { artifactContentType } from '@webpilot/capability-file';
+import '@/server/capabilities/webpilot-file-observability';
 import {
   executeInteractiveBrowserTurn,
   type BrowserToolConfirmationDecision,
@@ -22,12 +24,12 @@ import {
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import { generateSkillFromBrowserHistory } from '@/server/ai/agents/skill-generator.agent';
 import {
-  browserChatAttachmentMetadata,
-  isBrowserChatImageAttachment,
-  readBrowserChatAttachment,
-  readBrowserChatFileVisuals,
-  type BrowserChatFileVisualInput,
-} from '@/server/ai/agents/browser-chat-attachment-reader';
+  fileAttachmentMetadata as browserChatAttachmentMetadata,
+  isImageFileAttachment as isBrowserChatImageAttachment,
+  readFileAttachment as readBrowserChatAttachment,
+  readFileVisuals as readBrowserChatFileVisuals,
+  type FileVisualInput as BrowserChatFileVisualInput,
+} from '@webpilot/capability-file/node';
 import {
   normalizeBrowserChatAttachments,
   normalizeBrowserChatUploadPath,
@@ -101,7 +103,7 @@ import {
 } from '@/server/ai/agents/skill-context';
 import { expandMultilingualRetrievalQuery } from '@/server/ai/retrieval-query';
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
-import { officeDraftCatalogForPrompt } from '@/server/ai/agents/file-artifact-tools';
+import { officeDraftCatalogForPrompt } from '@webpilot/capability-file/node/workspace';
 import {
   extractPersonalMemoryFromTurn,
   formatPersonalMemoryForPrompt,
@@ -1581,7 +1583,7 @@ function browserChatCredentialPrompt(credentials: BrowserChatCredentialDescripto
       `  密码：await credentialVault.fill(page.getByLabel('密码'), "${item.passwordRef}")`,
       '</account>',
     ].join('\n')),
-    'credentialVault.fill 只会把对应值写入当前浏览器会话中的真实 Playwright Locator；保存的默认站点仅用于识别账号和提供登录地址，不限制账号在哪个 HTTP(S) 站点使用。它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 waitForHumanVerification。',
+    'credentialVault.fill 只会把对应值写入当前浏览器会话中的真实 Playwright Locator；保存的默认站点仅用于识别账号和提供登录地址，不限制账号在哪个 HTTP(S) 站点使用。它不会返回账号或密码明文。不得读取已填充输入框的 inputValue/value，不得在 nodeRepl.write、console、工具参数或最终回复中输出凭据或引用。验证码、OTP、扫码或二次认证必须调用 browser action=waitForHumanVerification。',
   ].join('\n');
 }
 
@@ -1716,7 +1718,7 @@ async function readFileVisualsForSession(
   if (!attachment) {
     return {
       ok: false,
-      actual: 'fileVisual could not find this artifact in the current conversation. Use the exact Artifact ID returned by a successful file generation or download.',
+      actual: 'File visual inspection could not find this artifact in the current conversation. Use the exact Artifact ID returned by a successful file generation or download.',
     };
   }
   return readBrowserChatFileVisuals({
@@ -3259,7 +3261,7 @@ async function ensureStarted(
 
 function createBrowserChatBrowser(session: BrowserChatSessionRecord, preferExistingPage = false) {
   const browserProfileKey = browserChatBrowserProfileKey(session);
-  return new BrowserSession({
+  return createWebPilotBrowserSession({
     browserSurface: 'electron-embedded',
     browserProfileKey,
     ...(process.env.ELECTRON_EMBEDDED_BROWSER === 'true' ? {} : { sharedBrowserRuntimeKey: browserProfileKey }),
@@ -4261,7 +4263,13 @@ function latestManualVerificationAssistant(session: BrowserChatSessionRecord) {
     const message = session.messages[index];
     if (message.role !== 'assistant' || message.status !== 'blocked') continue;
     const stepIndexes = new Set(message.stepIndexes || []);
-    const waiting = session.steps.some((step) => stepIndexes.has(step.index) && (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'));
+    const waiting = session.steps.some((step) => stepIndexes.has(step.index) && (step.tools || []).some((tool) => (
+      tool.name === 'browser'
+      && tool.input
+      && typeof tool.input === 'object'
+      && !Array.isArray(tool.input)
+      && (tool.input as Record<string, unknown>).action === 'waitForHumanVerification'
+    )));
     if (waiting) return { message, messageIndex: index };
   }
   for (let index = session.messages.length - 1; index >= 0; index -= 1) {
@@ -5098,7 +5106,7 @@ async function createBrowserChatSubagentBrowser(
     ? await parentBrowser.exportStorageState().catch(() => undefined)
     : undefined;
   const browserProfileKey = browserChatBrowserProfileKey(session);
-  const browser = new BrowserSession({
+  const browser = createWebPilotBrowserSession({
     browserSurface: 'external',
     headless: true,
     browserProfileKey,
@@ -5246,7 +5254,7 @@ async function executeBrowserChatSubagentBatch(input: {
           '你拥有完整浏览器工具集。完成当前分支后立即返回；不要读取或等待其他子 Agent，也不要因为其他分支失败而停止。',
           browserChatSubagentAuthPrompt(childBrowser.authMode),
           '你运行在独立的子 Agent 页面中。遇到必须由用户处理的验证码、扫码、OTP 或设备确认时，不要继续尝试绕过；请明确报告阻塞证据并把该步骤交回主 Agent。',
-          '浏览器检查与操作统一使用 browserCode，在隔离程序中直接调用真实 Playwright page/context，并返回可追溯的结构化证据。需要跨内核或跨轮次保留的非敏感 JSON 数据使用 agent.state。',
+          '浏览器检查与操作统一使用 browser：action=state 读取状态，action=code 在隔离程序中直接调用真实 Playwright page/context，action=waitForHumanVerification 等待人工验证。需要跨内核或跨轮次保留的非敏感 JSON 数据使用 agent.state。',
           '只有已经发现明确的懒加载、虚拟列表或无限滚动证据，且目标内容尚未加载时才滚动；不要把滚动当作默认页面读取方式。',
           '单个工具失败只属于过程诊断。如果已经通过其他页面证据完成任务，最终整体状态必须是 passed。不要单独创建失败记录、验证记录或透明披露章节；只有尚未解决且实质影响目标结果的失败，才在受影响的结论旁简短说明。',
           summaryGuidanceChars

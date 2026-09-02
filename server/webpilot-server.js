@@ -4,6 +4,7 @@ const net = require('node:net');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const v8 = require('node:v8');
 const { createRequire } = require('node:module');
 const { randomBytes } = require('node:crypto');
 const {
@@ -13,6 +14,72 @@ const {
 } = require('./webpilot-identity');
 const { createRealtimeRefreshHub } = require('./realtime-refresh-hub');
 const { startProcessMemoryMonitor } = require('./process-memory-monitor');
+
+const DEVELOPMENT_CHILD_FLAG = '--development-child';
+const DEVELOPMENT_RESTART_EXIT_CODE = 77;
+
+function boundedDevelopmentMemoryThreshold(value) {
+  const parsed = Number(value || 0.8);
+  return Number.isFinite(parsed) ? Math.min(0.95, Math.max(0.5, parsed)) : 0.8;
+}
+
+function developmentMemoryRestartStats(dev, runtimeChildMode, environment = process.env, heap = v8.getHeapStatistics()) {
+  if (!dev || runtimeChildMode || !process.argv.includes(DEVELOPMENT_CHILD_FLAG)) return undefined;
+  if (String(environment.WEBPILOT_DEV_MEMORY_RESTART || '').trim().toLowerCase() === 'false') return undefined;
+  const threshold = boundedDevelopmentMemoryThreshold(environment.WEBPILOT_DEV_MEMORY_RESTART_THRESHOLD);
+  return heap.used_heap_size > threshold * heap.heap_size_limit
+    ? { heapSizeLimit: heap.heap_size_limit, heapUsed: heap.used_heap_size, threshold }
+    : undefined;
+}
+
+function startDevelopmentSupervisor() {
+  let child;
+  let restartTimer;
+  let stopped = false;
+
+  const stop = (signal) => {
+    if (stopped) return;
+    stopped = true;
+    if (restartTimer) clearTimeout(restartTimer);
+    if (child && !child.killed) child.kill(signal);
+  };
+  process.once('SIGINT', () => stop('SIGINT'));
+  process.once('SIGTERM', () => stop('SIGTERM'));
+
+  const start = () => {
+    if (stopped) return;
+    child = spawn(process.execPath, [
+      ...process.execArgv,
+      __filename,
+      ...process.argv.slice(2),
+      DEVELOPMENT_CHILD_FLAG,
+    ], {
+      cwd: process.cwd(),
+      env: process.env,
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+    child.once('error', (error) => {
+      console.error('[webpilot-server] Development child failed.', error);
+    });
+    child.once('exit', (code, signal) => {
+      child = undefined;
+      if (stopped) {
+        process.exitCode = 0;
+        return;
+      }
+      if (code === DEVELOPMENT_RESTART_EXIT_CODE) {
+        console.log('[webpilot-server] Restarting the development runtime after memory pressure.');
+        restartTimer = setTimeout(start, 250);
+        return;
+      }
+      process.exitCode = typeof code === 'number' ? code : 1;
+      if (signal) console.error(`[webpilot-server] Development child exited from ${signal}.`);
+    });
+  };
+
+  start();
+}
 
 function normalizeBasePath(value) {
   const normalized = String(value || '').trim().replace(/^\/+|\/+$/g, '');
@@ -544,7 +611,22 @@ async function main() {
   const basePath = applicationBasePath(dev, compiledConfig);
 
   const refreshHub = createRealtimeRefreshHub({ appDir });
+  let activeRequestCount = 0;
+  let developmentRestartRequested = false;
+  const requestDevelopmentRestartIfNeeded = () => {
+    if (developmentRestartRequested || activeRequestCount > 0) return;
+    const stats = developmentMemoryRestartStats(dev, runtimeChildMode);
+    if (!stats) return;
+    developmentRestartRequested = true;
+    console.warn(
+      `[webpilot-server] Development runtime reached ${Math.round(stats.heapUsed / stats.heapSizeLimit * 100)}% of its V8 heap limit; restarting to prevent an out-of-memory crash.`,
+    );
+    process.exit(DEVELOPMENT_RESTART_EXIT_CODE);
+  };
+  const developmentMemoryTimer = setInterval(requestDevelopmentRestartIfNeeded, 10_000);
+  developmentMemoryTimer.unref?.();
   const server = http.createServer((request, response) => {
+    activeRequestCount += 1;
     void (async () => {
       removeUntrustedProxyHeaders(request);
       const requestUrl = new URL(request.url || '/', `http://${request.headers.host || `${hostname}:${port}`}`);
@@ -594,6 +676,9 @@ async function main() {
       console.error('[webpilot-server] HTTP request failed.', error);
       if (!response.headersSent) response.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
       response.end('Internal Server Error');
+    }).finally(() => {
+      activeRequestCount = Math.max(0, activeRequestCount - 1);
+      requestDevelopmentRestartIfNeeded();
     });
   });
 
@@ -625,6 +710,7 @@ async function main() {
   });
 
   const close = () => {
+    clearInterval(developmentMemoryTimer);
     memoryMonitor.stop();
     refreshHub.close();
     apiRuntimeSupervisor?.stop();
@@ -637,10 +723,14 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error('[webpilot-server] Failed to start.', error);
-    process.exitCode = 1;
-  });
+  if (process.argv.includes('--dev') && !process.argv.includes(DEVELOPMENT_CHILD_FLAG)) {
+    startDevelopmentSupervisor();
+  } else {
+    main().catch((error) => {
+      console.error('[webpilot-server] Failed to start.', error);
+      process.exitCode = 1;
+    });
+  }
 }
 
 module.exports = {
@@ -649,6 +739,8 @@ module.exports = {
   createApiRuntimeSupervisor,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
+  boundedDevelopmentMemoryThreshold,
+  developmentMemoryRestartStats,
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { analyzeOfficeProgram, diagnoseOfficeProgramRuntimeError } from './office-program-analysis';
+import { analyzeOfficeProgram, diagnoseOfficeProgramRuntimeError } from '@webpilot/capability-file/node';
 
 describe('Office program diagnostic excerpts', () => {
   it('includes the failing JavaScript source line', async () => {

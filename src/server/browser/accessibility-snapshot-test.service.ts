@@ -3,9 +3,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { artifactApiUrlFromRelative } from '@/lib/artifacts';
 import {
-  BrowserSession,
+  type BrowserSession,
   type AccessibilitySnapshotExportControlResult,
-} from '@/server/browser/browser-session';
+} from '@webpilot/capability-browser/node';
+import { createWebPilotBrowserSession } from '@/server/capabilities/webpilot-browser';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
 
 const DOM_EXPORT_CHUNK_CHARS = 20000;
@@ -194,7 +195,7 @@ export async function openAccessibilitySnapshotTestBrowser(appOrigin?: string): 
 
   state.startPromise = (async () => {
     await state.session?.close().catch(() => undefined);
-    const session = new BrowserSession({
+    const session = createWebPilotBrowserSession({
       headless: false,
       isolated: true,
       runId: 'dom-observation-test',

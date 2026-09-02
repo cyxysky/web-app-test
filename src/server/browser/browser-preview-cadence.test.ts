@@ -3,7 +3,7 @@ import test from 'node:test';
 import {
   browserPreviewFrameIntervalMs,
   browserPreviewFramesPerSecond,
-} from './browser-preview-cadence';
+} from '@webpilot/capability-browser/node';
 
 test('browser preview defaults to twenty frames per second and allows low rates', () => {
   assert.equal(browserPreviewFramesPerSecond(undefined), 20);

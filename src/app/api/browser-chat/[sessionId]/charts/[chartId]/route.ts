@@ -1,4 +1,4 @@
-import { readBrowserChatChart } from '@/server/ai/agents/chart-artifact-tools';
+import { readBrowserChatChart } from '@/server/capabilities/browser-chat-chart';
 import { readBrowserChatRuntimeState } from '@/server/ai/agents/browser-chat-read.service';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';

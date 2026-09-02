@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
-import { BrowserSession } from '@/server/browser/browser-session';
+import type { BrowserSession } from '@webpilot/capability-browser/node';
+import { createWebPilotBrowserSession } from '@/server/capabilities/webpilot-browser';
 import { store } from '@/server/db/store';
 import { apiError, apiJson } from '@/server/http/api-request';
 import { requireDebugRouteAccess } from '@/server/http/debug-route-access';
@@ -41,7 +42,7 @@ export async function GET(request: NextRequest) {
 
     const session = reuse && debugState.session
       ? debugState.session
-      : new BrowserSession({
+      : createWebPilotBrowserSession({
           isMarked: true,
           runId,
           debugDevtools: true,

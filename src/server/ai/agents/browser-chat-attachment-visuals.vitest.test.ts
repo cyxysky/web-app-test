@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizeBrowserChatAttachmentPreviewPages } from './browser-chat-attachment-visuals';
+import { normalizeFilePreviewPages as normalizeBrowserChatAttachmentPreviewPages } from '@webpilot/capability-file/node';
 
 describe('browser chat attachment visual page normalization', () => {
   it('keeps all eight explicitly requested preview pages in order', () => {

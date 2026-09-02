@@ -33,15 +33,12 @@ export function browserChatFileToolPresentation(
   name: string,
   input: unknown,
 ): BrowserChatFileToolPresentation | undefined {
+  if (name !== 'file') return undefined;
   const record = asRecord(input);
   const action = textValue(record?.action);
 
-  if (name === 'fileVisual') {
-    if (action === 'index') return { key: 'file-visual-index', label: '获取截图列表' };
-    if (action === 'read') return { key: 'file-visual-read', label: '查看页面截图' };
-    return undefined;
-  }
-  if (name !== 'file') return undefined;
+  if (action === 'visualIndex') return { key: 'file-visual-index', label: '获取截图列表' };
+  if (action === 'visualRead') return { key: 'file-visual-read', label: '查看页面截图' };
 
   if (action === 'read') {
     if (textValue(record?.documentId)) return { key: 'read-draft', label: '读取草稿' };

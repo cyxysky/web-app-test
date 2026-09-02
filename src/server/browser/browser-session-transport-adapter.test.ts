@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolveBrowserSessionTransportAdapter } from './browser-session-transport-adapter';
+import { resolveBrowserSessionTransportAdapter } from '@webpilot/capability-browser/node';
 
 test('browser transport adapters are mutually exclusive and priority ordered', () => {
   assert.deepEqual(resolveBrowserSessionTransportAdapter({

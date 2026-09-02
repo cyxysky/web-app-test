@@ -5,9 +5,12 @@ import path from 'node:path';
 import test from 'node:test';
 import JSZip from 'jszip';
 import sharp from 'sharp';
-import { extractAttachmentTextInWorker } from '@/server/runtime/cpu-worker-pool';
-import { readBrowserChatAttachment } from './browser-chat-attachment-reader';
-import { BROWSER_CHAT_FILE_READ_MIN_CHARS, normalizeBrowserChatFileReadLimit } from './browser-chat-file-read';
+import {
+  extractFileTextInWorker as extractAttachmentTextInWorker,
+  FILE_READ_MIN_CHARACTERS as BROWSER_CHAT_FILE_READ_MIN_CHARS,
+  normalizeFileReadLimit as normalizeBrowserChatFileReadLimit,
+  readFileAttachment as readBrowserChatAttachment,
+} from '@webpilot/capability-file/node';
 
 test('readFile defaults to 20000 characters and clamps smaller requested limits', () => {
   assert.equal(normalizeBrowserChatFileReadLimit(undefined), 20_000);

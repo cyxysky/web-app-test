@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserCodeReportedFailure } from './browser-code-runner';
+import { browserCodeReportedFailure } from '@webpilot/capability-browser/node';
 
 test('browserCode explicit top-level ok false is a semantic execution failure', () => {
   assert.equal(browserCodeReportedFailure({ ok: false, error: 'capture failed' }), 'capture failed');

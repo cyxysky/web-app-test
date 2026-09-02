@@ -10,12 +10,12 @@ import {
   isUnoBridgeStartupError,
   isTransientUnoBridgeError,
   resolveUnoProgramWorker,
-} from './uno-program';
-import { resolveLibreOfficeExecutable } from './libreoffice';
-import { validateOfficeArtifact } from './office-artifact-validator';
+  resolveLibreOfficeExecutable,
+  validateOfficeArtifact,
+} from '@webpilot/capability-file/node';
 
 test('forces UTF-8 for UNO worker diagnostics on Windows and other hosts', async () => {
-  const source = await readFile(new URL('./uno-program.ts', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../../../packages/capability-file/src/node/office/uno.ts', import.meta.url), 'utf8');
   assert.match(source, /PYTHONIOENCODING:\s*'utf-8'/);
   assert.match(source, /PYTHONUTF8:\s*'1'/);
 });

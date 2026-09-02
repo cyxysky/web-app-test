@@ -4,8 +4,9 @@ import {
   executeRecordedBrowserOperation,
 } from '@/server/ai/agents/browser-chat-executor.agent';
 import type { InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
-import { BrowserSession, type BrowserActionResult } from '@/server/browser/browser-session';
-import type { BrowserCodeCredentialBinding } from '@/server/browser/browser-code-runner';
+import type { BrowserActionResult, BrowserSession } from '@webpilot/capability-browser/node';
+import type { BrowserCodeCredentialBinding } from '@webpilot/capability-browser/node';
+import { createWebPilotBrowserSession } from '@/server/capabilities/webpilot-browser';
 import {
   listLoginAccounts,
   resolveLoginAccountCredentialById,
@@ -462,7 +463,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
     const credentialContext = await credentialContextForCase(automationCase);
     await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     const browserProfileKey = `user_${automationCase.userId}`;
-    browser = new BrowserSession({
+    browser = createWebPilotBrowserSession({
       browserSurface: 'external',
       headless: true,
       browserProfileKey,
@@ -500,7 +501,13 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       if (
         operation.replayable === false
         || operation.waitForManual === true
-        || operation.name === 'waitForHumanVerification'
+        || (
+          operation.name === 'browser'
+          && operation.input
+          && typeof operation.input === 'object'
+          && !Array.isArray(operation.input)
+          && (operation.input as Record<string, unknown>).action === 'waitForHumanVerification'
+        )
         || operation.recordedStatus === 'failed'
         || operation.recordedStatus === 'cancelled'
       ) {

@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 import { runtimeMetricsSnapshot } from '@/server/observability/runtime-observability';
 import { databaseWriteQueueSnapshot } from '@/server/storage/database-write-queue';
-import { cpuWorkerPoolSnapshot } from '@/server/runtime/cpu-worker-pool';
+import { fileTextExtractionPoolSnapshot } from '@/server/capabilities/webpilot-file-observability';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 
 export const dynamic = 'force-dynamic';
@@ -16,7 +16,7 @@ export async function GET(request: NextRequest) {
     return apiJson(request, {
       metrics: runtimeMetricsSnapshot(),
       queues: {
-        cpuWorkers: cpuWorkerPoolSnapshot(),
+        cpuWorkers: fileTextExtractionPoolSnapshot(),
         databaseWrites: databaseWriteQueueSnapshot(),
       },
     });

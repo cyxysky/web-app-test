@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { analyzeOfficeProgram } from './office-program-analysis';
+import { analyzeOfficeProgram } from '@webpilot/capability-file/node';
 
 test('reports JavaScript syntax and incompatible CommonJS usage before Office execution', async () => {
   const syntax = await analyzeOfficeProgram('export function createDocument(job) { const broken = ; }', 'javascript');

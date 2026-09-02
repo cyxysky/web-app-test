@@ -1,7 +1,7 @@
 import { queryDatabase, queryDatabaseOne } from '@/server/db/database';
 import { runtimeMetricsSnapshot } from '@/server/observability/runtime-observability';
 import { databaseWriteQueueSnapshot } from '@/server/storage/database-write-queue';
-import { cpuWorkerPoolSnapshot } from '@/server/runtime/cpu-worker-pool';
+import { fileTextExtractionPoolSnapshot } from '@/server/capabilities/webpilot-file-observability';
 import { readArchivedAiOperationsChatSessions } from '@/server/observability/ai-operations-chat-archive';
 
 export type AiOperationsStatus = 'passed' | 'failed' | 'blocked' | 'running' | 'interrupted' | 'unknown';
@@ -94,7 +94,7 @@ export type AiOperationsDashboardData = {
   };
   rangeDays: number;
   runtime: {
-    cpuWorkers: ReturnType<typeof cpuWorkerPoolSnapshot>;
+    cpuWorkers: ReturnType<typeof fileTextExtractionPoolSnapshot>;
     databaseWrites: ReturnType<typeof databaseWriteQueueSnapshot>;
   };
   systems: AiOperationsSystemMetric[];
@@ -725,7 +725,7 @@ export async function readAiOperationsDashboard(
     },
     rangeDays,
     runtime: {
-      cpuWorkers: cpuWorkerPoolSnapshot(),
+      cpuWorkers: fileTextExtractionPoolSnapshot(),
       databaseWrites: databaseWriteQueueSnapshot(),
     },
     systems: [...systems.values()]

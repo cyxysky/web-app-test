@@ -38,7 +38,7 @@ function sessionFixture(): BrowserChatSessionSnapshot {
         expected: '创建成功',
         actual: '创建成功',
         status: 'passed',
-        tools: [{ id: 'tool-1', name: 'browserCode', input: { code: 'submit()' }, ok: true }],
+        tools: [{ id: 'tool-1', name: 'browser', input: { action: 'code', code: 'submit()' }, ok: true }],
       },
       {
         index: 2,
@@ -47,7 +47,7 @@ function sessionFixture(): BrowserChatSessionSnapshot {
         expected: '需求存在',
         actual: '需求存在',
         status: 'passed',
-        tools: [{ id: 'tool-2', name: 'browserCode', input: { code: 'check()' }, ok: true }],
+        tools: [{ id: 'tool-2', name: 'browser', input: { action: 'code', code: 'check()' }, ok: true }],
       },
     ],
   };

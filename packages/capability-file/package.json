@@ -1,0 +1,99 @@
+{
+  "name": "@webpilot/capability-file",
+  "version": "0.1.0",
+  "description": "Agent-framework-neutral file artifact capability contracts, schemas, and action routing.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "runtime",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./formats": {
+      "types": "./dist/formats.d.ts",
+      "import": "./dist/formats.js"
+    },
+    "./office": {
+      "types": "./dist/office/types.d.ts",
+      "import": "./dist/office/types.js"
+    },
+    "./runtime-skill": {
+      "types": "./dist/runtime-skill.d.ts",
+      "import": "./dist/runtime-skill.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    },
+    "./node/artifacts": {
+      "types": "./dist/node/artifacts.d.ts",
+      "import": "./dist/node/artifacts.js"
+    },
+    "./node/convert": {
+      "types": "./dist/node/convert.d.ts",
+      "import": "./dist/node/convert.js"
+    },
+    "./node/download": {
+      "types": "./dist/node/download.d.ts",
+      "import": "./dist/node/download.js"
+    },
+    "./node/generate": {
+      "types": "./dist/node/generate.d.ts",
+      "import": "./dist/node/generate.js"
+    },
+    "./node/office": {
+      "types": "./dist/node/office.d.ts",
+      "import": "./dist/node/office.js"
+    },
+    "./node/read": {
+      "types": "./dist/node/read.d.ts",
+      "import": "./dist/node/read.js"
+    },
+    "./node/text-extraction": {
+      "types": "./dist/node/text-extraction.d.ts",
+      "import": "./dist/node/text-extraction.js"
+    },
+    "./node/workspace": {
+      "types": "./dist/node/workspace.d.ts",
+      "import": "./dist/node/workspace.js"
+    }
+  },
+  "bin": {
+    "webpilot-file-mcp": "./dist/bin/mcp.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@webpilot/capability-adapter-mcp": "0.1.0",
+    "@webpilot/capability-sdk": "0.1.0",
+    "cfb": "^1.2.2",
+    "docx": "^9.7.1",
+    "exceljs": "^4.4.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.0",
+    "pdf-parse": "^2.4.5",
+    "playwright": "^1.60.0",
+    "pptxgenjs": "^4.0.1",
+    "sharp": "^0.34.5",
+    "typescript": "^5.8.3",
+    "xlsx": "^0.18.5",
+    "zod": "^4.4.3"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

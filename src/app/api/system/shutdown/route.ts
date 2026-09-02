@@ -1,4 +1,4 @@
-import { closeAllBrowserSessions } from '@/server/browser/browser-session';
+import { closeAllBrowserSessions } from '@webpilot/capability-browser/node';
 import { ApiRequestError, apiError, apiJson } from '@/server/http/api-request';
 
 export const dynamic = 'force-dynamic';

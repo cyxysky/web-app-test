@@ -8,9 +8,11 @@ const test = require('node:test');
 const {
   applyTrustedIdentityHeaders,
   applicationBasePath,
+  boundedDevelopmentMemoryThreshold,
   createApiRuntimeSupervisor,
   configureCompiledNextRuntime,
   configureNextDevelopmentRuntime,
+  developmentMemoryRestartStats,
   loadCompiledNextConfig,
   nextDevelopmentUpgrade,
   normalizeBasePath,
@@ -23,6 +25,28 @@ const {
 } = require('./webpilot-server');
 
 const ticket = 'a'.repeat(43);
+
+test('restarts only the development child after configurable V8 heap pressure', () => {
+  assert.equal(boundedDevelopmentMemoryThreshold('0.2'), 0.5);
+  assert.equal(boundedDevelopmentMemoryThreshold('0.9'), 0.9);
+  assert.equal(boundedDevelopmentMemoryThreshold('invalid'), 0.8);
+
+  const originalArgv = process.argv;
+  process.argv = [...originalArgv, '--development-child'];
+  try {
+    const heap = { heap_size_limit: 100, used_heap_size: 81 };
+    assert.deepEqual(developmentMemoryRestartStats(true, false, {}, heap), {
+      heapSizeLimit: 100,
+      heapUsed: 81,
+      threshold: 0.8,
+    });
+    assert.equal(developmentMemoryRestartStats(false, false, {}, heap), undefined);
+    assert.equal(developmentMemoryRestartStats(true, true, {}, heap), undefined);
+    assert.equal(developmentMemoryRestartStats(true, false, { WEBPILOT_DEV_MEMORY_RESTART: 'false' }, heap), undefined);
+  } finally {
+    process.argv = originalArgv;
+  }
+});
 
 test('replaces identity headers in both normalized and raw request views', () => {
   const request = {

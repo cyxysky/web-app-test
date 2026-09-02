@@ -3,9 +3,9 @@ import test from 'node:test';
 import {
   artifactContentType,
   fileFormatForExtension,
+  fileFormats as webPilotFileFormats,
   uploadStorageExtension,
-  webPilotFileFormats,
-} from './file-format-registry';
+} from '@webpilot/capability-file';
 
 test('every generated format is readable and has an explicit response MIME type', () => {
   const generated = webPilotFileFormats.filter((format) => format.canGenerate);

@@ -1,0 +1,31 @@
+{
+  "name": "@webpilot/capability-adapter-mcp",
+  "version": "0.1.0",
+  "description": "Expose framework-neutral WebPilot capabilities through the official MCP TypeScript SDK.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "@webpilot/capability-sdk": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

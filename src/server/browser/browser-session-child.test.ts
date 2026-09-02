@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { BrowserSession } from './browser-session';
+import { BrowserSession } from '@webpilot/capability-browser/node';
 
 test('child browser sessions share parent auth state while owning independent pages', async (context) => {
   const server = createServer((_request, response) => {

@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { generateFileBuffer } from './document-artifact-generators';
-import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
+import { generateFileBuffer, resolveLibreOfficeExecutable } from '@webpilot/capability-file/node';
 
 test('generates plain text and delimited data without treating them as Office documents', async () => {
   const json = await generateFileBuffer({
@@ -17,10 +16,10 @@ test('generates plain text and delimited data without treating them as Office do
   assert.match(csv.buffer.toString('utf8'), /name,value/);
 });
 
-test('requires a Python UNO draft for Office outputs', async () => {
+test('requires a saved program draft for Office outputs', async () => {
   await assert.rejects(
     generateFileBuffer({ blocks: [], document: {}, documentType: 'word', fileName: 'report.docx' }),
-    /Python UNO program/,
+    /saved source draft/,
   );
 });
 
@@ -31,14 +30,14 @@ test('routes Office output through the direct UNO program worker', async (contex
   }
   const result = await generateFileBuffer({
     blocks: [], document: {}, documentType: 'spreadsheet', fileName: 'results.xlsx',
+    generator: 'uno',
     program: `
 def create_document(job):
-    document = job.new_document('spreadsheet')
-    sheet = document.Sheets.getByIndex(0)
-    sheet.getCellByPosition(0, 0).String = 'Result'
-    sheet.getCellByPosition(1, 0).String = 'Passed'
-    document.storeAsURL(job.output_url, (job.property('FilterName', 'Calc MS Excel 2007 XML'),))
-    job.close(document)
+    document = job.spreadsheet('document')
+    sheet = document.sheet('results', 'Results')
+    sheet.set_range('values', 'A1', [['Result', 'Passed']])
+    document.save()
+    document.close()
 `,
   });
   assert.ok(result.buffer.byteLength > 64);

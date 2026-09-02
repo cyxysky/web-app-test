@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { browserCodeRuntimeSkillId } from './browser-code-runtime-skill';
+import { browserCodeRuntimeSkillId } from '@webpilot/capability-browser/runtime-skill';
 import {
   fileArtifactRuntimeSkillContent,
   fileArtifactRuntimeSkillId,
-} from './file-artifact-runtime-skill';
+} from '@webpilot/capability-file/runtime-skill';
 import {
   hiddenRuntimeSkillContent,
   automaticallyLoadHiddenRuntimeSkill,
@@ -19,15 +19,15 @@ import {
 } from './subagent-runtime-skill';
 
 test('hidden runtime policy gates only the configured tool actions', () => {
-  assert.equal(requiredHiddenRuntimeSkillId('browserCode', { code: 'nodeRepl.write(1)' }), browserCodeRuntimeSkillId);
-  assert.equal(requiredHiddenRuntimeSkillId('readBrowserState', {}), undefined);
+  assert.equal(requiredHiddenRuntimeSkillId('browser', { action: 'code', code: 'nodeRepl.write(1)' }), browserCodeRuntimeSkillId);
+  assert.equal(requiredHiddenRuntimeSkillId('browser', { action: 'state' }), undefined);
 
   for (const action of ['list', 'read', 'download', 'plan', 'generate', 'edit', 'render', 'convert', 'jsApi', 'unoApi']) {
     assert.equal(requiredHiddenRuntimeSkillId('file', { action }), fileArtifactRuntimeSkillId);
   }
 
-  assert.equal(requiredHiddenRuntimeSkillId('fileVisual', { action: 'index' }), fileArtifactRuntimeSkillId);
-  assert.equal(requiredHiddenRuntimeSkillId('fileVisual', { action: 'read' }), fileArtifactRuntimeSkillId);
+  assert.equal(requiredHiddenRuntimeSkillId('file', { action: 'visualIndex' }), fileArtifactRuntimeSkillId);
+  assert.equal(requiredHiddenRuntimeSkillId('file', { action: 'visualRead' }), fileArtifactRuntimeSkillId);
   assert.equal(requiredHiddenRuntimeSkillId('subagent', { action: 'spawn' }), subagentRuntimeSkillId);
   assert.equal(requiredHiddenRuntimeSkillId('subagent', { action: 'read' }), undefined);
 });
@@ -60,7 +60,7 @@ test('explicit and automatic hidden Skill loads share the run-scoped set', () =>
 });
 
 test('governed tools remain advertised while their Skills load automatically on first call', () => {
-  const tools = ['readBrowserState', 'skill', 'browserCode', 'file', 'fileVisual', 'subagent'];
+  const tools = ['browser', 'skill', 'file', 'subagent'];
   assert.deepEqual(runtimeToolTypesWithAutomaticSkills(tools), tools);
 });
 
@@ -85,7 +85,7 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /renderedDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /UNO and JavaScript modes/);
   assert.match(fileArtifactRuntimeSkillContent, /single editable source buffer/);
-  assert.match(fileArtifactRuntimeSkillContent, /A failed validation saves the patched candidate/);
+  assert.match(fileArtifactRuntimeSkillContent, /validation-failed candidate (?:is|are) saved/);
   assert.match(fileArtifactRuntimeSkillContent, /visualQaDigest equals renderedDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /Prefer `slide\.addChart\(\)` for standard column charts, horizontal bar charts, and doughnut charts/);
   assert.match(fileArtifactRuntimeSkillContent, /Prefer `slide\.addTable\(\)` for standard tables/);
@@ -104,15 +104,16 @@ test('file and subagent runtime Skills carry the state, QA, and browser ownershi
   assert.match(fileArtifactRuntimeSkillContent, /patchBaseDigest/);
   assert.match(fileArtifactRuntimeSkillContent, /never calculate or emit hunk line counts/i);
   assert.match(fileArtifactRuntimeSkillContent, /retain the current source's original whitespace and indentation/);
-  assert.match(fileArtifactRuntimeSkillContent, /later full replacement is allowed only/);
+  assert.match(fileArtifactRuntimeSkillContent, /guarded complete replacement is an exceptional last resort only/);
   assert.match(fileArtifactRuntimeSkillContent, /optimistic-concurrency guard for edit/);
   assert.match(fileArtifactRuntimeSkillContent, /baseDigest: string/);
   assert.match(fileArtifactRuntimeSkillContent, /replaceExisting\?: boolean/);
-  assert.match(fileArtifactRuntimeSkillContent, /intentional complete replacement requires/);
+  assert.match(fileArtifactRuntimeSkillContent, /replacement is truly unavoidable/);
   assert.doesNotMatch(fileArtifactRuntimeSkillContent, /restoreRevision\?:/);
   assert.match(fileArtifactRuntimeSkillContent, /patch: string/);
-  assert.match(fileArtifactRuntimeSkillContent, /## fileVisual API signatures and examples/);
-  assert.match(fileArtifactRuntimeSkillContent, /declare function fileVisual\(input: FileVisualInput\)/);
+  assert.match(fileArtifactRuntimeSkillContent, /## Visual file actions and examples/);
+  assert.doesNotMatch(fileArtifactRuntimeSkillContent, /declare function fileVisual/);
+  assert.match(fileArtifactRuntimeSkillContent, /action: "visualRead"/);
   assert.match(fileArtifactRuntimeSkillContent, /screenshot-0001/);
   assert.match(fileArtifactRuntimeSkillContent, /placeholder categories such as 1\/2\/3/);
   assert.match(fileArtifactRuntimeSkillContent, /known visible defect is a failed review/i);

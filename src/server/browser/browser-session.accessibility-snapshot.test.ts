@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile, unlink } from 'node:fs/promises';
 import test from 'node:test';
 import type { Page } from 'playwright';
-import { BrowserSession } from './browser-session';
+import { BrowserSession } from '@webpilot/capability-browser/node';
 import { exportAccessibilitySnapshotJson } from './accessibility-snapshot-test.service';
 
 type SnapshotMode = 'actionable' | 'full' | 'text';

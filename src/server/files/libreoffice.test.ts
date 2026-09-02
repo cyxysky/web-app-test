@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { resolveLibreOfficeExecutable } from './libreoffice';
+import { resolveLibreOfficeExecutable } from '@webpilot/capability-file/node';
 
 test('finds LibreOffice bundled beside a packaged server', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'webpilot-packaged-libreoffice-'));

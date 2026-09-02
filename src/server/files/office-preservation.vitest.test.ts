@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import JSZip from 'jszip';
 import { describe, expect, it } from 'vitest';
-import { validateOfficeArtifact } from './office-artifact-validator';
+import { validateOfficeArtifact } from '@webpilot/capability-file/node';
 
 describe('Office preserve-only feature gate', () => {
   it('blocks an existing PPTX edit that drops SmartArt package parts', async () => {

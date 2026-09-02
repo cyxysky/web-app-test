@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 test('browser launch falls back to headless on Linux without a display server', async () => {
-  const { browserHeadlessEnabled } = await import('./browser-session-runtime');
+  const { browserHeadlessEnabled } = await import('@webpilot/capability-browser/node');
 
   assert.equal(browserHeadlessEnabled({}, {
     env: { HEADLESS_BROWSER: 'false' },
@@ -22,7 +22,7 @@ test('browser launch falls back to headless on Linux without a display server', 
 });
 
 test('explicit browser launch options take precedence over automatic headless detection', async () => {
-  const { browserHeadlessEnabled } = await import('./browser-session-runtime');
+  const { browserHeadlessEnabled } = await import('@webpilot/capability-browser/node');
   const linuxWithoutDisplay = { env: {}, platform: 'linux' as const };
 
   assert.equal(browserHeadlessEnabled({ headless: false }, linuxWithoutDisplay), false);
@@ -34,7 +34,7 @@ test('managed profile cleanup removes only transient browser caches', async () =
   const previousDataRoot = process.env.APP_DATA_DIR;
   const dataRoot = mkdtempSync(path.join(tmpdir(), 'webpilot-browser-profile-'));
   process.env.APP_DATA_DIR = dataRoot;
-  const runtime = await import('./browser-session-runtime');
+  const runtime = await import('@webpilot/capability-browser/node');
   const profileDir = path.join(runtime.managedBrowserProfilesRoot(), 'tab-groups', 'user-test');
   const outsideProfileDir = path.join(dataRoot, 'outside-profile');
   const cacheDirectories = [

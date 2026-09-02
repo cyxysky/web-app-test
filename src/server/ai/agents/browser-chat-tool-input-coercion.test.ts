@@ -37,17 +37,17 @@ test('accepts standard OpenAI-compatible transport envelopes without unwrapping 
   });
 });
 
-test('normalizes fileVisual transport envelopes and screenshot id arrays', () => {
-  assert.deepEqual(coerceBrowserChatToolInput('fileVisual', {
+test('normalizes unified file visual transport envelopes and screenshot id arrays', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('file', {
     params: {
-      action: 'READ',
+      action: 'VISUAL_READ',
       artifactId: 'chat/generated/deck.pptx',
       screenshotIds: '["screenshot-0001","screenshot-0003"]',
       offset: '2',
       limit: '6',
     },
   }), {
-    action: 'read',
+    action: 'visualRead',
     artifactId: 'chat/generated/deck.pptx',
     screenshotIds: ['screenshot-0001', 'screenshot-0003'],
     offset: 2,
@@ -117,25 +117,31 @@ test('normalizes repeated Codex patch envelopes into one multi-update envelope',
   assert.match(coerced.patch, /-second\n\+SECOND/);
 });
 
-test('removes accidental outer Markdown or HTML wrappers from browserCode only', () => {
-  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+test('removes accidental outer Markdown or HTML wrappers from browser action=code only', () => {
+  assert.deepEqual(coerceBrowserChatToolInput('browser', {
+    action: 'code',
     reason: '读取标题',
     code: 'nodeRepl.write(await page.title());</code>',
   }), {
+    action: 'code',
     reason: '读取标题',
     code: 'nodeRepl.write(await page.title());',
   });
-  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+  assert.deepEqual(coerceBrowserChatToolInput('browser', {
+    action: 'code',
     reason: '读取标题',
     code: '```js\nnodeRepl.write(await page.title())\n```',
   }), {
+    action: 'code',
     reason: '读取标题',
     code: 'nodeRepl.write(await page.title())',
   });
-  assert.deepEqual(coerceBrowserChatToolInput('browserCode', {
+  assert.deepEqual(coerceBrowserChatToolInput('browser', {
+    action: 'code',
     reason: '读取 HTML',
     code: 'nodeRepl.write("<code>inside</code>")',
   }), {
+    action: 'code',
     reason: '读取 HTML',
     code: 'nodeRepl.write("<code>inside</code>")',
   });

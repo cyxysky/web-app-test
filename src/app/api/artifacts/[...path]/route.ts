@@ -8,7 +8,7 @@ import type { BrowserChatSessionSnapshot } from '@/server/ai/agents/browser-chat
 import { readBrowserChatSessionHeader } from '@/server/storage/browser-chat-history-store';
 import { artifactsRoot } from '@/server/storage/paths';
 import { ApiRequestError, apiError, apiRequestId } from '@/server/http/api-request';
-import { artifactContentType } from '@/server/files/file-format-registry';
+import { artifactContentType } from '@webpilot/capability-file';
 
 type RouteContext = {
   params: Promise<{ path: string[] }>;

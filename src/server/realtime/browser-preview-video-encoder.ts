@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import ffmpegStaticPath from 'ffmpeg-static';
 
-export { browserPreviewVideoDimensions } from '../browser/browser-preview-video-settings';
+export { browserPreviewVideoDimensions } from '@webpilot/capability-browser/node';
 
 export const BROWSER_PREVIEW_VIDEO_MIME_TYPE = 'video/mp4; codecs="avc1.42C029"';
 

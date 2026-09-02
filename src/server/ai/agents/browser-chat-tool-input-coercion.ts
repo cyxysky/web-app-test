@@ -78,6 +78,9 @@ function normalizedAction(value: unknown) {
   const normalized = value.trim().toLowerCase();
   if (normalized === 'unoapi' || normalized === 'uno-api' || normalized === 'uno_api') return 'unoApi';
   if (normalized === 'jsapi' || normalized === 'js-api' || normalized === 'js_api') return 'jsApi';
+  if (['visualindex', 'visual-index', 'visual_index', 'visual.index'].includes(normalized)) return 'visualIndex';
+  if (['visualread', 'visual-read', 'visual_read', 'visual.read'].includes(normalized)) return 'visualRead';
+  if (['visualreport', 'visual-report', 'visual_report', 'visual.report'].includes(normalized)) return 'visualReport';
   return normalized;
 }
 
@@ -169,7 +172,7 @@ function legacyReplacementPatch(oldValue: string, newValue: string) {
 
 /** Scalar transport normalization only; never reshape a document or program. */
 export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
-  if (toolName === 'browserCode') {
+  if (toolName === 'browser') {
     const source = recordFromUnknown(unwrapToolTransport(value));
     if (!source) return value;
     return {
@@ -187,16 +190,11 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
       screenshotFileNames: arrayFromJsonString(source.screenshotFileNames),
     };
   }
-  if (toolName !== 'file' && toolName !== 'fileVisual') return value;
+  if (toolName !== 'file') return value;
   const source = recordFromUnknown(unwrapToolTransport(value));
   if (!source) return value;
   const input: JsonRecord = { ...source };
   if ('action' in input) input.action = normalizedAction(input.action);
-  if (toolName === 'fileVisual') {
-    for (const key of ['limit', 'offset']) if (key in input) input[key] = numberFromString(input[key]);
-    if ('screenshotIds' in input) input.screenshotIds = arrayFromJsonString(input.screenshotIds);
-    return input;
-  }
   if ('documentType' in input) input.documentType = normalizedDocumentType(input.documentType);
   if (input.action === 'plan' && !input.documentType) {
     const inferred = documentTypeFromFileName(input.fileName);
@@ -227,6 +225,9 @@ export function coerceBrowserChatToolInput(toolName: string, value: unknown) {
   }
   if ('pages' in input) input.pages = arrayFromJsonString(input.pages);
   if (Array.isArray(input.pages)) input.pages = input.pages.map(numberFromString);
+  if ('screenshotIds' in input) input.screenshotIds = arrayFromJsonString(input.screenshotIds);
+  if ('reviews' in input) input.reviews = arrayFromJsonString(input.reviews);
+  if ('deckReview' in input) input.deckReview = jsonValueFromString(input.deckReview);
   return input;
 }
 

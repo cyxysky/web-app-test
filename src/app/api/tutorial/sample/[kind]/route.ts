@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { artifactContentType } from '@/server/files/file-format-registry';
-import { generateFileBuffer } from '@/server/ai/agents/document-artifact-generators';
+import { artifactContentType } from '@webpilot/capability-file';
+import { generateFileBuffer } from '@webpilot/capability-file/node';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { apiError } from '@/server/http/api-request';
 

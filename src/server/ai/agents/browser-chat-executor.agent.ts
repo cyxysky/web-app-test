@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelMessage, type ToolCallRepairFunction, type ToolSet } from 'ai';
+import { generateText, hasToolCall, streamText, ToolLoopAgent, tool, type ModelMessage, type StopCondition, type ToolCallRepairFunction, type ToolSet } from 'ai';
 import { z } from 'zod';
+import { CapabilityRegistry, type CapabilityProgressEvent } from '@webpilot/capability-sdk';
+import { fileCapabilityToolNames, type FileReadInput } from '@webpilot/capability-file';
+import { browserCapabilityToolNames } from '@webpilot/capability-browser';
+import { chartCapabilityToolNames } from '@webpilot/capability-chart';
+import { toAISDKToolSet } from '@webpilot/capability-adapter-ai-sdk';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import { aiMaxOutputTokens, aiReasoningEffort, aiRuntimeRequestTimeoutMs, aiStreamTimeouts, aiTelemetry, createAiRequestWatchdog } from '@/server/ai/ai-sdk-runtime';
@@ -9,12 +14,12 @@ import { buildCodexObjectPrompt, currentRuntimeTimePromptLine, customRuntimeProm
 import {
   BrowserSession,
   type BrowserActionResult,
-} from '@/server/browser/browser-session';
+} from '@webpilot/capability-browser/node';
 import {
-  browserCodeHasImageOperation,
+  readBrowserStateCode,
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
-} from '@/server/browser/browser-code-runner';
+} from '@webpilot/capability-browser/node';
 import { richTextToPlainText } from '@/lib/rich-text';
 import {
   aiSdkEmptyStopRequiresRetry,
@@ -23,7 +28,7 @@ import {
   aiSdkToolResultRequiresContinuation,
 } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
-import { fileArtifactRuntimeSkillId } from './file-artifact-runtime-skill';
+import { fileArtifactRuntimeSkillId } from '@webpilot/capability-file/runtime-skill';
 import {
   activeBrowserRuntimeSkillId,
   hiddenRuntimeSkillContent,
@@ -32,8 +37,17 @@ import {
   runtimeToolTypesWithAutomaticSkills,
 } from './hidden-runtime-skills';
 import { subagentRuntimeSkillId } from './subagent-runtime-skill';
-import { chartRuntimeSkillId } from './chart-runtime-skill';
-import { createBrowserChatChart, readBrowserChatChartApi } from './chart-artifact-tools';
+import { chartRuntimeSkillId } from '@webpilot/capability-chart/runtime-skill';
+import {
+  browserChatChartCapability,
+  executeBrowserChatChart,
+} from '@/server/capabilities/browser-chat-chart';
+import { capabilityResultToBrowserActionResult } from '@/server/capabilities/browser-chat-result';
+import {
+  createBrowserChatFileCapability,
+  executeBrowserChatFile,
+} from '@/server/capabilities/browser-chat-file';
+import { createBrowserChatBrowserCapability } from '@/server/capabilities/browser-chat-browser';
 import {
   browserChatFinalBlocksToText,
   browserChatFinalResponseSchema,
@@ -41,28 +55,11 @@ import {
 } from '@/lib/browser-chat-ui-message';
 import { containsPrivateToolProtocol, isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from './browser-chat-reply-text';
 import {
-  BROWSER_CHAT_FILE_READ_MAX_CHARS,
-  normalizeBrowserChatFileReadLimit,
-} from './browser-chat-file-read';
-import {
-  repairFileArtifactDownloadLinks,
-  convertFileArtifact,
-  downloadFileArtifact,
-  editUnoFileArtifact,
   formatFileArtifactResult,
-  generateUnoFileArtifact,
-  getOfficeJsApi,
-  getUnoApi,
-  listOfficeDrafts,
   pendingOfficeDocumentWork,
   pendingOfficeVisualQa,
-  planFileArtifact,
-  readUnoDraft,
-  recordOfficeVisualQaProgress,
-  renderFileArtifact,
-  verifyCurrentUnoRenderedArtifact,
-  type FileGenerationProgress,
-} from './file-artifact-tools';
+} from '@webpilot/capability-file/node/workspace';
+import { repairFileArtifactDownloadLinks } from '@/server/capabilities/browser-chat-file-links';
 import { browserChatCodeRules } from './runtime-prompt-rules';
 import {
   appendRuntimePromptCacheMetadata,
@@ -93,6 +90,8 @@ import {
 
 import {
   browserToolPrerequisiteNames,
+  browserStatePrerequisiteToolName,
+  isBrowserHumanVerificationCall,
   requiresBrowserStatePreflight,
   runtimeAllowedToolTypes,
   runtimeBrowserSessionToolNames,
@@ -141,7 +140,7 @@ import {
   repairBrowserChatToolCallInput,
 } from './browser-chat-tool-input-coercion';
 import { racePromiseWithAbort } from './browser-chat-interrupt-state';
-import type { BrowserChatFileVisualInput } from './browser-chat-attachment-reader';
+import type { FileVisualInput as BrowserChatFileVisualInput } from '@webpilot/capability-file/node';
 import { createBrowserChatDefectReport } from '@/server/storage/browser-chat-defect-store';
 
 export type { BrowserChatSubagentTask } from './browser-chat-subagent-task';
@@ -150,14 +149,7 @@ type ExecutionDebug = (event: { phase: string; message: string; stepIndex?: numb
 type RuntimeModelMessage = ModelMessage;
 type RuntimeRetryState = RuntimeRetryStateBase<RuntimeModelMessage>;
 
-export type BrowserChatReadFileInput = {
-  attachmentId?: string;
-  artifactId?: string;
-  includeVisuals?: boolean;
-  limit?: number;
-  offset?: number;
-  pages?: number[];
-};
+export type BrowserChatReadFileInput = FileReadInput;
 
 export type BrowserChatReadSkill = (skillId: string) => Promise<BrowserActionResult>;
 
@@ -273,7 +265,7 @@ const codexRuntimeObjectSchema = z.object({
     code: z.string().nullable().optional(),
     maxOutputChars: z.number().nullable().optional(),
     skillId: z.string().nullable().optional(),
-  }).passthrough().describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason. Tool-specific keys not listed in this common envelope are preserved. Example file parameters: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. The browserCode tool supplies the code example for the currently selected runtime mode.'),
+  }).passthrough().describe('Parameters for the selected tool. Include only keys needed by that tool plus a concise reason. Tool-specific keys not listed in this common envelope are preserved. Example file parameters: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. The browser tool uses action=state|code|waitForHumanVerification.'),
 }).describe('Return exactly one object with type, optional message, and params. Example: {"type":"file","message":"准备演示文稿","params":{"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}}.');
 type CodexRuntimeObject = z.infer<typeof codexRuntimeObjectSchema>;
 
@@ -495,14 +487,18 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, _max =
 function compactToolResultForModel(
   name: string,
   result: BrowserActionResult,
+  input?: unknown,
 ): BrowserActionResult {
+  const action = input && typeof input === 'object' && !Array.isArray(input)
+    ? String((input as Record<string, unknown>).action || '')
+    : '';
   const modelResult = { ...result };
   delete modelResult.snapshotId;
-  if (name === 'browserCode') delete modelResult.observation;
+  if (name === 'browser' && action === 'code') delete modelResult.observation;
   if (modelResult.domChanges) {
     modelResult.domChanges = { ...modelResult.domChanges };
     delete modelResult.domChanges.snapshotId;
-    if (name === 'browserCode') delete modelResult.domChanges.observation;
+    if (name === 'browser' && action === 'code') delete modelResult.domChanges.observation;
   }
   delete modelResult.referenceImagePath;
   delete modelResult.referenceImagePaths;
@@ -512,7 +508,7 @@ function compactToolResultForModel(
   // payloads and stack traces quickly dominate the conversation context.
   const fileResult = formatFileArtifactResult(name, modelResult.actual);
   if (fileResult) return { ...modelResult, actual: fileResult };
-  if (name === 'fileVisual') {
+  if (name === 'file' && action === 'visualReport') {
     try {
       const payload = JSON.parse(modelResult.actual) as Record<string, unknown>;
       const kind = String(payload.kind || '');
@@ -536,7 +532,7 @@ function compactToolResultForModel(
         };
       }
     } catch {
-      // Keep the original result when this is not a structured fileVisual payload.
+      // Keep the original result when this is not a structured visual-report payload.
     }
   }
   return modelResult;
@@ -855,7 +851,8 @@ function formatCurrentToolAttemptSummary(traces: ToolTrace[], limit = 5) {
       : trace.result.ok
         ? fileResult ? `ok: ${sanitizeHistoricalToolText(fileResult, 260)}` : 'ok'
         : `failed: ${sanitizeHistoricalToolText(trace.result.actual, 180)}`;
-    const screenshotNames = trace.name === 'browserCode'
+    const screenshotNames = trace.name === 'browser'
+      && splitToolInputAndReason(trace.input).input.action === 'code'
       ? browserCodeScreenshotFileNames((trace.screenshots || []).map((screenshot) => screenshot.path))
       : [];
     const shots = screenshotNames.length
@@ -1008,10 +1005,8 @@ function pushFailureFrameScreenshots(screenshots: ToolTrace['screenshots'], name
 
 const internalReferenceImageToolNames = new Set([
   'file',
-  'fileVisual',
   'readFile',
   'generateFile',
-  'fillDocumentTemplate',
 ]);
 
 function createToolTrace(input: {
@@ -1165,7 +1160,7 @@ async function executeTracedBrowserAction(input: {
 }
 
 function initialBrowserStateCode() {
-  return 'nodeRepl.write({ tabs: await browser.user.openTabs(), activePage: { url: page.url(), title: await page.title() }, pageState: await page.domSnapshot() })';
+  return readBrowserStateCode;
 }
 
 async function readCurrentBrowserState(
@@ -1194,7 +1189,7 @@ const reportDefectInputSchema = z.object({
   whyItIsAProblem: z.string().min(1).max(1_200).describe('Why the observed behavior harms correctness, usability, or task completion.'),
   reasons: z.array(z.string().min(1).max(500)).min(1).max(8).describe('Concrete evidence-based reasons that support classifying the behavior as a defect.'),
   reproductionSteps: z.array(z.string().min(1).max(500)).min(1).max(20).describe('Ordered steps that reproduce the defect from a known page state.'),
-  screenshotFileNames: z.array(z.string().min(1).max(260).regex(/^[^\\/]+$/)).min(1).max(6).describe('One to six exact screenshot file names returned by prior successful browserCode calls in this Agent run.'),
+  screenshotFileNames: z.array(z.string().min(1).max(260).regex(/^[^\\/]+$/)).min(1).max(6).describe('One to six exact screenshot file names returned by prior successful browser action=code calls in this Agent run.'),
 }).strict();
 
 type ReportDefectInput = z.infer<typeof reportDefectInputSchema>;
@@ -1202,7 +1197,11 @@ type ReportDefectInput = z.infer<typeof reportDefectInputSchema>;
 function resolveDefectScreenshotEvidence(traces: ToolTrace[], requestedFileNames: string[]) {
   const candidates = new Map<string, { fileName: string; path: string }>();
   for (const trace of traces) {
-    if (trace.name !== 'browserCode' || trace.result?.ok !== true) continue;
+    if (
+      trace.name !== 'browser'
+      || splitToolInputAndReason(trace.input).input.action !== 'code'
+      || trace.result?.ok !== true
+    ) continue;
     for (const screenshot of trace.screenshots || []) {
       if (screenshot.kind === 'marker') continue;
       const fileName = screenshotFileName(screenshot.path);
@@ -1236,7 +1235,7 @@ async function reportBrowserChatDefect(
   if (evidence.missing.length) {
     return {
       ok: false,
-      actual: `Screenshot evidence rejected because these files were not emitted by a successful browserCode call in this Agent run: ${evidence.missing.join(', ')}. Available screenshot file names: ${evidence.availableFileNames.join(', ') || '[none]'}.`,
+      actual: `Screenshot evidence rejected because these files were not emitted by a successful browser action=code call in this Agent run: ${evidence.missing.join(', ')}. Available screenshot file names: ${evidence.availableFileNames.join(', ') || '[none]'}.`,
     };
   }
   const report = await createBrowserChatDefectReport(sessionId, {
@@ -1260,6 +1259,7 @@ async function reportBrowserChatDefect(
 
 async function bundledBrowserToolPrerequisiteResults(input: {
   toolName: string;
+  toolInput: unknown;
   preflightPending: boolean;
   session: BrowserSession;
   runId?: string;
@@ -1269,13 +1269,14 @@ async function bundledBrowserToolPrerequisiteResults(input: {
 }) {
   const prerequisiteNames = browserToolPrerequisiteNames(
     input.toolName,
+    input.toolInput,
     input.preflightPending,
     runtimeBrowserSessionToolNames,
   );
   const results: NonNullable<BrowserActionResult['prerequisiteResults']> = [];
 
   for (const prerequisiteName of prerequisiteNames) {
-    if (prerequisiteName !== 'readBrowserState') continue;
+    if (prerequisiteName !== browserStatePrerequisiteToolName) continue;
     await input.ensureBrowserStarted?.();
     results.push({
       toolName: prerequisiteName,
@@ -1303,33 +1304,7 @@ function attachPrerequisiteResults(
   } satisfies BrowserActionResult;
 }
 
-const visualQaCheckStatusSchema = z.enum(['failed', 'not-applicable', 'passed']);
-const visualQaPageChecksSchema = z.object({
-  overlap: visualQaCheckStatusSchema,
-  clipping: visualQaCheckStatusSchema,
-  alignment: visualQaCheckStatusSchema,
-  spacing: visualQaCheckStatusSchema,
-  typography: visualQaCheckStatusSchema,
-  contrast: visualQaCheckStatusSchema,
-  visualHierarchy: visualQaCheckStatusSchema,
-  chartTableLegibility: visualQaCheckStatusSchema,
-  imageQuality: visualQaCheckStatusSchema,
-}).strict();
-const visualQaDeckChecksSchema = z.object({
-  templateConsistency: z.enum(['failed', 'passed']),
-  typographyConsistency: z.enum(['failed', 'passed']),
-  colorConsistency: z.enum(['failed', 'passed']),
-  spacingRhythm: z.enum(['failed', 'passed']),
-  componentConsistency: z.enum(['failed', 'passed']),
-}).strict();
-const visualQaIssuesSchema = z.array(z.object({
-  type: z.string().min(1).max(80),
-  description: z.string().min(1).max(500),
-  region: z.string().max(120).optional(),
-  severity: z.enum(['error', 'warning']).optional(),
-}).strict()).max(50).optional();
-
-function makeBrowserTools(
+async function makeBrowserTools(
   session: BrowserSession,
   traces: ToolTrace[],
   aiRequest?: AiRequestSnapshot,
@@ -1391,7 +1366,7 @@ function makeBrowserTools(
     shape: T,
     examples: readonly Record<string, unknown>[] = [],
   ) => withToolInputExamples(z.object({ ...toolContextShape, ...shape }), examples);
-  const fileProgressReporter = (trace?: ToolTrace) => async (progress: FileGenerationProgress) => {
+  const fileProgressReporter = (trace?: ToolTrace) => async (progress: CapabilityProgressEvent) => {
     if (!trace) return;
     trace.progress = {
       ...progress,
@@ -1415,6 +1390,7 @@ function makeBrowserTools(
           : result;
         const prerequisiteResults = await bundledBrowserToolPrerequisiteResults({
           toolName: name,
+          toolInput: input,
           preflightPending: referenceOptions?.browserStatePreflightComplete
             ? !referenceOptions.browserStatePreflightComplete()
             : false,
@@ -1451,14 +1427,14 @@ function makeBrowserTools(
         const action = input && typeof input === 'object' && 'action' in input
           ? String((input as { action?: unknown }).action || '')
           : '';
-        const source = (name === 'file' || name === 'fileVisual') && action
+        const source = name === 'file' && action
           ? `${name}:${action}`
           : name;
-        const screenshotIds = name === 'fileVisual' && input && typeof input === 'object' && 'screenshotIds' in input
+        const screenshotIds = name === 'file' && action === 'visualRead' && input && typeof input === 'object' && 'screenshotIds' in input
           ? (input as { screenshotIds?: unknown }).screenshotIds
           : undefined;
         // A render can produce every page preview at once. Those files are
-        // indexed evidence, not implicit model attachments: fileVisual reads
+        // indexed evidence, not implicit model attachments: visualRead attaches
         // only the requested pages in bounded batches.
         if (!(name === 'file' && action === 'render')) {
           for (const [index, path] of [...new Set(imagePaths)].entries()) {
@@ -1468,10 +1444,10 @@ function makeBrowserTools(
             referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
           }
         }
-        const resultForModel = name === 'browserCode' && imagePaths.length
+        const resultForModel = name === 'browser' && action === 'code' && imagePaths.length
           ? { ...result, screenshotFileNames: browserCodeScreenshotFileNames(imagePaths) }
           : result;
-        return compactToolResultForModel(name, resultForModel);
+        return compactToolResultForModel(name, resultForModel, input);
       });
     };
     const inputAction = input && typeof input === 'object' && 'action' in input
@@ -1491,50 +1467,53 @@ function makeBrowserTools(
     return queued;
   }
 
-  const sharedTools = {
-    readBrowserState: tool({
-      description: 'Explicitly read the current conversation tab group, all tabs in that group, the active page URL/title, and current page state without changing the browser. If another browser tool needs this prerequisite, the execution layer reads it internally, includes its complete result in prerequisiteResults, and then executes the originally requested tool in the same call. Use this explicit tool only when the state itself is the requested result.',
-      inputSchema: browserToolInput({}, [{ reason: '读取当前会话浏览器状态' }]),
-      execute: (input, execution) => record('readBrowserState', input, (abortSignal) => readCurrentBrowserState(session, {
-        runId: referenceOptions?.runId,
-        stepIndex: referenceOptions?.stepIndex,
-        abortSignal,
-      }), execution),
-    }),
-    browserCode: tool({
-      description: `Execute one bounded JavaScript cell against the live Playwright browser for inspection, navigation, interaction, upload, or verification.${imageInputAvailable ? ' page.screenshot plus nodeRepl.emitImage emits model-visible image evidence.' : ' The selected model has no image input, so screenshot/image operations are unavailable; use exact Locator rect evidence instead.'} The persistent agent.state API stores non-secret JSON-safe values across kernel recycling and later conversation turns. The first call automatically loads hidden Skill ${browserRuntimeSkillId}. If live browser state has not yet been read, the execution layer reads it first, returns that result in prerequisiteResults, and still executes the supplied code in this same tool call.`,
-      inputSchema: browserToolInput({
-        code: z.string().min(1).max(40_000).describe(`Ordinary JavaScript cell for the persistent kernel. Use page/context or browser/tab directly with top-level await. Save non-secret JSON-safe values needed after recycling or in later turns with agent.state. Emit JSON with nodeRepl.write(...).${imageInputAvailable ? ' Emit pixels with await nodeRepl.emitImage(await page.screenshot(...)).' : ' Do not call screenshot or nodeRepl.emitImage; this model has no image input.'} Prefer top-level var or fresh binding names for temporary values. Do not write a function wrapper, module, export, or Markdown fences.`),
-        maxOutputChars: z.number().int().min(1_000).optional().describe('Optional maximum serialized return size. When omitted, the complete return value is preserved.'),
-      }, [{
-        reason: '读取当前页面地址和标题',
-        code: 'nodeRepl.write({ url: page.url(), title: await page.title() })',
-      }]),
-      execute: (rawInput, execution) => {
-        const input = coerceBrowserChatToolInput('browserCode', rawInput) as typeof rawInput;
-        return record('browserCode', input, (abortSignal) => {
-          const violation = browserCodeServiceFileDeliveryViolation(input.code);
-          if (violation) return Promise.resolve({ ok: false, actual: violation });
-          if (!imageInputAvailable && browserCodeHasImageOperation(input.code)) {
-            return Promise.resolve({
-              ok: false,
-              actual: 'Image operation rejected: the selected model is not configured with image input support. Use exact Playwright Locator and boundingBox evidence instead.',
-            });
-          }
-          return session.executeBrowserCode({
-            code: input.code,
-            maxOutputChars: input.maxOutputChars,
-            attachments: referenceOptions?.attachmentBindings,
-            credentials: referenceOptions?.getCredentialBindings?.() || referenceOptions?.credentialBindings,
-            runId: referenceOptions?.runId || 'browser-code',
-            stepIndex: referenceOptions?.stepIndex || 0,
-            abortSignal,
-          });
-        }, execution);
+  const capabilitySnapshot = await new CapabilityRegistry()
+    .register(createBrowserChatBrowserCapability({
+      session,
+      runId: referenceOptions?.runId || '',
+      stepIndex: referenceOptions?.stepIndex,
+      attachmentBindings: referenceOptions?.attachmentBindings,
+      credentialBindings: referenceOptions?.credentialBindings,
+      getCredentialBindings: referenceOptions?.getCredentialBindings,
+      imageInputAvailable,
+    }))
+    .register(browserChatChartCapability)
+    .register(createBrowserChatFileCapability({
+      attachmentBindings: referenceOptions?.attachmentBindings,
+      currentPageUrl: () => session.currentUrl(),
+      readFile: referenceOptions?.readFile,
+      readFileVisuals: referenceOptions?.readFileVisuals,
+      visualInputAvailable: imageInputAvailable,
+    }))
+    .resolve({
+      context: {
+        runId: referenceOptions?.runId || '',
+        abortSignal: referenceOptions?.abortSignal,
       },
-    }),
+      allowedToolNames: referenceOptions?.allowedToolTypes?.length
+        ? new Set(referenceOptions.allowedToolTypes)
+        : undefined,
+    });
+  const capabilityTools = toAISDKToolSet(capabilitySnapshot, {
+    metadata: {
+      runId: referenceOptions?.runId || '',
+      stepIndex: referenceOptions?.stepIndex,
+    },
+    execute: ({ resolvedTool, input, context, execution }) => record(
+      resolvedTool.publicName,
+      input,
+      async (abortSignal, trace) => capabilityResultToBrowserActionResult(await resolvedTool.tool.execute(input, {
+        ...context,
+        abortSignal,
+        reportProgress: fileProgressReporter(trace),
+      })),
+      execution,
+    ),
+  });
+
+  const sharedTools = {
     reportDefect: tool({
-      description: 'Proactively report one evidence-backed product defect or reproducible product problem found while testing the live interface. During a testing task, calling this tool is mandatory as soon as browserCode has reproduced the issue and emitted at least one screenshot that visibly proves it; do not defer the report to the final answer or wait for the user to ask. Do not report speculation, expected behavior, environment/configuration/permission limitations, or the same issue twice. screenshotFileNames must exactly match the safe file names returned by a successful browserCode call in this Agent run.',
+      description: 'Proactively report one evidence-backed product defect or reproducible product problem found while testing the live interface. During a testing task, calling this tool is mandatory as soon as browser action=code has reproduced the issue and emitted at least one screenshot that visibly proves it; do not defer the report to the final answer or wait for the user to ask. Do not report speculation, expected behavior, environment/configuration/permission limitations, or the same issue twice. screenshotFileNames must exactly match the safe file names returned by a successful browser action=code call in this Agent run.',
       inputSchema: withToolInputExamples(reportDefectInputSchema, [{
         problemDescription: '长表格向下滚动后，横向滚动条离开当前视口。',
         whyItIsAProblem: '用户无法在浏览表格中段时横向查看右侧列。',
@@ -1548,13 +1527,6 @@ function makeBrowserTools(
         () => reportBrowserChatDefect(referenceOptions?.runId, traces, input),
         execution,
       ),
-    }),
-    waitForHumanVerification: tool({
-      description: 'Immediately pause for the user to complete a visible CAPTCHA, OTP, QR-code scan, login/security check, identity confirmation, or other credential/device-owned verification in the non-headless browser. Use this proactively whenever live page evidence shows such a blocker, or required credentials were not explicitly supplied. Do not try to solve, bypass, guess, or merely describe the verification in assistant text.',
-      inputSchema: browserToolInput({
-        maxMs: z.number().optional().describe('Maximum wait time in milliseconds. Defaults to MANUAL_VERIFICATION_TIMEOUT_MS or 180000.'),
-      }, [{ reason: '等待用户完成验证码', maxMs: 180000 }]),
-      execute: (input, execution) => record('waitForHumanVerification', input, () => session.waitForManualVerification(input.maxMs), execution),
     }),
     ...((referenceOptions?.runSubagents || referenceOptions?.readSubagent) ? {
       subagent: tool({
@@ -1615,50 +1587,7 @@ function makeBrowserTools(
         },
       }),
     } : {}),
-    chart: tool({
-      description: `Read modular Apache ECharts API guidance or create one persistent inline ECharts chart. Use action=api without query for the module index, action=api with an exact module id for focused signatures/examples, then action=create with a complete JSON-serializable ECharts option. The full echarts package is loaded and no series-type whitelist is imposed. The first call automatically loads hidden Skill ${chartRuntimeSkillId}. A successful create returns an exact chartId; reference it from a finalResponse chart block.`,
-      inputSchema: browserToolInput({
-        action: z.enum(['api', 'create']).describe('api reads the indexed ECharts capability catalog; create persists and renders a complete ECharts option.'),
-        query: z.string().trim().min(1).max(120).optional().describe('For action=api only. Omit to list modules, or pass one exact module id returned by the index.'),
-        offset: z.number().int().min(0).optional().describe('For action=api index pagination.'),
-        limit: z.number().int().min(1).max(50).optional().describe('For action=api index pagination.'),
-        title: z.string().trim().min(1).max(200).optional().describe('Accessible chart title shown above the canvas.'),
-        description: z.string().trim().min(1).max(1_000).optional().describe('Accessible plain-language summary of the chart and its main point.'),
-        height: z.number().int().min(240).max(720).optional().describe('Rendered chart height in pixels. Defaults to 380.'),
-        renderer: z.enum(['canvas', 'svg']).optional().describe('ECharts renderer for action=create. Defaults to canvas.'),
-        option: z.record(z.string(), z.unknown()).optional().describe('For action=create: complete native ECharts option. Series may use any type registered by the full echarts package. Values must be JSON-serializable.'),
-        maps: z.array(z.object({
-          name: z.string().trim().min(1).max(160),
-          geoJson: z.union([z.record(z.string(), z.unknown()), z.string().min(1)]),
-          specialAreas: z.record(z.string(), z.unknown()).optional(),
-        })).max(12).optional().describe('Optional GeoJSON or SVG maps registered with echarts.registerMap before rendering.'),
-      }, [
-        { action: 'api', reason: '查看 ECharts API 模块索引' },
-        { action: 'api', reason: '读取直角坐标系列配置说明', query: 'series.cartesian' },
-        {
-          action: 'create',
-          reason: '展示最近六个月收入趋势',
-          title: '最近六个月收入趋势',
-          option: {
-            tooltip: { trigger: 'axis' },
-            xAxis: { type: 'category', data: ['1月', '2月', '3月', '4月', '5月', '6月'] },
-            yAxis: { type: 'value' },
-            series: [{ name: '收入（万元）', type: 'line', smooth: true, areaStyle: {}, data: [120, 138, 151, 149, 182, 205] }],
-          },
-        },
-      ]),
-      execute: (input, execution) => record('chart', input, () => input.action === 'api'
-        ? readBrowserChatChartApi({ limit: input.limit, offset: input.offset, query: input.query })
-        : createBrowserChatChart({
-            description: input.description,
-            height: input.height,
-            maps: input.maps,
-            option: input.option,
-            renderer: input.renderer,
-            runId: referenceOptions?.runId || '',
-            title: input.title,
-          }), execution),
-    }),
+    ...capabilityTools,
     finalResponse: tool({
       description: 'Finish the request with ordered UI blocks. Use markdown for prose, chart for a successful chart id, and ui for declarative cards/layout. The client preserves this exact order in UIMessage.parts.',
       inputSchema: browserChatFinalResponseSchema,
@@ -1695,218 +1624,25 @@ function makeBrowserTools(
           : { ok: false, actual: `Skill ${input.skillId} is unavailable in this runtime.` } satisfies BrowserActionResult;
       }, execution),
     }),
-    file: tool({
-      description: `List, read, download, convert, create, modify, or render file artifacts in a stable documentId workspace. Every action requires hidden Skill ${fileArtifactRuntimeSkillId} to have been read in a previous model step.`,
-      // Keep the provider-facing schema flat. Several OpenAI-compatible
-      // gateways mishandle a discriminated union/oneOf and reject a perfectly
-      // usable file call before the action-specific implementation can return
-      // a helpful correction. Each action validates its required fields below.
-      inputSchema: withToolInputExamples(z.preprocess(
-        (input) => coerceBrowserChatToolInput('file', input),
-        z.object({
-          reason: z.string().min(1).max(300).optional().describe('Optional concise reason; it never changes file behavior.'),
-          action: z.string().max(32).optional().describe('Exactly one action: list, read, download, convert, plan, generate, edit, unoApi, jsApi, or render. Call list before starting or resuming Office work. New presentation example: {"action":"plan","documentId":"xsbn-5d-yxg-guide","fileName":"西双版纳5日游攻略-野象谷周边.pptx","documentType":"presentation","operation":"create","intent":"创建一份西双版纳5日游攻略演示文稿"}. For existing Office files use plan={action:"plan",operation:"modify",sourceAttachmentId,documentId,fileName,documentType}; this edits the source component instead of recreating it. Call unoApi only for an UNO-planned document and jsApi only for a JavaScript-planned document; both require that planned documentId. unoApi without query returns its module index; query an exact module before using it. jsApi returns the cookbook for JavaScript generation mode.'),
-          attachmentId: z.string().max(160).optional().describe('Exact user attachment id returned in conversation metadata. Example: "attachment-7f3a".'),
-          artifactId: z.string().max(4_000).optional().describe('Exact Artifact ID returned by a previous successful file tool result; never invent it.'),
-          sourceArtifactId: z.string().max(4_000).optional().describe('For action=convert: exact Artifact ID of the source Office file.'),
-          documentId: z.string().max(96).optional().describe('Required for plan, API lookup, generate, read, edit, render, and visual correction: the stable model-chosen id reused for the logical document. Use 1-96 ASCII letters, numbers, dot, underscore, or hyphen. If edit accidentally omits it, the backend can recover only when baseDigest uniquely identifies one current draft. Example: "xsbn-5d-yxg-guide".'),
-          fileName: z.string().max(180).optional().describe('Optional output file name including the target extension. Examples: "西双版纳5日游攻略-野象谷周边.pptx", "项目复盘.docx", or "预算明细.xlsx".'),
-          fileType: z.string().regex(/^[a-z0-9]{1,10}$/).optional().describe('Required for action=download: the expected file extension without a dot, such as jpg, png, pdf, docx, xlsx, or pptx. Always infer and provide it even when fileName is omitted.'),
-          documentType: z.enum(['word', 'spreadsheet', 'presentation']).optional().describe('Required for plan. For unoApi it is inferred from the planned documentId when omitted; if provided it must match the plan. Common aliases such as docx/xlsx/pptx are accepted and normalized.'),
-          operation: z.enum(['create', 'modify']).optional().describe('For plan: create a new document or modify an attached existing Office document.'),
-          sourceAttachmentId: z.string().max(160).optional().describe('For operation=modify: exact attachment id of the existing Office file.'),
-          intent: z.string().max(8_000).optional().describe('For plan: concise description of the document to create or modify. Example: "创建一份西双版纳5日游攻略演示文稿".'),
-          url: z.string().max(8_000).optional(),
-          path: z.string().max(8_000).optional().describe('For draft read/edit, an optional semantic source-unit path returned by read, such as pages/s30-risk-matrix or symbols/add_bg; for download, a source path or URL as documented by that action.'),
-          startLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional one-based first line. It is draft-global without path and source-unit-relative when path is supplied.'),
-          endLine: z.number().int().min(1).optional().describe('For action=read with documentId: optional inclusive last line. Values beyond the current draft/unit are clamped to its final line; source windows are limited to 240 lines.'),
-          urlOrPath: z.string().max(8_000).optional(),
-          program: z.string().optional().describe('Required for the initial action=generate. If a working source already exists, use action=edit first. UNO source must define exactly one top-level synchronous def create_document(job):, keep job.presentation/job.writer/job.spreadsheet and all authoring inside it, then call that facade save() exactly once followed by close() exactly once.'),
-          baseDigest: z.string().regex(/^[a-f0-9]{64}$/i).optional().describe('Required for action=edit and for generate with replaceExisting=true: exact patchBaseDigest from the latest read of the same documentId and optional path.'),
-          replaceExisting: z.boolean().optional().describe('Exceptional last resort for action=generate only, after reading the complete current source: use only when bounded edit patches cannot coherently perform a near-total rebuild. Never use it for local validation errors, patch formatting errors, context conflicts, or ordinary revisions.'),
-          patch: z.string().max(200_000).optional().describe("Required for action=edit, which is always the first choice when a source exists: one Codex apply_patch document using '*** Begin Patch', '*** Update File: draft.py', one or more '@@' hunks, and '*** End Patch'. BEFORE CALLING, verify every hunk has a real change: at least one line beginning literally '-' or '+'. A replacement needs both '-old' and '+new'; context-only hunks are invalid. Do not write unified-diff line numbers or file headers. Unchanged context should begin with one literal space and keep the source's original indentation. If a patch fails formatting or context matching, correct and retry action=edit; do not switch to generate/replaceExisting."),
-          render: z.boolean().optional(),
-          includeVisuals: z.boolean().optional(),
-          offset: z.number().int().min(0).optional(),
-          limit: z.number().int().min(1).max(BROWSER_CHAT_FILE_READ_MAX_CHARS).optional(),
-          pages: z.array(z.number().int().min(1)).max(6).optional(),
-          query: z.string().max(1_000).optional().describe('For unoApi: omit once to list available modules, then pass an exact module query such as presentation.shape, presentation.professional, writer.table, or calc.chart-image. A module response includes every installed signature, accepted value schema, and registered example for all matched APIs.'),
-        }).passthrough(),
-      ), [
-        { reason: 'Download the referenced JPEG image', action: 'download', urlOrPath: 'https://example.com/image', fileType: 'jpg' },
-        { reason: 'List planned presentation API modules', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation' },
-        { reason: 'Load exact shape signatures and all shape examples', action: 'unoApi', documentId: 'xsbn-5d-yxg-guide', documentType: 'presentation', query: 'presentation.shape' },
-        {
-          action: 'plan',
-          reason: '规划西双版纳攻略演示文稿',
-          documentId: 'xsbn-5d-yxg-guide',
-          fileName: '西双版纳5日游攻略-野象谷周边.pptx',
-          documentType: 'presentation',
-          operation: 'create',
-          intent: '创建一份西双版纳5日游攻略演示文稿',
-        },
-        { reason: '读取当前文稿源文件', action: 'read', documentId: 'xsbn-5d-yxg-guide' },
-        { reason: '修改文稿中的行程页', action: 'edit', documentId: 'xsbn-5d-yxg-guide', baseDigest: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', patch: '*** Begin Patch\n*** Update File: draft.py\n@@\n def create_document(job):\n-    title = "Old"\n+    title = "New"\n     deck = job.presentation("deck")\n*** End Patch' },
-        { reason: '渲染当前文稿版本', action: 'render', documentId: 'xsbn-5d-yxg-guide' },
-      ]),
-      execute: (input, execution) => {
-        if (input.action === 'list') {
-          return record('file', input, () => listOfficeDrafts({ runId: referenceOptions?.runId }), execution);
-        }
-        if (input.action === 'read') {
-          if (input.documentId) {
-            return record('file', input, () => readUnoDraft({
-              documentId: input.documentId,
-              path: input.path,
-              startLine: input.startLine,
-              endLine: input.endLine,
-              runId: referenceOptions?.runId,
-            }), execution);
-          }
-          const includeVisuals = modelSupportsImageInput()
-            && (input.includeVisuals ?? (input.offset === undefined || input.offset === 0 || Boolean(input.pages?.length)));
-          const normalizedInput = {
-            ...input,
-            includeVisuals,
-            limit: normalizeBrowserChatFileReadLimit(input.limit),
-          };
-          return record('file', normalizedInput, () => referenceOptions?.readFile
-            ? referenceOptions.readFile(normalizedInput)
-            : Promise.resolve({ ok: false, actual: 'file action=read is unavailable in this runtime.' }), execution);
-        }
-        if (input.action === 'download') {
-          return record('file', input, () => downloadFileArtifact({ ...input, runId: referenceOptions?.runId, sourcePageUrl: session.currentUrl() }), execution);
-        }
-        if (input.action === 'convert') {
-          return record('file', input, () => convertFileArtifact({
-            runId: referenceOptions?.runId,
-            sourceArtifactId: input.sourceArtifactId,
-            fileName: input.fileName,
-            includeVisualVerification: modelSupportsImageInput(),
-          }), execution);
-        }
-        if (input.action === 'plan') {
-          return record('file', input, () => planFileArtifact({ ...input, runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings }), execution);
-        }
-        if (input.action === 'unoApi') {
-          return record('file', input, () => getUnoApi({ ...input, runId: referenceOptions?.runId }), execution);
-        }
-        if (input.action === 'jsApi') {
-          return record('file', input, () => getOfficeJsApi({ ...input, runId: referenceOptions?.runId }), execution);
-        }
-        if (input.action === 'generate') {
-          return record('file', input, (abortSignal, trace) => generateUnoFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: false }), execution);
-        }
-        if (input.action === 'render') {
-          return record('file', input, (abortSignal, trace) => renderFileArtifact({ ...input, abortSignal, onProgress: fileProgressReporter(trace), runId: referenceOptions?.runId, attachmentBindings: referenceOptions?.attachmentBindings, includeVisualVerification: modelSupportsImageInput() }), execution);
-        }
-        if (input.action === 'edit') {
-          return record('file', input, (abortSignal, trace) => editUnoFileArtifact({
-            documentId: input.documentId,
-            path: input.path,
-            program: input.program,
-            baseDigest: input.baseDigest,
-            patch: input.patch,
-            render: input.render,
-            abortSignal,
-            onProgress: fileProgressReporter(trace),
-            runId: referenceOptions?.runId,
-            attachmentBindings: referenceOptions?.attachmentBindings,
-            includeVisualVerification: false,
-          }), execution);
-        }
-        return record('file', input, () => Promise.resolve({
-          ok: false,
-          actual: 'file requires one action: list | read | download | convert | plan | generate | edit | unoApi | jsApi | render. To modify an attachment, plan with operation=modify and sourceAttachmentId. Do not retry an empty object.',
-        }), execution);
-      },
-    }),
-    ...(modelSupportsImageInput() && referenceOptions?.readFileVisuals ? {
-      fileVisual: tool({
-        description: `Index, read, and report evidence-backed page-level and cross-page visual QA for the exact current artifact. Reviews must judge actual pixels, aesthetics, chart semantics, and image identification; known visible defects cannot be waived as compatibility limits. Every action requires the shared hidden Skill ${fileArtifactRuntimeSkillId}.`,
-        inputSchema: z.preprocess(
-          (input) => coerceBrowserChatToolInput('fileVisual', input),
-          browserToolInput({
-            action: z.enum(['index', 'read', 'report']),
-            artifactId: z.string().min(1).max(4_000).describe('Exact current-conversation Artifact ID returned by a successful file generation or download.'),
-            screenshotIds: z.array(z.string().min(1).max(40)).min(1).max(8).optional().describe('For action=read only: one to eight exact screenshot-NNNN ids returned by action=index.'),
-            reviews: z.array(z.object({
-              screenshotId: z.string().min(1).max(40),
-              status: z.enum(['failed', 'passed']),
-              observation: z.string().trim().min(20).max(1_000).describe('Concrete page-specific visual evidence covering composition and readability; a generic pass statement is invalid.'),
-              checks: visualQaPageChecksSchema,
-              issues: visualQaIssuesSchema,
-            }).strict()).min(1).max(100).optional().describe('For action=report: evidence-backed conclusions for any already-read screenshots from this artifact; one report may cover the complete document.'),
-            deckReview: z.object({
-              status: z.enum(['failed', 'passed']),
-              observation: z.string().trim().min(30).max(2_000).describe('Concrete cross-page comparison of the complete rendered artifact.'),
-              checks: visualQaDeckChecksSchema,
-              issues: visualQaIssuesSchema,
-            }).strict().optional().describe('Required once after every page has been read and reviewed; evaluates consistency across the complete artifact.'),
-            offset: z.number().int().min(0).optional().describe('For action=index only: zero-based screenshot-list offset. Defaults to 0.'),
-            limit: z.number().int().min(1).max(200).optional().describe('For action=index only: number of screenshot ids to list. Defaults to 100.'),
-          }, [
-            { reason: '列出当前文稿的全部预览页', action: 'index', artifactId: 'exact-artifact-id-from-file-result', offset: 0, limit: 100 },
-            { reason: '读取前两页预览图', action: 'read', artifactId: 'exact-artifact-id-from-file-result', screenshotIds: ['screenshot-0001', 'screenshot-0002'] },
-            { reason: '提交第一页视觉检查结论', action: 'report', artifactId: 'exact-artifact-id-from-file-result', reviews: [{ screenshotId: 'screenshot-0001', status: 'passed', observation: '标题、正文和数据图形层级清楚，四周留白均衡，当前预览尺寸下全部文字可读。', checks: { overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed', typography: 'passed', contrast: 'passed', visualHierarchy: 'passed', chartTableLegibility: 'passed', imageQuality: 'not-applicable' } }] },
-          ]).superRefine((input, context) => {
-            if (input.action === 'read' && !input.screenshotIds?.length) {
-              context.addIssue({ code: z.ZodIssueCode.custom, message: 'read requires screenshotIds.', path: ['screenshotIds'] });
-            }
-            if (input.action === 'report' && !input.reviews?.length) {
-              context.addIssue({ code: z.ZodIssueCode.custom, message: 'report requires reviews.', path: ['reviews'] });
-            }
-            for (const [index, review] of (input.reviews || []).entries()) {
-              const failedChecks = Object.entries(review.checks).filter(([, status]) => status === 'failed').map(([name]) => name);
-              const invalidNotApplicable = Object.entries(review.checks)
-                .filter(([name, status]) => status === 'not-applicable' && name !== 'chartTableLegibility' && name !== 'imageQuality')
-                .map(([name]) => name);
-              if (invalidNotApplicable.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `Only chartTableLegibility and imageQuality may be not-applicable; invalid: ${invalidNotApplicable.join(', ')}.`, path: ['reviews', index, 'checks'] });
-              if (review.status === 'passed' && failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `A passed review cannot contain failed checks: ${failedChecks.join(', ')}.`, path: ['reviews', index, 'status'] });
-              if (review.status === 'failed' && !failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed review requires at least one failed check.', path: ['reviews', index, 'checks'] });
-              if (review.status === 'passed' && review.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A passed review cannot contain issues.', path: ['reviews', index, 'issues'] });
-              if (review.status === 'failed' && !review.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed review requires issue details.', path: ['reviews', index, 'issues'] });
-            }
-            if (input.deckReview) {
-              const failedChecks = Object.entries(input.deckReview.checks).filter(([, status]) => status === 'failed').map(([name]) => name);
-              if (input.deckReview.status === 'passed' && failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: `A passed deckReview cannot contain failed checks: ${failedChecks.join(', ')}.`, path: ['deckReview', 'status'] });
-              if (input.deckReview.status === 'failed' && !failedChecks.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed deckReview requires at least one failed check.', path: ['deckReview', 'checks'] });
-              if (input.deckReview.status === 'passed' && input.deckReview.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A passed deckReview cannot contain issues.', path: ['deckReview', 'issues'] });
-              if (input.deckReview.status === 'failed' && !input.deckReview.issues?.length) context.addIssue({ code: z.ZodIssueCode.custom, message: 'A failed deckReview requires issue details.', path: ['deckReview', 'issues'] });
-            }
-          }),
-        ),
-        execute: (input, execution) => record('fileVisual', input, async () => {
-          const version = await verifyCurrentUnoRenderedArtifact({
-            runId: referenceOptions?.runId,
-            artifactId: input.artifactId,
-          });
-          if (!version.ok) return version;
-          const result = referenceOptions?.readFileVisuals
-            ? await referenceOptions.readFileVisuals(input)
-            : { ok: false, actual: 'fileVisual is unavailable in this runtime.' };
-          return recordOfficeVisualQaProgress({
-            runId: referenceOptions?.runId,
-            artifactId: input.artifactId,
-            action: input.action,
-            result,
-          });
-        }, execution),
-      }),
-    } : {}),
   };
 
   const tools = sharedTools;
   const allowedToolTypes = referenceOptions?.allowedToolTypes;
-  if (!allowedToolTypes?.length) return tools;
+  if (!allowedToolTypes?.length) return { tools, dispose: capabilitySnapshot.dispose };
   const allowed = new Set(allowedToolTypes);
-  return Object.fromEntries(Object.entries(tools).filter(([name]) => allowed.has(name))) as typeof tools;
+  return {
+    tools: Object.fromEntries(Object.entries(tools).filter(([name]) => allowed.has(name))) as typeof tools,
+    dispose: capabilitySnapshot.dispose,
+  };
 }
 
 type RuntimeToolDefinitions = ToolSet;
 
 function toolInputJsonSchema(inputSchema: unknown) {
   if (!inputSchema) return undefined;
+  if (typeof inputSchema === 'object' && 'jsonSchema' in inputSchema) {
+    return (inputSchema as { jsonSchema?: unknown }).jsonSchema;
+  }
   try {
     return z.toJSONSchema(inputSchema as z.ZodType);
   } catch (error) {
@@ -1941,7 +1677,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     'Operating rules:',
     '- Simple knowledge questions and other requests that do not need the live browser may be answered directly. When browser evidence or interaction is needed, call the relevant browser tool directly. The execution layer runs any pending prerequisite tools first, then runs the requested tool, and returns every prerequisite result in prerequisiteResults alongside the requested tool result in one tool response. Do not issue separate prerequisite tool calls unless their result alone is desired. In one model step call at most one relevant tool.',
     '- The latest user message is the scope authority. If it explicitly narrows the current turn to one action (for example, "just click Search"), perform and verify only that action, then stop. Do not silently resume a broader goal from an earlier message unless the latest message explicitly asks you to continue it.',
-    '- browserCode is the real browser operation mechanism. It can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. Use browserCode whenever the user asks to open, visit, jump to, click, or operate a page. A pending readBrowserState prerequisite is executed internally and returned in prerequisiteResults while the requested browserCode still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browserCode is available unless a real browserCode attempt failed and you report that failure. One cell may execute multiple bounded operations.',
+    '- The single browser tool is the real browser mechanism. Use action=state for a read-only live snapshot, action=code for Playwright inspection or interaction, and action=waitForHumanVerification only for user-owned verification. action=code can navigate with page.goto(url), open a tab with browser.tabs.new(url), switch tabs, click observed links/controls, type, select, upload, inspect, and verify. A pending browser state prerequisite is executed internally and returned in prerequisiteResults while the requested action=code still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browser action=code is available unless a real attempt failed and you report that failure. One code cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     `- User-role messages beginning with ${runtimeOperationalContextMarker}, ${runtimeCurrentTimeMarker}, [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. The newest runtime snapshot supersedes older snapshots. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.`,
@@ -1951,9 +1687,9 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- If agent.state tracks task stage, coverage, status, issues, or artifacts, update those records before the final answer so no pending/generated/failed field contradicts a complete claim. Do not set an overall complete/passed state while any required item remains pending, unsupported, failed, or unverified unless the user explicitly accepted a partial result.',
     `- Use chart when an Apache ECharts visualization materially improves the answer. Its first call atomically loads hidden Skill ${chartRuntimeSkillId}. Read its indexed API with action=api before action=create. After every successful create, reference the exact returned chartId from a finalResponse chart block. Never invent a chart id or use one from a failed call.`,
     '- Complete every terminal response by calling finalResponse with ordered blocks. Use markdown blocks for normal prose, chart blocks for generated ECharts artifacts, and ui blocks for declarative cards/layout. Never serialize these blocks into assistant text. The UI renders blocks in the exact array order.',
-    '- Defect reporting is a mandatory part of every interface or product testing task. As soon as live browser evidence reveals a real defect or reproducible product problem (including functional, data, interaction, visual/layout, or compatibility problems), proactively reproduce it, use browserCode to emit a screenshot that visibly proves it, and call reportDefect in the immediately following model step with the exact screenshotFileNames returned by browserCode before continuing unrelated test cases. Never wait for the user to ask, defer reporting until the final answer, or merely describe the problem in test notes or the final report. Create one report for each unique confirmed problem. Investigate permission, configuration, version, requirement, and environment explanations first; report only an observed product problem, never speculation or expected behavior, and do not report duplicates. Recording a defect does not end the requested test unless its full scope is complete.',
+    '- Defect reporting is a mandatory part of every interface or product testing task. As soon as live browser evidence reveals a real defect or reproducible product problem (including functional, data, interaction, visual/layout, or compatibility problems), proactively reproduce it, use browser action=code to emit a screenshot that visibly proves it, and call reportDefect in the immediately following model step with the exact screenshotFileNames returned by browser before continuing unrelated test cases. Never wait for the user to ask, defer reporting until the final answer, or merely describe the problem in test notes or the final report. Create one report for each unique confirmed problem. Investigate permission, configuration, version, requirement, and environment explanations first; report only an observed product problem, never speculation or expected behavior, and do not report duplicates. Recording a defect does not end the requested test unless its full scope is complete.',
     screenshotAvailable && input.fileVisualAvailable
-      ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before fileVisual and follow its complete current-artifact page-review workflow.`
+      ? `- Office/PDF visual QA is a server-enforced delivery gate. Read ${fileArtifactRuntimeSkillId} before file visual actions and follow its complete current-artifact page-review workflow with visualIndex, visualRead, and visualReport.`
       : screenshotAvailable
         ? '- A successful render is only a candidate. Inspect every returned preview and generationDiagnostics for clipping, overlap, hidden text, word/character wrapping, unexpectedly wrapped titles, covered captions, off-canvas content, empty pages, image distortion, broken tables/charts, contrast, and alignment. If a defect exists, read the exact current source, apply one Codex-format patch with its patchBaseDigest, render again, and inspect the replacement preview. Do not claim full visual verification when a complete screenshot-by-screenshot review was unavailable.'
       : '- This selected model has no image input. A successful document render is structural verification only; do not claim that you saw, inspected, confirmed, or corrected a visual layout, preview, overlap, contrast, clipping, or image quality. Do not request preview screenshots and do not describe visual defects as observed evidence. State the verification boundary accurately if it matters to the user.',
@@ -1962,7 +1698,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- Do not create a dedicated failure log, verification log, transparency disclosure, or similarly named section in the final answer. Recovered or irrelevant low-level tool failures remain in the process UI and logs. Mention only an unresolved failure that materially limits the requested outcome, and state it briefly alongside the affected result or limitation.',
     '- If progress stops or the target mismatches, inspect fresh evidence and change approach instead of repeating the same failed target.',
     `- Use subagent action=spawn only for independent parallel work and read ${subagentRuntimeSkillId} first. action=read stays ungated; collect one returned UUID per model step in the required order, then integrate results in the parent Agent.`,
-    '- Use waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
+    '- Use browser action=waitForHumanVerification only when an empty captcha/OTP/security check, unavailable user credential, QR scan, payment/identity confirmation, or personal-device action genuinely requires the user. If a detected captcha is already filled, submit and continue.',
     '- To upload a user attachment to a web file input, do not call file merely for upload and never reconstruct the file. First place and verify the editor caret at the requested destination when placement matters, then call attachmentVault.setInputFiles(locator, attachmentId) with the exact current file-input locator and listed attachmentId. After the site inserts it, verify exactly one attachment remains at the requested destination. For existing remote files use file action=download; to create a new file use the plan → generate → render document flow.',
     caseSystemPrompt ? `Loaded safety rules and Skills:\n${caseSystemPrompt}` : '',
     customPrompt,
@@ -1971,16 +1707,13 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
   ].filter(Boolean).join('\n');
 }
 
-function runtimeToolNames(includeVisualTools = true) {
+function runtimeToolNames() {
   return [
-    'readBrowserState',
-    'browserCode',
+    browserCapabilityToolNames.browser,
     'reportDefect',
-    'waitForHumanVerification',
     'subagent',
-    'file',
-    ...(includeVisualTools ? ['fileVisual'] : []),
-    'chart',
+    fileCapabilityToolNames.file,
+    chartCapabilityToolNames.chart,
     'finalResponse',
     'skill',
   ];
@@ -2326,7 +2059,7 @@ function deriveBrowserChatStepDecision(text: string, traces: ToolTrace[]): Runti
   const note = extractProgressNote(text);
   const toolReason = executed.map((trace) => readableActionFromTrace(trace)).find(Boolean);
 
-  if (last?.name === 'waitForHumanVerification') {
+  if (last && isBrowserHumanVerificationCall(last.name, last.input)) {
     return {
       action: readableActionFromTrace(last) || toolReason || 'Wait for human verification',
       expected: 'The user should complete captcha, login, security verification, or other manual work in the visible browser.',
@@ -2427,7 +2160,7 @@ async function executeRuntimeStep(input: {
   await onDebug?.({
     phase: 'ai:runtime-input:start',
     stepIndex,
-    message: 'Preparing runtime input for browserCode execution.',
+    message: 'Preparing runtime input for unified browser execution.',
     details: { imageInputAvailable, markerEnabled },
   });
   const contextMs = 0;
@@ -2501,7 +2234,7 @@ async function executeRuntimeStep(input: {
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
     const externalTools = codexMode ? {} : (input.memoryTools || {});
     const externalToolNames = new Set(Object.keys(externalTools));
-    const availableRuntimeToolNames = [...runtimeToolNames(imageInputAvailable && Boolean(input.readFileVisuals)), ...externalToolNames].filter((name) => (
+    const availableRuntimeToolNames = [...runtimeToolNames(), ...externalToolNames].filter((name) => (
       name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent)
     ));
     const runtimeTools = runtimeAllowedToolTypes({
@@ -2512,7 +2245,7 @@ async function executeRuntimeStep(input: {
     });
     const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
     const allowedToolTypes = requestedToolTypes
-      ? runtimeTools.filter((toolType) => toolType === 'readBrowserState' || toolType === 'skill' || requestedToolTypes.has(toolType))
+      ? runtimeTools.filter((toolType) => toolType === browserCapabilityToolNames.browser || toolType === 'skill' || requestedToolTypes.has(toolType))
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
@@ -2542,8 +2275,8 @@ async function executeRuntimeStep(input: {
     const queuedReferenceImageKeys = new Set<string>();
     const reportedDocumentVisualSources = new Set<string>();
     const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
-      const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('fileVisual:read');
-      const normalizedSource = source.startsWith('fileVisual:read:') ? 'fileVisual:read' : source;
+      const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('file:visualRead');
+      const normalizedSource = source.startsWith('file:visualRead:') ? 'file:visualRead' : source;
       const referenceKey = `${source}\u0000${path}`;
       if (queuedReferenceImageKeys.has(referenceKey)) return;
       queuedReferenceImageKeys.add(referenceKey);
@@ -2560,7 +2293,7 @@ async function executeRuntimeStep(input: {
         return;
       }
       const text = documentVisualQa
-      ? '[Document visual QA]\nThe attached images are the exact pages returned by the latest fileVisual read. Inspect the pixels for clipping, overlap, hierarchy, typography, contrast, alignment, chart/table legibility, image quality, and page-edge defects. Use the screenshot IDs from the tool result when reporting evidence. If any page fails, patch the same current source, render a replacement artifact, and inspect only that new artifact.'
+      ? '[Document visual QA]\nThe attached images are the exact pages returned by the latest file action=visualRead. Inspect the pixels for clipping, overlap, hierarchy, typography, contrast, alignment, chart/table legibility, image quality, and page-edge defects. Use the screenshot IDs from the tool result when reporting evidence. If any page fails, patch the same current source, render a replacement artifact, and inspect only that new artifact.'
         : source === 'file:read'
           ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
           : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';
@@ -3228,7 +2961,7 @@ async function executeRuntimeStep(input: {
       };
     }
 
-    const browserTools = makeBrowserTools(session, traces, aiRequest, async (trace) => {
+    const browserToolRuntime = await makeBrowserTools(session, traces, aiRequest, async (trace) => {
       if (!trace.result && !trace.completedAt) requestWatchdog.pause();
       else requestWatchdog.resume();
       ensureActive();
@@ -3277,10 +3010,16 @@ async function executeRuntimeStep(input: {
         await onAttemptDebug?.({ phase: 'ai:visual-context', stepIndex, message: 'Visual Context Manager updated.', details: snapshot });
       },
     });
+    const browserTools = browserToolRuntime.tools;
     const allowedToolNameSet = new Set(allowedToolTypes);
     const allowedExternalTools = Object.fromEntries(
       Object.entries(externalTools).filter(([name]) => allowedToolNameSet.has(name)),
     );
+    const conflictingExternalToolName = Object.keys(allowedExternalTools).find((name) => name in browserTools);
+    if (conflictingExternalToolName) {
+      await browserToolRuntime.dispose();
+      throw new Error(`External tool name conflicts with an enabled capability: ${conflictingExternalToolName}.`);
+    }
     nativeToolsRef.current = {
       ...browserTools,
       ...allowedExternalTools,
@@ -3294,6 +3033,10 @@ async function executeRuntimeStep(input: {
     const stopWhen = runtimeToolLoopStopToolNames.map((toolName) => (
       hasToolCall<typeof toolsForRequest>(toolName)
     ));
+    const stopAfterHumanVerification: StopCondition<typeof toolsForRequest> = ({ steps }) => steps.some((step) => (
+      step.toolCalls.some((call) => isBrowserHumanVerificationCall(call.toolName, call.input))
+    ));
+    stopWhen.push(stopAfterHumanVerification);
     try {
       let streamedStepText = '';
       const runtimeContext = {
@@ -3612,6 +3355,8 @@ async function executeRuntimeStep(input: {
         attachRuntimeFailureRecovery(error, lastRetryState, historyMessages.length, turnInputMessages);
       }
       throw error;
+    } finally {
+      await browserToolRuntime.dispose();
     }
   }
 
@@ -3988,10 +3733,10 @@ export async function executeInteractiveBrowserTurn(input: {
         ? requiredVisualQa.failedPages.length
           ? `[Mandatory Office visual repair gate]
 Continue the current artifact workflow and the same documentId=${requiredVisualQa.documentId}; do not recreate the document or repeat source research. Do not present a delivery/final-success summary yet.
-The latest rendered artifact failed visual QA on pages ${requiredVisualQa.failedPages.join(', ')}. Repair the current saved source with file action=edit using these recorded findings: ${JSON.stringify(requiredVisualQa.failedReviews.flatMap((review) => review.issues.map((issue) => ({ page: review.pageNumber, ...issue }))).slice(0, 20))}. Do not call fileVisual again until the source has been edited and re-rendered. Success is forbidden until the new rendered digest passes every page.`
+The latest rendered artifact failed visual QA on pages ${requiredVisualQa.failedPages.join(', ')}. Repair the current saved source with file action=edit using these recorded findings: ${JSON.stringify(requiredVisualQa.failedReviews.flatMap((review) => review.issues.map((issue) => ({ page: review.pageNumber, ...issue }))).slice(0, 20))}. Do not call a file visual action again until the source has been edited and re-rendered. Success is forbidden until the new rendered digest passes every page.`
           : `[Mandatory Office visual QA gate]
 Continue the current artifact workflow; do not restart the user's original task, revisit source research, or recreate already generated documents. Do not present a delivery/final-success summary yet.
-The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered yet. Its renderedDigest is ${requiredVisualQa.renderedDigest}, visualQaDigest is ${requiredVisualQa.visualQaDigest || 'null'}, ${requiredVisualQa.seenPageCount}/${requiredVisualQa.pageCount || '?'} pages have been read, and ${requiredVisualQa.reviewedPageCount}/${requiredVisualQa.pageCount || '?'} pages have explicit reviews. Call fileVisual index/read and then report an explicit passed/failed conclusion for every page. Reading alone never passes QA. Success is forbidden until every page passes and visualQaDigest === renderedDigest.`
+The latest rendered artifact ${requiredVisualQa.artifactId} cannot be delivered yet. Its renderedDigest is ${requiredVisualQa.renderedDigest}, visualQaDigest is ${requiredVisualQa.visualQaDigest || 'null'}, ${requiredVisualQa.seenPageCount}/${requiredVisualQa.pageCount || '?'} pages have been read, and ${requiredVisualQa.reviewedPageCount}/${requiredVisualQa.pageCount || '?'} pages have explicit reviews. Call file action=visualIndex, then visualRead, then visualReport with an explicit passed/failed conclusion for every page. Reading alone never passes QA. Success is forbidden until every page passes and visualQaDigest === renderedDigest.`
         : '';
       const requiredDocumentWorkInstruction = requiredDocumentWork
         ? `[Mandatory Office document completion gate]
@@ -4019,7 +3764,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
         abortSignal: input.abortSignal,
         shouldContinue: input.shouldContinue,
         requestToolConfirmation: input.requestToolConfirmation,
-        allowedToolTypes: requiredSubagentUuid ? ['readBrowserState', 'subagent'] : input.allowedToolTypes,
+        allowedToolTypes: requiredSubagentUuid ? [browserCapabilityToolNames.browser, 'subagent'] : input.allowedToolTypes,
         requiredSubagentUuid,
         runSubagents: input.runSubagents,
         readSubagent: input.readSubagent,
@@ -4270,7 +4015,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
     ensureActive();
     await input.onProgress?.(completedStep);
     ensureActive();
-    const lastToolName = operationalTraces.at(-1)?.name;
+    const lastTool = operationalTraces.at(-1);
     const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
     if (pendingSubagentUuids.length) {
       await input.onDebug?.({
@@ -4325,7 +4070,7 @@ Continue the existing documentId=${requiredDocumentWork.documentId}; do not crea
       endedWithFinalAnswer = true;
       break;
     }
-    if (lastToolName === 'waitForHumanVerification') {
+    if (lastTool && isBrowserHumanVerificationCall(lastTool.name, lastTool.input)) {
       finalStatus = 'blocked';
       if (!reply) reply = browserChatReplyFromDecision(decision);
       finalBlocks = [{ type: 'markdown', text: reply }];
@@ -4530,6 +4275,33 @@ export async function executeRecordedBrowserOperation(
   const credentialBindings = options.credentialBindings;
 
   switch (flow.name) {
+    case 'browser': {
+      if (input.action === 'state') {
+        return readCurrentBrowserState(session, {
+          runId,
+          stepIndex: flow.index,
+          abortSignal,
+        });
+      }
+      if (input.action === 'waitForHumanVerification') {
+        return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
+      }
+      if (input.action !== 'code') {
+        return { ok: false, actual: 'browser requires action=state|code|waitForHumanVerification.' };
+      }
+      const code = typeof input.code === 'string' ? input.code : '';
+      const violation = browserCodeServiceFileDeliveryViolation(code);
+      if (violation) return { ok: false, actual: violation };
+      return session.executeBrowserCode({
+        code,
+        maxOutputChars: typeof input.maxOutputChars === 'number' ? input.maxOutputChars : undefined,
+        attachments: attachmentBindings,
+        credentials: credentialBindings,
+        runId: runId || 'browser-code',
+        stepIndex: flow.index,
+        abortSignal,
+      });
+    }
     case 'readBrowserState':
       return readCurrentBrowserState(session, {
         runId,
@@ -4553,110 +4325,28 @@ export async function executeRecordedBrowserOperation(
     case 'waitForHumanVerification':
       return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
     case 'file':
-      if (input.action === 'list') {
-        return listOfficeDrafts({ runId });
-      }
-      if (input.action === 'read' && typeof input.documentId === 'string') {
-        return readUnoDraft({
-          runId,
-          documentId: input.documentId,
-          path: typeof input.path === 'string' ? input.path : undefined,
-          startLine: typeof input.startLine === 'number' ? input.startLine : undefined,
-          endLine: typeof input.endLine === 'number' ? input.endLine : undefined,
-        });
-      }
-      if (input.action === 'download') {
-        return downloadFileArtifact({
-          runId,
-          url: typeof input.url === 'string' ? input.url : undefined,
-          path: typeof input.path === 'string' ? input.path : undefined,
-          urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
-          sourcePageUrl: session.currentUrl(),
-          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-          fileType: typeof input.fileType === 'string' ? input.fileType : undefined,
-        });
-      }
-      if (input.action === 'convert') {
-        return convertFileArtifact({
-          runId,
-          sourceArtifactId: typeof input.sourceArtifactId === 'string' ? input.sourceArtifactId : undefined,
-          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-          includeVisualVerification: true,
-        });
-      }
-      if (input.action === 'plan') {
-        const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
-        return planFileArtifact({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-          documentType,
-          intent: typeof input.intent === 'string' ? input.intent : undefined,
-          operation: input.operation === 'create' || input.operation === 'modify' ? input.operation : undefined,
-          sourceAttachmentId: typeof input.sourceAttachmentId === 'string' ? input.sourceAttachmentId : undefined,
+      return executeBrowserChatFile({
+        runId: runId || '',
+        params: input,
+        options: {
           attachmentBindings,
-        });
-      }
-      if (input.action === 'generate') {
-        return generateUnoFileArtifact({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          program: typeof input.program === 'string' ? input.program : undefined,
-          render: input.render === false ? false : undefined,
-          includeVisualVerification: false,
-          attachmentBindings,
-        });
-      }
-      if (input.action === 'unoApi') {
-        const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
-        return getUnoApi({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          documentType,
-          query: typeof input.query === 'string' ? input.query : undefined,
-          offset: typeof input.offset === 'number' ? input.offset : undefined,
-          limit: typeof input.limit === 'number' ? input.limit : undefined,
-        });
-      }
-      if (input.action === 'jsApi') {
-        const documentType = input.documentType === 'word' || input.documentType === 'spreadsheet' || input.documentType === 'presentation' ? input.documentType : undefined;
-        return getOfficeJsApi({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          documentType,
-        });
-      }
-      if (input.action === 'edit') {
-        return editUnoFileArtifact({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          path: typeof input.path === 'string' ? input.path : undefined,
-          program: typeof input.program === 'string' ? input.program : undefined,
-          baseDigest: typeof input.baseDigest === 'string' ? input.baseDigest : undefined,
-          patch: typeof input.patch === 'string' ? input.patch : undefined,
-          render: input.render === false ? false : undefined,
-          includeVisualVerification: false,
-          attachmentBindings,
-        });
-      }
-      if (input.action === 'render') {
-        return renderFileArtifact({
-          runId,
-          documentId: typeof input.documentId === 'string' ? input.documentId : undefined,
-          includeVisualVerification: true,
-          attachmentBindings,
-        });
-      }
-      return { ok: false, actual: `Unsupported recorded file action: ${String(input.action || '')}.${reason}` };
+          currentPageUrl: () => session.currentUrl(),
+          visualInputAvailable: true,
+        },
+        abortSignal,
+        invocationId: `recorded:file:${flow.index}`,
+      });
     case 'downloadFile':
-      return downloadFileArtifact({
-        runId,
-        url: typeof input.url === 'string' ? input.url : undefined,
-        path: typeof input.path === 'string' ? input.path : undefined,
-        urlOrPath: typeof input.urlOrPath === 'string' ? input.urlOrPath : undefined,
-        sourcePageUrl: session.currentUrl(),
-        fileName: typeof input.fileName === 'string' ? input.fileName : undefined,
-        fileType: typeof input.fileType === 'string' ? input.fileType : undefined,
+      return executeBrowserChatFile({
+        runId: runId || '',
+        params: { ...input, action: 'download' },
+        options: {
+          attachmentBindings,
+          currentPageUrl: () => session.currentUrl(),
+          visualInputAvailable: true,
+        },
+        abortSignal,
+        invocationId: `recorded:downloadFile:${flow.index}`,
       });
     default:
       return { ok: false, actual: `Unsupported recorded tool: ${flow.name}.${reason}` };
@@ -4732,43 +4422,34 @@ async function executeCodexRuntimeObject(input: {
   const normalizedParams = {
     ...(coerceBrowserChatToolInput(type, params) as Record<string, unknown>),
   };
-  if (type === 'file' && normalizedParams.action === 'read') {
-    normalizedParams.limit = normalizeBrowserChatFileReadLimit(normalizedParams.limit);
-    normalizedParams.pages = Array.isArray(normalizedParams.pages)
-      ? Array.from(new Set(normalizedParams.pages
-          .map((page) => Number(page))
-          .filter((page) => Number.isSafeInteger(page) && page > 0))).slice(0, 6)
-      : undefined;
-    normalizedParams.includeVisuals = modelSupportsImageInput()
-      && (typeof normalizedParams.includeVisuals === 'boolean'
-        ? normalizedParams.includeVisuals
-        : normalizedParams.offset === undefined || Number(normalizedParams.offset) === 0 || Boolean((normalizedParams.pages as number[] | undefined)?.length));
-  }
   const flow: BrowserOperationRecord = {
     index: stepIndex,
     name: type,
     input: normalizedParams,
     reason: typeof normalizedParams.reason === 'string' ? normalizedParams.reason : undefined,
   };
-  const runTool = async (toolCallId?: string) => {
-    if (type === 'chart') {
-      if (normalizedParams.action === 'api') {
-        return readBrowserChatChartApi({
-          limit: normalizedParams.limit,
-          offset: normalizedParams.offset,
-          query: normalizedParams.query,
+    const runTool = async (toolCallId?: string) => {
+      if (type === 'chart') {
+        return executeBrowserChatChart(runId, normalizedParams, {
+          abortSignal,
+          invocationId: toolCallId,
         });
       }
-      return createBrowserChatChart({
-        description: normalizedParams.description,
-        height: normalizedParams.height,
-        maps: normalizedParams.maps,
-        option: normalizedParams.option,
-        renderer: normalizedParams.renderer,
-        runId,
-        title: normalizedParams.title,
-      });
-    }
+      if (type === 'file') {
+        return executeBrowserChatFile({
+          runId,
+          params: normalizedParams,
+          options: {
+            attachmentBindings,
+            currentPageUrl: () => session.currentUrl(),
+            readFile,
+            readFileVisuals,
+            visualInputAvailable: modelSupportsImageInput(),
+          },
+          abortSignal,
+          invocationId: toolCallId,
+        });
+      }
     if (type === 'subagent' && normalizedParams.action === 'spawn') {
       if (!runSubagents) return { ok: false, actual: 'subagent action=spawn is unavailable in this runtime.' };
       const tasks = normalizeBrowserChatSubagentTasks(normalizedParams.tasks ?? normalizedParams);
@@ -4802,111 +4483,6 @@ async function executeCodexRuntimeObject(input: {
         };
       }
       return await reportBrowserChatDefect(runId, traces, parsed.data);
-    }
-    if (type === 'file' && normalizedParams.action === 'read') {
-      const documentId = typeof normalizedParams.documentId === 'string' ? normalizedParams.documentId.trim() : undefined;
-      if (documentId) return readUnoDraft({
-        runId,
-        documentId,
-        path: typeof normalizedParams.path === 'string' ? normalizedParams.path : undefined,
-        startLine: typeof normalizedParams.startLine === 'number' ? normalizedParams.startLine : undefined,
-        endLine: typeof normalizedParams.endLine === 'number' ? normalizedParams.endLine : undefined,
-      });
-      if (!readFile) return { ok: false, actual: 'file action=read is unavailable in this runtime.' };
-      const attachmentId = typeof normalizedParams.attachmentId === 'string' ? normalizedParams.attachmentId.trim() : undefined;
-      const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : undefined;
-      if (Boolean(attachmentId) === Boolean(artifactId)) return { ok: false, actual: 'file action=read requires exactly one attachmentId or artifactId.' };
-      return readFile({
-        attachmentId,
-        artifactId,
-        includeVisuals: normalizedParams.includeVisuals === true,
-        limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
-        offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
-        pages: Array.isArray(normalizedParams.pages) ? normalizedParams.pages as number[] : undefined,
-      });
-    }
-    if (type === 'fileVisual') {
-      if (!readFileVisuals) return { ok: false, actual: 'fileVisual is unavailable in this runtime.' };
-      const action = normalizedParams.action === 'index' || normalizedParams.action === 'read' || normalizedParams.action === 'report'
-        ? normalizedParams.action
-        : undefined;
-      const artifactId = typeof normalizedParams.artifactId === 'string' ? normalizedParams.artifactId.trim() : '';
-      const screenshotIds = Array.isArray(normalizedParams.screenshotIds)
-        ? Array.from(new Set(normalizedParams.screenshotIds
-            .filter((value): value is string => typeof value === 'string')
-            .map((value) => value.trim())
-            .filter(Boolean))).slice(0, 8)
-        : undefined;
-      if (!action || !artifactId) {
-        return { ok: false, actual: 'fileVisual requires action=index|read|report and the exact Artifact ID returned by file.' };
-      }
-      if (action === 'read' && !screenshotIds?.length) {
-        return { ok: false, actual: 'fileVisual action=read requires screenshotIds returned by action=index.' };
-      }
-      const reviews = Array.isArray(normalizedParams.reviews)
-        ? normalizedParams.reviews.flatMap((item) => {
-            const review = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : undefined;
-            const screenshotId = typeof review?.screenshotId === 'string' ? review.screenshotId.trim() : '';
-            const status: 'failed' | 'passed' | undefined = review?.status === 'passed' || review?.status === 'failed' ? review.status : undefined;
-            if (!screenshotId || !status) return [];
-            const observation = typeof review?.observation === 'string' ? review.observation.trim() : '';
-            const checks = review?.checks && typeof review.checks === 'object' && !Array.isArray(review.checks)
-              ? review.checks as NonNullable<BrowserChatFileVisualInput['reviews']>[number]['checks']
-              : undefined;
-            if (!observation || !checks) return [];
-            const issues = Array.isArray(review?.issues) ? review.issues.flatMap((issue) => {
-              const value = issue && typeof issue === 'object' && !Array.isArray(issue) ? issue as Record<string, unknown> : undefined;
-              const issueType = typeof value?.type === 'string' ? value.type.trim() : '';
-              const description = typeof value?.description === 'string' ? value.description.trim() : '';
-              if (!issueType || !description) return [];
-              const severity: 'error' | 'warning' | undefined = value?.severity === 'error' || value?.severity === 'warning'
-                ? value.severity
-                : undefined;
-              return [{
-                type: issueType,
-                description,
-                ...(typeof value?.region === 'string' ? { region: value.region } : {}),
-                ...(severity ? { severity } : {}),
-              }];
-            }) : [];
-            return [{ screenshotId, status, observation, checks, issues }];
-          }).slice(0, 100)
-        : undefined;
-      if (action === 'report' && !reviews?.length) {
-        return { ok: false, actual: 'fileVisual action=report requires reviews for pages already read.' };
-      }
-      const version = await verifyCurrentUnoRenderedArtifact({ runId, artifactId });
-      if (!version.ok) return version;
-      const rawDeckReview = normalizedParams.deckReview && typeof normalizedParams.deckReview === 'object' && !Array.isArray(normalizedParams.deckReview)
-        ? normalizedParams.deckReview as Record<string, unknown>
-        : undefined;
-      const deckReview = rawDeckReview && (rawDeckReview.status === 'passed' || rawDeckReview.status === 'failed')
-        && typeof rawDeckReview.observation === 'string'
-        && rawDeckReview.checks && typeof rawDeckReview.checks === 'object' && !Array.isArray(rawDeckReview.checks)
-        ? {
-            status: rawDeckReview.status as 'failed' | 'passed',
-            observation: rawDeckReview.observation.trim(),
-            checks: rawDeckReview.checks as NonNullable<BrowserChatFileVisualInput['deckReview']>['checks'],
-            issues: Array.isArray(rawDeckReview.issues) ? rawDeckReview.issues.flatMap((issue) => {
-              const value = issue && typeof issue === 'object' && !Array.isArray(issue) ? issue as Record<string, unknown> : undefined;
-              const issueType = typeof value?.type === 'string' ? value.type.trim() : '';
-              const description = typeof value?.description === 'string' ? value.description.trim() : '';
-              if (!issueType || !description) return [];
-              const severity: 'error' | 'warning' | undefined = value?.severity === 'error' || value?.severity === 'warning' ? value.severity : undefined;
-              return [{ type: issueType, description, ...(typeof value?.region === 'string' ? { region: value.region } : {}), ...(severity ? { severity } : {}) }];
-            }) : [],
-          }
-        : undefined;
-      const visualResult = await readFileVisuals({
-        action,
-        artifactId,
-        screenshotIds,
-        reviews,
-        deckReview,
-        offset: typeof normalizedParams.offset === 'number' ? normalizedParams.offset : undefined,
-        limit: typeof normalizedParams.limit === 'number' ? normalizedParams.limit : undefined,
-      });
-      return recordOfficeVisualQaProgress({ runId, artifactId, action, result: visualResult });
     }
     if (type === 'skill' && normalizedParams.action === 'read') {
       const skillId = typeof normalizedParams.skillId === 'string' ? normalizedParams.skillId.trim() : '';
@@ -4947,6 +4523,7 @@ async function executeCodexRuntimeObject(input: {
         : result;
       const prerequisiteResults = await bundledBrowserToolPrerequisiteResults({
         toolName: type,
+        toolInput: normalizedParams,
         preflightPending: !Boolean(browserStatePreflightComplete),
         session,
         runId,
@@ -4982,10 +4559,10 @@ async function executeCodexRuntimeObject(input: {
   const imagePaths = result.referenceImagePaths?.length
     ? result.referenceImagePaths
     : result.referenceImagePath ? [result.referenceImagePath] : [];
-  const imageSource = type === 'file' || type === 'fileVisual'
+  const imageSource = type === 'file'
     ? `${type}:${String(normalizedParams.action || 'unknown')}`
     : type;
-  const screenshotIds = type === 'fileVisual' && Array.isArray(normalizedParams.screenshotIds)
+  const screenshotIds = type === 'file' && normalizedParams.action === 'visualRead' && Array.isArray(normalizedParams.screenshotIds)
     ? normalizedParams.screenshotIds
     : undefined;
   for (const [index, imagePath] of [...new Set(imagePaths)].entries()) {

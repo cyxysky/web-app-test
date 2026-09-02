@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { validateOfficeRendererMatrix } from './office-render-validation';
+import { validateOfficeRendererMatrix } from '@webpilot/capability-file/node';
 
 describe('Office renderer validation policy', () => {
   it('uses LibreOffice only and never exposes a Microsoft renderer slot', async () => {

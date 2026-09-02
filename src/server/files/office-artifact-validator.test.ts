@@ -5,7 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import JSZip from 'jszip';
 import sharp from 'sharp';
-import { inspectRenderedPage, validateOfficeArtifact } from './office-artifact-validator';
+import { inspectRenderedPage, validateOfficeArtifact } from '@webpilot/capability-file/node';
 
 test('validates the final OOXML package independently from its authoring engine', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'webpilot-office-validator-'));

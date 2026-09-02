@@ -62,20 +62,24 @@ function operationFromTool(
 ): AutomationOperationRecord {
   const status = recordedStatus(tool);
   const recordedResult = resultText(tool);
+  const browserAction = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input)
+    ? (tool.input as Record<string, unknown>).action
+    : undefined;
+  const waitsForHuman = tool.name === 'browser' && browserAction === 'waitForHumanVerification';
   return {
     index: operationIndex,
     name: tool.name,
     input: tool.input,
     reason: tool.reason,
     delayBeforeMs: 0,
-    waitForManual: tool.name === 'waitForHumanVerification',
+    waitForManual: waitsForHuman,
     sourceStepIndex: step.index,
     sourceStepAction: step.action,
     sourceStepExpected: step.expected,
     sourceToolIndex,
     recordedStatus: status,
     recordedResult: recordedResult || undefined,
-    replayable: status === 'passed' && tool.name !== 'waitForHumanVerification',
+    replayable: status === 'passed' && !waitsForHuman,
   };
 }
 

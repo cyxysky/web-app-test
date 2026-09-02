@@ -2,6 +2,14 @@
   "name": "webpilot-qa",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "packages/capability-sdk",
+    "packages/capability-adapter-ai-sdk",
+    "packages/capability-adapter-mcp",
+    "packages/capability-browser",
+    "packages/capability-chart",
+    "packages/capability-file"
+  ],
   "engines": {
     "node": ">=22.16"
   },
@@ -19,6 +27,9 @@
     "desktop:installer": "npm run desktop:prepare && electron-builder --win nsis",
     "desktop:portable": "npm run desktop:prepare && electron-builder --win portable",
     "start": "node server/webpilot-server.js",
+    "capabilities:build": "npm run build --workspace @webpilot/capability-sdk && npm run build --workspace @webpilot/capability-adapter-ai-sdk && npm run build --workspace @webpilot/capability-adapter-mcp && npm run build --workspace @webpilot/capability-browser && npm run build --workspace @webpilot/capability-chart && npm run build --workspace @webpilot/capability-file",
+    "capabilities:publish": "node scripts/publish-capabilities.mjs",
+    "capabilities:publish:dry-run": "node scripts/publish-capabilities.mjs --dry-run",
     "check:responsive": "node scripts/check-responsive-ui.mjs",
     "docker:build": "docker build -t webpilot-qa:latest .",
     "docker:up": "docker compose up -d --build",
@@ -26,6 +37,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@webpilot/capability-adapter-ai-sdk": "0.1.0",
+    "@webpilot/capability-adapter-mcp": "0.1.0",
+    "@webpilot/capability-browser": "0.1.0",
+    "@webpilot/capability-chart": "0.1.0",
+    "@webpilot/capability-file": "0.1.0",
+    "@webpilot/capability-sdk": "0.1.0",
     "@ai-sdk/alibaba": "^2.0.30",
     "@ai-sdk/amazon-bedrock": "^5.0.51",
     "@ai-sdk/anthropic": "^4.0.37",

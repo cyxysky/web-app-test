@@ -17,7 +17,6 @@ const browserChatFileToolNames = new Set([
   'file',
   'downloadFile',
   'generateFile',
-  'fillDocumentTemplate',
 ]);
 
 export function browserChatScreenshotIsInternalDocumentPreview(
@@ -26,7 +25,7 @@ export function browserChatScreenshotIsInternalDocumentPreview(
 ) {
   const path = String(screenshot.path || '').replace(/\\/g, '/');
   if (/(?:^|\/)attachment-previews(?:\/|$)/i.test(path)) return true;
-  const legacyInternalTitle = /^\s*(?:file|readFile|generateFile|fillDocumentTemplate)\s+explicit image\s+\d+\s*$/i.test(String(screenshot.title || ''));
+  const legacyInternalTitle = /^\s*(?:file|readFile|generateFile)\s+explicit image\s+\d+\s*$/i.test(String(screenshot.title || ''));
   return legacyInternalTitle && (!toolName || browserChatFileToolNames.has(toolName));
 }
 

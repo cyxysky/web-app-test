@@ -1,0 +1,33 @@
+{
+  "name": "@webpilot/capability-adapter-ai-sdk",
+  "version": "0.1.0",
+  "description": "AI SDK adapter for framework-neutral WebPilot capabilities.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@webpilot/capability-sdk": "0.1.0"
+  },
+  "peerDependencies": {
+    "ai": ">=7.0.0 <8"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

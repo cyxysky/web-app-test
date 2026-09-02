@@ -21,13 +21,13 @@ import {
   planFileArtifact,
   readUnoDraft,
   recordOfficeVisualQaProgress,
-  repairFileArtifactDownloadLinks,
   renderFileArtifact,
   sourceUnitsForDraft,
   syncDocumentAssets,
   verifyCurrentUnoRenderedArtifact,
-} from './file-artifact-tools';
-import { resolveLibreOfficeExecutable } from '@/server/files/libreoffice';
+} from '@webpilot/capability-file/node/workspace';
+import { resolveLibreOfficeExecutable } from '@webpilot/capability-file/node';
+import { repairFileArtifactDownloadLinks } from '@/server/capabilities/browser-chat-file-links';
 
 const passedPageVisualChecks = {
   overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed',
@@ -529,14 +529,17 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
     const overwrite = await generateUnoFileArtifact({
       documentId: 'uno-report', program: wordProgram, render: false, runId: 'chat_test',
     });
-    assert.equal(overwrite.ok, true, overwrite.actual);
+    assert.equal(overwrite.ok, false, overwrite.actual);
+    assert.equal(JSON.parse(overwrite.actual || '{}').code, 'DESTRUCTIVE_GENERATE_REQUIRES_CONFIRMATION');
 
     const draft = await readUnoDraft({ documentId: 'uno-report', runId: 'chat_test' });
     assert.equal(draft.ok, true, draft.actual);
-    const draftPayload = JSON.parse(draft.actual || '{}') as { sourceDigest: string };
+    const draftPayload = JSON.parse(draft.actual || '{}') as { patchBaseDigest: string; sourceDigest: string };
     const atomicallyReplaced = await generateUnoFileArtifact({
       documentId: 'uno-report',
       program: wordProgram.replace('Generated through the UNO worker', 'Generated through atomic replacement'),
+      replaceExisting: true,
+      baseDigest: draftPayload.patchBaseDigest,
       render: false,
       runId: 'chat_test',
     });
@@ -551,7 +554,7 @@ test('validates a complete UNO draft before render publishes the artifact', asyn
     assert.equal(rerendered.ok, true, rerendered.actual);
     const replacement = await editDraftText({
       documentId: 'uno-report',
-      oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+      oldText: "    document.add_paragraph('body', 'Generated through atomic replacement')",
       newText: "    document.add_paragraph('body', 'Generated through a replacement program')",
       render: false,
       runId: 'chat_test',
@@ -855,8 +858,8 @@ test('keeps one current source per documentId without revision history', async (
     assert.equal(generated.ok, true, generated.actual);
     const edited = await editDraftText({
       documentId: 'single-source-workflow',
-      oldText: 'Generated through the UNO worker',
-      newText: 'Current source edit',
+      oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+      newText: "    document.add_paragraph('body', 'Current source edit')",
       render: false,
       runId: 'chat_test',
     });
@@ -898,7 +901,7 @@ test('saves cumulative syntax repairs so multiple errors can be fixed across edi
       includeVisualVerification: false,
       runId: 'chat_test',
     });
-    assert.equal(failed.ok, false, failed.actual);
+    assert.equal(failed.ok, true, failed.actual);
     const failure = JSON.parse(failed.actual || '{}') as {
       kind?: string;
       changed?: boolean;
@@ -928,7 +931,7 @@ test('saves cumulative syntax repairs so multiple errors can be fixed across edi
       includeVisualVerification: false,
       runId: 'chat_test',
     });
-    assert.equal(firstRepair.ok, false, firstRepair.actual);
+    assert.equal(firstRepair.ok, true, firstRepair.actual);
     const afterFirstRepair = await readUnoDraft({ documentId: 'transactional-edit', runId: 'chat_test' });
     assert.match(afterFirstRepair.actual || '', /First syntax error repaired/);
     assert.match(afterFirstRepair.actual || '', /while \(/);
@@ -960,16 +963,15 @@ test('reads and edits one marked page unit without changing other source units',
   const previous = process.env.ARTIFACTS_DIR;
   process.env.ARTIFACTS_DIR = root;
   const unitProgram = `def create_document(job):
-    document = job.new_document('word')
-    cursor = document.Text.createTextCursor()
+    document = job.writer('document')
     # @webpilot-unit pages/page-001
-    document.Text.insertString(cursor, 'page one', False)
+    document.add_paragraph('page-one', 'page one')
     # @webpilot-endunit
     # @webpilot-unit pages/page-002
-    document.Text.insertString(cursor, 'page two', False)
+    document.add_paragraph('page-two', 'page two')
     # @webpilot-endunit
-    document.storeAsURL(job.output_url, (job.property('FilterName', 'Office Open XML Text'),))
-    job.close(document)
+    document.save()
+    document.close()
 `;
   try {
     await planFileArtifact({ documentId: 'unit-workflow', documentType: 'word', fileName: 'units.docx', runId: 'chat_test' });
@@ -986,13 +988,13 @@ test('reads and edits one marked page unit without changing other source units',
     assert.match(unitPayload.program || '', /page two/);
     assert.doesNotMatch(unitPayload.program || '', /page one/);
     assert.deepEqual(unitPayload.sourceLineRange, {
-      startLine: 8,
-      endLine: 8,
+      startLine: 7,
+      endLine: 7,
       coordinateSpace: 'global',
-      totalSourceLines: 11,
+      totalSourceLines: 10,
       unitLineCount: 1,
     });
-    assert.match(unitPayload.program || '', /^    document\.Text/);
+    assert.match(unitPayload.program || '', /^    document\.add_paragraph/);
 
     const edited = await editUnoFileArtifact({
       documentId: 'unit-workflow',
@@ -1002,8 +1004,8 @@ test('reads and edits one marked page unit without changing other source units',
         '*** Begin Patch',
         '*** Update File: draft.py',
         '@@',
-        "-    document.Text.insertString(cursor, 'page two', False)",
-        "+    document.Text.insertString(cursor, 'updated page two', False)",
+        "-    document.add_paragraph('page-two', 'page two')",
+        "+    document.add_paragraph('page-two', 'updated page two')",
         '*** End Patch',
       ].join('\n'),
       render: false,
@@ -1131,10 +1133,10 @@ test('applies a Codex patch only against the latest source digest', async () => 
     });
     assert.equal(generated.ok, true, generated.actual);
 
-    const retriedProgram = wordProgram.replace('Generated through the UNO worker', 'generate retry');
-    const retried = await generateUnoFileArtifact({
+    const retried = await editDraftText({
       documentId: 'editor-workflow',
-      program: retriedProgram,
+      oldText: "    document.add_paragraph('body', 'Generated through the UNO worker')",
+      newText: "    document.add_paragraph('body', 'generate retry')",
       render: false,
       runId: 'chat_test',
     });
@@ -1197,8 +1199,7 @@ test('applies a Codex patch only against the latest source digest', async () => 
       runId: 'chat_test',
     });
     assert.equal(unchanged.ok, false, unchanged.actual);
-    assert.equal(JSON.parse(unchanged.actual || '{}').changed, false);
-    assert.equal(JSON.parse(unchanged.actual || '{}').code, 'PATCH_NO_CHANGES');
+    assert.match(unchanged.actual || '', /only matching context and no unambiguous source change/);
 
     const replacementProgram = wordProgram.replace('Generated through the UNO worker', 'whole-file replacement');
     const replaced = await editUnoFileArtifact({
@@ -1208,7 +1209,7 @@ test('applies a Codex patch only against the latest source digest', async () => 
       runId: 'chat_test',
     });
     assert.equal(replaced.ok, false, replaced.actual);
-    assert.match(replaced.actual || '', /does not accept a complete source replacement/);
+    assert.match(replaced.actual || '', /requires a Codex-format patch rather than a complete program/);
     assert.match(await readFile(path.join(root, 'chat_test', 'document-drafts', 'editor-workflow.py'), 'utf8'), /targeted edit/);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
@@ -1274,7 +1275,7 @@ test('saves a rejected initial source so the model can read and edit it in place
       runId: 'chat_test',
     });
     assert.equal(result.ok, false);
-    assert.match(result.actual || '', /must define create_document\(job\)/);
+    assert.match(result.actual || '', /define exactly one synchronous create_document\(job\)/);
     const failure = JSON.parse(result.actual || '{}') as { requiredNextAction?: string; saved?: boolean };
     assert.equal(failure.saved, true);
     assert.equal(failure.requiredNextAction, 'edit');
@@ -1295,7 +1296,7 @@ test('saves a rejected initial source so the model can read and edit it in place
     assert.equal(pending[0]?.requiredNextAction, 'render');
     const retriedRender = await renderFileArtifact({ documentId: 'rejected-program', runId: 'chat_test' });
     assert.equal(retriedRender.ok, false);
-    assert.match(retriedRender.actual || '', /must define create_document\(job\)/);
+    assert.match(retriedRender.actual || '', /define exactly one synchronous create_document\(job\)/);
     assert.doesNotMatch(retriedRender.actual || '', /office-render-blocked/);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
@@ -1323,6 +1324,8 @@ test('does not require visual QA when the active model cannot inspect images', a
       renderedDigest: digest,
       renderedSourceDigest: digest,
       sourceDigest: digest,
+      validatedSourceDigest: digest,
+      validationStatus: 'passed',
       workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString() },
     }), 'utf8');
 
@@ -1330,7 +1333,7 @@ test('does not require visual QA when the active model cannot inspect images', a
       'chat_test',
       new Set(['structural-only-model']),
     );
-    assert.equal(visualModelPending[0]?.requiredNextAction, 'fileVisual');
+    assert.equal(visualModelPending[0]?.requiredNextAction, 'visualIndex');
 
     const textModelPending = await pendingOfficeDocumentWork(
       'chat_test',
@@ -1366,6 +1369,8 @@ test('does not complete visual QA when any fully read page has a failed review',
       renderedDigest: digest,
       renderedSourceDigest: digest,
       sourceDigest: digest,
+      validatedSourceDigest: digest,
+      validationStatus: 'passed',
       workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString(), renderedDigest: digest },
     }), 'utf8');
 

@@ -15,7 +15,7 @@ import {
   scheduleUploadArtifactMaintenance,
   userUploadUsage,
 } from '@/server/storage/upload-artifact-lifecycle';
-import { uploadStorageExtension } from '@/server/files/file-format-registry';
+import { uploadStorageExtension } from '@webpilot/capability-file';
 
 function uploadMaxBytes() {
   const configured = Number(process.env.WEBPILOT_UPLOAD_MAX_BYTES || 50 * 1024 * 1024);

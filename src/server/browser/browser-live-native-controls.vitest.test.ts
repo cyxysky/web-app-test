@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
-import { BrowserSession, type BrowserLiveNativeEvent } from './browser-session';
+import { BrowserSession, type BrowserLiveNativeEvent } from '@webpilot/capability-browser/node';
 
 async function waitFor(check: () => boolean | Promise<boolean>, timeoutMs = 8_000) {
   const deadline = Date.now() + timeoutMs;

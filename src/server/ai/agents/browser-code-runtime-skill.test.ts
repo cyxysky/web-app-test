@@ -4,15 +4,15 @@ import {
   browserCodeRuntimeSkillContent,
   browserCodeRuntimeSkillId,
   browserCodeRuntimeSkillSummary,
-} from './browser-code-runtime-skill';
+} from '@webpilot/capability-browser/runtime-skill';
 
-test('hidden browserCode runtime Skill documents the complete required operating sequence', () => {
+test('hidden browser code-action runtime Skill documents the complete required operating sequence', () => {
   assert.equal(browserCodeRuntimeSkillId, 'system-browser-code-runtime');
   assert.match(browserCodeRuntimeSkillSummary, /<system_skill>/);
   assert.match(browserCodeRuntimeSkillSummary, /<required>true<\/required>/);
   assert.match(browserCodeRuntimeSkillContent, /skill\(\{ action: "read"/);
   assert.match(browserCodeRuntimeSkillContent, /includes its complete result in `prerequisiteResults`/);
-  assert.match(browserCodeRuntimeSkillContent, /still executes the supplied browserCode in the same tool call/);
+  assert.match(browserCodeRuntimeSkillContent, /still executes the supplied code in the same tool call/);
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\("https:\/\/example\.com\/"\)/);
   assert.match(browserCodeRuntimeSkillContent, /browser\.tabs\.new\(\{ url: "https:\/\/example\.com\/" \}\)/);
   assert.match(browserCodeRuntimeSkillContent, /page\.activeSurface\(\)/);
@@ -25,8 +25,8 @@ test('hidden browserCode runtime Skill documents the complete required operating
   assert.match(browserCodeRuntimeSkillContent, /credentialVault\.fill/);
   assert.match(browserCodeRuntimeSkillContent, /## Runtime API reference/);
   assert.match(browserCodeRuntimeSkillContent, /## Host tool boundary/);
-  assert.match(browserCodeRuntimeSkillContent, /readBrowserState\(\{ reason \}\)/);
-  assert.match(browserCodeRuntimeSkillContent, /browserCode\(\{ reason, code, maxOutputChars\? \}\)/);
+  assert.match(browserCodeRuntimeSkillContent, /browser\(\{ action: "state", reason \}\)/);
+  assert.match(browserCodeRuntimeSkillContent, /browser\(\{ action: "code", reason, code, maxOutputChars\? \}\)/);
   assert.match(browserCodeRuntimeSkillContent, /failureCategory\?/);
   assert.match(browserCodeRuntimeSkillContent, /Promise<RuntimeTab>/);
   assert.match(browserCodeRuntimeSkillContent, /page\.expectNavigation\(action, options\?\)/);

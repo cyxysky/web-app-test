@@ -14,7 +14,7 @@ import {
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
   type BrowserCodeUidReference,
-} from './browser-code-runner';
+} from '@webpilot/capability-browser/node';
 
 let browserServer: BrowserServer;
 let browser: Browser;

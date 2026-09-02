@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   BrowserCodeKernel,
   type BrowserCodeUidReference,
-} from './browser-code-runner';
+} from '@webpilot/capability-browser/node';
 
 describe('browserCode UID locators and zero-match diagnostics', () => {
   let browserServer: BrowserServer;

@@ -20,16 +20,12 @@ copyInto(path.join(root, 'public'), path.join(serverOutput, 'public'));
 const serverRuntimeFiles = copyServerRuntime(root, serverOutput);
 copyGlinerRuntime(path.join(serverOutput, 'gliner-runtime'));
 copyInto(
-  path.join(root, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
-  path.join(serverOutput, 'src', 'server', 'files', 'libreoffice-program-worker.py'),
+  path.join(root, 'packages', 'capability-file', 'runtime'),
+  path.join(serverOutput, 'capability-runtime', 'file'),
 );
 copyInto(
-  path.join(root, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
-  path.join(serverOutput, 'src', 'server', 'files', 'office-js-program-worker.mjs'),
-);
-copyInto(
-  path.join(root, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
-  path.join(serverOutput, 'src', 'server', 'browser', 'session-tab-grouper-extension'),
+  path.join(root, 'packages', 'capability-browser', 'runtime'),
+  path.join(serverOutput, 'capability-runtime', 'browser'),
 );
 
 if (

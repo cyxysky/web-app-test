@@ -3,11 +3,14 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { resolveLibreOfficeExecutable, resolveLibreOfficePythonExecutable } from '@/server/files/libreoffice';
-import { resolveUnoProgramWorker } from '@/server/files/uno-program';
-import { generateFileBuffer } from './document-artifact-generators';
-import { renderBrowserChatAttachmentVisuals } from './browser-chat-attachment-visuals';
-import { readBrowserChatFileVisuals } from './browser-chat-attachment-reader';
+import {
+  generateFileBuffer,
+  readFileVisuals as readBrowserChatFileVisuals,
+  renderFilePreview as renderBrowserChatAttachmentVisuals,
+  resolveLibreOfficeExecutable,
+  resolveLibreOfficePythonExecutable,
+  resolveUnoProgramWorker,
+} from '@webpilot/capability-file/node';
 
 const passedPageVisualChecks = {
   overlap: 'passed', clipping: 'passed', alignment: 'passed', spacing: 'passed',
@@ -25,15 +28,14 @@ test('renders selected PDF pages into model-ready PNG files', async (context) =>
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-attachment-visual-'));
   const sourcePath = path.join(root, 'source.pdf');
   const generated = await generateFileBuffer({
-    document: { title: 'Attachment visual pages' }, documentType: 'word', fileName: 'source.pdf',
+    document: { title: 'Attachment visual pages' }, documentType: 'word', fileName: 'source.pdf', generator: 'uno',
     program: `
 def create_document(job):
-    document = job.new_document('word')
-    cursor = document.Text.createTextCursor()
+    document = job.writer('document')
     for index in range(140):
-        document.Text.insertString(cursor, f'Paragraph {index + 1}: enough content to verify exact PDF page selection.\\n', False)
-    document.storeToURL(job.output_url, (job.property('FilterName', 'writer_pdf_Export'),))
-    job.close(document)
+        document.add_paragraph(f'paragraph-{index + 1}', f'Paragraph {index + 1}: enough content to verify exact PDF page selection.')
+    document.save()
+    document.close()
 `,
   });
   await writeFile(sourcePath, generated.buffer);
@@ -96,14 +98,14 @@ test('renders a LibreOffice-generated DOCX into visual pages without detaching t
   const root = await mkdtemp(path.join(os.tmpdir(), 'webpilot-docx-visual-'));
   const sourcePath = path.join(root, 'template.docx');
   const generated = await generateFileBuffer({
-    document: { title: '研发部员工年中工作总结报告' }, documentType: 'word', fileName: 'template.docx',
+    document: { title: '研发部员工年中工作总结报告' }, documentType: 'word', fileName: 'template.docx', generator: 'uno',
     program: `
 def create_document(job):
-    document = job.new_document('word')
-    cursor = document.Text.createTextCursor()
-    document.Text.insertString(cursor, '研发部员工年中工作总结报告\\n\\n本年度研发工作按计划推进。', False)
-    document.storeAsURL(job.output_url, (job.property('FilterName', 'Office Open XML Text'),))
-    job.close(document)
+    document = job.writer('document')
+    document.add_title('title', '研发部员工年中工作总结报告')
+    document.add_paragraph('summary', '本年度研发工作按计划推进。')
+    document.save()
+    document.close()
 `,
   });
   await writeFile(sourcePath, generated.buffer);

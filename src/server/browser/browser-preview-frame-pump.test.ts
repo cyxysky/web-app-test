@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BrowserPreviewFramePump } from './browser-preview-frame-pump';
+import { BrowserPreviewFramePump } from '@webpilot/capability-browser/node';
 
 function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));

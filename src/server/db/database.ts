@@ -18,6 +18,7 @@ type DatabaseRuntimeState = {
   dataSource?: DataSource;
   initialization?: Promise<DataSource>;
   identity?: string;
+  sqliteTransactionQueue?: Promise<void>;
 };
 
 const databaseFileName = 'webpilot.db';
@@ -135,6 +136,7 @@ export async function closeDatabase() {
   runtimeState.dataSource = undefined;
   runtimeState.initialization = undefined;
   runtimeState.identity = undefined;
+  runtimeState.sqliteTransactionQueue = undefined;
   if (dataSource?.isInitialized) await dataSource.destroy();
 }
 
@@ -198,7 +200,25 @@ export async function runDatabaseTransaction<T>(
   operation: (manager: EntityManager) => Promise<T>,
 ): Promise<T> {
   const database = await getDatabase();
-  return database.transaction(operation);
+  if (configuredDriver() !== 'sqlite') return database.transaction(operation);
+
+  // better-sqlite3 exposes one synchronous connection. TypeORM otherwise lets
+  // concurrent requests issue BEGIN on that same connection, which produces
+  // "cannot start a transaction within a transaction" and can also make the
+  // losing request roll back the winning request. Serialize SQLite
+  // transactions while preserving normal pooled concurrency for PostgreSQL.
+  const previous = runtimeState.sqliteTransactionQueue || Promise.resolve();
+  let releaseCurrent!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  runtimeState.sqliteTransactionQueue = previous.then(() => current, () => current);
+  await previous.catch(() => undefined);
+  try {
+    return await database.transaction(operation);
+  } finally {
+    releaseCurrent();
+  }
 }
 
 export function parseDatabaseJson<T>(value: unknown, fallback: T): T {

@@ -1,9 +1,8 @@
 import http from 'node:http';
 import type { Socket } from 'node:net';
 import { dispatchBrowserChatPreviewInput, startBrowserChatScreencast } from '@/server/ai/agents/browser-chat.service';
-import type { BrowserLiveInput, BrowserScreencastFrame, BrowserTabSnapshot } from '@/server/browser/browser-session';
-import { browserPreviewFramesPerSecond } from '@/server/browser/browser-preview-cadence';
-import type { BrowserPreviewFramePumpMetrics } from '@/server/browser/browser-preview-frame-pump';
+import type { BrowserLiveInput, BrowserScreencastFrame, BrowserTabSnapshot } from '@webpilot/capability-browser/node';
+import { browserPreviewFramesPerSecond, type BrowserPreviewFramePumpMetrics } from '@webpilot/capability-browser/node';
 import {
   acceptWebSocketUpgrade,
   consumeWebSocketFrames,

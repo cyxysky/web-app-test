@@ -17,8 +17,8 @@ import { readModelSettingsState } from '@/server/settings/settings-snapshot';
 import {
   resolveLibreOfficeExecutable,
   resolveLibreOfficePythonExecutable,
-} from '@/server/files/libreoffice';
-import { resolveUnoProgramWorker } from '@/server/files/uno-program';
+  resolveUnoProgramWorker,
+} from '@webpilot/capability-file/node';
 import { store } from '@/server/db/store';
 
 type OnboardingRow = {

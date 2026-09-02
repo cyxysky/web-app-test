@@ -10,9 +10,9 @@ function combinedRules(screenshotAvailable: boolean) {
   ].join('\n');
 }
 
-test('browserCode rules describe direct Playwright execution with bounded operations', () => {
+test('unified browser rules describe direct Playwright execution with bounded operations', () => {
   const rules = combinedRules(true);
-  assert.match(rules, /real browser inspection and operation tool/);
+  assert.match(rules, /single browser tool/);
   assert.match(rules, /page\.goto\(url\)/);
   assert.match(rules, /Never claim these capabilities are unavailable/);
   assert.match(rules, /ordinary JavaScript cell/);
@@ -22,7 +22,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /beginning of every new or resumed user request/i);
   assert.match(rules, /browser\.user\.openTabs/);
   assert.match(rules, /active-tab and tab-group metadata/);
-  assert.match(rules, /separate read-only/i);
+  assert.match(rules, /separate browser action=code read-only/i);
   assert.match(rules, /locator\.selectOption/);
   assert.match(rules, /page\.evaluate/);
   assert.match(rules, /page\.domSnapshot/);
@@ -48,7 +48,7 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.match(rules, /exactly one attachment (?:remains )?at the requested destination/i);
   assert.match(rules, /system-file-artifact-runtime/);
   assert.match(rules, /system-subagent-runtime/);
-  assert.match(rules, /first file or fileVisual call atomically loads/i);
+  assert.match(rules, /first file call atomically loads/i);
   assert.match(rules, /loadedRuntimeSkill/);
   assert.doesNotMatch(rules, /expectedRevision/);
   assert.doesNotMatch(rules, /lastSuccessfulRevision/);
@@ -113,30 +113,30 @@ test('browserCode rules describe direct Playwright execution with bounded operat
   assert.doesNotMatch(rules, /postActionObservation|dialogs\/notices\/focus/);
   assert.doesNotMatch(rules, /FRESH_OBSERVATION_REQUIRED|shared \[page-state\] observation|mandatory pre-action freshness gate/);
 });
-test('screenshot guidance stays inside browserCode', () => {
+test('screenshot guidance stays inside browser action=code', () => {
   assert.match(combinedRules(true), /nodeRepl\.emitImage/);
   assert.match(combinedRules(true), /page\.screenshot/);
   assert.doesNotMatch(combinedRules(false), /takeScreenshot/);
-  assert.match(combinedRules(false), /browserCode for inspection and browser operations/);
+  assert.match(combinedRules(false), /browser action=code for inspection and browser operations/);
   assert.match(combinedRules(false), /current exact Locator\.boundingBox\(\) rect/);
   assert.match(browserChatCodeRules(false).join('\n'), /rect-derived coordinate targeting is supported/i);
   assert.doesNotMatch(browserChatCodeRules(false).join('\n'), /coordinate targeting (?:is|are) unavailable/i);
 });
-test('browser chat keeps browserCode capabilities in a compact non-duplicated rule set', () => {
+test('browser chat keeps code-action capabilities in a compact non-duplicated rule set', () => {
   const rules = browserChatCodeRules(true).join('\n');
-  assert.equal(browserChatCodeRules(true).length, 14);
+  assert.equal(browserChatCodeRules(true).length, 15);
   assert.match(rules, /system-browser-code-runtime/);
   assert.match(rules, /system-file-artifact-runtime/);
   assert.match(rules, /system-subagent-runtime/);
-  assert.match(rules, /first browserCode call.*atomically loads/i);
+  assert.match(rules, /first browser action=code call.*atomically loads/i);
   assert.match(rules, /real Playwright page\/context/);
   assert.match(rules, /persistent top-level-await JavaScript kernel/);
   assert.match(rules, /incremental domChanges/);
   assert.match(rules, /never an automatic axTree/);
   assert.match(rules, /bundled prerequisiteResults entry supplies browser\.user\.openTabs/i);
   assert.match(rules, /browser\.user\.openTabs/);
-  assert.match(rules, /requested browserCode still executes and returns its own result in the same response/i);
-  assert.match(rules, /targeted read-only browserCode cell only when/i);
+  assert.match(rules, /requested browser action still executes and returns its own result in the same response/i);
+  assert.match(rules, /targeted read-only action=code cell only when/i);
   assert.match(rules, /added\/updated\/removed/);
   assert.match(rules, /not a full snapshot/);
   assert.match(rules, /never translate or invent a selector/i);
@@ -175,7 +175,7 @@ test('browser chat keeps browserCode capabilities in a compact non-duplicated ru
   assert.match(rules, /five-minute validity/i);
   assert.match(rules, /context\.pages/);
   assert.match(rules, /credentialVault\.fill/);
-  assert.match(rules, /first file or fileVisual call atomically loads/i);
+  assert.match(rules, /first file call atomically loads/i);
   assert.match(rules, /loadedRuntimeSkill/);
   assert.doesNotMatch(rules, /lastSuccessfulRevision/);
   assert.match(rules, /deterministic batch in one bounded cell/i);

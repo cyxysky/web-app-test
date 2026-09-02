@@ -5,6 +5,8 @@
 /.next-dev-runtime
 /out
 /dist
+/packages/*/dist/
+/.capability-runtime/
 /.tmp
 /output
 /validation

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { Page } from 'playwright';
-import { BrowserSession, type BrowserTabSnapshot } from './browser-session';
+import { BrowserSession, type BrowserTabSnapshot } from '@webpilot/capability-browser/node';
 
 const environmentKeys = [
   'AI_WEB_TEST_BROWSER_PROFILE_DIR',

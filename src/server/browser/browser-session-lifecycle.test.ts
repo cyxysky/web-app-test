@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Page } from 'playwright';
-import { BrowserSession } from './browser-session';
+import { BrowserSession } from '@webpilot/capability-browser/node';
 
 type MutableBrowserSession = {
   browserOwnership: 'shared';

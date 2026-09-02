@@ -1,8 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
-import { planFileArtifact, generateUnoFileArtifact, renderFileArtifact } from '../../src/server/ai/agents/file-artifact-tools';
-import { renderBrowserChatAttachmentVisuals } from '../../src/server/ai/agents/browser-chat-attachment-visuals';
+import { planFileArtifact, generateUnoFileArtifact, renderFileArtifact } from '@webpilot/capability-file/node/workspace';
+import { renderFilePreview as renderBrowserChatAttachmentVisuals } from '@webpilot/capability-file/node';
 
 type ActionResult = { ok: boolean; actual?: string; referenceImagePaths?: string[] };
 

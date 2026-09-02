@@ -224,7 +224,7 @@ import {
 } from '@/components/browser-chat-log-model';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
-import { browserSessionGroupLabel } from '@/lib/browser-session-group';
+import { browserSessionGroupLabel } from '@webpilot/capability-browser';
 import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import {
   browserChatSessionDisplayTitle,
@@ -1290,6 +1290,12 @@ function summarizeToolFields(fields: unknown, t: (value: string, params?: Record
 function browserChatToolLabel(name: string, input: unknown, t: (value: string) => string) {
   const filePresentation = browserChatFileToolPresentation(name, input);
   if (filePresentation) return t(filePresentation.label);
+  if (name === 'browser') {
+    const action = toolInputValue(asRecord(input), ['action']);
+    if (action === 'state') return t('读取浏览器状态');
+    if (action === 'waitForHumanVerification') return t('等待人工验证');
+    return t('执行浏览器代码');
+  }
   const labels: Record<string, string> = {
     browserCode: '执行浏览器代码',
     contextCompression: '压缩上下文',
@@ -1300,7 +1306,6 @@ function browserChatToolLabel(name: string, input: unknown, t: (value: string) =
     skill: '读取 Skill',
     subagent: '子 Agent',
     downloadFile: '下载文件',
-    fillDocumentTemplate: '填充文档模板',
     generateFile: '生成文件',
     readFile: '读取文件',
     readSubagent: '读取子 Agent',
@@ -1329,6 +1334,11 @@ function browserChatToolMeta(name: string, input: unknown, t: (value: string, pa
   if (!record) return toolStringValue(input);
 
   const lower = name.toLowerCase();
+  if (name === 'browser') {
+    return record.action === 'waitForHumanVerification'
+      ? toolInputValue(record, ['reason', 'maxMs'])
+      : toolInputValue(record, ['reason']) || String(record.action || 'Playwright');
+  }
   if (name === 'browserCode') return toolInputValue(record, ['reason']) || 'Playwright';
   if (name === 'contextCompression') {
     const before = typeof record.estimatedTokensBefore === 'number' ? Math.round(record.estimatedTokensBefore) : undefined;
@@ -1383,6 +1393,7 @@ function isSubagentSpawnTool(name: string, input: unknown) {
 
 function BrowserChatToolIcon({ input, name }: { input?: unknown; name: string }) {
   const lower = name.toLowerCase();
+  if (name === 'browser') return asRecord(input)?.action === 'code' ? <Braces size={13} /> : <Globe size={13} />;
   if (name === 'browserCode') return <Braces size={13} />;
   if (name === 'contextCompression') return <Brain size={13} />;
   const filePresentation = browserChatFileToolPresentation(name, input);
@@ -5098,8 +5109,8 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   ), [aiCycleToolDetails, renderAiOutputCycles]);
   const shouldShowStepTimeline = currentTimelineEntries.length > 0 || waitingForTool;
   const manualVerificationPaused = Boolean(manualVerificationRequired) || (message.status === 'blocked' && (
-    steps.some((step) => (step.tools || []).some((tool) => tool.name === 'waitForHumanVerification'))
-    || pairedAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'waitForHumanVerification'))
+    steps.some((step) => (step.tools || []).some((tool) => tool.name === 'browser' && asRecord(tool.input)?.action === 'waitForHumanVerification'))
+    || pairedAiOutputCycles.some((cycle) => cycle.output.tools.some((tool) => tool.name === 'browser' && asRecord(tool.input)?.action === 'waitForHumanVerification'))
   ));
   const hasFinalText = Boolean(finalText.trim());
   const hasStructuredResponse = Boolean(message.parts?.some((part) => (

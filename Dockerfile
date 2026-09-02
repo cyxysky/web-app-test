@@ -1,11 +1,25 @@
+ARG WEBPILOT_CAPABILITY_SOURCE=workspace
+
 FROM mcr.microsoft.com/playwright:v1.60.0-noble AS build
 
 WORKDIR /app
 
+ARG WEBPILOT_CAPABILITY_SOURCE
+ENV WEBPILOT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
+
 COPY package*.json ./
-RUN npm ci
+COPY scripts/prepare-capability-install.mjs ./scripts/prepare-capability-install.mjs
+COPY packages/capability-sdk/package.json ./packages/capability-sdk/package.json
+COPY packages/capability-adapter-ai-sdk/package.json ./packages/capability-adapter-ai-sdk/package.json
+COPY packages/capability-adapter-mcp/package.json ./packages/capability-adapter-mcp/package.json
+COPY packages/capability-browser/package.json ./packages/capability-browser/package.json
+COPY packages/capability-chart/package.json ./packages/capability-chart/package.json
+COPY packages/capability-file/package.json ./packages/capability-file/package.json
+RUN if [ "$WEBPILOT_CAPABILITY_SOURCE" = "npm" ]; then node scripts/prepare-capability-install.mjs npm && npm install && cp package.json /tmp/webpilot-package.json && cp package-lock.json /tmp/webpilot-package-lock.json; else npm ci; fi
 
 COPY . .
+RUN if [ "$WEBPILOT_CAPABILITY_SOURCE" = "npm" ]; then cp /tmp/webpilot-package.json package.json && cp /tmp/webpilot-package-lock.json package-lock.json; else node scripts/prepare-capability-install.mjs workspace; fi
+RUN node scripts/stage-capability-runtime.mjs "$WEBPILOT_CAPABILITY_SOURCE"
 ARG WEBPILOT_BASE_PATH
 # The image includes .env. An explicitly supplied build argument can override
 # its base path, while an omitted argument leaves Next.js to load .env.
@@ -15,6 +29,9 @@ RUN npm prune --omit=dev
 FROM mcr.microsoft.com/playwright:v1.60.0-noble AS runner
 
 WORKDIR /app
+
+ARG WEBPILOT_CAPABILITY_SOURCE
+ENV WEBPILOT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
 
 ARG GLINER_MODEL=fastino/gliner2.5-multi-v1
 ARG GLINER_CHINESE_NER_MODEL=uer/roberta-base-finetuned-cluener2020-chinese
@@ -46,7 +63,9 @@ ENV HOSTNAME=0.0.0.0
 ENV HEADLESS_BROWSER=true
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV LIBREOFFICE_PATH=/usr/bin/libreoffice
-ENV LIBREOFFICE_UNO_PROGRAM_WORKER_PATH=/app/src/server/files/libreoffice-program-worker.py
+ENV CAPABILITY_FILE_RUNTIME_DIR=/app/capability-runtime/file
+ENV CAPABILITY_BROWSER_RUNTIME_DIR=/app/capability-runtime/browser
+ENV LIBREOFFICE_UNO_PROGRAM_WORKER_PATH=/app/capability-runtime/file/python/libreoffice-program-worker.py
 ENV APP_DATA_DIR=/app
 ENV ARTIFACTS_DIR=/app/artifacts
 ENV AI_SENSITIVE_DATA_FILTER_ENABLED=true
@@ -67,7 +86,8 @@ COPY --from=build /app/.next ./.next
 COPY --from=build /app/.env ./.env
 COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=build /app/server ./server
-COPY src/server/files/libreoffice-program-worker.py ./src/server/files/libreoffice-program-worker.py
+COPY --from=build /app/.capability-runtime/file ./capability-runtime/file
+COPY --from=build /app/.capability-runtime/browser ./capability-runtime/browser
 
 RUN find ./server -type f -name '*.test.js' -delete \
     && mkdir -p .data artifacts

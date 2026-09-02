@@ -3,8 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import JSZip from 'jszip';
 import { describe, expect, it } from 'vitest';
-import { resolveLibreOfficeExecutable } from './libreoffice';
-import { generateUnoProgramDocument, inspectUnoApi } from './uno-program';
+import { generateUnoProgramDocument, inspectUnoApi, resolveLibreOfficeExecutable } from '@webpilot/capability-file/node';
 
 type Capability = { id: string; support: string };
 

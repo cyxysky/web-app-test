@@ -26,13 +26,26 @@ import {
   type PreviewTheme,
 } from '@open-file-viewer/core';
 
+const pdfWorkerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url,
+).toString();
+
 const previewPlugins = [
   imagePlugin(),
   videoPlugin(),
   audioPlugin(),
   textPlugin(),
-  pdfPlugin(),
-  officePlugin(),
+  pdfPlugin({
+    workerSrc: pdfWorkerSrc,
+    useSystemFonts: true,
+  }),
+  officePlugin({
+    pdf: {
+      workerSrc: pdfWorkerSrc,
+      useSystemFonts: true,
+    },
+  }),
   ofdPlugin(),
   epubPlugin(),
   xpsPlugin(),

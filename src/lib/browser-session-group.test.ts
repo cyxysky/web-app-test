@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
-import { browserSessionGroupLabel } from './browser-session-group';
+import { browserSessionGroupLabel } from '@webpilot/capability-browser';
 
 test('uses one stable short label for a browser conversation group', () => {
   assert.equal(browserSessionGroupLabel('chat_5ebaac21fdeb'), 'ai-21fdeb');
@@ -14,7 +14,7 @@ test('uses one stable short label for a browser conversation group', () => {
 test('the Chrome tab-group extension uses the same canonical label', () => {
   const source = readFileSync(path.join(
     process.cwd(),
-    'src/server/browser/session-tab-grouper-extension/group-title.js',
+    'packages/capability-browser/runtime/session-tab-grouper-extension/group-title.js',
   ), 'utf8');
   const sandbox: { result?: string } = {};
   runInNewContext(`${source}\nglobalThis.result = aiWebTestSessionGroupTitle('chat_5ebaac21fdeb');`, sandbox);

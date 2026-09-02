@@ -5,7 +5,7 @@ import {
   encodeDomObservationCursor,
   parseDomObservationCursor,
   readDomObservationPage,
-} from './browser-dom-observation-pagination';
+} from '@webpilot/capability-browser/node';
 
 test('DOM observation pagination preserves cursor mode and entry boundaries', () => {
   const lines = ['alpha', 'bravo', 'charlie'];

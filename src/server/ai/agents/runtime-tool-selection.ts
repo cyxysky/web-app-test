@@ -1,13 +1,14 @@
+import { browserCapabilityToolNames } from '@webpilot/capability-browser';
+
+export const browserStatePrerequisiteToolName = 'browser.state';
+
 export const runtimeToolLoopStopToolNames = [
   'finalResponse',
-  'waitForHumanVerification',
   'subagent',
 ] as const;
 
 export const runtimeBrowserSessionToolNames: ReadonlySet<string> = new Set([
-  'readBrowserState',
-  'browserCode',
-  'waitForHumanVerification',
+  browserCapabilityToolNames.browser,
 ]);
 
 export function runtimeToolRequiresBrowserSession(toolName: string) {
@@ -27,25 +28,33 @@ export function runtimeAllowedToolTypes({
 }) {
   const nativeAllowedToolTypes = nativeToolNames;
   void observationToolNames;
-  const baseAllowedToolTypes = nativeAllowedToolTypes;
+  return browserChatMode && codexMode ? [...nativeAllowedToolTypes, 'answer'] : nativeAllowedToolTypes;
+}
 
-  return browserChatMode && codexMode ? [...baseAllowedToolTypes, 'answer'] : baseAllowedToolTypes;
+function actionFromInput(input: unknown) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const action = (input as Record<string, unknown>).action;
+  return typeof action === 'string' ? action : undefined;
 }
 
 export function requiresBrowserStatePreflight(
   alreadyCompleted: boolean,
-  traces: Array<{ name?: string; result?: unknown }>,
+  traces: Array<{ name?: string; input?: unknown; result?: unknown }>,
 ) {
   return !alreadyCompleted
     && !traces.some((trace) => {
-      if (trace.name === 'readBrowserState' && trace.result !== undefined) return true;
+      if (
+        trace.name === browserCapabilityToolNames.browser
+        && actionFromInput(trace.input) === 'state'
+        && trace.result !== undefined
+      ) return true;
       if (!trace.result || typeof trace.result !== 'object' || !('prerequisiteResults' in trace.result)) return false;
       const prerequisiteResults = trace.result.prerequisiteResults;
       return Array.isArray(prerequisiteResults) && prerequisiteResults.some((entry) => (
         entry
         && typeof entry === 'object'
         && 'toolName' in entry
-        && entry.toolName === 'readBrowserState'
+        && entry.toolName === browserStatePrerequisiteToolName
         && 'result' in entry
         && entry.result !== undefined
       ));
@@ -54,12 +63,19 @@ export function requiresBrowserStatePreflight(
 
 export function browserToolPrerequisiteNames(
   toolName: string,
+  toolInput: unknown,
   preflightPending: boolean,
   browserToolNames: ReadonlySet<string>,
 ) {
   return preflightPending
-    && toolName !== 'readBrowserState'
+    && toolName === browserCapabilityToolNames.browser
+    && actionFromInput(toolInput) !== 'state'
     && browserToolNames.has(toolName)
-    ? ['readBrowserState'] as const
+    ? [browserStatePrerequisiteToolName] as const
     : [] as const;
+}
+
+export function isBrowserHumanVerificationCall(toolName: string, toolInput: unknown) {
+  return toolName === browserCapabilityToolNames.browser
+    && actionFromInput(toolInput) === 'waitForHumanVerification';
 }
