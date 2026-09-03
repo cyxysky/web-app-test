@@ -2,11 +2,15 @@ import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type {
   ChartArtifactStore,
-  ChartOptionValidationInput,
-  ChartRecord,
-  CreateChartRecordInput,
 } from './index.js';
 import { createChartCapability } from './index.js';
+import {
+  echartsMapDefinition,
+  parseChartRecord,
+  type ChartOptionValidationInput,
+  type ChartRecord,
+  type CreateChartRecordInput,
+} from './core.js';
 import type { CapabilityRunContext } from '@webpilot/capability-sdk';
 
 const chartIdPattern = /^chart_(\d{6})$/;
@@ -16,7 +20,7 @@ export async function validateEChartsOption(input: ChartOptionValidationInput) {
   for (const map of input.maps || []) {
     echarts.registerMap(
       map.name,
-      map.geoJson as Parameters<typeof echarts.registerMap>[1],
+      echartsMapDefinition(map) as unknown as Parameters<typeof echarts.registerMap>[1],
       map.specialAreas as Parameters<typeof echarts.registerMap>[2],
     );
   }
@@ -78,12 +82,14 @@ export function createFileSystemChartStore(input: {
     async read(chartId: string) {
       if (!chartIdPattern.test(chartId)) return undefined;
       try {
-        const parsed = JSON.parse(
-          await readFile(path.join(directory, `${chartId}.json`), 'utf8'),
-        ) as ChartRecord;
-        return parsed?.version === 2 && parsed.chartId === chartId ? parsed : undefined;
-      } catch {
-        return undefined;
+        const parsed = JSON.parse(await readFile(path.join(directory, `${chartId}.json`), 'utf8')) as unknown;
+        return parseChartRecord(parsed, chartId);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw new Error(
+          `Unable to read chart artifact ${chartId}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
       }
     },
     async health() {

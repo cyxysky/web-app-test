@@ -56,6 +56,9 @@ export function classifyRuntimeToolFailure(
   if (/forbids|policy violation|direct file paths|scripted DOM|dispatchEvent\("click"\)|DOM element\.click/i.test(actual)) {
     return 'policy';
   }
+  if (/disabled by host configuration|not enabled by host configuration/i.test(actual)) {
+    return 'policy';
+  }
   if (/circular|serialize|serialization|JSON-safe|cannot stringify|output.*truncat|heap limit|rss limit|object graph/i.test(actual)) {
     return 'serialization';
   }
@@ -76,7 +79,7 @@ export function classifyRuntimeToolFailure(
   return 'unknown';
 }
 
-function appendFailureCategory(actual: string, category: RuntimeToolFailureCategory) {
+function appendFailureCategory(actual: string, category: string) {
   const parsed = parseActualObject(actual);
   if (parsed) {
     if (typeof parsed.failureCategory !== 'string' || !parsed.failureCategory.trim()) {
@@ -90,7 +93,7 @@ function appendFailureCategory(actual: string, category: RuntimeToolFailureCateg
 
 export function withToolFailureGuidance(name: string, result: BrowserActionResult): BrowserActionResult {
   if (result.ok) return result;
-  const failureCategory = classifyRuntimeToolFailure(name, result);
+  const failureCategory = result.failureCategory?.trim() || classifyRuntimeToolFailure(name, result);
   return {
     ...result,
     actual: appendFailureCategory(result.actual, failureCategory),

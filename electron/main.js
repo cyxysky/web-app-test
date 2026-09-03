@@ -2471,6 +2471,9 @@ async function startServer(appDataDir) {
     CAPABILITY_BROWSER_RUNTIME_DIR: app.isPackaged
       ? path.join(serverDir, 'capability-runtime', 'browser')
       : process.env.CAPABILITY_BROWSER_RUNTIME_DIR,
+    CAPABILITY_COMPUTER_RUNTIME_DIR: app.isPackaged
+      ? path.join(serverDir, 'capability-runtime', 'computer')
+      : process.env.CAPABILITY_COMPUTER_RUNTIME_DIR,
     NODE_PATH: app.isPackaged ? path.join(serverDir, 'node_modules') : process.env.NODE_PATH,
     NODE_ENV: 'production',
     PORT: String(port),

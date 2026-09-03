@@ -44,14 +44,6 @@ async function resolveContextValue<T>(value: ContextValue<T>, context: Capabilit
     : value;
 }
 
-function parsedOperationData(actual: string): unknown {
-  try {
-    return JSON.parse(actual) as unknown;
-  } catch {
-    return actual;
-  }
-}
-
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -60,21 +52,28 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 export function fileOperationToCapabilityResult(
   result: FileArtifactOperationResult,
+  fallbackErrorCode: string,
 ): CapabilityResult {
-  const parsed = parsedOperationData(result.actual);
+  const operationData = result.data !== undefined
+    ? result.data
+    : result.error?.details !== undefined
+      ? result.error.details
+      : result.actual;
   const imagePaths = result.referenceImagePaths?.filter(Boolean) || [];
-  const parsedRecord = record(parsed);
+  const operationRecord = record(operationData);
   const data = imagePaths.length
-    ? parsedRecord
-      ? { ...parsedRecord, referenceImagePaths: imagePaths }
-      : { actual: parsed, referenceImagePaths: imagePaths }
-    : parsed;
+    ? operationRecord
+      ? { ...operationRecord, referenceImagePaths: imagePaths }
+      : { actual: operationData, referenceImagePaths: imagePaths }
+    : operationData;
   if (!result.ok) {
     return {
       ok: false,
+      summary: result.summary,
       error: {
-        code: 'file-operation-failed',
-        message: result.actual,
+        code: result.error?.code || fallbackErrorCode,
+        message: result.error?.message || result.actual,
+        retryable: result.error?.retryable,
         details: data,
       },
     };
@@ -98,7 +97,7 @@ export function fileOperationToCapabilityResult(
   ];
   return {
     ok: true,
-    summary: result.actual,
+    summary: result.summary || result.actual,
     data,
     content: content.length ? content : undefined,
   };
@@ -125,7 +124,13 @@ export async function createNodeFileOperations(
       ? resolveContextValue(options.sourcePageUrl, runContext)
       : undefined,
   ]);
-  const workspace = createNodeFileWorkspace(workspaceHost);
+  const workspace = createNodeFileWorkspace({
+    ...workspaceHost,
+    configuration: {
+      ...runContext.configuration,
+      ...workspaceHost.configuration,
+    },
+  });
   const attachmentBindings = configuredBindings ? [...configuredBindings] : undefined;
   const runId = runContext.runId;
   const includeVisualVerification = options.includeVisualVerification === true;
@@ -133,6 +138,7 @@ export async function createNodeFileOperations(
   const file: FileCapabilityRuntimeOperations['file'] = {
     list: async () => fileOperationToCapabilityResult(
       await workspace.listOfficeDrafts({ runId }),
+      'file-list-failed',
     ),
     read: async (input, context) => {
       if (input.documentId) {
@@ -142,12 +148,12 @@ export async function createNodeFileOperations(
           path: input.path,
           startLine: input.startLine,
           endLine: input.endLine,
-        }));
+        }), 'file-read-failed');
       }
       if (!options.readFile) {
         return unavailable('Reading external attachments requires a host-provided readFile adapter.');
       }
-      return fileOperationToCapabilityResult(await options.readFile(input, context, runContext));
+      return fileOperationToCapabilityResult(await options.readFile(input, context, runContext), 'file-read-failed');
     },
     download: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.downloadFileArtifact({
@@ -159,6 +165,7 @@ export async function createNodeFileOperations(
         fileType: input.fileType,
         sourcePageUrl,
       }, { abortSignal: context.abortSignal }),
+      'file-download-failed',
     ),
     convert: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.convertFileArtifact({
@@ -167,6 +174,7 @@ export async function createNodeFileOperations(
         fileName: input.fileName,
         includeVisualVerification,
       }, { abortSignal: context.abortSignal }),
+      'file-convert-failed',
     ),
     plan: async (input: FileToolInput) => fileOperationToCapabilityResult(
       await workspace.planFileArtifact({
@@ -179,6 +187,7 @@ export async function createNodeFileOperations(
         sourceAttachmentId: input.sourceAttachmentId,
         attachmentBindings,
       }),
+      'file-plan-failed',
     ),
     unoApi: async (input: FileToolInput) => fileOperationToCapabilityResult(
       await workspace.getUnoApi({
@@ -189,6 +198,7 @@ export async function createNodeFileOperations(
         offset: input.offset,
         limit: input.limit,
       }),
+      'file-uno-api-failed',
     ),
     jsApi: async (input: FileToolInput) => fileOperationToCapabilityResult(
       await workspace.getOfficeJsApi({
@@ -196,6 +206,7 @@ export async function createNodeFileOperations(
         documentId: input.documentId,
         documentType: input.documentType,
       }),
+      'file-js-api-failed',
     ),
     generate: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.generateUnoFileArtifact({
@@ -210,6 +221,7 @@ export async function createNodeFileOperations(
         abortSignal: context.abortSignal,
         onProgress: progressReporter(context),
       }),
+      'file-generate-failed',
     ),
     edit: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.editUnoFileArtifact({
@@ -225,6 +237,7 @@ export async function createNodeFileOperations(
         abortSignal: context.abortSignal,
         onProgress: progressReporter(context),
       }),
+      'file-edit-failed',
     ),
     render: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.renderFileArtifact({
@@ -235,6 +248,7 @@ export async function createNodeFileOperations(
         abortSignal: context.abortSignal,
         onProgress: progressReporter(context),
       }),
+      'file-render-failed',
     ),
   };
 
@@ -249,14 +263,14 @@ export async function createNodeFileOperations(
       runId,
       artifactId: input.artifactId,
     });
-    if (!current.ok) return fileOperationToCapabilityResult(current);
+    if (!current.ok) return fileOperationToCapabilityResult(current, 'file-visual-version-failed');
     const visualResult = await options.readFileVisuals!(input, context, runContext);
     return fileOperationToCapabilityResult(await workspace.recordOfficeVisualQaProgress({
       runId,
       artifactId: input.artifactId,
       action: input.action,
       result: visualResult,
-    }));
+    }), 'file-visual-report-failed');
   }
 
   return {

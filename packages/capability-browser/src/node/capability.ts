@@ -1,4 +1,4 @@
-import type { CapabilityExecutionContext, CapabilityHealth } from '@webpilot/capability-sdk';
+import type { CapabilityConfiguration, CapabilityExecutionContext, CapabilityHealth } from '@webpilot/capability-sdk';
 import {
   browserOperationToCapabilityResult,
   createBrowserCapability,
@@ -26,11 +26,13 @@ export type NodeBrowserOperationsOptions = {
   validateCode?: (code: string) => string | undefined;
   ensureStarted?: () => Promise<void>;
   disposeSession?: boolean;
+  configuration?: CapabilityConfiguration;
 };
 
 export function createNodeBrowserOperations(
   options: NodeBrowserOperationsOptions,
 ): BrowserCapabilityOperations {
+  options.session.configure(options.configuration);
   const credentials = () => typeof options.credentials === 'function'
     ? options.credentials()
     : options.credentials;
@@ -63,10 +65,10 @@ export function createNodeBrowserOperations(
       maxOutputChars: 40_000,
     }, context),
     browserCode: (input: BrowserCodeInput, context) => execute(input, context),
-    async waitForHumanVerification(input: WaitForHumanVerificationInput) {
+    async waitForHumanVerification(input: WaitForHumanVerificationInput, context) {
       await options.ensureStarted?.();
       return browserOperationToCapabilityResult(
-        await options.session.waitForManualVerification(input.maxMs),
+        await options.session.waitForManualVerification(input.maxMs, context.abortSignal),
       );
     },
     health: async (): Promise<CapabilityHealth> => ({
@@ -82,6 +84,15 @@ export function createNodeBrowserCapability(options: {
     NodeBrowserOperationsOptions | Promise<NodeBrowserOperationsOptions>;
 }) {
   return createBrowserCapability({
-    createOperations: async (context) => createNodeBrowserOperations(await options.createOptions(context)),
+    createOperations: async (context) => {
+      const resolved = await options.createOptions(context);
+      return createNodeBrowserOperations({
+        ...resolved,
+        configuration: {
+          ...context.configuration,
+          ...resolved.configuration,
+        },
+      });
+    },
   });
 }

@@ -2,7 +2,17 @@ import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/r
 import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import { browserCapabilitySettings } from '@webpilot/capability-browser/settings';
 import { chartCapabilitySettings } from '@webpilot/capability-chart/settings';
+import { codeSandboxCapabilitySettings } from '@webpilot/capability-code-sandbox/settings';
+import { communicationCapabilitySettings } from '@webpilot/capability-communication/settings';
+import { computerCapabilitySettings } from '@webpilot/capability-computer/settings';
+import { connectorsCapabilitySettings } from '@webpilot/capability-connectors/settings';
+import { dataCapabilitySettings } from '@webpilot/capability-data/settings';
 import { fileCapabilitySettings } from '@webpilot/capability-file/settings';
+import { gitCapabilitySettings } from '@webpilot/capability-git/settings';
+import { knowledgeCapabilitySettings } from '@webpilot/capability-knowledge/settings';
+import { mediaCapabilitySettings } from '@webpilot/capability-media/settings';
+import { researchCapabilitySettings } from '@webpilot/capability-research/settings';
+import { workflowCapabilitySettings } from '@webpilot/capability-workflow/settings';
 import {
   defaultGlinerOpenLabelModel,
   defaultLiquidPiiModel,
@@ -46,6 +56,7 @@ export type RuntimeEnvDefinition = {
   options?: ReadonlyArray<{ label: string; value: string }>;
   picker?: 'directory';
   secret?: boolean;
+  hidden?: boolean;
   emptyUsesDefault?: boolean;
   valueAliases?: Readonly<Record<string, string>>;
 };
@@ -54,6 +65,16 @@ const capabilitySettingDefinitions: readonly CapabilitySettingDefinition[] = [
   ...browserCapabilitySettings,
   ...chartCapabilitySettings,
   ...fileCapabilitySettings,
+  ...codeSandboxCapabilitySettings,
+  ...researchCapabilitySettings,
+  ...connectorsCapabilitySettings,
+  ...knowledgeCapabilitySettings,
+  ...dataCapabilitySettings,
+  ...mediaCapabilitySettings,
+  ...communicationCapabilitySettings,
+  ...gitCapabilitySettings,
+  ...computerCapabilitySettings,
+  ...workflowCapabilitySettings,
   ...sensitiveDataCapabilitySettings,
 ];
 

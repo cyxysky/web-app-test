@@ -200,10 +200,32 @@
   transform: rotate(180deg);
 }
 
+.settings-group-card-body-frame {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  overflow: hidden;
+  transition: grid-template-rows 200ms ease, opacity 150ms ease;
+}
+
+.settings-group-card.is-expanded .settings-group-card-body-frame {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+
 .settings-group-card-body {
   border-top: 1px solid color-mix(in srgb, var(--border) 68%, transparent);
   display: grid;
+  min-height: 0;
+  overflow: hidden;
   padding: 0 16px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-group-card-body-frame,
+  .settings-group-card-head svg {
+    transition: none;
+  }
 }
 
 .settings-group-card-body > .settings-row {

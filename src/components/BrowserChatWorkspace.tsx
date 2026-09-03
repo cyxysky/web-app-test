@@ -101,6 +101,7 @@ import {
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
+import { FileTypeIcon } from '@/components/FileTypeIcon';
 import { ModelBrandIcon } from '@/components/ModelBrandIcon';
 import { useEscapeDismiss } from '@/hooks/useEscapeDismiss';
 import { AppModal } from '@/components/ui/app-modal';
@@ -2408,10 +2409,10 @@ function browserChatReferenceMeta(attachment: BrowserChatAttachment, kind: Brows
   return formatAttachmentSize(attachment.size) || browserChatReferenceLabel(kind);
 }
 
-function BrowserChatReferenceIcon({ kind }: { kind: BrowserChatAttachmentKind }) {
+function BrowserChatReferenceIcon({ attachment, kind }: { attachment: BrowserChatAttachment; kind: BrowserChatAttachmentKind }) {
   if (kind === 'image') return <ImageUp size={14} />;
   if (kind === 'tab') return <AppWindow size={14} />;
-  return <FileText size={14} />;
+  return <FileTypeIcon fileName={attachment.name} mimeType={attachment.type} size={14} />;
 }
 
 function inlineTokenSvg(paths: string) {
@@ -2491,7 +2492,7 @@ const BrowserChatReferenceChip = memo(function BrowserChatReferenceChip({
   const children = (
     <>
       <span className={`browser-chat-reference-icon ${kind}`}>
-        <BrowserChatReferenceIcon kind={kind} />
+        <BrowserChatReferenceIcon attachment={attachment} kind={kind} />
       </span>
       {attachment.name || label}
     </>
@@ -2849,7 +2850,7 @@ function browserChatArtifactFileIcon(fileName: string, openUrl: string) {
         : /^PDF$/i.test(extension)
           ? { name: 'PDF', src: '/file-icons/pdf.svg' }
           : undefined;
-  if (!icon) return <FileText size={20} />;
+  if (!icon) return <FileTypeIcon fileName={fileName} size={20} />;
   return (
     <img
       alt=""
@@ -4757,7 +4758,10 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
   }, [item.skillIds, skillsById]);
 
   return (
-    <article className={`browser-chat-message ${item.role}${operationRunning ? ' is-running' : ''}${waitingInQueue ? ' is-queued' : ''}`}>
+    <article
+      className={`browser-chat-message ${item.role}${operationRunning ? ' is-running' : ''}${waitingInQueue ? ' is-queued' : ''}`}
+      data-browser-chat-turn-anchor={item.role === 'user' ? item.id : undefined}
+    >
       <div>
         {item.role === 'assistant' ? (
           <BrowserChatAssistantTimeline
@@ -4879,6 +4883,58 @@ function useBrowserChatRecordsByMessageId<TRecord extends { messageId?: string }
     return groups;
   }, [records]);
 }
+
+type BrowserChatTurnNavigationItem = {
+  contentSize: number;
+  messageId: string;
+  prompt: string;
+  response?: string;
+};
+
+const BrowserChatTurnNavigator = memo(function BrowserChatTurnNavigator({
+  items,
+  onSelect,
+}: {
+  items: BrowserChatTurnNavigationItem[];
+  onSelect: (messageId: string) => void;
+}) {
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
+  if (!items.length) return null;
+  return (
+    <nav
+      aria-label="对话轮次导航"
+      className="browser-chat-turn-navigator"
+      onMouseLeave={() => setHoveredIndex(null)}
+    >
+      {items.map((item, index) => {
+        const distance = hoveredIndex === null ? Number.POSITIVE_INFINITY : Math.abs(hoveredIndex - index);
+        const markerWidth = hoveredIndex === null
+          ? 12 + Math.min(18, Math.round(Math.sqrt(item.contentSize) / 2))
+          : [40, 30, 23, 18, 14][Math.min(distance, 4)];
+        return (
+          <button
+            aria-label={`第 ${index + 1} 轮：${item.prompt}`}
+            key={item.messageId}
+            onBlur={() => setHoveredIndex(null)}
+            onClick={() => onSelect(item.messageId)}
+            onFocus={() => setHoveredIndex(index)}
+            onMouseEnter={() => setHoveredIndex(index)}
+            style={{
+              '--browser-chat-turn-marker-width': `${markerWidth}px`,
+            } as CSSProperties}
+            type="button"
+          >
+            <span aria-hidden="true" className="browser-chat-turn-marker" />
+            <span aria-hidden="true" className="browser-chat-turn-preview">
+              <strong>{item.prompt}</strong>
+              {item.response ? <span>{item.response}</span> : null}
+            </span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+});
 
 const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
   expandedArtifactMessageId,
@@ -5089,6 +5145,33 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     [displayMessages],
   );
   const skillsById = useMemo(() => new Map(availableSkills.map((skill) => [skill.id, skill])), [availableSkills]);
+  const turnNavigationItems = useMemo(() => {
+    const items: BrowserChatTurnNavigationItem[] = [];
+    let current: BrowserChatTurnNavigationItem | undefined;
+    for (const message of displayMessages) {
+      if (message.role === 'user') {
+        current = {
+          contentSize: message.content.length + (message.attachments?.length || 0) * 40,
+          messageId: message.id,
+          prompt: browserChatGenerationPreviewText(message, skillsById, {
+            fallbackFileLabel: t('文件'),
+            fallbackSkillLabel: 'Skill',
+            max: 76,
+          }) || t('附件消息'),
+        };
+        items.push(current);
+        continue;
+      }
+      if (!current || current.response) continue;
+      current.contentSize += message.content.length;
+      current.response = browserChatGenerationPreviewText(message, skillsById, {
+        fallbackFileLabel: t('文件'),
+        fallbackSkillLabel: 'Skill',
+        max: 180,
+      }) || message.activity?.label;
+    }
+    return items;
+  }, [displayMessages, skillsById, t]);
   const renderEntries = useMemo(
     () => buildBrowserChatMessageRenderEntries(
       displayMessages,
@@ -5105,6 +5188,17 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     ),
     [displayMessages, lastAssistantMessageId, logIndex, outputCyclesByMessageId, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
   );
+  const scrollToTurn = useCallback((messageId: string) => {
+    const container = getScrollContainer();
+    if (!container) return;
+    const anchor = Array.from(container.querySelectorAll<HTMLElement>('[data-browser-chat-turn-anchor]'))
+      .find((candidate) => candidate.dataset.browserChatTurnAnchor === messageId);
+    if (!anchor) return;
+    followLatestRef.current = false;
+    const containerRect = container.getBoundingClientRect();
+    const targetTop = container.scrollTop + anchor.getBoundingClientRect().top - containerRect.top - 28;
+    container.scrollTo({ behavior: 'smooth', top: Math.max(0, targetTop) });
+  }, [getScrollContainer]);
   const firstMessageId = messages[0]?.id || '';
 
   const addLoadedHistoryHeight = useCallback(() => {
@@ -5444,6 +5538,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           <div aria-hidden="true" className="browser-chat-message-list-end" />
         </div>
           </div>
+          <BrowserChatTurnNavigator
+            items={turnNavigationItems}
+            onSelect={scrollToTurn}
+          />
           <button
             aria-hidden={!showScrollToBottom}
             aria-label={t('滚动到底部')}
@@ -9194,6 +9292,7 @@ export function BrowserChatWorkspace({
   const [editingConversationTitle, setEditingConversationTitle] = useState(false);
   const [conversationTitleDraft, setConversationTitleDraft] = useState('');
   const [savingConversationTitle, setSavingConversationTitle] = useState(false);
+  const cancelConversationTitleSaveRef = useRef(false);
   const [shareLinkCopied, setShareLinkCopied] = useState(false);
   const shareLinkFeedbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const uiChatTransport = useMemo(() => new DefaultChatTransport<BrowserChatUIMessage>({
@@ -10890,7 +10989,7 @@ export function BrowserChatWorkspace({
                       expandedIcon={running
                         ? <Loader2 aria-label={t('AI 正在处理')} className="spin" role="status" size={16} />
                         : titleParts.fileName
-                          ? <FileText aria-hidden="true" size={16} />
+                          ? <FileTypeIcon fileName={titleParts.fileName} size={16} />
                           : undefined}
                       iconTone={running ? 'running' : active ? 'accent' : 'muted'}
                       meta={sessionSidebarTime(item, language)}
@@ -10951,15 +11050,19 @@ export function BrowserChatWorkspace({
 
   function startConversationTitleEdit() {
     if (!session) return;
+    cancelConversationTitleSaveRef.current = false;
     setConversationTitleDraft(sessionDisplayTitle(session));
     setEditingConversationTitle(true);
   }
 
-  async function saveConversationTitle(event?: FormEvent<HTMLFormElement>) {
-    event?.preventDefault();
+  async function saveConversationTitle() {
     if (!session || savingConversationTitle) return;
     const title = conversationTitleDraft.trim();
-    if (!title) return;
+    if (!title) {
+      setConversationTitleDraft(sessionDisplayTitle(session));
+      setEditingConversationTitle(false);
+      return;
+    }
     if (title === sessionDisplayTitle(session)) {
       setEditingConversationTitle(false);
       return;
@@ -11026,40 +11129,48 @@ export function BrowserChatWorkspace({
     <header className="browser-chat-conversation-header">
       <div className="browser-chat-conversation-title-area">
         {editingConversationTitle ? (
-          <form className="browser-chat-conversation-title-form" onSubmit={(event) => void saveConversationTitle(event)}>
-            <AppInput
+          <form
+            className="browser-chat-conversation-title-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              event.currentTarget.querySelector('input')?.blur();
+            }}
+          >
+            <input
               aria-label={t('对话标题')}
               autoFocus
+              className="browser-chat-conversation-title-input"
               disabled={savingConversationTitle}
               maxLength={240}
+              onBlur={() => {
+                if (cancelConversationTitleSaveRef.current) {
+                  cancelConversationTitleSaveRef.current = false;
+                  return;
+                }
+                void saveConversationTitle();
+              }}
               onChange={(event) => setConversationTitleDraft(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key !== 'Escape') return;
                 event.preventDefault();
+                cancelConversationTitleSaveRef.current = true;
+                setConversationTitleDraft(sessionDisplayTitle(session));
                 setEditingConversationTitle(false);
               }}
               value={conversationTitleDraft}
             />
-            <button aria-label={t('保存标题')} disabled={!conversationTitleDraft.trim() || savingConversationTitle} title={t('保存标题')} type="submit">
-              {savingConversationTitle ? <Loader2 className="spin" size={15} /> : <Check size={15} />}
-            </button>
-            <button aria-label={t('取消修改')} disabled={savingConversationTitle} onClick={() => setEditingConversationTitle(false)} title={t('取消')} type="button">
-              <X size={15} />
-            </button>
           </form>
         ) : (
-          <>
-            <h1 title={sessionDisplayTitle(session)}>{sessionDisplayTitle(session)}</h1>
+          <h1 title={sessionDisplayTitle(session)}>
             <button
               aria-label={t('修改对话标题')}
-              className="browser-chat-conversation-title-edit"
+              className="browser-chat-conversation-title-field"
               onClick={startConversationTitleEdit}
-              title={t('修改对话标题')}
               type="button"
             >
-              <PencilLine aria-hidden="true" size={15} />
+              {sessionDisplayTitle(session)}
             </button>
-          </>
+          </h1>
         )}
       </div>
       <div className="browser-chat-conversation-header-actions">

@@ -32,6 +32,7 @@ import { fileArtifactRuntimeSkillId } from '@webpilot/capability-file/runtime-sk
 import {
   activeBrowserRuntimeSkillId,
   hiddenRuntimeSkillContent,
+  hiddenRuntimeSkillIds,
   requireHiddenRuntimeSkillRead,
   hiddenRuntimeSkillIdsReadFromTraces,
   runtimeToolTypesWithLoadedSkills,
@@ -43,6 +44,7 @@ import {
   executeBrowserChatChart,
 } from '@/server/capabilities/browser-chat-chart';
 import { capabilityResultToBrowserActionResult } from '@/server/capabilities/browser-chat-result';
+import { agentInfrastructureToolNames, createAgentInfrastructureProviders } from '@/server/capabilities/agent-infrastructure';
 import {
   createBrowserChatFileCapability,
   executeBrowserChatFile,
@@ -153,8 +155,10 @@ export type BrowserChatReadFileInput = FileReadInput;
 export type BrowserChatReadSkill = (skillId: string) => Promise<BrowserActionResult>;
 
 export type BrowserChatTextStreamUpdate = {
+  agentStepIndex: number;
   blocks?: BrowserChatFinalBlock[];
   delta: string;
+  runtimeStepIndex: number;
   stepNumber: number;
   text: string;
 };
@@ -1339,6 +1343,7 @@ async function makeBrowserTools(
   onToolTrace?: (trace: ToolTrace) => void | Promise<void>,
   referenceOptions?: {
     runId?: string;
+    userId?: string;
     stepIndex?: number;
     allowedToolTypes?: string[];
     visualContext?: VisualContextManager;
@@ -1515,11 +1520,19 @@ async function makeBrowserTools(
   const allowedCapabilityToolNames = referenceOptions?.allowedToolTypes?.length
     ? new Set(referenceOptions.allowedToolTypes)
     : undefined;
+  const infrastructureProviders = createAgentInfrastructureProviders({
+    attachmentBindings: referenceOptions?.attachmentBindings,
+  });
   const enabledCapabilityIds = allowedCapabilityToolNames
     ? new Set([
         ...(allowedCapabilityToolNames.has(browserCapabilityToolNames.browser) ? [browserCapabilityManifest.id] : []),
         ...(allowedCapabilityToolNames.has(chartCapabilityToolNames.chart) ? [chartCapabilityManifest.id] : []),
         ...(allowedCapabilityToolNames.has(fileCapabilityToolNames.file) ? [fileCapabilityManifest.id] : []),
+        ...infrastructureProviders.filter((provider) => (
+          (provider.manifest.skills || []).some((skill) => (
+            (skill.activation || []).some((activation) => allowedCapabilityToolNames.has(activation.toolName))
+          ))
+        )).map((provider) => provider.manifest.id),
       ])
     : undefined;
   const capabilityRuntime = await mountAISDKCapabilities({
@@ -1541,9 +1554,11 @@ async function makeBrowserTools(
         readFileVisuals: referenceOptions?.readFileVisuals,
         visualInputAvailable: imageInputAvailable,
       }),
+      ...infrastructureProviders,
     ],
     context: {
       runId: referenceOptions?.runId || '',
+      userId: referenceOptions?.userId,
       abortSignal: referenceOptions?.abortSignal,
     },
     configStore: new EnvironmentCapabilityConfigStore(process.env),
@@ -1671,7 +1686,7 @@ async function makeBrowserTools(
       }), execution),
     }),
     skill: tool({
-      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${browserRuntimeSkillId}, ${fileArtifactRuntimeSkillId}, ${chartRuntimeSkillId}, and ${subagentRuntimeSkillId}; successful reads remain loaded only for the current Agent run.`,
+      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${hiddenRuntimeSkillIds().join(', ')}; successful reads remain loaded only for the current Agent run.`,
       inputSchema: withToolInputExamples(z.preprocess((value) => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
         const record = value as Record<string, unknown>;
@@ -1750,7 +1765,8 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     'You are an AI browser chat agent. Satisfy the latest user message from the live browser or answer directly when browser evidence is unnecessary.',
     '',
     'Operating rules:',
-    '- Simple knowledge questions and other text-only requests that do not need a capability may be answered directly as ordinary assistant Markdown so the answer can stream to the user. Before using browser, file, chart, or subagent spawn, explicitly read its required system Skill in a separate model step. Governed tools remain unavailable until that read succeeds. In one model step call at most one relevant tool.',
+    '- Simple knowledge questions and other text-only requests that do not need a capability may be answered directly as ordinary assistant Markdown so the answer can stream to the user. Before using browser, file, chart, an infrastructure capability, or subagent spawn, read its required system Skill. Capability schemas are visible from the start; if one is called before its Skill is loaded, the Agent returns the Skill content and skips the requested operation, so read that content and retry in the next model step. In one model step call at most one relevant tool.',
+    `- Optional infrastructure tools are ${agentInfrastructureToolNames.join(', ')}. Use only a configured tool that directly helps the current request. Research is for sourced public retrieval; knowledge is durable reference storage; workflow is durable multi-stage state; connectors, data, media, communication, Git, code execution, and computer control retain their separate permission boundaries.`,
     '- The latest user message is the scope authority. If it explicitly narrows the current turn to one action (for example, "just click Search"), perform and verify only that action, then stop. Do not silently resume a broader goal from an earlier message unless the latest message explicitly asks you to continue it.',
     '- The single browser tool is the real browser mechanism. action=state returns a fresh fixed top-level snapshot, action=code performs targeted Playwright reads and interactions, and action=waitForHumanVerification pauses for user-owned verification. The action field is authoritative; unrelated fields are discarded. Use action=code for iframe, selector, DOM, screenshot, and targeted page-state inspection. A pending browser-state prerequisite is executed internally and returned in prerequisiteResults while the requested action still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browser action=code is available unless a real attempt failed and you report that failure. One code cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
@@ -1789,6 +1805,7 @@ function runtimeToolNames() {
     'subagent',
     fileCapabilityToolNames.file,
     chartCapabilityToolNames.chart,
+    ...agentInfrastructureToolNames,
     'finalResponse',
     'skill',
   ];
@@ -2160,6 +2177,7 @@ async function executeRuntimeStep(input: {
   session: BrowserSession;
   runtimeRecord: BrowserChatRuntimeRecord;
   runId: string;
+  userId?: string;
   turnId?: string;
   stepIndex: number;
   instruction?: string;
@@ -3032,6 +3050,7 @@ async function executeRuntimeStep(input: {
     }, {
       allowedToolTypes,
       runId: input.runId,
+      userId: input.userId,
       stepIndex,
       visualContext,
       getAiRequest: () => aiRequest,
@@ -3104,7 +3123,13 @@ async function executeRuntimeStep(input: {
           ? visibleText.slice(publishedStepText.length)
           : visibleText;
         publishedStepText = visibleText;
-        await onTextStream?.({ delta, stepNumber, text: visibleText });
+        await onTextStream?.({
+          agentStepIndex: retryAgentStepOffset + stepNumber + 1,
+          delta,
+          runtimeStepIndex: stepIndex,
+          stepNumber,
+          text: visibleText,
+        });
         ensureActive();
       };
       const publishFinalBlocks = async (blocks: BrowserChatFinalBlock[], stepNumber: number) => {
@@ -3116,7 +3141,14 @@ async function executeRuntimeStep(input: {
           : text;
         publishedStepText = text;
         publishedFinalBlocksSignature = signature;
-        await onTextStream?.({ blocks, delta, stepNumber, text });
+        await onTextStream?.({
+          agentStepIndex: retryAgentStepOffset + stepNumber + 1,
+          blocks,
+          delta,
+          runtimeStepIndex: stepIndex,
+          stepNumber,
+          text,
+        });
         ensureActive();
       };
       const runtimeContext = {
@@ -3712,6 +3744,7 @@ function upsertStep(steps: StepExecutionResult[], step: StepExecutionResult) {
 export async function executeInteractiveBrowserTurn(input: {
   session: BrowserSession;
   runId: string;
+  userId?: string;
   turnId?: string;
   initialStepIndex?: number;
   targetUrl: string;
@@ -3798,6 +3831,7 @@ export async function executeInteractiveBrowserTurn(input: {
         session: input.session,
         runtimeRecord,
         runId: input.runId,
+        userId: input.userId,
         turnId: input.turnId || input.runId,
         stepIndex,
         instruction: [
@@ -3949,11 +3983,31 @@ export async function executeInteractiveBrowserTurn(input: {
 
     ensureActive();
     const browserChatReply = textFromUnknown(actionResult.text).trim();
+    const operationalTraces = actionResult.traces.filter((trace) => trace.name !== 'contextCompression');
+    const decision = deriveBrowserChatStepDecision(actionResult.text, operationalTraces);
+    const completedStep: StepExecutionResult = {
+      index: stepIndex,
+      action: decision.action,
+      expected: decision.expected,
+      actual: decision.actual,
+      status: decision.status,
+      note: decision.note,
+      aiRequest: actionResult.aiRequest,
+      tools: summarizeToolTraces(actionResult.traces),
+      visualContext: actionResult.visualContext,
+    };
+    const persistCompletedToolStep = async () => {
+      if (!actionResult.traces.length) return;
+      upsertStep(steps, completedStep);
+      newSteps.push(completedStep);
+      ensureActive();
+      await input.onProgress?.(completedStep);
+      ensureActive();
+    };
     const structuredFinalResponse = finalResponseFromTraces(actionResult.traces)
       || finalResponseFromText(browserChatReply);
     if (structuredFinalResponse?.blocks.length) {
-      const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
-      if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      await persistCompletedToolStep();
       finalBlocks = structuredFinalResponse.blocks;
       reply = browserChatFinalBlocksToText(finalBlocks);
       finalStatus = structuredFinalResponse.status;
@@ -3961,8 +4015,7 @@ export async function executeInteractiveBrowserTurn(input: {
       break;
     }
     if (actionResult.responseFinished && browserChatReply) {
-      const runningIndex = steps.findIndex((step) => step.index === stepIndex && step.status === 'running');
-      if (runningIndex >= 0) steps.splice(runningIndex, 1);
+      await persistCompletedToolStep();
       reply = browserChatReply;
       finalBlocks = [{ type: 'markdown', text: reply }];
       finalStatus = actionResult.responseStatus === 'blocked'
@@ -3996,24 +4049,7 @@ export async function executeInteractiveBrowserTurn(input: {
       continue;
     }
 
-    const operationalTraces = actionResult.traces.filter((trace) => trace.name !== 'contextCompression');
-    const decision = deriveBrowserChatStepDecision(actionResult.text, operationalTraces);
-    const completedStep: StepExecutionResult = {
-      index: stepIndex,
-      action: decision.action,
-      expected: decision.expected,
-      actual: decision.actual,
-      status: decision.status,
-      note: decision.note,
-      aiRequest: actionResult.aiRequest,
-      tools: summarizeToolTraces(actionResult.traces),
-      visualContext: actionResult.visualContext,
-    };
-    upsertStep(steps, completedStep);
-    newSteps.push(completedStep);
-    ensureActive();
-    await input.onProgress?.(completedStep);
-    ensureActive();
+    await persistCompletedToolStep();
     const lastTool = operationalTraces.at(-1);
     const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
     if (pendingSubagentUuids.length) {
@@ -4250,7 +4286,10 @@ export async function executeRecordedBrowserOperation(
         });
       }
       if (input.action === 'waitForHumanVerification') {
-        return session.waitForManualVerification(typeof input.maxMs === 'number' ? input.maxMs : undefined);
+        return session.waitForManualVerification(
+          typeof input.maxMs === 'number' ? input.maxMs : undefined,
+          abortSignal,
+        );
       }
       if (input.action !== 'code') {
         return { ok: false, actual: 'browser requires action=state|code|waitForHumanVerification.' };

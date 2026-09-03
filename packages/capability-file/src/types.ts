@@ -80,10 +80,25 @@ export type FileAttachmentBinding = {
   ref: string;
 };
 
-export type FileArtifactOperationResult = {
+export type FileArtifactOperationError = {
+  code: string;
+  message: string;
+  details?: unknown;
+  retryable?: boolean;
+};
+
+/**
+ * Structured result returned by Node artifact operations. `actual` remains for
+ * browser-operation compatibility; new integrations should consume data/error.
+ */
+export type FileArtifactOperationResult<TData = unknown> = {
   ok: boolean;
+  /** @deprecated Compatibility text for BrowserActionResult consumers. Prefer data/error. */
   actual: string;
+  data?: TData;
+  error?: FileArtifactOperationError;
   referenceImagePaths?: string[];
+  summary?: string;
 };
 
 export type FileVisualCheckStatus = OfficeVisualQaCheckStatus;

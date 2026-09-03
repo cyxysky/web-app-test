@@ -64,6 +64,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV LIBREOFFICE_PATH=/usr/bin/libreoffice
 ENV CAPABILITY_FILE_RUNTIME_DIR=/app/capability-runtime/file
 ENV CAPABILITY_BROWSER_RUNTIME_DIR=/app/capability-runtime/browser
+ENV CAPABILITY_COMPUTER_RUNTIME_DIR=/app/capability-runtime/computer
 ENV LIBREOFFICE_UNO_PROGRAM_WORKER_PATH=/app/capability-runtime/file/python/libreoffice-program-worker.py
 ENV APP_DATA_DIR=/app
 ENV ARTIFACTS_DIR=/app/artifacts
@@ -87,6 +88,7 @@ COPY --from=build /app/next.config.ts ./next.config.ts
 COPY --from=build /app/server ./server
 COPY --from=build /app/.capability-runtime/file ./capability-runtime/file
 COPY --from=build /app/.capability-runtime/browser ./capability-runtime/browser
+COPY --from=build /app/.capability-runtime/computer ./capability-runtime/computer
 
 RUN find ./server -type f -name '*.test.js' -delete \
     && mkdir -p .data artifacts

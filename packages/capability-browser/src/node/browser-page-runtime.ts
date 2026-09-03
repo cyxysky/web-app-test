@@ -1371,7 +1371,14 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       state,
       maxElements,
       maxChars,
-      rectForFrame: (element) => visibleDomRect(element, viewportClip),
+      rectForFrame: (element) => {
+        const rect = visibleDomRect(element, viewportClip);
+        return rect ? {
+          ...rect,
+          height: Math.max(0, rect.bottom - rect.top),
+          width: Math.max(0, rect.right - rect.left),
+        } : undefined;
+      },
     });
     visitVisibleDom({
       stop,

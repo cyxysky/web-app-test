@@ -11,7 +11,7 @@ const stagingRoot = path.join(root, '.capability-runtime');
 await rm(stagingRoot, { recursive: true, force: true });
 await mkdir(stagingRoot, { recursive: true });
 
-for (const name of ['file', 'browser', 'sensitive-data']) {
+for (const name of ['file', 'browser', 'computer', 'sensitive-data']) {
   const packageRoot = source === 'npm'
     ? path.join(root, 'node_modules', '@webpilot', `capability-${name}`)
     : path.join(root, 'packages', `capability-${name}`);

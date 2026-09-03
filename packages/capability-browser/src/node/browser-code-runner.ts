@@ -283,6 +283,7 @@ export type BrowserCodeRuntimeStateOperation = {
 };
 
 export type BrowserCodeKernelOptions = {
+  environment?: Readonly<Record<string, string | undefined>>;
   executionTimeoutMs?: number;
   maxAgeMs?: number;
   maxExecutions?: number;
@@ -2998,19 +2999,19 @@ function childSource() {
   return `const __name = (target) => target;\n(${browserCodeKernelMain.toString()})();`;
 }
 
-function browserCodeModuleReadRoots() {
+function browserCodeModuleReadRoots(environment: Readonly<Record<string, string | undefined>> = process.env) {
   const roots = [path.resolve(process.cwd(), 'node_modules')];
-  for (const entry of String(process.env.NODE_PATH || '').split(path.delimiter)) {
+  for (const entry of String(environment.NODE_PATH || '').split(path.delimiter)) {
     if (entry.trim()) roots.push(path.resolve(entry.trim()));
   }
   return Array.from(new Set(roots));
 }
 
-function browserCodeChildArgs(tempDir: string) {
+function browserCodeChildArgs(tempDir: string, environment?: Readonly<Record<string, string | undefined>>) {
   return [
     '--permission',
     '--experimental-vm-modules',
-    ...browserCodeModuleReadRoots().map((root) => `--allow-fs-read=${root}`),
+    ...browserCodeModuleReadRoots(environment).map((root) => `--allow-fs-read=${root}`),
     `--allow-fs-read=${tempDir}`,
     `--allow-fs-write=${tempDir}`,
     '--max-old-space-size=128',
@@ -3020,15 +3021,18 @@ function browserCodeChildArgs(tempDir: string) {
   ];
 }
 
-function browserCodeChildEnv(tempDir: string): NodeJS.ProcessEnv {
+function browserCodeChildEnv(
+  tempDir: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
     ['SystemRoot', 'WINDIR', 'HOME', 'ELECTRON_RUN_AS_NODE']
-      .flatMap((name) => process.env[name] ? [[name, process.env[name] as string]] : []),
+      .flatMap((name) => environment[name] ? [[name, environment[name] as string]] : []),
   );
   return {
     ...env,
     NODE_ENV: 'production',
-    NODE_PATH: browserCodeModuleReadRoots().join(path.delimiter),
+    NODE_PATH: browserCodeModuleReadRoots(environment).join(path.delimiter),
     TEMP: tempDir,
     TMP: tempDir,
     TMPDIR: tempDir,
@@ -3142,7 +3146,7 @@ export class BrowserCodeKernel {
       };
       input.abortSignal?.addEventListener('abort', onAbort, { once: true });
       const executionTimeoutMs = boundedInteger(
-        this.options.executionTimeoutMs ?? process.env.AI_BROWSER_CODE_EXECUTION_TIMEOUT_MS,
+        this.options.executionTimeoutMs ?? this.options.environment?.AI_BROWSER_CODE_EXECUTION_TIMEOUT_MS ?? process.env.AI_BROWSER_CODE_EXECUTION_TIMEOUT_MS,
         defaultBrowserCodeExecutionTimeoutMs,
         100,
         10 * 60_000,
@@ -3209,9 +3213,9 @@ export class BrowserCodeKernel {
     this.readyPromise = readyPromise;
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, browserCodeChildArgs(tempDir), {
+      child = spawn(process.execPath, browserCodeChildArgs(tempDir, this.options.environment), {
         cwd: process.cwd(),
-        env: browserCodeChildEnv(tempDir),
+        env: browserCodeChildEnv(tempDir, this.options.environment),
         stdio: ['pipe', 'ignore', 'pipe', 'ipc'],
         windowsHide: true,
       });
@@ -3247,7 +3251,7 @@ export class BrowserCodeKernel {
       this.finishPending({ ok: false, error: error.message, logs: [] });
     });
     const readyTimeoutMs = boundedInteger(
-      this.options.readyTimeoutMs ?? process.env.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS,
+      this.options.readyTimeoutMs ?? this.options.environment?.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS ?? process.env.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS,
       defaultBrowserCodeKernelReadyTimeoutMs,
       100,
       60_000,
@@ -3288,25 +3292,25 @@ export class BrowserCodeKernel {
     } : undefined;
     const mb = 1024 * 1024;
     const maxHeapBytes = boundedInteger(
-      this.options.maxHeapBytes ?? Number(process.env.AI_BROWSER_CODE_KERNEL_MAX_HEAP_MB || 96) * mb,
+      this.options.maxHeapBytes ?? Number(this.options.environment?.AI_BROWSER_CODE_KERNEL_MAX_HEAP_MB ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_HEAP_MB ?? 96) * mb,
       96 * mb,
       16 * mb,
       1024 * mb,
     );
     const maxRssBytes = boundedInteger(
-      this.options.maxRssBytes ?? Number(process.env.AI_BROWSER_CODE_KERNEL_MAX_RSS_MB || 384) * mb,
+      this.options.maxRssBytes ?? Number(this.options.environment?.AI_BROWSER_CODE_KERNEL_MAX_RSS_MB ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_RSS_MB ?? 384) * mb,
       384 * mb,
       32 * mb,
       4 * 1024 * mb,
     );
     const maxExecutions = boundedInteger(
-      this.options.maxExecutions ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_EXECUTIONS,
+      this.options.maxExecutions ?? this.options.environment?.AI_BROWSER_CODE_KERNEL_MAX_EXECUTIONS ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_EXECUTIONS,
       80,
       1,
       1_000,
     );
     const maxAgeMs = boundedInteger(
-      this.options.maxAgeMs ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_AGE_MS,
+      this.options.maxAgeMs ?? this.options.environment?.AI_BROWSER_CODE_KERNEL_MAX_AGE_MS ?? process.env.AI_BROWSER_CODE_KERNEL_MAX_AGE_MS,
       20 * 60_000,
       60_000,
       4 * 60 * 60_000,

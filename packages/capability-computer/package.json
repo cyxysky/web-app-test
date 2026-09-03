@@ -1,0 +1,5 @@
+{
+  "name": "@webpilot/capability-computer", "version": "0.1.0", "description": "Framework-neutral desktop computer-control capability with a built-in Windows driver and remote adapter.", "type": "module", "sideEffects": false, "files": ["dist", "runtime", "README.md"],
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }, "./node": { "types": "./dist/node.d.ts", "import": "./dist/node.js" }, "./mcp": { "types": "./dist/mcp.d.ts", "import": "./dist/mcp.js" }, "./runtime-skill": { "types": "./dist/runtime-skill.d.ts", "import": "./dist/runtime-skill.js" }, "./settings": { "types": "./dist/settings.d.ts", "import": "./dist/settings.js" } },
+  "scripts": { "build": "tsc -p tsconfig.build.json", "prepack": "npm run build" }, "dependencies": { "@webpilot/capability-adapter-mcp": "0.1.0", "@webpilot/capability-sdk": "0.1.0", "zod": "^4.4.3" }, "engines": { "node": ">=22.16" }, "publishConfig": { "access": "public" }
+}

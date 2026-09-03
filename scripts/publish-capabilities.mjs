@@ -8,6 +8,16 @@ const packages = [
   '@webpilot/capability-browser',
   '@webpilot/capability-chart',
   '@webpilot/capability-file',
+  '@webpilot/capability-code-sandbox',
+  '@webpilot/capability-research',
+  '@webpilot/capability-connectors',
+  '@webpilot/capability-knowledge',
+  '@webpilot/capability-data',
+  '@webpilot/capability-media',
+  '@webpilot/capability-communication',
+  '@webpilot/capability-git',
+  '@webpilot/capability-computer',
+  '@webpilot/capability-workflow',
   '@webpilot/capability-sensitive-data',
 ];
 const dryRun = process.argv.includes('--dry-run');

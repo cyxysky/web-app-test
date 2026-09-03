@@ -106,6 +106,13 @@ function copyBrowserSessionExtension() {
   );
 }
 
+function copyComputerDriverRuntime() {
+  copyInto(
+    path.join(root, 'packages', 'capability-computer', 'runtime'),
+    path.join(serverRoot, 'capability-runtime', 'computer'),
+  );
+}
+
 function removePackageEntry(entryPath) {
   try {
     fs.rmSync(entryPath, {
@@ -141,6 +148,7 @@ copyInto(
   path.join(serverRoot, 'capability-runtime', 'file'),
 );
 copyBrowserSessionExtension();
+copyComputerDriverRuntime();
 copyLibreOffice();
 copyPlaywrightChromium();
 

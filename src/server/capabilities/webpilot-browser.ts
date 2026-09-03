@@ -12,6 +12,7 @@ export function createWebPilotBrowserSession(options: BrowserSessionOptions = {}
     host: {
       artifactPath: configuredHost?.artifactPath || ((runId) => artifactPath(runId)),
       runtimeState: configuredHost?.runtimeState || executeBrowserCodeRuntimeStateOperation,
+      waitForManualVerification: configuredHost?.waitForManualVerification,
     },
   });
 }

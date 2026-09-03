@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import '@open-file-viewer/core/style.css';
+import { WorkspaceBrandProvider } from '@/brand/WorkspaceBrandProvider';
 import { InterfaceMotion } from '@/components/InterfaceMotion';
 import { FilePreviewProvider } from '@/components/FilePreviewProvider';
 import { NavigationLoading } from '@/components/NavigationLoading';
@@ -27,11 +28,13 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         <script dangerouslySetInnerHTML={{ __html: themeBootScript }} />
         <ThemeProvider>
           <I18nProvider>
-            <FilePreviewProvider>
-              <InterfaceMotion />
-              {children}
-              <NavigationLoading />
-            </FilePreviewProvider>
+            <WorkspaceBrandProvider>
+              <FilePreviewProvider>
+                <InterfaceMotion />
+                {children}
+                <NavigationLoading />
+              </FilePreviewProvider>
+            </WorkspaceBrandProvider>
           </I18nProvider>
         </ThemeProvider>
       </body>

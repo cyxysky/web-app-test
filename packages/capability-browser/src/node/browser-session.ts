@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
 import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import { raceWithAbort, type CapabilityConfiguration } from '@webpilot/capability-sdk';
 import {
   resolveBrowserOutputPixelRatio,
   resolveBrowserPreviewImageFormat,
@@ -32,6 +33,7 @@ import {
   sessionTabGrouperProfileDir,
   sharedBrowserTabsEnabled,
   withSessionTabGrouperArgs,
+  type BrowserRuntimeEnvironment,
 } from './browser-session-runtime.js';
 import type {
   BrowserPageObservation,
@@ -95,7 +97,6 @@ import {
 } from './browser-session-transport-adapter.js';
 import {
   closeManagedBrowserSessions,
-  installBrowserSessionShutdownHooks,
   registerBrowserSession,
   unregisterBrowserSession,
 } from './browser-session-lifecycle.js';
@@ -112,15 +113,15 @@ const DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS = 250;
 const DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS = 1000;
 const BROWSER_NAVIGATION_DOM_STABILITY_POLL_MS = 50;
 
-function fixedBrowserViewportFromEnv() {
-  if (process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() !== 'fixed') return undefined;
-  const width = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH');
-  const height = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT');
+function fixedBrowserViewportFromEnv(environment: BrowserRuntimeEnvironment) {
+  if (environment.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() !== 'fixed') return undefined;
+  const width = positiveIntegerEnv('BROWSER_VIEWPORT_WIDTH', environment);
+  const height = positiveIntegerEnv('BROWSER_VIEWPORT_HEIGHT', environment);
   return width && height ? { width, height } : undefined;
 }
 
-function browserOutputPixelRatioFromEnv() {
-  return resolveBrowserOutputPixelRatio(process.env.BROWSER_OUTPUT_PIXEL_RATIO);
+function browserOutputPixelRatioFromEnv(environment: BrowserRuntimeEnvironment) {
+  return resolveBrowserOutputPixelRatio(environment.BROWSER_OUTPUT_PIXEL_RATIO);
 }
 
 
@@ -146,6 +147,8 @@ export type BrowserSessionOptions = {
   actionFrameLimit?: number;
   /** Host-owned artifact storage and optional durable browserCode state. */
   host?: BrowserSessionHost;
+  /** Per-runtime settings loaded by the Capability host; values override process.env. */
+  configuration?: CapabilityConfiguration;
 };
 
 export type BrowserSessionHost = {
@@ -154,6 +157,14 @@ export type BrowserSessionHost = {
     sessionId: string,
     operation: BrowserCodeRuntimeStateOperation,
   ) => Promise<unknown> | unknown;
+  /** Optional host-owned pause/resume implementation for human verification. */
+  waitForManualVerification?: (request: BrowserManualVerificationRequest) => Promise<BrowserActionResult>;
+};
+
+export type BrowserManualVerificationRequest = {
+  session: BrowserSession;
+  maxMs: number;
+  abortSignal?: AbortSignal;
 };
 
 export type BrowserChildSessionOptions = Pick<BrowserSessionOptions,
@@ -197,6 +208,8 @@ export type BrowserActionResult = {
   }>;
   /** Stable runtime failure category used for category-specific recovery guidance. */
   failureCategory?: string;
+  /** Signals a host-owned human-verification pause when no waiter is installed. */
+  manualVerification?: { requested: true; maxMs: number };
   /** Runtime Skill required by an Agent-owned execution gate. */
   requiredSkillId?: string;
   /** Browser-owned control mirrored into the remote live-preview surface. */
@@ -1255,6 +1268,7 @@ type SharedBrowserState = {
   }>;
   idleTimer?: ReturnType<typeof setTimeout>;
   managedProfileDir?: string;
+  environment?: BrowserRuntimeEnvironment;
 };
 const sharedBrowserStates = ((globalThis as typeof globalThis & {
   __webPilotSharedBrowserStates?: Map<string, SharedBrowserState>;
@@ -1505,8 +1519,9 @@ async function connectOrLaunchPersistentBrowserOverCdp(input: {
   userDataDir: string;
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
+  environment: BrowserRuntimeEnvironment;
 }) {
-  const connectTimeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_CONNECT_TIMEOUT_MS', 1_200, 500, 10_000);
+  const connectTimeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_CONNECT_TIMEOUT_MS', 1_200, 500, 10_000, input.environment);
   const connectErrors: string[] = [];
   const connect = async () => {
     const attempt = await tryConnectExistingBrowserOverCdp({
@@ -1523,7 +1538,7 @@ async function connectOrLaunchPersistentBrowserOverCdp(input: {
 
   const port = cdpPortFromEndpoint(input.endpoint);
   if (!port) throw new Error(`Automatic tab-group browser reuse needs a CDP port endpoint, got: ${input.endpoint || '[empty]'}`);
-  const timeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_LAUNCH_TIMEOUT_MS', 15_000, 3_000, 120_000);
+  const timeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_LAUNCH_TIMEOUT_MS', 15_000, 3_000, 120_000, input.environment);
 
   if (await tcpEndpointIsListening(input.endpoint)) {
     const existingDeadline = Date.now() + timeoutMs;
@@ -1643,10 +1658,11 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
     sharedBrowserState.idleTimer = undefined;
     return;
   }
-  const closeImmediately = force || process.env.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
+  const environment = sharedBrowserState.environment || process.env;
+  const closeImmediately = force || environment.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
   if (!closeImmediately) {
     if (!sharedBrowserState.idleTimer) {
-      const configured = Number(process.env.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
+      const configured = Number(environment.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
       const timeoutMs = Number.isFinite(configured)
         ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
         : 3 * 60 * 1000;
@@ -1671,7 +1687,7 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   } else if (ownership === 'launched') {
     await browser?.close().catch(() => undefined);
     managedProfileBrowserClosed = true;
-  } else if (ownership === 'connected' && (force || process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
+  } else if (ownership === 'connected' && (force || environment.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
     if (force) managedProfileBrowserClosed = await closeConnectedBrowserProcess(browser);
     await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
   }
@@ -1684,7 +1700,8 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
   sharedBrowserState.initPromise = undefined;
   sharedBrowserState.key = undefined;
   sharedBrowserState.managedProfileDir = undefined;
-  if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir);
+  sharedBrowserState.environment = undefined;
+  if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir, environment);
 }
 
 async function acquireSharedBrowser(input: {
@@ -1696,6 +1713,7 @@ async function acquireSharedBrowser(input: {
   launchOptions: LaunchOptions;
   contextOptions: BrowserContextOptions;
   managedProfileDir?: string;
+  environment: BrowserRuntimeEnvironment;
 }): Promise<SharedBrowserLease> {
   const runtimeKey = input.runtimeKey?.trim() || 'global';
   const sharedBrowserState = sharedBrowserStateFor(runtimeKey);
@@ -1713,6 +1731,7 @@ async function acquireSharedBrowser(input: {
   if (!sharedBrowserState.initPromise || sharedBrowserState.key !== key || !browserStillConnected || !sharedBrowserState.context) {
     sharedBrowserState.key = key;
     sharedBrowserState.managedProfileDir = input.managedProfileDir;
+    sharedBrowserState.environment = input.environment;
     sharedBrowserState.initPromise = (async () => {
       if (input.cdpEndpoint) {
         const browser = await input.chromium.connectOverCDP(input.cdpEndpoint);
@@ -1733,6 +1752,7 @@ async function acquireSharedBrowser(input: {
             userDataDir: input.userDataDir,
             launchOptions: input.launchOptions,
             contextOptions: input.contextOptions,
+            environment: input.environment,
           });
         }
         try {
@@ -1879,12 +1899,32 @@ export class BrowserSession {
   private visitedOrigins = new Set<string>();
   private observedPageLinks = new Map<string, { url: string; title: string }>();
   private readonly pageGroupId: string;
+  private capabilityConfiguration: CapabilityConfiguration;
   private browserSurface: BrowserSessionSurface = 'external';
   private transportKind?: BrowserSessionTransportKind;
 
   constructor(private readonly options: BrowserSessionOptions = {}) {
+    this.capabilityConfiguration = Object.freeze({ ...options.configuration });
     this.pageGroupId = normalizePageGroupId(options.runId);
     registerBrowserSession(this);
+  }
+
+  /** Applies host-loaded settings before a lazily created session is started. */
+  configure(configuration: CapabilityConfiguration | undefined) {
+    if (!configuration) return this;
+    this.capabilityConfiguration = Object.freeze({
+      ...this.capabilityConfiguration,
+      ...configuration,
+    });
+    return this;
+  }
+
+  private runtimeEnvironment(): BrowserRuntimeEnvironment {
+    return { ...process.env, ...this.capabilityConfiguration };
+  }
+
+  private configuredValue(key: string) {
+    return this.capabilityConfiguration[key] ?? process.env[key];
   }
 
   isUsable() {
@@ -1953,6 +1993,7 @@ export class BrowserSession {
       runId: options.runId,
       slowMoMs: options.slowMoMs,
       host: this.options.host,
+      configuration: this.capabilityConfiguration,
     });
     child.browserSurface = this.browserSurface;
     child.transportKind = this.transportKind;
@@ -2000,11 +2041,12 @@ export class BrowserSession {
     // keep their BrowserSession identity while it reconnects to the tab group.
     registerBrowserSession(this);
     const { chromium } = await import('playwright');
-    const headless = browserHeadlessEnabled(this.options);
+    const environment = this.runtimeEnvironment();
+    const headless = browserHeadlessEnabled(this.options, { env: environment });
     const isolated = this.options.isolated === true;
-    this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled());
-    const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const fixedViewport = fixedBrowserViewportFromEnv();
+    this.browserSurface = resolveBrowserSessionSurface(this.options, electronEmbeddedBrowserEnabled(environment));
+    const fullscreen = environment.BROWSER_FULLSCREEN !== 'false';
+    const fixedViewport = fixedBrowserViewportFromEnv(environment);
     const headlessFallbackViewport = { width: fullscreen ? 1920 : 1280, height: fullscreen ? 1080 : 800 };
     const useNativeViewport = !headless && !fixedViewport;
     const contextViewport = useNativeViewport ? null : fixedViewport || headlessFallbackViewport;
@@ -2013,20 +2055,20 @@ export class BrowserSession {
       : headless
         ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
         : '';
-    const ignoreHTTPSErrors = process.env.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
+    const ignoreHTTPSErrors = environment.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
     const useElectronEmbeddedBrowser = this.browserSurface === 'electron-embedded';
-    const forceBundledBrowser = isolated || (process.env.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
-    const channel = forceBundledBrowser ? undefined : process.env.BROWSER_CHANNEL?.trim() || undefined;
-    const executablePath = process.env.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
+    const forceBundledBrowser = isolated || (environment.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
+    const channel = forceBundledBrowser ? undefined : environment.BROWSER_CHANNEL?.trim() || undefined;
+    const executablePath = environment.AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH?.trim() || undefined;
     const browserProfileKey = this.options.browserProfileKey ? normalizePageGroupId(this.options.browserProfileKey) : '';
     const sharedBrowserRuntimeKey = this.options.sharedBrowserRuntimeKey?.trim() || '';
     const rawCdpEndpoint = forceBundledBrowser
       ? ''
       : useElectronEmbeddedBrowser
-        ? electronEmbeddedBrowserCdpEndpoint()
-        : process.env.BROWSER_CDP_ENDPOINT?.trim()
-          || process.env.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
-          || process.env.CHROME_REMOTE_DEBUGGING_URL?.trim()
+        ? electronEmbeddedBrowserCdpEndpoint(environment)
+        : environment.BROWSER_CDP_ENDPOINT?.trim()
+          || environment.BROWSER_CONNECT_CDP_ENDPOINT?.trim()
+          || environment.CHROME_REMOTE_DEBUGGING_URL?.trim()
           || '';
     const cdpEndpoint = browserProfileKey && rawCdpEndpoint && !useElectronEmbeddedBrowser
       ? /\{(?:browserProfileKey|profileKey)\}/.test(rawCdpEndpoint)
@@ -2037,21 +2079,21 @@ export class BrowserSession {
       : rawCdpEndpoint;
     const configuredUserDataDir = isolated
       ? ''
-      : process.env.BROWSER_USER_DATA_DIR?.trim()
-        || process.env.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
+      : environment.BROWSER_USER_DATA_DIR?.trim()
+        || environment.AI_WEB_TEST_BROWSER_PROFILE_DIR?.trim()
         || '';
     const requestedUserDataDir = configuredUserDataDir && browserProfileKey
       ? path.join(configuredUserDataDir, browserProfileKey)
       : configuredUserDataDir;
-    const tabGrouperEnabled = !isolated && sessionTabGrouperEnabled(headless);
+    const tabGrouperEnabled = !isolated && sessionTabGrouperEnabled(headless, environment);
     const useSharedBrowserTabs = !isolated && (
       Boolean(sharedBrowserRuntimeKey)
-      || (sharedBrowserTabsEnabled() && !useElectronEmbeddedBrowser && !browserProfileKey)
+      || (sharedBrowserTabsEnabled(environment) && !useElectronEmbeddedBrowser && !browserProfileKey)
     );
     const useSessionGroupPageSelection = tabGrouperEnabled || Boolean(browserProfileKey);
     this.nativeTabGrouperEnabled = tabGrouperEnabled;
     this.usesSessionGroupPageSelection = useSessionGroupPageSelection;
-    const restoreLastSession = tabGrouperEnabled && process.env.BROWSER_RESTORE_LAST_SESSION !== 'false';
+    const restoreLastSession = tabGrouperEnabled && environment.BROWSER_RESTORE_LAST_SESSION !== 'false';
     const autoTabGroupProfileKey = browserProfileKey || (useSharedBrowserTabs ? 'shared' : this.pageGroupId);
     // A user-scoped profile must remain persistent in headless runtimes too.
     // Native tab groups still require a visible browser, but cookies, local
@@ -2060,11 +2102,11 @@ export class BrowserSession {
       && !cdpEndpoint
       && !requestedUserDataDir
       && (Boolean(browserProfileKey) || tabGrouperEnabled)
-      ? sessionTabGrouperProfileDir(autoTabGroupProfileKey)
+      ? sessionTabGrouperProfileDir(autoTabGroupProfileKey, environment)
       : '';
     const autoTabGroupProfileDir = tabGrouperEnabled ? autoManagedProfileDir : '';
     const autoTabGroupDebugPort = (autoTabGroupProfileDir || (tabGrouperEnabled && browserProfileKey && !cdpEndpoint))
-      ? sessionTabGrouperDebugPort(autoTabGroupProfileKey)
+      ? sessionTabGrouperDebugPort(autoTabGroupProfileKey, environment)
       : undefined;
     const autoTabGroupCdpEndpoint = cdpEndpointForPort(autoTabGroupDebugPort);
     const userDataDir = requestedUserDataDir || autoManagedProfileDir;
@@ -2089,7 +2131,7 @@ export class BrowserSession {
         this.options.debugDevtools ? '--auto-open-devtools-for-tabs' : '',
         restoreLastSession ? '--restore-last-session' : '',
         autoTabGroupDebugPort ? `--remote-debugging-port=${autoTabGroupDebugPort}` : '',
-      ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir) }),
+      ].filter(Boolean), headless, { exclusive: Boolean(autoTabGroupProfileDir), environment }),
     };
     const contextOptions: BrowserContextOptions = {
       viewport: contextViewport,
@@ -2115,6 +2157,7 @@ export class BrowserSession {
         launchOptions,
         contextOptions,
         managedProfileDir: this.managedProfileDir,
+        environment,
       });
       this.browserOwnership = 'shared';
       this.browser = lease.browser;
@@ -2170,6 +2213,7 @@ export class BrowserSession {
           userDataDir,
           launchOptions,
           contextOptions,
+          environment,
         });
         this.browserOwnership = 'connected';
         this.browser = connected.browser;
@@ -2537,7 +2581,7 @@ export class BrowserSession {
   }
 
   private browserSlowMoMs() {
-    const configured = this.options.slowMoMs ?? Number(process.env.BROWSER_SLOW_MO_MS || 0);
+    const configured = this.options.slowMoMs ?? Number(this.configuredValue('BROWSER_SLOW_MO_MS') || 0);
     if (!Number.isFinite(configured) || configured < 0) return 0;
     return Math.min(Math.floor(configured), 2000);
   }
@@ -2546,7 +2590,11 @@ export class BrowserSession {
     const configured = this.options.actionFrameLimit;
     const frameLimit = typeof configured === 'number' && Number.isFinite(configured) && configured > 0
       ? Math.min(200, Math.floor(configured))
-      : numericLimitFromEnv('BROWSER_ACTION_FRAME_LIMIT', 24);
+      : numericLimitFromEnv(
+          'BROWSER_CHAT_ACTION_FRAME_LIMIT',
+          numericLimitFromEnv('BROWSER_ACTION_FRAME_LIMIT', 24, this.runtimeEnvironment()),
+          this.runtimeEnvironment(),
+        );
     const page = this.activePage;
     return [page.mainFrame(), ...page.frames().filter((frame) => frame !== page.mainFrame()).slice(0, frameLimit)];
   }
@@ -2571,8 +2619,8 @@ export class BrowserSession {
     const hostPath = this.options.host?.artifactPath?.(runId);
     if (hostPath) return path.resolve(hostPath);
     const root = path.resolve(
-      process.env.CAPABILITY_BROWSER_ARTIFACTS_DIR
-        || process.env.ARTIFACTS_DIR
+      this.configuredValue('CAPABILITY_BROWSER_ARTIFACTS_DIR')
+        || this.configuredValue('ARTIFACTS_DIR')
         || path.join(process.cwd(), 'runtime', 'artifacts'),
     );
     const safeRunId = String(runId || 'browser')
@@ -2597,7 +2645,7 @@ export class BrowserSession {
       id: this.pageGroupId,
       title: this.tabGroupLabel(),
       prefix: this.tabTitlePrefix(),
-      applyPrefix: browserTabTitlePrefixEnabled(),
+      applyPrefix: browserTabTitlePrefixEnabled(this.runtimeEnvironment()),
     };
   }
 
@@ -2761,8 +2809,9 @@ export class BrowserSession {
     if (!Number.isFinite(this.livePreviewNativeTabRefreshAt)) this.livePreviewNativeTabRefreshAt = 0;
     if (!Number.isFinite(this.livePreviewTabIdSequence)) this.livePreviewTabIdSequence = 0;
     if (typeof this.nativeTabGrouperEnabled !== 'boolean') {
-      const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
-      this.nativeTabGrouperEnabled = this.options.isolated !== true && sessionTabGrouperEnabled(headless);
+      const environment = this.runtimeEnvironment();
+      const headless = this.options.debugDevtools ? false : this.options.headless ?? environment.HEADLESS_BROWSER === 'true';
+      this.nativeTabGrouperEnabled = this.options.isolated !== true && sessionTabGrouperEnabled(headless, environment);
     }
     if (typeof this.usesSessionGroupPageSelection !== 'boolean') {
       this.usesSessionGroupPageSelection = this.nativeTabGrouperEnabled || Boolean(this.options.browserProfileKey);
@@ -2816,7 +2865,7 @@ export class BrowserSession {
     const restoredPages: Array<Page | undefined> = [];
     const failedUrls: string[] = [];
     let created = 0;
-    const navigationTimeoutMs = boundedPositiveIntegerEnv('BROWSER_TAB_RESTORE_TIMEOUT_MS', 15_000, 1_000, 60_000);
+    const navigationTimeoutMs = boundedPositiveIntegerEnv('BROWSER_TAB_RESTORE_TIMEOUT_MS', 15_000, 1_000, 60_000, this.runtimeEnvironment());
 
     for (const tab of requested) {
       const matching = [...unusedPages].find((page) => page.url() === tab.url);
@@ -2936,10 +2985,11 @@ export class BrowserSession {
   private async applyConfiguredViewport(page: Page) {
     this.ensureLivePreviewState();
     if (page.isClosed()) return;
-    const headless = this.options.debugDevtools ? false : this.options.headless ?? process.env.HEADLESS_BROWSER === 'true';
-    const fullscreen = process.env.BROWSER_FULLSCREEN !== 'false';
-    const viewportMode = process.env.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() === 'fixed' ? 'fixed' : 'auto';
-    const fixedViewport = fixedBrowserViewportFromEnv();
+    const environment = this.runtimeEnvironment();
+    const headless = this.options.debugDevtools ? false : this.options.headless ?? environment.HEADLESS_BROWSER === 'true';
+    const fullscreen = environment.BROWSER_FULLSCREEN !== 'false';
+    const viewportMode = environment.BROWSER_VIEWPORT_MODE?.trim().toLowerCase() === 'fixed' ? 'fixed' : 'auto';
+    const fixedViewport = fixedBrowserViewportFromEnv(environment);
     const connectedExternalBrowser = this.browserSurface === 'external'
       && (this.transportKind === 'cdp' || this.transportKind === 'persistent-cdp' || this.transportKind === 'shared');
     // A connected browser owns its native window and CSS viewport. Applying a
@@ -2952,8 +3002,8 @@ export class BrowserSession {
         : undefined);
     const settingKey = [
       viewportMode,
-      process.env.BROWSER_VIEWPORT_WIDTH || '',
-      process.env.BROWSER_VIEWPORT_HEIGHT || '',
+      environment.BROWSER_VIEWPORT_WIDTH || '',
+      environment.BROWSER_VIEWPORT_HEIGHT || '',
       headless ? 'headless' : 'headful',
       fullscreen ? 'fullscreen' : 'windowed',
       this.browserSurface,
@@ -2998,13 +3048,14 @@ export class BrowserSession {
   }): Promise<BrowserScreencastHandle> {
     this.ensureLivePreviewState();
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
+    const environment = this.runtimeEnvironment();
     const format = options.video
-      ? resolveBrowserPreviewImageFormat(process.env.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT || 'png')
-      : resolveBrowserPreviewImageFormat(process.env.BROWSER_SCREENCAST_FORMAT);
+      ? resolveBrowserPreviewImageFormat(environment.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT || 'png')
+      : resolveBrowserPreviewImageFormat(environment.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
-    const rawQuality = Number(process.env.BROWSER_SCREENCAST_QUALITY ?? 90);
+    const rawQuality = Number(environment.BROWSER_SCREENCAST_QUALITY ?? 90);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 90)));
-    const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(process.env.BROWSER_PREVIEW_FPS);
+    const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(environment.BROWSER_PREVIEW_FPS);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
     let page: Page | undefined;
@@ -3281,7 +3332,7 @@ export class BrowserSession {
           maxConcurrentCaptures: 1,
           nativeFrames,
           nativeFps: nativeFrames / Math.max(0.001, metrics.elapsedSeconds),
-          targetFps: browserPreviewFramesPerSecond(process.env.BROWSER_PREVIEW_FPS),
+          targetFps: browserPreviewFramesPerSecond(environment.BROWSER_PREVIEW_FPS),
         };
       },
       stop: async () => {
@@ -4024,7 +4075,7 @@ export class BrowserSession {
       resourceType: request.resourceType(),
     };
     records.push(record);
-    const rawMaxRecords = Number(process.env.BROWSER_HTTP_REQUEST_HISTORY_LIMIT || 400);
+    const rawMaxRecords = Number(this.configuredValue('BROWSER_HTTP_REQUEST_HISTORY_LIMIT') || 400);
     const maxRecords = Math.max(50, Math.floor(Number.isFinite(rawMaxRecords) ? rawMaxRecords : 400));
     if (records.length > maxRecords) {
       const removed = records.splice(0, records.length - maxRecords);
@@ -4122,9 +4173,9 @@ export class BrowserSession {
     maxChars?: number;
     timings?: Record<string, number>;
   }) {
-    const fallbackMaxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000));
+    const fallbackMaxChars = numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000, this.runtimeEnvironment()), this.runtimeEnvironment());
     const maxChars = options.maxChars ?? fallbackMaxChars;
-    const frameLimit = numericLimitFromEnv('DOM_STRUCTURED_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER));
+    const frameLimit = numericLimitFromEnv('DOM_STRUCTURED_TEXT_FRAME_LIMIT', numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER, this.runtimeEnvironment()), this.runtimeEnvironment());
     const mainFrame = this.activePage.mainFrame();
     const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
     const parts: string[] = [];
@@ -4229,7 +4280,7 @@ export class BrowserSession {
     const domObservationPromise = canUseCombinedDomObservation
       ? timedBrowserStep(timings, 'readDomObservationMs', () => this.readDomObservation({
           includeInteractiveCandidates: true,
-          maxChars: numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000)),
+          maxChars: numericLimitFromEnv('DOM_STRUCTURED_TEXT_MAX_CHARS', numericLimitFromEnv('DOM_PAGE_TEXT_READ_MAX_CHARS', 200000, this.runtimeEnvironment()), this.runtimeEnvironment()),
           timings,
         }))
       : undefined;
@@ -4406,7 +4457,7 @@ export class BrowserSession {
     outputPixelRatio?: number;
     timeoutMs: number;
   }) {
-    const outputPixelRatio = input.outputPixelRatio ?? browserOutputPixelRatioFromEnv();
+    const outputPixelRatio = input.outputPixelRatio ?? browserOutputPixelRatioFromEnv(this.runtimeEnvironment());
     if (outputPixelRatio === 1) {
       await this.activePage.screenshot({
         animations: 'disabled',
@@ -4476,7 +4527,7 @@ export class BrowserSession {
       viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
       viewportMetrics,
       devicePixelRatio: viewportMetrics.devicePixelRatio,
-      outputPixelRatio: outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
+      outputPixelRatio: outputPixelRatio ?? browserOutputPixelRatioFromEnv(this.runtimeEnvironment()),
       capture,
       generation: ++this.screenshotGenerationSequence,
       page: this.activePage,
@@ -4524,6 +4575,7 @@ export class BrowserSession {
       DEFAULT_SCREENSHOT_TIMEOUT_MS,
       MIN_SCREENSHOT_TIMEOUT_MS,
       MAX_SCREENSHOT_TIMEOUT_MS,
+      this.runtimeEnvironment(),
     );
     // Original clean screenshots are disabled globally; keep only the primary screenshot
     // and, when configured, the separate marker map.
@@ -4576,6 +4628,7 @@ export class BrowserSession {
       DEFAULT_SCREENSHOT_TIMEOUT_MS,
       MIN_SCREENSHOT_TIMEOUT_MS,
       MAX_SCREENSHOT_TIMEOUT_MS,
+      this.runtimeEnvironment(),
     );
     await this.capturePngScreenshot({
       capture,
@@ -4678,7 +4731,7 @@ export class BrowserSession {
     }
     const journal = this.interActionChangeJournal!;
     const mainFrame = this.activePage.mainFrame();
-    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER, this.runtimeEnvironment());
     const frames = [mainFrame, ...this.activePage.frames().filter((frame) => frame !== mainFrame).slice(0, frameLimit)];
     const deltas = await Promise.all(frames.map(async (frame) => {
       const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
@@ -4726,7 +4779,7 @@ export class BrowserSession {
   }
 
   async getCurrentTabHttpRequests(options: { ids?: string[] } = {}): Promise<BrowserActionResult> {
-    const rawLimit = Number(process.env.AI_HTTP_REQUEST_TOOL_LIMIT || 80);
+    const rawLimit = Number(this.configuredValue('AI_HTTP_REQUEST_TOOL_LIMIT') || 80);
     const limit = Math.max(1, Math.floor(Number.isFinite(rawLimit) ? rawLimit : 80));
     const requestedIds = new Set((options.ids || []).filter((id) => typeof id === 'string' && id));
     const detailed = requestedIds.size > 0;
@@ -4736,7 +4789,7 @@ export class BrowserSession {
     if (!records.length) {
       return { ok: true, actual: detailed ? 'None of the requested HTTP request IDs are available in the current tab history.' : 'Current tab has no captured HTTP requests yet.' };
     }
-    const detailLimit = Math.max(1000, Math.floor(Number(process.env.AI_HTTP_REQUEST_DETAIL_MAX_CHARS || 12000)));
+    const detailLimit = Math.max(1000, Math.floor(Number(this.configuredValue('AI_HTTP_REQUEST_DETAIL_MAX_CHARS') || 12000)));
     const output = await Promise.all(records.map(async (record) => {
       const summary = {
         id: record.id,
@@ -4781,6 +4834,7 @@ export class BrowserSession {
       DEFAULT_BROWSER_WAIT_FOR_PAGE_LOAD_STATE_TIMEOUT_MS,
       100,
       30000,
+      this.runtimeEnvironment(),
     );
     let loadStateTimedOut = false;
     await this.activePage.waitForLoadState('domcontentloaded', { timeout: loadStateTimeoutMs }).catch((error) => {
@@ -4796,6 +4850,7 @@ export class BrowserSession {
       'BROWSER_WAIT_FOR_PAGE_STABLE_MS',
       DEFAULT_BROWSER_WAIT_FOR_PAGE_STABLE_MS,
       5000,
+      this.runtimeEnvironment(),
     );
     if (stableMs > 0) await this.waitForStableViewport(stableMs);
     const note = await this.manualVerificationNote();
@@ -4884,6 +4939,7 @@ export class BrowserSession {
       || this.pageGroupId;
     const runtimeState = this.options.host?.runtimeState;
     const kernel = this.browserCodeKernel ||= new BrowserCodeKernel(this.browserCodeConnection, {
+      environment: this.runtimeEnvironment(),
       sessionGroupId: this.pageGroupId,
       runtimeState: runtimeState
         ? (operation) => runtimeState(browserCodeStateSessionId, operation)
@@ -5017,14 +5073,29 @@ export class BrowserSession {
     return result;
   }
 
-  async waitForManualVerification(maxMs = Number(process.env.MANUAL_VERIFICATION_TIMEOUT_MS || 180000)): Promise<BrowserActionResult> {
-    void maxMs;
+  async waitForManualVerification(maxMs?: number, abortSignal?: AbortSignal): Promise<BrowserActionResult> {
+    const configuredDefault = Number(this.configuredValue('MANUAL_VERIFICATION_TIMEOUT_MS') || 180_000);
+    const defaultMaxMs = Number.isFinite(configuredDefault)
+      ? Math.max(1_000, Math.min(30 * 60_000, Math.floor(configuredDefault)))
+      : 180_000;
+    const requestedMaxMs = typeof maxMs === 'number' && Number.isFinite(maxMs)
+      ? Math.max(1_000, Math.min(30 * 60_000, Math.floor(maxMs)))
+      : defaultMaxMs;
+    abortSignal?.throwIfAborted();
+    if (this.options.host?.waitForManualVerification) {
+      return raceWithAbort(this.options.host.waitForManualVerification({
+        session: this,
+        maxMs: requestedMaxMs,
+        abortSignal,
+      }), abortSignal);
+    }
     const note = await this.manualVerificationNote();
     return {
       ok: true,
       actual: note
         ? '已暂停自动操作：页面需要人工完成验证。请在浏览器中完成验证码、登录/安全验证或其他需要本人确认的步骤；完成后点击对话中的“校验完成，继续执行”。'
         : '已暂停自动操作，等待您检查浏览器并完成可能需要的人工验证；完成后点击对话中的“校验完成，继续执行”。',
+      manualVerification: { requested: true, maxMs: requestedMaxMs },
     };
   }
 
@@ -5073,12 +5144,12 @@ export class BrowserSession {
           ? await closeConnectedBrowserProcess(this.browser)
           : false;
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
-        if (managedProfileBrowserClosed && this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir);
+        if (managedProfileBrowserClosed && this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir, this.runtimeEnvironment());
         return;
       }
       if (this.browserOwnership === 'persistent') {
         await this.context?.close().catch(() => undefined);
-        if (this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir);
+        if (this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir, this.runtimeEnvironment());
         return;
       }
       await this.browser?.close().catch(() => undefined);
@@ -5509,7 +5580,7 @@ export class BrowserSession {
     const configuredWaitMs = this.options.popupWaitMs;
     const waitMs = typeof configuredWaitMs === 'number' && Number.isFinite(configuredWaitMs) && configuredWaitMs >= 0
       ? Math.min(3000, Math.floor(configuredWaitMs))
-      : boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000);
+      : boundedNonNegativeIntegerEnv('BROWSER_POPUP_WAIT_MS', DEFAULT_BROWSER_POPUP_WAIT_MS, 3000, this.runtimeEnvironment());
     return {
       waitMs,
       popup: waitMs > 0
@@ -5542,7 +5613,7 @@ export class BrowserSession {
   private async settlePopupAfterAction(popup: Promise<Page | undefined>, waitMs: number, timings?: Record<string, number>) {
     if (waitMs <= 0) return undefined;
     const selectionSequence = this.livePreviewExplicitPageSelectionSequence;
-    const fastWaitMs = Math.min(waitMs, boundedNonNegativeIntegerEnv('BROWSER_POPUP_FAST_WAIT_MS', 250, 1000));
+    const fastWaitMs = Math.min(waitMs, boundedNonNegativeIntegerEnv('BROWSER_POPUP_FAST_WAIT_MS', 250, 1000, this.runtimeEnvironment()));
     const newPage = await timedBrowserStep(timings, 'popupFastWaitMs', () => Promise.race([
       popup,
       sleep(fastWaitMs).then(() => undefined),
@@ -5691,8 +5762,8 @@ export class BrowserSession {
   }
 
   private pruneSnapshotUidMappings() {
-    const retentionGenerations = boundedPositiveIntegerEnv('SNAPSHOT_UID_RETENTION_GENERATIONS', 12, 2, 200);
-    const maxEntries = boundedPositiveIntegerEnv('SNAPSHOT_UID_MAX_ENTRIES', 20000, 1000, 200000);
+    const retentionGenerations = boundedPositiveIntegerEnv('SNAPSHOT_UID_RETENTION_GENERATIONS', 12, 2, 200, this.runtimeEnvironment());
+    const maxEntries = boundedPositiveIntegerEnv('SNAPSHOT_UID_MAX_ENTRIES', 20000, 1000, 200000, this.runtimeEnvironment());
     const oldestGeneration = Math.max(0, this.snapshotGenerationSequence - retentionGenerations);
     for (const [key, entry] of this.snapshotUidByIdentity) {
       if (entry.lastSeenGeneration < oldestGeneration) this.snapshotUidByIdentity.delete(key);
@@ -6277,11 +6348,13 @@ export class BrowserSession {
       'BROWSER_NAVIGATION_DOM_QUIET_MS',
       DEFAULT_BROWSER_NAVIGATION_DOM_QUIET_MS,
       2000,
+      this.runtimeEnvironment(),
     );
     const timeoutMs = boundedNonNegativeIntegerEnv(
       'BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS',
       DEFAULT_BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS,
       5000,
+      this.runtimeEnvironment(),
     );
     if (quietMs === 0 || timeoutMs === 0) return undefined;
 
@@ -7061,7 +7134,7 @@ export class BrowserSession {
     if (metrics.page !== this.activePage || metrics.url !== this.activePage.url()) {
       return { error: 'The latest screenshot is stale because the active page or URL changed. Capture a new viewport screenshot.' };
     }
-    const maxAgeMs = boundedPositiveIntegerEnv('SCREENSHOT_COORDINATE_MAX_AGE_MS', 30000, 1000, 300000);
+    const maxAgeMs = boundedPositiveIntegerEnv('SCREENSHOT_COORDINATE_MAX_AGE_MS', 30000, 1000, 300000, this.runtimeEnvironment());
     if (Date.now() - metrics.capturedAt > maxAgeMs) {
       return { error: `The latest screenshot is older than ${maxAgeMs}ms. Capture a new viewport screenshot before coordinate input.` };
     }
@@ -7717,7 +7790,7 @@ export class BrowserSession {
           await page.keyboard.press('Backspace');
         }
       }
-      const delay = boundedNonNegativeIntegerEnv('BROWSER_KEYBOARD_TYPE_DELAY_MS', 0, 200);
+      const delay = boundedNonNegativeIntegerEnv('BROWSER_KEYBOARD_TYPE_DELAY_MS', 0, 200, this.runtimeEnvironment());
       const fastInserted = input.allowedOrigins?.length ? false : await this.insertFocusedTextFast(text);
       if (!fastInserted) {
         if (targetHandle) await targetHandle.type(text, { delay });
@@ -7821,18 +7894,18 @@ export class BrowserSession {
     const startedAt = Date.now();
     const fullScope = options.scope === 'full';
     const defaultMaxElements = fullScope
-      ? numericLimitFromEnv('DOM_CUA_FULL_MAX_ELEMENTS', numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600))
-      : numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 200);
+      ? numericLimitFromEnv('DOM_CUA_FULL_MAX_ELEMENTS', numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 600, this.runtimeEnvironment()), this.runtimeEnvironment())
+      : numericLimitFromEnv('DOM_CUA_MAX_ELEMENTS', 200, this.runtimeEnvironment());
     const defaultMaxChars = fullScope
-      ? numericLimitFromEnv('DOM_CUA_FULL_MAX_CHARS', numericLimitFromEnv('DOM_CUA_MAX_CHARS', 60000))
-      : numericLimitFromEnv('DOM_CUA_MAX_CHARS', 20000);
+      ? numericLimitFromEnv('DOM_CUA_FULL_MAX_CHARS', numericLimitFromEnv('DOM_CUA_MAX_CHARS', 60000, this.runtimeEnvironment()), this.runtimeEnvironment())
+      : numericLimitFromEnv('DOM_CUA_MAX_CHARS', 20000, this.runtimeEnvironment());
     const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || defaultMaxElements));
     const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || defaultMaxChars));
     const addTiming = (name: string, startedAt: number) => {
       if (options.timings) options.timings[name] = (options.timings[name] || 0) + Date.now() - startedAt;
     };
     this.lastDomNodeReferences = new Map();
-    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER);
+    const frameLimit = numericLimitFromEnv('DOM_CUA_FRAME_LIMIT', Number.MAX_SAFE_INTEGER, this.runtimeEnvironment());
     const fullFrameSnapshotsPromise = fullScope
       ? timedBrowserStep(options.timings, 'readFullFrameDomSnapshotsMs', () => this.readFullFrameDomSnapshots(maxElements, maxChars, frameLimit, options.timings))
       : undefined;
@@ -8245,8 +8318,8 @@ export class BrowserSession {
       };
     }
 
-    const maxElements = numericLimitFromEnv('DOM_CUA_PAGED_MAX_ELEMENTS', 10000);
-    const maxChars = numericLimitFromEnv('DOM_CUA_PAGED_MAX_CHARS', 1000000);
+    const maxElements = numericLimitFromEnv('DOM_CUA_PAGED_MAX_ELEMENTS', 10000, this.runtimeEnvironment());
+    const maxChars = numericLimitFromEnv('DOM_CUA_PAGED_MAX_CHARS', 1000000, this.runtimeEnvironment());
     const result = await this.readSimplifiedDomTree({
       scope: mode === 'full' || mode === 'text' ? 'full' : 'visible',
       maxChars,
@@ -8631,5 +8704,3 @@ export class BrowserSession {
 export async function closeAllBrowserSessions() {
   return closeManagedBrowserSessions();
 }
-
-installBrowserSessionShutdownHooks();

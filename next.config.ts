@@ -12,6 +12,8 @@ const configFilePath = resolve(projectRoot, 'next.config.ts');
 const configRevision = createHash('sha256').update(readFileSync(configFilePath)).digest('hex');
 const configuredBasePath = String(process.env.WEBPILOT_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
 const basePath = configuredBasePath ? `/${configuredBasePath}` : '';
+const brandPrefix = String(process.env.WEBPILOT_BRAND_PREFIX || 'DOMP').trim() || 'DOMP';
+const brandText = String(process.env.WEBPILOT_BRAND_TEXT || 'WebPilot').trim() || 'WebPilot';
 const serverRole = process.env.WEBPILOT_SERVER_ROLE === 'runtime' ? 'runtime' : 'ui';
 const capabilitySource = process.env.WEBPILOT_CAPABILITY_SOURCE === 'npm' ? 'npm' : 'workspace';
 
@@ -29,6 +31,16 @@ export default function nextConfig(phase: string): NextConfig {
       '@webpilot/capability-browser',
       '@webpilot/capability-chart',
       '@webpilot/capability-file',
+      '@webpilot/capability-code-sandbox',
+      '@webpilot/capability-research',
+      '@webpilot/capability-connectors',
+      '@webpilot/capability-knowledge',
+      '@webpilot/capability-data',
+      '@webpilot/capability-media',
+      '@webpilot/capability-communication',
+      '@webpilot/capability-git',
+      '@webpilot/capability-computer',
+      '@webpilot/capability-workflow',
       '@webpilot/capability-sensitive-data',
     ],
     // A running development server must never write into the production build
@@ -36,6 +48,8 @@ export default function nextConfig(phase: string): NextConfig {
     distDir: phase === PHASE_DEVELOPMENT_SERVER ? `.next-dev-${serverRole}` : '.next',
     env: {
       NEXT_PUBLIC_WEBPILOT_BASE_PATH: basePath,
+      NEXT_PUBLIC_WEBPILOT_BRAND_PREFIX: brandPrefix,
+      NEXT_PUBLIC_WEBPILOT_BRAND_TEXT: brandText,
     },
     // Do not let Turbopack walk out to an unrelated package-lock.json in a
     // parent directory (for example, the Windows user profile directory).
@@ -52,12 +66,13 @@ export default function nextConfig(phase: string): NextConfig {
       // whole barrel whenever a workspace route is compiled for the first time.
       optimizePackageImports: ['@heroui/react'],
     },
-    webpack(config, { dev, isServer }) {
-      if (dev && !isServer) {
+    webpack(config, { dev }) {
+      if (dev) {
         // Webpack otherwise compiles every nested async import during the first
         // route request. Browser Chat owns optional, very large viewers and
-        // charting surfaces, so defer those chunks until the user opens them.
-        // Route entries stay eager because Next manages their lifecycle.
+        // charting surfaces, so defer those chunks in both the client and server
+        // graphs until the user opens them. Route entries stay eager because
+        // Next manages their lifecycle.
         config.experiments = {
           ...(config.experiments || {}),
           lazyCompilation: {

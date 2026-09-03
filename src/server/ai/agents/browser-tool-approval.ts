@@ -1,4 +1,5 @@
 import { analyzeBrowserCodeRisk } from '@webpilot/capability-browser/node';
+import { isReadOnlyStatement } from '@webpilot/capability-data';
 
 export type BrowserToolApprovalRequest = {
   prompt: string;
@@ -31,6 +32,25 @@ export function browserToolApprovalRequest(input: {
 
   if (input.toolName === 'file' && record.action === 'download') {
     return { reason, prompt: `请确认是否下载文件${reason ? `：${reason}` : ''}` };
+  }
+
+  const action = typeof record.action === 'string' ? record.action : '';
+  const approvalRequired = (
+    (input.toolName === 'codeSandbox' && action === 'run')
+    || (input.toolName === 'connectors' && action === 'call')
+    || (input.toolName === 'knowledge' && action === 'delete')
+    || (input.toolName === 'data' && action === 'query' && !isReadOnlyStatement(typeof record.statement === 'string' ? record.statement : ''))
+    || (input.toolName === 'media' && action === 'generateImage')
+    || (input.toolName === 'communication' && action === 'send')
+    || (input.toolName === 'git' && (action === 'applyPatch' || action === 'commit'))
+    || (input.toolName === 'computer' && ['click', 'type', 'key', 'scroll'].includes(action))
+    || (input.toolName === 'workflow' && action === 'cancel')
+  );
+  if (approvalRequired) {
+    return {
+      reason,
+      prompt: reason || `请确认是否执行 ${input.toolName} ${action} 操作。`,
+    };
   }
 
   return undefined;

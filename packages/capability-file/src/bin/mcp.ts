@@ -11,4 +11,9 @@ const artifactsRoot = path.resolve(
 serveFileMcpStdio({
   workspace: { artifactsRoot },
   visualInputAvailable: false,
+  configurations: {
+    'com.webpilot.file': {
+      OFFICE_GENERATION_MODE: process.env.OFFICE_GENERATION_MODE,
+    },
+  },
 });

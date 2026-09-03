@@ -48,6 +48,7 @@ import {
 } from '@/lib/extra-request-parameters';
 import type { SensitiveDataEvaluationCase } from '@/lib/sensitive-data-evaluation';
 import { WorkspaceSidebarArchiveRow } from '@/components/WorkspaceSidebarArchive';
+import { useWorkspaceBrand } from '@/brand/WorkspaceBrandProvider';
 
 export {
   environmentSettingsTabs,
@@ -178,7 +179,13 @@ function SettingsGroupCard({
         <h3>{title}</h3>
         <ChevronDown aria-hidden="true" size={17} />
       </button>
-      {expanded ? <div className="settings-group-card-body">{children}</div> : null}
+      <div
+        aria-hidden={!expanded}
+        className="settings-group-card-body-frame"
+        inert={expanded ? undefined : true}
+      >
+        <div className="settings-group-card-body">{children}</div>
+      </div>
     </div>
   );
 }
@@ -482,6 +489,7 @@ export function EnvironmentSettings({
     || !['skills', 'memory', 'accounts'].includes(controlledActiveTab);
   const { language, setLanguage, t } = useI18n();
   const { color, scrollbarColor, setColor, setScrollbarColor } = useTheme();
+  const { brandPrefix, brandText, setBrandPrefix, setBrandText } = useWorkspaceBrand();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
@@ -1995,7 +2003,7 @@ export function EnvironmentSettings({
   const activeProviderDuplicateExtraRequestParameterKeys = duplicateExtraRequestParameterKeys(activeProviderExtraRequestParameterRows);
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab);
+    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab && definition.hidden !== true);
   const visibleEnvGroups = groupVisibleEnvSettings(activeTab, visibleEnvItems);
 
   return (
@@ -2044,6 +2052,34 @@ export function EnvironmentSettings({
                 </div>
               </div>
               <SettingsGroupCard title={t('基础设置')}>
+                <div className="settings-row">
+                  <div>
+                    <strong>{t('品牌前缀')}</strong>
+                    <span>{t('设置侧边栏中高亮显示的品牌文字。')}</span>
+                  </div>
+                  <div className="settings-control">
+                    <AppInput
+                      aria-label={t('品牌前缀')}
+                      maxLength={48}
+                      onChange={(event) => setBrandPrefix(event.target.value)}
+                      value={brandPrefix}
+                    />
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <strong>{t('产品名称')}</strong>
+                    <span>{t('设置侧边栏中显示在品牌前缀右侧的名称。')}</span>
+                  </div>
+                  <div className="settings-control">
+                    <AppInput
+                      aria-label={t('产品名称')}
+                      maxLength={48}
+                      onChange={(event) => setBrandText(event.target.value)}
+                      value={brandText}
+                    />
+                  </div>
+                </div>
                 <div className="settings-row">
                   <div>
                     <strong>{t('界面语言')}</strong>

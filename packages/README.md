@@ -13,6 +13,16 @@ dependencies are isolated behind explicit adapter entrypoints.
 | `@webpilot/capability-browser` | Playwright sessions, browser kernel, snapshots, runtime and MCP server |
 | `@webpilot/capability-chart` | ECharts API, persistence, React rendering and MCP server |
 | `@webpilot/capability-file` | File/Office workspace, workers, validation, preview and MCP server |
+| `@webpilot/capability-code-sandbox` | Bounded JavaScript/Python execution with replaceable sandbox backends |
+| `@webpilot/capability-research` | Provenance-preserving public search and document fetching |
+| `@webpilot/capability-connectors` | MCP Streamable HTTP, OpenAPI and custom external connectors |
+| `@webpilot/capability-knowledge` | Durable document ingestion and knowledge retrieval |
+| `@webpilot/capability-data` | Structured source discovery and bounded SQL querying |
+| `@webpilot/capability-media` | OCR, transcription, frame extraction and image-generation contracts |
+| `@webpilot/capability-communication` | Draft-first outbound communication channels |
+| `@webpilot/capability-git` | Bounded Git inspection and explicitly enabled repository writes |
+| `@webpilot/capability-computer` | Desktop observation and input through host-selected drivers |
+| `@webpilot/capability-workflow` | Durable dependency-aware workflows and checkpoints |
 | `@webpilot/capability-sensitive-data` | Provider-boundary redaction, AI SDK adapter, local GLiNER runtime and packaging scripts |
 
 Local development uses npm workspaces and the TypeScript path mappings in the

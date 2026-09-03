@@ -5,7 +5,7 @@ import { access, copyFile, mkdir, open, readFile, readdir, rename, stat, unlink,
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import sharp from 'sharp';
-import { raceWithAbort } from '@webpilot/capability-sdk';
+import { raceWithAbort, type CapabilityConfiguration } from '@webpilot/capability-sdk';
 import type {
   FileArtifactOperationResult,
   FileAttachmentBinding,
@@ -43,13 +43,16 @@ import { renderFilePreview, type FilePreviewResult } from './office/preview.js';
 export type NodeFileWorkspaceHost = {
   artifactsRoot: string;
   artifactUrl?: NodeArtifactUrlResolver;
+  configuration?: CapabilityConfiguration;
   converter?: NodeFileConverter;
   downloader?: NodeFileDownloader;
+  officeGenerationMode?: 'auto' | 'javascript' | 'uno';
   renderPreview?: (input: Parameters<typeof renderFilePreview>[0]) => Promise<FilePreviewResult>;
 };
 
 type ResolvedNodeFileWorkspaceHost = Required<Pick<NodeFileWorkspaceHost, 'artifactsRoot' | 'converter' | 'downloader' | 'renderPreview'>> & {
   artifactUrl: NodeArtifactUrlResolver;
+  officeGenerationMode: 'auto' | 'javascript' | 'uno';
   dispose(): Promise<void>;
 };
 
@@ -66,11 +69,20 @@ function resolveNodeFileWorkspaceHost(options: NodeFileWorkspaceHost): ResolvedN
     artifactUrl,
     renderPreview: async (input) => renderPreview(input),
   });
+  const configuredOfficeGenerationMode = String(
+    options.officeGenerationMode || options.configuration?.OFFICE_GENERATION_MODE || 'uno',
+  ).trim().toLowerCase();
+  const officeGenerationMode = configuredOfficeGenerationMode === 'auto'
+    || configuredOfficeGenerationMode === 'javascript'
+    || configuredOfficeGenerationMode === 'uno'
+    ? configuredOfficeGenerationMode
+    : 'uno';
   return {
     artifactsRoot,
     artifactUrl,
     converter,
     downloader,
+    officeGenerationMode,
     renderPreview,
     async dispose() {
       await Promise.all([
@@ -379,7 +391,7 @@ const javascriptOfficeExtensions = new Set(['.docx', '.pptx', '.xlsx', '.pdf']);
 function configuredOfficeGenerator(fileName: string, operation: 'create' | 'modify'):
   OfficeDocumentDraft['generator'] {
   if (operation === 'modify') return 'uno';
-  const configured = String(process.env.OFFICE_GENERATION_MODE || 'uno').trim().toLowerCase();
+  const configured = currentNodeFileWorkspaceHost().officeGenerationMode;
   const extension = path.extname(fileName).toLowerCase();
   if (configured === 'javascript') {
     if (!javascriptOfficeExtensions.has(extension)) {
@@ -3846,6 +3858,53 @@ function bindNodeFileWorkspaceOperation<TArgs extends unknown[], TResult>(
   return (...args: TArgs) => nodeFileWorkspaceHost.run(host, () => operation(...args));
 }
 
+function legacyOperationData(actual: string): unknown {
+  try {
+    return JSON.parse(actual) as unknown;
+  } catch {
+    return actual;
+  }
+}
+
+function structuredOperationErrorCode(data: unknown, fallback: string) {
+  const candidate = data && typeof data === 'object' && !Array.isArray(data)
+    ? (data as { code?: unknown }).code
+    : undefined;
+  if (typeof candidate !== 'string' || !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(candidate)) return fallback;
+  return candidate.trim().toLowerCase().replace(/[_.]+/g, '-');
+}
+
+function structuredFileOperationResult(
+  result: FileArtifactOperationResult,
+  fallbackErrorCode: string,
+): FileArtifactOperationResult {
+  if (result.data !== undefined || result.error) return result;
+  const data = legacyOperationData(result.actual);
+  if (result.ok) {
+    return { ...result, data, summary: result.summary || result.actual };
+  }
+  return {
+    ...result,
+    data,
+    error: {
+      code: structuredOperationErrorCode(data, fallbackErrorCode),
+      message: result.actual,
+      details: data,
+    },
+  };
+}
+
+function bindNodeFileWorkspaceResultOperation<TArgs extends unknown[]>(
+  host: ResolvedNodeFileWorkspaceHost,
+  operation: (...args: TArgs) => Promise<FileArtifactOperationResult>,
+  fallbackErrorCode: string,
+) {
+  return (...args: TArgs) => nodeFileWorkspaceHost.run(
+    host,
+    async () => structuredFileOperationResult(await operation(...args), fallbackErrorCode),
+  );
+}
+
 /**
  * Creates one host-bound Office draft workspace. The returned operations keep
  * artifact paths, URL mapping, downloads, conversions, and preview rendering
@@ -3856,20 +3915,20 @@ export function createNodeFileWorkspace(options: NodeFileWorkspaceHost) {
   return Object.freeze({
     artifactsRoot: host.artifactsRoot,
     syncDocumentAssets: bindNodeFileWorkspaceOperation(host, syncDocumentAssets),
-    downloadFileArtifact: bindNodeFileWorkspaceOperation(host, downloadFileArtifact),
-    convertFileArtifact: bindNodeFileWorkspaceOperation(host, convertFileArtifact),
+    downloadFileArtifact: bindNodeFileWorkspaceResultOperation(host, downloadFileArtifact, 'file-download-failed'),
+    convertFileArtifact: bindNodeFileWorkspaceResultOperation(host, convertFileArtifact, 'file-convert-failed'),
     listOfficeDraftCatalog: bindNodeFileWorkspaceOperation(host, listOfficeDraftCatalog),
-    listOfficeDrafts: bindNodeFileWorkspaceOperation(host, listOfficeDrafts),
+    listOfficeDrafts: bindNodeFileWorkspaceResultOperation(host, listOfficeDrafts, 'file-list-failed'),
     officeDraftCatalogForPrompt: bindNodeFileWorkspaceOperation(host, officeDraftCatalogForPrompt),
-    getUnoApi: bindNodeFileWorkspaceOperation(host, getUnoApi),
-    getOfficeJsApi: bindNodeFileWorkspaceOperation(host, getOfficeJsApi),
-    verifyCurrentUnoRenderedArtifact: bindNodeFileWorkspaceOperation(host, verifyCurrentUnoRenderedArtifact),
-    recordOfficeVisualQaProgress: bindNodeFileWorkspaceOperation(host, recordOfficeVisualQaProgress),
-    readUnoDraft: bindNodeFileWorkspaceOperation(host, readUnoDraft),
-    planFileArtifact: bindNodeFileWorkspaceOperation(host, planFileArtifact),
-    generateUnoFileArtifact: bindNodeFileWorkspaceOperation(host, generateUnoFileArtifact),
-    editUnoFileArtifact: bindNodeFileWorkspaceOperation(host, editUnoFileArtifact),
-    renderFileArtifact: bindNodeFileWorkspaceOperation(host, renderFileArtifact),
+    getUnoApi: bindNodeFileWorkspaceResultOperation(host, getUnoApi, 'file-uno-api-failed'),
+    getOfficeJsApi: bindNodeFileWorkspaceResultOperation(host, getOfficeJsApi, 'file-js-api-failed'),
+    verifyCurrentUnoRenderedArtifact: bindNodeFileWorkspaceResultOperation(host, verifyCurrentUnoRenderedArtifact, 'file-visual-version-failed'),
+    recordOfficeVisualQaProgress: bindNodeFileWorkspaceResultOperation(host, recordOfficeVisualQaProgress, 'file-visual-report-failed'),
+    readUnoDraft: bindNodeFileWorkspaceResultOperation(host, readUnoDraft, 'file-read-failed'),
+    planFileArtifact: bindNodeFileWorkspaceResultOperation(host, planFileArtifact, 'file-plan-failed'),
+    generateUnoFileArtifact: bindNodeFileWorkspaceResultOperation(host, generateUnoFileArtifact, 'file-generate-failed'),
+    editUnoFileArtifact: bindNodeFileWorkspaceResultOperation(host, editUnoFileArtifact, 'file-edit-failed'),
+    renderFileArtifact: bindNodeFileWorkspaceResultOperation(host, renderFileArtifact, 'file-render-failed'),
     async health() {
       const [download, conversion] = await Promise.all([
         host.downloader.health(),

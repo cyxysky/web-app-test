@@ -106,6 +106,7 @@ export type CapabilitySettingDefinition<TSection extends string = string> = {
   options?: ReadonlyArray<{ label: string; value: string }>;
   picker?: 'directory';
   secret?: boolean;
+  hidden?: boolean;
   emptyUsesDefault?: boolean;
   valueAliases?: Readonly<Record<string, string>>;
 };

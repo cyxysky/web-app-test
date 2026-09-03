@@ -1,0 +1,21 @@
+{
+  "name": "@webpilot/capability-data",
+  "version": "0.1.0",
+  "description": "Framework-neutral structured data capability with TypeORM-backed SQL sources.",
+  "type": "module",
+  "sideEffects": false,
+  "files": ["dist", "README.md"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./typeorm": { "types": "./dist/typeorm.d.ts", "import": "./dist/typeorm.js" },
+    "./mcp": { "types": "./dist/mcp.d.ts", "import": "./dist/mcp.js" },
+    "./runtime-skill": { "types": "./dist/runtime-skill.d.ts", "import": "./dist/runtime-skill.js" },
+    "./settings": { "types": "./dist/settings.d.ts", "import": "./dist/settings.js" }
+  },
+  "scripts": { "build": "tsc -p tsconfig.build.json", "prepack": "npm run build" },
+  "dependencies": { "@webpilot/capability-adapter-mcp": "0.1.0", "@webpilot/capability-sdk": "0.1.0", "zod": "^4.4.3" },
+  "peerDependencies": { "typeorm": ">=0.3.20 <2" },
+  "peerDependenciesMeta": { "typeorm": { "optional": true } },
+  "engines": { "node": ">=22.16" },
+  "publishConfig": { "access": "public" }
+}

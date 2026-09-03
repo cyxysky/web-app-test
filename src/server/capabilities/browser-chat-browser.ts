@@ -21,7 +21,7 @@ export function createBrowserChatBrowserCapability(
   options: BrowserChatBrowserCapabilityOptions,
 ) {
   return createBrowserCapability({
-    createOperations: () => createNodeBrowserOperations({
+    createOperations: (context) => createNodeBrowserOperations({
       session: options.session,
       runId: options.runId,
       stepIndex: options.stepIndex,
@@ -29,6 +29,7 @@ export function createBrowserChatBrowserCapability(
       credentials: options.getCredentialBindings || options.credentialBindings,
       imageInputAvailable: options.imageInputAvailable,
       validateCode: browserCodeServiceFileDeliveryViolation,
+      configuration: context.configuration,
     }),
   });
 }

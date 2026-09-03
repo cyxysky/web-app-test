@@ -86,6 +86,156 @@
       "@webpilot/capability-chart/mcp": [
         "./packages/capability-chart/src/mcp.ts"
       ],
+      "@webpilot/capability-code-sandbox": [
+        "./packages/capability-code-sandbox/src/index.ts"
+      ],
+      "@webpilot/capability-code-sandbox/node": [
+        "./packages/capability-code-sandbox/src/node.ts"
+      ],
+      "@webpilot/capability-code-sandbox/runtime-skill": [
+        "./packages/capability-code-sandbox/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-code-sandbox/settings": [
+        "./packages/capability-code-sandbox/src/settings.ts"
+      ],
+      "@webpilot/capability-code-sandbox/mcp": [
+        "./packages/capability-code-sandbox/src/mcp.ts"
+      ],
+      "@webpilot/capability-research": [
+        "./packages/capability-research/src/index.ts"
+      ],
+      "@webpilot/capability-research/node": [
+        "./packages/capability-research/src/node.ts"
+      ],
+      "@webpilot/capability-research/runtime-skill": [
+        "./packages/capability-research/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-research/settings": [
+        "./packages/capability-research/src/settings.ts"
+      ],
+      "@webpilot/capability-research/mcp": [
+        "./packages/capability-research/src/mcp.ts"
+      ],
+      "@webpilot/capability-connectors": [
+        "./packages/capability-connectors/src/index.ts"
+      ],
+      "@webpilot/capability-connectors/node": [
+        "./packages/capability-connectors/src/node.ts"
+      ],
+      "@webpilot/capability-connectors/runtime-skill": [
+        "./packages/capability-connectors/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-connectors/settings": [
+        "./packages/capability-connectors/src/settings.ts"
+      ],
+      "@webpilot/capability-connectors/mcp": [
+        "./packages/capability-connectors/src/mcp.ts"
+      ],
+      "@webpilot/capability-knowledge": [
+        "./packages/capability-knowledge/src/index.ts"
+      ],
+      "@webpilot/capability-knowledge/node": [
+        "./packages/capability-knowledge/src/node.ts"
+      ],
+      "@webpilot/capability-knowledge/runtime-skill": [
+        "./packages/capability-knowledge/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-knowledge/settings": [
+        "./packages/capability-knowledge/src/settings.ts"
+      ],
+      "@webpilot/capability-knowledge/mcp": [
+        "./packages/capability-knowledge/src/mcp.ts"
+      ],
+      "@webpilot/capability-data": [
+        "./packages/capability-data/src/index.ts"
+      ],
+      "@webpilot/capability-data/typeorm": [
+        "./packages/capability-data/src/typeorm.ts"
+      ],
+      "@webpilot/capability-data/runtime-skill": [
+        "./packages/capability-data/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-data/settings": [
+        "./packages/capability-data/src/settings.ts"
+      ],
+      "@webpilot/capability-data/mcp": [
+        "./packages/capability-data/src/mcp.ts"
+      ],
+      "@webpilot/capability-media": [
+        "./packages/capability-media/src/index.ts"
+      ],
+      "@webpilot/capability-media/node": [
+        "./packages/capability-media/src/node.ts"
+      ],
+      "@webpilot/capability-media/runtime-skill": [
+        "./packages/capability-media/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-media/settings": [
+        "./packages/capability-media/src/settings.ts"
+      ],
+      "@webpilot/capability-media/mcp": [
+        "./packages/capability-media/src/mcp.ts"
+      ],
+      "@webpilot/capability-communication": [
+        "./packages/capability-communication/src/index.ts"
+      ],
+      "@webpilot/capability-communication/node": [
+        "./packages/capability-communication/src/node.ts"
+      ],
+      "@webpilot/capability-communication/runtime-skill": [
+        "./packages/capability-communication/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-communication/settings": [
+        "./packages/capability-communication/src/settings.ts"
+      ],
+      "@webpilot/capability-communication/mcp": [
+        "./packages/capability-communication/src/mcp.ts"
+      ],
+      "@webpilot/capability-git": [
+        "./packages/capability-git/src/index.ts"
+      ],
+      "@webpilot/capability-git/node": [
+        "./packages/capability-git/src/node.ts"
+      ],
+      "@webpilot/capability-git/runtime-skill": [
+        "./packages/capability-git/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-git/settings": [
+        "./packages/capability-git/src/settings.ts"
+      ],
+      "@webpilot/capability-git/mcp": [
+        "./packages/capability-git/src/mcp.ts"
+      ],
+      "@webpilot/capability-computer": [
+        "./packages/capability-computer/src/index.ts"
+      ],
+      "@webpilot/capability-computer/node": [
+        "./packages/capability-computer/src/node.ts"
+      ],
+      "@webpilot/capability-computer/runtime-skill": [
+        "./packages/capability-computer/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-computer/settings": [
+        "./packages/capability-computer/src/settings.ts"
+      ],
+      "@webpilot/capability-computer/mcp": [
+        "./packages/capability-computer/src/mcp.ts"
+      ],
+      "@webpilot/capability-workflow": [
+        "./packages/capability-workflow/src/index.ts"
+      ],
+      "@webpilot/capability-workflow/node": [
+        "./packages/capability-workflow/src/node.ts"
+      ],
+      "@webpilot/capability-workflow/runtime-skill": [
+        "./packages/capability-workflow/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-workflow/settings": [
+        "./packages/capability-workflow/src/settings.ts"
+      ],
+      "@webpilot/capability-workflow/mcp": [
+        "./packages/capability-workflow/src/mcp.ts"
+      ],
       "@webpilot/capability-file": [
         "./packages/capability-file/src/index.ts"
       ],

@@ -33,7 +33,7 @@ const browserCodeParser = z.object({
 const waitForHumanVerificationParser = z.object({
   action: z.literal('waitForHumanVerification'),
   reason,
-  maxMs: z.number().int().positive().optional(),
+  maxMs: z.number().int().min(1_000).max(30 * 60_000).optional(),
 }).strict();
 // Keep the provider-facing JSON Schema flat. Several OpenAI-compatible models
 // treat the first `oneOf` branch as a default and then keep emitting `state`
@@ -48,7 +48,7 @@ const browserParser = z.object({
     'Required only when action=code. JavaScript executed in the persistent Playwright runtime.',
   ),
   maxOutputChars: z.number().int().min(1_000).optional().describe('Optional only when action=code.'),
-  maxMs: z.number().int().positive().optional().describe('Optional only when action=waitForHumanVerification.'),
+  maxMs: z.number().int().min(1_000).max(30 * 60_000).optional().describe('Optional only when action=waitForHumanVerification.'),
 }).strict();
 
 /**

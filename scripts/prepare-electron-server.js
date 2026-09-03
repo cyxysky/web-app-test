@@ -30,6 +30,10 @@ copyInto(
   path.join(root, 'packages', 'capability-browser', 'runtime'),
   path.join(serverOutput, 'capability-runtime', 'browser'),
 );
+copyInto(
+  path.join(root, 'packages', 'capability-computer', 'runtime'),
+  path.join(serverOutput, 'capability-runtime', 'computer'),
+);
 
 if (
   !fs.existsSync(path.join(serverOutput, '.next', 'BUILD_ID'))

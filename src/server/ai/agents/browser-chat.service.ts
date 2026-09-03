@@ -2191,7 +2191,7 @@ export function subscribeBrowserChatUIStream(
   clientMessageId: string,
   listener: BrowserChatUIStreamListener,
 ) {
-  const publishedOutputCycleIds = new Set<string>();
+  const publishedOutputCycleSignatures = new Map<string, string>();
   const wrapped: BrowserChatUIStreamListener = (update) => {
     const currentSession = sessions.get(sessionId);
     const message = update.message?.clientMessageId === clientMessageId
@@ -2201,8 +2201,11 @@ export function subscribeBrowserChatUIStream(
         ));
     const outputCycles = message
       ? update.outputCycles
-          .filter((cycle) => cycle.messageId === message.id && !publishedOutputCycleIds.has(cycle.id))
           .map(compactOutputCycleForRealtime)
+          .filter((cycle) => (
+            cycle.messageId === message.id
+            && publishedOutputCycleSignatures.get(cycle.id) !== JSON.stringify(cycle)
+          ))
       : [];
     listener({
       message,
@@ -2216,7 +2219,9 @@ export function subscribeBrowserChatUIStream(
         ? update.subagents.filter((subagent) => subagent.messageId === message.id)
         : [],
     });
-    for (const cycle of outputCycles) publishedOutputCycleIds.add(cycle.id);
+    for (const cycle of outputCycles) {
+      publishedOutputCycleSignatures.set(cycle.id, JSON.stringify(cycle));
+    }
   };
   const listeners = uiStreamListeners.get(sessionId) || new Set<BrowserChatUIStreamListener>();
   listeners.add(wrapped);
@@ -4381,19 +4386,36 @@ function updateAssistantMessage(
   markMessageDirty(session, session.messages[index]);
 }
 
-function appendBrowserChatOutputCycle(session: BrowserChatSessionRecord, cycle: BrowserChatAiOutputCycle) {
+function upsertBrowserChatOutputCycle(session: BrowserChatSessionRecord, cycle: BrowserChatAiOutputCycle) {
   const outputCycles = session.outputCycles || [];
   const lastSequence = outputCycles.reduce((highest, item) => (
     typeof item.sequence === 'number' && Number.isFinite(item.sequence)
       ? Math.max(highest, item.sequence)
       : highest
   ), 0);
-  session.outputCycles = trimBrowserChatOutputCycles([...outputCycles, {
+  const existingIndex = outputCycles.findIndex((item) => item.id === cycle.id);
+  const existing = existingIndex >= 0 ? outputCycles[existingIndex] : undefined;
+  const updated = {
+    ...existing,
     ...cycle,
-    sequence: cycle.sequence ?? lastSequence + 1,
-    createdAt: cycle.createdAt || now(),
-  }]);
+    sequence: cycle.sequence ?? existing?.sequence ?? lastSequence + 1,
+    createdAt: cycle.createdAt || existing?.createdAt || now(),
+  };
+  if (existingIndex < 0) session.outputCycles = trimBrowserChatOutputCycles([...outputCycles, updated]);
+  else {
+    const next = [...outputCycles];
+    next[existingIndex] = updated;
+    session.outputCycles = trimBrowserChatOutputCycles(next);
+  }
   session.updatedAt = now();
+}
+
+function browserChatStreamingOutputCycleId(
+  messageId: string,
+  runtimeStepIndex: number,
+  agentStepIndex: number,
+) {
+  return `cycle_stream_${messageId}_${runtimeStepIndex}_${agentStepIndex}`;
 }
 
 function upsertBrowserChatSubagent(session: BrowserChatSessionRecord, record: BrowserChatSubagentRecord) {
@@ -5327,6 +5349,7 @@ async function executeBrowserChatSubagentBatch(input: {
       const executeChildAttempt = (attemptNumber: number, retryReason = '') => executeInteractiveBrowserTurn({
         session: activeChild,
         runId: `${session.id}_${task.id}`,
+        userId: session.userId,
         turnId: `${assistantMessageId}:subagent:${task.id}:attempt:${attemptNumber}`,
         targetUrl: task.url || session.targetUrl || activeChild.currentUrl() || 'about:blank',
         instruction: task.instruction,
@@ -5575,6 +5598,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     const result = await withModelSettings(await browserChatModelSettings(session.modelProvider, session.model), () => executeInteractiveBrowserTurn({
       session: binding.browser,
       runId: `${session.id}_${binding.id}_verification_resume`,
+      userId: session.userId,
       turnId: `${assistantMessageId}:subagent:${binding.id}:verification-resume`,
       targetUrl: binding.task.url || binding.browser.currentUrl() || session.targetUrl || 'about:blank',
       instruction: `${binding.task.instruction}\n\n[系统续跑] 用户已完成当前可见页面的人工校验，请立即读取最新页面并从暂停点继续。`,
@@ -5797,6 +5821,7 @@ async function runBrowserChatMessage(
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
+        userId: session.userId,
         turnId: assistantMessageId,
         targetUrl: session.targetUrl || 'about:blank',
         instruction: text,
@@ -5835,13 +5860,27 @@ async function runBrowserChatMessage(
         readFile: (input) => readFileForSession(session, input, historicalMessages),
         readFileVisuals: (input) => readFileVisualsForSession(session, input),
         attachmentBindings: browserCodeAttachmentBindingsForSession(session, historicalMessages),
-        onTextStream: ({ blocks, text: streamedText }) => {
+        onTextStream: ({ agentStepIndex, blocks, runtimeStepIndex, text: streamedText }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           const timestamp = now();
+          if (!blocks?.length && streamedText) {
+            upsertBrowserChatOutputCycle(session, {
+              id: browserChatStreamingOutputCycleId(assistantMessageId, runtimeStepIndex, agentStepIndex),
+              messageId: assistantMessageId,
+              output: {
+                parts: [{ index: 0, kind: 'text' }],
+                reasoning: [],
+                texts: [streamedText],
+                tools: [],
+              },
+              stepIndex: runtimeStepIndex,
+              agentStepIndex,
+            });
+          }
           updateAssistantMessage(session, assistantMessageId, (message) => {
             const updated: BrowserChatMessage = {
               ...message,
-              content: streamedText,
+              ...(blocks?.length ? { content: streamedText } : {}),
               activity: {
                 phase: 'ai:text:streaming',
                 label: 'AI 正在生成回复',
@@ -5951,7 +5990,17 @@ async function runBrowserChatMessage(
             phase: event.phase,
             stepIndex: event.stepIndex,
           });
-          if (outputCycle) appendBrowserChatOutputCycle(session, outputCycle);
+          if (outputCycle) {
+            const streamingCycle = (session.outputCycles || []).find((cycle) => (
+              cycle.messageId === assistantMessageId
+              && cycle.stepIndex === outputCycle.stepIndex
+              && cycle.agentStepIndex === outputCycle.agentStepIndex
+              && cycle.id.startsWith('cycle_stream_')
+            ));
+            upsertBrowserChatOutputCycle(session, streamingCycle
+              ? { ...outputCycle, id: streamingCycle.id }
+              : outputCycle);
+          }
           const persistImmediately = event.phase === 'ai:runtime:attempt-failed'
             || event.phase === 'ai:runtime:retry'
             || event.phase === 'ai:runtime:retry-exhausted'

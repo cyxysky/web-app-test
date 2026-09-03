@@ -44,10 +44,15 @@ type ManagedBrowserSession = {
   runId: string;
   session: BrowserSession;
   stepIndex: number;
+  queue: Promise<void>;
+  idleTimer?: ReturnType<typeof setTimeout>;
+  closing: boolean;
 };
 
 export type BrowserMcpSessionManagerOptions = {
   maxSessions?: number;
+  /** Closes forgotten sessions after inactivity. Set to 0 to disable expiry. */
+  idleTimeoutMs?: number;
   sessionOptions?: BrowserSessionOptions;
 };
 
@@ -83,10 +88,18 @@ function browserResult(
 export class BrowserMcpSessionManager {
   readonly #sessions = new Map<string, ManagedBrowserSession>();
   readonly #maxSessions: number;
+  readonly #idleTimeoutMs: number;
   #openingSessions = 0;
 
   constructor(private readonly options: BrowserMcpSessionManagerOptions = {}) {
-    this.#maxSessions = Math.max(1, Math.min(100, Math.floor(options.maxSessions || 8)));
+    const configuredMaxSessions = Number(options.maxSessions ?? 8);
+    this.#maxSessions = Number.isFinite(configuredMaxSessions)
+      ? Math.max(1, Math.min(100, Math.floor(configuredMaxSessions)))
+      : 8;
+    const configuredIdleTimeout = Number(options.idleTimeoutMs ?? 15 * 60_000);
+    this.#idleTimeoutMs = Number.isFinite(configuredIdleTimeout)
+      ? Math.max(0, Math.min(24 * 60 * 60_000, Math.floor(configuredIdleTimeout)))
+      : 15 * 60_000;
   }
 
   async open(inputValue: z.infer<typeof openParser>): Promise<CapabilityResult> {
@@ -118,7 +131,15 @@ export class BrowserMcpSessionManager {
           return browserResult(id, result);
         }
       }
-      this.#sessions.set(id, { runId, session, stepIndex: 0 });
+      const managed: ManagedBrowserSession = {
+        runId,
+        session,
+        stepIndex: 0,
+        queue: Promise.resolve(),
+        closing: false,
+      };
+      this.#sessions.set(id, managed);
+      this.#armIdleTimer(id, managed);
       return {
         ok: true,
         summary: inputValue.url
@@ -147,16 +168,16 @@ export class BrowserMcpSessionManager {
     inputValue: z.infer<typeof codeParser>,
     abortSignal?: AbortSignal,
   ): Promise<CapabilityResult> {
-    const managed = this.#sessions.get(inputValue.browserSessionId);
-    if (!managed) return this.#missing(inputValue.browserSessionId);
-    managed.stepIndex += 1;
-    return browserResult(inputValue.browserSessionId, await managed.session.executeBrowserCode({
-      code: inputValue.code,
-      maxOutputChars: inputValue.maxOutputChars,
-      runId: managed.runId,
-      stepIndex: managed.stepIndex,
-      abortSignal,
-    }));
+    return this.#enqueue(inputValue.browserSessionId, async (managed) => {
+      managed.stepIndex += 1;
+      return browserResult(inputValue.browserSessionId, await managed.session.executeBrowserCode({
+        code: inputValue.code,
+        maxOutputChars: inputValue.maxOutputChars,
+        runId: managed.runId,
+        stepIndex: managed.stepIndex,
+        abortSignal,
+      }));
+    });
   }
 
   snapshot(
@@ -172,8 +193,12 @@ export class BrowserMcpSessionManager {
 
   async close(id: string): Promise<CapabilityResult> {
     const managed = this.#sessions.get(id);
-    if (!managed) return this.#missing(id);
-    this.#sessions.delete(id);
+    if (!managed || managed.closing) return this.#missing(id);
+    managed.closing = true;
+    if (managed.idleTimer) clearTimeout(managed.idleTimer);
+    managed.idleTimer = undefined;
+    await managed.queue;
+    if (this.#sessions.get(id) === managed) this.#sessions.delete(id);
     await managed.session.close({ force: true });
     return {
       ok: true,
@@ -185,7 +210,44 @@ export class BrowserMcpSessionManager {
   async dispose() {
     const sessions = [...this.#sessions.values()];
     this.#sessions.clear();
-    await Promise.allSettled(sessions.map(({ session }) => session.close({ force: true })));
+    for (const managed of sessions) {
+      managed.closing = true;
+      if (managed.idleTimer) clearTimeout(managed.idleTimer);
+      managed.idleTimer = undefined;
+    }
+    await Promise.allSettled(sessions.map(async (managed) => {
+      await managed.queue;
+      await managed.session.close({ force: true });
+    }));
+  }
+
+  #enqueue(
+    id: string,
+    operation: (managed: ManagedBrowserSession) => Promise<CapabilityResult>,
+  ): Promise<CapabilityResult> {
+    const managed = this.#sessions.get(id);
+    if (!managed || managed.closing) return Promise.resolve(this.#missing(id));
+    if (managed.idleTimer) clearTimeout(managed.idleTimer);
+    managed.idleTimer = undefined;
+    const scheduled = managed.queue.then(() => operation(managed));
+    const tail = scheduled.then(() => undefined, () => undefined);
+    managed.queue = tail;
+    void tail.then(() => {
+      if (managed.queue === tail && !managed.closing && this.#sessions.get(id) === managed) {
+        this.#armIdleTimer(id, managed);
+      }
+    });
+    return scheduled;
+  }
+
+  #armIdleTimer(id: string, managed: ManagedBrowserSession) {
+    if (!this.#idleTimeoutMs || managed.closing || this.#sessions.get(id) !== managed) return;
+    if (managed.idleTimer) clearTimeout(managed.idleTimer);
+    managed.idleTimer = setTimeout(() => {
+      managed.idleTimer = undefined;
+      void this.close(id).catch(() => undefined);
+    }, this.#idleTimeoutMs);
+    managed.idleTimer.unref?.();
   }
 
   #missing(id: string): CapabilityResult {
@@ -207,6 +269,7 @@ export type BrowserMcpOptions = {
   skillMode?: CapabilityMcpServerOptions['skillMode'];
   skillToolName?: CapabilityMcpServerOptions['skillToolName'];
   maxSessions?: number;
+  idleTimeoutMs?: number;
   sessionOptions?: BrowserSessionOptions | ((context: CapabilityRunContext) => BrowserSessionOptions | Promise<BrowserSessionOptions>);
 };
 
@@ -235,7 +298,14 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
         : options.sessionOptions;
       const manager = new BrowserMcpSessionManager({
         maxSessions: options.maxSessions,
-        sessionOptions,
+        idleTimeoutMs: options.idleTimeoutMs,
+        sessionOptions: {
+          ...sessionOptions,
+          configuration: {
+            ...context.configuration,
+            ...sessionOptions?.configuration,
+          },
+        },
       });
       return {
         tools: {

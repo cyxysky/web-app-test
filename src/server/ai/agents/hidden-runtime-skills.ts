@@ -3,6 +3,16 @@ import type { CapabilitySkill } from '@webpilot/capability-sdk';
 import { browserCapabilityManifest } from '@webpilot/capability-browser';
 import { fileCapabilityManifest } from '@webpilot/capability-file';
 import { chartCapabilityManifest } from '@webpilot/capability-chart';
+import { codeSandboxCapabilityManifest } from '@webpilot/capability-code-sandbox';
+import { communicationCapabilityManifest } from '@webpilot/capability-communication';
+import { computerCapabilityManifest } from '@webpilot/capability-computer';
+import { connectorsCapabilityManifest } from '@webpilot/capability-connectors';
+import { dataCapabilityManifest } from '@webpilot/capability-data';
+import { gitCapabilityManifest } from '@webpilot/capability-git';
+import { knowledgeCapabilityManifest } from '@webpilot/capability-knowledge';
+import { mediaCapabilityManifest } from '@webpilot/capability-media';
+import { researchCapabilityManifest } from '@webpilot/capability-research';
+import { workflowCapabilityManifest } from '@webpilot/capability-workflow';
 import { subagentRuntimeSkill } from './subagent-runtime-skill';
 
 function manifestRuntimeSkill(manifest: { id: string; skills?: readonly CapabilitySkill[] }) {
@@ -14,6 +24,27 @@ function manifestRuntimeSkill(manifest: { id: string; skills?: readonly Capabili
 const browserRuntimeSkill = manifestRuntimeSkill(browserCapabilityManifest);
 const fileRuntimeSkill = manifestRuntimeSkill(fileCapabilityManifest);
 const chartCapabilityRuntimeSkill = manifestRuntimeSkill(chartCapabilityManifest);
+const infrastructureRuntimeSkills = [
+  codeSandboxCapabilityManifest,
+  researchCapabilityManifest,
+  connectorsCapabilityManifest,
+  knowledgeCapabilityManifest,
+  dataCapabilityManifest,
+  mediaCapabilityManifest,
+  communicationCapabilityManifest,
+  gitCapabilityManifest,
+  computerCapabilityManifest,
+  workflowCapabilityManifest,
+].map(manifestRuntimeSkill);
+
+// These capability tools are always visible to the model. Skill enforcement is
+// owned by the Agent runtime below, not by the capability packages themselves.
+const defaultVisibleCapabilityToolNames: ReadonlySet<string> = new Set([
+  browserRuntimeSkill,
+  fileRuntimeSkill,
+  chartCapabilityRuntimeSkill,
+  ...infrastructureRuntimeSkills,
+].flatMap((skill) => (skill.activation || []).map((activation) => activation.toolName)));
 
 type HiddenRuntimeSkillPolicy = {
   skillId: string;
@@ -31,6 +62,7 @@ const hiddenRuntimeSkills: Readonly<Record<string, CapabilitySkill>> = Object.fr
   fileRuntimeSkill,
   subagentRuntimeSkill,
   chartCapabilityRuntimeSkill,
+  ...infrastructureRuntimeSkills,
 ].map((skill) => [skill.id, skill])));
 
 export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSkillPolicy>> = Object.freeze(
@@ -54,7 +86,12 @@ export function hiddenRuntimeSkillSummaries() {
     fileRuntimeSkill.summary,
     subagentRuntimeSkill.summary,
     chartCapabilityRuntimeSkill.summary,
+    ...infrastructureRuntimeSkills.map((skill) => skill.summary),
   ].join('\n');
+}
+
+export function hiddenRuntimeSkillIds() {
+  return Object.keys(hiddenRuntimeSkills);
 }
 
 export function hiddenRuntimeSkillContent(skillId: string) {
@@ -95,13 +132,18 @@ export function requireHiddenRuntimeSkillRead(
 ): BrowserActionResult | undefined {
   const requiredSkillId = requiredHiddenRuntimeSkillId(toolName, input);
   if (!requiredSkillId || loadedSkillIds.has(requiredSkillId)) return undefined;
+  const skillContent = hiddenRuntimeSkillContent(requiredSkillId);
+  if (skillContent) loadedSkillIds.add(requiredSkillId);
   return {
     ok: false,
     actual: JSON.stringify({
       ok: false,
-      code: 'RUNTIME_SKILL_READ_REQUIRED',
-      error: `Read required runtime Skill ${requiredSkillId} before calling ${toolName}. The governed operation was not executed.`,
+      code: skillContent ? 'RUNTIME_SKILL_CONTENT_RETURNED' : 'RUNTIME_SKILL_READ_REQUIRED',
+      error: skillContent
+        ? `The Agent returned required runtime Skill ${requiredSkillId} instead of executing ${toolName}. Read it, then retry the tool in the next model step.`
+        : `Read required runtime Skill ${requiredSkillId} before calling ${toolName}. The governed operation was not executed.`,
       requiredSkillId,
+      ...(skillContent ? { skillContent } : {}),
     }, null, 2),
     failureCategory: 'skill-read-required',
     requiredSkillId,
@@ -114,6 +156,7 @@ export function runtimeToolTypesWithLoadedSkills(
   options: { allowSubagentRead?: boolean } = {},
 ) {
   return toolTypes.filter((toolName) => {
+    if (defaultVisibleCapabilityToolNames.has(toolName)) return true;
     // subagent action=read must remain available for collecting a result after
     // a resume. action=spawn is still rejected by requireHiddenRuntimeSkillRead.
     if (toolName === 'subagent' && options.allowSubagentRead) return true;

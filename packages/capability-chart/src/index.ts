@@ -2,39 +2,29 @@ import { z } from 'zod';
 import {
   defineCapabilityInput,
   defineCapabilityTool,
-  jsonRecordFromUnknown,
   type CapabilityHealth,
   type CapabilityManifest,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
 } from '@webpilot/capability-sdk';
+import {
+  maxChartBytes,
+  normalizeChartMaps,
+  normalizeChartOption,
+  type ChartOptionValidator,
+  type ChartRecord,
+  type CreateChartRecordInput,
+} from './core.js';
 import { chartCapabilitySettings } from './settings.js';
 import { chartCapabilityRuntimeSkill } from './runtime-skill.js';
+export * from './core.js';
 export * from './runtime-skill.js';
 export * from './settings.js';
 
 export const chartCapabilityToolNames = Object.freeze({
   chart: 'chart',
 } as const);
-
-export type EChartsMapRegistration = {
-  geoJson: Record<string, unknown> | string;
-  name: string;
-  specialAreas?: Record<string, unknown>;
-};
-
-export type ChartRecord = {
-  chartId: string;
-  createdAt: string;
-  description?: string;
-  height: number;
-  maps?: EChartsMapRegistration[];
-  option: Record<string, unknown>;
-  renderer: 'canvas' | 'svg';
-  title?: string;
-  version: 2;
-};
 
 type EChartsApiModule = {
   examples: Array<Record<string, unknown>>;
@@ -44,21 +34,6 @@ type EChartsApiModule = {
   summary: string;
   title: string;
 };
-
-const maxChartBytes = 4 * 1024 * 1024;
-
-export type CreateChartRecordInput = Omit<ChartRecord, 'chartId' | 'createdAt'>;
-
-export type ChartOptionValidationInput = {
-  height: number;
-  maps?: EChartsMapRegistration[];
-  option: Record<string, unknown>;
-  renderer: 'canvas' | 'svg';
-};
-
-export type ChartOptionValidator = (
-  input: ChartOptionValidationInput,
-) => Promise<void> | void;
 
 export interface ChartArtifactStore {
   create(input: CreateChartRecordInput): Promise<ChartRecord>;
@@ -278,102 +253,6 @@ const apiModules: EChartsApiModule[] = [
   },
 ];
 
-function serializableClone<T>(value: T, fieldName: string): T {
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(value);
-  } catch {
-    throw new Error(`${fieldName} must be JSON-serializable.`);
-  }
-  if (serialized === undefined) throw new Error(`${fieldName} must be JSON-serializable.`);
-  return JSON.parse(serialized) as T;
-}
-
-function hasOptionComponent(option: Record<string, unknown>, component: string) {
-  const value = option[component];
-  return Array.isArray(value) ? value.length > 0 : Boolean(jsonRecordFromUnknown(value));
-}
-
-const linesCoordinateComponents = Object.freeze({
-  calendar: ['calendar'],
-  cartesian2d: ['xAxis', 'yAxis'],
-  geo: ['geo'],
-  matrix: ['matrix'],
-  polar: ['polar', 'radiusAxis', 'angleAxis'],
-} satisfies Record<string, readonly string[]>);
-
-export function normalizeChartOption(value: unknown) {
-  const option = jsonRecordFromUnknown(value);
-  if (!option) throw new Error('action=create requires option as an ECharts option object.');
-  const series = option.series;
-  const hasSeries = Array.isArray(series) ? series.length > 0 : Boolean(jsonRecordFromUnknown(series));
-  const hasGraphic = Array.isArray(option.graphic) ? option.graphic.length > 0 : Boolean(jsonRecordFromUnknown(option.graphic));
-  if (!hasSeries && !hasGraphic) throw new Error('option must contain at least one series item or one graphic element.');
-  const graphic = jsonRecordFromUnknown(option.graphic);
-  if (graphic && typeof graphic.type !== 'string' && !Array.isArray(graphic.elements)) {
-    throw new Error('option.graphic must be an element, an element array, or an object with an elements array.');
-  }
-  const seriesItems = Array.isArray(series) ? series : series === undefined ? [] : [series];
-  for (const [index, item] of seriesItems.entries()) {
-    const seriesItem = jsonRecordFromUnknown(item);
-    if (!seriesItem || typeof seriesItem.type !== 'string' || !seriesItem.type.trim()) {
-      throw new Error(`option.series[${index}].type must be a non-empty ECharts series type.`);
-    }
-    if (seriesItem.data !== undefined && !Array.isArray(seriesItem.data)) {
-      throw new Error(`option.series[${index}].data must be an array when provided.`);
-    }
-    const type = String(seriesItem.type).trim();
-    if (type === 'custom') {
-      throw new Error(`option.series[${index}] uses custom without a JSON-safe renderItem. Use option.graphic for static custom visuals.`);
-    }
-    if (type === 'lines') {
-      const coordinateSystem = typeof seriesItem.coordinateSystem === 'string' && seriesItem.coordinateSystem.trim()
-        ? seriesItem.coordinateSystem.trim()
-        : 'geo';
-      const requiredComponents = linesCoordinateComponents[coordinateSystem as keyof typeof linesCoordinateComponents];
-      if (!requiredComponents) {
-        throw new Error(`option.series[${index}].coordinateSystem ${JSON.stringify(coordinateSystem)} is not supported by the bundled ECharts lines series.`);
-      }
-      const missingComponents = requiredComponents.filter((component) => !hasOptionComponent(option, component));
-      if (missingComponents.length) {
-        throw new Error(`option.series[${index}] lines coordinateSystem ${JSON.stringify(coordinateSystem)} requires option.${missingComponents.join(' and option.')}.`);
-      }
-      if (Array.isArray(seriesItem.data)) {
-        for (const [dataIndex, dataItem] of seriesItem.data.entries()) {
-          const coords = jsonRecordFromUnknown(dataItem)?.coords;
-          if (!Array.isArray(coords) || coords.length < 2 || coords.some((point) => !Array.isArray(point) || point.length < 2)) {
-            throw new Error(`option.series[${index}].data[${dataIndex}].coords must contain at least two coordinate arrays.`);
-          }
-        }
-      }
-    }
-    if (type === 'chord') {
-      const links = seriesItem.links ?? seriesItem.edges;
-      if (!Array.isArray(links) || links.length === 0) {
-        throw new Error(`option.series[${index}] chord requires a non-empty links or edges array.`);
-      }
-    }
-  }
-  return serializableClone(option, 'option');
-}
-
-function normalizeMaps(value: unknown): EChartsMapRegistration[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error('maps must be an array.');
-  if (value.length > 12) throw new Error('maps supports at most 12 registrations per chart.');
-  const maps = value.map((item, index) => {
-    const map = jsonRecordFromUnknown(item);
-    const name = typeof map?.name === 'string' ? map.name.trim() : '';
-    const geoJson = map?.geoJson;
-    if (!name) throw new Error(`maps[${index}].name is required.`);
-    if (!(typeof geoJson === 'string' && geoJson.trim()) && !jsonRecordFromUnknown(geoJson)) throw new Error(`maps[${index}].geoJson must be a GeoJSON object or SVG XML string.`);
-    const specialAreas = map?.specialAreas === undefined ? undefined : jsonRecordFromUnknown(map.specialAreas);
-    if (map?.specialAreas !== undefined && !specialAreas) throw new Error(`maps[${index}].specialAreas must be an object.`);
-    return { name, geoJson: geoJson as Record<string, unknown> | string, specialAreas };
-  });
-  return serializableClone(maps, 'maps');
-}
-
 function normalizedText(value: unknown, maxLength: number) {
   if (typeof value !== 'string') return undefined;
   const text = value.trim();
@@ -448,7 +327,7 @@ export async function createChart(store: ChartArtifactStore, input: {
 }, options: { validateOption?: ChartOptionValidator } = {}): Promise<CapabilityResult<{ chartId: string }>> {
   try {
     const option = normalizeChartOption(input.option);
-    const maps = normalizeMaps(input.maps);
+    const maps = normalizeChartMaps(input.maps);
     if (new TextEncoder().encode(JSON.stringify({ maps, option })).byteLength > maxChartBytes) {
       throw new Error('option and maps must be no larger than 4 MB in total.');
     }

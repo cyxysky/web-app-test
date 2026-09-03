@@ -50,6 +50,9 @@ export function capabilityResultToBrowserActionResult(
   }
   const browserResult = browserActionEnvelope(result.data);
   if (browserResult) return browserResult;
+  const referenceImagePaths = result.content?.flatMap((item) => (
+    item.type === 'image' && item.artifactId ? [item.artifactId] : []
+  ));
   return {
     ok: true,
     actual: JSON.stringify({
@@ -60,5 +63,6 @@ export function capabilityResultToBrowserActionResult(
         : result.data === undefined ? {} : { data: result.data }),
       ...(result.content?.length ? { content: result.content } : {}),
     }, null, 2),
+    ...(referenceImagePaths?.length ? { referenceImagePaths } : {}),
   };
 }

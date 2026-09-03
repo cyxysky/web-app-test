@@ -2504,11 +2504,11 @@
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-history-stage {
-    margin-right: -10px;
+    margin-right: -18px;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .browser-chat-conversation-history .browser-chat-recent-list {
-    padding-right: 10px;
+    padding-right: 18px;
     padding-top: 8px;
   }
 
