@@ -21,6 +21,12 @@ settings. A host may pass `screenshotDirectory` when screenshots should be
 published from an application-owned artifact directory; otherwise the package
 uses an isolated temporary directory.
 
+The model-facing `computer` tool uses normalized click coordinates: `x=0` is
+the left edge, `x=1000` is the right edge, `y=0` is the top edge, and `y=1000`
+is the bottom edge of the latest screenshot. The capability converts those
+values back to physical display pixels before calling the driver. This keeps
+clicks aligned when an AI provider resizes an image before visual inference.
+
 ## Remote driver protocol
 
 `AGENT_COMPUTER_ENDPOINT` is an optional advanced override for deployments that
@@ -45,6 +51,11 @@ Example request:
   "timeoutMs": 30000
 }
 ```
+
+The HTTP driver boundary receives physical pixel coordinates. Coordinate
+normalization is handled by the capability tool before this request is sent,
+so existing desktop-driver implementations do not need to implement image
+scaling themselves.
 
 Supported actions are `observe`, `screenshot`, `click`, `type`, `key`,
 `scroll`, and `wait`. An observation response can include `displayId`, `width`,

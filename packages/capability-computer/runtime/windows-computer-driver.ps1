@@ -48,9 +48,11 @@ function Get-VirtualKey([string]$Name) {
     'ALT' = 0x12; 'BACKSPACE' = 0x08; 'CTRL' = 0x11; 'CONTROL' = 0x11
     'DELETE' = 0x2E; 'DOWN' = 0x28; 'END' = 0x23; 'ENTER' = 0x0D
     'ESC' = 0x1B; 'ESCAPE' = 0x1B; 'HOME' = 0x24; 'INSERT' = 0x2D
-    'LEFT' = 0x25; 'META' = 0x5B; 'PAGEDOWN' = 0x22; 'PAGEUP' = 0x21
-    'RIGHT' = 0x27; 'SHIFT' = 0x10; 'SPACE' = 0x20; 'TAB' = 0x09
-    'UP' = 0x26; 'WIN' = 0x5B; 'WINDOWS' = 0x5B; 'COMMAND' = 0x5B
+    'LEFT' = 0x25; 'ARROWLEFT' = 0x25; 'META' = 0x5B; 'SUPER' = 0x5B
+    'PAGEDOWN' = 0x22; 'PAGEUP' = 0x21; 'RETURN' = 0x0D
+    'RIGHT' = 0x27; 'ARROWRIGHT' = 0x27; 'SHIFT' = 0x10; 'SPACE' = 0x20; 'TAB' = 0x09
+    'UP' = 0x26; 'ARROWUP' = 0x26; 'ARROWDOWN' = 0x28
+    'WIN' = 0x5B; 'WINDOWS' = 0x5B; 'COMMAND' = 0x5B; 'CMD' = 0x5B
   }
   if ($known.ContainsKey($normalized)) { return [byte]$known[$normalized] }
   if ($normalized -match '^F([1-9]|1[0-2])$') { return [byte](0x6F + [int]$Matches[1]) }
