@@ -1,3 +1,4 @@
+# Runtime dependencies for @webpilot/capability-sensitive-data.
 fastapi>=0.115,<1
 gliner2[local]==2.0.0
 huggingface-hub>=0.36,<1

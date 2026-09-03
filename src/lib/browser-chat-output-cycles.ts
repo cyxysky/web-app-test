@@ -2,31 +2,19 @@ import type {
   BrowserChatAiOutputCycle,
   BrowserChatAiOutputView,
 } from '@/server/ai/schemas/runtime.schema';
+import {
+  formatToolPayload,
+  parseJsonObjectText,
+  stripAnsiControlCodes,
+} from './browser-chat-format';
 import { asRecord } from './unknown-value';
 
-function stripAnsiControlCodes(value: string) {
-  return value.replace(/\u001B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g, '');
-}
-
-function stringFromUnknown(value: unknown): string {
+export function stringFromUnknown(value: unknown): string {
   if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) return value.map(stringFromUnknown).filter(Boolean).join('\n').trim();
   const record = asRecord(value);
   return record ? stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value) : '';
-}
-
-function parseJsonObjectText(value?: string) {
-  const text = (value || '').trim();
-  if (!text || !text.startsWith('{') || !text.endsWith('}')) return undefined;
-  try {
-    const parsed = JSON.parse(text);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function toolReasonFromInput(input: unknown) {
@@ -72,11 +60,11 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
   const type = String(record.type || '').toLowerCase();
   if (type === 'reasoning') {
-    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning);
+    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
     return { parts: text ? [{ index: 0, kind: 'reasoning' }] : [], reasoning: text ? [text] : [], texts: [], tools: [] };
   }
   if (type === 'text') {
-    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning);
+    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
     return { parts: text ? [{ index: 0, kind: 'text' }] : [], reasoning: [], texts: text ? [text] : [], tools: [] };
   }
   if (type === 'tool-call' || type === 'tool_call') {
@@ -179,16 +167,6 @@ export function browserChatAiOutputViewFromResponse(response: unknown): BrowserC
   return output;
 }
 
-function formatToolPayload(value: unknown) {
-  if (value === undefined || value === null || value === '') return '';
-  if (typeof value === 'string') return stripAnsiControlCodes(value);
-  try {
-    return stripAnsiControlCodes(JSON.stringify(value, null, 2));
-  } catch {
-    return stripAnsiControlCodes(String(value));
-  }
-}
-
 export function compactBrowserChatAiOutputView(output: BrowserChatAiOutputView): BrowserChatAiOutputView {
   const compacted: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
   const seenReasoning = new Set<string>();
@@ -232,7 +210,7 @@ function isCodexRuntimeObjectEnvelope(value: string) {
   return hasMessage || hasParams;
 }
 
-function hasBrowserChatAiOutputView(output: BrowserChatAiOutputView) {
+export function hasAiOutputView(output: BrowserChatAiOutputView) {
   return Boolean(output.reasoning.length || output.texts.length || output.tools.length);
 }
 
@@ -317,7 +295,7 @@ export function browserChatAiOutputCycleFromDebugEvent(input: {
     ));
   }
   const compacted = compactBrowserChatAiOutputView(output);
-  if (!hasBrowserChatAiOutputView(compacted)) return undefined;
+  if (!hasAiOutputView(compacted)) return undefined;
   return {
     id: input.id,
     messageId: input.messageId,

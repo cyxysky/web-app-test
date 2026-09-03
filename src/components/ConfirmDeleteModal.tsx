@@ -1,6 +1,7 @@
 'use client';
 
-import { AlertDialog, Button } from '@heroui/react';
+import { AlertDialog } from '@heroui/react/alert-dialog';
+import { Button } from '@heroui/react/button';
 import { Loader2, Trash2, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';
 

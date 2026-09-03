@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   browserChatSessionNavigationHref,
-  browserChatViewNavigationHref,
   compactBrowserChatSessionForList,
   loadRequestedBrowserChatSessionDetail,
   shouldAcceptBrowserChatViewportPosition,
@@ -47,13 +46,6 @@ test('updates the selected conversation and drops client-declared identity', () 
   assert.equal(
     browserChatSessionNavigationHref('https://example.com/webpilot/browser-chat?userId=42&sessionId=old', ''),
     '/webpilot/browser-chat',
-  );
-});
-
-test('preserves mounted view state without carrying client-declared identity', () => {
-  assert.equal(
-    browserChatViewNavigationHref('/webpilot/settings', 'https://example.com/webpilot/browser-chat?webpilotEmbed=1&userId=42&sessionId=chat-1'),
-    '/webpilot/settings?webpilotEmbed=1&sessionId=chat-1',
   );
 });
 

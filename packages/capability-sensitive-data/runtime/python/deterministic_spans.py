@@ -1,3 +1,5 @@
+"""Deterministic sensitive-span rules shipped with the redaction package."""
+
 from __future__ import annotations
 
 import re

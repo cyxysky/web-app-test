@@ -33,6 +33,15 @@ import {
   sharedBrowserTabsEnabled,
   withSessionTabGrouperArgs,
 } from './browser-session-runtime.js';
+import type {
+  BrowserPageObservation,
+} from './browser-page-observation.js';
+import {
+  applyEditableTextSelection,
+  readEditableText,
+  resolveEditableTextSelection,
+  type BrowserTextSelectionSpec,
+} from './editable-text-selection.js';
 import {
   buildSnapshotViews,
   captureAxSnapshot,
@@ -84,10 +93,6 @@ import {
   resolveBrowserSessionTransportAdapter,
   type BrowserSessionTransportKind,
 } from './browser-session-transport-adapter.js';
-import {
-  resolveEditableTextSelection,
-  type BrowserTextSelectionSpec,
-} from './editable-text-selection.js';
 import {
   closeManagedBrowserSessions,
   installBrowserSessionShutdownHooks,
@@ -180,45 +185,7 @@ export type BrowserSnapshotViews = Partial<Record<BrowserSnapshotView, string>> 
   defaultType?: BrowserSnapshotView;
 };
 
-export type BrowserActiveSurface = {
-  id: string;
-  descriptor: string;
-  kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
-  label: string;
-  modal: boolean;
-  likelyOverlay: boolean;
-  focusedInside: boolean;
-  zIndex: number;
-  rect: {
-    bottom: number;
-    height: number;
-    left: number;
-    right: number;
-    top: number;
-    width: number;
-  };
-  signals: string[];
-  selector?: string;
-  framePath?: string;
-  parentId?: string;
-  depth: number;
-  activationOrder: number;
-};
-
-export type BrowserPageObservation = {
-  epoch: number;
-  url: string;
-  title: string;
-  focusedElement?: {
-    descriptor: string;
-    label: string;
-  };
-  activeSurface?: BrowserActiveSurface;
-  surfaces: BrowserActiveSurface[];
-  surfaceStack: BrowserActiveSurface[];
-  topSurfaceIds: string[];
-  surfaceTransition: 'initial' | 'unchanged' | 'opened' | 'closed' | 'changed';
-};
+export type { BrowserActiveSurface, BrowserPageObservation } from './browser-page-observation.js';
 
 export type BrowserActionResult = {
   ok: boolean;
@@ -228,15 +195,9 @@ export type BrowserActionResult = {
     toolName: string;
     result: BrowserActionResult;
   }>;
-  /** Hidden runtime Skill automatically loaded before this first governed tool call. */
-  loadedRuntimeSkill?: {
-    id: string;
-    content: string;
-    loadedAutomatically: true;
-  };
   /** Stable runtime failure category used for category-specific recovery guidance. */
   failureCategory?: string;
-  /** Hidden runtime Skill whose automatic load failed before this tool call. */
+  /** Runtime Skill required by an Agent-owned execution gate. */
   requiredSkillId?: string;
   /** Browser-owned control mirrored into the remote live-preview surface. */
   liveControl?: BrowserLiveNativeControl;
@@ -696,6 +657,10 @@ type AiDomRuntime = {
   textOf: (element: Element, maxLength?: number) => string;
   recordedEventTypes: (element: Element) => string[];
   hasActionAttribute: (element: Element) => boolean;
+  hasPointerCursor: (element: Element) => boolean;
+  isContentEditableOwner: (element: Element) => boolean;
+  labelControlFor: (element: Element) => Element | undefined;
+  visibleDomHoverElements: () => Set<Element>;
   isActionable: (element: Element) => boolean;
   actionableTargetFor: (element: Element) => Element;
   visibleRect: (element: Element, options?: { requirePointerEvents?: boolean }) => AiDomVisibleRect | undefined;
@@ -703,6 +668,7 @@ type AiDomRuntime = {
   topmostRenderableAt: (x: number, y: number, options?: { requirePointerEvents?: boolean }) => Element | undefined;
   pointBelongsToElement: (element: Element, x: number, y: number, options?: { requirePointerEvents?: boolean }) => boolean;
   visiblePointForElement: (element: Element, options?: { requirePointerEvents?: boolean }) => ({ x: number; y: number } | undefined);
+  scrollState: (element: Element) => ScrollableArea['scroll'];
   visibleDomSnapshot: (options: {
     maxChars: number;
     maxElements: number;
@@ -915,13 +881,9 @@ export type BrowserMouseAction = {
   action: 'click' | 'move' | 'drag' | 'scroll' | 'scrollIntoView';
   abortSignal?: AbortSignal;
   target?: BrowserElementTarget;
-  /** Internal direct-call shorthand; model-facing tools use target. */
-  uid?: string;
   xThousandth?: number;
   yThousandth?: number;
   toTarget?: BrowserElementTarget;
-  /** Internal direct-call shorthand; model-facing tools use toTarget. */
-  toUid?: string;
   toXThousandth?: number;
   toYThousandth?: number;
   button?: 'left' | 'right' | 'middle';
@@ -934,8 +896,6 @@ export type BrowserMouseAction = {
 export type BrowserKeyboardAction = {
   action: 'type' | 'press' | 'shortcut' | 'editText';
   target?: BrowserElementTarget;
-  /** Internal direct-call shorthand; model-facing tools use target. */
-  uid?: string;
   xThousandth?: number;
   yThousandth?: number;
   text?: string;
@@ -1086,8 +1046,6 @@ export type BrowserLiveNativeEvent =
 export type BrowserSelectOptionAction = {
   abortSignal?: AbortSignal;
   target?: BrowserElementTarget;
-  /** Internal direct-call shorthand; model-facing tools use target. */
-  uid?: string;
   value?: string;
   label?: string;
 };
@@ -1664,6 +1622,21 @@ function isPersistentProfileAlreadyOpenError(error: unknown) {
   return /Target page, context or browser has been closed|browser session|user data directory|profile.*in use|already.*open/i.test(message);
 }
 
+async function closeConnectedBrowserProcess(browser?: Browser) {
+  if (!browser) return false;
+  const client = await browser.newBrowserCDPSession().catch(() => undefined);
+  if (!client) return false;
+  const closed = await Promise.race([
+    client.send('Browser.close').then(() => true).catch(() => false),
+    sleep(1000).then(() => false),
+  ]);
+  await Promise.race([
+    client.detach().catch(() => undefined),
+    sleep(500),
+  ]);
+  return closed;
+}
+
 async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: SharedBrowserState, force = false) {
   if (sharedBrowserState.refCount > 0) {
     if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
@@ -1699,19 +1672,7 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
     await browser?.close().catch(() => undefined);
     managedProfileBrowserClosed = true;
   } else if (ownership === 'connected' && (force || process.env.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
-    if (force && browser) {
-      const client = await browser.newBrowserCDPSession().catch(() => undefined);
-      if (client) {
-        managedProfileBrowserClosed = await Promise.race([
-          client.send('Browser.close').then(() => true).catch(() => false),
-          sleep(1000).then(() => false),
-        ]);
-        await Promise.race([
-          client.detach().catch(() => undefined),
-          sleep(500),
-        ]);
-      }
-    }
+    if (force) managedProfileBrowserClosed = await closeConnectedBrowserProcess(browser);
     await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
   }
   await browserServer?.close().catch(() => undefined);
@@ -1828,6 +1789,17 @@ async function acquireSharedBrowser(input: {
       await closeIdleSharedBrowser(runtimeKey, sharedBrowserState, force);
     },
   };
+}
+
+function normalizedOriginSet(values: readonly string[]) {
+  return new Set(values.flatMap((value) => {
+    try {
+      const origin = new URL(value).origin;
+      return origin === 'null' ? [] : [origin];
+    } catch {
+      return [];
+    }
+  }));
 }
 
 export class BrowserSession {
@@ -4488,6 +4460,33 @@ export class BrowserSession {
     }
   }
 
+  private async updateLastScreenshotMetrics(
+    filePath: string,
+    capture: ScreenshotCaptureMode,
+    outputPixelRatio?: number,
+  ) {
+    const [image, viewportMetrics, scrollPosition] = await Promise.all([
+      this.readPngSize(filePath),
+      this.getViewportMetrics(),
+      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
+    ]);
+    this.lastScreenshotMetrics = {
+      path: filePath,
+      image,
+      viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
+      viewportMetrics,
+      devicePixelRatio: viewportMetrics.devicePixelRatio,
+      outputPixelRatio: outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
+      capture,
+      generation: ++this.screenshotGenerationSequence,
+      page: this.activePage,
+      url: this.activePage.url(),
+      scrollX: scrollPosition.x,
+      scrollY: scrollPosition.y,
+      capturedAt: Date.now(),
+    };
+  }
+
   // Capture the current viewport. Candidate marker overlays are no longer captured automatically.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
     const totalStartedAt = Date.now();
@@ -4550,26 +4549,7 @@ export class BrowserSession {
     skipped('drawMarkerOverlay');
     skipped('captureMarkerScreenshot');
     skipped('removeMarkerOverlay');
-    const [image, viewportMetrics, scrollPosition] = await timed('readScreenshotMetadata', () => Promise.all([
-      this.readPngSize(filePath),
-      this.getViewportMetrics(),
-      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
-    ]));
-    this.lastScreenshotMetrics = {
-      path: filePath,
-      image,
-      viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
-      viewportMetrics,
-      devicePixelRatio: viewportMetrics.devicePixelRatio,
-      outputPixelRatio: options.outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
-      capture,
-      generation: ++this.screenshotGenerationSequence,
-      page: this.activePage,
-      url: this.activePage.url(),
-      scrollX: scrollPosition.x,
-      scrollY: scrollPosition.y,
-      capturedAt: Date.now(),
-    };
+    await timed('readScreenshotMetadata', () => this.updateLastScreenshotMetrics(filePath, capture, options.outputPixelRatio));
     this.lastScreenshotTiming = {
       phase: String(phase),
       capture,
@@ -4603,26 +4583,7 @@ export class BrowserSession {
       outputPixelRatio: options.outputPixelRatio,
       timeoutMs: screenshotTimeoutMs,
     });
-    const [image, viewportMetrics, scrollPosition] = await Promise.all([
-      this.readPngSize(filePath),
-      this.getViewportMetrics(),
-      this.activePage.evaluate(() => ({ x: window.scrollX, y: window.scrollY })).catch(() => ({ x: 0, y: 0 })),
-    ]);
-    this.lastScreenshotMetrics = {
-      path: filePath,
-      image,
-      viewport: { width: viewportMetrics.width, height: viewportMetrics.height },
-      viewportMetrics,
-      devicePixelRatio: viewportMetrics.devicePixelRatio,
-      outputPixelRatio: options.outputPixelRatio ?? browserOutputPixelRatioFromEnv(),
-      capture,
-      generation: ++this.screenshotGenerationSequence,
-      page: this.activePage,
-      url: this.activePage.url(),
-      scrollX: scrollPosition.x,
-      scrollY: scrollPosition.y,
-      capturedAt: Date.now(),
-    };
+    await this.updateLastScreenshotMetrics(filePath, capture, options.outputPixelRatio);
     return filePath;
   }
 
@@ -5108,20 +5069,9 @@ export class BrowserSession {
           return;
         }
         if (options.closePages) await this.closeOwnedPages();
-        let managedProfileBrowserClosed = false;
-        if (options.force && this.browser) {
-          const client = await this.browser.newBrowserCDPSession().catch(() => undefined);
-          if (client) {
-            managedProfileBrowserClosed = await Promise.race([
-              client.send('Browser.close').then(() => true).catch(() => false),
-              sleep(1000).then(() => false),
-            ]);
-            await Promise.race([
-              client.detach().catch(() => undefined),
-              sleep(500),
-            ]);
-          }
-        }
+        const managedProfileBrowserClosed = options.force
+          ? await closeConnectedBrowserProcess(this.browser)
+          : false;
         await this.browser?.close({ reason: 'AI test run finished; disconnecting from existing browser.' }).catch(() => undefined);
         if (managedProfileBrowserClosed && this.managedProfileDir) await clearManagedBrowserProfileCaches(this.managedProfileDir);
         return;
@@ -5158,7 +5108,7 @@ export class BrowserSession {
     // wait, so a focused search box cannot spend the full default timeout
     // while an application rerenders around it.  Returning false is reserved
     // for controls that are not native text inputs/contenteditables; callers
-    // can then use Playwright's keyboard path as the compatibility fallback.
+    // can then use Playwright's keyboard path as the general fallback.
     return Boolean(await timedBrowserStep(timings, 'domTextMs', () => this.insertTextIntoFocusedElement(text)));
   }
 
@@ -5373,42 +5323,10 @@ export class BrowserSession {
   }
 
   private async getPageScrollState() {
+    await this.ensureBrowserPageRuntime();
     return this.activePage.evaluate(() => {
       const root = document.scrollingElement || document.documentElement;
-      const top = Math.round(root.scrollTop);
-      const left = Math.round(root.scrollLeft);
-      const height = Math.round(root.scrollHeight);
-      const width = Math.round(root.scrollWidth);
-      const clientHeight = Math.round(root.clientHeight);
-      const clientWidth = Math.round(root.clientWidth);
-      const maxTop = Math.max(0, height - clientHeight);
-      const maxLeft = Math.max(0, width - clientWidth);
-      const remainingUp = Math.max(0, top);
-      const remainingDown = Math.max(0, maxTop - top);
-      const remainingLeft = Math.max(0, left);
-      const remainingRight = Math.max(0, maxLeft - left);
-      return {
-        top,
-        left,
-        height,
-        width,
-        clientHeight,
-        clientWidth,
-        maxTop,
-        maxLeft,
-        remainingUp,
-        remainingDown,
-        remainingLeft,
-        remainingRight,
-        atTop: remainingUp <= 1,
-        atBottom: remainingDown <= 1,
-        atLeft: remainingLeft <= 1,
-        atRight: remainingRight <= 1,
-        canScrollUp: remainingUp > 1,
-        canScrollDown: remainingDown > 1,
-        canScrollLeft: remainingLeft > 1,
-        canScrollRight: remainingRight > 1,
-      };
+      return (window as WindowWithAiDomRuntime).__aiDomRuntime!.scrollState(root);
     });
   }
 
@@ -5474,18 +5392,6 @@ export class BrowserSession {
         if (!path) continue;
         const tag = element === root ? 'document' : element.tagName.toLowerCase();
         const role = element === root ? undefined : element.getAttribute('role') || undefined;
-        const top = Math.round(element.scrollTop);
-        const left = Math.round(element.scrollLeft);
-        const height = Math.round(element.scrollHeight);
-        const width = Math.round(element.scrollWidth);
-        const clientHeight = Math.round(element.clientHeight);
-        const clientWidth = Math.round(element.clientWidth);
-        const maxTop = Math.max(0, height - clientHeight);
-        const maxLeft = Math.max(0, width - clientWidth);
-        const remainingUp = Math.max(0, top);
-        const remainingDown = Math.max(0, maxTop - top);
-        const remainingLeft = Math.max(0, left);
-        const remainingRight = Math.max(0, maxLeft - left);
         output.push({
           path,
           tag,
@@ -5494,28 +5400,7 @@ export class BrowserSession {
           text: element === root ? undefined : textOf(element),
           rect,
           center: { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) },
-          scroll: {
-            top,
-            left,
-            height,
-            width,
-            clientHeight,
-            clientWidth,
-            maxTop,
-            maxLeft,
-            remainingUp,
-            remainingDown,
-            remainingLeft,
-            remainingRight,
-            atTop: remainingUp <= 1,
-            atBottom: remainingDown <= 1,
-            atLeft: remainingLeft <= 1,
-            atRight: remainingRight <= 1,
-            canScrollUp: remainingUp > 1,
-            canScrollDown: remainingDown > 1,
-            canScrollLeft: remainingLeft > 1,
-            canScrollRight: remainingRight > 1,
-          },
+          scroll: runtime.scrollState(element),
         });
       }
       return output
@@ -6513,18 +6398,14 @@ export class BrowserSession {
           && ['opened', 'closed', 'changed'].includes(domChanges.observation.surfaceTransition)
       ),
     ) || /Navigation changed the document\./.test(result.actual);
-    const passed = result.ok && (verification.ok || observableStateChanged);
+    const verificationPassed = verification.ok || observableStateChanged;
     const verificationDetail = observableStateChanged && !verification.ok
       ? `${verification.detail} A concrete DOM, active-surface, or navigation state change was observed.`
       : verification.detail;
     result.verification = {
-      status: passed ? 'passed' : 'failed',
+      status: verificationPassed ? 'passed' : 'failed',
       detail: verificationDetail,
     };
-    if (!passed) {
-      result.ok = false;
-      result.actual = `${result.actual} Runtime verification is a hard condition; the action must not be treated as complete. Re-observe the current page and choose the next single operation from fresh evidence.`;
-    }
     return result;
   }
 
@@ -6586,86 +6467,16 @@ export class BrowserSession {
     handle: ElementHandle<Element> | undefined,
     spec: BrowserTextSelectionSpec,
   ) {
-    const read = (element: Element) => {
-      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
-      if (element instanceof HTMLElement && element.isContentEditable) {
-        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
-        return editable.textContent || '';
-      }
-      throw new Error('Target is not an editable input, textarea, or contenteditable element.');
-    };
     const before = handle
-      ? await handle.evaluate(read)
+      ? await handle.evaluate(readEditableText)
       : locator
-        ? await locator.evaluate(read)
+        ? await locator.evaluate(readEditableText)
         : undefined;
     if (before === undefined) throw new Error('The editable target no longer resolves to a live element.');
     const selection = resolveEditableTextSelection(before, spec);
-    const apply = (element: Element, range: { direction: 'forward' | 'backward'; end: number; start: number }) => {
-      const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-        ? element
-        : undefined;
-      const editable = inputElement
-        ? inputElement
-        : element instanceof HTMLElement && element.isContentEditable
-          ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
-          : undefined;
-      if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
-      if (inputElement) {
-        inputElement.setSelectionRange(range.start, range.end, range.direction);
-        return;
-      }
-      const startWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-      let startTraversed = 0;
-      let startNode: Node = editable;
-      let startOffset = editable.childNodes.length;
-      let startMapped = range.start === 0 && !startWalker.currentNode.textContent;
-      let startTextNode = startWalker.nextNode();
-      while (startTextNode) {
-        const nodeLength = startTextNode.textContent?.length || 0;
-        if (range.start <= startTraversed + nodeLength) {
-          startNode = startTextNode;
-          startOffset = range.start - startTraversed;
-          startMapped = true;
-          break;
-        }
-        startTraversed += nodeLength;
-        startTextNode = startWalker.nextNode();
-      }
-      if (!startMapped && range.start !== startTraversed) throw new Error(`Selection offset ${range.start} could not be mapped to the editable DOM.`);
-      const endWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-      let endTraversed = 0;
-      let endNode: Node = editable;
-      let endOffset = editable.childNodes.length;
-      let endMapped = range.end === 0 && !endWalker.currentNode.textContent;
-      let endTextNode = endWalker.nextNode();
-      while (endTextNode) {
-        const nodeLength = endTextNode.textContent?.length || 0;
-        if (range.end <= endTraversed + nodeLength) {
-          endNode = endTextNode;
-          endOffset = range.end - endTraversed;
-          endMapped = true;
-          break;
-        }
-        endTraversed += nodeLength;
-        endTextNode = endWalker.nextNode();
-      }
-      if (!endMapped && range.end !== endTraversed) throw new Error(`Selection offset ${range.end} could not be mapped to the editable DOM.`);
-      const browserSelection = editable.ownerDocument.defaultView?.getSelection();
-      if (!browserSelection) throw new Error('The editable document does not expose a text selection.');
-      browserSelection.removeAllRanges();
-      if (range.direction === 'backward' && typeof browserSelection.setBaseAndExtent === 'function') {
-        browserSelection.setBaseAndExtent(endNode, endOffset, startNode, startOffset);
-      } else {
-        const domRange = editable.ownerDocument.createRange();
-        domRange.setStart(startNode, startOffset);
-        domRange.setEnd(endNode, endOffset);
-        browserSelection.addRange(domRange);
-      }
-    };
     const range = { direction: selection.direction, end: selection.end, start: selection.start };
-    if (handle) await handle.evaluate(apply, range);
-    else if (locator) await locator.evaluate(apply, range);
+    if (handle) await handle.evaluate(applyEditableTextSelection, range);
+    else if (locator) await locator.evaluate(applyEditableTextSelection, range);
     return selection;
   }
 
@@ -7282,25 +7093,18 @@ export class BrowserSession {
   private async unifiedActionPoint(
     input: {
       target?: BrowserElementTarget;
-      uid?: string;
       xThousandth?: number;
       yThousandth?: number;
       force?: boolean;
     },
     allowNonActionable = false,
   ): Promise<ResolvedBrowserActionPoint> {
-    const legacyUid = typeof input.uid === 'string' ? input.uid.trim() : '';
-    const target = input.target || (legacyUid ? { kind: 'ref' as const, ref: legacyUid } : undefined);
+    const target = input.target;
     const hasTarget = Boolean(target);
     const hasAnyCoordinate = input.xThousandth !== undefined || input.yThousandth !== undefined;
     if (hasTarget && hasAnyCoordinate) return { error: 'Use either a snapshot-bound target or screenshot coordinates, never both.' };
     if (target) {
-      if (input.target) {
-        return this.resolveStructuredActionTarget(target, allowNonActionable);
-      }
-      return legacyUid.startsWith('dom-')
-        ? this.resolveDomObservationReferencePoint(legacyUid, allowNonActionable)
-        : this.resolveSnapshotReferencePoint(legacyUid, allowNonActionable);
+      return this.resolveStructuredActionTarget(target, allowNonActionable);
     }
     if (hasAnyCoordinate) return this.resolveScreenshotPoint(input.xThousandth, input.yThousandth);
     return { error: 'A snapshot-bound target or the latest screenshot x_thousandth/y_thousandth coordinates are required.' };
@@ -7319,7 +7123,7 @@ export class BrowserSession {
     if (input.action === 'scroll') {
       let point: { x: number; y: number; descriptor: string; source: string } | undefined;
       let targetLocator: Locator | undefined;
-      if (input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined) {
+      if (input.target || input.xThousandth !== undefined || input.yThousandth !== undefined) {
         const resolved = await this.unifiedActionPoint(input, true);
         throwIfAborted();
         if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to resolve scroll target.' };
@@ -7356,8 +7160,8 @@ export class BrowserSession {
     }
 
     if (input.action === 'scrollIntoView') {
-      if (!input.target && !input.uid) return { ok: false, actual: 'scrollIntoView requires a current snapshot-bound target.' };
-      const resolved = await this.unifiedActionPoint({ target: input.target, uid: input.uid }, true);
+      if (!input.target) return { ok: false, actual: 'scrollIntoView requires a current snapshot-bound target.' };
+      const resolved = await this.unifiedActionPoint({ target: input.target }, true);
       if (!resolved.point) return { ok: false, actual: resolved.error || 'Unable to scroll the target into view.' };
       const targetLocator = resolved.reference && isSnapshotReference(resolved.reference) ? await this.snapshotReferenceLocator(resolved.reference) : undefined;
       return this.completeVerifiedAction(
@@ -7391,7 +7195,7 @@ export class BrowserSession {
     if (fromPoint.coveredBy && input.action !== 'click') {
       return {
         ok: false,
-        actual: `Target ${input.uid || fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}; ${input.action} was not sent. Dismiss the top layer or inspect the current dialog first.`,
+        actual: `Target ${fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}; ${input.action} was not sent. Dismiss the top layer or inspect the current dialog first.`,
       };
     }
     if (input.action === 'move') {
@@ -7421,7 +7225,6 @@ export class BrowserSession {
     if (input.action === 'drag') {
       const to = await this.unifiedActionPoint({
         target: input.toTarget,
-        uid: input.toUid,
         xThousandth: input.toXThousandth,
         yThousandth: input.toYThousandth,
       }, true);
@@ -7491,7 +7294,7 @@ export class BrowserSession {
       clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
       return {
         ok: false,
-        actual: `Target ${input.uid || fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}, so no click was sent. Inspect the active layer first. Use force=true only when the fresh page state confirms this exact click is intended to close that layer.`,
+        actual: `Target ${fromPoint.descriptor} is currently covered by ${fromPoint.coveredBy}, so no click was sent. Inspect the active layer first. Use force=true only when the fresh page state confirms this exact click is intended to close that layer.`,
         clickTimings,
       };
     }
@@ -7515,7 +7318,7 @@ export class BrowserSession {
         clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
         return {
           ok: false,
-          actual: `Target ${input.uid || from.point.descriptor} failed Playwright actionability validation and was not clicked: ${unknownErrorMessage(error)}`,
+          actual: `Target ${from.point.descriptor} failed Playwright actionability validation and was not clicked: ${unknownErrorMessage(error)}`,
           clickTimings,
         };
       }
@@ -7553,7 +7356,7 @@ export class BrowserSession {
       clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
       return {
         ok: false,
-        actual: `Target ${input.uid || from.point.descriptor} became non-actionable before Playwright could click it: ${unknownErrorMessage(error)}`,
+        actual: `Target ${from.point.descriptor} became non-actionable before Playwright could click it: ${unknownErrorMessage(error)}`,
         clickTimings,
       };
     } finally {
@@ -7619,14 +7422,13 @@ export class BrowserSession {
         : new Error('Browser option selection was cancelled.');
     };
     throwIfAborted();
-    if (!input.target && !input.uid) return { ok: false, actual: 'selectOption requires a fresh snapshot-bound select target.' };
+    if (!input.target) return { ok: false, actual: 'selectOption requires a fresh snapshot-bound select target.' };
     if (!String(input.value || '').trim() && !String(input.label || '').trim()) {
       return { ok: false, actual: 'selectOption requires an exact value or full label.' };
     }
     const previousGeneration = this.snapshotGeneration;
     const actionPoint = await this.unifiedActionPoint({
       target: input.target,
-      uid: input.uid,
     });
     throwIfAborted();
     if (!actionPoint.point || !actionPoint.reference) {
@@ -7730,17 +7532,17 @@ export class BrowserSession {
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
-    if (input.action === 'editText' && !input.target && !input.uid) {
+    if (input.action === 'editText' && !input.target) {
       return { ok: false, actual: 'editText requires a fresh snapshot-bound editable target.' };
     }
     let targetLocator: Locator | undefined;
     let targetHandle: ElementHandle<Element> | undefined;
-    const hasExplicitTarget = Boolean(input.target || input.uid || input.xThousandth !== undefined || input.yThousandth !== undefined);
+    const hasExplicitTarget = Boolean(input.target || input.xThousandth !== undefined || input.yThousandth !== undefined);
     if (hasExplicitTarget) {
       const target = await this.unifiedActionPoint(input, true);
       if (!target.point) return { ok: false, actual: target.error || 'Unable to resolve keyboard focus target.' };
       if (target.point.coveredBy) {
-        return { ok: false, actual: `Keyboard target ${input.uid || target.point.descriptor} is currently covered by ${target.point.coveredBy}. Dismiss the active layer before typing or pressing keys.` };
+        return { ok: false, actual: `Keyboard target ${target.point.descriptor} is currently covered by ${target.point.coveredBy}. Dismiss the active layer before typing or pressing keys.` };
       }
       targetLocator = target.reference && isSnapshotReference(target.reference) ? await this.snapshotReferenceLocator(target.reference) : undefined;
       if (!targetLocator && target.reference && !isSnapshotReference(target.reference) && target.reference.interactive) {
@@ -7779,14 +7581,7 @@ export class BrowserSession {
           targetHandle = boundHandle as ElementHandle<Element>;
           targetLocator = undefined;
         }
-        const allowedOrigins = new Set(input.allowedOrigins.flatMap((value) => {
-          try {
-            const origin = new URL(value).origin;
-            return origin === 'null' ? [] : [origin];
-          } catch {
-            return [];
-          }
-        }));
+        const allowedOrigins = normalizedOriginSet(input.allowedOrigins);
         const targetOrigin = await targetHandle!.evaluate(() => window.location.origin).catch(() => '');
         if (!targetOrigin || !allowedOrigins.has(targetOrigin)) {
           return { ok: false, actual: 'Credential entry was blocked because the target field belongs to a different frame origin.' };
@@ -7883,14 +7678,7 @@ export class BrowserSession {
     if (input.action === 'type') {
       if (typeof input.text !== 'string') return { ok: false, actual: 'Keyboard type requires text.' };
       if (input.allowedOrigins?.length) {
-        const allowedOrigins = new Set(input.allowedOrigins.flatMap((value) => {
-          try {
-            const origin = new URL(value).origin;
-            return origin === 'null' ? [] : [origin];
-          } catch {
-            return [];
-          }
-        }));
+        const allowedOrigins = normalizedOriginSet(input.allowedOrigins);
         const currentTarget = targetHandle
           ? await targetHandle.evaluate((element) => ({
               focused: element === document.activeElement || element.contains(document.activeElement),
@@ -8393,7 +8181,7 @@ export class BrowserSession {
   /**
    * Read the lightweight DOM-observation snapshot used as the baseline for
    * incremental MutationObserver updates. It intentionally avoids CDP
-   * DOMSnapshot/AX collection, which is reserved for explicit legacy search
+   * DOMSnapshot/AX collection, which is reserved for explicit semantic search
    * tools and is never run after every action.
    */
   async readDomObservationSnapshot(options: { cursor?: string; mode?: BrowserSnapshotView } = {}) {
@@ -8674,11 +8462,12 @@ export class BrowserSession {
     viewportClip?: BrowserUseViewportClip,
     preserveExistingRefs = false,
   ) {
-    await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((input) => {
-      const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      return runtime?.visibleDomSnapshot(input);
-    }, { maxChars, maxElements, preserveExistingRefs, viewportClip }).catch(() => undefined);
+    return this.readDomSnapshot(target, 'visible', {
+      maxChars,
+      maxElements,
+      preserveExistingRefs,
+      viewportClip,
+    });
   }
 
   private async readFullDomSnapshot(
@@ -8687,11 +8476,26 @@ export class BrowserSession {
     maxChars: number,
     preserveExistingRefs = false,
   ) {
+    return this.readDomSnapshot(target, 'full', { maxChars, maxElements, preserveExistingRefs });
+  }
+
+  private async readDomSnapshot(
+    target: Page | Frame,
+    mode: 'full' | 'visible',
+    input: {
+      maxChars: number;
+      maxElements: number;
+      preserveExistingRefs?: boolean;
+      viewportClip?: BrowserUseViewportClip;
+    },
+  ) {
     await this.ensureBrowserPageRuntime(target);
-    return target.evaluate((input) => {
+    return target.evaluate(({ mode: snapshotMode, options }) => {
       const runtime = (window as WindowWithAiDomRuntime).__aiDomRuntime!;
-      return runtime?.fullDomSnapshot(input);
-    }, { maxChars, maxElements, preserveExistingRefs }).catch(() => undefined);
+      return snapshotMode === 'full'
+        ? runtime?.fullDomSnapshot(options)
+        : runtime?.visibleDomSnapshot(options);
+    }, { mode, options: input }).catch(() => undefined);
   }
 
   private async readFullFrameDomSnapshots(

@@ -13,6 +13,7 @@ import {
 } from 'react';
 import { FileText, X } from 'lucide-react';
 import type { PreviewSource } from '@open-file-viewer/core';
+import { artifactContentType } from '@webpilot/capability-file/formats';
 import { BeautifulLoadingState } from '@/components/BeautifulLoadingState';
 import { useI18n } from '@/i18n/I18nProvider';
 import { useTheme } from '@/theme/ThemeProvider';
@@ -52,6 +53,13 @@ export type FilePreviewRequest = {
   mimeType?: string;
   source: PreviewSource | (() => Promise<PreviewSource>);
 };
+
+function filePreviewMimeType(fileName: string, mimeType?: string) {
+  const explicit = String(mimeType || '').trim();
+  if (explicit) return explicit;
+  const inferred = artifactContentType(fileName);
+  return inferred === 'application/octet-stream' ? undefined : inferred;
+}
 
 type FilePreviewContextValue = {
   closeFilePreview: () => void;
@@ -101,7 +109,10 @@ export function FilePreviewProvider({ children }: { children: ReactNode }) {
     setError('');
   }, []);
   const openFilePreview = useCallback((nextRequest: FilePreviewRequest) => {
-    setRequest(nextRequest);
+    setRequest({
+      ...nextRequest,
+      mimeType: filePreviewMimeType(nextRequest.fileName, nextRequest.mimeType),
+    });
     setResolvedSource(typeof nextRequest.source === 'function' ? null : nextRequest.source);
     setLoadingSource(typeof nextRequest.source === 'function');
     setError('');

@@ -21,7 +21,6 @@ export function createBrowserChatBrowserCapability(
   options: BrowserChatBrowserCapabilityOptions,
 ) {
   return createBrowserCapability({
-    instruction: false,
     createOperations: () => createNodeBrowserOperations({
       session: options.session,
       runId: options.runId,

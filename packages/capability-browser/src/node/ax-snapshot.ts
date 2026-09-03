@@ -1,51 +1,16 @@
 import type { CDPSession, Page } from 'playwright';
+import {
+  flattenCdpFrameTree,
+  type CapturedSnapshotFrame,
+  type CdpAxNode,
+  type CdpAxProperty,
+  type CdpAxValue,
+  type CdpFrameTree,
+} from './snapshot-shared.js';
+
+export type { CapturedSnapshotFrame } from './snapshot-shared.js';
 
 export type SnapshotView = 'actionable' | 'full' | 'text';
-
-type CdpAxValue = {
-  type?: string;
-  value?: unknown;
-};
-
-type CdpAxProperty = {
-  name?: string;
-  value?: CdpAxValue;
-};
-
-type CdpAxNode = {
-  nodeId?: string;
-  ignored?: boolean;
-  role?: CdpAxValue;
-  chromeRole?: CdpAxValue;
-  name?: CdpAxValue;
-  description?: CdpAxValue;
-  value?: CdpAxValue;
-  properties?: CdpAxProperty[];
-  parentId?: string;
-  childIds?: string[];
-  backendDOMNodeId?: number;
-};
-
-type CdpFrameTree = {
-  frame: {
-    id: string;
-    loaderId?: string;
-    name?: string;
-    parentId?: string;
-    url?: string;
-  };
-  childFrames?: CdpFrameTree[];
-};
-
-export type CapturedSnapshotFrame = {
-  frameId: string;
-  documentId: string;
-  name?: string;
-  parentFrameId?: string;
-  url?: string;
-  depth: number;
-  error?: string;
-};
 
 export type CapturedSnapshotNode = {
   identity: string;
@@ -246,19 +211,6 @@ function isActionable(role: string, properties: Record<string, string | number |
     && !['generic', 'none', 'rootwebarea', 'statictext', 'webarea'].includes(normalizedRole);
 }
 
-function flattenFrameTree(tree: CdpFrameTree, depth = 0, output: CapturedSnapshotFrame[] = []) {
-  output.push({
-    frameId: tree.frame.id,
-    documentId: tree.frame.loaderId || tree.frame.id,
-    name: tree.frame.name || undefined,
-    parentFrameId: tree.frame.parentId || undefined,
-    url: tree.frame.url || undefined,
-    depth,
-  });
-  for (const child of tree.childFrames || []) flattenFrameTree(child, depth + 1, output);
-  return output;
-}
-
 async function concurrentMap<T, R>(values: T[], concurrency: number, mapper: (value: T) => Promise<R>) {
   const results = new Array<R>(values.length);
   let cursor = 0;
@@ -372,7 +324,7 @@ export async function captureAxSnapshot(page: Page, allowedFrameIds?: ReadonlySe
   try {
     const frameTreeStartedAt = Date.now();
     const frameTreeResult = await client.send('Page.getFrameTree') as { frameTree: CdpFrameTree };
-    const frames = flattenFrameTree(frameTreeResult.frameTree)
+    const frames = flattenCdpFrameTree(frameTreeResult.frameTree)
       .filter((frame) => !allowedFrameIds || allowedFrameIds.has(frame.frameId));
     const frameTreeMs = Date.now() - frameTreeStartedAt;
     const axTreeStartedAt = Date.now();

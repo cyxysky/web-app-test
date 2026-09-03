@@ -1,3 +1,5 @@
+import { asRecord } from '@/lib/unknown-value';
+
 type ValidationIssue = {
   code?: string;
   expected?: string;
@@ -13,12 +15,6 @@ type OfficeSourceDiagnostic = {
   message?: string;
   severity?: string;
 };
-
-function recordFromUnknown(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
 
 function parsedJsonValue(value: string) {
   const source = value.trim();
@@ -45,7 +41,7 @@ function officeSourceValidationFailure(value: unknown) {
       }
       return undefined;
     }
-    const record = recordFromUnknown(current);
+    const record = asRecord(current);
     if (!record || seen.has(record)) return undefined;
     seen.add(record);
     const kind = typeof record.kind === 'string' ? record.kind : '';
@@ -68,7 +64,7 @@ function officeSourceValidationFailure(value: unknown) {
 }
 
 function officeSourceDiagnostic(value: unknown): OfficeSourceDiagnostic | undefined {
-  const record = recordFromUnknown(value);
+  const record = asRecord(value);
   if (!record) return undefined;
   return {
     code: typeof record.code === 'string' ? record.code : undefined,
@@ -126,7 +122,7 @@ export function browserChatToolFailureSummary(value: unknown) {
 }
 
 function validationIssue(value: unknown): ValidationIssue | undefined {
-  const record = recordFromUnknown(value);
+  const record = asRecord(value);
   if (!record) return undefined;
   const message = typeof record.message === 'string' ? record.message.trim() : '';
   const path = Array.isArray(record.path)
@@ -193,7 +189,7 @@ function collectValidationIssues(value: unknown) {
       for (const item of current) visit(item, depth + 1);
       return;
     }
-    const record = recordFromUnknown(current);
+    const record = asRecord(current);
     if (!record || seen.has(record)) return;
     seen.add(record);
     const direct = validationIssue(record);

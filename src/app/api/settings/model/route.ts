@@ -6,7 +6,6 @@ import {
   modelListForProvider,
   modelProviderDefinitions,
   modelProviderDefinition,
-  modelProviderValues,
 } from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
 import { normalizedModelCapabilities } from '@/lib/model-capabilities';
@@ -16,8 +15,8 @@ import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/h
 import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';
 import { readModelSettingsState } from '@/server/settings/settings-snapshot';
+import { normalizeModelProvider } from '@/lib/model-selection';
 
-const providers = new Set<ModelProvider>(modelProviderValues);
 const modelBodySchema = z.record(z.string(), z.unknown());
 
 function normalizeExtraRequestParameters(value: unknown) {
@@ -41,18 +40,6 @@ function requireAdmin(request: NextRequest) {
   if (!requestHasAdminSettingsAccess(request)) {
     throw new ApiRequestError('请先输入管理员设置密码。', { code: 'admin_access_required', status: 401 });
   }
-}
-
-function normalizeProvider(value: unknown): ModelProvider {
-  const provider = String(value || 'openrouter').trim().toLowerCase();
-  if (provider === 'azure' || provider === 'azure-openai') return 'azure-openai';
-  if (provider === 'codex' || provider === 'codex-cli') return 'codex';
-  if (provider === 'gemini' || provider === 'gemini-cli') return 'google';
-  if (provider === 'lm-studio' || provider === 'local') return 'lmstudio';
-  if (provider === 'openai-compatible-1' || provider === 'openai-compatible-api' || provider === 'custom-openai' || provider === 'custom-openai-1') return 'openai-compatible';
-  if (provider === 'custom-openai-2') return 'openai-compatible-2';
-  if (provider === 'custom-openai-3') return 'openai-compatible-3';
-  return providers.has(provider as ModelProvider) ? provider as ModelProvider : 'openrouter';
 }
 
 function readProviderSettings(value: unknown): Partial<Record<ModelProvider, ModelProviderSettings>> {
@@ -118,7 +105,7 @@ export async function POST(request: NextRequest) {
       scope: 'settings.model',
       userId,
     }, async () => {
-      const provider = normalizeProvider(body.provider);
+      const provider = normalizeModelProvider(body.provider);
       const providersInput = readProviderSettings(body.providers);
       if (!Object.keys(providersInput).length) {
         const definition = modelProviderDefinition(provider);

@@ -1,6 +1,7 @@
 'use client';
 
-import { Button, Popover } from '@heroui/react';
+import { Button } from '@heroui/react/button';
+import { Popover } from '@heroui/react/popover';
 import { useId, useState, type ReactNode } from 'react';
 
 type WorkspaceOverflowMenuProps = {

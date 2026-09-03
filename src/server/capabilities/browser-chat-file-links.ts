@@ -27,7 +27,7 @@ function verifiedArtifactDownloadUrl(value: unknown) {
 }
 
 function fileArtifactDownloadFromToolResult(tool: FileArtifactToolResult): FileArtifactDownload | undefined {
-  if (tool.name !== 'file' && tool.name !== 'downloadFile' && tool.name !== 'generateFile') return undefined;
+  if (tool.name !== 'file') return undefined;
   if (!tool.result || typeof tool.result !== 'object' || !('ok' in tool.result) || tool.result.ok !== true) return undefined;
   try {
     const actual = 'actual' in tool.result && typeof tool.result.actual === 'string'

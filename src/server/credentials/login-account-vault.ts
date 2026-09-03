@@ -1,21 +1,8 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-  randomUUID,
-} from 'node:crypto';
-import {
-  chmodSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs';
-import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { executeDatabase, queryDatabase, queryDatabaseOne, runDatabaseTransaction, type DatabaseExecutor } from '@/server/db/database';
-import { appDataRoot } from '@/server/storage/paths';
 import { queueDatabaseWrite, type DatabaseWriteStatement } from '@/server/storage/database-write-queue';
+import { decryptCredentialSecret, encryptCredentialSecret } from './credential-master-key';
 
 export type LoginAccountStatus = 'active' | 'disabled';
 
@@ -88,23 +75,11 @@ type LoginAccountRow = {
   use_count: number;
 };
 
-type PasswordEnvelope = {
-  v: 1;
-  alg: 'aes-256-gcm';
-  kid: string;
-  iv: string;
-  tag: string;
-  ciphertext: string;
-};
-
 const metadataColumns = `
   id, user_id, shared, domain, username, label, login_url, status,
   CASE WHEN length(password_envelope) > 0 THEN 1 ELSE 0 END AS has_password,
   created_at, updated_at, last_used_at, use_count
 `;
-const keyFileName = 'credential-master.key';
-let cachedMasterKey: Buffer | undefined;
-
 function now() {
   return new Date().toISOString();
 }
@@ -156,76 +131,6 @@ function normalizeLoginUrl(value: unknown, domain: string) {
   }
 }
 
-function masterKeyPath() {
-  return path.join(appDataRoot(), '.data', keyFileName);
-}
-
-function configuredMasterKey(value: string) {
-  const raw = value.trim();
-  if (/^[a-fA-F0-9]{64}$/.test(raw)) return Buffer.from(raw, 'hex');
-  if (/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) {
-    const decoded = Buffer.from(raw, 'base64');
-    if (decoded.length === 32) return decoded;
-  }
-  return createHash('sha256').update(raw, 'utf8').digest();
-}
-
-function readGeneratedMasterKey(filePath: string) {
-  const raw = readFileSync(filePath, 'utf8').trim();
-  const decoded = Buffer.from(raw, 'base64');
-  if (decoded.length !== 32) throw new Error('本地账号凭据主密钥文件无效');
-  return decoded;
-}
-
-function generatedMasterKey() {
-  const filePath = masterKeyPath();
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  try {
-    const existing = readGeneratedMasterKey(filePath);
-    try {
-      chmodSync(filePath, 0o600);
-    } catch {
-      // Some filesystems (notably Windows) do not implement POSIX mode bits.
-    }
-    return existing;
-  } catch (error) {
-    const missing = error && typeof error === 'object' && 'code' in error
-      && (error as { code?: unknown }).code === 'ENOENT';
-    if (!missing) throw error;
-  }
-
-  const created = randomBytes(32);
-  try {
-    writeFileSync(filePath, created.toString('base64'), {
-      encoding: 'utf8',
-      flag: 'wx',
-      mode: 0o600,
-    });
-    try {
-      chmodSync(filePath, 0o600);
-    } catch {
-      // Best effort on filesystems without POSIX permissions.
-    }
-    return created;
-  } catch (error) {
-    const raced = error && typeof error === 'object' && 'code' in error
-      && (error as { code?: unknown }).code === 'EEXIST';
-    if (!raced) throw error;
-    return readGeneratedMasterKey(filePath);
-  }
-}
-
-function credentialMasterKey() {
-  if (cachedMasterKey) return cachedMasterKey;
-  const configured = String(process.env.WEBPILOT_CREDENTIAL_MASTER_KEY || '').trim();
-  cachedMasterKey = configured ? configuredMasterKey(configured) : generatedMasterKey();
-  return cachedMasterKey;
-}
-
-function masterKeyId(key: Buffer) {
-  return createHash('sha256').update(key).digest('hex').slice(0, 16);
-}
-
 function passwordAad(input: Pick<LoginAccountRow, 'id' | 'user_id' | 'domain' | 'username'>) {
   return Buffer.from(JSON.stringify([
     'webpilot-login-account',
@@ -238,60 +143,18 @@ function passwordAad(input: Pick<LoginAccountRow, 'id' | 'user_id' | 'domain' | 
 
 function encryptPassword(password: string, identity: Pick<LoginAccountRow, 'id' | 'user_id' | 'domain' | 'username'>) {
   if (!password) throw new Error('登录密码不能为空');
-  const key = credentialMasterKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(passwordAad(identity));
-  const ciphertext = Buffer.concat([cipher.update(password, 'utf8'), cipher.final()]);
-  const envelope: PasswordEnvelope = {
-    v: 1,
-    alg: 'aes-256-gcm',
-    kid: masterKeyId(key),
-    iv: iv.toString('base64'),
-    tag: cipher.getAuthTag().toString('base64'),
-    ciphertext: ciphertext.toString('base64'),
-  };
-  return JSON.stringify(envelope);
-}
-
-function parsePasswordEnvelope(value: string): PasswordEnvelope {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch {
-    throw new Error('账号凭据密文格式无效');
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error('账号凭据密文格式无效');
-  }
-  const envelope = parsed as Partial<PasswordEnvelope>;
-  if (envelope.v !== 1
-    || envelope.alg !== 'aes-256-gcm'
-    || typeof envelope.kid !== 'string'
-    || typeof envelope.iv !== 'string'
-    || typeof envelope.tag !== 'string'
-    || typeof envelope.ciphertext !== 'string') {
-    throw new Error('账号凭据密文格式无效');
-  }
-  return envelope as PasswordEnvelope;
+  return encryptCredentialSecret(password, passwordAad(identity));
 }
 
 function decryptPassword(row: LoginAccountRow) {
   if (!row.password_envelope) throw new Error('账号没有可用的登录密码');
-  const key = credentialMasterKey();
-  const envelope = parsePasswordEnvelope(row.password_envelope);
-  if (envelope.kid !== masterKeyId(key)) throw new Error('账号凭据主密钥不匹配');
-  try {
-    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
-    decipher.setAAD(passwordAad(row));
-    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-    return Buffer.concat([
-      decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
-      decipher.final(),
-    ]).toString('utf8');
-  } catch {
-    throw new Error('账号凭据解密失败');
-  }
+  return decryptCredentialSecret({
+    aad: passwordAad(row),
+    envelope: row.password_envelope,
+    formatError: '账号凭据密文格式无效',
+    keyMismatchError: '账号凭据主密钥不匹配',
+    decryptionError: '账号凭据解密失败',
+  });
 }
 
 function metadataFromRow(row: LoginAccountRow): LoginAccountMetadata {

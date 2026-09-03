@@ -1,21 +1,23 @@
+import type { CapabilitySkill } from '@webpilot/capability-sdk';
+
 export const browserCodeRuntimeSkillId = 'system-browser-code-runtime';
 
 export const browserCodeRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${browserCodeRuntimeSkillId}</id>`,
   '<title>Browser Code Runtime</title>',
-  '<description>Hidden built-in API reference for browser action=code. The first code action automatically loads and returns it while continuing the operation.</description>',
+  '<description>Required built-in API reference for the browser tool. Read this Skill successfully before the first browser action in every Agent run.</description>',
   '<required>true</required>',
   '</system_skill>',
 ].join('\n');
 
 export const browserCodeRuntimeSkillContent = `# Browser Code Runtime
 
-This hidden built-in Skill is the authoritative API reference and operating contract for browser action=code. The backend loads it once per Agent run during the first code action and returns it in loadedRuntimeSkill while continuing the original operation.
+This Skill is the authoritative API reference and operating contract supplied by the browser package. The consuming Agent is responsible for loading it and deciding when the browser tool becomes available.
 
 ## Required state machine
 
-1. Call browser with action=code normally. On the first code action, the backend loads and returns this Skill in the same tool transaction. An explicit Skill read remains supported but is not required:
+1. Before the first browser action, explicitly read this Skill. The Skill read and browser operation are separate model steps; the Agent host must reject an early browser call without executing it:
 
 \`\`\`json
 { "action": "read", "skillId": "${browserCodeRuntimeSkillId}", "reason": "读取浏览器代码 API 与运行规范" }
@@ -436,3 +438,12 @@ Use \`force: true\` only when fresh evidence proves one exact rendered target an
 
 Playwright delivery alone is not business success. Before claiming completion, run a final read-only check for the requested URL, value, row/table state, toast, dialog, confirmation identifier, or other direct fact, plus \`page.activeSurface()\`. Report an unresolved failure or residual popup when it materially limits the outcome. Never describe a page as ready for a consequential final click if the latest verified state is on another page or no longer contains that control.
 `;
+
+export const browserRuntimeSkill = Object.freeze({
+  id: browserCodeRuntimeSkillId,
+  title: 'Browser Code Runtime',
+  summary: browserCodeRuntimeSkillSummary,
+  content: browserCodeRuntimeSkillContent,
+  required: true,
+  activation: [{ toolName: 'browser', actions: ['code', 'state', 'waitForHumanVerification'] }],
+} satisfies CapabilitySkill);

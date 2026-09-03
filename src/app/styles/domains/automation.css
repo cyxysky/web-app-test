@@ -549,25 +549,6 @@
   }
 }
 
-/* Automation workbench refinement */
-.automation-content {
-  margin: 0 auto;
-  min-height: 100%;
-  width: 100%;
-  max-width: 1180px;
-  padding: 32px 28px 64px;
-}
-
-.automation-page-header {
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 24px;
-  min-height: 70px;
-  padding-bottom: 18px;
-}
-
 .automation-page-header h1 {
   line-height: 1.1;
   margin: 0;
@@ -586,10 +567,6 @@
 .automation-header-actions,
 .automation-case-actions {
   gap: 8px;
-}
-
-.automation-case-section {
-  margin-top: 24px;
 }
 
 .automation-state-dot.is-running {
@@ -711,13 +688,6 @@
 
 .automation-case-context svg {
   flex: 0 0 auto;
-}
-
-.automation-case-instruction {
-  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
-  border-radius: 9px;
-  margin: 0 22px 14px;
-  padding: 10px 12px;
 }
 
 .automation-case-instruction > span {

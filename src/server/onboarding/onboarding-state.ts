@@ -51,22 +51,6 @@ function stateFromRow(row: OnboardingRow): WebPilotOnboardingState {
   };
 }
 
-async function userHasExistingWork(userId: string) {
-  const row = await queryDatabaseOne<{ has_automation: boolean | number; has_messages: boolean | number }>(`
-    SELECT
-      EXISTS(
-        SELECT 1 FROM browser_chat_message AS message
-        JOIN browser_chat_session AS session ON session.id = message.session_id
-        WHERE session.user_id = ?
-        LIMIT 1
-      ) AS has_messages,
-      EXISTS(
-        SELECT 1 FROM automation_case WHERE user_id = ? LIMIT 1
-      ) AS has_automation
-  `, [userId, userId]);
-  return Boolean(row?.has_messages || row?.has_automation);
-}
-
 export async function readOnboardingState(userId: string): Promise<WebPilotOnboardingState> {
   const existing = await queryDatabaseOne<OnboardingRow>(`
     SELECT tutorial_version, status, completed_steps_json, dismissed_at, updated_at
@@ -79,8 +63,7 @@ export async function readOnboardingState(userId: string): Promise<WebPilotOnboa
   }
 
   const timestamp = new Date().toISOString();
-  const legacyComplete = await userHasExistingWork(userId);
-  const completedSteps = legacyComplete ? [...webPilotOnboardingSteps] : [];
+  const completedSteps: WebPilotOnboardingStep[] = [];
   await executeDatabase(`
     INSERT INTO user_onboarding_state (
       user_id, tutorial_version, status, completed_steps_json, dismissed_at, created_at, updated_at
@@ -88,14 +71,14 @@ export async function readOnboardingState(userId: string): Promise<WebPilotOnboa
   `, [
     userId,
     WEBPILOT_ONBOARDING_VERSION,
-    legacyComplete ? 'completed' : 'not_started',
+    'not_started',
     JSON.stringify(completedSteps),
     timestamp,
     timestamp,
   ]);
   return {
     completedSteps,
-    status: legacyComplete ? 'completed' as const : 'not_started' as const,
+    status: 'not_started',
     tutorialVersion: WEBPILOT_ONBOARDING_VERSION,
     updatedAt: timestamp,
   };

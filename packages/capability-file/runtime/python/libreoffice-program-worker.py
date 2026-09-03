@@ -875,19 +875,8 @@ class UnoExpertAccess:
         return self.job.register_element(element_id, kind, target, metadata, force_artifact_name=True)
 
 
-class WriterLayout:
-    """Stable flow-layout helpers backed by native UNO Writer objects.
-
-    The facade is the default authoring surface because paragraphs, tables and
-    inline media participate in Writer pagination. Advanced features use
-    versioned facade recipes rather than model-authored UNO.
-    """
-
-    def __init__(self, job, component):
-        self.job = job
-        self._component = component
-        self._paragraph_count = 0
-        self._tables = {}
+class OfficeUnitConversion:
+    """Shared conversion helpers for UNO's 1/100 mm geometry unit."""
 
     @staticmethod
     def mm(value):
@@ -904,6 +893,21 @@ class WriterLayout:
     @staticmethod
     def pt(value):
         return int(round(float(value) * POINT_TO_100TH_MM))
+
+
+class WriterLayout(OfficeUnitConversion):
+    """Stable flow-layout helpers backed by native UNO Writer objects.
+
+    The facade is the default authoring surface because paragraphs, tables and
+    inline media participate in Writer pagination. Advanced features use
+    versioned facade recipes rather than model-authored UNO.
+    """
+
+    def __init__(self, job, component):
+        self.job = job
+        self._component = component
+        self._paragraph_count = 0
+        self._tables = {}
 
     def _end_cursor(self):
         cursor = self._component.Text.createTextCursor()
@@ -2417,7 +2421,7 @@ class PresentationSlide:
         )
 
 
-class PresentationLayout:
+class PresentationLayout(OfficeUnitConversion):
     """Stable Impress geometry helpers. Expert mode covers unmodeled services."""
 
     _LAYOUT_ROLES = {'content', 'container', 'decoration', 'background'}
@@ -2447,26 +2451,6 @@ class PresentationLayout:
                 for index in range(pages.Count):
                     page = pages.getByIndex(index)
                     page.Width, page.Height = wide_width, wide_height
-
-    @staticmethod
-    def mm(value):
-        """Convert millimetres to UNO geometry units (1/100 mm)."""
-        return int(round(float(value) * 100.0))
-
-    @staticmethod
-    def cm(value):
-        """Convert centimetres to UNO geometry units (1/100 mm)."""
-        return int(round(float(value) * 1000.0))
-
-    @staticmethod
-    def inch(value):
-        """Convert inches to UNO geometry units (1/100 mm)."""
-        return int(round(float(value) * 2540.0))
-
-    @staticmethod
-    def pt(value):
-        """Convert typographic points to UNO geometry units (1/100 mm)."""
-        return int(round(float(value) * POINT_TO_100TH_MM))
 
     @staticmethod
     def text_height(font_size, lines=1, padding=0, line_spacing=1.15):
@@ -3282,21 +3266,7 @@ class PresentationLayout:
             (center, 'CENTER', 'center', center_url),
             (right, 'RIGHT', 'right', right_url),
         )
-        for cell, (value, align, suffix, link) in zip(cells, values):
-            if not str(value or '').strip():
-                continue
-            if str(link or '').strip():
-                self.add_text_link(
-                    f'{element_id}/{suffix}', page, value, cell, url=link,
-                    font_size=font_size, min_font_size=font_size, color=color,
-                    align=align, padding=0, valign='CENTER',
-                )
-            else:
-                self.add_text_box(
-                    f'{element_id}/{suffix}', page, value, cell, font_size=font_size,
-                    min_font_size=font_size, color=color, align=align,
-                    padding=0, valign='CENTER',
-                )
+        self._add_three_zone_text(element_id, page, cells, values, font_size, color)
         if accent is not None:
             self.add_shape(
                 f'{element_id}/accent', page, area['x'], safe_height - self.mm(0.4),
@@ -3331,20 +3301,29 @@ class PresentationLayout:
             (center, 'CENTER', 'center', center_url),
             (right, 'RIGHT', 'right', right_url),
         )
-        for cell, (value, align, suffix, link) in zip(cells, values):
-            if str(value or '').strip():
-                if str(link or '').strip():
-                    self.add_text_link(
-                        f'{element_id}/{suffix}', page, value, cell, url=link,
-                        font_size=font_size, min_font_size=font_size, color=color,
-                        align=align, padding=0, valign='CENTER',
-                    )
-                else:
-                    self.add_text_box(
-                        f'{element_id}/{suffix}', page, value, cell, font_size=font_size,
-                        min_font_size=font_size, color=color, align=align, padding=0, valign='CENTER',
-                    )
+        self._add_three_zone_text(element_id, page, cells, values, font_size, color)
         return area
+
+    def _add_three_zone_text(self, element_id, page, cells, values, font_size, color):
+        for cell, (value, align, suffix, link) in zip(cells, values):
+            if not str(value or '').strip():
+                continue
+            text_options = {
+                'font_size': font_size,
+                'min_font_size': font_size,
+                'color': color,
+                'align': align,
+                'padding': 0,
+                'valign': 'CENTER',
+            }
+            if str(link or '').strip():
+                self.add_text_link(
+                    f'{element_id}/{suffix}', page, value, cell, url=link, **text_options,
+                )
+            else:
+                self.add_text_box(
+                    f'{element_id}/{suffix}', page, value, cell, **text_options,
+                )
 
     def add_shape(self, element_id, page, x, y, width, height, service=None, shape_type='rectangle',
                   fill=None, line=None, line_width=0, fill_transparency=0,
@@ -4645,27 +4624,11 @@ class SpreadsheetSheet:
         )
 
 
-class SpreadsheetLayout:
+class SpreadsheetLayout(OfficeUnitConversion):
     """Stable Calc workbook facade with model-facing A1 worksheet objects."""
 
     def __init__(self, job, component):
         self.job, self._component = job, component
-
-    @staticmethod
-    def mm(value):
-        return int(round(float(value) * 100.0))
-
-    @staticmethod
-    def cm(value):
-        return int(round(float(value) * 1000.0))
-
-    @staticmethod
-    def inch(value):
-        return int(round(float(value) * 2540.0))
-
-    @staticmethod
-    def pt(value):
-        return int(round(float(value) * POINT_TO_100TH_MM))
 
     @staticmethod
     def _column_name(index):

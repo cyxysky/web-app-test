@@ -26,6 +26,66 @@ export type EditableTextSelection = {
   start: number;
 };
 
+export function readEditableText(element: Element) {
+  if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
+  if (element instanceof HTMLElement && element.isContentEditable) {
+    const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
+    return editable.textContent || '';
+  }
+  throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+}
+
+export function applyEditableTextSelection(
+  element: Element,
+  range: { direction: 'forward' | 'backward'; end: number; start: number },
+) {
+  const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
+    ? element
+    : undefined;
+  const editable = inputElement
+    ? inputElement
+    : element instanceof HTMLElement && element.isContentEditable
+      ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
+      : undefined;
+  if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+  if (inputElement) {
+    inputElement.setSelectionRange(range.start, range.end, range.direction);
+    return;
+  }
+  const mapOffset = (offset: number) => {
+    const walker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
+    let traversed = 0;
+    let node: Node = editable;
+    let nodeOffset = editable.childNodes.length;
+    let mapped = offset === 0 && !walker.currentNode.textContent;
+    for (let textNode = walker.nextNode(); textNode; textNode = walker.nextNode()) {
+      const nodeLength = textNode.textContent?.length || 0;
+      if (offset <= traversed + nodeLength) {
+        node = textNode;
+        nodeOffset = offset - traversed;
+        mapped = true;
+        break;
+      }
+      traversed += nodeLength;
+    }
+    if (!mapped && offset !== traversed) throw new Error(`Selection offset ${offset} could not be mapped to the editable DOM.`);
+    return { node, offset: nodeOffset };
+  };
+  const start = mapOffset(range.start);
+  const end = mapOffset(range.end);
+  const selection = editable.ownerDocument.defaultView?.getSelection();
+  if (!selection) throw new Error('The editable document does not expose a text selection.');
+  selection.removeAllRanges();
+  if (range.direction === 'backward' && typeof selection.setBaseAndExtent === 'function') {
+    selection.setBaseAndExtent(end.node, end.offset, start.node, start.offset);
+    return;
+  }
+  const domRange = editable.ownerDocument.createRange();
+  domRange.setStart(start.node, start.offset);
+  domRange.setEnd(end.node, end.offset);
+  selection.addRange(domRange);
+}
+
 export function resolveEditableTextSelection(
   before: string,
   spec: BrowserTextSelectionSpec,

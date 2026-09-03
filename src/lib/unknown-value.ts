@@ -1,8 +1,4 @@
-export function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
+export { jsonRecordFromUnknown as asRecord } from '@webpilot/capability-sdk';
 
 export function finiteNumber(value: unknown) {
   const numberValue = typeof value === 'number' ? value : Number(value);

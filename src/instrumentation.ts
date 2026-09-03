@@ -47,6 +47,10 @@ function scheduleBootstrapAttempt(state: SchedulerBootstrapState, delay: number)
 
 export function register() {
   if (process.env.NEXT_RUNTIME !== 'nodejs') return;
+  // In development the schedules API starts this loop on first use. Avoid
+  // adding the scheduler entry to Webpack's shared cold-compilation queue while
+  // the requested UI route is still compiling.
+  if (process.env.NODE_ENV === 'development') return;
   const state = schedulerBootstrapGlobal.__webpilotSchedulerBootstrap ??= {
     attempts: 0,
     started: false,

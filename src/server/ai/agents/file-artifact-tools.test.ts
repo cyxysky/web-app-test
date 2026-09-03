@@ -17,7 +17,6 @@ import {
   listOfficeDrafts,
   officeValidationCacheBaseName,
   officeValidationRepairHints,
-  pendingOfficeDocumentWork,
   planFileArtifact,
   readUnoDraft,
   recordOfficeVisualQaProgress,
@@ -1276,9 +1275,8 @@ test('saves a rejected initial source so the model can read and edit it in place
     });
     assert.equal(result.ok, false);
     assert.match(result.actual || '', /define exactly one synchronous create_document\(job\)/);
-    const failure = JSON.parse(result.actual || '{}') as { requiredNextAction?: string; saved?: boolean };
+    const failure = JSON.parse(result.actual || '{}') as { saved?: boolean };
     assert.equal(failure.saved, true);
-    assert.equal(failure.requiredNextAction, 'edit');
     const catalog = await listOfficeDrafts({ runId: 'chat_test' });
     assert.equal(catalog.ok, true, catalog.actual);
     const catalogEntry = (JSON.parse(catalog.actual || '{}') as { drafts?: Array<{ documentId?: string; sourceDigest?: string | null; state?: string; validationStatus?: string }> })
@@ -1292,55 +1290,10 @@ test('saves a rejected initial source so the model can read and edit it in place
     };
     assert.match(readable.program || '', /wrong_entrypoint/);
     assert.equal(readable.validationStatus, 'failed');
-    const pending = await pendingOfficeDocumentWork('chat_test', new Set(['rejected-program']));
-    assert.equal(pending[0]?.requiredNextAction, 'render');
     const retriedRender = await renderFileArtifact({ documentId: 'rejected-program', runId: 'chat_test' });
     assert.equal(retriedRender.ok, false);
     assert.match(retriedRender.actual || '', /define exactly one synchronous create_document\(job\)/);
     assert.doesNotMatch(retriedRender.actual || '', /office-render-blocked/);
-  } finally {
-    if (previous === undefined) delete process.env.ARTIFACTS_DIR;
-    else process.env.ARTIFACTS_DIR = previous;
-    await rm(root, { force: true, recursive: true });
-  }
-});
-
-test('does not require visual QA when the active model cannot inspect images', async () => {
-  const root = await mkdtemp(path.join(tmpdir(), 'webpilot-uno-structural-only-'));
-  const previous = process.env.ARTIFACTS_DIR;
-  process.env.ARTIFACTS_DIR = root;
-  try {
-    await planFileArtifact({
-      documentId: 'structural-only-model', documentType: 'word', fileName: 'report.docx', runId: 'chat_test',
-    });
-    const draftsDir = path.join(root, 'chat_test', 'document-drafts');
-    const metadataPath = path.join(draftsDir, 'structural-only-model.json');
-    const draft = JSON.parse(await readFile(metadataPath, 'utf8')) as Record<string, unknown>;
-    const digest = createHash('sha256').update(wordProgram).digest('hex');
-    await writeFile(path.join(draftsDir, 'structural-only-model.py'), wordProgram, 'utf8');
-    await writeFile(metadataPath, JSON.stringify({
-      ...draft,
-      program: wordProgram,
-      renderedDigest: digest,
-      renderedSourceDigest: digest,
-      sourceDigest: digest,
-      validatedSourceDigest: digest,
-      validationStatus: 'passed',
-      workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString() },
-    }), 'utf8');
-
-    const visualModelPending = await pendingOfficeDocumentWork(
-      'chat_test',
-      new Set(['structural-only-model']),
-    );
-    assert.equal(visualModelPending[0]?.requiredNextAction, 'visualIndex');
-
-    const textModelPending = await pendingOfficeDocumentWork(
-      'chat_test',
-      new Set(['structural-only-model']),
-      { requireVisualQa: false },
-    );
-    assert.deepEqual(textModelPending, []);
   } finally {
     if (previous === undefined) delete process.env.ARTIFACTS_DIR;
     else process.env.ARTIFACTS_DIR = previous;
@@ -1367,7 +1320,6 @@ test('does not complete visual QA when any fully read page has a failed review',
       program: wordProgram,
       renderedArtifactId: artifactId,
       renderedDigest: digest,
-      renderedSourceDigest: digest,
       sourceDigest: digest,
       validatedSourceDigest: digest,
       validationStatus: 'passed',
@@ -1411,9 +1363,6 @@ test('does not complete visual QA when any fully read page has a failed review',
     const resultPayload = JSON.parse(reportResult.actual || '{}') as { visualQa?: { complete?: boolean; visualQaDigest?: string | null } };
     assert.equal(resultPayload.visualQa?.complete, false);
     assert.equal(resultPayload.visualQa?.visualQaDigest, null);
-    const pendingRepair = await pendingOfficeDocumentWork('chat_test', new Set(['visual-review']));
-    assert.equal(pendingRepair[0]?.requiredNextAction, 'edit');
-    assert.deepEqual(pendingRepair[0]?.visualQaFailedPages, [2]);
     const saved = JSON.parse(await readFile(metadataPath, 'utf8')) as { visualQaDigest?: string; workflow?: { state?: string } };
     assert.equal(saved.visualQaDigest, undefined);
     assert.equal(saved.workflow?.state, 'qa-pending');

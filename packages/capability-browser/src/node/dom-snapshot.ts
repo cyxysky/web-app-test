@@ -1,5 +1,12 @@
 import type { CDPSession, Page } from 'playwright';
-import type { CapturedSnapshotFrame, CapturedSnapshotNode } from './ax-snapshot.js';
+import type { CapturedSnapshotNode } from './ax-snapshot.js';
+import {
+  flattenCdpFrameTree,
+  type CapturedSnapshotFrame,
+  type CdpAxNode,
+  type CdpAxValue,
+  type CdpFrameTree,
+} from './snapshot-shared.js';
 
 type StringIndex = number;
 type RareStringData = { index?: number[]; value?: number[] };
@@ -43,30 +50,6 @@ type DomSnapshotDocument = {
 type DomSnapshotResult = {
   documents: DomSnapshotDocument[];
   strings: string[];
-};
-
-type CdpFrameTree = {
-  frame: {
-    id: string;
-    loaderId?: string;
-    name?: string;
-    parentId?: string;
-    url?: string;
-  };
-  childFrames?: CdpFrameTree[];
-};
-
-type CdpAxValue = { value?: unknown };
-type CdpAxNode = {
-  nodeId?: string;
-  ignored?: boolean;
-  role?: CdpAxValue;
-  chromeRole?: CdpAxValue;
-  name?: CdpAxValue;
-  description?: CdpAxValue;
-  value?: CdpAxValue;
-  properties?: Array<{ name?: string; value?: CdpAxValue }>;
-  backendDOMNodeId?: number;
 };
 
 export type CapturedDomSnapshotNode = CapturedSnapshotNode & {
@@ -145,19 +128,6 @@ function classDescriptor(tag: string, className: string) {
 function axValue(value?: CdpAxValue) {
   const raw = value?.value;
   return typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean' ? raw : '';
-}
-
-function frameList(tree: CdpFrameTree, depth = 0, output: CapturedSnapshotFrame[] = []) {
-  output.push({
-    frameId: tree.frame.id,
-    documentId: tree.frame.loaderId || tree.frame.id,
-    name: tree.frame.name || undefined,
-    parentFrameId: tree.frame.parentId || undefined,
-    url: tree.frame.url || undefined,
-    depth,
-  });
-  for (const child of tree.childFrames || []) frameList(child, depth + 1, output);
-  return output;
 }
 
 function rareString(data: RareStringData | undefined, strings: string[]) {
@@ -316,7 +286,7 @@ export async function captureDomSnapshot(page: Page): Promise<CapturedDomSnapsho
   try {
     const frameStartedAt = Date.now();
     const frameTreeResult = await client.send('Page.getFrameTree') as { frameTree: CdpFrameTree };
-    const frames = frameList(frameTreeResult.frameTree);
+    const frames = flattenCdpFrameTree(frameTreeResult.frameTree);
     const frameTreeMs = Date.now() - frameStartedAt;
     const frameById = new Map(frames.map((frame) => [frame.frameId, frame]));
 

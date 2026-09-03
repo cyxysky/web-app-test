@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Check, Copy, X } from 'lucide-react';
-import { formatToolPayload } from '@/components/browser-chat-format';
+import { formatToolPayload } from '@/lib/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { AppModal } from '@/components/ui/app-modal';

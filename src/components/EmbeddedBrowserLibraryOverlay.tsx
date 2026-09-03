@@ -2,7 +2,7 @@
 
 import { ChevronDown, Globe2, History, Search, Star, Trash2, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { InputGroup } from '@heroui/react';
+import { InputGroup } from '@heroui/react/input-group';
 import { useI18n } from '@/i18n/I18nProvider';
 import styles from './EmbeddedBrowserLibraryOverlay.module.css';
 

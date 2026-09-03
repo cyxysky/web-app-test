@@ -2,7 +2,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { copyProductionRuntime, copyServerRuntime } = require('./server-package-layout');
-const { assertGlinerRuntime, copyGlinerRuntime } = require('./gliner-runtime-layout');
+const {
+  assertSensitiveDataRuntime,
+  copySensitiveDataRuntime,
+} = require('../packages/capability-sensitive-data/scripts/runtime-layout.cjs');
 
 const root = path.resolve(__dirname, '..');
 const packageName = 'WebPilot-Server';
@@ -80,7 +83,7 @@ function writeStartScript() {
   const packagedStartScript = startScript
     .replace(
       'if not defined HOSTNAME',
-      'if not defined LIBREOFFICE_PATH set "LIBREOFFICE_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\soffice.exe"\r\nif not defined LIBREOFFICE_PYTHON_PATH set "LIBREOFFICE_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\python.exe"\r\nif not defined CAPABILITY_FILE_RUNTIME_DIR set "CAPABILITY_FILE_RUNTIME_DIR=%WEBPILOT_SERVER_ROOT%server\\capability-runtime\\file"\r\nif not defined CAPABILITY_BROWSER_RUNTIME_DIR set "CAPABILITY_BROWSER_RUNTIME_DIR=%WEBPILOT_SERVER_ROOT%server\\capability-runtime\\browser"\r\nif not defined AI_SENSITIVE_DATA_FILTER_ENABLED set "AI_SENSITIVE_DATA_FILTER_ENABLED=true"\r\nif not defined AI_SENSITIVE_DATA_FILTER_FAILURE_MODE set "AI_SENSITIVE_DATA_FILTER_FAILURE_MODE=closed"\r\nif not defined GLINER_BATCH_SIZE set "GLINER_BATCH_SIZE=8"\r\nif not defined GLINER_DEVICE set "GLINER_DEVICE=cpu"\r\nif not defined GLINER_RUNTIME_MODE set "GLINER_RUNTIME_MODE=local"\r\nif not defined GLINER_SERVICE_URL set "GLINER_SERVICE_URL=http://127.0.0.1:18001"\r\nif not defined GLINER_PYTHON_PATH set "GLINER_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\python\\python.exe"\r\nif not defined GLINER_SERVICE_DIR set "GLINER_SERVICE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\service"\r\nif not defined GLINER_MODEL_BUNDLE_DIR set "GLINER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\models\\gliner2"\r\nif not defined GLINER_CHINESE_NER_MODEL_BUNDLE_DIR set "GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\models\\chinese-roberta"\r\nif not defined GLINER_PII_MODEL_BUNDLE_DIR set "GLINER_PII_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\gliner-runtime\\models\\liquid-pii"\r\nif not defined HOSTNAME',
+      'if not defined LIBREOFFICE_PATH set "LIBREOFFICE_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\soffice.exe"\r\nif not defined LIBREOFFICE_PYTHON_PATH set "LIBREOFFICE_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%libreoffice\\program\\python.exe"\r\nif not defined CAPABILITY_FILE_RUNTIME_DIR set "CAPABILITY_FILE_RUNTIME_DIR=%WEBPILOT_SERVER_ROOT%server\\capability-runtime\\file"\r\nif not defined CAPABILITY_BROWSER_RUNTIME_DIR set "CAPABILITY_BROWSER_RUNTIME_DIR=%WEBPILOT_SERVER_ROOT%server\\capability-runtime\\browser"\r\nif not defined AI_SENSITIVE_DATA_FILTER_ENABLED set "AI_SENSITIVE_DATA_FILTER_ENABLED=true"\r\nif not defined AI_SENSITIVE_DATA_FILTER_FAILURE_MODE set "AI_SENSITIVE_DATA_FILTER_FAILURE_MODE=closed"\r\nif not defined GLINER_BATCH_SIZE set "GLINER_BATCH_SIZE=8"\r\nif not defined GLINER_DEVICE set "GLINER_DEVICE=cpu"\r\nif not defined GLINER_RUNTIME_MODE set "GLINER_RUNTIME_MODE=local"\r\nif not defined GLINER_SERVICE_URL set "GLINER_SERVICE_URL=http://127.0.0.1:18001"\r\nif not defined GLINER_PYTHON_PATH set "GLINER_PYTHON_PATH=%WEBPILOT_SERVER_ROOT%server\\sensitive-data-runtime\\python\\python.exe"\r\nif not defined GLINER_SERVICE_DIR set "GLINER_SERVICE_DIR=%WEBPILOT_SERVER_ROOT%server\\sensitive-data-runtime\\service"\r\nif not defined GLINER_MODEL_BUNDLE_DIR set "GLINER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\sensitive-data-runtime\\models\\gliner2"\r\nif not defined GLINER_CHINESE_NER_MODEL_BUNDLE_DIR set "GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\sensitive-data-runtime\\models\\chinese-roberta"\r\nif not defined GLINER_PII_MODEL_BUNDLE_DIR set "GLINER_PII_MODEL_BUNDLE_DIR=%WEBPILOT_SERVER_ROOT%server\\sensitive-data-runtime\\models\\liquid-pii"\r\nif not defined HOSTNAME',
     )
     .replace('PORT=17890', 'PORT=3000');
   fs.writeFileSync(path.join(distributionRoot, 'start.cmd'), packagedStartScript, 'utf8');
@@ -132,7 +135,7 @@ prepareOutputDirectory();
 const productionPackagePaths = copyProductionRuntime(root, serverRoot);
 copyInto(path.join(root, 'public'), path.join(serverRoot, 'public'));
 const serverRuntimeFiles = copyServerRuntime(root, serverRoot);
-copyGlinerRuntime(path.join(serverRoot, 'gliner-runtime'));
+copySensitiveDataRuntime(path.join(serverRoot, 'sensitive-data-runtime'));
 copyInto(
   path.join(root, 'packages', 'capability-file', 'runtime'),
   path.join(serverRoot, 'capability-runtime', 'file'),
@@ -152,7 +155,7 @@ if (
 ) {
   throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run "npm run build" before packaging.');
 }
-assertGlinerRuntime(path.join(serverRoot, 'gliner-runtime'));
+assertSensitiveDataRuntime(path.join(serverRoot, 'sensitive-data-runtime'));
 
 writeStartScript();
 writeReadme();

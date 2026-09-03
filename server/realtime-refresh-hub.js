@@ -6,6 +6,9 @@ const { DataSource } = require('typeorm');
 const REFRESH_SERVICE_NAME = 'webpilot-refresh-websocket';
 const REFRESH_SERVICE_HEADER = 'x-webpilot-refresh-service';
 const MAX_PUBLISH_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_REFRESH_BATCH_BYTES = 1024 * 1024;
+const MAX_REFRESH_BATCH_EVENTS = 64;
+const REFRESH_BATCH_DELAY_MS = 16;
 
 function encodeFrame(opcode, payload) {
   const content = Buffer.isBuffer(payload) ? payload : Buffer.from(payload);
@@ -95,6 +98,7 @@ function createRealtimeRefreshHub(options) {
   let database;
   let databaseInitialization;
   const pending = [];
+  let pendingFlushTimer;
   const databasePath = path.join(
     path.resolve(process.env.APP_DATA_DIR || path.join(options.appDir, 'runtime')),
     '.data',
@@ -157,19 +161,58 @@ function createRealtimeRefreshHub(options) {
     }
   };
 
+  const batchedRefreshPayloads = (events) => {
+    const batches = [];
+    let batch = [];
+    let batchBytes = 0;
+    for (const event of events) {
+      const eventBytes = Buffer.byteLength(JSON.stringify(event));
+      if (batch.length && (
+        batch.length >= MAX_REFRESH_BATCH_EVENTS
+        || batchBytes + eventBytes > MAX_REFRESH_BATCH_BYTES
+      )) {
+        batches.push({ type: 'refresh-batch', events: batch });
+        batch = [];
+        batchBytes = 0;
+      }
+      batch.push(event);
+      batchBytes += eventBytes;
+    }
+    if (batch.length) batches.push({ type: 'refresh-batch', events: batch });
+    return batches;
+  };
+
   const flushPending = () => {
+    if (pendingFlushTimer) {
+      clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = undefined;
+    }
     if (!clients.size || !pending.length) return;
     const connectedUsers = new Set([...clients].map((client) => client.userId));
     const deliverable = pending.filter((event) => connectedUsers.has(event.userId));
     const retained = pending.filter((event) => !connectedUsers.has(event.userId));
     pending.splice(0, pending.length, ...retained);
-    for (const event of deliverable) broadcast(event, event.userId);
+    const eventsByUser = new Map();
+    for (const event of deliverable) {
+      const events = eventsByUser.get(event.userId) || [];
+      events.push(event);
+      eventsByUser.set(event.userId, events);
+    }
+    for (const [userId, events] of eventsByUser) {
+      for (const payload of batchedRefreshPayloads(events)) broadcast(payload, userId);
+    }
+  };
+
+  const schedulePendingFlush = () => {
+    if (pendingFlushTimer || !clients.size || !pending.length) return;
+    pendingFlushTimer = setTimeout(flushPending, REFRESH_BATCH_DELAY_MS);
+    pendingFlushTimer.unref?.();
   };
 
   const publish = (event) => {
     pending.push(event);
     if (pending.length > 500) pending.splice(0, pending.length - 500);
-    flushPending();
+    schedulePendingFlush();
   };
 
   const consumeTicket = async (ticket, origin) => {
@@ -242,7 +285,7 @@ function createRealtimeRefreshHub(options) {
     socket.on('close', () => clients.delete(client));
     socket.on('error', () => removeClient(client));
     send(client, { type: 'hello', connectedAt: new Date().toISOString() });
-    flushPending();
+    schedulePendingFlush();
   };
 
   const readPublishBody = (request) => new Promise((resolve, reject) => {
@@ -295,6 +338,8 @@ function createRealtimeRefreshHub(options) {
     acceptUpgrade,
     async close() {
       clearInterval(heartbeat);
+      if (pendingFlushTimer) clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = undefined;
       for (const client of clients) client.socket.destroy();
       clients.clear();
       const activeDatabase = databaseInitialization

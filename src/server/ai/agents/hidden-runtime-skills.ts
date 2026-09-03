@@ -1,27 +1,19 @@
 import type { BrowserActionResult } from '@webpilot/capability-browser/node';
-import { browserCapabilityToolNames } from '@webpilot/capability-browser';
-import { fileCapabilityToolNames } from '@webpilot/capability-file';
-import { chartCapabilityToolNames } from '@webpilot/capability-chart';
-import {
-  browserCodeRuntimeSkillContent,
-  browserCodeRuntimeSkillId,
-  browserCodeRuntimeSkillSummary,
-} from '@webpilot/capability-browser/runtime-skill';
-import {
-  fileArtifactRuntimeSkillContent,
-  fileArtifactRuntimeSkillId,
-  fileArtifactRuntimeSkillSummary,
-} from '@webpilot/capability-file/runtime-skill';
-import {
-  subagentRuntimeSkillContent,
-  subagentRuntimeSkillId,
-  subagentRuntimeSkillSummary,
-} from './subagent-runtime-skill';
-import {
-  chartRuntimeSkillContent,
-  chartRuntimeSkillId,
-  chartRuntimeSkillSummary,
-} from '@webpilot/capability-chart/runtime-skill';
+import type { CapabilitySkill } from '@webpilot/capability-sdk';
+import { browserCapabilityManifest } from '@webpilot/capability-browser';
+import { fileCapabilityManifest } from '@webpilot/capability-file';
+import { chartCapabilityManifest } from '@webpilot/capability-chart';
+import { subagentRuntimeSkill } from './subagent-runtime-skill';
+
+function manifestRuntimeSkill(manifest: { id: string; skills?: readonly CapabilitySkill[] }) {
+  const skill = manifest.skills?.[0];
+  if (!skill) throw new Error(`Capability ${manifest.id} does not export a runtime Skill.`);
+  return skill;
+}
+
+const browserRuntimeSkill = manifestRuntimeSkill(browserCapabilityManifest);
+const fileRuntimeSkill = manifestRuntimeSkill(fileCapabilityManifest);
+const chartCapabilityRuntimeSkill = manifestRuntimeSkill(chartCapabilityManifest);
 
 type HiddenRuntimeSkillPolicy = {
   skillId: string;
@@ -34,54 +26,34 @@ function actionFromInput(input: unknown) {
   return typeof action === 'string' ? action : undefined;
 }
 
-export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSkillPolicy>> = Object.freeze({
-  [browserCapabilityToolNames.browser]: {
-    skillId: browserCodeRuntimeSkillId,
-    requires: (input) => actionFromInput(input) === 'code',
-  },
-  [fileCapabilityToolNames.file]: {
-    skillId: fileArtifactRuntimeSkillId,
-    requires: () => true,
-  },
-  [chartCapabilityToolNames.chart]: {
-    skillId: chartRuntimeSkillId,
-    requires: () => true,
-  },
-  subagent: {
-    skillId: subagentRuntimeSkillId,
-    requires: (input) => actionFromInput(input) === 'spawn',
-  },
-});
+const hiddenRuntimeSkills: Readonly<Record<string, CapabilitySkill>> = Object.freeze(Object.fromEntries([
+  browserRuntimeSkill,
+  fileRuntimeSkill,
+  subagentRuntimeSkill,
+  chartCapabilityRuntimeSkill,
+].map((skill) => [skill.id, skill])));
 
-const hiddenRuntimeSkills = Object.freeze({
-  [browserCodeRuntimeSkillId]: {
-    content: browserCodeRuntimeSkillContent,
-    summary: browserCodeRuntimeSkillSummary,
-  },
-  [fileArtifactRuntimeSkillId]: {
-    content: fileArtifactRuntimeSkillContent,
-    summary: fileArtifactRuntimeSkillSummary,
-  },
-  [subagentRuntimeSkillId]: {
-    content: subagentRuntimeSkillContent,
-    summary: subagentRuntimeSkillSummary,
-  },
-  [chartRuntimeSkillId]: {
-    content: chartRuntimeSkillContent,
-    summary: chartRuntimeSkillSummary,
-  },
-});
+export const hiddenRuntimeSkillPolicies: Readonly<Record<string, HiddenRuntimeSkillPolicy>> = Object.freeze(
+  Object.fromEntries(Object.values(hiddenRuntimeSkills).flatMap((skill) => (
+    (skill.activation || []).map((activation) => [activation.toolName, {
+      skillId: skill.id,
+      requires: activation.actions?.length
+        ? (input: unknown) => activation.actions!.includes(actionFromInput(input) || '')
+        : () => true,
+    } satisfies HiddenRuntimeSkillPolicy])
+  ))),
+);
 
 export function activeBrowserRuntimeSkillId() {
-  return browserCodeRuntimeSkillId;
+  return browserRuntimeSkill.id;
 }
 
 export function hiddenRuntimeSkillSummaries() {
   return [
-    hiddenRuntimeSkills[browserCodeRuntimeSkillId].summary,
-    hiddenRuntimeSkills[fileArtifactRuntimeSkillId].summary,
-    hiddenRuntimeSkills[subagentRuntimeSkillId].summary,
-    hiddenRuntimeSkills[chartRuntimeSkillId].summary,
+    browserRuntimeSkill.summary,
+    fileRuntimeSkill.summary,
+    subagentRuntimeSkill.summary,
+    chartCapabilityRuntimeSkill.summary,
   ].join('\n');
 }
 
@@ -116,43 +88,36 @@ export function hiddenRuntimeSkillIdsReadFromTraces(traces: ReadonlyArray<{
   return loaded;
 }
 
-export function automaticallyLoadHiddenRuntimeSkill(
+export function requireHiddenRuntimeSkillRead(
   toolName: string,
   input: unknown,
   loadedSkillIds: Set<string>,
-): Pick<BrowserActionResult, 'loadedRuntimeSkill'> | BrowserActionResult | undefined {
+): BrowserActionResult | undefined {
   const requiredSkillId = requiredHiddenRuntimeSkillId(toolName, input);
   if (!requiredSkillId || loadedSkillIds.has(requiredSkillId)) return undefined;
-  const content = hiddenRuntimeSkillContent(requiredSkillId);
-  if (!content) {
-    return {
-      ok: false,
-      actual: JSON.stringify({
-        ok: false,
-        error: `Unable to load required hidden runtime Skill ${requiredSkillId}.`,
-        requiredSkillId,
-      }, null, 2),
-      failureCategory: 'skill-load-failed',
-      requiredSkillId,
-    };
-  }
-  loadedSkillIds.add(requiredSkillId);
   return {
-    loadedRuntimeSkill: {
-      id: requiredSkillId,
-      content,
-      loadedAutomatically: true,
-    },
+    ok: false,
+    actual: JSON.stringify({
+      ok: false,
+      code: 'RUNTIME_SKILL_READ_REQUIRED',
+      error: `Read required runtime Skill ${requiredSkillId} before calling ${toolName}. The governed operation was not executed.`,
+      requiredSkillId,
+    }, null, 2),
+    failureCategory: 'skill-read-required',
+    requiredSkillId,
   };
 }
 
-/**
- * Governed tools stay visible. Their first call in one Agent run atomically
- * loads and returns the corresponding hidden Skill before executing the
- * original call, removing the extra model round-trip.
- */
-export function runtimeToolTypesWithAutomaticSkills(
+export function runtimeToolTypesWithLoadedSkills(
   toolTypes: readonly string[],
+  loadedSkillIds: ReadonlySet<string>,
+  options: { allowSubagentRead?: boolean } = {},
 ) {
-  return [...toolTypes];
+  return toolTypes.filter((toolName) => {
+    // subagent action=read must remain available for collecting a result after
+    // a resume. action=spawn is still rejected by requireHiddenRuntimeSkillRead.
+    if (toolName === 'subagent' && options.allowSubagentRead) return true;
+    const policy = hiddenRuntimeSkillPolicies[toolName];
+    return !policy || loadedSkillIds.has(policy.skillId);
+  });
 }

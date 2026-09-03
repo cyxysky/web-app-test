@@ -3,12 +3,12 @@ import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
   compactBrowserChatLogsForClient,
 } from '@/server/ai/agents/browser-chat-log-client';
-import {
-  recoverOrphanedBrowserChatSession,
-  type BrowserChatLogRecord,
-  type BrowserChatMessage,
-  type BrowserChatSessionSnapshot,
+import type {
+  BrowserChatLogRecord,
+  BrowserChatMessage,
+  BrowserChatSessionSnapshot,
 } from '@/server/ai/agents/browser-chat.service';
+import { recoverOrphanedBrowserChatSession } from '@/server/ai/agents/browser-chat-session-recovery';
 // Session list/detail reads use database projections rather than the in-memory
 // service list, so reconcile persisted `running` flags with the live registry.
 import type { BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';

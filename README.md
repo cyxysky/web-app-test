@@ -669,6 +669,7 @@ packages/
   capability-file/
   capability-chart/
   capability-browser/
+  capability-sensitive-data/
 ```
 
 ### `@webpilot/capability-sdk`

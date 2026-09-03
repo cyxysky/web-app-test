@@ -114,12 +114,19 @@ for (const format of fileFormats) {
 }
 
 export function normalizedFileExtension(value: string) {
-  const name = String(value || '').split(/[?#]/, 1)[0]
+  const leaf = String(value || '')
     .replace(/\\/g, '/')
     .split('/')
     .at(-1) || '';
-  const dot = name.lastIndexOf('.');
-  return dot > -1 ? name.slice(dot).toLowerCase() : '';
+  const dot = leaf.lastIndexOf('.');
+  if (dot < 0) return '';
+  // `#` and `?` are valid filename characters on supported local platforms.
+  // Treat them as URL suffix delimiters only when they occur after the file
+  // extension has started; otherwise names such as "#31471 report.docx" lose
+  // their entire basename and are misclassified as extensionless.
+  const suffixOffset = leaf.slice(dot).search(/[?#]/);
+  const name = suffixOffset > -1 ? leaf.slice(0, dot + suffixOffset) : leaf;
+  return name.slice(dot).toLowerCase();
 }
 
 export function fileFormatForExtension(extension: string) {

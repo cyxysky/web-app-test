@@ -22,9 +22,6 @@ through `FileCapabilityOperations` and `@webpilot/capability-sdk`.
 - Office source analysis, artifact validation, rendering validation, preview
   generation, attachment reading, and bounded worker-based text extraction.
 
-The legacy anchor-based DOCX fill helper is package-internal. It is not part of
-the package exports and is not exposed as a `file` action.
-
 The default converter runs local LibreOffice. Hosts may instead inject a remote
 conversion function, so consumers are not tied to WebPilot, AI SDK, or a local
 Office installation.
@@ -53,6 +50,30 @@ const provider = createNodeFileCapability({
   visualInputAvailable: false,
 });
 ```
+
+For an AI SDK Agent, install `@webpilot/capability-file` and
+`@webpilot/capability-adapter-ai-sdk`, then mount the provider in one call:
+
+```ts
+import { createNodeFileCapability } from '@webpilot/capability-file/node';
+import { mountAISDKCapabilities } from '@webpilot/capability-adapter-ai-sdk';
+
+const fileRuntime = await mountAISDKCapabilities({
+  providers: [createNodeFileCapability({
+    workspace: { artifactsRoot: './artifacts' },
+    visualInputAvailable: false,
+  })],
+  context: { runId: crypto.randomUUID() },
+  configurations: {
+    'com.webpilot.file': { OFFICE_GENERATION_MODE: 'auto' },
+  },
+  skills: { mode: 'lazy' },
+});
+```
+
+`@webpilot/capability-host` is not a dependency of the File core. The AI SDK
+adapter brings it transitively for one-call mounting; direct Provider consumers
+can continue to use File without the host API.
 
 Set `visualInputAvailable` from the active model's image-input capability. When
 it is false, the `file` schema omits `visualIndex`, `visualRead`,

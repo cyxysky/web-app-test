@@ -2,11 +2,13 @@ import { spawnSync } from 'node:child_process';
 
 const packages = [
   '@webpilot/capability-sdk',
+  '@webpilot/capability-host',
   '@webpilot/capability-adapter-ai-sdk',
   '@webpilot/capability-adapter-mcp',
   '@webpilot/capability-browser',
   '@webpilot/capability-chart',
   '@webpilot/capability-file',
+  '@webpilot/capability-sensitive-data',
 ];
 const dryRun = process.argv.includes('--dry-run');
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';

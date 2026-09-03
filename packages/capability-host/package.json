@@ -1,0 +1,46 @@
+{
+  "name": "@webpilot/capability-host",
+  "version": "0.1.0",
+  "description": "Framework-neutral capability mounting, configuration stores, and Skill catalog.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./typeorm": {
+      "types": "./dist/typeorm.d.ts",
+      "import": "./dist/typeorm.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@webpilot/capability-sdk": "0.1.0"
+  },
+  "peerDependencies": {
+    "typeorm": ">=0.3.0 <2"
+  },
+  "peerDependenciesMeta": {
+    "typeorm": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

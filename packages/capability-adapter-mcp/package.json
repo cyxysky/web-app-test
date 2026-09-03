@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
+    "@webpilot/capability-host": "0.1.0",
     "@webpilot/capability-sdk": "0.1.0"
   },
   "engines": {

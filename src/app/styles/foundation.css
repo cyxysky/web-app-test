@@ -181,54 +181,9 @@ body {
   font-weight: 600;
 }
 
-.ui-button {
-  align-items: center;
-  color: var(--muted-strong);
-  cursor: pointer;
-  display: inline-flex;
-  font-family: inherit;
-  gap: 7px;
-  justify-content: center;
-  transition:
-    background-color var(--motion-fast) ease,
-    border-color var(--motion-fast) ease,
-    box-shadow var(--motion-fast) ease,
-    color var(--motion-fast) ease,
-    opacity var(--motion-fast) ease,
-    transform var(--motion-fast) var(--ease-standard);
-  background: transparent;
-  box-shadow: none;
-  border: 1px solid transparent;
-  padding: 0 14px;
-  white-space: nowrap;
-  border-radius: var(--control-radius);
-  font-size: 13px;
-  font-weight: 600;
-  min-height: var(--control-height);
-  padding-inline: 14px;
-}
-
 .ui-icon-button {
-  align-items: center;
-  color: var(--muted-strong);
-  cursor: pointer;
-  display: inline-flex;
   flex: 0 0 auto;
-  font-family: inherit;
-  gap: 7px;
-  justify-content: center;
-  transition:
-    background-color var(--motion-fast) ease,
-    border-color var(--motion-fast) ease,
-    box-shadow var(--motion-fast) ease,
-    color var(--motion-fast) ease,
-    opacity var(--motion-fast) ease,
-    transform var(--motion-fast) var(--ease-standard);
   padding: 0;
-  white-space: nowrap;
-  border-radius: var(--control-radius);
-  font-size: 13px;
-  font-weight: 600;
   background: transparent;
   border: 0;
   box-shadow: none;

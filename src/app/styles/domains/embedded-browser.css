@@ -315,7 +315,7 @@
   }
 }
 
-/* Edge-style raised active surface, kept above the legacy dark-theme rules. */
+/* Edge-style raised active surface, kept above the dark-theme rules. */
 .browser-chat-embedded-browser .browser-chat-embedded-tab.active,
 :root[data-theme="dark"] .browser-chat-embedded-browser .browser-chat-embedded-tab.active {
   --embedded-active-tab-bg: color-mix(in srgb, var(--embedded-toolbar-bg) 90%, var(--foreground) 10%);

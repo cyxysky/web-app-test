@@ -29,8 +29,23 @@
       "@webpilot/capability-sdk": [
         "./packages/capability-sdk/src/index.ts"
       ],
+      "@webpilot/capability-host": [
+        "./packages/capability-host/src/index.ts"
+      ],
+      "@webpilot/capability-host/node": [
+        "./packages/capability-host/src/node.ts"
+      ],
+      "@webpilot/capability-host/typeorm": [
+        "./packages/capability-host/src/typeorm.ts"
+      ],
       "@webpilot/capability-adapter-ai-sdk": [
         "./packages/capability-adapter-ai-sdk/src/index.ts"
+      ],
+      "@webpilot/capability-adapter-ai-sdk/node": [
+        "./packages/capability-adapter-ai-sdk/src/node.ts"
+      ],
+      "@webpilot/capability-adapter-ai-sdk/typeorm": [
+        "./packages/capability-adapter-ai-sdk/src/typeorm.ts"
       ],
       "@webpilot/capability-adapter-mcp": [
         "./packages/capability-adapter-mcp/src/index.ts"
@@ -43,6 +58,12 @@
       ],
       "@webpilot/capability-browser/runtime-skill": [
         "./packages/capability-browser/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-browser/settings": [
+        "./packages/capability-browser/src/settings.ts"
+      ],
+      "@webpilot/capability-browser/session-group": [
+        "./packages/capability-browser/src/session-group.ts"
       ],
       "@webpilot/capability-browser/mcp": [
         "./packages/capability-browser/src/mcp.ts"
@@ -58,6 +79,9 @@
       ],
       "@webpilot/capability-chart/runtime-skill": [
         "./packages/capability-chart/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-chart/settings": [
+        "./packages/capability-chart/src/settings.ts"
       ],
       "@webpilot/capability-chart/mcp": [
         "./packages/capability-chart/src/mcp.ts"
@@ -76,6 +100,9 @@
       ],
       "@webpilot/capability-file/runtime-skill": [
         "./packages/capability-file/src/runtime-skill.ts"
+      ],
+      "@webpilot/capability-file/settings": [
+        "./packages/capability-file/src/settings.ts"
       ],
       "@webpilot/capability-file/mcp": [
         "./packages/capability-file/src/mcp.ts"
@@ -103,6 +130,18 @@
       ],
       "@webpilot/capability-file/node/workspace": [
         "./packages/capability-file/src/node/workspace.ts"
+      ],
+      "@webpilot/capability-sensitive-data": [
+        "./packages/capability-sensitive-data/src/index.ts"
+      ],
+      "@webpilot/capability-sensitive-data/ai-sdk": [
+        "./packages/capability-sensitive-data/src/ai-sdk.ts"
+      ],
+      "@webpilot/capability-sensitive-data/node": [
+        "./packages/capability-sensitive-data/src/node.ts"
+      ],
+      "@webpilot/capability-sensitive-data/settings": [
+        "./packages/capability-sensitive-data/src/settings.ts"
       ]
     }
   },

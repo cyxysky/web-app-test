@@ -241,11 +241,12 @@ function packagedLibreOfficeExecutable() {
 
 function packagedGlinerEnvironment(serverDir) {
   if (!app.isPackaged) return {};
-  const runtimeRoot = path.join(serverDir, 'gliner-runtime');
+  const runtimeRoot = path.join(serverDir, 'sensitive-data-runtime');
   const pythonPath = path.join(runtimeRoot, 'python', 'python.exe');
   const serviceDir = path.join(runtimeRoot, 'service');
   const modelDir = path.join(runtimeRoot, 'models', 'gliner2');
   const chineseNerModelDir = path.join(runtimeRoot, 'models', 'chinese-roberta');
+  const piiModelDir = path.join(runtimeRoot, 'models', 'liquid-pii');
   for (const requiredPath of [
     pythonPath,
     path.join(serviceDir, 'app.py'),
@@ -253,6 +254,7 @@ function packagedGlinerEnvironment(serverDir) {
     path.join(serviceDir, 'entity_boundaries.py'),
     path.join(modelDir, 'config.json'),
     path.join(chineseNerModelDir, 'config.json'),
+    path.join(piiModelDir, 'config.json'),
   ]) {
     if (!fs.existsSync(requiredPath)) throw new Error(`Packaged GLiNER runtime is missing: ${requiredPath}`);
   }
@@ -263,6 +265,7 @@ function packagedGlinerEnvironment(serverDir) {
     GLINER_CHINESE_NER_MODEL_BUNDLE_DIR: chineseNerModelDir,
     GLINER_DEVICE: 'cpu',
     GLINER_MODEL_BUNDLE_DIR: modelDir,
+    GLINER_PII_MODEL_BUNDLE_DIR: piiModelDir,
     GLINER_PYTHON_PATH: pythonPath,
     GLINER_RUNTIME_MODE: 'local',
     GLINER_SERVICE_DIR: serviceDir,
@@ -2219,6 +2222,17 @@ function showEmbeddedBrowserTabContextMenu(input = {}) {
   return { ok: true };
 }
 
+function registerIpcHandler(channel, handler, onError) {
+  ipcMain.handle(channel, async (event, input = {}) => {
+    try {
+      return await handler(event, input);
+    } catch (error) {
+      onError?.(error);
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+}
+
 function registerEmbeddedBrowserIpc() {
   ipcMain.on('webpilot:embedded-browser:client-navigation', (event, payload = {}) => {
     const tab = embeddedBrowserTabForWebContents(event.sender);
@@ -2237,376 +2251,197 @@ function registerEmbeddedBrowserIpc() {
     notifyEmbeddedBrowserStateChange();
   });
 
-  ipcMain.handle('webpilot:embedded-browser:get-state', async () => {
-    try {
-      return embeddedBrowserState();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:embedded-browser:get-state', () => embeddedBrowserState());
+  registerIpcHandler('webpilot:embedded-browser:create-tab', (_event, input) => createManualEmbeddedBrowserTab(input));
+  registerIpcHandler('webpilot:embedded-browser:create-group', (_event, input) => createManualEmbeddedBrowserGroup(input));
+  registerIpcHandler('webpilot:embedded-browser:set-library-panel', (_event, input) => {
+    const requestedPanel = input.panel === 'library' ? input.panel : '';
+    const nextPanel = input.toggle && embeddedBrowserLibraryPanel === requestedPanel ? '' : requestedPanel;
+    return setEmbeddedBrowserLibraryPanel(nextPanel);
   });
+  registerIpcHandler('webpilot:embedded-browser:clear-history', () => clearEmbeddedBrowserHistory());
+  registerIpcHandler('webpilot:embedded-browser:remove-bookmark', (_event, input) => (
+    removeEmbeddedBrowserBookmark(typeof input.url === 'string' ? input.url : '')
+  ));
+  registerIpcHandler('webpilot:embedded-browser:set-tab-muted', (_event, input) => (
+    setEmbeddedBrowserTabMuted({ id: input.id, muted: input.muted })
+  ));
+  registerIpcHandler('webpilot:embedded-browser:go-back', () => navigateEmbeddedBrowserHistory('back'));
+  registerIpcHandler('webpilot:embedded-browser:go-forward', () => navigateEmbeddedBrowserHistory('forward'));
+  registerIpcHandler('webpilot:embedded-browser:reload', () => reloadEmbeddedBrowserTab());
+  registerIpcHandler('webpilot:embedded-browser:stop', () => stopEmbeddedBrowserTabLoading());
+  registerIpcHandler('webpilot:embedded-browser:toggle-bookmark', () => toggleEmbeddedBrowserBookmark());
 
-  ipcMain.handle('webpilot:embedded-browser:create-tab', async (_event, input = {}) => {
-    try {
-      return await createManualEmbeddedBrowserTab(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:create-group', async (_event, input = {}) => {
-    try {
-      return createManualEmbeddedBrowserGroup(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:set-library-panel', async (_event, input = {}) => {
-    try {
-      const requestedPanel = input.panel === 'library' ? input.panel : '';
-      const nextPanel = input.toggle && embeddedBrowserLibraryPanel === requestedPanel ? '' : requestedPanel;
-      return setEmbeddedBrowserLibraryPanel(nextPanel);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:clear-history', async () => {
-    try {
-      return clearEmbeddedBrowserHistory();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:remove-bookmark', async (_event, input = {}) => {
-    try {
-      return removeEmbeddedBrowserBookmark(typeof input.url === 'string' ? input.url : '');
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:set-tab-muted', async (_event, input = {}) => {
-    try {
-      return setEmbeddedBrowserTabMuted({ id: input.id, muted: input.muted });
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:go-back', async () => {
-    try {
-      return await navigateEmbeddedBrowserHistory('back');
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:go-forward', async () => {
-    try {
-      return await navigateEmbeddedBrowserHistory('forward');
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:reload', async () => {
-    try {
-      return reloadEmbeddedBrowserTab();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:stop', async () => {
-    try {
-      return stopEmbeddedBrowserTabLoading();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:toggle-bookmark', async () => {
-    try {
-      return toggleEmbeddedBrowserBookmark();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:set-visible', async (_event, input = {}) => {
-    try {
-      if (input.bounds) setEmbeddedBrowserBounds(input.bounds);
-      if (input.visible) {
-        const hasRequestedBrowserTarget = Boolean(
-          String(input.groupId || '').trim()
-          || String(input.id || '').trim()
-          || normalizeEmbeddedBrowserSessionId(input.sessionId)
-        );
-        if (!hasRequestedBrowserTarget) {
-          detachEmbeddedBrowserView();
-          return embeddedBrowserState();
-        }
-        attachEmbeddedBrowserView({
-          createIfMissing: input.createIfMissing === true,
-          groupId: input.groupId,
-          id: input.id,
-          sessionId: input.sessionId,
-          userId: input.userId,
-        });
-        const tab = activeEmbeddedBrowserTab();
-        if (typeof input.url === 'string' && input.url.trim()) {
-          if (!tab) throw new Error('Embedded browser tab is not ready.');
-          await loadEmbeddedBrowserTabUrl(tab, input.url.trim());
-        } else if (tab) {
-          void ensureEmbeddedBrowserTabReady(tab);
-        }
-      } else {
+  registerIpcHandler('webpilot:embedded-browser:set-visible', async (_event, input) => {
+    if (input.bounds) setEmbeddedBrowserBounds(input.bounds);
+    if (input.visible) {
+      const hasRequestedBrowserTarget = Boolean(
+        String(input.groupId || '').trim()
+        || String(input.id || '').trim()
+        || normalizeEmbeddedBrowserSessionId(input.sessionId)
+      );
+      if (!hasRequestedBrowserTarget) {
         detachEmbeddedBrowserView();
+        return embeddedBrowserState();
       }
-      return embeddedBrowserState();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:set-bounds', async (_event, bounds = {}) => {
-    try {
-      return { ok: true, bounds: setEmbeddedBrowserBounds(bounds) };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:navigate', async (_event, input = {}) => {
-    try {
-      const url = typeof input.url === 'string' ? input.url.trim() : '';
-      if (!url) throw new Error('URL is empty.');
       attachEmbeddedBrowserView({
-        createIfMissing: true,
+        createIfMissing: input.createIfMissing === true,
         groupId: input.groupId,
         id: input.id,
         sessionId: input.sessionId,
+        userId: input.userId,
       });
       const tab = activeEmbeddedBrowserTab();
-      if (!tab) throw new Error('Embedded browser tab is not ready.');
-      await loadEmbeddedBrowserTabUrl(tab, url);
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:move-tab', async (_event, input = {}) => {
-    try {
-      return moveEmbeddedBrowserTab(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:show-tab-context-menu', async (_event, input = {}) => {
-    try {
-      return showEmbeddedBrowserTabContextMenu(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:set-group-collapsed', async (_event, input = {}) => {
-    try {
-      return setEmbeddedBrowserGroupCollapsed(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:close-active-tab', async () => {
-    try {
-      return closeEmbeddedBrowserTab(embeddedBrowserActiveTabId);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:close-tab', async (_event, input = {}) => {
-    try {
-      return closeEmbeddedBrowserTab(typeof input.id === 'string' ? input.id : embeddedBrowserActiveTabId);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:close-group', async (_event, input = {}) => {
-    try {
-      return closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : embeddedBrowserActiveGroupId);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:embedded-browser:discard-group', async (_event, input = {}) => {
-    try {
-      const groupId = typeof input.id === 'string' ? input.id : '';
-      const sessionId = embeddedBrowserSessionIdFromGroupId(groupId)
-        || normalizeEmbeddedBrowserSessionId(embeddedBrowserGroups.get(groupId)?.sessionId);
-      const userId = normalizeEmbeddedBrowserUserId(embeddedBrowserGroups.get(groupId)?.userId);
-      const state = closeEmbeddedBrowserGroup(groupId, { rememberClosed: false });
-      const userPartitionStillInUse = Boolean(userId) && Array.from(embeddedBrowserGroups.values())
-        .some((group) => normalizeEmbeddedBrowserUserId(group.userId) === userId);
-      if (input.clearStorage === true && (sessionId || userId) && !userPartitionStillInUse) {
-        await clearEmbeddedBrowserPartition(sessionId, userId);
+      if (typeof input.url === 'string' && input.url.trim()) {
+        if (!tab) throw new Error('Embedded browser tab is not ready.');
+        await loadEmbeddedBrowserTabUrl(tab, input.url.trim());
+      } else if (tab) {
+        void ensureEmbeddedBrowserTabReady(tab);
       }
-      return state;
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    } else {
+      detachEmbeddedBrowserView();
     }
+    return embeddedBrowserState();
   });
 
-  ipcMain.handle('webpilot:embedded-browser:activate-tab', async (_event, input = {}) => {
-    try {
-      const id = typeof input.id === 'string' ? input.id : '';
-      const tab = id ? embeddedBrowserTabs.get(id) : undefined;
-      if (!tab || tab.view.webContents.isDestroyed()) throw new Error('Embedded browser tab not found.');
-      if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id });
-      else setActiveEmbeddedBrowserTab(tab);
-      return embeddedBrowserState();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:embedded-browser:set-bounds', (_event, bounds) => (
+    { ok: true, bounds: setEmbeddedBrowserBounds(bounds) }
+  ));
+
+  registerIpcHandler('webpilot:embedded-browser:navigate', async (_event, input) => {
+    const url = typeof input.url === 'string' ? input.url.trim() : '';
+    if (!url) throw new Error('URL is empty.');
+    attachEmbeddedBrowserView({
+      createIfMissing: true,
+      groupId: input.groupId,
+      id: input.id,
+      sessionId: input.sessionId,
+    });
+    const tab = activeEmbeddedBrowserTab();
+    if (!tab) throw new Error('Embedded browser tab is not ready.');
+    await loadEmbeddedBrowserTabUrl(tab, url);
+    return { ok: true };
   });
 
-  ipcMain.handle('webpilot:embedded-browser:reset', async () => {
-    try {
-      attachEmbeddedBrowserView({
-        createIfMissing: true,
-        groupId: embeddedBrowserActiveGroupId || undefined,
-        id: embeddedBrowserActiveTabId || undefined,
-      });
-      const tab = activeEmbeddedBrowserTab();
-      if (!tab) throw new Error('Embedded browser tab is not ready.');
-      await loadEmbeddedBrowserTabUrl(tab, embeddedBrowserPlaceholderUrl());
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  registerIpcHandler('webpilot:embedded-browser:move-tab', (_event, input) => moveEmbeddedBrowserTab(input));
+  registerIpcHandler('webpilot:embedded-browser:show-tab-context-menu', (_event, input) => showEmbeddedBrowserTabContextMenu(input));
+  registerIpcHandler('webpilot:embedded-browser:set-group-collapsed', (_event, input) => setEmbeddedBrowserGroupCollapsed(input));
+  registerIpcHandler('webpilot:embedded-browser:close-active-tab', () => closeEmbeddedBrowserTab(embeddedBrowserActiveTabId));
+  registerIpcHandler('webpilot:embedded-browser:close-tab', (_event, input) => (
+    closeEmbeddedBrowserTab(typeof input.id === 'string' ? input.id : embeddedBrowserActiveTabId)
+  ));
+  registerIpcHandler('webpilot:embedded-browser:close-group', (_event, input) => (
+    closeEmbeddedBrowserGroup(typeof input.id === 'string' ? input.id : embeddedBrowserActiveGroupId)
+  ));
+
+  registerIpcHandler('webpilot:embedded-browser:discard-group', async (_event, input) => {
+    const groupId = typeof input.id === 'string' ? input.id : '';
+    const sessionId = embeddedBrowserSessionIdFromGroupId(groupId)
+      || normalizeEmbeddedBrowserSessionId(embeddedBrowserGroups.get(groupId)?.sessionId);
+    const userId = normalizeEmbeddedBrowserUserId(embeddedBrowserGroups.get(groupId)?.userId);
+    const state = closeEmbeddedBrowserGroup(groupId, { rememberClosed: false });
+    const userPartitionStillInUse = Boolean(userId) && Array.from(embeddedBrowserGroups.values())
+      .some((group) => normalizeEmbeddedBrowserUserId(group.userId) === userId);
+    if (input.clearStorage === true && (sessionId || userId) && !userPartitionStillInUse) {
+      await clearEmbeddedBrowserPartition(sessionId, userId);
     }
+    return state;
+  });
+
+  registerIpcHandler('webpilot:embedded-browser:activate-tab', (_event, input) => {
+    const id = typeof input.id === 'string' ? input.id : '';
+    const tab = id ? embeddedBrowserTabs.get(id) : undefined;
+    if (!tab || tab.view.webContents.isDestroyed()) throw new Error('Embedded browser tab not found.');
+    if (embeddedBrowserVisible) attachEmbeddedBrowserView({ id });
+    else setActiveEmbeddedBrowserTab(tab);
+    return embeddedBrowserState();
+  });
+
+  registerIpcHandler('webpilot:embedded-browser:reset', async () => {
+    attachEmbeddedBrowserView({
+      createIfMissing: true,
+      groupId: embeddedBrowserActiveGroupId || undefined,
+      id: embeddedBrowserActiveTabId || undefined,
+    });
+    const tab = activeEmbeddedBrowserTab();
+    if (!tab) throw new Error('Embedded browser tab is not ready.');
+    await loadEmbeddedBrowserTabUrl(tab, embeddedBrowserPlaceholderUrl());
+    return { ok: true };
   });
 }
 
 function registerSystemIpc() {
-  ipcMain.handle('webpilot:system:select-directory', async (_event, input = {}) => {
-    try {
-      const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
-        ? input.defaultPath.trim()
-        : undefined;
-      const result = await dialog.showOpenDialog(mainWindow, {
-        defaultPath,
-        properties: ['openDirectory', 'createDirectory'],
-        title: 'Select file output directory',
-      });
-      if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
-      return { ok: true, path: result.filePaths[0] };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:system:select-directory', async (_event, input) => {
+    const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
+      ? input.defaultPath.trim()
+      : undefined;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      defaultPath,
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Select file output directory',
+    });
+    if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
+    return { ok: true, path: result.filePaths[0] };
   });
 
-  ipcMain.handle('webpilot:system:download-url', async (_event, input = {}) => {
-    try {
-      const url = String(input.url || '').trim();
-      if (!url) throw new Error('Download URL is required.');
-      const webContents = preferredDownloadWebContents();
-      return startNativeDownload(webContents, url);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:system:download-url', (_event, input) => {
+    const url = String(input.url || '').trim();
+    if (!url) throw new Error('Download URL is required.');
+    const webContents = preferredDownloadWebContents();
+    return startNativeDownload(webContents, url);
   });
 
-  ipcMain.handle('webpilot:system:get-downloads', async () => {
-    try {
-      return systemDownloadState();
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:system:get-downloads', () => systemDownloadState());
+
+  registerIpcHandler('webpilot:system:read-download', async (_event, input) => {
+    const download = systemDownloads.get(String(input.id || ''));
+    if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+    const filePath = path.resolve(download.path);
+    const fileStat = await fs.promises.stat(filePath);
+    if (!fileStat.isFile()) throw new Error('下载路径不是文件。');
+    const buffer = await fs.promises.readFile(filePath);
+    const data = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    return { ok: true, data, fileName: download.fileName || path.basename(filePath) };
   });
 
-  ipcMain.handle('webpilot:system:read-download', async (_event, input = {}) => {
-    try {
-      const download = systemDownloads.get(String(input.id || ''));
-      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+  registerIpcHandler('webpilot:system:remove-download', async (_event, input) => {
+    const id = String(input.id || '');
+    const download = systemDownloads.get(id);
+    if (!id || !download) throw new Error('下载记录不存在。');
+    if (nativeDownloadItems.has(id)) throw new Error('下载进行中，暂时不能删除记录。');
+    if (download.path && fs.existsSync(download.path)) {
       const filePath = path.resolve(download.path);
-      const fileStat = await fs.promises.stat(filePath);
-      if (!fileStat.isFile()) throw new Error('下载路径不是文件。');
-      const buffer = await fs.promises.readFile(filePath);
-      const data = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-      return { ok: true, data, fileName: download.fileName || path.basename(filePath) };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      if (!fs.statSync(filePath).isFile()) throw new Error('下载路径不是文件，无法删除。');
+      await shell.trashItem(filePath);
+      if (fs.existsSync(filePath)) throw new Error('文件未能移入回收站。');
     }
+    systemDownloads.delete(id);
+    emitDownloadRemoved(id);
+    return { ok: true };
+  }, (error) => appendLog(`Download remove failed: ${error instanceof Error ? error.message : String(error)}`));
+
+  registerIpcHandler('webpilot:system:choose-download-directory', (_event, input) => chooseDownloadDirectory(input));
+
+  registerIpcHandler('webpilot:system:open-download', async (_event, input) => {
+    const download = systemDownloads.get(String(input.id || ''));
+    if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+    const error = await shell.openPath(download.path);
+    return error ? { ok: false, error } : { ok: true };
   });
 
-  ipcMain.handle('webpilot:system:remove-download', async (_event, input = {}) => {
-    try {
-      const id = String(input.id || '');
-      const download = systemDownloads.get(id);
-      if (!id || !download) throw new Error('下载记录不存在。');
-      if (nativeDownloadItems.has(id)) throw new Error('下载进行中，暂时不能删除记录。');
-      if (download.path && fs.existsSync(download.path)) {
-        const filePath = path.resolve(download.path);
-        if (!fs.statSync(filePath).isFile()) throw new Error('下载路径不是文件，无法删除。');
-        await shell.trashItem(filePath);
-        if (fs.existsSync(filePath)) throw new Error('文件未能移入回收站。');
-      }
-      systemDownloads.delete(id);
-      emitDownloadRemoved(id);
-      return { ok: true };
-    } catch (error) {
-      appendLog(`Download remove failed: ${error instanceof Error ? error.message : String(error)}`);
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:system:show-download-in-folder', (_event, input) => {
+    const download = systemDownloads.get(String(input.id || ''));
+    if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
+    shell.showItemInFolder(download.path);
+    return { ok: true };
   });
 
-  ipcMain.handle('webpilot:system:choose-download-directory', async (_event, input = {}) => {
-    try {
-      return await chooseDownloadDirectory(input);
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:system:open-download', async (_event, input = {}) => {
-    try {
-      const download = systemDownloads.get(String(input.id || ''));
-      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
-      const error = await shell.openPath(download.path);
-      return error ? { ok: false, error } : { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:system:show-download-in-folder', async (_event, input = {}) => {
-    try {
-      const download = systemDownloads.get(String(input.id || ''));
-      if (!download?.path || !fs.existsSync(download.path)) throw new Error('下载文件不存在或已被移动。');
-      shell.showItemInFolder(download.path);
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
-  });
-
-  ipcMain.handle('webpilot:system:cancel-download', async (_event, input = {}) => {
-    try {
-      const id = String(input.id || '');
-      const item = nativeDownloadItems.get(id);
-      if (!item) throw new Error('该下载已结束。');
-      item.cancel();
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
-    }
+  registerIpcHandler('webpilot:system:cancel-download', (_event, input) => {
+    const id = String(input.id || '');
+    const item = nativeDownloadItems.get(id);
+    if (!item) throw new Error('该下载已结束。');
+    item.cancel();
+    return { ok: true };
   });
 }
 

@@ -32,7 +32,7 @@ id_ed25519.*
 /dist-desktop
 /dist-server
 /dist-electron
-/dist-gliner-runtime
+/dist-sensitive-data-runtime
 /.swc
 /.workflow-data
 /.workflow-vitest

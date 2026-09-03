@@ -2,23 +2,16 @@ import { readBrowserChatSessionHistoryPage } from '@/server/ai/agents/browser-ch
 import { ApiRequestError, apiError, apiJson, boundedQueryInteger } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { BROWSER_CHAT_MESSAGE_PAGE_SIZE } from '@/server/storage/browser-chat-history-store';
+import type { BrowserChatSessionRouteContext } from '@/server/http/browser-chat-route';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RouteContext = {
-  params: Promise<{ sessionId: string }>;
-};
-
-function requestUserId(request: Request) {
-  return requestApplicationUserId(request);
-}
-
-export async function GET(request: Request, context: RouteContext) {
+export async function GET(request: Request, context: BrowserChatSessionRouteContext) {
   try {
     const { sessionId } = await context.params;
     const url = new URL(request.url);
-    const result = await readBrowserChatSessionHistoryPage(sessionId, requestUserId(request), {
+    const result = await readBrowserChatSessionHistoryPage(sessionId, requestApplicationUserId(request), {
       messageCursor: url.searchParams.get('messageCursor') || undefined,
       messageLimit: boundedQueryInteger(url.searchParams.get('messageLimit'), {
         fallback: BROWSER_CHAT_MESSAGE_PAGE_SIZE,

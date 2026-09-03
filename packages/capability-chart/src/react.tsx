@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import type { ECharts, EChartsOption } from 'echarts';
-import type { ChartRecord } from './index.js';
+import { normalizeChartOption, type ChartRecord } from './index.js';
 
 export type ChartRendererClassNames = {
   root?: string;
@@ -31,6 +31,7 @@ export function ChartRenderer({
     void import('echarts')
       .then((echarts) => {
         if (disposed) return;
+        const option = normalizeChartOption(chart.option);
         for (const map of chart.maps || []) {
           const mapDefinition = typeof map.geoJson === 'string' ? { svg: map.geoJson } : map.geoJson;
           echarts.registerMap(
@@ -40,10 +41,19 @@ export function ChartRenderer({
           );
         }
         const instance = echarts.init(surface, undefined, { renderer: chart.renderer || 'canvas' });
-        chartRef.current = instance;
-        instance.setOption(chart.option as EChartsOption, { lazyUpdate: false, notMerge: true });
-        resizeObserver = new ResizeObserver(() => instance.resize());
-        resizeObserver.observe(surface);
+        try {
+          instance.setOption(option as EChartsOption, { lazyUpdate: false, notMerge: true });
+          if (disposed) {
+            instance.dispose();
+            return;
+          }
+          chartRef.current = instance;
+          resizeObserver = new ResizeObserver(() => instance.resize());
+          resizeObserver.observe(surface);
+        } catch (reason) {
+          instance.dispose();
+          throw reason;
+        }
       })
       .catch((reason) => {
         if (!disposed) setError(reason instanceof Error ? reason.message : 'Chart rendering failed.');

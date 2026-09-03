@@ -3,8 +3,9 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const root = path.resolve(__dirname, '..');
-const virtualEnvironment = path.join(root, '.venv-gliner');
+const packageRoot = path.resolve(__dirname, '..');
+const hostRoot = process.cwd();
+const virtualEnvironment = path.resolve(process.env.GLINER_VENV_DIR || path.join(hostRoot, '.venv-gliner'));
 const virtualPython = path.join(
   virtualEnvironment,
   process.platform === 'win32' ? 'Scripts' : 'bin',
@@ -29,7 +30,7 @@ function bootstrapPython() {
 
 function run(command, args) {
   const result = spawnSync(command, args, {
-    cwd: root,
+    cwd: hostRoot,
     env: process.env,
     stdio: 'inherit',
     windowsHide: true,
@@ -48,5 +49,5 @@ if (!fs.existsSync(virtualPython)) {
 }
 
 run(virtualPython, ['-m', 'pip', 'install', '--upgrade', 'pip']);
-run(virtualPython, ['-m', 'pip', 'install', '-r', path.join(root, 'services', 'gliner', 'requirements.txt')]);
+run(virtualPython, ['-m', 'pip', 'install', '-r', path.join(packageRoot, 'runtime', 'python', 'requirements.txt')]);
 console.log('Local GLiNER dependencies are installed. npm run dev will start the sidecar on demand in auto/local mode.');

@@ -1,33 +1,11 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-} from 'node:crypto';
-import {
-  chmodSync,
-  mkdirSync,
-  readFileSync,
-  writeFileSync,
-} from 'node:fs';
-import path from 'node:path';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 import { executeDatabase, queryDatabase } from '@/server/db/database';
-import { appDataRoot } from '@/server/storage/paths';
+import { decryptCredentialSecret, encryptCredentialSecret } from './credential-master-key';
 
 export type BrowserDomainCookie = {
   name: string;
   url: string;
   value: string;
-};
-
-type CookieEnvelope = {
-  alg: 'aes-256-gcm';
-  ciphertext: string;
-  iv: string;
-  kid: string;
-  tag: string;
-  v: 1;
 };
 
 type CookieRow = {
@@ -50,75 +28,8 @@ const cookieAttributeNames = new Set([
   'secure',
 ]);
 const cookieNamePattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-const keyFileName = 'credential-master.key';
-let cachedMasterKey: Buffer | undefined;
-
 function now() {
   return new Date().toISOString();
-}
-
-function masterKeyPath() {
-  return path.join(appDataRoot(), '.data', keyFileName);
-}
-
-function configuredMasterKey(value: string) {
-  const raw = value.trim();
-  if (/^[a-fA-F0-9]{64}$/.test(raw)) return Buffer.from(raw, 'hex');
-  if (/^[A-Za-z0-9+/]+={0,2}$/.test(raw)) {
-    const decoded = Buffer.from(raw, 'base64');
-    if (decoded.length === 32) return decoded;
-  }
-  return createHash('sha256').update(raw, 'utf8').digest();
-}
-
-function readGeneratedMasterKey(filePath: string) {
-  const decoded = Buffer.from(readFileSync(filePath, 'utf8').trim(), 'base64');
-  if (decoded.length !== 32) throw new Error('本地凭据主密钥文件无效');
-  return decoded;
-}
-
-function generatedMasterKey() {
-  const filePath = masterKeyPath();
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  try {
-    const existing = readGeneratedMasterKey(filePath);
-    try { chmodSync(filePath, 0o600); } catch {
-      // Windows and some filesystems do not implement POSIX mode bits.
-    }
-    return existing;
-  } catch (error) {
-    const missing = error && typeof error === 'object' && 'code' in error
-      && (error as { code?: unknown }).code === 'ENOENT';
-    if (!missing) throw error;
-  }
-  const created = randomBytes(32);
-  try {
-    writeFileSync(filePath, created.toString('base64'), {
-      encoding: 'utf8',
-      flag: 'wx',
-      mode: 0o600,
-    });
-    try { chmodSync(filePath, 0o600); } catch {
-      // Windows and some filesystems do not implement POSIX mode bits.
-    }
-    return created;
-  } catch (error) {
-    const raced = error && typeof error === 'object' && 'code' in error
-      && (error as { code?: unknown }).code === 'EEXIST';
-    if (!raced) throw error;
-    return readGeneratedMasterKey(filePath);
-  }
-}
-
-function credentialMasterKey() {
-  if (cachedMasterKey) return cachedMasterKey;
-  const configured = String(process.env.WEBPILOT_CREDENTIAL_MASTER_KEY || '').trim();
-  cachedMasterKey = configured ? configuredMasterKey(configured) : generatedMasterKey();
-  return cachedMasterKey;
-}
-
-function keyId(key: Buffer) {
-  return createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
 
 function cookieAad(userId: string, domain: string) {
@@ -126,43 +37,16 @@ function cookieAad(userId: string, domain: string) {
 }
 
 function encryptCookie(cookie: string, userId: string, domain: string) {
-  const key = credentialMasterKey();
-  const iv = randomBytes(12);
-  const cipher = createCipheriv('aes-256-gcm', key, iv);
-  cipher.setAAD(cookieAad(userId, domain));
-  const ciphertext = Buffer.concat([cipher.update(cookie, 'utf8'), cipher.final()]);
-  return JSON.stringify({
-    v: 1,
-    alg: 'aes-256-gcm',
-    kid: keyId(key),
-    iv: iv.toString('base64'),
-    tag: cipher.getAuthTag().toString('base64'),
-    ciphertext: ciphertext.toString('base64'),
-  } satisfies CookieEnvelope);
+  return encryptCredentialSecret(cookie, cookieAad(userId, domain));
 }
 
 function decryptCookie(row: CookieRow) {
-  const envelope = JSON.parse(row.cookie_envelope) as Partial<CookieEnvelope>;
-  const key = credentialMasterKey();
-  if (envelope.v !== 1
-    || envelope.alg !== 'aes-256-gcm'
-    || envelope.kid !== keyId(key)
-    || typeof envelope.iv !== 'string'
-    || typeof envelope.tag !== 'string'
-    || typeof envelope.ciphertext !== 'string') {
-    throw new Error('浏览器 Cookie 密文格式无效');
-  }
-  try {
-    const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64'));
-    decipher.setAAD(cookieAad(row.user_id, row.domain));
-    decipher.setAuthTag(Buffer.from(envelope.tag, 'base64'));
-    return Buffer.concat([
-      decipher.update(Buffer.from(envelope.ciphertext, 'base64')),
-      decipher.final(),
-    ]).toString('utf8');
-  } catch {
-    throw new Error('浏览器 Cookie 解密失败');
-  }
+  return decryptCredentialSecret({
+    aad: cookieAad(row.user_id, row.domain),
+    envelope: row.cookie_envelope,
+    formatError: '浏览器 Cookie 密文格式无效',
+    decryptionError: '浏览器 Cookie 解密失败',
+  });
 }
 
 export function normalizeBrowserCookieDomain(value: unknown) {

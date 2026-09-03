@@ -1,3 +1,5 @@
+"""Managed redaction sidecar shipped by @webpilot/capability-sensitive-data."""
+
 from __future__ import annotations
 
 import hmac
@@ -322,7 +324,7 @@ def load_liquid_decoder(model_name: str):
     helper_directory = str(helper_path.parent)
     if helper_directory not in sys.path:
         sys.path.insert(0, helper_directory)
-    spec = importlib.util.spec_from_file_location("webpilot_liquid_pii_hybrid_decode", helper_path)
+    spec = importlib.util.spec_from_file_location("sensitive_data_liquid_pii_hybrid_decode", helper_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load LiquidAI decoder: {helper_path}")
     module = importlib.util.module_from_spec(spec)
@@ -604,7 +606,7 @@ chinese_boundary_model = pipeline(
     device=pipeline_device(),
 )
 model_lock = threading.Lock()
-app = FastAPI(title="WebPilot hybrid sensitive-data filter", docs_url=None, redoc_url=None)
+app = FastAPI(title="Hybrid sensitive-data filter", docs_url=None, redoc_url=None)
 
 
 @app.get("/health")

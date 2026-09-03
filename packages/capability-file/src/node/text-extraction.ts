@@ -64,7 +64,7 @@ const workerSource = String.raw`
     const JSZip = imported.default || imported;
     return JSZip.loadAsync(buffer);
   }
-  function legacyOfficeText(buffer) {
+  function binaryOfficeText(buffer) {
     const CFB = require('cfb');
     const container = CFB.read(buffer, { type: 'buffer' });
     return container.FileIndex.filter((entry) => entry.content && entry.content.length)
@@ -83,7 +83,7 @@ const workerSource = String.raw`
       try { return (await parser.getText()).text.trim(); } finally { await parser.destroy(); }
     }
     if (job.kind === 'word') {
-      if (job.extension === '.doc') return legacyOfficeText(buffer);
+      if (job.extension === '.doc') return binaryOfficeText(buffer);
       if (job.extension === '.odt') {
         const archive = await zipFrom(buffer);
         const document = archive.files['content.xml'];
@@ -101,7 +101,7 @@ const workerSource = String.raw`
         .join('\n\n').trim();
     }
     if (job.kind === 'presentation') {
-      if (['.ppt', '.pps', '.pot'].includes(job.extension)) return legacyOfficeText(buffer);
+      if (['.ppt', '.pps', '.pot'].includes(job.extension)) return binaryOfficeText(buffer);
       const archive = await zipFrom(buffer);
       const slides = Object.keys(archive.files).filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
         .sort((left, right) => Number((left.match(/\d+/) || [0])[0]) - Number((right.match(/\d+/) || [0])[0]));

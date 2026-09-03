@@ -1,7 +1,7 @@
 import {
   defaultModelForProvider,
+  defaultModelProviderSettings,
   modelListForProvider,
-  modelProviderDefinition,
   modelProviderDefinitions,
   migrateRuntimeEnvValue,
   runtimeEnvDefinitions,
@@ -10,23 +10,6 @@ import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/r
 import { normalizedModelCapabilities } from '@/lib/model-capabilities';
 import { store } from '@/server/db/store';
 
-function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
-  const definition = modelProviderDefinition(provider);
-  const models = modelListForProvider(definition);
-  const model = defaultModelForProvider(definition);
-  return {
-    displayName: '',
-    enabled: false,
-    defaultModel: model,
-    model,
-    models,
-    modelCapabilities: normalizedModelCapabilities(provider, models),
-    apiKey: '',
-    baseURL: definition.defaultBaseURL || '',
-    extraRequestParameters: '',
-  };
-}
-
 function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSettings>>) {
   const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
   for (const definition of modelProviderDefinitions) {
@@ -34,7 +17,7 @@ function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSe
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, current);
     result[definition.value] = {
-      ...defaultProviderSettings(definition.value),
+      ...defaultModelProviderSettings(definition.value),
       ...current,
       enabled: current?.enabled === true,
       defaultModel: model,

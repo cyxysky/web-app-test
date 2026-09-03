@@ -5,7 +5,7 @@ import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
 import { normalizeMiniMaxOpenAIBaseURL } from '@/config/settings';
 import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
-import { filterSensitiveData } from '@/server/ai/sensitive-data-filter';
+import { filterSensitiveData } from '@/server/capabilities/sensitive-data';
 
 ensureAiSdkTelemetryRegistered();
 

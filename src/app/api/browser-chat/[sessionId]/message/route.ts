@@ -1,7 +1,6 @@
 import { NextRequest } from 'next/server';
 import { createUIMessageStream, createUIMessageStreamResponse, type DynamicToolUIPart } from 'ai';
 import {
-  interruptBrowserChatSession,
   sendBrowserChatMessage,
   subscribeBrowserChatUIStream,
 } from '@/server/ai/agents/browser-chat.service';
@@ -9,23 +8,16 @@ import type { BrowserChatUIMessage } from '@/lib/browser-chat-ui-message';
 import { sendBrowserChatMessageRequestSchema } from '@/server/http/browser-chat-request.schema';
 import { ApiRequestError, apiError, parseJsonRequest } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import type { BrowserChatSessionRouteContext } from '@/server/http/browser-chat-route';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RouteContext = {
-  params: Promise<{ sessionId: string }>;
-};
-
-function requestUserId(request: NextRequest) {
-  return requestApplicationUserId(request);
-}
-
-export async function POST(request: NextRequest, context: RouteContext) {
+export async function POST(request: NextRequest, context: BrowserChatSessionRouteContext) {
   const { sessionId } = await context.params;
   try {
     const body = await parseJsonRequest(request, sendBrowserChatMessageRequestSchema, { maxBytes: 512 * 1024 });
-    const userId = requestUserId(request);
+    const userId = requestApplicationUserId(request);
     const clientMessageId = body.clientMessageId?.trim();
     if (!clientMessageId) {
       throw new ApiRequestError('clientMessageId is required for UI message streaming', {
@@ -44,7 +36,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
         let messageMetadataSignature = '';
         let resolveTerminal: () => void = () => undefined;
         const terminal = new Promise<void>((resolve) => { resolveTerminal = resolve; });
-        const unsubscribe = subscribeBrowserChatUIStream(sessionId, clientMessageId, ({ message }) => {
+        const unsubscribe = subscribeBrowserChatUIStream(sessionId, clientMessageId, ({ message, outputCycles, subagents }) => {
           if (!message || finished) return;
           const messageMetadata = {
             sessionId,
@@ -67,6 +59,29 @@ export async function POST(request: NextRequest, context: RouteContext) {
             writer.write({
               type: 'message-metadata',
               messageMetadata,
+            });
+          }
+
+          for (const outputCycle of outputCycles) {
+            const key = `data-outputCycle:${outputCycle.id}`;
+            if (dataParts.has(key)) continue;
+            dataParts.set(key, 'published');
+            writer.write({
+              type: 'data-outputCycle',
+              id: outputCycle.id,
+              data: outputCycle,
+            });
+          }
+
+          for (const subagent of subagents) {
+            const key = `data-subagent:${subagent.id}`;
+            const signature = JSON.stringify(subagent);
+            if (dataParts.get(key) === signature) continue;
+            dataParts.set(key, signature);
+            writer.write({
+              type: 'data-subagent',
+              id: subagent.id,
+              data: subagent,
             });
           }
 
@@ -152,7 +167,11 @@ export async function POST(request: NextRequest, context: RouteContext) {
           }
         });
         const abort = () => {
-          if (!finished) void interruptBrowserChatSession(sessionId, clientMessageId, userId);
+          // This signal only describes the HTTP response transport. Navigation,
+          // reconnects and component unmounts may close it without the user
+          // requesting that the background Agent Loop be cancelled. Business
+          // cancellation is handled exclusively by the explicit /interrupt API.
+          finished = true;
           resolveTerminal();
         };
         request.signal.addEventListener('abort', abort, { once: true });

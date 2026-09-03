@@ -25,6 +25,11 @@ const provider = createNodeBrowserCapability({
 });
 ```
 
+Pass this provider to `mountAISDKCapabilities()` for AI SDK Agents. The returned
+`agentOptions` contains both tools and eager/lazy Skill instructions; settings
+are loaded from the selected host configuration store before Browser runtime
+creation.
+
 `@webpilot/capability-browser/mcp` exposes explicit sessions. Call
 `browser.open` to obtain a `browserSessionId`, then pass it to
 `browser.code`, `browser.snapshot`, and `browser.close`. The included

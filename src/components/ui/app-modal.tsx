@@ -1,6 +1,6 @@
 'use client';
 
-import { Modal } from '@heroui/react';
+import { Modal } from '@heroui/react/modal';
 import { Children, cloneElement, isValidElement, type CSSProperties, type ReactNode } from 'react';
 
 type AppModalSize = 'cover' | 'full' | 'lg' | 'log' | 'management' | 'md' | 'media' | 'preview' | 'sm' | 'wide' | 'xs';

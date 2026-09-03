@@ -20,38 +20,7 @@ export function apiRequestId(request: Pick<Request, 'headers'>) {
   return /^[a-zA-Z0-9._:-]{8,128}$/.test(supplied) ? supplied : randomUUID();
 }
 
-export async function parseJsonRequest<T extends z.ZodType>(
-  request: Request,
-  schema: T,
-  input: { maxBytes?: number } = {},
-): Promise<z.infer<T>> {
-  const maxBytes = Math.max(1024, Math.floor(input.maxBytes || 1024 * 1024));
-  const contentLength = Number(request.headers.get('content-length'));
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    throw new ApiRequestError('Request body is too large', { code: 'payload_too_large', status: 413 });
-  }
-  let value: unknown;
-  try {
-    value = await request.json();
-  } catch {
-    throw new ApiRequestError('Request body must be valid JSON');
-  }
-  if (Buffer.byteLength(JSON.stringify(value), 'utf8') > maxBytes) {
-    throw new ApiRequestError('Request body is too large', { code: 'payload_too_large', status: 413 });
-  }
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) {
-    throw new ApiRequestError('Request body is invalid', { code: 'validation_failed' });
-  }
-  return parsed.data;
-}
-
-export async function parseOptionalJsonRequest<T extends z.ZodType>(
-  request: Request,
-  schema: T,
-  input: { maxBytes?: number } = {},
-): Promise<z.infer<T>> {
-  const maxBytes = Math.max(1024, Math.floor(input.maxBytes || 1024 * 1024));
+async function readJsonRequestValue(request: Request, maxBytes: number, optional: boolean) {
   const contentLength = Number(request.headers.get('content-length'));
   if (Number.isFinite(contentLength) && contentLength > maxBytes) {
     throw new ApiRequestError('Request body is too large', { code: 'payload_too_large', status: 413 });
@@ -60,17 +29,45 @@ export async function parseOptionalJsonRequest<T extends z.ZodType>(
   if (Buffer.byteLength(raw, 'utf8') > maxBytes) {
     throw new ApiRequestError('Request body is too large', { code: 'payload_too_large', status: 413 });
   }
-  let value: unknown = {};
-  if (raw.trim()) {
-    try {
-      value = JSON.parse(raw);
-    } catch {
-      throw new ApiRequestError('Request body must be valid JSON');
-    }
+  if (!raw.trim()) {
+    if (optional) return {};
+    throw new ApiRequestError('Request body must be valid JSON');
   }
-  const parsed = schema.safeParse(value);
-  if (!parsed.success) throw new ApiRequestError('Request body is invalid', { code: 'validation_failed' });
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new ApiRequestError('Request body must be valid JSON');
+  }
+}
+
+async function parseRequestBody<T extends z.ZodType>(
+  request: Request,
+  schema: T,
+  input: { maxBytes?: number },
+  optional: boolean,
+): Promise<z.infer<T>> {
+  const maxBytes = Math.max(1024, Math.floor(input.maxBytes || 1024 * 1024));
+  const parsed = schema.safeParse(await readJsonRequestValue(request, maxBytes, optional));
+  if (!parsed.success) {
+    throw new ApiRequestError('Request body is invalid', { code: 'validation_failed' });
+  }
   return parsed.data;
+}
+
+export async function parseJsonRequest<T extends z.ZodType>(
+  request: Request,
+  schema: T,
+  input: { maxBytes?: number } = {},
+): Promise<z.infer<T>> {
+  return parseRequestBody(request, schema, input, false);
+}
+
+export async function parseOptionalJsonRequest<T extends z.ZodType>(
+  request: Request,
+  schema: T,
+  input: { maxBytes?: number } = {},
+): Promise<z.infer<T>> {
+  return parseRequestBody(request, schema, input, true);
 }
 
 export function apiJson<T>(request: Pick<Request, 'headers'>, body: T, init: ResponseInit = {}) {

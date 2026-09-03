@@ -1252,6 +1252,9 @@ const en: Record<string, string> = {
 
   '{count} 个工具': '{count} tools',
   '调整子 Agent 侧边栏宽度': 'Resize sub-agent sidebar',
+  '停止子 Agent': 'Stop sub-agent',
+  '停止子 Agent 失败': 'Failed to stop sub-agent',
+  '已停止': 'Stopped',
   '{count} 轮': '{count} turns',
   '{count} 次调用': '{count} calls',
   '{transport} · 目标 {target} · 截图 {capture} · 发送 {send} · 接收 {received} · 显示 {displayed} FPS': '{transport} · Target {target} · Capture {capture} · Sent {send} · Received {received} · Displayed {displayed} FPS',
@@ -1778,7 +1781,7 @@ const en: Record<string, string> = {
   '为什么有些操作需要确认？': 'Why do some actions require confirmation?',
   '严格安全模式会在提交、删除、上传和其他会产生外部影响的操作前请求确认。': 'Strict safety mode requests confirmation before submitting, deleting, uploading, or performing other actions with external effects.',
   '文件为什么没有自动全文读取？': 'Why are files not read in full automatically?',
-  '附件默认只提供名称、类型和大小，避免把无关大文件全部放进模型上下文。需要分析时模型会调用 readFile 分段读取。': 'Attachments initially provide only their name, type, and size so unrelated large files do not fill the model context. When analysis is needed, the model calls readFile to read them in sections.',
+  '附件默认只提供名称、类型和大小，避免把无关大文件全部放进模型上下文。需要分析时模型会调用 file 的 read 操作分段读取。': 'Attachments initially provide only their name, type, and size so unrelated large files do not fill the model context. When analysis is needed, the model calls the file tool read action in sections.',
   '浏览器登录状态在哪里？': 'Where is the browser sign-in state stored?',
   '登录状态保存在当前用户的受控浏览器配置中；每个对话只接管属于自己标签组的页面。': 'Sign-in state is stored in the current user controlled browser profile. Each chat only controls pages in its own tab group.',
   '重新开始教程': 'Restart tutorial',

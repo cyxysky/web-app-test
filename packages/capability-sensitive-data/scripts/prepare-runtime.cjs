@@ -3,28 +3,29 @@ const { createHash } = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadEnvConfig } = require('@next/env');
 const {
-  assertGlinerRuntime,
-  preparedGlinerRuntimeRoot,
-} = require('./gliner-runtime-layout');
+  assertSensitiveDataRuntime,
+  preparedSensitiveDataRuntimeRoot,
+} = require('./runtime-layout.cjs');
 
-const root = path.resolve(__dirname, '..');
-const outputParent = path.dirname(preparedGlinerRuntimeRoot);
-const stagingRoot = `${preparedGlinerRuntimeRoot}.staging`;
-const requirementsPath = path.join(root, 'services', 'gliner', 'requirements.txt');
-const serviceAppPath = path.join(root, 'services', 'gliner', 'app.py');
-const serviceBoundariesPath = path.join(root, 'services', 'gliner', 'entity_boundaries.py');
-const serviceCandidateResolutionPath = path.join(root, 'services', 'gliner', 'candidate_resolution.py');
-const serviceDeterministicSpansPath = path.join(root, 'services', 'gliner', 'deterministic_spans.py');
-const defaultVirtualPython = path.join(root, '.venv-gliner', 'Scripts', 'python.exe');
+const packageRoot = path.resolve(__dirname, '..');
+const hostRoot = process.cwd();
+const stagingRoot = `${preparedSensitiveDataRuntimeRoot}.staging`;
+const serviceRoot = path.join(packageRoot, 'runtime', 'python');
+const requirementsPath = path.join(serviceRoot, 'requirements.txt');
+const serviceAppPath = path.join(serviceRoot, 'app.py');
+const serviceBoundariesPath = path.join(serviceRoot, 'entity_boundaries.py');
+const serviceCandidateResolutionPath = path.join(serviceRoot, 'candidate_resolution.py');
+const serviceDeterministicSpansPath = path.join(serviceRoot, 'deterministic_spans.py');
+const defaultVirtualPython = path.join(hostRoot, '.venv-gliner', 'Scripts', 'python.exe');
 const bundleFormatVersion = 3;
 
-loadEnvConfig(root, false);
+const environmentPath = path.join(hostRoot, '.env');
+if (fs.existsSync(environmentPath)) process.loadEnvFile(environmentPath);
 
 function safelyRemove(target) {
   const resolved = path.resolve(target);
-  if (path.dirname(resolved) !== outputParent || !path.basename(resolved).startsWith('win32-x64')) {
+  if (resolved !== preparedSensitiveDataRuntimeRoot && resolved !== stagingRoot) {
     throw new Error(`Refusing to remove an unexpected GLiNER bundle path: ${resolved}`);
   }
   fs.rmSync(resolved, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
@@ -32,7 +33,7 @@ function safelyRemove(target) {
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
-    cwd: root,
+    cwd: hostRoot,
     env: { ...process.env, ...(options.env || {}) },
     encoding: options.capture ? 'utf8' : undefined,
     stdio: options.capture ? 'pipe' : 'inherit',
@@ -85,8 +86,8 @@ function bundleFingerprint(input) {
 
 function currentBundleMatches(fingerprint) {
   try {
-    assertGlinerRuntime(preparedGlinerRuntimeRoot);
-    const manifest = JSON.parse(fs.readFileSync(path.join(preparedGlinerRuntimeRoot, 'runtime-manifest.json'), 'utf8'));
+    assertSensitiveDataRuntime(preparedSensitiveDataRuntimeRoot);
+    const manifest = JSON.parse(fs.readFileSync(path.join(preparedSensitiveDataRuntimeRoot, 'runtime-manifest.json'), 'utf8'));
     return manifest.fingerprint === fingerprint;
   } catch {
     return false;
@@ -115,7 +116,7 @@ function main() {
   }
   const sourcePython = path.resolve(String(process.env.GLINER_BUNDLE_PYTHON_PATH || defaultVirtualPython).trim());
   if (!fs.existsSync(sourcePython)) {
-    throw new Error(`GLiNER build Python was not found: ${sourcePython}. Run "npm run gliner:install" first or set GLINER_BUNDLE_PYTHON_PATH.`);
+    throw new Error(`GLiNER build Python was not found: ${sourcePython}. Run "npm run sensitive-data:install" first or set GLINER_BUNDLE_PYTHON_PATH.`);
   }
   const python = pythonInformation(sourcePython);
   const configuredModelName = String(process.env.GLINER_MODEL || '').trim();
@@ -130,11 +131,11 @@ function main() {
   ).trim();
   const fingerprint = bundleFingerprint({ modelName, piiModelName, chineseNerModelName, pythonVersion: python.version });
   if (currentBundleMatches(fingerprint)) {
-    console.log(`Reusing bundled GLiNER runtime: ${preparedGlinerRuntimeRoot}`);
+    console.log(`Reusing bundled sensitive-data runtime: ${preparedSensitiveDataRuntimeRoot}`);
     return;
   }
 
-  fs.mkdirSync(outputParent, { recursive: true });
+  fs.mkdirSync(path.dirname(preparedSensitiveDataRuntimeRoot), { recursive: true });
   safelyRemove(stagingRoot);
   fs.mkdirSync(stagingRoot, { recursive: true });
   const bundledPythonRoot = path.join(stagingRoot, 'python');
@@ -221,10 +222,10 @@ function main() {
     platform: 'win32-x64',
     pythonVersion: python.version,
   }, null, 2), 'utf8');
-  safelyRemove(preparedGlinerRuntimeRoot);
-  fs.renameSync(stagingRoot, preparedGlinerRuntimeRoot);
-  assertGlinerRuntime(preparedGlinerRuntimeRoot);
-  console.log(`Self-contained GLiNER runtime created: ${preparedGlinerRuntimeRoot}`);
+  safelyRemove(preparedSensitiveDataRuntimeRoot);
+  fs.renameSync(stagingRoot, preparedSensitiveDataRuntimeRoot);
+  assertSensitiveDataRuntime(preparedSensitiveDataRuntimeRoot);
+  console.log(`Self-contained sensitive-data runtime created: ${preparedSensitiveDataRuntimeRoot}`);
 }
 
 try {

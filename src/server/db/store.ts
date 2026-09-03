@@ -1,8 +1,8 @@
 import {
   defaultModelByProvider,
   defaultModelForProvider,
+  defaultModelProviderSettings,
   modelListForProvider,
-  modelProviderDefinition,
   modelProviderDefinitions,
   normalizeMiniMaxOpenAIBaseURL,
   migrateRuntimeEnvValue,
@@ -129,23 +129,6 @@ const modelExtraRequestParametersEnv: Partial<Record<ModelProvider, string>> = {
   'openai-compatible-3': 'OPENAI_COMPATIBLE_3_EXTRA_REQUEST_PARAMETERS',
 };
 
-function defaultProviderSettings(provider: ModelProvider): ModelProviderSettings {
-  const definition = modelProviderDefinition(provider);
-  const models = modelListForProvider(definition);
-  const model = defaultModelForProvider(definition);
-  return {
-    displayName: '',
-    enabled: false,
-    defaultModel: model,
-    model,
-    models,
-    modelCapabilities: normalizedModelCapabilities(provider, models),
-    apiKey: '',
-    baseURL: definition.defaultBaseURL || '',
-    extraRequestParameters: '',
-  };
-}
-
 function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecord | undefined {
   if (!input) return undefined;
   const provider = modelProviderDefinitions.some((item) => item.value === input.provider)
@@ -160,7 +143,7 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
       ? normalizeMiniMaxOpenAIBaseURL(current?.baseURL)
       : current?.baseURL;
     providers[definition.value] = {
-      ...defaultProviderSettings(definition.value),
+      ...defaultModelProviderSettings(definition.value),
       ...current,
       enabled: current?.enabled === true,
       defaultModel: model,
@@ -183,7 +166,7 @@ function applyModelConfig(config?: ModelConfigRecord) {
     return;
   }
   for (const definition of modelProviderDefinitions) {
-    const settings = normalized.providers[definition.value] || defaultProviderSettings(definition.value);
+    const settings = normalized.providers[definition.value] || defaultModelProviderSettings(definition.value);
     const keyEnv = modelApiKeyEnv[definition.value];
     if (keyEnv) process.env[keyEnv] = settings.apiKey || '';
     const baseUrlEnv = modelBaseUrlEnv[definition.value];
@@ -200,7 +183,7 @@ function applyModelConfig(config?: ModelConfigRecord) {
     delete process.env.AI_MODEL;
     return;
   }
-  const active = normalized.providers[activeProvider] || defaultProviderSettings(activeProvider);
+  const active = normalized.providers[activeProvider] || defaultModelProviderSettings(activeProvider);
   process.env.AI_MODEL_PROVIDER_ENABLED = 'true';
   process.env.AI_PROVIDER = activeProvider;
   process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[activeProvider];
@@ -243,6 +226,35 @@ function normalizeSkillRecord(record: SkillRecord): SkillRecord {
   };
 }
 
+type UpsertSkillInput = {
+  id?: string;
+  title: string;
+  description: string;
+  triggerPhrases?: string[];
+  content: SkillContent;
+  sourceSessionId?: string;
+  status?: SkillRecord['status'];
+  shared?: boolean;
+  userId?: string | number;
+};
+
+function buildSkillRecord(input: UpsertSkillInput, existing: SkillRecord | undefined, userId: string, timestamp: string) {
+  return normalizeSkillRecord({
+    id: existing?.id || id('skl'),
+    userId,
+    shared: input.shared ?? existing?.shared ?? false,
+    title: input.title.trim() || existing?.title || 'Runtime Skill',
+    description: input.description.trim() || existing?.description || '',
+    triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
+    content: normalizeSkillContent(input.content),
+    sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
+    status: input.status || existing?.status || 'ready',
+    version: existing ? existing.version + 1 : 1,
+    createdAt: existing?.createdAt || timestamp,
+    updatedAt: timestamp,
+  });
+}
+
 async function readConfigData(): Promise<ConfigStoreData> {
   const stored = await readConfigRecord() as Partial<ConfigStoreData>;
   return {
@@ -275,17 +287,7 @@ export const store = {
       .map((skill) => [skill.id, skill]));
     return skillIds.map((skillId) => byId.get(skillId)).filter((item): item is SkillRecord => Boolean(item));
   },
-  async upsertSkill(input: {
-    id?: string;
-    title: string;
-    description: string;
-    triggerPhrases?: string[];
-    content: SkillContent;
-    sourceSessionId?: string;
-    status?: SkillRecord['status'];
-    shared?: boolean;
-    userId?: string | number;
-  }) {
+  async upsertSkill(input: UpsertSkillInput) {
     const userId = normalizeApplicationUserId(input.userId);
     const timestamp = now();
     const storedExisting = input.id ? await readSkillById(input.id) : undefined;
@@ -293,34 +295,11 @@ export const store = {
       throw new Error('Only the Skill creator can edit this shared Skill.');
     }
     const existing = storedExisting ? normalizeSkillRecord(storedExisting) : undefined;
-    const skill = normalizeSkillRecord({
-      id: existing?.id || id('skl'),
-      userId,
-      shared: input.shared ?? existing?.shared ?? false,
-      title: input.title.trim() || existing?.title || 'Runtime Skill',
-      description: input.description.trim() || existing?.description || '',
-      triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
-      content: normalizeSkillContent(input.content),
-      sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
-      status: input.status || existing?.status || 'ready',
-      version: existing ? existing.version + 1 : 1,
-      createdAt: existing?.createdAt || timestamp,
-      updatedAt: timestamp,
-    });
+    const skill = buildSkillRecord(input, existing, userId, timestamp);
     await writeSkillRecord(skill, userId);
     return skill;
   },
-  async upsertSkillsBatch(inputs: Array<{
-    id?: string;
-    title: string;
-    description: string;
-    triggerPhrases?: string[];
-    content: SkillContent;
-    sourceSessionId?: string;
-    status?: SkillRecord['status'];
-    shared?: boolean;
-    userId?: string | number;
-  }>, options: { queued?: boolean } = {}) {
+  async upsertSkillsBatch(inputs: UpsertSkillInput[], options: { queued?: boolean } = {}) {
     const existingById = new Map((await readSkills()).map((skill) => [skill.id, normalizeSkillRecord(skill)]));
     const records = inputs.map((input) => {
       const userId = normalizeApplicationUserId(input.userId);
@@ -328,21 +307,7 @@ export const store = {
       if (existing && normalizeApplicationUserId(existing.userId) !== userId) {
         throw new Error('Only the Skill creator can edit this shared Skill.');
       }
-      const timestamp = now();
-      const skill = normalizeSkillRecord({
-        id: existing?.id || id('skl'),
-        userId,
-        shared: input.shared ?? existing?.shared ?? false,
-        title: input.title.trim() || existing?.title || 'Runtime Skill',
-        description: input.description.trim() || existing?.description || '',
-        triggerPhrases: input.triggerPhrases || existing?.triggerPhrases || [],
-        content: normalizeSkillContent(input.content),
-        sourceSessionId: input.sourceSessionId || existing?.sourceSessionId,
-        status: input.status || existing?.status || 'ready',
-        version: existing ? existing.version + 1 : 1,
-        createdAt: existing?.createdAt || timestamp,
-        updatedAt: timestamp,
-      });
+      const skill = buildSkillRecord(input, existing, userId, now());
       existingById.set(skill.id, skill);
       return { skill, userId };
     });
@@ -396,7 +361,7 @@ export const store = {
       const model = defaultModelForProvider(definition, { ...merged, models });
       const baseURL = current?.baseURL ?? previous?.baseURL ?? definition.defaultBaseURL ?? '';
       providers[provider] = {
-        ...defaultProviderSettings(provider),
+        ...defaultModelProviderSettings(provider),
         ...merged,
         enabled: current?.enabled ?? previous?.enabled ?? false,
         defaultModel: model,

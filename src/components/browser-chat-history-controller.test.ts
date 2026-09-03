@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  beginHistoricalSubagentQuery,
   browserChatHasEarlierMessages,
   browserChatReachedHistoryTop,
   mergeBrowserChatHistoryChunkData,
@@ -14,13 +13,6 @@ test('loads earlier messages only on the transition from a nonzero position to t
   assert.equal(browserChatReachedHistoryTop(1, 0), true);
   assert.equal(browserChatReachedHistoryTop(0, 0), false);
   assert.equal(browserChatReachedHistoryTop(0, 10), false);
-});
-
-test('historical subagent data is queried only on the first subagent-group expansion', () => {
-  const queried = new Set<string>();
-  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), true);
-  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-1'), false);
-  assert.equal(beginHistoricalSubagentQuery(queried, 'session-1\u0000message-2'), true);
 });
 
 test('offers earlier-message loading only while the message page has a cursor', () => {

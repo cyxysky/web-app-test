@@ -1,13 +1,15 @@
 import {
+  createCapabilityRuntime,
   defineCapabilityTool,
   type CapabilityExecutionContext,
-  type CapabilityInstruction,
   type CapabilityManifest,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
   type CapabilityToolSet,
 } from '@webpilot/capability-sdk';
+import { fileCapabilitySettings } from './settings.js';
+import { fileRuntimeSkill } from './runtime-skill.js';
 import { createFileToolInput } from './schema.js';
 import {
   fileActions,
@@ -26,6 +28,7 @@ import {
 export * from './formats.js';
 export * from './office/types.js';
 export * from './runtime-skill.js';
+export * from './settings.js';
 export * from './schema.js';
 export * from './transport.js';
 export * from './types.js';
@@ -50,17 +53,8 @@ export const fileCapabilityManifest: CapabilityManifest = {
       python: 'Required when using the included UNO authoring runtime.',
     },
   },
-};
-
-export const fileRuntimeInstruction: CapabilityInstruction = {
-  id: 'com.webpilot.file/runtime',
-  title: 'File artifact workflow',
-  content: [
-    'Use stable document ids for logical documents.',
-    'Read an existing draft before editing it and preserve the latest digest expected by the host.',
-    'Treat artifact and screenshot ids as opaque host-issued values; never invent them.',
-    'When visual inspection is available, index and read exact rendered pages before reporting visual QA.',
-  ].join('\n'),
+  configuration: { settings: fileCapabilitySettings },
+  skills: [fileRuntimeSkill],
 };
 
 function isFileAction(value: string | undefined): value is FileAction {
@@ -193,7 +187,6 @@ export function createFileTools(
         concurrency: 'serial',
         concurrencyGroup: 'file-artifacts',
         permissions: fileCapabilityManifest.permissions,
-        runtimeInstructionId: fileRuntimeInstruction.id,
       },
       execute: (input, context) => {
         if (!isFileVisualToolAction(input.action)) {
@@ -229,22 +222,18 @@ export function createFileCapability(options: {
   createOperations(
     context: CapabilityRunContext,
   ): FileCapabilityRuntimeOperations | Promise<FileCapabilityRuntimeOperations>;
-  instruction?: CapabilityInstruction | false;
 }): CapabilityProvider {
   return {
     manifest: fileCapabilityManifest,
     async createRuntime(context) {
       const operations = await options.createOperations(context);
-      return {
+      return createCapabilityRuntime({
         tools: createFileTools(operations, {
           visualInputAvailable: options.visualInputAvailable,
         }),
-        instructions: options.instruction === false
-          ? []
-          : [options.instruction || fileRuntimeInstruction],
-        health: operations.health || (() => Promise.resolve({ status: 'healthy' })),
-        dispose: operations.dispose || (() => Promise.resolve()),
-      };
+        health: operations.health,
+        dispose: operations.dispose,
+      });
     },
   };
 }

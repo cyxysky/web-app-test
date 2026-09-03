@@ -200,7 +200,7 @@ export type BrowserChatSubagentRecord = {
   instruction: string;
   createdAt: string;
   updatedAt: string;
-  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed';
+  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed' | 'stopped';
   content: string;
   summary?: string;
   resumable: boolean;

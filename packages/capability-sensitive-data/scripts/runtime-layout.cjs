@@ -2,10 +2,13 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const projectRoot = path.resolve(__dirname, '..');
-const preparedGlinerRuntimeRoot = path.join(projectRoot, 'dist-gliner-runtime', 'win32-x64');
+const hostRoot = process.cwd();
+const preparedSensitiveDataRuntimeRoot = path.resolve(
+  process.env.SENSITIVE_DATA_BUNDLE_OUTPUT_DIR
+    || path.join(hostRoot, 'dist-sensitive-data-runtime', 'win32-x64'),
+);
 
-function requiredGlinerRuntimeEntries(runtimeRoot = preparedGlinerRuntimeRoot) {
+function requiredSensitiveDataRuntimeEntries(runtimeRoot = preparedSensitiveDataRuntimeRoot) {
   return [
     path.join(runtimeRoot, 'runtime-manifest.json'),
     path.join(runtimeRoot, 'python', 'python.exe'),
@@ -20,26 +23,26 @@ function requiredGlinerRuntimeEntries(runtimeRoot = preparedGlinerRuntimeRoot) {
   ];
 }
 
-function assertGlinerRuntime(runtimeRoot = preparedGlinerRuntimeRoot) {
-  const missing = requiredGlinerRuntimeEntries(runtimeRoot).filter((entry) => !fs.existsSync(entry));
+function assertSensitiveDataRuntime(runtimeRoot = preparedSensitiveDataRuntimeRoot) {
+  const missing = requiredSensitiveDataRuntimeEntries(runtimeRoot).filter((entry) => !fs.existsSync(entry));
   if (missing.length) {
-    throw new Error(`The bundled GLiNER runtime is incomplete. Run "npm run gliner:bundle" first. Missing:\n${missing.join('\n')}`);
+    throw new Error(`The bundled sensitive-data runtime is incomplete. Run "npm run sensitive-data:bundle" first. Missing:\n${missing.join('\n')}`);
   }
   return runtimeRoot;
 }
 
-function copyGlinerRuntime(targetRoot, sourceRoot = preparedGlinerRuntimeRoot) {
-  assertGlinerRuntime(sourceRoot);
+function copySensitiveDataRuntime(targetRoot, sourceRoot = preparedSensitiveDataRuntimeRoot) {
+  assertSensitiveDataRuntime(sourceRoot);
   fs.rmSync(targetRoot, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(targetRoot), { recursive: true });
   fs.cpSync(sourceRoot, targetRoot, { recursive: true });
-  assertGlinerRuntime(targetRoot);
+  assertSensitiveDataRuntime(targetRoot);
   return targetRoot;
 }
 
 module.exports = {
-  assertGlinerRuntime,
-  copyGlinerRuntime,
-  preparedGlinerRuntimeRoot,
-  requiredGlinerRuntimeEntries,
+  assertSensitiveDataRuntime,
+  copySensitiveDataRuntime,
+  preparedSensitiveDataRuntimeRoot,
+  requiredSensitiveDataRuntimeEntries,
 };

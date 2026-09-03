@@ -21,7 +21,6 @@ function isWorkspaceViewPathname(pathname: string) {
   pathname = withoutWebPilotBasePath(pathname);
   return pathname === '/automation'
     || pathname === '/browser-chat'
-    || pathname === '/dashboard'
     || pathname === '/settings';
 }
 

@@ -772,6 +772,8 @@
 
 .browser-chat-message {
   box-sizing: border-box;
+  contain-intrinsic-size: auto 160px;
+  content-visibility: auto;
   min-width: 0;
   max-width: 780px;
 }
@@ -1280,8 +1282,8 @@
     inset 0 1px 0 rgba(255, 255, 255, 0.04) !important;
 }
 
-:root[data-theme="dark"] .browser-chat-management-dialog > :is(.modal__header, .ui-modal-header),
-:root[data-theme="dark"] .browser-chat-management-dialog > :is(.modal__body, .ui-modal-body) {
+:root[data-theme="dark"] .browser-chat-management-dialog > .ui-modal-header,
+:root[data-theme="dark"] .browser-chat-management-dialog > .ui-modal-body {
   background: #17181c !important;
 }
 
@@ -1437,11 +1439,6 @@
   min-height: 0;
 }
 
-html body form.browser-chat-compose.browser-chat-compose--reference {
-  -webkit-backdrop-filter: blur(30px) saturate(1.12);
-  backdrop-filter: blur(30px) saturate(1.12);
-}
-
 .browser-chat-compose.browser-chat-compose--reference::before {
   -webkit-backdrop-filter: blur(26px) saturate(1.08);
   backdrop-filter: blur(26px) saturate(1.08);
@@ -1524,13 +1521,6 @@ html body form.browser-chat-compose.browser-chat-compose--reference {
   z-index: 2;
 }
 
-.browser-chat-compose--reference .browser-chat-inline-editor:empty::after,
-.browser-chat-compose--reference .browser-chat-inline-editor[data-empty="true"]::after {
-  color: var(--muted);
-  font-style: italic;
-  opacity: 0.72;
-}
-
 .browser-chat-compose--reference .browser-chat-compose-actions {
   align-items: center;
   background: transparent;
@@ -1570,10 +1560,6 @@ html body form.browser-chat-compose.browser-chat-compose--reference {
   position: relative;
 }
 
-.browser-chat-compose--reference .browser-chat-compose-submit::before {
-  content: none;
-}
-
 .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
   gap: 1.4cqi;
   grid-template-columns: 9.35cqi 3cqi var(--composer-circle-size);
@@ -1585,11 +1571,6 @@ html body form.browser-chat-compose.browser-chat-compose--reference {
   color: var(--muted-strong);
   height: var(--composer-circle-size);
   width: var(--composer-circle-size);
-}
-
-.browser-chat-compose--reference .browser-chat-attach svg {
-  height: 1.9cqi;
-  width: 1.9cqi;
 }
 
 html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--reference .browser-chat-attach {
@@ -1617,14 +1598,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
   position: relative;
 }
 
-.browser-chat-compose--reference .browser-chat-mode-selector::before {
-  content: none;
-}
-
-.browser-chat-compose--reference .browser-chat-context-usage {
-  display: none;
-}
-
 .browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts {
   gap: 1.65cqi;
   justify-self: center;
@@ -1643,11 +1616,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
   justify-content: center;
   padding-inline: 0;
   position: relative;
-}
-
-.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button svg {
-  height: 1.42cqi;
-  width: 1.42cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button + button {
@@ -2505,15 +2473,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
     0 0.55cqi 1.8cqi rgba(0, 0, 0, 0.12);
 }
 
-:root[data-theme="dark"] .browser-chat-compose.browser-chat-compose--reference:focus-within {
-  box-shadow:
-    0 0 0 3px color-mix(in srgb, var(--focus-ring) 11%, transparent),
-    -1.45cqi 1.9cqi 4.3cqi color-mix(in srgb, var(--composer-prism-left) 12%, transparent),
-    1.65cqi 2cqi 4.5cqi color-mix(in srgb, var(--composer-prism-right) 13%, transparent),
-    0 1.6cqi 3.5cqi rgba(0, 0, 0, 0.38),
-    inset 0 1px 0 rgba(255, 255, 255, 0.14);
-}
-
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor:empty::after,
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-inline-editor[data-empty="true"]::after,
 :root[data-theme="dark"] .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button {
@@ -2619,14 +2578,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
 :root[data-theme="dark"] .skills-manager-list,
 :root[data-theme="dark"] .personal-memory-settings {
   border-color: var(--border);
-}
-
-/* Screenshot-matched selected conversation marker. */
-@media (min-width: 1025px) {
-
-
-
-
 }
 
 /* Tablet and narrow-window workspace: two compact top rows, no lost actions. */
@@ -2883,13 +2834,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
     width: 100%;
   }
 
-  .browser-chat-compose.browser-chat-compose--reference {
-    aspect-ratio: auto;
-    border-radius: 17px;
-    grid-template-rows: minmax(76px, auto) 54px;
-    min-height: 130px;
-  }
-
   .browser-chat-compose.browser-chat-compose--reference::before {
     border-radius: 14px;
     inset: 7px 7px 54px;
@@ -2923,11 +2867,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
 
   .browser-chat-compose--reference .browser-chat-compose-tools {
     gap: 6px;
-  }
-
-  .browser-chat-compose--reference .browser-chat-compose-submit {
-    gap: 6px;
-    grid-template-columns: minmax(96px, 1fr) 40px;
   }
 
   .browser-chat-compose--reference .browser-chat-compose-submit:has(.browser-chat-stop) {
@@ -3689,6 +3628,11 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
   width: 13px;
 }
 
+.browser-chat-subagent-list .browser-chat-subagent-stop {
+  height: 22px;
+  width: 22px;
+}
+
 .browser-chat-tool-reason {
   font-size: 12px;
   line-height: 1.45;
@@ -3996,10 +3940,6 @@ html .browser-chat-sidebar .browser-chat-sidebar-footer .browser-chat-theme-togg
     inset 0 -1px 0 rgba(47, 151, 173, 0.16);
 }
 
-.browser-chat-compose--reference .browser-chat-send.magic-rainbow-button:disabled {
-  animation: none;
-}
-
 @media (max-width: 620px) {
   .browser-chat-mode-selector { gap: 4px; }
   .browser-chat-context-card {
@@ -4224,11 +4164,6 @@ html body form.browser-chat-compose.browser-chat-compose--reference {
   width: 100% !important;
 }
 
-.browser-chat-compose--reference .browser-chat-mode-selector {
-  display: contents;
-  position: static;
-}
-
 .browser-chat-compose--reference .browser-chat-compose-submit::before,
 .browser-chat-compose--reference .browser-chat-mode-selector::before,
 .browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button + button::before {
@@ -4339,34 +4274,9 @@ html body form.browser-chat-compose.browser-chat-compose--reference {
   transform: translateY(-0.21322cqi);
 }
 
-.browser-chat-compose--reference .browser-chat-mode-selector-trigger {
-  font-size: 1.634684cqi;
-  gap: 0.923952cqi;
-  height: var(--composer-pill-height);
-  left: 12.295665cqi;
-  padding: 0 1.918977cqi;
-  top: 19.189765cqi;
-  width: 17.199716cqi;
-}
-
-.browser-chat-compose--reference .browser-chat-mode-selector-trigger > svg:first-child {
-  height: 2.416489cqi;
-  width: 2.416489cqi;
-}
-
 .browser-chat-compose--reference .browser-chat-mode-selector-trigger > svg:last-child {
   height: 1.350391cqi;
   width: 1.350391cqi;
-}
-
-.browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts button {
-  font-size: 1.634684cqi;
-  gap: 0.923952cqi;
-  height: var(--composer-pill-height);
-  padding: 0;
-  position: absolute;
-  top: 19.189765cqi;
-  width: 11.656006cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-compose-actions > .browser-chat-management-shortcuts .skill {
@@ -4428,12 +4338,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
   width: var(--composer-circle-size);
 }
 
-.browser-chat-compose--reference .browser-chat-attach svg {
-  height: 2.771855cqi;
-  transform: translateY(0);
-  width: 2.700782cqi;
-}
-
 html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--reference .browser-chat-attach:not(:disabled):hover {
   filter: brightness(1.015);
   transform: translateY(-0.071073cqi);
@@ -4461,10 +4365,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
   width: 16.275764cqi;
 }
 
-.browser-chat-compose--reference .browser-chat-provider-select {
-  flex: 1 1 auto;
-}
-
 .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button,
 .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button:hover:not(:disabled),
 .browser-chat-compose--reference .browser-chat-provider-select .custom-select-button:focus-visible {
@@ -4477,17 +4377,6 @@ html body .browser-chat-chat-pane .browser-chat-compose.browser-chat-compose--re
   justify-content: space-between;
   min-height: calc(var(--composer-pill-height) - 0.142146cqi);
   padding: 0;
-}
-
-.browser-chat-compose--reference .browser-chat-provider-select .custom-select-button > div {
-  flex: 1 1 auto;
-  overflow: visible;
-  text-overflow: clip;
-}
-
-.browser-chat-compose--reference .browser-chat-provider-select .custom-select-button > svg {
-  height: 1.421464cqi;
-  width: 1.421464cqi;
 }
 
 .browser-chat-compose--reference .browser-chat-send.magic-rainbow-button {
@@ -4613,22 +4502,9 @@ html[data-theme="dark"] body form.browser-chat-compose.browser-chat-compose--ref
     top: 15px;
   }
 
-  .browser-chat-compose--reference .browser-chat-compose-actions {
-    gap: 6px;
-    grid-template-columns: auto minmax(0, 1fr);
-    padding: 6px 7px 8px 8px;
-  }
-
   .browser-chat-compose--reference .browser-chat-compose-submit {
     gap: 6px;
     grid-template-columns: minmax(96px, 1fr) 40px;
-  }
-
-  .browser-chat-compose--reference .browser-chat-mode-selector-trigger {
-    font-size: 12px;
-    gap: 5px;
-    padding: 0 10px;
-    width: 124px;
   }
 
   .browser-chat-compose--reference .browser-chat-mode-selector::before,

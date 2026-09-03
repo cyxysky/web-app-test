@@ -1,3 +1,5 @@
+"""Candidate reconciliation for the packaged sensitive-data runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

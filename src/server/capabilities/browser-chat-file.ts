@@ -215,7 +215,6 @@ export function createBrowserChatFileCapability(
   options: BrowserChatFileCapabilityOptions,
 ) {
   return createFileCapability({
-    instruction: false,
     visualInputAvailable: options.visualInputAvailable,
     createOperations: (context) => createBrowserChatFileOperations(context.runId, options),
   });

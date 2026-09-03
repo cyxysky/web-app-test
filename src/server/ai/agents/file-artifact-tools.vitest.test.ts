@@ -189,7 +189,6 @@ describe('UNO file tool policies', () => {
         sourceDigest: digest,
         renderedArtifactId: artifactId,
         renderedDigest: digest,
-        renderedSourceDigest: digest,
         workflow: { state: 'qa-pending', checkpointAt: new Date().toISOString(), renderedDigest: digest },
       }), 'utf8');
       await recordOfficeVisualQaProgress({

@@ -23,7 +23,7 @@ import {
   type NodeFileDownloadExecutionOptions,
   type NodeFileDownloader,
 } from './download.js';
-import type { NodeArtifactUrlResolver } from './artifacts.js';
+import { sanitizeNodeArtifactFileName, type NodeArtifactUrlResolver } from './artifacts.js';
 import { inspectUnoApi, isUnoBridgeStartupError } from './office/uno.js';
 import { validateOfficeArtifact, type OfficeElementMapEntry } from './office/validation.js';
 import { validateOfficeRendererMatrix } from './office/render-validation.js';
@@ -243,7 +243,6 @@ type ArtifactToolPayload = {
   validation?: string;
   validationStatus?: string;
   validationFailureCount?: number;
-  requiredNextAction?: string;
   saved?: boolean;
   message?: string;
   error?: string;
@@ -301,15 +300,7 @@ function escapeMarkdownLinkLabel(value: string) {
   return value.replace(/[[\]\\]/g, '\\$&');
 }
 
-function sanitizeFileName(value: string | undefined | null, fallback: string) {
-  const cleaned = String(value || '')
-    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, '_')
-    .replace(/\s+/g, ' ')
-    .replace(/^\.+/, '')
-    .trim()
-    .slice(0, 160);
-  return cleaned || fallback;
-}
+const sanitizeFileName = sanitizeNodeArtifactFileName;
 
 function artifactDir(runId: string | undefined, kind: 'attachment-previews' | 'document-assets' | 'document-drafts' | 'downloads' | 'generated') {
   return path.join(currentNodeFileWorkspaceHost().artifactsRoot, sanitizeFileName(runId, 'adhoc'), kind);
@@ -392,7 +383,7 @@ function configuredOfficeGenerator(fileName: string, operation: 'create' | 'modi
   const extension = path.extname(fileName).toLowerCase();
   if (configured === 'javascript') {
     if (!javascriptOfficeExtensions.has(extension)) {
-      throw new Error('JavaScript Office generation supports .pptx, .docx, .xlsx, and PDF converted from the matching Office source. Select UNO mode for legacy Office or OpenDocument output.');
+      throw new Error('JavaScript Office generation supports .pptx, .docx, .xlsx, and PDF converted from the matching Office source. Select UNO mode for binary Office or OpenDocument output.');
     }
     return 'javascript';
   }
@@ -672,7 +663,6 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
     : [];
   return [
     `error=${error}`,
-    payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
     payload.validationFailureCount ? `consecutiveValidationFailures=${payload.validationFailureCount}` : '',
     diagnostics.length ? `diagnostics=${diagnostics.join(' | ')}` : '',
     repairHints.length ? `repairHints=${repairHints.join(' | ')}` : '',
@@ -727,10 +717,10 @@ export function officeValidationRepairHints(
     hints.push('The artifact was kept valid by deterministic runtime ID disambiguation. On the next relevant edit, update the shared helper namespace once instead of renaming only the last reported object or rewriting the complete source.');
   }
   if (codes.has('UNO_BRIDGE_DISPOSED')) {
-    hints.push('The runtime already retried once with a fresh isolated LibreOffice profile. Preserve the current facade source and retry render; source edits cannot repair a disposed LibreOffice process.');
+    hints.push('The runtime already retried once with a fresh isolated LibreOffice profile. The disposed LibreOffice process prevented validation from completing and does not by itself identify a source defect.');
   }
   if (codes.has('UNO_BRIDGE_STARTUP')) {
-    hints.push('LibreOffice failed before the document source could run. Do not edit the Office source; retry render with the unchanged draft after the isolated startup retries complete.');
+    hints.push('LibreOffice failed before the document source could run. Validation did not produce evidence of a source defect.');
   }
   if (codes.has('RAW_CONNECTOR_SHAPE_UNSTABLE')) {
     hints.push('Replace only the reported raw connector with slide.connect(elementId, sourceBox, targetBox, ...). Keep the existing named slide layout and child IDs.');
@@ -792,7 +782,7 @@ export function officeValidationRepairHints(
 }
 
 export function formatFileArtifactResult(toolName: string, actual?: string) {
-  if (toolName !== 'file' && toolName !== 'downloadFile' && toolName !== 'generateFile') return undefined;
+  if (toolName !== 'file') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
     if (payload.kind === 'uno-draft-patch-conflict') {
@@ -802,7 +792,6 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
         payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
         payload.expectedBaseDigest ? `currentDigest=${payload.expectedBaseDigest}` : '',
         payload.suppliedBaseDigest ? `suppliedDigest=${payload.suppliedBaseDigest}` : '',
-        `requiredNextAction=${payload.requiredNextAction || 'read'}`,
         payload.error || 'Read the current source and prepare a new patch from the exact returned program.',
       ].filter(Boolean).join('; ');
     }
@@ -813,7 +802,6 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
         payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
         payload.patchBaseDigest ? `patchBaseDigest=${payload.patchBaseDigest}` : '',
         payload.validationStatus ? `validationStatus=${payload.validationStatus}` : '',
-        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
         payload.message || payload.error || '',
       ].filter(Boolean).join('; ');
     }
@@ -834,7 +822,6 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       }
       return [
         `Office source validated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; sourceCharacters=${payload.sourceCharacters || 0}; cacheHit=${payload.cacheHit === true}`,
-        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
         compactAutomaticValidation(payload),
       ].filter(Boolean).join('; ');
     }
@@ -844,12 +831,11 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
     if (payload.kind === 'office-source-unit-validation' && payload.validation === 'passed') {
       return [
         `Office source unit validated: Document ID: ${payload.documentId}; sourceUnitPath=${String((payload as Record<string, unknown>).sourceUnitPath || '')}`,
-        payload.requiredNextAction ? `requiredNextAction=${payload.requiredNextAction}` : '',
         compactAutomaticValidation(payload),
       ].filter(Boolean).join('; ');
     }
     if (payload.kind !== 'download' && payload.kind !== 'generated') return undefined;
-    const label = toolName === 'downloadFile' || (toolName === 'file' && payload.kind === 'download')
+    const label = payload.kind === 'download'
       ? 'File downloaded'
       : 'File generated';
     const fileName = payload.fileName || 'artifact';
@@ -1043,21 +1029,9 @@ async function recoverDraftTransaction(runId: string | undefined, documentId: st
 
 async function loadDraft(runId: string | undefined, documentId: string) {
   await recoverDraftTransaction(runId, documentId);
-  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft & {
-    currentRevision?: unknown;
-    revision?: unknown;
-    revisions?: unknown;
-    validatedRevision?: unknown;
-  };
-  // Migrate metadata written by the retired editor revision protocol. A
-  // documentId owns one current source file; old history metadata is ignored.
-  delete parsed.currentRevision;
-  delete parsed.revision;
-  delete parsed.revisions;
-  delete parsed.validatedRevision;
+  const parsed = JSON.parse(await readFile(draftPath(runId, documentId), 'utf8')) as OfficeDocumentDraft;
   parsed.generator ||= 'javascript';
   parsed.operation ||= parsed.sourceDocument ? 'modify' : 'create';
-  parsed.renderedDigest ||= parsed.renderedSourceDigest;
   parsed.workflow ||= {
     state: parsed.visualQaDigest && parsed.visualQaDigest === parsed.renderedDigest
       ? 'completed'
@@ -1156,7 +1130,7 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || null,
         validationFailureCount: draft.validationFailureCount || 0,
-        renderedDigest: draft.renderedDigest || draft.renderedSourceDigest || null,
+        renderedDigest: draft.renderedDigest || null,
         visualQaDigest: draft.visualQaDigest || null,
         visualQaFailedPages: failedReviews.map((review) => review.pageNumber),
         visualQaFailureSummary: failedReviews.flatMap((review) => review.issues
@@ -1191,30 +1165,6 @@ export async function officeDraftCatalogForPrompt(runId: string | undefined) {
     'Resume an existing logical document with its exact documentId. Do not guess an ID or create a replacement unless the user explicitly requests a new document.',
     ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | validationFailureCount=${draft.validationFailureCount} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | visualQaDeckStatus=${draft.visualQaDeckStatus || 'none'}${draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? ` | visualQaFailedPages=${draft.visualQaFailedPages?.join(',') || 'none'} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
   ].join('\n');
-}
-
-export async function pendingOfficeDocumentWork(
-  runId: string | undefined,
-  documentIds: Set<string>,
-  options: { requireVisualQa?: boolean } = {},
-) {
-  const catalog = await listOfficeDraftCatalog(runId);
-  return catalog.filter((draft) => documentIds.has(draft.documentId)).reduce<Array<OfficeDraftCatalogEntry & {
-    requiredNextAction: 'edit' | 'generate' | 'render' | 'visualIndex';
-  }>>((pending, draft) => {
-    if (!draft.sourceDigest) pending.push({ ...draft, requiredNextAction: 'generate' });
-    else if (draft.validatedSourceDigest !== draft.sourceDigest
-      || draft.renderedDigest !== draft.sourceDigest) {
-      pending.push({ ...draft, requiredNextAction: 'render' });
-    }
-    else if (draft.state === 'qa-pending' && options.requireVisualQa !== false) {
-      pending.push({
-        ...draft,
-        requiredNextAction: draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? 'edit' : 'visualIndex',
-      });
-    }
-    return pending;
-  }, []);
 }
 
 async function writeDraftWorkspace(runId: string | undefined, draft: OfficeDocumentDraft) {
@@ -1304,16 +1254,7 @@ function normalizedSourceUnitPath(value: string | undefined) {
 
 function sourceUnitForRequestedPath(units: ParsedSourceUnit[], requestedPath: string | undefined) {
   if (!requestedPath) return undefined;
-  const exact = units.find((unit) => unit.path === requestedPath);
-  if (exact) return exact;
-  const legacySlide = /^pages\/slide-0*(\d+)$/i.exec(requestedPath)?.[1];
-  if (!legacySlide) return undefined;
-  const slideNumber = Number(legacySlide);
-  const semanticMatches = units.filter((unit) => {
-    const authoredNumber = /^pages\/(?:s|slide-)0*(\d+)(?:[-_/]|$)/i.exec(unit.path)?.[1];
-    return authoredNumber !== undefined && Number(authoredNumber) === slideNumber;
-  });
-  return semanticMatches.length === 1 ? semanticMatches[0] : undefined;
+  return units.find((unit) => unit.path === requestedPath);
 }
 
 function parseSourceUnits(source: string): ParsedSourceUnit[] {
@@ -2381,6 +2322,71 @@ type ValidatedDraftCandidate = {
   };
 };
 
+type OfficeArtifactValidation = ValidatedDraftCandidate['validation'];
+
+function assertOfficeValidationPassed(
+  validation: OfficeArtifactValidation,
+  diagnostics: Array<{ message: string; severity?: string }> = validation.issues,
+) {
+  if (validation.passed) return;
+  const failed = diagnostics.filter((issue) => issue.severity === 'error');
+  const error = new Error(failed.map((issue) => issue.message).join('\n'));
+  Object.assign(error, { diagnostics: failed });
+  throw error;
+}
+
+function includeGeneratedRuntimeValidation(
+  validation: OfficeArtifactValidation,
+  diagnostics: unknown,
+  enabled: boolean,
+): OfficeArtifactValidation {
+  if (!enabled) return validation;
+  const issues = [...generatedRuntimeDiagnostics(diagnostics), ...generatedVerificationIssues(diagnostics)];
+  const next = {
+    ...validation,
+    issues: [...validation.issues, ...issues],
+    passed: validation.passed && !issues.some((issue) => issue.severity === 'error'),
+  };
+  assertOfficeValidationPassed(next, issues);
+  return next;
+}
+
+async function includeRendererValidation(
+  validation: OfficeArtifactValidation,
+  previewPath?: string,
+): Promise<OfficeArtifactValidation> {
+  const rendererMatrix = await validateOfficeRendererMatrix({ libreOfficePdfPath: previewPath });
+  const next = {
+    ...validation,
+    issues: [...validation.issues, ...rendererMatrix.issues],
+    passed: validation.passed && rendererMatrix.passed,
+    rendererMatrix,
+  };
+  assertOfficeValidationPassed(next);
+  return next;
+}
+
+function officeQualityGate(
+  validation: OfficeArtifactValidation,
+  visualVerification: FilePreviewResult | undefined,
+  noVisualReason?: string,
+) {
+  return {
+    structural: true,
+    renderers: validation.rendererMatrix?.renderers,
+    rendererPolicy: validation.rendererMatrix?.policy,
+    visual: visualVerification ? {
+      previewGenerated: visualVerification.imagePaths.length > 0,
+      modelReviewRequired: true,
+      previewPages: visualVerification.renderedPages,
+      fullReviewStatus: 'pending',
+    } : {
+      status: 'not-performed',
+      ...(noVisualReason ? { reason: noVisualReason } : {}),
+    },
+  };
+}
+
 function generatedElementMap(diagnostics: unknown): OfficeElementMapEntry[] {
   if (!diagnostics || typeof diagnostics !== 'object') return [];
   const candidate = (diagnostics as { elementMap?: unknown }).elementMap;
@@ -2553,7 +2559,7 @@ function documentAssetsFingerprint(assets: DocumentAsset[]) {
   }), 'utf8').digest('hex');
 }
 
-async function prepareValidatedDraftLegacy(input: {
+async function generateValidatedDraftCandidate(input: {
   runId?: string;
   draft: OfficeDocumentDraft;
   attachmentBindings?: FileAttachmentBinding[];
@@ -2654,7 +2660,7 @@ async function prepareValidatedDraft(input: {
       Object.assign(error, { diagnostics: staticDiagnostics });
       throw error;
     }
-    let candidate = await prepareValidatedDraftLegacy(input);
+    let candidate = await generateValidatedDraftCandidate(input);
     await input.onProgress?.({ phase: 'artifact-validation', message: '正在执行统一 Office、字体和嵌入图片检查' });
     const unoStrict = input.draft.generator === 'uno';
     const elementMap = unoStrict ? generatedElementMap(candidate.generated.diagnostics) : [];
@@ -2673,7 +2679,7 @@ async function prepareValidatedDraft(input: {
     if (!validation.passed && candidate.cacheHit) {
       const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
       await clearValidationCacheFiles(cache);
-      candidate = await prepareValidatedDraftLegacy(input);
+      candidate = await generateValidatedDraftCandidate(input);
       validation = await validateOfficeArtifact({
         absolutePath: candidate.generated.outputPath,
         sourceAbsolutePath,
@@ -2694,47 +2700,11 @@ async function prepareValidatedDraft(input: {
         passed: false,
       };
     }
-    if (!validation.passed) {
-      const error = new Error(validation.issues
-        .filter((issue) => issue.severity === 'error')
-        .map((issue) => issue.message)
-        .join('\n'));
-      Object.assign(error, { diagnostics: validation.issues });
-      throw error;
-    }
-    const workerDiagnostics = unoStrict ? generatedRuntimeDiagnostics(candidate.generated.diagnostics) : [];
-    const runtimeIssues = unoStrict ? generatedVerificationIssues(candidate.generated.diagnostics) : [];
-    validation = {
-      ...validation,
-      issues: [...validation.issues, ...workerDiagnostics, ...runtimeIssues],
-      passed: validation.passed
-        && !workerDiagnostics.some((issue) => issue.severity === 'error')
-        && !runtimeIssues.some((issue) => issue.severity === 'error'),
-    };
-    if (!validation.passed) {
-      const failedRuntimeDiagnostics = [...workerDiagnostics, ...runtimeIssues]
-        .filter((issue) => issue.severity === 'error');
-      const error = new Error(failedRuntimeDiagnostics.map((issue) => issue.message).join('\n'));
-      Object.assign(error, { diagnostics: failedRuntimeDiagnostics });
-      throw error;
-    }
-    let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
+    assertOfficeValidationPassed(validation);
+    validation = includeGeneratedRuntimeValidation(validation, candidate.generated.diagnostics, unoStrict);
     if (unoStrict) {
       await input.onProgress?.({ phase: 'renderer-validation', message: '正在通过 LibreOffice 验证渲染结果' });
-      rendererMatrix = await validateOfficeRendererMatrix({
-        libreOfficePdfPath: candidate.generated.previewPath,
-      });
-      validation = {
-        ...validation,
-        issues: [...validation.issues, ...rendererMatrix.issues],
-        passed: validation.passed && rendererMatrix.passed,
-        rendererMatrix,
-      };
-      if (!validation.passed) {
-        const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
-        Object.assign(error, { diagnostics: validation.issues });
-        throw error;
-      }
+      validation = await includeRendererValidation(validation, candidate.generated.previewPath);
     }
     input.draft.validationStatus = 'passed';
     input.draft.validationFailureCount = 0;
@@ -2755,7 +2725,7 @@ async function prepareValidatedDraft(input: {
           : undefined;
         return unit ? { ...element, unitPath: unit.path } : element;
       });
-      if (rendererMatrix) input.draft.rendererValidation = rendererMatrix;
+      if (validation.rendererMatrix) input.draft.rendererValidation = validation.rendererMatrix;
     } else {
       delete input.draft.elementMap;
       delete input.draft.rendererValidation;
@@ -2832,23 +2802,12 @@ async function validateDraft(input: {
         sourceDigest: sourceDigest(input.draft.program || ''),
         sourceCharacters: input.draft.program?.length || 0,
         validationStatus: input.draft.validationStatus,
-        requiredNextAction: 'render',
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         generationDiagnostics: candidate.generated.diagnostics,
         automaticValidation: candidate.validation,
         workflow: input.draft.workflow,
-        qualityGate: {
-          structural: true,
-          renderers: candidate.validation.rendererMatrix?.renderers,
-          rendererPolicy: candidate.validation.rendererMatrix?.policy,
-          visual: visualVerification ? {
-            previewGenerated: visualVerification.imagePaths.length > 0,
-            modelReviewRequired: true,
-            previewPages: visualVerification.renderedPages,
-            fullReviewStatus: 'pending',
-          } : { status: 'not-performed' },
-        },
+        qualityGate: officeQualityGate(candidate.validation, visualVerification),
       }),
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
@@ -2876,19 +2835,15 @@ async function validateDraft(input: {
         lineCount: draftSourceLineCount(source),
         validation: transientUnoFailure ? 'pending' : 'failed',
         validationFailureCount: transientUnoFailure ? input.draft.validationFailureCount || 0 : input.draft.validationFailureCount || 1,
-        requiredNextAction: transientUnoFailure ? 'render' : 'edit',
         diagnostics: transientUnoFailure ? [{
           code: 'UNO_BRIDGE_STARTUP',
           severity: 'error',
           message: compactToolText(validationError),
         }] : compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
         repairHints: transientUnoFailure
-          ? ['LibreOffice startup retries were exhausted. Do not edit the Office source; retry action=render for the unchanged current draft.']
+          ? ['LibreOffice startup retries were exhausted before source validation completed; the current source was preserved.']
           : officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
         error: compactToolText(saveError ? `${validationError}\nWorking source save failed: ${saveError}` : validationError),
-        recoverySuggestion: transientUnoFailure
-          ? 'The current source was preserved and was not marked invalid. Retry render; source changes cannot repair a LibreOffice process startup failure.'
-          : 'Continue editing this same current source. Read the reported source units or bounded windows, then submit one Codex-format patch containing every independent repair with the returned patchBaseDigest. Use @@ hunks without numeric line counts; split only overlapping or dependent repairs. Do not use action=generate for local validation errors.',
         workflow: compactWorkflowForTool(input.draft.workflow),
       }),
     };
@@ -2955,43 +2910,10 @@ async function validateDraftSourceUnit(input: {
       requireElementIds: unoStrict && input.draft.operation !== 'modify',
       validationProfile: unoStrict ? 'uno-strict' : 'basic',
     });
-    if (!validation.passed) {
-      const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
-      Object.assign(error, { diagnostics: validation.issues });
-      throw error;
-    }
-    const workerDiagnostics = unoStrict ? generatedRuntimeDiagnostics(generated.diagnostics) : [];
-    const runtimeIssues = unoStrict ? generatedVerificationIssues(generated.diagnostics) : [];
-    validation = {
-      ...validation,
-      issues: [...validation.issues, ...workerDiagnostics, ...runtimeIssues],
-      passed: validation.passed
-        && !workerDiagnostics.some((issue) => issue.severity === 'error')
-        && !runtimeIssues.some((issue) => issue.severity === 'error'),
-    };
-    if (!validation.passed) {
-      const failedRuntimeDiagnostics = [...workerDiagnostics, ...runtimeIssues]
-        .filter((issue) => issue.severity === 'error');
-      const error = new Error(failedRuntimeDiagnostics.map((issue) => issue.message).join('\n'));
-      Object.assign(error, { diagnostics: failedRuntimeDiagnostics });
-      throw error;
-    }
-    let rendererMatrix: Awaited<ReturnType<typeof validateOfficeRendererMatrix>> | undefined;
+    assertOfficeValidationPassed(validation);
+    validation = includeGeneratedRuntimeValidation(validation, generated.diagnostics, unoStrict);
     if (unoStrict) {
-      rendererMatrix = await validateOfficeRendererMatrix({
-        libreOfficePdfPath: generated.previewPath,
-      });
-      validation = {
-        ...validation,
-        issues: [...validation.issues, ...rendererMatrix.issues],
-        passed: validation.passed && rendererMatrix.passed,
-        rendererMatrix,
-      };
-      if (!validation.passed) {
-        const error = new Error(validation.issues.filter((issue) => issue.severity === 'error').map((issue) => issue.message).join('\n'));
-        Object.assign(error, { diagnostics: validation.issues });
-        throw error;
-      }
+      validation = await includeRendererValidation(validation, generated.previewPath);
     }
     const needsVisuals = Boolean(input.includeVisualVerification && generated.previewPath);
     const visualVerification = needsVisuals
@@ -3016,7 +2938,7 @@ async function validateDraftSourceUnit(input: {
     ];
     if (unoStrict) {
       input.draft.elementMap = elementMap;
-      if (rendererMatrix) input.draft.rendererValidation = rendererMatrix;
+      if (validation.rendererMatrix) input.draft.rendererValidation = validation.rendererMatrix;
     } else {
       delete input.draft.elementMap;
       delete input.draft.rendererValidation;
@@ -3035,7 +2957,6 @@ async function validateDraftSourceUnit(input: {
         assets: assets.map(describeDocumentAsset),
         automaticValidation: validation,
         automaticVisualChecks: visualVerification?.automaticChecks || [],
-        requiredNextAction: 'Continue editing other units, or call render for final full-document validation and publication.',
       }),
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
@@ -3073,11 +2994,9 @@ async function validateDraftSourceUnit(input: {
           saved: !saveError,
           renderable: true,
           sourceDigest: sourceDigest(input.draft.program || ''),
-          requiredNextAction: 'render',
           diagnostics: [{ code: 'UNO_BRIDGE_STARTUP', severity: 'error', message: compactToolText(errorText) }],
-          repairHints: ['LibreOffice startup retries were exhausted. Do not edit the Office source; retry action=render for the unchanged current draft.'],
+          repairHints: ['LibreOffice startup retries were exhausted before source-unit validation completed; the current source was preserved.'],
           error: compactToolText(saveError ? `${errorText}\nWorking source save failed: ${saveError}` : errorText),
-          recoverySuggestion: 'The edited source was preserved and was not marked invalid. Retry render; source changes cannot repair a LibreOffice process startup failure.',
           workflow: compactWorkflowForTool(input.draft.workflow),
         }),
       };
@@ -3104,7 +3023,6 @@ async function validateDraftSourceUnit(input: {
         renderable: false,
         sourceDigest: sourceDigest(input.draft.program || ''),
         validationFailureCount: input.draft.validationFailureCount || 1,
-        requiredNextAction: 'edit',
         diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
         repairHints: officeValidationRepairHints(input.draft.validationDiagnostics, error instanceof Error ? error.message : String(error)),
         error: compactToolText(saveError
@@ -3185,7 +3103,6 @@ async function renderDraft(input: {
     });
     input.draft.renderedArtifactId = artifact.artifactId;
     input.draft.renderedFileName = target.fileName;
-    input.draft.renderedSourceDigest = digest;
     input.draft.renderedDigest = digest;
     input.draft.visualQaArtifactId = undefined;
     input.draft.visualQaDigest = undefined;
@@ -3214,20 +3131,11 @@ async function renderDraft(input: {
         generationDiagnostics: candidate.generated.diagnostics,
         automaticValidation: candidate.validation,
         workflow: input.draft.workflow,
-        qualityGate: {
-          structural: true,
-          renderers: candidate.validation.rendererMatrix?.renderers,
-          rendererPolicy: candidate.validation.rendererMatrix?.policy,
-          visual: visualVerification ? {
-            previewGenerated: visualVerification.imagePaths.length > 0,
-            modelReviewRequired: true,
-            previewPages: visualVerification.renderedPages,
-            fullReviewStatus: 'pending',
-          } : {
-            status: 'not-performed',
-            reason: 'The selected model does not accept image input; this result is structurally verified only.',
-          },
-        },
+        qualityGate: officeQualityGate(
+          candidate.validation,
+          visualVerification,
+          'The selected model does not accept image input; this result is structurally verified only.',
+        ),
         visualVerification: visualVerification ? {
           imageCount: visualVerification.imagePaths.length,
           pageCount: visualVerification.pageCount,
@@ -3254,13 +3162,12 @@ async function renderDraft(input: {
           documentId: input.draft.documentId,
           sourceDigest: sourceDigest(input.draft.program || ''),
           sourceUnchanged: true,
-          requiredNextAction: 'render',
           diagnostics: [{
             code: 'UNO_BRIDGE_STARTUP',
             severity: 'error',
             message: compactToolText(error instanceof Error ? error.message : String(error)),
           }],
-          error: 'LibreOffice could not start after isolated retries. Retry render; do not edit the Office source.',
+          error: 'LibreOffice could not start after isolated retries. The Office source was unchanged and validation did not complete.',
         }),
       };
     }
@@ -3419,8 +3326,7 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
           sourceCharacters: existingProgram.length,
           sourceDigest: existingDigest,
           patchBaseDigest: existingDigest,
-          requiredNextAction: 'edit',
-          error: `action=generate found an existing working source${drasticShrink || removesEntrypoint ? ' and this replacement would discard most of it or its create_document entrypoint' : ''}. Existing drafts must be repaired with action=edit. Read the current source and patchBaseDigest, then submit a focused Codex-format patch; formatting or context failures must also be retried as edit.`,
+          error: `action=generate found an existing working source${drasticShrink || removesEntrypoint ? ' and this replacement would discard most of it or its create_document entrypoint' : ''}. Replacing it requires replaceExisting=true with the current baseDigest. A smaller change may instead be submitted through action=edit.`,
         }),
       };
     }
@@ -3473,10 +3379,7 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     if (!/^[a-f0-9]{64}$/.test(baseDigest)) {
       return { ok: false, actual: 'file action=edit patch requires baseDigest copied from the latest action=read result.' };
     }
-    // Unit-scoped reads return the complete draft digest so callers can omit
-    // path safely. Keep accepting the legacy unit digest when path is given.
-    const acceptedDigests = new Set(requestedUnit ? [draftDigest, editableDigest] : [draftDigest]);
-    const rebased = !acceptedDigests.has(baseDigest);
+    const rebased = baseDigest !== draftDigest;
     let patchResult: UnoDraftPatchResult;
     try {
       patchResult = applyUnoDraftPatchHunks(editableSource, patchText);
@@ -3492,7 +3395,6 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           expectedBaseDigest: draftDigest,
           expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
           suppliedBaseDigest: baseDigest,
-          requiredNextAction: 'read',
           error: `The current source changed after the patch was prepared and the exact-context patch could not be rebased safely: ${error instanceof Error ? error.message : String(error)}. Read it again and regenerate only the conflicting hunks from the exact returned program.`,
         }),
       };
@@ -3515,7 +3417,6 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
             ignored: patchResult.ignoredHunks,
             total: patchResult.totalHunks,
           },
-          requiredNextAction: 'read',
           error: 'The source changed after this patch was prepared. Some hunks still conflict, so no part of the stale patch was saved. Read the current source and retry only those conflicts.',
         }),
       };
@@ -3547,7 +3448,6 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           sourceUnitPath: requestedUnit?.path,
           lineCount: draftSourceLineCount(editableSource),
           validationStatus: persistedDraft.validationStatus || 'pending',
-          requiredNextAction: persistedDraft.validatedSourceDigest === sourceDigest(persistedDraft.program) ? 'render' : 'read',
           message: 'The patch target is already satisfied. No source bytes needed to change.',
         }),
       };
@@ -3574,9 +3474,7 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
       const patchWasSaved = failure.saved === true;
       return {
         // Editing and validation are separate outcomes. A saved patch is a
-        // successful mutation even when automatic validation discovers the
-        // next repair. The requiredNextAction gate still prevents rendering or
-        // final delivery until those diagnostics are fixed.
+        // successful mutation even when automatic validation discovers errors.
         ok: patchWasSaved,
         actual: JSON.stringify({
           ...failure,
@@ -3595,9 +3493,8 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           sourceCharacters: draft.program?.length || 0,
           diagnostics: failure.diagnostics || draft.validationDiagnostics || [],
           validation: 'failed',
-          requiredNextAction: failure.requiredNextAction || 'edit',
           recoverySuggestion: failure.recoverySuggestion
-            || 'The current working source and diagnostics were saved. Continue editing this same documentId; read the exact source and patchBaseDigest, then submit a Codex-format patch. Rendering remains blocked until the current source passes validation.',
+            || 'The current working source and diagnostics were saved. Publication remains unavailable while the current source is invalid.',
           workflow: compactWorkflowForTool(draft.workflow),
         }),
       };
@@ -3622,7 +3519,6 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
             total: patchResult.totalHunks,
           },
           rebased,
-          requiredNextAction: 'read',
           recoverySuggestion: 'Successful independent hunks were saved. Read the current source and use its new patchBaseDigest before retrying only the reported conflicting hunks.',
         }),
       };
@@ -3662,8 +3558,7 @@ export async function verifyCurrentUnoRenderedArtifact(input: {
     const normalized = String(input.artifactId || '').replace(/\\/g, '/').replace(/^\/+/, '');
     const segments = normalized.split('/').filter(Boolean);
     const generatedIndex = segments.indexOf('generated');
-    // Downloads and legacy flat generated artifacts do not carry a UNO source
-    // version in their Artifact ID.
+    // Non-versioned artifacts do not carry an Office source digest in their Artifact ID.
     if (generatedIndex < 0 || segments.length < generatedIndex + 4) return { ok: true, actual: 'unversioned-artifact' };
     const documentId = segments[generatedIndex + 1];
     const renderedDigest = segments[generatedIndex + 2];
@@ -3679,10 +3574,9 @@ export async function verifyCurrentUnoRenderedArtifact(input: {
           kind: 'stale-file-visual-artifact',
           documentId,
           artifactId: normalized,
-          renderedSourceDigest: renderedDigest,
+          renderedDigest,
           currentSourceDigest: currentDigest,
-          requiredNextAction: 'render',
-          error: 'This artifact does not represent the current source draft. Render the current documentId and use the new Artifact ID.',
+          error: 'This artifact does not represent the current source draft and cannot be used as evidence for it.',
         }),
       };
     }
@@ -3733,7 +3627,7 @@ export async function recordOfficeVisualQaProgress(input: {
     };
     return await withDraftLock(input.runId, identity.documentId, async () => {
       const draft = await loadDraft(input.runId, identity.documentId);
-      if (draft.renderedArtifactId !== identity.artifactId || (draft.renderedDigest || draft.renderedSourceDigest) !== identity.renderedDigest) {
+      if (draft.renderedArtifactId !== identity.artifactId || draft.renderedDigest !== identity.renderedDigest) {
         return { ok: false, actual: 'File visual QA progress rejected because the rendered artifact is no longer current.' };
       }
       if (draft.visualQaArtifactId !== identity.artifactId) {
@@ -3876,66 +3770,6 @@ export async function recordOfficeVisualQaProgress(input: {
   }
 }
 
-export async function pendingOfficeVisualQa(runId?: string, artifactIds?: ReadonlySet<string>) {
-  const directory = artifactDir(runId, 'document-drafts');
-  const entries = await visibleFiles(directory);
-  const pending: Array<{
-    documentId: string;
-    artifactId: string;
-    renderedDigest: string;
-    visualQaDigest?: string;
-    pageCount: number;
-    seenPageCount: number;
-    reviewedPageCount: number;
-    failedPages: number[];
-    failedReviews: Array<{ pageNumber: number; issues: Array<{ type: string; description: string; region?: string; severity?: string }> }>;
-    deckReviewStatus?: 'failed' | 'passed';
-    deckReviewIssues: Array<{ type: string; description: string; region?: string; severity?: string }>;
-  }> = [];
-  for (const entry of entries) {
-    if (!entry.name.endsWith('.json') || entry.name.endsWith('.transaction.json')) continue;
-    try {
-      const draft = JSON.parse(await readFile(path.join(directory, entry.name), 'utf8')) as OfficeDocumentDraft;
-      const renderedDigest = draft.renderedDigest || draft.renderedSourceDigest;
-      if (!draft.renderedArtifactId || !renderedDigest) continue;
-      if (artifactIds && !artifactIds.has(draft.renderedArtifactId)) continue;
-      const pageCount = draft.visualQaPageCount || 0;
-      const seen = new Set(draft.visualQaSeenPages || []);
-      const completeCoverage = pageCount > 0 && Array.from({ length: pageCount }, (_, index) => seen.has(index + 1));
-      const reviews = new Map((draft.visualQaReviews || []).map((review) => [review.pageNumber, review]));
-      const completePassingReview = pageCount > 0
-        && Array.from({ length: pageCount }, (_, index) => reviews.get(index + 1)?.status === 'passed');
-      const completeDeckReview = draft.visualQaDeckReview?.status === 'passed';
-      if (draft.visualQaArtifactId !== draft.renderedArtifactId
-        || draft.visualQaDigest !== renderedDigest
-        || !completeCoverage
-        || !completePassingReview
-        || !completeDeckReview) {
-        pending.push({
-          documentId: draft.documentId,
-          artifactId: draft.renderedArtifactId,
-          renderedDigest,
-          visualQaDigest: draft.visualQaDigest,
-          pageCount,
-          seenPageCount: seen.size,
-          reviewedPageCount: reviews.size,
-          failedPages: Array.from(reviews.values())
-            .filter((review) => review.status === 'failed')
-            .map((review) => review.pageNumber),
-          failedReviews: Array.from(reviews.values())
-            .filter((review) => review.status === 'failed')
-            .map((review) => ({ pageNumber: review.pageNumber, issues: review.issues })),
-          deckReviewStatus: draft.visualQaDeckReview?.status,
-          deckReviewIssues: draft.visualQaDeckReview?.issues || [],
-        });
-      }
-    } catch {
-      // Ignore unrelated/corrupt sidecars; loadDraft reports them when addressed.
-    }
-  }
-  return pending;
-}
-
 async function renderFileArtifactUnlocked(input: RenderArtifactInput): Promise<FileArtifactOperationResult> {
   try {
     const documentId = String(input.documentId || '').trim();
@@ -4027,12 +3861,10 @@ export function createNodeFileWorkspace(options: NodeFileWorkspaceHost) {
     listOfficeDraftCatalog: bindNodeFileWorkspaceOperation(host, listOfficeDraftCatalog),
     listOfficeDrafts: bindNodeFileWorkspaceOperation(host, listOfficeDrafts),
     officeDraftCatalogForPrompt: bindNodeFileWorkspaceOperation(host, officeDraftCatalogForPrompt),
-    pendingOfficeDocumentWork: bindNodeFileWorkspaceOperation(host, pendingOfficeDocumentWork),
     getUnoApi: bindNodeFileWorkspaceOperation(host, getUnoApi),
     getOfficeJsApi: bindNodeFileWorkspaceOperation(host, getOfficeJsApi),
     verifyCurrentUnoRenderedArtifact: bindNodeFileWorkspaceOperation(host, verifyCurrentUnoRenderedArtifact),
     recordOfficeVisualQaProgress: bindNodeFileWorkspaceOperation(host, recordOfficeVisualQaProgress),
-    pendingOfficeVisualQa: bindNodeFileWorkspaceOperation(host, pendingOfficeVisualQa),
     readUnoDraft: bindNodeFileWorkspaceOperation(host, readUnoDraft),
     planFileArtifact: bindNodeFileWorkspaceOperation(host, planFileArtifact),
     generateUnoFileArtifact: bindNodeFileWorkspaceOperation(host, generateUnoFileArtifact),

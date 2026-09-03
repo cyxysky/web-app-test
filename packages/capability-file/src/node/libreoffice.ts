@@ -181,7 +181,10 @@ async function convertStagedOfficeFile(input: {
   return path.join(outputDirectory, outputName);
 }
 
-export async function convertOfficeFile(input: OfficeFileConversionInput) {
+async function withConvertedOfficeFile<T>(
+  input: OfficeFileConversionInput,
+  consume: (convertedPath: string) => Promise<T>,
+) {
   input.abortSignal?.throwIfAborted();
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'capability-file-office-convert-'));
   try {
@@ -195,33 +198,22 @@ export async function convertOfficeFile(input: OfficeFileConversionInput) {
       runtime: input.runtime,
       timeoutMs: input.timeoutMs,
     });
-    return convertedPath ? await readFile(convertedPath) : undefined;
+    return convertedPath ? consume(convertedPath) : undefined;
   } finally {
     await rm(temporaryDirectory, { force: true, recursive: true });
   }
 }
 
+export async function convertOfficeFile(input: OfficeFileConversionInput) {
+  return withConvertedOfficeFile(input, (convertedPath) => readFile(convertedPath));
+}
+
 export async function convertOfficeFileToPath(input: OfficeFileConversionInput & {
   targetPath: string;
 }) {
-  input.abortSignal?.throwIfAborted();
-  const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'capability-file-office-convert-'));
-  try {
-    const sourcePath = path.join(temporaryDirectory, `source${input.sourceExtension}`);
-    await copyFile(input.absolutePath, sourcePath);
-    const convertedPath = await convertStagedOfficeFile({
-      sourcePath,
-      targetExtension: input.targetExtension,
-      temporaryDirectory,
-      abortSignal: input.abortSignal,
-      runtime: input.runtime,
-      timeoutMs: input.timeoutMs,
-    });
-    if (!convertedPath) return false;
+  return (await withConvertedOfficeFile(input, async (convertedPath) => {
     input.abortSignal?.throwIfAborted();
     await copyFile(convertedPath, input.targetPath);
     return true;
-  } finally {
-    await rm(temporaryDirectory, { force: true, recursive: true });
-  }
+  })) ?? false;
 }

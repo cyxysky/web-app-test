@@ -9,7 +9,7 @@
 ```text
 AI SDK 原始 prompt
   -> getModel() 的统一模型包装器
-  -> sensitive-data-filter.ts 收集所有模型可见文本
+  -> @webpilot/capability-sensitive-data 收集所有模型可见文本
   -> 本机/可信内网 GLiNER sidecar
        -> 确定性规则
        -> LiquidAI 固定 PII 检测
@@ -221,15 +221,16 @@ sidecar 使用进程内锁串行执行一次完整推理，避免多个请求同
 | 位置 | 职责 |
 | --- | --- |
 | `src/server/ai/model.ts` | 为所有模型提供商统一包装 `doGenerate` / `doStream` |
-| `src/server/ai/sensitive-data-filter.ts` | 收集模型可见文本、调用 sidecar、处理 fail-open/fail-closed、重建 prompt |
-| `src/server/ai/gliner-local-runtime.ts` | 管理本地 sidecar、模型目录、健康检查和进程生命周期 |
-| `services/gliner/app.py` | 三模型加载、候选汇总、占位符替换及 `/health`、`/redact` API |
-| `services/gliner/deterministic_spans.py` | 金额和 DOMP/业务上下文字段规则 |
-| `services/gliner/candidate_resolution.py` | 中文边界修正及重叠候选裁决 |
-| `services/gliner/entity_boundaries.py` | 人名/公司/组织标签归类和中文公司边界拆分 |
+| `packages/capability-sensitive-data/src/ai-sdk.ts` | 收集模型可见文本、处理 fail-open/fail-closed 并重建 AI SDK prompt |
+| `packages/capability-sensitive-data/src/client.ts` | 调用受信任的脱敏服务并校验替换结果 |
+| `packages/capability-sensitive-data/src/local-runtime.ts` | 管理本地 sidecar、模型目录、健康检查和进程生命周期 |
+| `packages/capability-sensitive-data/runtime/python/app.py` | 三模型加载、候选汇总、占位符替换及 `/health`、`/redact` API |
+| `packages/capability-sensitive-data/runtime/python/deterministic_spans.py` | 金额和 DOMP/业务上下文字段规则 |
+| `packages/capability-sensitive-data/runtime/python/candidate_resolution.py` | 中文边界修正及重叠候选裁决 |
+| `packages/capability-sensitive-data/runtime/python/entity_boundaries.py` | 人名/公司/组织标签归类和中文公司边界拆分 |
 | `src/app/api/settings/sensitive-data-test/route.ts` | 管理员单条测试 API |
 | `src/app/api/settings/sensitive-data-evaluation/route.ts` | 评测集保存和 precision/recall 计算 |
-| `scripts/prepare-gliner-runtime.js`、`Dockerfile` | Windows/Electron/Docker 的三模型离线打包 |
+| `packages/capability-sensitive-data/scripts/prepare-runtime.cjs`、`Dockerfile` | Windows/Electron/Docker 的三模型离线打包 |
 
 
 1.报错：

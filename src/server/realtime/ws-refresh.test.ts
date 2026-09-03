@@ -2,32 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
 import test from 'node:test';
-import { parseRealtimeRefreshEvent, publishRealtimeRefreshEvent } from './ws-refresh';
-
-test('realtime refresh protocol accepts automation entity deltas', () => {
-  const event = parseRealtimeRefreshEvent({
-    type: 'refresh',
-    entityType: 'automationRun',
-    id: 'run-1',
-    updatedAt: '2026-08-10T00:00:00.000Z',
-    userId: 'user-1',
-    version: 1,
-    patch: { id: 'run-1', status: 'running' },
-  });
-  assert.equal(event?.entityType, 'automationRun');
-  assert.equal(event?.id, 'run-1');
-});
-
-test('realtime refresh protocol rejects unknown entity types', () => {
-  assert.equal(parseRealtimeRefreshEvent({
-    type: 'refresh',
-    entityType: 'unknown',
-    id: 'record-1',
-    updatedAt: '2026-08-10T00:00:00.000Z',
-    userId: 'user-1',
-    version: 1,
-  }), undefined);
-});
+import { publishRealtimeRefreshEvent } from './ws-refresh';
 
 test('failed realtime publish cleanup does not leak an unhandled rejection', async () => {
   const blocker = createServer((socket) => socket.destroy());

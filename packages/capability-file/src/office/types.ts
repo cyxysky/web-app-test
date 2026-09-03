@@ -221,10 +221,9 @@ export type OfficeDocumentDraft = {
   };
   /** Artifact identity of the last published source. A later edit makes this stale. */
   renderedArtifactId?: string;
-  /** Current published source digest. Kept alongside renderedSourceDigest for legacy metadata compatibility. */
+  /** Current published source digest. */
   renderedDigest?: string;
   renderedFileName?: string;
-  renderedSourceDigest?: string;
   /** Version-bound, server-recorded complete visual inspection state. */
   visualQaArtifactId?: string;
   visualQaDigest?: string;

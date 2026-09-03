@@ -20,7 +20,7 @@ import {
   environmentSettingsTabsForUser,
   isAdministratorOnlySettingsTab,
 } from '@/components/environment-settings-model';
-import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceNavigationSidebar } from '@/components/WorkspaceSidebar';
 import type { SettingsTab } from '@/config/settings';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
@@ -128,25 +128,15 @@ export function SettingsWorkspace({
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed settings-workspace-route' : 'browser-chat-layout settings-workspace-route'}>
-      <WorkspaceSidebar
+      <WorkspaceNavigationSidebar
+        activeKey="/settings"
         collapsed={sidebarCollapsed}
-        collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
         onThemeChange={setMode}
+        showAiOperations={defaultUserId === '1'}
         themeMode={themeMode}
-        themeToggleLabel={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
-        themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
+        translate={t}
       >
-        <WorkspaceModeTabs
-          activeKey="/settings"
-          aiOperationsLabel={t('AI 运营')}
-          ariaLabel={t('工作模式')}
-          automationLabel={t('自动化')}
-          collapsed={sidebarCollapsed}
-          conversationLabel={t('对话模式')}
-          settingsLabel={t('设置')}
-          showAiOperations={defaultUserId === '1'}
-        />
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
           <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
             {visibleSettingsTabs.map((tab) => (
@@ -168,7 +158,7 @@ export function SettingsWorkspace({
             ))}
           </nav>
         </section>
-      </WorkspaceSidebar>
+      </WorkspaceNavigationSidebar>
 
       <main className="browser-chat-main">
         <div className="browser-chat-settings-pane">

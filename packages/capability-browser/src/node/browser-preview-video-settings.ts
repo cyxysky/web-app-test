@@ -1,11 +1,12 @@
+import { normalizeBoundedInteger } from '@webpilot/capability-sdk';
+
 function evenDimension(value: number, fallback: number) {
   const normalized = Number.isFinite(value) ? Math.max(2, Math.floor(value)) : fallback;
   return normalized % 2 === 0 ? normalized : normalized - 1;
 }
 
 function boundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number) {
-  const value = Number(process.env[name] || fallback);
-  return Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, Math.floor(value))) : fallback;
+  return normalizeBoundedInteger(process.env[name], fallback, minimum, maximum);
 }
 
 export function browserPreviewVideoMaximumDimensions() {

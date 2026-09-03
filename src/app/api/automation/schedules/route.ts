@@ -5,7 +5,7 @@ import {
   automationScheduleOverlapSchema,
   automationScheduleRecurrenceSchema,
 } from '@/server/automation/automation.schema';
-import { nextAutomationOccurrence } from '@/server/automation/automation-scheduler';
+import { nextAutomationOccurrence, startAutomationScheduler } from '@/server/automation/automation-scheduler';
 import { requestApplicationUserId } from '@/server/auth/user-context';
 import { ApiRequestError, apiError, apiJson, boundedQueryInteger, parseJsonRequest, parseOptionalJsonRequest } from '@/server/http/api-request';
 import { idempotencyFingerprint, runIdempotentJson } from '@/server/http/idempotency';
@@ -39,6 +39,10 @@ function text(value: unknown) {
   return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
 }
 
+function ensureDevelopmentScheduler() {
+  if (process.env.NODE_ENV === 'development') startAutomationScheduler();
+}
+
 function normalizedTimezone(value: unknown) {
   const timezone = text(value);
   if (!timezone) throw new ApiRequestError('计划时区不能为空', { code: 'timezone_required' });
@@ -50,6 +54,7 @@ function normalizedTimezone(value: unknown) {
 }
 
 export async function GET(request: NextRequest) {
+  ensureDevelopmentScheduler();
   const enabled = request.nextUrl.searchParams.get('enabled');
   return apiJson(request, {
     schedules: await listAutomationSchedules({
@@ -62,6 +67,7 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  ensureDevelopmentScheduler();
   try {
     const body = await parseJsonRequest(request, scheduleSchema, { maxBytes: 32 * 1024 });
     const userId = requestApplicationUserId(request);
@@ -103,6 +109,7 @@ export async function POST(request: NextRequest) {
 }
 
 export async function DELETE(request: NextRequest) {
+  ensureDevelopmentScheduler();
   try {
     const body = await parseOptionalJsonRequest(request, deleteSchema, { maxBytes: 8 * 1024 });
     const scheduleId = text(body.id ?? body.scheduleId ?? request.nextUrl.searchParams.get('id') ?? request.nextUrl.searchParams.get('scheduleId'));

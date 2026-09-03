@@ -19,7 +19,7 @@ import { useCallback, useLayoutEffect, useMemo, useState, type ReactNode } from 
 import { CustomSelect } from '@/components/CustomSelect';
 import { BackendRuntimePanel } from '@/components/BackendRuntimePanel';
 import { DataTable } from '@/components/ui/data-table';
-import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceNavigationSidebar } from '@/components/WorkspaceSidebar';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
 import {
@@ -272,26 +272,16 @@ export function AiOperationsWorkspace({
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed ai-operations-layout' : 'browser-chat-layout ai-operations-layout'}>
-      <WorkspaceSidebar
+      <WorkspaceNavigationSidebar
+        activeKey="/admin/ai-operations"
         className="ai-operations-sidebar"
         collapsed={sidebarCollapsed}
-        collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
         onThemeChange={setMode}
+        showAiOperations
         themeMode={themeMode}
-        themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
-        themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
+        translate={t}
       >
-        <WorkspaceModeTabs
-          activeKey="/admin/ai-operations"
-          aiOperationsLabel={t('AI 运营')}
-          ariaLabel={t('工作模式')}
-          automationLabel={t('自动化')}
-          collapsed={sidebarCollapsed}
-          conversationLabel={t('对话模式')}
-          settingsLabel={t('设置')}
-          showAiOperations
-        />
         <section aria-label={t('管理员')} className="browser-chat-sidebar-section ai-operations-sidebar-summary">
           <div aria-current="page" className="ai-operations-sidebar-current">
             <span className="ai-operations-sidebar-current-icon">
@@ -304,7 +294,7 @@ export function AiOperationsWorkspace({
             <span>{t('仅用户 1 可访问')}</span>
           </small>
         </section>
-      </WorkspaceSidebar>
+      </WorkspaceNavigationSidebar>
 
       <main className="browser-chat-main ai-operations-main">
         <div className="ai-operations-content" aria-busy={loading}>

@@ -4,7 +4,13 @@ import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse } from 'acorn';
-import type { BrowserTextSelectionSpec } from './editable-text-selection.js';
+import {
+  applyEditableTextSelection,
+  readEditableText,
+  resolveEditableTextSelection,
+  type BrowserTextSelectionSpec,
+} from './editable-text-selection.js';
+import type { BrowserPageObservation } from './browser-page-observation.js';
 
 export type BrowserCodeConnection = {
   protocol: 'playwright' | 'cdp';
@@ -34,72 +40,7 @@ export type BrowserCodeImage = {
   mimeType: 'image/jpeg' | 'image/png' | 'image/webp';
 };
 
-type BrowserCodePageObservation = {
-  epoch: number;
-  url: string;
-  title: string;
-  focusedElement?: { descriptor: string; label: string };
-  activeSurface?: {
-    id: string;
-    descriptor: string;
-    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
-    label: string;
-    modal: boolean;
-    likelyOverlay: boolean;
-    focusedInside: boolean;
-    zIndex: number;
-    rect: {
-      bottom: number;
-      height: number;
-      left: number;
-      right: number;
-      top: number;
-      width: number;
-    };
-    signals: string[];
-    selector?: string;
-    framePath?: string;
-    parentId?: string;
-    depth: number;
-    activationOrder: number;
-  };
-  surfaces: Array<{
-    id: string;
-    descriptor: string;
-    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
-    label: string;
-    modal: boolean;
-    likelyOverlay: boolean;
-    focusedInside: boolean;
-    zIndex: number;
-    rect: { bottom: number; height: number; left: number; right: number; top: number; width: number };
-    signals: string[];
-    selector?: string;
-    framePath?: string;
-    parentId?: string;
-    depth: number;
-    activationOrder: number;
-  }>;
-  surfaceStack: Array<{
-    id: string;
-    descriptor: string;
-    kind: 'dialog' | 'popover' | 'menu' | 'listbox' | 'panel' | 'overlay';
-    label: string;
-    modal: boolean;
-    likelyOverlay: boolean;
-    focusedInside: boolean;
-    zIndex: number;
-    rect: { bottom: number; height: number; left: number; right: number; top: number; width: number };
-    signals: string[];
-    selector?: string;
-    framePath?: string;
-    parentId?: string;
-    depth: number;
-    activationOrder: number;
-  }>;
-  topSurfaceIds: string[];
-  surfaceTransition: 'initial' | 'unchanged' | 'opened' | 'closed' | 'changed';
-};
+type BrowserCodePageObservation = BrowserPageObservation;
 
 export type BrowserCodeActivity = {
   actions: string[];
@@ -2446,125 +2387,13 @@ function browserCodeKernelMain() {
     }
     const actionableLocator = await resolveActionableLocator(locatorInput, 'focus');
     await actionableLocator.focus();
-    const before = await actionableLocator.evaluate((element) => {
-      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) return element.value;
-      if (element instanceof HTMLElement && element.isContentEditable) {
-        const editable = element.closest('[contenteditable=""], [contenteditable="true"]') || element;
-        return editable.textContent || '';
-      }
-      throw new Error('Target is not an editable input, textarea, or contenteditable element.');
+    const before = await actionableLocator.evaluate(readEditableText);
+    const selection = resolveEditableTextSelection(before, input);
+    await actionableLocator.evaluate(applyEditableTextSelection, {
+      direction: selection.direction,
+      end: selection.end,
+      start: selection.start,
     });
-    const occurrenceOffset = (needle: string, occurrenceValue: unknown, label: string) => {
-      if (!needle) throw new Error(`${label} text cannot be empty.`);
-      const occurrence = occurrenceValue === undefined ? 1 : Number(occurrenceValue);
-      if (!Number.isInteger(occurrence) || occurrence < 1) throw new Error(`${label} occurrence must be a positive integer.`);
-      let offset = -1;
-      let searchFrom = 0;
-      for (let index = 0; index < occurrence; index += 1) {
-        offset = before.indexOf(needle, searchFrom);
-        if (offset < 0) break;
-        searchFrom = offset + needle.length;
-      }
-      if (offset < 0) throw new Error(`${label} occurrence ${occurrence} was not found in the editable text.`);
-      return offset;
-    };
-    const anchorOffset = (anchor: { offset?: number; afterText?: string; beforeText?: string; occurrence?: number }, label: string) => {
-      const hasOffset = anchor?.offset !== undefined;
-      const hasAfterText = anchor?.afterText !== undefined;
-      const hasBeforeText = anchor?.beforeText !== undefined;
-      if (Number(hasOffset) + Number(hasAfterText) + Number(hasBeforeText) !== 1) {
-        throw new Error(`${label} requires exactly one of offset, afterText, or beforeText.`);
-      }
-      if (hasOffset) {
-        if (!Number.isInteger(anchor.offset) || Number(anchor.offset) < 0) throw new Error(`${label} offset must be a non-negative integer.`);
-        if (anchor.occurrence !== undefined) throw new Error(`${label} occurrence is available only with afterText or beforeText.`);
-        return Number(anchor.offset);
-      }
-      const needle = hasAfterText ? String(anchor.afterText) : String(anchor.beforeText);
-      const found = occurrenceOffset(needle, anchor.occurrence, label);
-      return hasAfterText ? found + needle.length : found;
-    };
-    let start: number;
-    let end: number;
-    if ('exactText' in input) {
-      start = occurrenceOffset(input.exactText, input.occurrence, 'Selection text');
-      end = start + input.exactText.length;
-    } else {
-      start = anchorOffset(input.start, 'Selection start');
-      end = input.end ? anchorOffset(input.end, 'Selection end') : start;
-    }
-    if (start > before.length || end > before.length) throw new Error(`Selection range ${start}-${end} exceeds editable text length ${before.length}.`);
-    if (end < start) throw new Error(`Selection end ${end} cannot precede start ${start}.`);
-    const selection = {
-      before,
-      collapsed: start === end,
-      direction: input.direction === 'backward' ? 'backward' as const : 'forward' as const,
-      end,
-      selectedText: before.slice(start, end),
-      start,
-    };
-    await actionableLocator.evaluate((element, range) => {
-      const inputElement = element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement
-        ? element
-        : undefined;
-      const editable = inputElement
-        ? inputElement
-        : element instanceof HTMLElement && element.isContentEditable
-          ? element.closest('[contenteditable=""], [contenteditable="true"]') || element
-          : undefined;
-      if (!editable) throw new Error('Target is not an editable input, textarea, or contenteditable element.');
-      if (inputElement) {
-        inputElement.setSelectionRange(range.start, range.end, range.direction);
-        return;
-      }
-      const startWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-      let startTraversed = 0;
-      let startNode: Node = editable;
-      let startOffset = editable.childNodes.length;
-      let startMapped = range.start === 0 && !startWalker.currentNode.textContent;
-      let startTextNode = startWalker.nextNode();
-      while (startTextNode) {
-        const nodeLength = startTextNode.textContent?.length || 0;
-        if (range.start <= startTraversed + nodeLength) {
-          startNode = startTextNode;
-          startOffset = range.start - startTraversed;
-          startMapped = true;
-          break;
-        }
-        startTraversed += nodeLength;
-        startTextNode = startWalker.nextNode();
-      }
-      if (!startMapped && range.start !== startTraversed) throw new Error(`Selection offset ${range.start} could not be mapped to the editable DOM.`);
-      const endWalker = editable.ownerDocument.createTreeWalker(editable, NodeFilter.SHOW_TEXT);
-      let endTraversed = 0;
-      let endNode: Node = editable;
-      let endOffset = editable.childNodes.length;
-      let endMapped = range.end === 0 && !endWalker.currentNode.textContent;
-      let endTextNode = endWalker.nextNode();
-      while (endTextNode) {
-        const nodeLength = endTextNode.textContent?.length || 0;
-        if (range.end <= endTraversed + nodeLength) {
-          endNode = endTextNode;
-          endOffset = range.end - endTraversed;
-          endMapped = true;
-          break;
-        }
-        endTraversed += nodeLength;
-        endTextNode = endWalker.nextNode();
-      }
-      if (!endMapped && range.end !== endTraversed) throw new Error(`Selection offset ${range.end} could not be mapped to the editable DOM.`);
-      const browserSelection = editable.ownerDocument.defaultView?.getSelection();
-      if (!browserSelection) throw new Error('The editable document does not expose a text selection.');
-      browserSelection.removeAllRanges();
-      if (range.direction === 'backward' && typeof browserSelection.setBaseAndExtent === 'function') {
-        browserSelection.setBaseAndExtent(endNode, endOffset, startNode, startOffset);
-      } else {
-        const domRange = editable.ownerDocument.createRange();
-        domRange.setStart(startNode, startOffset);
-        domRange.setEnd(endNode, endOffset);
-        browserSelection.addRange(domRange);
-      }
-    }, { direction: selection.direction, end: selection.end, start: selection.start });
     return {
       collapsed: selection.collapsed,
       direction: selection.direction,

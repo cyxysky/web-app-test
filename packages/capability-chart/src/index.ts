@@ -2,13 +2,17 @@ import { z } from 'zod';
 import {
   defineCapabilityInput,
   defineCapabilityTool,
+  jsonRecordFromUnknown,
   type CapabilityHealth,
   type CapabilityManifest,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
 } from '@webpilot/capability-sdk';
+import { chartCapabilitySettings } from './settings.js';
+import { chartCapabilityRuntimeSkill } from './runtime-skill.js';
 export * from './runtime-skill.js';
+export * from './settings.js';
 
 export const chartCapabilityToolNames = Object.freeze({
   chart: 'chart',
@@ -102,19 +106,9 @@ export const chartCapabilityManifest = Object.freeze({
   runtimeRequirements: {
     node: '>=22.16',
   },
+  configuration: { settings: chartCapabilitySettings },
+  skills: [chartCapabilityRuntimeSkill],
 } satisfies CapabilityManifest);
-
-export const chartRuntimeInstruction = Object.freeze({
-  id: 'chart-runtime',
-  title: 'Apache ECharts Runtime',
-  required: true,
-  content: [
-    'Use chart only when a visualization materially improves the result.',
-    'Read the API index, then the exact relevant API modules, before creating a chart.',
-    'Create one complete JSON-serializable ECharts option. JavaScript callbacks are not supported.',
-    'A successful create returns an opaque chartId and a UI resource contribution. Do not invent resource identifiers.',
-  ].join('\n'),
-});
 
 function seriesApiModule(
   type: string,
@@ -149,7 +143,7 @@ const seriesApiModules: EChartsApiModule[] = [
   seriesApiModule('heatmap', '热力图', '直角坐标、日历和地理热力图。', { xAxis: { type: 'category', data: ['周一', '周二'] }, yAxis: { type: 'category', data: ['上午', '下午'] }, visualMap: { min: 0, max: 10 }, series: [{ type: 'heatmap', data: [[0, 0, 5], [1, 0, 8], [0, 1, 7], [1, 1, 4]] }] }, ['通常配合 visualMap 映射颜色。'], ['visualMap', 'calendar', 'geo']),
   seriesApiModule('map', '地图', 'GeoJSON/SVG 区域分布图与多地图组合。', { maps: [{ name: 'region', geoJson: { type: 'FeatureCollection', features: [] } }], option: { visualMap: { min: 0, max: 100 }, series: [{ type: 'map', map: 'region', data: [{ name: 'A 区', value: 82 }] }] } }, ['action=create 的 maps 注册地图；series.map 必须与 maps[].name 一致。'], ['geo', 'visualMap']),
   seriesApiModule('parallel', '平行坐标图', '比较多维记录与聚类分布。', { parallelAxis: [{ dim: 0, name: '价格' }, { dim: 1, name: '销量' }, { dim: 2, name: '评分' }], series: [{ type: 'parallel', data: [[19, 84, 4.6], [25, 61, 4.2]] }] }, ['parallelAxis.dim 对应数据数组维度。'], ['parallel', 'parallelAxis']),
-  seriesApiModule('lines', '路径与迁徙线', '直角或地理坐标上的路线、流向和轨迹。', { xAxis: {}, yAxis: {}, series: [{ type: 'lines', coordinateSystem: 'cartesian2d', data: [{ coords: [[0, 0], [8, 12], [16, 7]] }] }] }, ['地理迁徙图使用 coordinateSystem: geo，并配置 geo/map。'], ['geo']),
+  seriesApiModule('lines', '路径与迁徙线', '直角或地理坐标上的路线、流向和轨迹。', { xAxis: {}, yAxis: {}, series: [{ type: 'lines', coordinateSystem: 'cartesian2d', data: [{ coords: [[0, 0], [8, 12], [16, 7]] }] }] }, ['必须显式声明 coordinateSystem 并配置对应坐标组件；cartesian2d 需要 xAxis/yAxis，geo 需要 geo。'], ['geo']),
   seriesApiModule('graph', '关系图', '力导向、环形或固定布局的节点关系网络。', { series: [{ type: 'graph', layout: 'force', roam: true, data: [{ name: 'A' }, { name: 'B' }], links: [{ source: 'A', target: 'B' }] }] }, ['data/nodes 定义节点，links/edges 定义关系；layout 可为 none、circular、force。']),
   seriesApiModule('sankey', '桑基图', '展示节点之间的数量流动。', { series: [{ type: 'sankey', data: [{ name: '访问' }, { name: '注册' }, { name: '购买' }], links: [{ source: '访问', target: '注册', value: 60 }, { source: '注册', target: '购买', value: 25 }] }] }, ['连接使用 source、target、value。']),
   seriesApiModule('funnel', '漏斗图', '展示流程转化、排序和阶段差异。', { series: [{ type: 'funnel', sort: 'descending', data: [{ name: '访问', value: 100 }, { name: '注册', value: 58 }, { name: '购买', value: 24 }] }] }, ['sort、gap、minSize、maxSize 控制布局。']),
@@ -284,10 +278,6 @@ const apiModules: EChartsApiModule[] = [
   },
 ];
 
-function recordFromUnknown(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
 function serializableClone<T>(value: T, fieldName: string): T {
   let serialized: string;
   try {
@@ -299,20 +289,33 @@ function serializableClone<T>(value: T, fieldName: string): T {
   return JSON.parse(serialized) as T;
 }
 
-function normalizeChartOption(value: unknown) {
-  const option = recordFromUnknown(value);
+function hasOptionComponent(option: Record<string, unknown>, component: string) {
+  const value = option[component];
+  return Array.isArray(value) ? value.length > 0 : Boolean(jsonRecordFromUnknown(value));
+}
+
+const linesCoordinateComponents = Object.freeze({
+  calendar: ['calendar'],
+  cartesian2d: ['xAxis', 'yAxis'],
+  geo: ['geo'],
+  matrix: ['matrix'],
+  polar: ['polar', 'radiusAxis', 'angleAxis'],
+} satisfies Record<string, readonly string[]>);
+
+export function normalizeChartOption(value: unknown) {
+  const option = jsonRecordFromUnknown(value);
   if (!option) throw new Error('action=create requires option as an ECharts option object.');
   const series = option.series;
-  const hasSeries = Array.isArray(series) ? series.length > 0 : Boolean(recordFromUnknown(series));
-  const hasGraphic = Array.isArray(option.graphic) ? option.graphic.length > 0 : Boolean(recordFromUnknown(option.graphic));
+  const hasSeries = Array.isArray(series) ? series.length > 0 : Boolean(jsonRecordFromUnknown(series));
+  const hasGraphic = Array.isArray(option.graphic) ? option.graphic.length > 0 : Boolean(jsonRecordFromUnknown(option.graphic));
   if (!hasSeries && !hasGraphic) throw new Error('option must contain at least one series item or one graphic element.');
-  const graphic = recordFromUnknown(option.graphic);
+  const graphic = jsonRecordFromUnknown(option.graphic);
   if (graphic && typeof graphic.type !== 'string' && !Array.isArray(graphic.elements)) {
     throw new Error('option.graphic must be an element, an element array, or an object with an elements array.');
   }
   const seriesItems = Array.isArray(series) ? series : series === undefined ? [] : [series];
   for (const [index, item] of seriesItems.entries()) {
-    const seriesItem = recordFromUnknown(item);
+    const seriesItem = jsonRecordFromUnknown(item);
     if (!seriesItem || typeof seriesItem.type !== 'string' || !seriesItem.type.trim()) {
       throw new Error(`option.series[${index}].type must be a non-empty ECharts series type.`);
     }
@@ -323,11 +326,24 @@ function normalizeChartOption(value: unknown) {
     if (type === 'custom') {
       throw new Error(`option.series[${index}] uses custom without a JSON-safe renderItem. Use option.graphic for static custom visuals.`);
     }
-    if (type === 'lines' && Array.isArray(seriesItem.data)) {
-      for (const [dataIndex, dataItem] of seriesItem.data.entries()) {
-        const coords = recordFromUnknown(dataItem)?.coords;
-        if (!Array.isArray(coords) || coords.length < 2 || coords.some((point) => !Array.isArray(point) || point.length < 2)) {
-          throw new Error(`option.series[${index}].data[${dataIndex}].coords must contain at least two coordinate arrays.`);
+    if (type === 'lines') {
+      const coordinateSystem = typeof seriesItem.coordinateSystem === 'string' && seriesItem.coordinateSystem.trim()
+        ? seriesItem.coordinateSystem.trim()
+        : 'geo';
+      const requiredComponents = linesCoordinateComponents[coordinateSystem as keyof typeof linesCoordinateComponents];
+      if (!requiredComponents) {
+        throw new Error(`option.series[${index}].coordinateSystem ${JSON.stringify(coordinateSystem)} is not supported by the bundled ECharts lines series.`);
+      }
+      const missingComponents = requiredComponents.filter((component) => !hasOptionComponent(option, component));
+      if (missingComponents.length) {
+        throw new Error(`option.series[${index}] lines coordinateSystem ${JSON.stringify(coordinateSystem)} requires option.${missingComponents.join(' and option.')}.`);
+      }
+      if (Array.isArray(seriesItem.data)) {
+        for (const [dataIndex, dataItem] of seriesItem.data.entries()) {
+          const coords = jsonRecordFromUnknown(dataItem)?.coords;
+          if (!Array.isArray(coords) || coords.length < 2 || coords.some((point) => !Array.isArray(point) || point.length < 2)) {
+            throw new Error(`option.series[${index}].data[${dataIndex}].coords must contain at least two coordinate arrays.`);
+          }
         }
       }
     }
@@ -346,12 +362,12 @@ function normalizeMaps(value: unknown): EChartsMapRegistration[] | undefined {
   if (!Array.isArray(value)) throw new Error('maps must be an array.');
   if (value.length > 12) throw new Error('maps supports at most 12 registrations per chart.');
   const maps = value.map((item, index) => {
-    const map = recordFromUnknown(item);
+    const map = jsonRecordFromUnknown(item);
     const name = typeof map?.name === 'string' ? map.name.trim() : '';
     const geoJson = map?.geoJson;
     if (!name) throw new Error(`maps[${index}].name is required.`);
-    if (!(typeof geoJson === 'string' && geoJson.trim()) && !recordFromUnknown(geoJson)) throw new Error(`maps[${index}].geoJson must be a GeoJSON object or SVG XML string.`);
-    const specialAreas = map?.specialAreas === undefined ? undefined : recordFromUnknown(map.specialAreas);
+    if (!(typeof geoJson === 'string' && geoJson.trim()) && !jsonRecordFromUnknown(geoJson)) throw new Error(`maps[${index}].geoJson must be a GeoJSON object or SVG XML string.`);
+    const specialAreas = map?.specialAreas === undefined ? undefined : jsonRecordFromUnknown(map.specialAreas);
     if (map?.specialAreas !== undefined && !specialAreas) throw new Error(`maps[${index}].specialAreas must be an object.`);
     return { name, geoJson: geoJson as Record<string, unknown> | string, specialAreas };
   });
@@ -496,7 +512,6 @@ export function createChartTool(
       concurrency: 'serial',
       concurrencyGroup: 'chart-artifacts',
       permissions: chartCapabilityManifest.permissions,
-      runtimeInstructionId: chartRuntimeInstruction.id,
     },
     execute: (input) => input.action === 'api'
       ? readChartApi(
@@ -523,7 +538,6 @@ export function createChartCapability(options: {
             validateOption: options.validateOption,
           }),
         }),
-        instructions: [chartRuntimeInstruction],
         health: () => store.health?.() || Promise.resolve({ status: 'healthy' }),
         dispose: () => store.dispose?.() || Promise.resolve(),
       };

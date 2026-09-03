@@ -1,18 +1,21 @@
 import { z } from 'zod';
 import {
+  createCapabilityRuntime,
   defineCapabilityInput,
   defineCapabilityTool,
   type CapabilityExecutionContext,
-  type CapabilityInstruction,
   type CapabilityManifest,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
   type CapabilityToolSet,
 } from '@webpilot/capability-sdk';
+import { browserCapabilitySettings } from './settings.js';
+import { browserRuntimeSkill } from './runtime-skill.js';
 
 export * from './output-settings.js';
 export * from './runtime-skill.js';
+export * from './settings.js';
 export * from './session-group.js';
 
 const reason = z.string().trim().min(1).max(300);
@@ -32,16 +35,55 @@ const waitForHumanVerificationParser = z.object({
   reason,
   maxMs: z.number().int().positive().optional(),
 }).strict();
-const browserParser = z.discriminatedUnion('action', [
-  readBrowserStateParser,
-  browserCodeParser,
-  waitForHumanVerificationParser,
-]);
+// Keep the provider-facing JSON Schema flat. Several OpenAI-compatible models
+// treat the first `oneOf` branch as a default and then keep emitting `state`
+// even when their reason describes a code/iframe operation. Runtime parsing
+// below still validates the exact action-specific shape.
+const browserParser = z.object({
+  action: z.enum(['code', 'state', 'waitForHumanVerification']).describe(
+    'Required operation. Use code for Playwright reads/interactions, including iframe or targeted DOM inspection. Use state only for the fixed top-level snapshot.',
+  ),
+  reason,
+  code: z.string().min(1).max(40_000).optional().describe(
+    'Required only when action=code. JavaScript executed in the persistent Playwright runtime.',
+  ),
+  maxOutputChars: z.number().int().min(1_000).optional().describe('Optional only when action=code.'),
+  maxMs: z.number().int().positive().optional().describe('Optional only when action=waitForHumanVerification.'),
+}).strict();
+
+/**
+ * `action` is the browser tool's discriminant and therefore the authoritative
+ * execution boundary. Models occasionally copy fields from a previous action;
+ * prune those unrelated fields before the strict union parser sees them.
+ */
+export function normalizeBrowserToolInput(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const input = value as Record<string, unknown>;
+  if (input.action === 'state') {
+    return { action: 'state', reason: input.reason };
+  }
+  if (input.action === 'code') {
+    return {
+      action: 'code',
+      reason: input.reason,
+      code: input.code,
+      ...(input.maxOutputChars !== undefined ? { maxOutputChars: input.maxOutputChars } : {}),
+    };
+  }
+  if (input.action === 'waitForHumanVerification') {
+    return {
+      action: 'waitForHumanVerification',
+      reason: input.reason,
+      ...(input.maxMs !== undefined ? { maxMs: input.maxMs } : {}),
+    };
+  }
+  return value;
+}
 
 export type ReadBrowserStateInput = z.infer<typeof readBrowserStateParser>;
 export type BrowserCodeInput = z.infer<typeof browserCodeParser>;
 export type WaitForHumanVerificationInput = z.infer<typeof waitForHumanVerificationParser>;
-export type BrowserToolInput = z.infer<typeof browserParser>;
+export type BrowserToolInput = ReadBrowserStateInput | BrowserCodeInput | WaitForHumanVerificationInput;
 
 export const browserCapabilityToolNames = Object.freeze({
   browser: 'browser',
@@ -55,7 +97,12 @@ export const browserCapabilityActions = Object.freeze({
 
 export const browserToolInput = defineCapabilityInput(
   z.toJSONSchema(browserParser) as Readonly<Record<string, unknown>>,
-  (value): BrowserToolInput => browserParser.parse(value),
+  (value): BrowserToolInput => {
+    const normalized = browserParser.parse(normalizeBrowserToolInput(value));
+    if (normalized.action === 'code') return browserCodeParser.parse(normalized);
+    if (normalized.action === 'state') return readBrowserStateParser.parse(normalized);
+    return waitForHumanVerificationParser.parse(normalized);
+  },
 );
 
 export type BrowserOperationResult = {
@@ -130,31 +177,25 @@ export const browserCapabilityManifest = Object.freeze({
   description: 'Persistent Playwright browser sessions, code execution, snapshots, and visual evidence.',
   permissions: ['browser:launch', 'browser:cdp', 'network:access', 'artifact:write'],
   runtimeRequirements: { node: '>=22.16', playwright: '>=1.60' },
+  configuration: { settings: browserCapabilitySettings },
+  skills: [browserRuntimeSkill],
 } satisfies CapabilityManifest);
-
-export const browserRuntimeInstruction: CapabilityInstruction = {
-  id: 'com.webpilot.browser/runtime',
-  title: 'Browser runtime',
-  required: true,
-  content: 'Use browser action=code for bounded Playwright inspection and interaction. Use action=state before depending on live page state. Use action=waitForHumanVerification instead of solving CAPTCHA, OTP, QR, login, or device-owned challenges.',
-};
 
 export function createBrowserTools(operations: BrowserCapabilityOperations): CapabilityToolSet {
   return Object.freeze({
     [browserCapabilityToolNames.browser]: defineCapabilityTool<BrowserToolInput, unknown>({
       name: browserCapabilityToolNames.browser,
-      description: 'Read browser state, execute one bounded JavaScript cell in the persistent Playwright session, or pause for human verification. Select exactly one operation with action.',
+      description: 'Execute one bounded Playwright JavaScript cell, read a fresh fixed top-level browser snapshot, or pause for human verification. Use action=code for iframe/DOM inspection and interaction. The action field is authoritative and unrelated fields are discarded before validation.',
       input: browserToolInput,
       inputExamples: [
-        { action: 'state', reason: 'Read the current browser state' },
         { action: 'code', reason: 'Read the current page URL and title', code: 'nodeRepl.write({ url: page.url(), title: await page.title() })' },
+        { action: 'state', reason: 'Read the current top-level browser state once' },
         { action: 'waitForHumanVerification', reason: 'Wait for the user to complete verification', maxMs: 180_000 },
       ],
       policy: {
         concurrency: 'serial',
         concurrencyGroup: 'browser',
         permissions: browserCapabilityManifest.permissions,
-        runtimeInstructionId: browserRuntimeInstruction.id,
       },
       execute: (input, context) => {
         if (input.action === 'state') return operations.readBrowserState(input, context);
@@ -169,18 +210,16 @@ export function createBrowserCapability(options: {
   createOperations(
     context: CapabilityRunContext,
   ): BrowserCapabilityOperations | Promise<BrowserCapabilityOperations>;
-  instruction?: CapabilityInstruction | false;
 }): CapabilityProvider {
   return {
     manifest: browserCapabilityManifest,
     async createRuntime(context) {
       const operations = await options.createOperations(context);
-      return {
+      return createCapabilityRuntime({
         tools: createBrowserTools(operations),
-        instructions: options.instruction === false ? [] : [options.instruction || browserRuntimeInstruction],
-        health: operations.health || (() => Promise.resolve({ status: 'healthy' })),
-        dispose: operations.dispose || (() => Promise.resolve()),
-      };
+        health: operations.health,
+        dispose: operations.dispose,
+      });
     },
   };
 }

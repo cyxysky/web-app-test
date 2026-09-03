@@ -4,7 +4,6 @@ export type RuntimeToolFailureCategory =
   | 'actionability'
   | 'browser-unavailable'
   | 'execution-context'
-  | 'file-workflow'
   | 'invalid-input'
   | 'javascript'
   | 'network'
@@ -38,7 +37,6 @@ export function classifyRuntimeToolFailure(
   if (name === 'skill' || /requiredSkillId|hidden built-in Skill|runtime Skill .* not loaded/i.test(actual)) {
     return 'skill-gate';
   }
-  if (name === 'file') return 'file-workflow';
   if (name === 'subagent') return 'subagent-workflow';
   if (/browser session has not started|browser unavailable|page has been closed|target page, context or browser has been closed/i.test(actual)) {
     return 'browser-unavailable';
@@ -93,10 +91,8 @@ function appendFailureCategory(actual: string, category: RuntimeToolFailureCateg
 export function withToolFailureGuidance(name: string, result: BrowserActionResult): BrowserActionResult {
   if (result.ok) return result;
   const failureCategory = classifyRuntimeToolFailure(name, result);
-  const sanitizedResult = { ...result } as BrowserActionResult & Record<string, unknown>;
-  delete sanitizedResult.requiredNextAction;
   return {
-    ...sanitizedResult,
+    ...result,
     actual: appendFailureCategory(result.actual, failureCategory),
     failureCategory,
   };

@@ -1,6 +1,6 @@
 import { NextRequest } from 'next/server';
 import { z } from 'zod';
-import { redactSensitiveTexts } from '@/server/ai/sensitive-data-filter';
+import { redactSensitiveTexts } from '@/server/capabilities/sensitive-data';
 import { store } from '@/server/db/store';
 import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';

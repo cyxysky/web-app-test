@@ -1,3 +1,5 @@
+import type { CapabilitySkill } from '@webpilot/capability-sdk';
+
 export const subagentRuntimeSkillId = 'system-subagent-runtime';
 
 export const subagentRuntimeSkillSummary = [
@@ -11,7 +13,7 @@ export const subagentRuntimeSkillSummary = [
 
 export const subagentRuntimeSkillContent = `# Subagent Runtime
 
-This hidden built-in Skill is authoritative for subagent action=spawn. The first spawn in an Agent run automatically loads and returns it while continuing the original spawn. subagent action=read is deliberately ungated, so pending results can always be collected.
+This built-in Skill is authoritative for subagent action=spawn. Read it successfully in a separate model step before the first spawn in an Agent run; an early spawn is rejected without executing. subagent action=read is deliberately ungated, so pending results can always be collected.
 
 ## Host tool boundary and API signatures
 
@@ -215,3 +217,12 @@ When a child cannot complete a browser operation, it should return:
 
 Do not hide an unresolved child failure behind a generic summary. The parent should use the returned surface and page evidence to continue safely without rerunning completed child work.
 `;
+
+export const subagentRuntimeSkill = Object.freeze({
+  id: subagentRuntimeSkillId,
+  title: 'Subagent Runtime',
+  summary: subagentRuntimeSkillSummary,
+  content: subagentRuntimeSkillContent,
+  required: false,
+  activation: [{ toolName: 'subagent', actions: ['spawn'] }],
+} satisfies CapabilitySkill);

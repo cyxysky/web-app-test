@@ -201,11 +201,23 @@ export class BrowserMcpSessionManager {
 
 export type BrowserMcpOptions = {
   context?: CapabilityMcpServerOptions['context'];
+  configurations?: CapabilityMcpServerOptions['configurations'];
+  configStore?: CapabilityMcpServerOptions['configStore'];
+  configScope?: CapabilityMcpServerOptions['configScope'];
+  skillMode?: CapabilityMcpServerOptions['skillMode'];
+  skillToolName?: CapabilityMcpServerOptions['skillToolName'];
   maxSessions?: number;
   sessionOptions?: BrowserSessionOptions | ((context: CapabilityRunContext) => BrowserSessionOptions | Promise<BrowserSessionOptions>);
 };
 
 export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): CapabilityProvider {
+  const runtimeSkill = {
+    id: 'com.webpilot.browser.mcp/runtime',
+    title: 'Explicit browser sessions',
+    summary: '<system_skill><id>com.webpilot.browser.mcp/runtime</id><title>Explicit browser sessions</title><required>true</required></system_skill>',
+    required: true,
+    content: 'Call browser.open first. Pass its exact browserSessionId to browser.code, browser.snapshot, and browser.close. Do not invent or reuse closed session ids.',
+  } as const;
   return {
     manifest: {
       schemaVersion: 1,
@@ -215,6 +227,7 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
       description: 'Explicit, isolated Playwright browser sessions for MCP clients.',
       permissions: ['browser:launch', 'browser:cdp', 'network:access', 'artifact:write'],
       runtimeRequirements: { node: '>=22.16', playwright: '>=1.60' },
+      skills: [runtimeSkill],
     },
     async createRuntime(context) {
       const sessionOptions = typeof options.sessionOptions === 'function'
@@ -251,12 +264,6 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
             execute: (value) => manager.close(value.browserSessionId),
           }),
         },
-        instructions: [{
-          id: 'com.webpilot.browser.mcp/runtime',
-          title: 'Explicit browser sessions',
-          required: true,
-          content: 'Call browser.open first. Pass its exact browserSessionId to browser.code, browser.snapshot, and browser.close. Do not invent or reuse closed session ids.',
-        }],
         health: async () => ({ status: 'healthy' as const }),
         dispose: () => manager.dispose(),
       };
@@ -269,6 +276,11 @@ function serverOptions(options: BrowserMcpOptions): CapabilityMcpServerOptions {
     name: 'webpilot-browser',
     version: '0.1.0',
     context: options.context,
+    configurations: options.configurations,
+    configStore: options.configStore,
+    configScope: options.configScope,
+    skillMode: options.skillMode,
+    skillToolName: options.skillToolName,
     providers: [createBrowserMcpCapability(options)],
   };
 }

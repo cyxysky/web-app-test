@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { TextArea } from '@heroui/react';
+import { TextArea } from '@heroui/react/textarea';
 import { ChevronDown, Clock3, Edit3, Loader2, Plus, Save, Trash2, X } from 'lucide-react';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { CustomSelect } from '@/components/CustomSelect';

@@ -845,12 +845,10 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     return undefined;
   }
 
-  function visibleDomClickablePoint(element: Element, viewportClip: BrowserUseViewportClip) {
-    const rect = visibleDomRect(element, viewportClip);
-    if (!rect) return undefined;
+  function visibleDomSamplePoints(rect: BrowserUseViewportClip) {
     const insetX = Math.min(10, Math.max(1, (rect.right - rect.left) / 4));
     const insetY = Math.min(10, Math.max(1, (rect.bottom - rect.top) / 4));
-    const samples = [
+    return [
       [rect.left + (rect.right - rect.left) / 2, rect.top + (rect.bottom - rect.top) / 2],
       [rect.left + insetX, rect.top + (rect.bottom - rect.top) / 2],
       [rect.right - insetX, rect.top + (rect.bottom - rect.top) / 2],
@@ -861,7 +859,49 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       [rect.left + insetX, rect.bottom - insetY],
       [rect.right - insetX, rect.bottom - insetY],
     ];
-    for (const [x, y] of samples) {
+  }
+
+  function scrollState(element: Element) {
+    const top = Math.round(element.scrollTop);
+    const left = Math.round(element.scrollLeft);
+    const height = Math.round(element.scrollHeight);
+    const width = Math.round(element.scrollWidth);
+    const clientHeight = Math.round(element.clientHeight);
+    const clientWidth = Math.round(element.clientWidth);
+    const maxTop = Math.max(0, height - clientHeight);
+    const maxLeft = Math.max(0, width - clientWidth);
+    const remainingUp = Math.max(0, top);
+    const remainingDown = Math.max(0, maxTop - top);
+    const remainingLeft = Math.max(0, left);
+    const remainingRight = Math.max(0, maxLeft - left);
+    return {
+      top,
+      left,
+      height,
+      width,
+      clientHeight,
+      clientWidth,
+      maxTop,
+      maxLeft,
+      remainingUp,
+      remainingDown,
+      remainingLeft,
+      remainingRight,
+      atTop: remainingUp <= 1,
+      atBottom: remainingDown <= 1,
+      atLeft: remainingLeft <= 1,
+      atRight: remainingRight <= 1,
+      canScrollUp: remainingUp > 1,
+      canScrollDown: remainingDown > 1,
+      canScrollLeft: remainingLeft > 1,
+      canScrollRight: remainingRight > 1,
+    };
+  }
+
+  function visibleDomClickablePoint(element: Element, viewportClip: BrowserUseViewportClip) {
+    const rect = visibleDomRect(element, viewportClip);
+    if (!rect) return undefined;
+    for (const [x, y] of visibleDomSamplePoints(rect)) {
       const px = Math.min(Math.max(x, 0), window.innerWidth - 1);
       const py = Math.min(Math.max(y, 0), window.innerHeight - 1);
       if (pointBelongsToElement(element, px, py, { requirePointerEvents: true })) return { x: px, y: py };
@@ -1241,58 +1281,57 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     return visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
   }
 
-  function visibleDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean; viewportClip?: BrowserUseViewportClip }) {
-    const state = visibleDomState();
-    if (!options.preserveExistingRefs) state.refToElement.clear();
-
-    const rawViewport = visualViewportRect();
-    const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
-    const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 200));
-    const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 20000));
+  function createVisibleDomSnapshotCollector(input: {
+    state: ReturnType<typeof visibleDomState>;
+    maxElements: number;
+    maxChars: number;
+    rectForFrame: (element: Element) => (BrowserUseViewportClip & { height: number; width: number }) | undefined;
+  }) {
     const frameElements: BrowserUseVisibleDomSnapshot['frameElements'] = [];
     const items: BrowserUseVisibleDomSnapshot['items'] = [];
     let chars = 0;
     let truncated = false;
-    const hoverElements = visibleDomHoverElements();
-
-    const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
+    const stop = () => truncated || items.length >= input.maxElements || chars >= input.maxChars;
     const pushItem = (element: Element, path: string, signals: string[] = []) => {
       if (stop()) return;
       const ref = visibleDomRef(element);
       const item = visibleDomItem(element, ref, signals);
-      const line = item.line;
-      const lineChars = line.length + (items.length === 0 ? 0 : 1);
-      if (chars + lineChars > maxChars) {
+      const lineChars = item.line.length + (items.length === 0 ? 0 : 1);
+      if (chars + lineChars > input.maxChars) {
         truncated = true;
         return;
       }
-      state.refToElement.set(ref, element);
-      items.push({
-        ...item,
-        descriptor: descriptor(element),
-        path,
-        ref,
-      });
+      input.state.refToElement.set(ref, element);
+      items.push({ ...item, descriptor: descriptor(element), path, ref });
       chars += lineChars;
     };
     const pushFrame = (element: Element) => {
-      if (frameElements.length >= maxElements) return;
-      const rect = visibleDomRect(element, viewportClip);
+      if (frameElements.length >= input.maxElements) return;
+      const rect = input.rectForFrame(element);
       if (!rect) return;
       const ref = visibleDomRef(element);
-      state.refToElement.set(ref, element);
+      input.state.refToElement.set(ref, element);
       const frameElement = element as HTMLIFrameElement;
-      const width = frameElement.clientWidth > 0 ? frameElement.clientWidth : rect.right - rect.left;
-      const height = frameElement.clientHeight > 0 ? frameElement.clientHeight : rect.bottom - rect.top;
       frameElements.push({
         rect,
         ref,
-        size: { height, width },
+        size: {
+          height: Math.max(0, frameElement.clientHeight || rect.height),
+          width: Math.max(0, frameElement.clientWidth || rect.width),
+        },
         ...(frameElement.src ? { url: frameElement.src } : {}),
       });
     };
+    return { frameElements, items, pushFrame, pushItem, stop };
+  }
+
+  function visitVisibleDom(input: {
+    stop: () => boolean;
+    onFrame: (element: Element) => void;
+    onElement: (element: Element, path: string) => void;
+  }) {
     const visit = (node: Node, path = '0') => {
-      if (stop()) return;
+      if (input.stop()) return;
       if (node.nodeType === Node.DOCUMENT_NODE) {
         const root = document.documentElement;
         if (root) visit(root, '0');
@@ -1300,7 +1339,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       }
       if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
         for (const [index, child] of Array.from((node as DocumentFragment).children).entries()) {
-          if (stop()) break;
+          if (input.stop()) break;
           visit(child, `${path}.${index}`);
         }
         return;
@@ -1309,23 +1348,44 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       const element = node as Element;
       if (isDisplayNone(element)) return;
       const tag = visibleDomElementName(element);
-      if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      const signals = visibleDomInteractionSignals(element, hoverElements);
-      if (
-        signals.length
-        && !isVisibleDomSubtreeHidden(element)
-        && hasVisibleDomPointerEvents(element)
-        && visibleDomClickablePoint(element, viewportClip)
-      ) {
-        pushItem(element, path, signals);
-      }
+      if (tag === 'frame' || tag === 'iframe') input.onFrame(element);
+      input.onElement(element, path);
       for (const [index, child] of children(element).entries()) {
-        if (stop()) break;
+        if (input.stop()) break;
         visit(child, `${path}.${index}`);
       }
     };
-
     visit(document);
+  }
+
+  function visibleDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean; viewportClip?: BrowserUseViewportClip }) {
+    const state = visibleDomState();
+    if (!options.preserveExistingRefs) state.refToElement.clear();
+
+    const rawViewport = visualViewportRect();
+    const viewportClip = options.viewportClip ? intersectClip(rawViewport, options.viewportClip) || rawViewport : rawViewport;
+    const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 200));
+    const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 20000));
+    const hoverElements = visibleDomHoverElements();
+    const { frameElements, items, pushFrame, pushItem, stop } = createVisibleDomSnapshotCollector({
+      state,
+      maxElements,
+      maxChars,
+      rectForFrame: (element) => visibleDomRect(element, viewportClip),
+    });
+    visitVisibleDom({
+      stop,
+      onFrame: pushFrame,
+      onElement: (element, path) => {
+        const signals = visibleDomInteractionSignals(element, hoverElements);
+        if (
+          signals.length
+          && !isVisibleDomSubtreeHidden(element)
+          && hasVisibleDomPointerEvents(element)
+          && visibleDomClickablePoint(element, viewportClip)
+        ) pushItem(element, path, signals);
+      },
+    });
     return { frameElements, items, stateKey: state.instanceId, viewport: rawViewport };
   }
 
@@ -1336,10 +1396,6 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     const viewport = visualViewportRect();
     const maxElements = Math.max(1, Math.floor(Number(options.maxElements) || 500));
     const maxChars = Math.max(1, Math.floor(Number(options.maxChars) || 60000));
-    const frameElements: BrowserUseVisibleDomSnapshot['frameElements'] = [];
-    const items: BrowserUseVisibleDomSnapshot['items'] = [];
-    let chars = 0;
-    let truncated = false;
     const hoverElements = visibleDomHoverElements();
 
     const structuralTextTags = new Set([
@@ -1349,7 +1405,6 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     ]);
     const directTextContainerTags = new Set(['article', 'aside', 'div', 'fieldset', 'footer', 'form', 'header', 'main', 'nav', 'section', 'span']);
     const signalCache = new WeakMap<Element, string[]>();
-    const stop = () => truncated || items.length >= maxElements || chars >= maxChars;
     const hasMeaningfulAttributes = (element: Element) => visibleDomMeaningfulAttributes.some((name) => Boolean(visibleDomAttributeValue(element, name)));
     const actionableSignals = (element: Element) => {
       const cached = signalCache.get(element);
@@ -1367,69 +1422,24 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       if (directTextContainerTags.has(tag) && visibleDomOwnTextContent(element)) return true;
       return hasMeaningfulAttributes(element);
     };
-    const pushItem = (element: Element, path: string, signals: string[] = []) => {
-      if (stop()) return;
-      const ref = visibleDomRef(element);
-      const item = visibleDomItem(element, ref, signals);
-      const line = item.line;
-      const lineChars = line.length + (items.length === 0 ? 0 : 1);
-      if (chars + lineChars > maxChars) {
-        truncated = true;
-        return;
-      }
-      state.refToElement.set(ref, element);
-      items.push({
-        ...item,
-        descriptor: descriptor(element),
-        path,
-        ref,
-      });
-      chars += lineChars;
-    };
-    const pushFrame = (element: Element) => {
-      if (frameElements.length >= maxElements) return;
-      const box = elementBox(element);
-      const rect = box?.visible || (box?.raw
-        ? { bottom: box.raw.bottom, height: box.raw.height, left: box.raw.left, right: box.raw.right, top: box.raw.top, width: box.raw.width }
-        : undefined);
-      if (!rect) return;
-      const ref = visibleDomRef(element);
-      state.refToElement.set(ref, element);
-      const frameElement = element as HTMLIFrameElement;
-      frameElements.push({
-        rect,
-        ref,
-        size: { height: Math.max(0, frameElement.clientHeight || rect.height), width: Math.max(0, frameElement.clientWidth || rect.width) },
-        ...(frameElement.src ? { url: frameElement.src } : {}),
-      });
-    };
-    const visit = (node: Node, path = '0') => {
-      if (stop()) return;
-      if (node.nodeType === Node.DOCUMENT_NODE) {
-        const root = document.documentElement;
-        if (root) visit(root, '0');
-        return;
-      }
-      if (node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
-        for (const [index, child] of Array.from((node as DocumentFragment).children).entries()) {
-          if (stop()) break;
-          visit(child, `${path}.${index}`);
-        }
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE) return;
-      const element = node as Element;
-      if (isDisplayNone(element)) return;
-      const tag = visibleDomElementName(element);
-      if (tag === 'frame' || tag === 'iframe') pushFrame(element);
-      if (shouldIncludeElement(element)) pushItem(element, path, actionableSignals(element));
-      for (const [index, child] of children(element).entries()) {
-        if (stop()) break;
-        visit(child, `${path}.${index}`);
-      }
-    };
-
-    visit(document);
+    const { frameElements, items, pushFrame, pushItem, stop } = createVisibleDomSnapshotCollector({
+      state,
+      maxElements,
+      maxChars,
+      rectForFrame: (element) => {
+        const box = elementBox(element);
+        return box?.visible || (box?.raw
+          ? { bottom: box.raw.bottom, height: box.raw.height, left: box.raw.left, right: box.raw.right, top: box.raw.top, width: box.raw.width }
+          : undefined);
+      },
+    });
+    visitVisibleDom({
+      stop,
+      onFrame: pushFrame,
+      onElement: (element, path) => {
+        if (shouldIncludeElement(element)) pushItem(element, path, actionableSignals(element));
+      },
+    });
     return { frameElements, items, stateKey: state.instanceId, viewport };
   }
 
@@ -1679,21 +1689,8 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   function visibleDomCoveredPoint(element: Element, viewportClip: BrowserUseViewportClip) {
     const rect = visibleDomRect(element, viewportClip);
     if (!rect) return undefined;
-    const insetX = Math.min(10, Math.max(1, (rect.right - rect.left) / 4));
-    const insetY = Math.min(10, Math.max(1, (rect.bottom - rect.top) / 4));
-    const samples = [
-      [rect.left + (rect.right - rect.left) / 2, rect.top + (rect.bottom - rect.top) / 2],
-      [rect.left + insetX, rect.top + (rect.bottom - rect.top) / 2],
-      [rect.right - insetX, rect.top + (rect.bottom - rect.top) / 2],
-      [rect.left + (rect.right - rect.left) / 2, rect.top + insetY],
-      [rect.left + (rect.right - rect.left) / 2, rect.bottom - insetY],
-      [rect.left + insetX, rect.top + insetY],
-      [rect.right - insetX, rect.top + insetY],
-      [rect.left + insetX, rect.bottom - insetY],
-      [rect.right - insetX, rect.bottom - insetY],
-    ];
     let firstCovered: { x: number; y: number; coveredBy: string } | undefined;
-    for (const [rawX, rawY] of samples) {
+    for (const [rawX, rawY] of visibleDomSamplePoints(rect)) {
       const x = Math.min(Math.max(rawX, 0), window.innerWidth - 1);
       const y = Math.min(Math.max(rawY, 0), window.innerHeight - 1);
       const cover = topmostRenderableAt(x, y, { requirePointerEvents: true });
@@ -1896,10 +1893,8 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     }
   }
 
-  function elementText(pathValue: string, options: { maxChars?: number } = {}) {
-    const element = elementFromPath(pathValue);
-    if (!element) return undefined;
-    const result = renderedTextFromNode(element, options.maxChars || 200000);
+  function textResultForElement(element: Element, maxChars = 200000) {
+    const result = renderedTextFromNode(element, maxChars);
     return {
       descriptor: descriptor(element),
       text: result.text,
@@ -1907,15 +1902,14 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     };
   }
 
+  function elementText(pathValue: string, options: { maxChars?: number } = {}) {
+    const element = elementFromPath(pathValue);
+    return element ? textResultForElement(element, options.maxChars) : undefined;
+  }
+
   function visibleDomText(ref: string, options: { maxChars?: number } = {}) {
     const element = visibleDomState().refToElement.get(ref);
-    if (!element?.isConnected) return undefined;
-    const result = renderedTextFromNode(element, options.maxChars || 200000);
-    return {
-      descriptor: descriptor(element),
-      text: result.text,
-      textLength: result.textLength,
-    };
+    return element?.isConnected ? textResultForElement(element, options.maxChars) : undefined;
   }
 
   let cachedSurfaceEpoch = -1;
@@ -2626,6 +2620,10 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     textOf,
     recordedEventTypes,
     hasActionAttribute,
+    hasPointerCursor,
+    isContentEditableOwner,
+    labelControlFor,
+    visibleDomHoverElements,
     isActionable,
     actionableTargetFor,
     visibleRect,
@@ -2633,6 +2631,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     topmostRenderableAt,
     pointBelongsToElement,
     visiblePointForElement,
+    scrollState,
     visibleDomSnapshot,
     fullDomSnapshot,
     visibleDomDelta,
@@ -2749,15 +2748,7 @@ export function collectAiDomObservation(input: { includeInteractiveCandidates?: 
     return runtime.flatParentElement(node);
   }
 
-  function hasPointerCursor(element: Element) {
-    const style = window.getComputedStyle(element);
-    if (!/\bpointer\b/i.test(style.cursor || '')) return false;
-    const parent = flatParentElement(element);
-    if (!parent) return true;
-    const parentStyle = window.getComputedStyle(parent);
-    if (!/\bpointer\b/i.test(parentStyle.cursor || '')) return true;
-    return /(?:^|;)\s*cursor\s*:\s*pointer\b/i.test(element.getAttribute('style') || '');
-  }
+  const hasPointerCursor = runtime.hasPointerCursor;
 
   function composedContains(ancestor: Element, node: Element) {
     return runtime.composedContains(ancestor, node);
@@ -2828,60 +2819,16 @@ export function collectAiDomObservation(input: { includeInteractiveCandidates?: 
     return hasRecordedHoverListener(element);
   }
 
-  const hoverSelectors = (() => {
-    const selectors: string[] = [];
-    for (const sheet of Array.from(document.styleSheets)) {
-      let rules: CSSRuleList | undefined;
-      try {
-        rules = sheet.cssRules;
-      } catch {
-        continue;
-      }
-      for (const rule of Array.from(rules || [])) {
-        const selectorText = (rule as CSSStyleRule).selectorText;
-        if (!selectorText || !selectorText.includes(':hover')) continue;
-        for (const part of selectorText.split(',')) {
-          const normalized = part
-            .replace(/:hover\b/g, '')
-            .replace(/:(active|focus|focus-visible|focus-within|visited|link)\b/g, '')
-            .trim();
-          if (normalized && !/[>+~]\s*$/.test(normalized)) selectors.push(normalized);
-        }
-      }
-    }
-    return Array.from(new Set(selectors)).slice(0, 600);
-  })();
+  const hoverElements = runtime.visibleDomHoverElements();
 
   function hasCssHoverEffect(element: Element) {
     const className = typeof element.className === 'string' ? element.className : '';
     if (/(^|\s)hover[:_-]/.test(className)) return true;
-    for (const selector of hoverSelectors) {
-      try {
-        if (element.matches(selector)) return true;
-      } catch {
-        // Ignore selectors that cannot be used with matches().
-      }
-    }
-    return false;
+    return hoverElements.has(element);
   }
 
-  function isContentEditableOwner(element: Element) {
-    const value = element.getAttribute('contenteditable');
-    return value !== null && value.toLowerCase() !== 'false';
-  }
-
-  function labelControlFor(element: Element) {
-    if (element.tagName.toLowerCase() !== 'label') return undefined;
-    const control = (element as HTMLLabelElement).control || undefined;
-    const fallback = control ||
-      (element.getAttribute('for') ? document.getElementById(element.getAttribute('for') || '') || undefined : undefined);
-    const target = fallback ||
-      element.querySelector('button, input, select, textarea, [contenteditable=""], [contenteditable="true"]') ||
-      undefined;
-    if (!target) return undefined;
-    const tag = target.tagName.toLowerCase();
-    return ['button', 'input', 'select', 'textarea'].includes(tag) || isContentEditableOwner(target) ? target : undefined;
-  }
+  const isContentEditableOwner = runtime.isContentEditableOwner;
+  const labelControlFor = runtime.labelControlFor;
 
   function interactionSignals(element: Element, tag = element.tagName.toLowerCase()) {
     const signals: string[] = [];

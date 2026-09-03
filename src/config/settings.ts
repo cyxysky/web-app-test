@@ -1,4 +1,16 @@
-import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
+import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
+import { normalizedModelCapabilities } from '@/lib/model-capabilities';
+import { browserCapabilitySettings } from '@webpilot/capability-browser/settings';
+import { chartCapabilitySettings } from '@webpilot/capability-chart/settings';
+import { fileCapabilitySettings } from '@webpilot/capability-file/settings';
+import {
+  defaultGlinerOpenLabelModel,
+  defaultLiquidPiiModel,
+} from '@webpilot/capability-sensitive-data';
+import { sensitiveDataCapabilitySettings } from '@webpilot/capability-sensitive-data/settings';
+import { normalizeBoundedNumberSetting, type CapabilitySettingDefinition } from '@webpilot/capability-sdk';
+
+export { defaultGlinerOpenLabelModel, defaultLiquidPiiModel };
 
 export type SettingsTab = 'general' | 'model' | 'browser' | 'sensitive-data' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'debug';
 
@@ -29,19 +41,31 @@ export type RuntimeEnvDefinition = {
   min?: number;
   max?: number;
   step?: number;
-  options?: Array<{ label: string; value: string }>;
+  group?: string;
+  applyMode?: 'runtime' | 'startup';
+  options?: ReadonlyArray<{ label: string; value: string }>;
   picker?: 'directory';
   secret?: boolean;
+  emptyUsesDefault?: boolean;
+  valueAliases?: Readonly<Record<string, string>>;
 };
 
-export const defaultGlinerOpenLabelModel = 'fastino/gliner2.5-multi-v1';
-export const defaultLiquidPiiModel = 'LiquidAI/LFM2.5-Encoder-350M-PII-Detector';
+const capabilitySettingDefinitions: readonly CapabilitySettingDefinition[] = [
+  ...browserCapabilitySettings,
+  ...chartCapabilitySettings,
+  ...fileCapabilitySettings,
+  ...sensitiveDataCapabilitySettings,
+];
+
+const capabilityRuntimeEnvDefinitions: RuntimeEnvDefinition[] = capabilitySettingDefinitions.map((definition) => ({
+  ...definition,
+  tab: definition.section as RuntimeEnvDefinition['tab'],
+}));
 
 export function migrateRuntimeEnvValue(key: string, value: string) {
-  if (key === 'GLINER_MODEL' && value.trim() === 'urchade/gliner_multi-v2.1') {
-    return defaultGlinerOpenLabelModel;
-  }
-  return value;
+  const definition = capabilitySettingDefinitions.find((item) => item.key === key);
+  const normalized = definition?.emptyUsesDefault && !value.trim() ? definition.defaultValue : value;
+  return definition?.valueAliases?.[normalized] ?? normalized;
 }
 
 export function normalizeMiniMaxOpenAIBaseURL(baseURL: string | undefined) {
@@ -180,52 +204,34 @@ export function defaultModelForProvider(definition: ModelProviderDefinition, set
   return requested && models.includes(requested) ? requested : models[0] || '';
 }
 
+export function defaultModelProviderSettings(provider: ModelProvider): ModelProviderSettings {
+  const definition = modelProviderDefinition(provider);
+  const models = modelListForProvider(definition);
+  const model = defaultModelForProvider(definition);
+  return {
+    displayName: '',
+    enabled: false,
+    defaultModel: model,
+    model,
+    models,
+    modelCapabilities: normalizedModelCapabilities(provider, models),
+    apiKey: '',
+    baseURL: definition.defaultBaseURL || '',
+    extraRequestParameters: '',
+  };
+}
+
 const boolOptions = [
   { label: '开启', value: 'true' },
   { label: '关闭', value: 'false' },
 ];
 
-export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
-  { key: 'BROWSER_PREVIEW_FPS', label: '实时预览帧率', description: '实时预览轮询截图并发送的目标帧率；可设置 1–60 FPS。静态页面也会按该频率持续发送画面。', tab: 'browser', defaultValue: '20', control: 'number', min: 1, max: 60, step: 1 },
-  { key: 'BROWSER_OUTPUT_PIXEL_RATIO', label: '截图输出像素倍率', description: '在不改变网页 CSS 视口和布局的前提下，提高系统截图的输出像素密度；实时预览始终使用原始倍率。', tab: 'browser', defaultValue: '1.5', control: 'number', min: 1, max: 2, step: 0.25 },
-  { key: 'BROWSER_SCREENCAST_FORMAT', label: '实时预览图片格式', description: 'JPEG 体积较小，适合高帧率；PNG 无损且文字更清晰，但会显著增加编码与网络压力。', tab: 'browser', defaultValue: 'jpeg', control: 'select', options: [{ label: 'JPEG（高帧率推荐）', value: 'jpeg' }, { label: 'PNG（无损）', value: 'png' }] },
-  { key: 'BROWSER_SCREENCAST_QUALITY', label: '实时预览 JPEG 质量', description: '仅对 JPEG 生效。数值越高画质越好，但编码和传输压力越大；30 FPS 推荐 85–90。', tab: 'browser', defaultValue: '90', control: 'number', min: 40, max: 100, step: 1 },
-  { key: 'BROWSER_PREVIEW_TRANSPORT', label: '实时预览传输模式', description: '视频流使用 FFmpeg 编码 H.264 fragmented MP4 并由浏览器 MediaSource 解码；编码器或客户端不支持时自动回退到独立图片帧。', tab: 'browser', defaultValue: 'video', control: 'select', options: [{ label: 'H.264 视频流（推荐）', value: 'video' }, { label: 'JPEG/PNG 图片帧', value: 'image' }] },
-  { key: 'BROWSER_PREVIEW_VIDEO_BITRATE_KBPS', label: '视频流码率', description: 'H.264 视频目标码率，单位 Kbps；留空时按分辨率和帧率自动估算。注意 8000 表示 8 Mbps，800000 表示 800 Mbps。', tab: 'browser', defaultValue: '', control: 'number', min: 500, step: 250 },
-  { key: 'BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT', label: '视频编码源格式', description: 'PNG 输入避免 JPEG 再经过 H.264 二次有损压缩，文字更清晰；JPEG 输入占用更低，适合高并发。', tab: 'browser', defaultValue: 'png', control: 'select', options: [{ label: 'PNG（最高画质）', value: 'png' }, { label: 'JPEG（较低负载）', value: 'jpeg' }] },
-  { key: 'BROWSER_PREVIEW_VIDEO_MAX_WIDTH', label: '视频流最大宽度', description: '视频编码宽度上限；仅由 FFmpeg 对原始预览帧进行等比缩小，不会放大或修改测试浏览器的网页视口。', tab: 'browser', defaultValue: '1920', control: 'number', min: 320, max: 4096, step: 2 },
-  { key: 'BROWSER_PREVIEW_VIDEO_MAX_HEIGHT', label: '视频流最大高度', description: '视频编码高度上限；仅由 FFmpeg 对原始预览帧进行等比缩小，不会放大或修改测试浏览器的网页视口。', tab: 'browser', defaultValue: '1080', control: 'number', min: 240, max: 2160, step: 2 },
-  { key: 'BROWSER_PREVIEW_VIDEO_KEYFRAME_INTERVAL', label: '视频关键帧间隔', description: 'H.264 关键帧间隔，单位帧；越小新客户端起播越快，但码率更高。留空默认约半秒。', tab: 'browser', defaultValue: '15', control: 'number', min: 1, max: 120, step: 1 },
-  { key: 'BROWSER_PROFILE_CLEAR_CACHE_ON_CLOSE', label: '关闭后清理浏览器缓存', description: '浏览器进程完全关闭后清理 Cache、Code Cache、GPUCache 和 Dawn*Cache；保留登录态及站点数据。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS', label: '用户浏览器空闲回收时间', description: '同一用户没有运行中的对话和实时预览后，等待该时长关闭其测试浏览器，单位毫秒；默认 3 分钟。', tab: 'browser', defaultValue: '180000', control: 'number', min: 60000, max: 86400000, step: 60000 },
-  { key: 'ELECTRON_EMBEDDED_BROWSER', label: '嵌入式 Electron 浏览器', description: '在桌面端对话模式中使用 Electron 原生浏览器视图；开启后对话页会切换为中间浏览器、右侧对话布局。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'HEADLESS_BROWSER', label: '无头浏览器', description: '是否隐藏浏览器窗口运行。', tab: 'browser', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_VIEWPORT_MODE', label: '视口模式', description: '自动时跟随真实浏览器窗口；固定时使用下方视口宽高。此设置决定网页布局，不用于提升输出清晰度。', tab: 'browser', defaultValue: 'auto', control: 'select', options: [{ label: '自动跟随窗口', value: 'auto' }, { label: '固定宽高', value: 'fixed' }] },
-  { key: 'BROWSER_VIEWPORT_WIDTH', label: '视口宽度', description: '固定模式下的浏览器视口宽度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
-  { key: 'BROWSER_VIEWPORT_HEIGHT', label: '视口高度', description: '固定模式下的浏览器视口高度；留空则自动跟随窗口。', tab: 'browser', defaultValue: '', control: 'number', min: 1, step: 1 },
-  { key: 'BROWSER_NAVIGATION_DOM_QUIET_MS', label: '导航后 DOM 静默窗口', description: '导航提交后 DOM 连续保持不变达到该时长即生成语义快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '250', control: 'number' },
-  { key: 'BROWSER_NAVIGATION_DOM_STABILITY_TIMEOUT_MS', label: '导航后 DOM 稳定上限', description: '等待导航后 DOM 稳定的最长时间，达到上限后继续生成当前快照，单位毫秒；0 表示关闭。', tab: 'browser', defaultValue: '1000', control: 'number' },
-  { key: 'BROWSER_IGNORE_HTTPS_ERRORS', label: '忽略 HTTPS 错误', description: '测试环境证书异常时允许继续打开页面。', tab: 'browser', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_HTTP_REQUEST_HISTORY_LIMIT', label: 'HTTP 请求历史上限', description: '每个标签页保留多少条 HTTP 请求记录，供 AI 诊断接口和资源加载问题。', tab: 'browser', defaultValue: '400', control: 'number' },
-  { key: 'AI_HTTP_REQUEST_TOOL_LIMIT', label: 'HTTP 请求工具返回条数', description: 'AI 调用 getHttpRequests 时最多返回当前标签页最近多少条请求。', tab: 'browser', defaultValue: '80', control: 'number' },
-  { key: 'SCREENSHOT_TIMEOUT_MS', label: '截图超时', description: 'Playwright 截图等待上限，单位毫秒；默认 15000。', tab: 'browser', defaultValue: '15000', control: 'number' },
+const applicationRuntimeEnvDefinitions: RuntimeEnvDefinition[] = [
 
   { key: 'SQLITE_AUTO_COMPACT_ENABLED', label: 'SQLite 自动压缩', description: '维护任务发现大量空闲页时执行 WAL checkpoint 和 VACUUM，减少数据库及备份体积。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'SQLITE_COMPACTION_FREE_RATIO', label: 'SQLite 压缩空闲比例', description: '空闲页达到该比例且超过最小页数时执行压缩；默认 0.3。', tab: 'runtime', defaultValue: '0.3', control: 'number', min: 0.1, max: 0.9, step: 0.05 },
   { key: 'SQLITE_COMPACTION_MIN_FREE_PAGES', label: 'SQLite 压缩最小空闲页', description: '达到该空闲页数后才允许执行 VACUUM，避免小数据库频繁重写。', tab: 'runtime', defaultValue: '1024', control: 'number', min: 128, max: 100000, step: 128 },
-  { key: 'OFFICE_GENERATION_MODE', label: 'Office 文件生成模式', description: 'LibreOffice UNO 通过统一的高层封装创建或修改 PPT、Word、Excel 文件；模型不直接操作 UNO 对象。JavaScript 模式保留用于显式选择 PptxGenJS、docx 或 ExcelJS。', tab: 'runtime', defaultValue: 'uno', control: 'select', options: [{ label: 'LibreOffice 高层封装（默认）', value: 'uno' }, { label: 'JavaScript Office 库', value: 'javascript' }, { label: '自动选择', value: 'auto' }] },
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
-  { key: 'AI_SENSITIVE_DATA_FILTER_ENABLED', label: 'AI 敏感数据过滤', description: '调用模型前在同一原文上分别运行 LiquidAI 固定 PII 检测与 GLiNER2.5 开放标签识别，叠加金额和业务编号规则，并由中文 RoBERTa 校正人名、公司和组织边界后统一替换；正式安装包和 Docker 镜像默认启用。', tab: 'sensitive-data', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'GLINER_SERVICE_URL', label: 'GLiNER 服务地址', description: '正式产物已自动配置为本机内置服务。仅在开发或私有化集群中改为其他可信内网地址。', tab: 'sensitive-data', defaultValue: 'http://127.0.0.1:18001', control: 'text' },
-  { key: 'AI_SENSITIVE_DATA_FILTER_FAILURE_MODE', label: '敏感数据过滤故障策略', description: '关闭模式会在 GLiNER 不可用时阻止 AI 请求；开放模式会继续发送原文，仅建议临时排障使用。', tab: 'sensitive-data', defaultValue: 'closed', control: 'select', options: [{ label: '关闭（阻止请求）', value: 'closed' }, { label: '开放（继续请求）', value: 'open' }] },
-  { key: 'AI_SENSITIVE_DATA_FILTER_TIMEOUT_MS', label: '敏感数据过滤超时', description: '等待本地双模型完成单次提示词脱敏的最长时间，单位毫秒。批量评测和长文本需要更长时间。', tab: 'sensitive-data', defaultValue: '60000', control: 'number', min: 1000, max: 600000, step: 1000 },
-  { key: 'AI_SENSITIVE_DATA_FILTER_THRESHOLD', label: 'GLiNER2.5 识别阈值', description: '第一阶段开放标签识别置信度阈值；越低召回率越高，但误报也会增加。', tab: 'sensitive-data', defaultValue: '0.5', control: 'number', min: 0.05, max: 1, step: 0.05 },
-  { key: 'AI_SENSITIVE_DATA_FILTER_LABELS', label: 'GLiNER2.5 敏感实体标签', description: '可选的逗号或换行分隔开放实体标签；留空时使用服务内置的业务与 PII 标签。该配置只控制 GLiNER2.5，LiquidAI 固定 PII、确定性规则和中文边界校正始终运行。', tab: 'sensitive-data', defaultValue: '', control: 'textarea' },
-  { key: 'GLINER_MODEL', label: 'GLiNER2.5 开放标签模型', description: '默认安装包内置 fastino/gliner2.5-multi-v1。这里只支持 GLiNER2.5/GLiNER2 的 AutoExtractor 检查点；修改后需要重新制作正式产物并重启应用。', tab: 'sensitive-data', defaultValue: defaultGlinerOpenLabelModel, control: 'text' },
-  { key: 'GLINER_PII_MODEL', label: 'LiquidAI 固定 PII 模型', description: '默认安装包内置 LiquidAI/LFM2.5-Encoder-350M-PII-Detector，用于补充姓名、联系方式、账号、凭据、金额、公司和医疗等固定 PII。修改后需要重新制作正式产物并重启应用。', tab: 'sensitive-data', defaultValue: defaultLiquidPiiModel, control: 'text' },
-  { key: 'GLINER_DEVICE', label: 'GLiNER 运行设备', description: '默认内置 CPU 运行时。CUDA 需要匹配的 NVIDIA 驱动和 CUDA 版 PyTorch，并重新制作正式产物。', tab: 'sensitive-data', defaultValue: 'cpu', control: 'select', options: [{ label: 'CPU', value: 'cpu' }, { label: 'CUDA', value: 'cuda' }] },
-  { key: 'GLINER_BATCH_SIZE', label: 'GLiNER 批量大小', description: '单次推理的批量大小；值越高吞吐量通常越高，但会占用更多 CPU/GPU 内存。修改后需重启应用。', tab: 'sensitive-data', defaultValue: '8', control: 'number', min: 1, max: 128, step: 1 },
-  { key: 'MANUAL_VERIFICATION_TIMEOUT_MS', label: '人工验证等待时间', description: '验证码或登录验证的最长等待时间。', tab: 'runtime', defaultValue: '180000', control: 'number' },
   { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求首个响应及普通非流式调用的最长等待时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_TIMEOUT_MS', label: 'Agent 模型请求超时', description: 'Agent Loop 单轮模型请求的最长等待时间；大上下文或长推理模型可能需要数分钟，默认 600000 毫秒。', tab: 'runtime', defaultValue: '600000', control: 'number' },
   { key: 'AI_MAX_OUTPUT_TOKENS', label: 'AI 最大输出 Token', description: '显式传给模型的单次最大输出 token，避免未知模型被兼容层自动限制为 4096。', tab: 'runtime', defaultValue: '32768', control: 'number', min: 256, max: 131072, step: 256 },
@@ -238,10 +244,6 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_SUBAGENT_CONCURRENCY', label: '子 Agent 全局并发数', description: '整个服务同时运行的子 Agent 数量，可配置为任意正整数；默认 20。超过配置值的任务排队。', tab: 'runtime', defaultValue: '20', control: 'number', min: 1, step: 1 },
   { key: 'AI_SUBAGENT_RESULT_MAX_CHARS', label: '子 Agent 总结建议长度', description: '写入子 Agent 提示词的建议最大字符数；只引导模型控制篇幅，后端不会截断实际结果。', tab: 'runtime', defaultValue: '40000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_RETRY_ATTEMPTS', label: 'AI 请求连续失败上限', description: 'Agent Loop 中上游连接或请求级错误连续失败达到该次数后停止；成功一次会清零。', tab: 'runtime', defaultValue: '3', control: 'number' },
-  { key: 'BROWSER_CHAT_KEEP_BROWSER_OPEN_AFTER_TURN', label: '对话完成保留浏览器', description: '浏览器对话每轮完成后是否保留浏览器，便于同一用户后续对话复用。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_CHAT_ACTION_FRAME_LIMIT', label: '对话动作 Frame 上限', description: '每次对话工具动作后参与交互校验与 DOM 增量采集的 frame 数量；较小值可避免多 iframe 页面拖慢点击。', tab: 'runtime', defaultValue: '24', control: 'number' },
-  { key: 'BROWSER_CHAT_SHOW_REASONING', label: '对话展示思维链', description: '是否在对话模式中展示模型返回的推理内容；关闭后仍会保留工具调用与最终回复。', tab: 'runtime', defaultValue: 'false', control: 'boolean', options: boolOptions },
-  { key: 'BROWSER_CHAT_LOG_LIMIT', label: '对话日志保留上限', description: '每个浏览器对话最多保留多少条执行日志；前端日志弹窗使用虚拟滚动。', tab: 'runtime', defaultValue: '2000', control: 'number' },
   { key: 'AI_PERSONAL_MEMORY_ENABLED', label: '个性化记忆召回', description: '是否在浏览器对话提示词中召回简洁的用户记忆和域名记忆。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'AI_PERSONAL_MEMORY_EXTRACT_ENABLED', label: '个性化记忆提炼', description: '每轮浏览器对话完成后，是否提炼可长期复用的别名、偏好、工作流和域名事实。', tab: 'runtime', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'AI_PERSONAL_MEMORY_PROMPT_LIMIT', label: '个性化记忆注入上限', description: '单轮浏览器对话最多注入多少条个性化记忆。', tab: 'runtime', defaultValue: '6', control: 'number' },
@@ -251,10 +253,7 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '256000', control: 'number' },
   { key: 'AI_GLM_CONTEXT_WINDOW_TOKENS', label: 'GLM 上下文窗口大小', description: 'GLM 模型使用的上下文窗口估算值；默认 1000000，覆盖通用上下文窗口配置。', tab: 'runtime', defaultValue: '1000000', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },
-  { key: 'AI_VISUAL_HISTORY_LIMIT', label: '视觉历史上限', description: 'Visual Context Manager 保留多少张历史图。', tab: 'runtime', defaultValue: '6', control: 'number' },
 
-  { key: 'AI_COMPLETION_VERIFY', label: '完成结果二次校验', description: 'AI 声明完成后是否再做一次完成校验。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
-  { key: 'PLAYWRIGHT_TRACE', label: 'Playwright Trace', description: '是否保存 Playwright trace。', tab: 'debug', defaultValue: 'true', control: 'boolean', options: boolOptions },
   { key: 'CODEX_PATH', label: 'Codex CLI 路径', description: '自定义 Codex CLI 可执行文件路径。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_CWD', label: 'Codex 工作目录', description: 'Codex CLI 默认工作目录。', tab: 'debug', defaultValue: '', control: 'text' },
   { key: 'CODEX_APPROVAL_MODE', label: 'Codex 审批模式', description: 'Codex CLI 的审批策略。', tab: 'debug', defaultValue: 'on-request', control: 'select', options: [{ label: '按需询问', value: 'on-request' }, { label: '永不询问', value: 'never' }, { label: '不受信任时询问', value: 'untrusted' }] },
@@ -264,23 +263,23 @@ export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'CODEX_ALLOW_NPX', label: '允许 Codex 使用 npx', description: 'Codex CLI 是否允许 npx。', tab: 'debug', defaultValue: 'false', control: 'boolean', options: boolOptions },
 ];
 
+export const runtimeEnvDefinitions: RuntimeEnvDefinition[] = [
+  ...applicationRuntimeEnvDefinitions,
+  ...capabilityRuntimeEnvDefinitions,
+];
+
 export const runtimeEnvKeys = runtimeEnvDefinitions.map((item) => item.key);
 
 export function normalizeRuntimeEnvValue(definition: RuntimeEnvDefinition, value: string) {
   const migratedValue = migrateRuntimeEnvValue(definition.key, value);
   if (definition.control !== 'number' || (definition.min === undefined && definition.max === undefined)) return migratedValue;
-  if (!migratedValue.trim()) return definition.defaultValue;
-  const numeric = Number(migratedValue);
-  if (!Number.isFinite(numeric)) return definition.defaultValue;
-  const minimum = definition.min ?? Number.NEGATIVE_INFINITY;
-  const maximum = definition.max ?? Number.POSITIVE_INFINITY;
-  let normalized = Math.min(maximum, Math.max(minimum, numeric));
-  if (definition.step && Number.isFinite(definition.step) && definition.step > 0) {
-    const base = definition.min ?? 0;
-    normalized = base + Math.round((normalized - base) / definition.step) * definition.step;
-    normalized = Math.min(maximum, Math.max(minimum, normalized));
-  }
-  return String(normalized);
+  return normalizeBoundedNumberSetting({
+    value: migratedValue,
+    defaultValue: definition.defaultValue,
+    min: definition.min,
+    max: definition.max,
+    step: definition.step,
+  });
 }
 
 export function runtimeEnvDefinition(key: string) {

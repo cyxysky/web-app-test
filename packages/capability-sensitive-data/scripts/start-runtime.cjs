@@ -2,13 +2,14 @@
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const { loadEnvConfig } = require('@next/env');
 
-const root = path.resolve(__dirname, '..');
-loadEnvConfig(root, true);
+const packageRoot = path.resolve(__dirname, '..');
+const hostRoot = process.cwd();
+const environmentPath = path.join(hostRoot, '.env');
+if (fs.existsSync(environmentPath)) process.loadEnvFile(environmentPath);
 
 const virtualPython = path.join(
-  root,
+  hostRoot,
   '.venv-gliner',
   process.platform === 'win32' ? 'Scripts' : 'bin',
   process.platform === 'win32' ? 'python.exe' : 'python',
@@ -23,7 +24,7 @@ const modelName = !configuredModelName || configuredModelName === 'urchade/gline
   ? 'fastino/gliner2.5-multi-v1'
   : configuredModelName;
 if (!['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname)) {
-  throw new Error('npm run gliner:start requires a loopback GLINER_SERVICE_URL.');
+  throw new Error('npm run sensitive-data:start requires a loopback GLINER_SERVICE_URL.');
 }
 
 const child = spawn(pythonCommand, [
@@ -36,12 +37,12 @@ const child = spawn(pythonCommand, [
   endpoint.port || '80',
   '--no-access-log',
 ], {
-  cwd: path.join(root, 'services', 'gliner'),
+  cwd: path.join(packageRoot, 'runtime', 'python'),
   env: {
     ...process.env,
     GLINER_MODEL: modelName,
-    HF_HOME: process.env.HF_HOME || path.join(root, '.data', 'gliner-models'),
-    TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || path.join(root, '.data', 'gliner-models'),
+    HF_HOME: process.env.HF_HOME || path.join(hostRoot, '.data', 'gliner-models'),
+    TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || path.join(hostRoot, '.data', 'gliner-models'),
   },
   stdio: 'inherit',
   windowsHide: true,

@@ -1,3 +1,5 @@
+import { asRecord } from '@/lib/unknown-value';
+
 export type BrowserChatFileToolPresentationKey =
   | 'create-draft'
   | 'download-file'
@@ -16,12 +18,6 @@ export type BrowserChatFileToolPresentation = {
   key: BrowserChatFileToolPresentationKey;
   label: string;
 };
-
-function asRecord(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
 
 function textValue(value: unknown) {
   if (typeof value === 'string') return value.trim();

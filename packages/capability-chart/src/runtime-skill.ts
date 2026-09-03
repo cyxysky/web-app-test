@@ -1,3 +1,5 @@
+import type { CapabilitySkill } from '@webpilot/capability-sdk';
+
 /** Complete model-facing operating manual for the Chart Capability workflow. */
 export const chartRuntimeSkillId = 'system-chart-runtime';
 
@@ -12,11 +14,11 @@ export const chartRuntimeSkillSummary = [
 
 export const chartRuntimeSkillContent = `# Apache ECharts Runtime
 
-This hidden built-in Skill is authoritative for the chart model tool. The backend loads it once per Agent run during the first chart call and returns it in loadedRuntimeSkill while continuing the original operation.
+This Skill is authoritative for the chart model tool and is supplied by the chart package. The consuming Agent is responsible for loading it and deciding when the chart tool becomes available.
 
 ## Required workflow
 
-1. Call chart only when a visual chart materially improves the answer.
+1. When a visual chart materially improves the answer, explicitly read this Skill and wait for that read to succeed before calling chart.
 2. Before creating a chart, call chart with action \`api\` and no query to read the compact API module index.
 3. Call action \`api\` again with the exact module id needed for the requested chart. Read more than one module when the design combines series, coordinates, datasets, maps, or interactions.
 4. Call action \`create\` with one complete JSON-serializable Apache ECharts \`option\`. The renderer imports the full \`echarts\` package, so no series whitelist is imposed.
@@ -30,6 +32,8 @@ The renderer recognizes only a standalone identifier with the exact form \`chart
 The complete ECharts 6.1 package is loaded. Standard built-in series include \`line\`, \`bar\`, \`pie\`, \`scatter\`, \`effectScatter\`, \`radar\`, \`tree\`, \`treemap\`, \`sunburst\`, \`boxplot\`, \`candlestick\`, \`heatmap\`, \`map\`, \`parallel\`, \`lines\`, \`graph\`, \`sankey\`, \`funnel\`, \`gauge\`, \`pictorialBar\`, \`themeRiver\`, \`chord\`, and \`custom\`. Mixed charts use multiple series items in one option.
 
 All standard coordinate systems and JSON option components are available, including grid/cartesian, polar, radar, geo, parallel, singleAxis, calendar, matrix, dataset, transforms, visualMap, dataZoom, timeline, brush, title, legend, tooltip, toolbox, graphic, interaction states, transitions, and animations.
+
+Every \`lines\` series must declare its coordinate system and include the matching top-level components: \`cartesian2d\` requires \`xAxis\` and \`yAxis\`; \`geo\` requires \`geo\`; \`polar\` requires \`polar\`, \`radiusAxis\`, and \`angleAxis\`; \`calendar\` requires \`calendar\`; and \`matrix\` requires \`matrix\`. Omitting \`coordinateSystem\` makes ECharts assume \`geo\`, so never omit it.
 
 Map charts may pass \`maps\`; each map is registered before \`setOption\`. The \`geoJson\` value may be a GeoJSON object or SVG XML string.
 
@@ -153,3 +157,12 @@ finalResponse({
 })
 \`\`\`
 `;
+
+export const chartCapabilityRuntimeSkill = Object.freeze({
+  id: chartRuntimeSkillId,
+  title: 'Apache ECharts Runtime',
+  summary: chartRuntimeSkillSummary,
+  content: chartRuntimeSkillContent,
+  required: true,
+  activation: [{ toolName: 'chart' }],
+} satisfies CapabilitySkill);

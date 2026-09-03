@@ -3,23 +3,17 @@ import { selectBrowserChatSessionRuntime, updateBrowserChatSessionTitle } from '
 import { updateBrowserChatSessionRequestSchema } from '@/server/http/browser-chat-request.schema';
 import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 import { requestApplicationUserId } from '@/server/auth/user-context';
+import type { BrowserChatSessionRouteContext } from '@/server/http/browser-chat-route';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-type RouteContext = {
-  params: Promise<{ sessionId: string }>;
-};
-
-function requestUserId(request: Request) {
-  return requestApplicationUserId(request);
-}
-
-export async function GET(request: Request, context: RouteContext) {
+export async function GET(request: Request, context: BrowserChatSessionRouteContext) {
   try {
     const { sessionId } = await context.params;
-    await selectBrowserChatSessionRuntime(sessionId, requestUserId(request));
-    const session = await readBrowserChatSessionPage(sessionId, requestUserId(request));
+    const userId = requestApplicationUserId(request);
+    await selectBrowserChatSessionRuntime(sessionId, userId);
+    const session = await readBrowserChatSessionPage(sessionId, userId);
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {
@@ -27,11 +21,11 @@ export async function GET(request: Request, context: RouteContext) {
   }
 }
 
-export async function PUT(request: Request, context: RouteContext) {
+export async function PUT(request: Request, context: BrowserChatSessionRouteContext) {
   try {
     const { sessionId } = await context.params;
     const body = await parseJsonRequest(request, updateBrowserChatSessionRequestSchema, { maxBytes: 16 * 1024 });
-    const session = await updateBrowserChatSessionTitle(sessionId, body.title, requestUserId(request));
+    const session = await updateBrowserChatSessionTitle(sessionId, body.title, requestApplicationUserId(request));
     if (!session) throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     return apiJson(request, { session });
   } catch (error) {

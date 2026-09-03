@@ -8,12 +8,18 @@ import {
 } from '@modelcontextprotocol/server';
 import { serveStdio, type StdioServerHandle } from '@modelcontextprotocol/server/stdio';
 import {
-  CapabilityRegistry,
+  capabilitySkillReadJsonSchema,
   type CapabilityContent,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
 } from '@webpilot/capability-sdk';
+import {
+  mountCapabilities,
+  type CapabilityConfigScope,
+  type CapabilityConfigStore,
+  type CapabilitySkillInstructionMode,
+} from '@webpilot/capability-host';
 
 export type CapabilityMcpServerOptions = {
   providers: readonly CapabilityProvider[];
@@ -21,6 +27,11 @@ export type CapabilityMcpServerOptions = {
   version?: string;
   instructions?: string;
   context?: Partial<CapabilityRunContext> | (() => Partial<CapabilityRunContext>);
+  configurations?: Readonly<Record<string, CapabilityRunContext['configuration']>>;
+  configStore?: CapabilityConfigStore;
+  configScope?: CapabilityConfigScope;
+  skillMode?: CapabilitySkillInstructionMode;
+  skillToolName?: string;
 };
 
 function resolvedContext(options: CapabilityMcpServerOptions): CapabilityRunContext {
@@ -31,6 +42,7 @@ function resolvedContext(options: CapabilityMcpServerOptions): CapabilityRunCont
     userId: configured?.userId,
     abortSignal: configured?.abortSignal,
     metadata: configured?.metadata,
+    configuration: configured?.configuration || {},
   };
 }
 
@@ -79,18 +91,63 @@ export function capabilityResultToMcpResult(result: CapabilityResult): CallToolR
 export async function createCapabilityMcpServer(
   options: CapabilityMcpServerOptions,
 ) {
-  const registry = new CapabilityRegistry();
-  for (const provider of options.providers) registry.register(provider);
   const runContext = resolvedContext(options);
-  const snapshot = await registry.resolve({ context: runContext });
-  const instructions = options.instructions || snapshot.instructions
-    .map((instruction) => `${instruction.title}\n${instruction.content}`)
+  const snapshot = await mountCapabilities({
+    providers: options.providers,
+    context: runContext,
+    configurations: options.configurations,
+    configStore: options.configStore,
+    configScope: options.configScope,
+  });
+  const skillMode = options.skillMode || 'eager';
+  const skillToolName = options.skillToolName || 'skill';
+  const skillInstructions = snapshot.skillCatalog.instructions(skillMode, { skillToolName });
+  const instructions = [options.instructions, skillInstructions]
+    .map((value) => value?.trim())
+    .filter(Boolean)
     .join('\n\n');
   try {
     const server = new McpServer({
       name: options.name || 'webpilot-capabilities',
       version: options.version || '0.1.0',
     }, instructions ? { instructions } : undefined);
+
+    if (skillMode === 'lazy' && snapshot.skills.length) {
+      if (snapshot.tools[skillToolName]) {
+        throw new Error(`Capability Skill tool name collides with an existing tool: ${skillToolName}.`);
+      }
+      server.registerTool(skillToolName, {
+        title: 'Read Capability Skill',
+        description: `Read one Capability Skill by exact id. Available ids: ${snapshot.skills.map((skill) => skill.id).join(', ')}.`,
+        inputSchema: fromJsonSchema(capabilitySkillReadJsonSchema(snapshot.skills.map((skill) => skill.id))),
+        _meta: {
+          'com.webpilot/capabilitySkillTool': true,
+        },
+      }, async (input: unknown) => {
+        const value = input && typeof input === 'object' && !Array.isArray(input)
+          ? input as Record<string, unknown>
+          : {};
+        const skillId = typeof value.skillId === 'string' ? value.skillId.trim() : '';
+        const skill = value.action === 'read' ? snapshot.skillCatalog.get(skillId) : undefined;
+        if (!skill) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `Unknown Capability Skill: ${skillId || '(empty)'}.` }],
+          };
+        }
+        return {
+          content: [{ type: 'text', text: skill.content }],
+          structuredContent: {
+            ok: true,
+            loadedRuntimeSkill: {
+              id: skill.id,
+              title: skill.title,
+              content: skill.content,
+            },
+          },
+        };
+      });
+    }
 
     for (const [publicName, resolved] of Object.entries(snapshot.tools)) {
       server.registerTool(publicName, {

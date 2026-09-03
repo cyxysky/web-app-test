@@ -11,6 +11,11 @@ export type ChartMcpOptions = {
   directory: string | ((context: CapabilityRunContext) => string);
   echartsVersion?: string;
   context?: CapabilityMcpServerOptions['context'];
+  configurations?: CapabilityMcpServerOptions['configurations'];
+  configStore?: CapabilityMcpServerOptions['configStore'];
+  configScope?: CapabilityMcpServerOptions['configScope'];
+  skillMode?: CapabilityMcpServerOptions['skillMode'];
+  skillToolName?: CapabilityMcpServerOptions['skillToolName'];
 };
 
 function serverOptions(options: ChartMcpOptions): CapabilityMcpServerOptions {
@@ -18,6 +23,11 @@ function serverOptions(options: ChartMcpOptions): CapabilityMcpServerOptions {
     name: 'webpilot-chart',
     version: '0.1.0',
     context: options.context,
+    configurations: options.configurations,
+    configStore: options.configStore,
+    configScope: options.configScope,
+    skillMode: options.skillMode,
+    skillToolName: options.skillToolName,
     providers: [createNodeChartCapability(options)],
   };
 }

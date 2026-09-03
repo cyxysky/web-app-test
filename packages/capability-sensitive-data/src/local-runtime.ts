@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
+import path, { dirname } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import {
+  defaultLiquidPiiModel,
+  normalizedGlinerModelName,
+} from './config.js';
 
 export type GlinerRuntimeMode = 'auto' | 'local' | 'external';
 
@@ -14,19 +19,11 @@ type LocalGlinerRuntimeState = {
 };
 
 const globalRuntime = globalThis as typeof globalThis & {
-  __webPilotLocalGlinerRuntime?: LocalGlinerRuntimeState;
+  __sensitiveDataFilterLocalRuntime?: LocalGlinerRuntimeState;
 };
 
-const runtimeState = globalRuntime.__webPilotLocalGlinerRuntime ||= {};
-const defaultGlinerOpenLabelModel = 'fastino/gliner2.5-multi-v1';
-const defaultLiquidPiiModel = 'LiquidAI/LFM2.5-Encoder-350M-PII-Detector';
-
-export function normalizedGlinerModelName(value: unknown) {
-  const configured = String(value || '').trim();
-  return !configured || configured === 'urchade/gliner_multi-v2.1'
-    ? defaultGlinerOpenLabelModel
-    : configured;
-}
+const runtimeState = globalRuntime.__sensitiveDataFilterLocalRuntime ||= {};
+const packageRoot = path.resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 export function normalizedGlinerRuntimeMode(value: unknown): GlinerRuntimeMode {
   const normalized = String(value || 'auto').trim().toLowerCase();
@@ -43,15 +40,16 @@ export function localGlinerServiceDirectories(projectRoot = process.cwd(), confi
   return [...new Set([
     configuredDirectory ? path.resolve(configuredDirectory) : '',
     ...bundledGlinerRuntimeDirectories(projectRoot).map((runtimeRoot) => path.join(runtimeRoot, 'service')),
-    path.resolve(projectRoot, 'services', 'gliner'),
-    path.resolve(projectRoot, '..', 'services', 'gliner'),
+    path.resolve(packageRoot, 'runtime', 'python'),
+    path.resolve(projectRoot, 'packages', 'capability-sensitive-data', 'runtime', 'python'),
+    path.resolve(projectRoot, 'node_modules', '@webpilot', 'capability-sensitive-data', 'runtime', 'python'),
   ].filter(Boolean))];
 }
 
 export function bundledGlinerRuntimeDirectories(projectRoot = process.cwd()) {
   return [...new Set([
-    path.resolve(projectRoot, 'gliner-runtime'),
-    path.resolve(projectRoot, '..', 'gliner-runtime'),
+    path.resolve(projectRoot, 'sensitive-data-runtime'),
+    path.resolve(projectRoot, '..', 'sensitive-data-runtime'),
   ])];
 }
 
@@ -164,7 +162,7 @@ async function waitForService(endpoint: string, child: ChildProcess, expectedRev
   const deadline = Date.now() + startupTimeoutMs();
   while (Date.now() < deadline) {
     if (child.exitCode !== null || child.killed) {
-      throw new Error('Local GLiNER process exited before becoming ready. Run "npm run gliner:install" and check the startup output.');
+      throw new Error('Local GLiNER process exited before becoming ready. Run "npm run sensitive-data:install" and check the startup output.');
     }
     if (await serviceHealthy(endpoint, 1_000, expectedRevision)) return endpoint;
     await new Promise((resolve) => setTimeout(resolve, 500));

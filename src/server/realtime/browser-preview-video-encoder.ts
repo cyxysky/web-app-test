@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { normalizeBoundedInteger } from '@webpilot/capability-sdk';
 import ffmpegStaticPath from 'ffmpeg-static';
 
 export { browserPreviewVideoDimensions } from '@webpilot/capability-browser/node';
@@ -111,8 +112,7 @@ function evenDimension(value: number, fallback: number) {
 }
 
 function boundedIntegerEnv(name: string, fallback: number, minimum: number, maximum: number) {
-  const value = Number(process.env[name] || fallback);
-  return Number.isFinite(value) ? Math.min(maximum, Math.max(minimum, Math.floor(value))) : fallback;
+  return normalizeBoundedInteger(process.env[name], fallback, minimum, maximum);
 }
 
 export function browserPreviewH264Configuration(

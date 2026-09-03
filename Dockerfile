@@ -10,11 +10,13 @@ ENV WEBPILOT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
 COPY package*.json ./
 COPY scripts/prepare-capability-install.mjs ./scripts/prepare-capability-install.mjs
 COPY packages/capability-sdk/package.json ./packages/capability-sdk/package.json
+COPY packages/capability-host/package.json ./packages/capability-host/package.json
 COPY packages/capability-adapter-ai-sdk/package.json ./packages/capability-adapter-ai-sdk/package.json
 COPY packages/capability-adapter-mcp/package.json ./packages/capability-adapter-mcp/package.json
 COPY packages/capability-browser/package.json ./packages/capability-browser/package.json
 COPY packages/capability-chart/package.json ./packages/capability-chart/package.json
 COPY packages/capability-file/package.json ./packages/capability-file/package.json
+COPY packages/capability-sensitive-data/package.json ./packages/capability-sensitive-data/package.json
 RUN if [ "$WEBPILOT_CAPABILITY_SOURCE" = "npm" ]; then node scripts/prepare-capability-install.mjs npm && npm install && cp package.json /tmp/webpilot-package.json && cp package-lock.json /tmp/webpilot-package-lock.json; else npm ci; fi
 
 COPY . .
@@ -41,21 +43,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libreoffice-nogui fonts-noto-cjk python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-COPY services/gliner/requirements.txt /opt/webpilot-gliner/service/requirements.txt
-RUN python3 -m venv /opt/webpilot-gliner/python \
-    && /opt/webpilot-gliner/python/bin/python -m pip install --no-cache-dir --upgrade pip \
-    && /opt/webpilot-gliner/python/bin/python -m pip install --no-cache-dir -r /opt/webpilot-gliner/service/requirements.txt
-COPY services/gliner/app.py /opt/webpilot-gliner/service/app.py
-COPY services/gliner/candidate_resolution.py /opt/webpilot-gliner/service/candidate_resolution.py
-COPY services/gliner/entity_boundaries.py /opt/webpilot-gliner/service/entity_boundaries.py
-COPY services/gliner/deterministic_spans.py /opt/webpilot-gliner/service/deterministic_spans.py
+COPY --from=build /app/.capability-runtime/sensitive-data/python/requirements.txt /opt/webpilot-sensitive-data/service/requirements.txt
+RUN python3 -m venv /opt/webpilot-sensitive-data/python \
+    && /opt/webpilot-sensitive-data/python/bin/python -m pip install --no-cache-dir --upgrade pip \
+    && /opt/webpilot-sensitive-data/python/bin/python -m pip install --no-cache-dir -r /opt/webpilot-sensitive-data/service/requirements.txt
+COPY --from=build /app/.capability-runtime/sensitive-data/python/ /opt/webpilot-sensitive-data/service/
 ENV GLINER_BUNDLED_MODEL_NAME=${GLINER_MODEL}
 ENV GLINER_BUNDLED_CHINESE_NER_MODEL_NAME=${GLINER_CHINESE_NER_MODEL}
 ENV GLINER_BUNDLED_PII_MODEL_NAME=${GLINER_PII_MODEL}
 ENV GLINER_MODEL=${GLINER_MODEL}
 ENV GLINER_CHINESE_NER_MODEL=${GLINER_CHINESE_NER_MODEL}
 ENV GLINER_PII_MODEL=${GLINER_PII_MODEL}
-RUN /opt/webpilot-gliner/python/bin/python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['GLINER_BUNDLED_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/gliner2'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_CHINESE_NER_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/chinese-roberta'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_PII_MODEL_NAME'], local_dir='/opt/webpilot-gliner/models/liquid-pii')"
+RUN /opt/webpilot-sensitive-data/python/bin/python -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id=os.environ['GLINER_BUNDLED_MODEL_NAME'], local_dir='/opt/webpilot-sensitive-data/models/gliner2'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_CHINESE_NER_MODEL_NAME'], local_dir='/opt/webpilot-sensitive-data/models/chinese-roberta'); snapshot_download(repo_id=os.environ['GLINER_BUNDLED_PII_MODEL_NAME'], local_dir='/opt/webpilot-sensitive-data/models/liquid-pii')"
 
 ENV NODE_ENV=production
 ENV PORT=3000
@@ -72,11 +71,11 @@ ENV AI_SENSITIVE_DATA_FILTER_ENABLED=true
 ENV AI_SENSITIVE_DATA_FILTER_FAILURE_MODE=closed
 ENV GLINER_RUNTIME_MODE=local
 ENV GLINER_SERVICE_URL=http://127.0.0.1:18001
-ENV GLINER_PYTHON_PATH=/opt/webpilot-gliner/python/bin/python
-ENV GLINER_SERVICE_DIR=/opt/webpilot-gliner/service
-ENV GLINER_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/gliner2
-ENV GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/chinese-roberta
-ENV GLINER_PII_MODEL_BUNDLE_DIR=/opt/webpilot-gliner/models/liquid-pii
+ENV GLINER_PYTHON_PATH=/opt/webpilot-sensitive-data/python/bin/python
+ENV GLINER_SERVICE_DIR=/opt/webpilot-sensitive-data/service
+ENV GLINER_MODEL_BUNDLE_DIR=/opt/webpilot-sensitive-data/models/gliner2
+ENV GLINER_CHINESE_NER_MODEL_BUNDLE_DIR=/opt/webpilot-sensitive-data/models/chinese-roberta
+ENV GLINER_PII_MODEL_BUNDLE_DIR=/opt/webpilot-sensitive-data/models/liquid-pii
 ENV GLINER_DEVICE=cpu
 ENV GLINER_BATCH_SIZE=8
 

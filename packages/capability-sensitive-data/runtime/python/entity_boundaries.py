@@ -1,3 +1,5 @@
+"""Chinese entity-boundary helpers for the packaged redaction runtime."""
+
 from __future__ import annotations
 
 import re

@@ -81,15 +81,6 @@ export function shouldFinishBrowserChatSessionLoading({
   return Boolean(loadingSessionId && minimumLoadingElapsed && viewportReady);
 }
 
-export function browserChatViewNavigationHref(targetHref: string, currentHref: string) {
-  const current = new URL(currentHref);
-  const target = new URL(targetHref, current);
-  target.search = current.search;
-  target.searchParams.delete('userId');
-  target.searchParams.delete('qzUserId');
-  return `${target.pathname}${target.search}${target.hash}`;
-}
-
 export function browserChatSessionNavigationHref(currentHref: string, sessionId?: string) {
   const current = new URL(currentHref);
   const normalizedSessionId = sessionId?.trim() || '';

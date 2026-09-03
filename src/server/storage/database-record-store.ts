@@ -455,19 +455,25 @@ export async function writeBrowserChatSessionRecord<
   });
 }
 
-export function writeBrowserChatSessionDelta<
-  TSnapshot extends BrowserChatSessionFields,
+type BrowserChatSessionDelta<
   TMessage extends { id: string; createdAt: string; updatedAt?: string },
   TStep extends { index: number },
   TLog extends { id: string; messageId?: string; time: string },
->(snapshot: TSnapshot, summary: unknown, delta: {
+> = {
   messages?: TMessage[];
   steps?: TStep[];
   logs?: TLog[];
   removedMessageIds?: string[];
   removedStepIndexes?: number[];
   removedLogIds?: string[];
-}) {
+};
+
+export function writeBrowserChatSessionDelta<
+  TSnapshot extends BrowserChatSessionFields,
+  TMessage extends { id: string; createdAt: string; updatedAt?: string },
+  TStep extends { index: number },
+  TLog extends { id: string; messageId?: string; time: string },
+>(snapshot: TSnapshot, summary: unknown, delta: BrowserChatSessionDelta<TMessage, TStep, TLog>) {
   return runDatabaseTransaction((manager) => upsertSessionRows(manager, snapshot, summary, delta));
 }
 
@@ -490,14 +496,7 @@ export function writeBrowserChatSessionDeltaQueued<
   TMessage extends { id: string; createdAt: string; updatedAt?: string },
   TStep extends { index: number },
   TLog extends { id: string; messageId?: string; time: string },
->(snapshot: TSnapshot, summary: unknown, delta: {
-  messages?: TMessage[];
-  steps?: TStep[];
-  logs?: TLog[];
-  removedMessageIds?: string[];
-  removedStepIndexes?: number[];
-  removedLogIds?: string[];
-}) {
+>(snapshot: TSnapshot, summary: unknown, delta: BrowserChatSessionDelta<TMessage, TStep, TLog>) {
   const statements: DatabaseWriteStatement[] = [{
     sql: sessionUpsertSql,
     params: [

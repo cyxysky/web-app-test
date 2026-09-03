@@ -29,23 +29,6 @@ const runtimeState = ((globalThis as typeof globalThis & {
   versions: new Map<string, number>(),
 });
 
-export function parseRealtimeRefreshEvent(value: unknown): RefreshWebSocketEvent | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const candidate = value as Partial<RefreshWebSocketEvent>;
-  if (
-    candidate.type !== 'refresh'
-    || !['automationCase', 'automationRun', 'automationSchedule', 'browserChatSession'].includes(String(candidate.entityType))
-    || typeof candidate.id !== 'string'
-    || !candidate.id
-    || typeof candidate.updatedAt !== 'string'
-    || typeof candidate.version !== 'number'
-    || !Number.isFinite(candidate.version)
-    || typeof candidate.userId !== 'string'
-    || !candidate.userId
-  ) return undefined;
-  return candidate as RefreshWebSocketEvent;
-}
-
 function publishToMainServer(event: RefreshWebSocketEvent) {
   return new Promise<void>((resolve, reject) => {
     let settled = false;

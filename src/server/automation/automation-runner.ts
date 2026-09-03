@@ -349,6 +349,7 @@ async function runRepairAgent(input: {
     shouldContinue: () => !input.abortSignal?.aborted,
     credentialBindings: input.credentialContext.bindings,
     ensureBrowserStarted: async () => undefined,
+    allowedToolTypes: ['browser', 'finalResponse'],
   });
 }
 

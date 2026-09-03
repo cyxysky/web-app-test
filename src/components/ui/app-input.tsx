@@ -1,6 +1,6 @@
 'use client';
 
-import { InputGroup } from '@heroui/react';
+import { InputGroup } from '@heroui/react/input-group';
 import { forwardRef, type ComponentProps, type ReactNode } from 'react';
 
 type AppInputProps = Omit<ComponentProps<typeof InputGroup.Input>, 'className' | 'prefix'> & {

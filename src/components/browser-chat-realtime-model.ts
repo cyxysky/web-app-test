@@ -22,12 +22,40 @@ export function mergeBrowserChatRealtimeRecords<T extends { id: string }>(
   current: T[] | undefined,
   incoming: Array<Partial<T> & Pick<T, 'id'>> | undefined,
 ) {
-  const byId = new Map((current || []).map((record) => [record.id, record]));
+  let records = current || [];
   for (const record of incoming || []) {
-    const previous = byId.get(record.id);
-    byId.set(record.id, previous ? { ...previous, ...record } : record as T);
+    const index = records.findIndex((item) => item.id === record.id);
+    if (index < 0) {
+      records = [...records, record as T];
+      continue;
+    }
+    const next = [...records];
+    next[index] = { ...records[index], ...record };
+    records = next;
   }
-  return [...byId.values()];
+  return records;
+}
+
+function removeRealtimeRecords<T>(
+  current: T[],
+  removedValues: readonly (string | number)[] | undefined,
+  valueOf: (record: T) => string | number,
+) {
+  if (!removedValues?.length) return current;
+  const removed = new Set(removedValues);
+  const next = current.filter((record) => !removed.has(valueOf(record)));
+  return next.length === current.length ? current : next;
+}
+
+function insertRealtimeRecord<T>(
+  current: T[],
+  record: T,
+  comesAfter: (candidate: T) => boolean,
+) {
+  const index = current.findIndex(comesAfter);
+  return index < 0
+    ? [...current, record]
+    : [...current.slice(0, index), record, ...current.slice(index)];
 }
 
 function mergeRealtimeStepTools(current: unknown[] = [], incoming: unknown[] = []) {
@@ -70,35 +98,35 @@ export function mergeBrowserChatRealtimeCollections<
   const messageKey = (message: TMessage) => message.clientMessageId && message.role
     ? `client:${message.clientMessageId}:${message.role}`
     : `id:${message.id}`;
-  const removedMessageIds = new Set(patch.removedMessageIds || []);
-  const messages = new Map(
-    current.messages
-      .filter((message) => !removedMessageIds.has(message.id))
-      .map((message) => [messageKey(message), message]),
-  );
+  let messages = removeRealtimeRecords(current.messages, patch.removedMessageIds, (message) => message.id);
   for (const message of patch.messages || []) {
     const key = messageKey(message);
-    const existing = messages.get(key);
+    const index = messages.findIndex((item) => messageKey(item) === key);
+    const existing = index >= 0 ? messages[index] : undefined;
     const existingTime = existing?.updatedAt || existing?.createdAt || '';
     const incomingTime = message.updatedAt || message.createdAt || '';
-    if (!existing || existing.id !== message.id || incomingTime >= existingTime) messages.set(key, message);
+    if (existing && existing.id === message.id && incomingTime < existingTime) continue;
+    if (index >= 0) {
+      const next = [...messages];
+      next[index] = message;
+      messages = next;
+      continue;
+    }
+    const createdAt = message.createdAt || '';
+    messages = insertRealtimeRecord(messages, message, (candidate) => (candidate.createdAt || '') > createdAt);
   }
 
-  const removedStepIndexes = new Set(patch.removedStepIndexes || []);
-  const steps = new Map(
-    current.steps
-      .filter((step) => !removedStepIndexes.has(step.index))
-      .map((step) => [step.index, step]),
-  );
+  let steps = removeRealtimeRecords(current.steps, patch.removedStepIndexes, (step) => step.index);
   for (const step of patch.steps || []) {
-    const existing = steps.get(step.index) as (TStep & { status?: string; tools?: unknown[] }) | undefined;
+    const index = steps.findIndex((item) => item.index === step.index);
+    const existing = (index >= 0 ? steps[index] : undefined) as (TStep & { status?: string; tools?: unknown[] }) | undefined;
     const incoming = step as TStep & { status?: string; tools?: unknown[] };
     const wouldRegressCompletedStep = existing
       && existing.status !== 'running'
       && incoming.status === 'running';
     if (wouldRegressCompletedStep) continue;
     if (!existing) {
-      steps.set(step.index, step);
+      steps = insertRealtimeRecord(steps, step, (candidate) => candidate.index > step.index);
       continue;
     }
     const mergedStep = {
@@ -108,20 +136,23 @@ export function mergeBrowserChatRealtimeCollections<
     if (existing.tools || incoming.tools) {
       mergedStep.tools = mergeRealtimeStepTools(existing.tools, incoming.tools);
     }
-    steps.set(step.index, mergedStep as TStep);
+    const next = [...steps];
+    next[index] = mergedStep as TStep;
+    steps = next;
   }
 
-  const removedLogIds = new Set(patch.removedLogIds || []);
-  const logs = new Map(
-    current.logs
-      .filter((log) => !removedLogIds.has(log.id))
-      .map((log) => [log.id, log]),
-  );
-  for (const log of patch.logs || []) logs.set(log.id, log);
+  let logs = removeRealtimeRecords(current.logs, patch.removedLogIds, (log) => log.id);
+  for (const log of patch.logs || []) {
+    const index = logs.findIndex((item) => item.id === log.id);
+    if (index >= 0) {
+      const next = [...logs];
+      next[index] = log;
+      logs = next;
+      continue;
+    }
+    const time = log.time || '';
+    logs = insertRealtimeRecord(logs, log, (candidate) => (candidate.time || '') > time);
+  }
 
-  return {
-    logs: [...logs.values()].sort((a, b) => (a.time || '').localeCompare(b.time || '')),
-    messages: [...messages.values()].sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')),
-    steps: [...steps.values()].sort((a, b) => a.index - b.index),
-  };
+  return { logs, messages, steps };
 }

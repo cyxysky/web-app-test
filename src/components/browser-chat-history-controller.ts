@@ -39,12 +39,6 @@ export function browserChatReachedHistoryTop(previousScrollTop: number, currentS
   return previousScrollTop > 0 && currentScrollTop === 0;
 }
 
-export function beginHistoricalSubagentQuery(queriedKeys: Set<string>, key: string) {
-  if (queriedKeys.has(key)) return false;
-  queriedKeys.add(key);
-  return true;
-}
-
 function messageKey(message: MessageLike) {
   return message.clientMessageId && message.role
     ? `client:${message.clientMessageId}:${message.role}`

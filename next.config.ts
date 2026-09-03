@@ -23,11 +23,13 @@ export default function nextConfig(phase: string): NextConfig {
     },
     transpilePackages: [
       '@webpilot/capability-sdk',
+      '@webpilot/capability-host',
       '@webpilot/capability-adapter-ai-sdk',
       '@webpilot/capability-adapter-mcp',
       '@webpilot/capability-browser',
       '@webpilot/capability-chart',
       '@webpilot/capability-file',
+      '@webpilot/capability-sensitive-data',
     ],
     // A running development server must never write into the production build
     // directory. Sharing .next lets dev hot updates corrupt next build manifests.
@@ -45,8 +47,25 @@ export default function nextConfig(phase: string): NextConfig {
       // loading every route into the long-lived server process.
       webpackMemoryOptimizations: true,
       preloadEntriesOnStart: false,
+      // HeroUI's root entry re-exports the complete component library. Rewrite
+      // named imports to component entrypoints so Webpack does not parse the
+      // whole barrel whenever a workspace route is compiled for the first time.
+      optimizePackageImports: ['@heroui/react'],
     },
-    webpack(config, { dev }) {
+    webpack(config, { dev, isServer }) {
+      if (dev && !isServer) {
+        // Webpack otherwise compiles every nested async import during the first
+        // route request. Browser Chat owns optional, very large viewers and
+        // charting surfaces, so defer those chunks until the user opens them.
+        // Route entries stay eager because Next manages their lifecycle.
+        config.experiments = {
+          ...(config.experiments || {}),
+          lazyCompilation: {
+            entries: false,
+            imports: true,
+          },
+        };
+      }
       if (dev && process.env.WEBPILOT_DEBUG_WEBPACK_CACHE === '1') {
         config.infrastructureLogging = {
           ...(config.infrastructureLogging || {}),

@@ -1,7 +1,7 @@
 'use client';
 
 import { type CSSProperties, useMemo, useRef, useState } from 'react';
-import { InputGroup } from '@heroui/react';
+import { InputGroup } from '@heroui/react/input-group';
 import { ChevronRight, Copy, Search, X } from 'lucide-react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetails';
@@ -15,7 +15,7 @@ import {
   summarizeBrowserChatExecutionTotals,
   summarizeBrowserChatLogs,
 } from '@/components/browser-chat-log-model';
-import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/components/browser-chat-format';
+import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } from '@/lib/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import { asRecord, finiteNumber } from '@/lib/unknown-value';
 import { AppModal } from '@/components/ui/app-modal';
@@ -192,7 +192,7 @@ function browserChatLogEventTitle(log: BrowserChatLogDialogRecord) {
   if (phaseMatches(log, 'ai:runtime:attempt')) return 'AI 请求已开始';
   if (phaseMatches(log, 'ai:runtime:request')) return 'AI 输入已发送';
   if (phaseMatches(log, 'ai:runtime:response') || phaseMatches(log, 'ai:runtime:object')) return '模型已返回';
-  if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return '本轮正常结束';
+  if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return 'AI 请求正常结束';
   if (isBrowserChatAiFailureLog(log)) return 'AI 请求异常';
   if (isBrowserChatDocumentVisualQaLog(log)) return '文档视觉质检';
   if (isBrowserChatToolLifecycleLog(log)) return '工具调用';

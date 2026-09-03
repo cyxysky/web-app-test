@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { TextArea } from '@heroui/react';
+import { TextArea } from '@heroui/react/textarea';
 import { FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   CalendarDays,
@@ -29,7 +29,7 @@ import {
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
-import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceNavigationSidebar } from '@/components/WorkspaceSidebar';
 import {
   WorkspaceSidebarArchiveFilter,
   WorkspaceSidebarArchiveHeader,
@@ -1008,28 +1008,16 @@ export function AutomationWorkspace({
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed automation-layout' : 'browser-chat-layout automation-layout'}>
-      <WorkspaceSidebar
+      <WorkspaceNavigationSidebar
+        activeKey="/automation"
         className="automation-sidebar"
         collapsed={sidebarCollapsed}
-        collapseLabel={t(sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏')}
         onToggleCollapse={toggleSidebar}
         onThemeChange={setMode}
+        showAiOperations={userId === '1'}
         themeMode={themeMode}
-        themeToggleLabel={t(themeMode === 'dark' ? '切换到浅色模式' : '切换到深色模式')}
-        themeToggleTitle={t(themeMode === 'dark' ? '浅色模式' : '深色模式')}
+        translate={t}
       >
-
-        <WorkspaceModeTabs
-          activeKey="/automation"
-          aiOperationsLabel={t('AI 运营')}
-          ariaLabel={t('工作模式')}
-          automationLabel={t('自动化')}
-          collapsed={sidebarCollapsed}
-          conversationLabel={t('对话模式')}
-          settingsLabel={t('设置')}
-          showAiOperations={userId === '1'}
-        />
-
         <section className="browser-chat-sidebar-section browser-chat-recent-section workspace-sidebar-archive browser-chat-conversation-history">
           <div className="browser-chat-recent-panel">
             <WorkspaceSidebarArchiveHeader
@@ -1164,7 +1152,7 @@ export function AutomationWorkspace({
           </div>
         </section>
 
-      </WorkspaceSidebar>
+      </WorkspaceNavigationSidebar>
 
       <main className="browser-chat-main automation-main">
         <div className="automation-content" aria-busy={loading}>

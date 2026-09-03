@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { TextArea } from '@heroui/react';
+import { TextArea } from '@heroui/react/textarea';
 import Link from 'next/link';
 import { AlertCircle, ArrowLeft, ChevronDown, CircleCheck, Copy, FolderOpen, ImageIcon, KeyRound, Loader2, Maximize2, PencilLine, PlayCircle, Plus, RefreshCw, Save, Search, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -183,7 +183,8 @@ function SettingsGroupCard({
   );
 }
 
-function runtimeSettingGroup(tab: SettingsTab, key: string) {
+function runtimeSettingGroup(tab: SettingsTab, key: string, configuredGroup?: string) {
+  if (configuredGroup) return configuredGroup;
   if (tab === 'browser') {
     if (/^BROWSER_(?:PREVIEW|SCREENCAST|OUTPUT)/.test(key)) return '实时预览';
     if (/^(?:ELECTRON_|HEADLESS_|BROWSER_(?:PROFILE|USER_BROWSER|VIEWPORT))/.test(key)) return '浏览器实例';
@@ -209,7 +210,7 @@ function runtimeSettingGroup(tab: SettingsTab, key: string) {
 function groupVisibleEnvSettings(tab: SettingsTab, settings: VisibleEnvSetting[]) {
   const groups = new Map<string, VisibleEnvSetting[]>();
   for (const setting of settings) {
-    const title = runtimeSettingGroup(tab, setting.item.key);
+    const title = runtimeSettingGroup(tab, setting.item.key, setting.definition?.group);
     const group = groups.get(title) || [];
     group.push(setting);
     groups.set(title, group);
@@ -2001,7 +2002,7 @@ export function EnvironmentSettings({
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
       {embedded ? null : (
         <header className="settings-header">
-          <Link className="ghost-link" href="/dashboard">
+          <Link className="ghost-link" href="/browser-chat">
             <ArrowLeft size={15} />
             {t('返回工作台')}
           </Link>

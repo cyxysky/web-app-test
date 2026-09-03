@@ -1,6 +1,8 @@
 'use client';
 
-import { EmptyState, Table, type SortDescriptor } from '@heroui/react';
+import { EmptyState } from '@heroui/react/empty-state';
+import { Table } from '@heroui/react/table';
+import type { SortDescriptor } from 'react-aria-components';
 import { useDeferredValue, useMemo, useState, type ReactNode } from 'react';
 
 export type DataTableColumn<T> = {

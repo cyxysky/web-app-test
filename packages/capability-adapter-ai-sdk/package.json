@@ -12,6 +12,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./typeorm": {
+      "types": "./dist/typeorm.d.ts",
+      "import": "./dist/typeorm.js"
     }
   },
   "scripts": {
@@ -19,6 +27,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
+    "@webpilot/capability-host": "0.1.0",
     "@webpilot/capability-sdk": "0.1.0"
   },
   "peerDependencies": {

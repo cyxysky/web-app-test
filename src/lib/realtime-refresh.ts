@@ -19,6 +19,9 @@ export type RealtimeRefreshEvent = {
 type RealtimeMessage = RealtimeRefreshEvent | {
   type: 'heartbeat' | 'hello';
   [key: string]: unknown;
+} | {
+  type: 'refresh-batch';
+  events: RealtimeRefreshEvent[];
 };
 
 type RefreshListener = (event: RealtimeRefreshEvent) => void;
@@ -89,8 +92,15 @@ async function connectRefreshWebSocket() {
         if (shouldResync) notifyResyncRequired();
         return;
       }
-      if (payload?.type !== 'refresh') return;
-      for (const subscription of [...subscriptions]) subscription.listener(payload);
+      const refreshEvents = payload?.type === 'refresh-batch' && Array.isArray(payload.events)
+        ? payload.events
+        : payload?.type === 'refresh'
+          ? [payload]
+          : [];
+      for (const event of refreshEvents) {
+        if (event?.type !== 'refresh') continue;
+        for (const subscription of [...subscriptions]) subscription.listener(event);
+      }
     };
     nextSocket.onclose = () => {
       if (socket !== nextSocket) return;

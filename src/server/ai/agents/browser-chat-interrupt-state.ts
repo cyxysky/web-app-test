@@ -95,32 +95,7 @@ export function revokeRegisteredBrowserChatTurnByAssistantMessageId<TSession>(
   return revokeRegisteredBrowserChatTurn(registry, sessionId, reason);
 }
 
-export function racePromiseWithAbort<T>(operation: PromiseLike<T>, signal?: AbortSignal): Promise<T> {
-  if (!signal) return Promise.resolve(operation);
-  const abortError = () => signal.reason instanceof Error
-    ? signal.reason
-    : new Error('Operation aborted.');
-  if (signal.aborted) return Promise.reject(abortError());
-
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => {
-      cleanup();
-      reject(abortError());
-    };
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
-    signal.addEventListener('abort', onAbort, { once: true });
-    Promise.resolve(operation).then(
-      (value) => {
-        cleanup();
-        resolve(value);
-      },
-      (error) => {
-        cleanup();
-        reject(error);
-      },
-    );
-  });
-}
+export const racePromiseWithAbort = raceWithAbort;
 
 /**
  * Revoke a turn synchronously, then dispatch abort without waiting for the
@@ -153,3 +128,4 @@ export function runtimeSnapshotIsNewer(runtimeUpdatedAt: string, persistedUpdate
   const persistedTime = Date.parse(persistedUpdatedAt);
   return Number.isFinite(runtimeTime) && Number.isFinite(persistedTime) && runtimeTime > persistedTime;
 }
+import { raceWithAbort } from '@webpilot/capability-sdk';

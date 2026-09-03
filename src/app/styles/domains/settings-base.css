@@ -1497,11 +1497,6 @@
 
 
 
-@media (prefers-reduced-motion: reduce) {
-}
-
-
-
 @media (max-width: 900px) {
   .domain-list-toolbar {
     grid-template-columns: minmax(0, 1fr) auto;

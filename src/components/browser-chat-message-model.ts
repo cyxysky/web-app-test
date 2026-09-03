@@ -16,8 +16,9 @@ export type BrowserChatMessageLike = {
 
 export type BrowserChatLogIndex<TLog extends BrowserChatLogRecordLike> = {
   byMessageId: Map<string, TLog[]>;
-  order: Map<TLog, number>;
 };
+
+const emptyBrowserChatLogs: never[] = [];
 
 export type BrowserChatAiOutputCycleLike = {
   id: string;
@@ -88,16 +89,6 @@ export function browserChatAiCycleAnchorsText(
   return cycle.output.texts.some((candidate) => normalizedVisibleText(candidate) === normalizedText);
 }
 
-export function browserChatAiCycleTextIsAccepted(
-  messageStatus: string | undefined,
-  cycle: BrowserChatAiOutputCycleLike,
-  isTerminalAnswerCycle = false,
-) {
-  return messageStatus === undefined
-    || (messageStatus !== 'running' && Boolean(cycle.output.tools?.length))
-    || (messageStatus === 'passed' && isTerminalAnswerCycle);
-}
-
 export function browserChatTerminalAnswerCycleIndex(cycles: BrowserChatAiOutputCycleLike[]) {
   for (let index = cycles.length - 1; index >= 0; index -= 1) {
     const cycle = cycles[index];
@@ -138,10 +129,8 @@ export function formatBrowserChatElapsedTime(value: number | undefined) {
 
 export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(logs: TLog[]): BrowserChatLogIndex<TLog> {
   const byMessageId = new Map<string, TLog[]>();
-  const order = new Map<TLog, number>();
 
-  for (const [index, log] of logs.entries()) {
-    order.set(log, index);
+  for (const log of logs) {
     if (log.messageId) {
       const entries = byMessageId.get(log.messageId) || [];
       entries.push(log);
@@ -149,19 +138,14 @@ export function buildBrowserChatLogIndex<TLog extends BrowserChatLogRecordLike>(
     }
   }
 
-  return { byMessageId, order };
+  return { byMessageId };
 }
 
 export function browserChatLogsForMessage<TMessage extends BrowserChatMessageLike, TLog extends BrowserChatLogRecordLike>(
   message: TMessage,
   logIndex: BrowserChatLogIndex<TLog>,
 ) {
-  const directLogs = logIndex.byMessageId.get(message.id) || [];
-  return directLogs.length
-    ? [...directLogs].sort((left, right) => (
-      (logIndex.order.get(left) ?? Number.MAX_SAFE_INTEGER) - (logIndex.order.get(right) ?? Number.MAX_SAFE_INTEGER)
-    ))
-    : [];
+  return logIndex.byMessageId.get(message.id) || (emptyBrowserChatLogs as TLog[]);
 }
 
 export function browserChatAssistantMessageHasVisibleText<TMessage extends BrowserChatMessageLike, TLog extends BrowserChatLogRecordLike>(

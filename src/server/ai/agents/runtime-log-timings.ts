@@ -1,3 +1,5 @@
+import { finiteNumber } from '@/lib/unknown-value';
+
 export type RuntimeToolTimingTrace = {
   actionElapsedMs?: unknown;
   completedAt?: unknown;
@@ -6,11 +8,6 @@ export type RuntimeToolTimingTrace = {
   postprocessTimings?: unknown;
   startedAt?: unknown;
 };
-
-function finiteNumber(value: unknown) {
-  const numberValue = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(numberValue) ? numberValue : undefined;
-}
 
 function stringValue(value: unknown) {
   return typeof value === 'string' ? value : String(value || '');

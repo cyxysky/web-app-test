@@ -1,6 +1,9 @@
 'use client';
 
-import { ColorArea, ColorPicker, ColorSlider, ColorSwatch } from '@heroui/react';
+import { ColorArea } from '@heroui/react/color-area';
+import { ColorPicker } from '@heroui/react/color-picker';
+import { ColorSlider } from '@heroui/react/color-slider';
+import { ColorSwatch } from '@heroui/react/color-swatch';
 
 export function ColorPickerField({
   ariaLabel,

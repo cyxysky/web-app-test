@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { formatToolPayload } from './browser-chat-format';
+import { formatToolPayload } from '@/lib/browser-chat-format';
 
 test('renders control characters in tool payload strings as whitespace', () => {
   const formatted = formatToolPayload({ code: '\nconst value = 1;\n\treturn value;' });

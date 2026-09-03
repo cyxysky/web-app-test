@@ -1,6 +1,6 @@
 'use client';
 
-import { InputGroup } from '@heroui/react';
+import { InputGroup } from '@heroui/react/input-group';
 import { useDeferredValue, useMemo, useState, type ReactNode } from 'react';
 import { Search, X } from 'lucide-react';
 import { useI18n } from '@/i18n/I18nProvider';

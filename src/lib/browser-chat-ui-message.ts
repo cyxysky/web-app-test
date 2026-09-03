@@ -1,6 +1,10 @@
 import type { DynamicToolUIPart, UIMessage } from 'ai';
 import { z } from 'zod';
-import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
+import type {
+  BrowserChatAiOutputCycle,
+  BrowserChatSubagentRecord,
+  StepExecutionResult,
+} from '@/server/ai/schemas/runtime.schema';
 
 const browserChatUIValueSchema: z.ZodType<unknown> = z.lazy(() => z.union([
   z.string(),
@@ -78,6 +82,8 @@ export type BrowserChatUIDataTypes = {
   chart: { chartId: string; title?: string };
   ui: { id?: string; tree: BrowserChatUINode };
   step: StepExecutionResult;
+  outputCycle: BrowserChatAiOutputCycle;
+  subagent: BrowserChatSubagentRecord;
   activity: { phase: string; label: string; updatedAt: string };
 };
 

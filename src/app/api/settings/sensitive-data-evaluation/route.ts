@@ -8,7 +8,7 @@ import {
   SENSITIVE_DATA_EVALUATION_TEXT_LIMIT,
   SENSITIVE_DATA_EVALUATION_TOTAL_TEXT_LIMIT,
 } from '@/lib/sensitive-data-evaluation';
-import { redactSensitiveTexts } from '@/server/ai/sensitive-data-filter';
+import { redactSensitiveTexts } from '@/server/capabilities/sensitive-data';
 import { store } from '@/server/db/store';
 import { ApiRequestError, apiError, apiJson, parseJsonRequest } from '@/server/http/api-request';
 import { requestHasAdminSettingsAccess } from '@/server/settings/admin-settings-access';

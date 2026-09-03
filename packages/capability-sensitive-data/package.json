@@ -1,0 +1,48 @@
+{
+  "name": "@webpilot/capability-sensitive-data",
+  "version": "0.1.0",
+  "description": "Provider-boundary sensitive-data redaction with a portable client and optional managed GLiNER runtime.",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "runtime",
+    "scripts",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./ai-sdk": {
+      "types": "./dist/ai-sdk.d.ts",
+      "import": "./dist/ai-sdk.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
+    "./settings": {
+      "types": "./dist/settings.d.ts",
+      "import": "./dist/settings.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "install-runtime": "node scripts/install-runtime.cjs",
+    "start-runtime": "node scripts/start-runtime.cjs",
+    "bundle-runtime": "node scripts/prepare-runtime.cjs",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "^4.0.7",
+    "@webpilot/capability-sdk": "0.1.0"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

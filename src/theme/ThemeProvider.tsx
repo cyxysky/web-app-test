@@ -49,14 +49,6 @@ const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 function normalizeHexColor(value: unknown) {
   if (typeof value !== 'string') return DEFAULT_ACCENT;
   const trimmed = value.trim();
-  const legacyPresets: Record<string, string> = {
-    blue: '#2563eb',
-    orange: '#ea580c',
-    purple: '#7c3aed',
-    rose: '#e11d48',
-    'gpt-green': DEFAULT_ACCENT,
-  };
-  if (legacyPresets[trimmed]) return legacyPresets[trimmed];
   if (/^#[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed.toLowerCase();
   if (/^[0-9a-fA-F]{6}$/.test(trimmed)) return `#${trimmed.toLowerCase()}`;
   return DEFAULT_ACCENT;

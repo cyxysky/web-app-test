@@ -1,4 +1,5 @@
 const { contextBridge, ipcRenderer } = require('electron');
+const { subscribeIpc } = require('./ipc-subscription');
 
 function markAppShell() {
   try {
@@ -63,16 +64,15 @@ contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
     return ipcRenderer.invoke('webpilot:embedded-browser:navigate', input);
   },
   onStateChange(listener) {
-    if (typeof listener !== 'function') return () => {};
-    const handler = (_event, state) => listener(state);
-    ipcRenderer.on('webpilot:embedded-browser:state-changed', handler);
-    return () => ipcRenderer.removeListener('webpilot:embedded-browser:state-changed', handler);
+    return subscribeIpc(ipcRenderer, 'webpilot:embedded-browser:state-changed', listener);
   },
   onFocusAddress(listener) {
-    if (typeof listener !== 'function') return () => {};
-    const handler = () => listener();
-    ipcRenderer.on('webpilot:embedded-browser:focus-address', handler);
-    return () => ipcRenderer.removeListener('webpilot:embedded-browser:focus-address', handler);
+    return subscribeIpc(
+      ipcRenderer,
+      'webpilot:embedded-browser:focus-address',
+      listener,
+      () => undefined,
+    );
   },
   reload() {
     return ipcRenderer.invoke('webpilot:embedded-browser:reload');
@@ -129,16 +129,10 @@ contextBridge.exposeInMainWorld('webPilotSystem', {
     return ipcRenderer.invoke('webpilot:system:get-downloads');
   },
   onDownloadProgress(listener) {
-    if (typeof listener !== 'function') return () => {};
-    const handler = (_event, payload) => listener(payload);
-    ipcRenderer.on('webpilot:system:download-progress', handler);
-    return () => ipcRenderer.removeListener('webpilot:system:download-progress', handler);
+    return subscribeIpc(ipcRenderer, 'webpilot:system:download-progress', listener);
   },
   onDownloadRemoved(listener) {
-    if (typeof listener !== 'function') return () => {};
-    const handler = (_event, payload) => listener(payload);
-    ipcRenderer.on('webpilot:system:download-removed', handler);
-    return () => ipcRenderer.removeListener('webpilot:system:download-removed', handler);
+    return subscribeIpc(ipcRenderer, 'webpilot:system:download-removed', listener);
   },
   openDownload(input) {
     return ipcRenderer.invoke('webpilot:system:open-download', input || {});

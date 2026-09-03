@@ -29,7 +29,7 @@ export function browserToolApprovalRequest(input: {
     };
   }
 
-  if (input.toolName === 'downloadFile' || (input.toolName === 'file' && record.action === 'download')) {
+  if (input.toolName === 'file' && record.action === 'download') {
     return { reason, prompt: `请确认是否下载文件${reason ? `：${reason}` : ''}` };
   }
 

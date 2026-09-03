@@ -1,3 +1,5 @@
+import type { CapabilitySkill } from '@webpilot/capability-sdk';
+
 /** Complete model-facing operating manual for the File Capability workflow. */
 export const fileArtifactRuntimeSkillId = 'system-file-artifact-runtime';
 
@@ -5,22 +7,22 @@ export const fileArtifactRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${fileArtifactRuntimeSkillId}</id>`,
   '<title>File Artifact Runtime</title>',
-  '<description>Hidden built-in operating manual for the unified file tool. Its first governed call automatically loads and returns it while continuing the operation.</description>',
+  '<description>Required built-in operating manual for the unified file tool. Read this Skill successfully before the first file call in every Agent run.</description>',
   '<required>true</required>',
   '</system_skill>',
 ].join('\n');
 
 export const fileArtifactRuntimeSkillContent = `# File Artifact Runtime
 
-This hidden built-in Skill is authoritative for the unified file artifact workflow. The backend loads it once per Agent run during the first governed file call and returns it in loadedRuntimeSkill while continuing the original operation.
+This Skill is authoritative for the unified file artifact workflow and is supplied by the file package. The consuming Agent is responsible for loading it and deciding when the file tool becomes available.
 
 ## Required sequence
 
-1. Call file normally with the required action.
-2. On the first governed call, inspect loadedRuntimeSkill and the original tool result returned by that same transaction.
-3. Continue the workflow below. Explicit skill action=read remains supported but is not required.
+1. Explicitly call skill action=read with skillId=${fileArtifactRuntimeSkillId}.
+2. Wait for that Skill read to succeed. Do not emit a file call in the same model step.
+3. Continue the workflow below. The Agent host must reject a file call emitted before the successful read without executing it.
 
-Every file action uses this same Skill. Do not read a second visual-only Skill. If automatic loading fails, use the complete error and requiredSkillId to restore the missing Skill registration. If the original tool operation fails, use its failureCategory and complete workflow result to correct the input or workflow state. Keep the same documentId or artifactId; never create a replacement document merely to escape a failed step.
+Every file action uses this same Skill. Do not read a second visual-only Skill. If the Skill read fails, use the complete error and requiredSkillId to restore the missing Skill registration. If a file operation fails, use its failureCategory and complete workflow result to correct the input or workflow state. Keep the same documentId or artifactId; never create a replacement document merely to escape a failed step.
 
 The base file actions are list, read, download, convert, plan, generate, edit, render, jsApi, and unoApi. When the host initializes file with visual input enabled, the same tool additionally exposes visualIndex, visualRead, and visualReport.
 
@@ -138,12 +140,12 @@ Action requirements:
 - \`read\`: with \`documentId\`, reads the current draft checkpoint. For a large source, read one returned source-unit \`path\` or a bounded \`startLine\`/\`endLine\` window; otherwise provide exactly one of \`attachmentId\` or \`artifactId\` to read an external/current artifact.
 - \`download\`: provide a real source in \`urlOrPath\`, \`url\`, or \`path\`, plus \`fileType\` without a dot. When two or more independent URLs are already known, emit their separate file calls in the same model response; the runtime batches them concurrently, coalesces duplicates, limits same-origin pressure, and performs only short bounded 429 retries. For Wikimedia, copy the exact thumbnail URL returned by Commons \`imageinfo/thumburl\`; never invent or rewrite its \`Npx-\` size segment. Never add a manual sleep or a fixed 30-second wait; after a persistent 429, switch to a different source or origin.
 - \`convert\`: \`sourceArtifactId\` is the exact Artifact ID of the source Office file.
-- \`plan\`: \`documentId\`, \`fileName\`, and \`documentType\` are required. \`operation\` defaults to \`"create"\`; \`sourceAttachmentId\` is required for \`operation: "modify"\`.
+- \`plan\`: \`documentId\`, \`fileName\`, and \`documentType\` are required. The extension must match the document type (Word: doc/docx/odt; spreadsheet: xls/xlsx/ods; presentation: ppt/pptx/odp; PDF is valid for each). If plan fails, correct and retry with the same documentId. \`operation\` defaults to \`"create"\`; \`sourceAttachmentId\` is required for \`operation: "modify"\`.
 - \`unoApi\` and \`jsApi\`: normally call after plan and only for its returned generation mode, always with the same \`documentId\`. An early UNO catalog lookup is also accepted when both \`documentId\` and \`documentType\` are supplied; it is read-only and returns \`boundToPlannedDraft=false\` plus \`nextAction=plan\`, so plan that same ID before generate. For UNO, omit \`query\` once to receive the module index, then query only the modules the draft uses (for example \`presentation.shape\` or \`presentation.professional\`). Every module response contains all exact installed signatures, accepted schemas, and registered examples for that module. Copy those examples instead of guessing. Repeated planned-module queries are cached. Raw UNO reflection is not exposed.
-- \`generate\`: create the initial source only. Once a documentId has a working source, \`edit\` is the mandatory first choice for every repair, validation failure, layout correction, content revision, and patch retry. A guarded complete replacement is an exceptional last resort only when the required change genuinely cannot be expressed as bounded patches without rebuilding most of the program. Never replace merely because a patch had invalid syntax, stale context, a matching conflict, or many diagnostics; read the current source and repair the patch instead. If replacement is truly unavoidable, read the complete current draft first, then pass \`replaceExisting=true\` and its exact \`patchBaseDigest\` as \`baseDigest\`. Initial generation and exceptional replacement must both preserve exactly one top-level synchronous \`def create_document(job):\`; keep every facade call inside it, and finish with exactly one \`facade.save()\` followed by exactly one \`facade.close()\`.
+- \`generate\`: create the initial source. If the result already contains a saved source and \`patchBaseDigest\`, normally use \`edit\` for repairs or revisions instead of starting over. Retry generate when no usable source checkpoint exists. A complete replacement is appropriate only when bounded patches cannot coherently implement the requested change; first read the complete current draft, then pass \`replaceExisting=true\` and its exact \`patchBaseDigest\` as \`baseDigest\`. Initial generation and replacement must both preserve exactly one top-level synchronous \`def create_document(job):\`; keep every facade call inside it, and finish with exactly one \`facade.save()\` followed by exactly one \`facade.close()\`.
 - \`edit\`: apply one Codex-format patch in \`patch\` to the exact source identified by \`baseDigest\`. Use exactly one \`*** Begin Patch\` / \`*** End Patch\` envelope containing \`*** Update File: draft.py\` and one or more \`@@\` hunks; every unchanged line starts with one space, every deletion with \`-\`, and every addition with \`+\`. Never wrap each hunk in another Begin/End pair, invent a separate \`replace\` field, or write unified-diff line-number headers. Put independent repairs in separate \`@@\` hunks of one call. Each hunk is atomic and independent: successful hunks are saved even if another hunk has stale context; then read the new source/digest and retry only the reported conflicts.
 - In an edit hunk, replacing a line always means \`-old line\` followed by \`+new line\`. A space-prefixed old line is unchanged context, so writing \` old line\` followed only by \`+new line\` inserts a duplicate; never use that form for replacement. Every hunk must contain a real \`+\` or \`-\` change; a context-only hunk is rejected before matching. Copy indentation from the exact unnumbered read result for both \`-\` and \`+\` lines.
-- \`render\`: publishes only the current source after that exact source passes validation.
+- \`render\`: publishes the current validated source. After render succeeds, inspect or deliver that artifact instead of rewriting it without a concrete reason. If the user request, validation result, or visual review identifies a real change, read and edit the same documentId, then render the updated source.
 
 ## JavaScript presentation visualization choices
 
@@ -184,7 +186,7 @@ A verified reference run delivered an 18-slide Impress deck, a 12-page Writer re
 - Keep Calc chart anchors inside each sheet's print area and validate that the complete source range, title row, and last category are included.
 - A layout diagnostic identifies a leaf element or a primary collision source. Repair that concrete call site first. Change a shared helper only when the intended change is valid for every caller and the whole dependent layout is deliberately reflowed.
 - Keep long artifacts compact and data-driven through high-level facade calls and content arrays. Prefer focused Codex-format patches for local defects; use the guarded generate replacement when the draft genuinely needs a complete architectural rewrite.
-- Generate/edit performs structural UNO validation without attaching page screenshots to every repair call. A patch scoped by \`path\` to one page or sheet is validated as that exact source unit; final render still performs mandatory full-document validation. Once the requested content and feature counts are complete and validation passes with \`requiredNextAction=render\`, call render immediately. Render creates the indexed previews but does not attach the whole document to the model; only bounded \`file action=visualRead\` batches add page-image context.
+- Generate/edit performs structural UNO validation without attaching page screenshots to every repair call. A patch scoped by \`path\` to one page or sheet is validated as that exact source unit; final render still performs full-document validation. Use the returned validation state and diagnostics to choose the next operation. Render creates indexed previews but does not attach the whole document to the model; only bounded \`file action=visualRead\` batches add page-image context.
 - A disposed UNO bridge is retried automatically once with a fresh isolated LibreOffice profile. If it fails again, preserve the source and retry the unchanged facade program; source edits cannot repair LibreOffice process startup.
 
 ## file call examples
@@ -429,15 +431,15 @@ file({
 })
 \`\`\`
 
-## Workflow state machine
+## Recommended workflow
 
 1. Call file action=list before starting or resuming Office/PDF authoring, and reuse an existing documentId when it represents the requested work.
 2. Call action=plan once for that documentId. For an existing attachment, use operation=modify with the exact sourceAttachmentId; for a new file, use operation=create.
 3. Follow the generationMode returned by plan. Call action=unoApi only for an UNO plan or action=jsApi only for a JavaScript plan, always with the planned documentId.
-4. Call action=generate to create the single editable source buffer. The source is saved even when validation fails.
-5. When a source already exists, use action=edit first and continue editing that same source until it validates. \`requiredNextAction=edit\` is binding. Failed drafts remain editable; a malformed or conflicting patch must be corrected and retried as edit, never converted into generate. Use guarded replacement only as a last resort when bounded patches cannot coherently implement a near-total program rebuild, after reading the complete current source and its exact patchBaseDigest.
-6. Call action=render only after the current source passes validation; render publishes that exact source.
-7. When visual QA is available, use file visualIndex -> visualRead -> visualReport against the exact latest Artifact ID until every page has an evidence-backed pass and the complete artifact has a passed deckReview.
+4. Call action=generate to create the initial editable source. A failed generate may still return a saved source and patchBaseDigest, so inspect the result before choosing the next action.
+5. When a usable source already exists, prefer action=edit on that same documentId for repairs and revisions. If no source checkpoint was created, correct the input and retry generate. Use guarded replacement only when bounded edits cannot coherently implement the requested change, after reading the complete current source and its exact patchBaseDigest.
+6. Call action=render only after the current source passes validation and the complete requested content is present; render publishes that exact source.
+7. After render, inspect the latest artifact when visual QA is available. Do not rewrite it speculatively. If the user request, validator, or visual inspection reveals a concrete issue, read and edit the same documentId and render again; otherwise return the artifact in finalResponse.
 
 Use action=read whenever the exact current source, patchBaseDigest, workflow checkpoint, or validation diagnostics are needed. Use action=download for an existing URL/path and action=convert to convert an existing Office artifact identified by sourceArtifactId. For web research, browser action=code may locate and verify a direct asset URL, but it must not fetch or save that asset locally; pass the direct URL to file action=download, then use the exact returned artifact name in Office source. Read downloaded image artifacts when authoritative pixel dimensions or aspect ratio are needed.
 
@@ -495,5 +497,14 @@ Delivery succeeds only when visualQaDigest equals renderedDigest, seenPageCount 
 
 ## Failure continuation
 
-Read the complete error and requiredNextAction. Preserve documentId and artifactId as applicable. Retry the required operation with corrected parameters or a focused edit against the one current source. Continue the original document workflow rather than starting a substitute artifact.
+Read the complete error, validation state, digests, and diagnostics. Preserve documentId and artifactId when continuing the same logical document. Choose the next operation from that evidence instead of mechanically repeating the failed action or starting a substitute artifact.
 `;
+
+export const fileRuntimeSkill = Object.freeze({
+  id: fileArtifactRuntimeSkillId,
+  title: 'File Artifact Runtime',
+  summary: fileArtifactRuntimeSkillSummary,
+  content: fileArtifactRuntimeSkillContent,
+  required: true,
+  activation: [{ toolName: 'file' }],
+} satisfies CapabilitySkill);

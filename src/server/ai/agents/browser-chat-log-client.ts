@@ -1,3 +1,5 @@
+import { asRecord } from '@/lib/unknown-value';
+
 type BrowserChatClientLog = {
   details?: string;
   id?: string;
@@ -7,12 +9,6 @@ type BrowserChatClientLog = {
   time?: string;
   toolCallId?: string;
 };
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
 
 function parsedDetails(value: string) {
   const details = asRecord(JSON.parse(value));

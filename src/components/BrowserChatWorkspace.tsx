@@ -28,7 +28,10 @@ import { CSS as DndCss } from '@dnd-kit/utilities';
 import { createPortal } from 'react-dom';
 import { DefaultChatTransport } from 'ai';
 import { Chat, useChat } from '@ai-sdk/react';
-import { Button, Checkbox, Popover, TextArea } from '@heroui/react';
+import { Button } from '@heroui/react/button';
+import { Checkbox } from '@heroui/react/checkbox';
+import { Popover } from '@heroui/react/popover';
+import { TextArea } from '@heroui/react/textarea';
 import dynamic from 'next/dynamic';
 import {
   AppWindow,
@@ -96,10 +99,6 @@ import {
   X,
 } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import ReactMarkdown from 'react-markdown';
-import rehypeKatex from 'rehype-katex';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
 import { CustomSelect } from '@/components/CustomSelect';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { ModelBrandIcon } from '@/components/ModelBrandIcon';
@@ -128,19 +127,27 @@ import {
 } from '@/components/browser-chat-tool-context';
 import { browserChatCurrentTurnAssistantMessageId } from '@/components/browser-chat-output-files-state';
 import {
-  normalizeBrowserChatMarkdown,
-  remarkBrowserChatCjkStrong,
-  splitBrowserChatChartBlocks,
-} from '@/components/browser-chat-markdown';
-import { BrowserChatChart } from '@/components/BrowserChatChart';
-import { BrowserChatDataUI } from '@/components/BrowserChatDataUI';
+  aiCycleToolKey,
+  buildAiCycleToolDetailMap,
+  hasAiOutputView,
+  stringFromUnknown,
+  toolInputSignature,
+  type BrowserChatToolDetail,
+} from '@/components/browser-chat-ai-output';
+import {
+  BrowserChatMarkdown,
+  BrowserChatOrderedResponse,
+  BrowserChatSessionIdContext,
+  handleBrowserChatMarkdownLinkClick,
+} from '@/components/BrowserChatMarkdown';
+import { normalizeEmbeddedBrowserAddress } from '@/components/browser-chat-embedded-url';
 import { browserChatGenerationPreviewText } from '@/components/browser-chat-message-generation-preview';
 import {
   mergeBrowserChatRealtimeCollections,
   mergeBrowserChatRealtimeRecords,
   parseBrowserChatRealtimePatch,
 } from '@/components/browser-chat-realtime-model';
-import { parseJsonObjectText, stripAnsiControlCodes } from '@/components/browser-chat-format';
+import { parseJsonObjectText, stripAnsiControlCodes } from '@/lib/browser-chat-format';
 import {
   browserChatToolFailureSummary,
   browserChatToolValidationSummary,
@@ -154,7 +161,7 @@ import {
   resolveEmbeddedBrowserWheelScrollLeft,
   type EmbeddedBrowserTabDensity,
 } from '@/components/embedded-browser-tab-layout';
-import { WorkspaceModeTabs, WorkspaceSidebar } from '@/components/WorkspaceSidebar';
+import { WorkspaceNavigationSidebar } from '@/components/WorkspaceSidebar';
 import {
   WorkspaceSidebarArchiveFilter,
   WorkspaceSidebarArchiveHeader,
@@ -175,6 +182,7 @@ import {
   type BrowserChatSessionListPage,
 } from '@/components/useBrowserChatSessionPagination';
 import { useBrowserChatRealtime } from '@/components/useBrowserChatRealtime';
+import type { RealtimeRefreshEvent } from '@/lib/realtime-refresh';
 import {
   readSidebarCollapsedPreference,
   writeSidebarCollapsedPreference,
@@ -196,7 +204,6 @@ import { ProgressiveBlur } from '@/components/ui/progressive-blur';
 import { RainbowButton } from '@/components/ui/rainbow-button';
 import {
   browserChatAiCycleAnchorsText,
-  browserChatAiCycleTextIsAccepted,
   browserChatAssistantMessageHasExecutionMetadata,
   browserChatMessageElapsedMs,
   browserChatMessageIsTextStreaming,
@@ -224,7 +231,7 @@ import {
 } from '@/components/browser-chat-log-model';
 import { useI18n } from '@/i18n/I18nProvider';
 import { readApiJson } from '@/lib/api-client';
-import { browserSessionGroupLabel } from '@webpilot/capability-browser';
+import { browserSessionGroupLabel } from '@webpilot/capability-browser/session-group';
 import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import {
   browserChatSessionDisplayTitle,
@@ -262,6 +269,8 @@ import type {
   SkillRecord,
   StepExecutionResult,
 } from '@/server/ai/schemas/runtime.schema';
+
+export { aiOutputViewFromResponse, buildAiCycleToolDetailMap } from '@/components/browser-chat-ai-output';
 
 type BrowserChatMessage = {
   id: string;
@@ -464,7 +473,7 @@ const BrowserChatScreenshotPreviewContext = createContext<{
 function browserChatRenderableScreenshots(tool: BrowserChatToolCall) {
   const paths = new Set<string>();
   return (tool.screenshots || []).flatMap((screenshot): BrowserChatRenderableScreenshot[] => {
-    if (browserChatScreenshotIsInternalDocumentPreview(tool.name, screenshot)) return [];
+    if (browserChatScreenshotIsInternalDocumentPreview(screenshot)) return [];
     const path = screenshot.path?.trim();
     const url = artifactApiUrl(path);
     if (!path || !url || paths.has(path)) return [];
@@ -556,14 +565,6 @@ function applyBrowserChatInterruptGuard(
       : session,
   };
 }
-
-type BrowserChatToolDetail = {
-  confirmationScreenshotUrl?: string;
-  stepIndex: number;
-  step: StepExecutionResult;
-  toolIndex: number;
-  tool: BrowserChatToolCall;
-};
 
 type BrowserChatMessageRecordPage = {
   history: { cursor?: string; hasMore: boolean };
@@ -871,184 +872,6 @@ function embeddedSessionIdFromGroupId(groupId?: string) {
 
 const BrowserChatReasoningVisibilityContext = createContext(false);
 
-function stringFromUnknown(value: unknown): string {
-  if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (Array.isArray(value)) {
-    return value
-      .map((item) => stringFromUnknown(item))
-      .filter(Boolean)
-      .join('\n')
-      .trim();
-  }
-  if (value && typeof value === 'object') {
-    const record = value as Record<string, unknown>;
-    return stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
-  }
-  return '';
-}
-
-function arrayFromUnknown(value: unknown) {
-  return Array.isArray(value) ? value : [];
-}
-
-function textFromAiContentPart(part: Record<string, unknown>) {
-  return stringFromUnknown(part.text)
-    || stringFromUnknown(part.content)
-    || stringFromUnknown(part.reasoning)
-    || stringFromUnknown(part.value);
-}
-
-function toolReasonFromInput(input: unknown) {
-  const record = asRecord(input);
-  return stringFromUnknown(record?.reason)
-    || stringFromUnknown(record?.targetVisual)
-    || stringFromUnknown(record?.url)
-    || stringFromUnknown(record?.text)
-    || stringFromUnknown(record?.action);
-}
-
-function toolErrorFromUnknown(value: unknown) {
-  const details: string[] = [];
-  const seen = new WeakSet<object>();
-  const visit = (current: unknown, depth = 0) => {
-    if (depth > 6 || current === null || current === undefined) return;
-    if (typeof current === 'string') {
-      const text = stripAnsiControlCodes(current).trim();
-      if (text && !details.includes(text)) details.push(text);
-      return;
-    }
-    const record = asRecord(current);
-    if (!record || seen.has(record)) return;
-    seen.add(record);
-    visit(record.message, depth + 1);
-    if (Array.isArray(record.issues)) {
-      for (const issue of record.issues) {
-        const item = asRecord(issue);
-        const path = Array.isArray(item?.path) ? item.path.map(String).join('.') : '';
-        const message = stringFromUnknown(item?.message);
-        if (message) details.push(`${path ? `参数 ${path}: ` : ''}${message}`);
-      }
-    }
-    visit(record.cause, depth + 1);
-    visit(record.error, depth + 1);
-  };
-  visit(value);
-  return [...new Set(details)].join('；') || '工具参数解析失败：运行时未返回可识别的错误详情';
-}
-
-function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
-  const record = asRecord(part);
-  if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
-  const type = String(record.type || '').toLowerCase();
-  if (type === 'reasoning') {
-    const text = textFromAiContentPart(record);
-    return { parts: text ? [{ index: 0, kind: 'reasoning' }] : [], reasoning: text ? [text] : [], texts: [], tools: [] };
-  }
-  if (type === 'text') {
-    const text = textFromAiContentPart(record);
-    return { parts: text ? [{ index: 0, kind: 'text' }] : [], reasoning: [], texts: text ? [text] : [], tools: [] };
-  }
-  if (type === 'tool-call' || type === 'tool_call') {
-    const name = stringFromUnknown(record.toolName) || stringFromUnknown(record.name) || stringFromUnknown(record.tool);
-    if (!name) return { parts: [], reasoning: [], texts: [], tools: [] };
-    const input = record.input ?? record.args ?? record.arguments;
-    const invalid = record.invalid === true;
-    return {
-      parts: [{ index: 0, kind: 'tool' }],
-      reasoning: [],
-      texts: [],
-      tools: [{
-        id: stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id) || name,
-        input,
-        name,
-        reason: toolReasonFromInput(input),
-        invalid,
-        error: invalid ? toolErrorFromUnknown(record.error) : undefined,
-      }],
-    };
-  }
-  return { parts: [], reasoning: [], texts: [], tools: [] };
-}
-
-function applyToolResultToAiOutput(output: BrowserChatAiOutputView, part: unknown) {
-  const record = asRecord(part);
-  if (!record) return false;
-  const type = String(record.type || '').toLowerCase();
-  if (type !== 'tool-result' && type !== 'tool_result' && type !== 'tool-error' && type !== 'tool_error') return false;
-  const id = stringFromUnknown(record.toolCallId) || stringFromUnknown(record.id);
-  if (!id) return true;
-  const transportSucceeded = type === 'tool-result' || type === 'tool_result';
-  const rawResult = transportSucceeded ? (record.output ?? record.result) : (record.error ?? record.output ?? record.result);
-  const businessResult = asRecord(rawResult);
-  const succeeded = transportSucceeded && (typeof businessResult?.ok !== 'boolean' || businessResult.ok);
-  const result = stringFromUnknown(businessResult?.actual)
-    || stringFromUnknown(businessResult?.error)
-    || textFromAiContentPart(businessResult || { value: rawResult })
-    || (succeeded ? 'Tool completed.' : toolErrorFromUnknown(rawResult));
-  const tool = [...output.tools].reverse().find((item) => item.id === id);
-  if (!tool) return true;
-  tool.ok = succeeded;
-  tool.result = result;
-  tool.rawResult = rawResult;
-  if (!succeeded) tool.error = result;
-  return true;
-}
-
-function mergeAiOutputView(target: BrowserChatAiOutputView, source: BrowserChatAiOutputView) {
-  const offsets = {
-    reasoning: target.reasoning.length,
-    text: target.texts.length,
-    tool: target.tools.length,
-  };
-  target.parts.push(...source.parts.map((part) => ({
-    ...part,
-    index: part.index + offsets[part.kind],
-  })));
-  target.reasoning.push(...source.reasoning);
-  target.texts.push(...source.texts);
-  target.tools.push(...source.tools);
-}
-
-function aiOutputViewFromContentParts(parts: unknown[]) {
-  const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
-  for (const part of parts) {
-    if (!applyToolResultToAiOutput(output, part)) mergeAiOutputView(output, normalizeAiContentPart(part));
-  }
-  return output;
-}
-
-export function aiOutputViewFromResponse(response: unknown) {
-  const record = asRecord(response);
-  if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
-  const output: BrowserChatAiOutputView = { parts: [], reasoning: [], texts: [], tools: [] };
-  mergeAiOutputView(output, aiOutputViewFromContentParts(arrayFromUnknown(record.content)));
-  if (!output.reasoning.length && !output.texts.length) {
-    const reasoningText = stringFromUnknown(record.reasoningText);
-    if (reasoningText) mergeAiOutputView(output, normalizeAiContentPart({ type: 'reasoning', text: reasoningText }));
-    const text = stringFromUnknown(record.text);
-    if (text) mergeAiOutputView(output, normalizeAiContentPart({ type: 'text', text }));
-  }
-  if (!output.tools.length) {
-    for (const toolCall of arrayFromUnknown(record.toolCalls)) {
-      mergeAiOutputView(output, normalizeAiContentPart({ ...asRecord(toolCall), type: 'tool-call' }));
-    }
-  }
-  const steps = arrayFromUnknown(record.steps);
-  if (steps.length && !output.reasoning.length && !output.tools.length) {
-    mergeAiOutputView(output, aiOutputViewFromResponse(steps.at(-1)));
-  }
-  const result = asRecord(record.result);
-  if (result && !output.reasoning.length && !output.tools.length && !output.texts.length) {
-    mergeAiOutputView(output, aiOutputViewFromResponse(result));
-  }
-  return output;
-}
-
-function hasAiOutputView(output: BrowserChatAiOutputView) {
-  return Boolean(output.reasoning.length || output.texts.length || output.tools.length);
-}
-
 function embeddedGroupIdsForChatSession(session?: BrowserChatSession, includeSessionGroup = true) {
   if (!session) return [];
   return Array.from(new Set([
@@ -1068,167 +891,6 @@ async function discardEmbeddedBrowserDataForSessions(
   for (const groupId of groupIds) {
     await bridge.discardGroup({ clearStorage: true, id: groupId }).catch(() => undefined);
   }
-}
-
-function aiCycleToolKey(cycleId: string, toolIndex: number) {
-  return `${cycleId}:${toolIndex}`;
-}
-
-function toolInputSignature(value: unknown) {
-  const canonicalize = (input: unknown): unknown => {
-    if (Array.isArray(input)) return input.map(canonicalize);
-    if (!input || typeof input !== 'object') return input;
-    const record = input as Record<string, unknown>;
-    return Object.fromEntries(Object.keys(record)
-      .filter((key) => key !== 'reason' && key !== 'requiresConfirmation' && key !== 'confirmationMessage')
-      .sort()
-      .map((key) => [key, canonicalize(record[key])]));
-  };
-  try {
-    return JSON.stringify(canonicalize(value)) || '';
-  } catch {
-    return '';
-  }
-}
-
-export function buildAiCycleToolDetailMap(cycles: BrowserChatAiOutputCycle[], steps: StepExecutionResult[], running = false) {
-  const details = new Map<string, BrowserChatToolDetail>();
-  const persistedToolsById = new Map<string, BrowserChatToolDetail[]>();
-  const persistedTools: BrowserChatToolDetail[] = [];
-  const consumedPersistedTools = new Set<BrowserChatToolDetail>();
-  const consumedProviderResultIds = new Set<string>();
-
-  steps.forEach((step) => {
-    (step.tools || []).forEach((tool, toolIndex) => {
-      const detail = {
-        stepIndex: step.index,
-        step,
-        toolIndex,
-        tool,
-      };
-      if (tool.id) {
-        const matches = persistedToolsById.get(tool.id) || [];
-        matches.push(detail);
-        persistedToolsById.set(tool.id, matches);
-      }
-      persistedTools.push(detail);
-    });
-  });
-
-  cycles.forEach((cycle) => {
-    const unmatched: Array<{ aiTool: BrowserChatAiOutputTool; aiToolIndex: number }> = [];
-    let matchedInCycle = false;
-    cycle.output.tools.forEach((aiTool, aiToolIndex) => {
-      const belongsToCycle = (candidate: BrowserChatToolDetail) => (
-        candidate.tool.name === aiTool.name
-        && (typeof cycle.stepIndex !== 'number' || candidate.stepIndex === cycle.stepIndex)
-      );
-      const idMatches = aiTool.id ? persistedToolsById.get(aiTool.id) : undefined;
-      const detail = idMatches
-        ? [...idMatches].sort((left, right) => {
-          const score = (candidate: BrowserChatToolDetail) => (
-            (candidate.tool.rawResult !== undefined ? 8 : 0)
-            + (candidate.tool.result !== undefined ? 4 : 0)
-            + (candidate.tool.ok !== undefined ? 2 : 0)
-          );
-          return score(right) - score(left);
-        }).find((candidate) => (
-          !consumedPersistedTools.has(candidate) && belongsToCycle(candidate)
-        ))
-        : undefined;
-      if (detail) {
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), detail);
-        consumedPersistedTools.add(detail);
-        matchedInCycle = true;
-        return;
-      }
-      // The same provider call can be present in a duplicated response cycle.
-      // Once its persisted trace was consumed, do not render a fictional second
-      // running tool in a later duplicate cycle.
-      if (idMatches?.length) return;
-      // If persistence has not caught up yet, the provider result is still an
-      // exact association. Synthesize a temporary card at the call's original
-      // position, but do not pretend it is persisted tool #0. That false index
-      // caused tools #1/#2 to be rendered again by the fallback timeline.
-      if (aiTool.ok !== undefined) {
-        const providerResultId = `${cycle.stepIndex ?? 'unknown'}:${aiTool.id || `${cycle.id}:${aiToolIndex}`}`;
-        if (consumedProviderResultIds.has(providerResultId)) return;
-        consumedProviderResultIds.add(providerResultId);
-        const tool: BrowserChatToolCall = {
-          id: aiTool.id || `${cycle.id}:${aiToolIndex}`,
-          input: aiTool.input,
-          name: aiTool.name,
-          reason: aiTool.reason,
-          ok: aiTool.ok,
-          result: aiTool.result,
-          rawResult: aiTool.rawResult,
-          ...(aiTool.ok ? {} : { error: aiTool.error || aiTool.result }),
-        };
-        const stepIndex = typeof cycle.stepIndex === 'number' ? cycle.stepIndex : -1;
-        const step: StepExecutionResult = {
-          index: stepIndex,
-          messageId: cycle.messageId,
-          action: aiTool.name,
-          expected: 'Tool execution result',
-          actual: aiTool.result || (aiTool.ok ? 'Tool completed.' : 'Tool failed.'),
-          status: aiTool.ok ? 'passed' : 'failed',
-          tools: [tool],
-        };
-        details.set(aiCycleToolKey(cycle.id, aiToolIndex), { stepIndex, step, toolIndex: -1, tool });
-        matchedInCycle = true;
-        return;
-      }
-      // Never infer ownership from matching tool names and arguments. One model
-      // cycle may propose several calls while the runtime executes only one,
-      // then retry an identical call in a later cycle. Argument matching moves
-      // that later execution card above the text that actually triggered it.
-      // Persisted traces without an exact call ID are rendered by the fallback
-      // step timeline instead of being attached to a guessed provider cycle.
-      unmatched.push({ aiTool, aiToolIndex });
-    });
-
-    let optimisticToolShown = false;
-    unmatched.forEach(({ aiTool, aiToolIndex }) => {
-      // A provider may emit several calls in one response while the runtime is
-      // intentionally limited to one executed tool per model step. Once one
-      // call from the cycle has a real trace, the remaining valid calls are
-      // proposals that were never executed, not additional running tools.
-      if (!aiTool.invalid && (matchedInCycle || !running || optimisticToolShown)) return;
-      if (!aiTool.invalid) optimisticToolShown = true;
-      const stepIndex = typeof cycle.stepIndex === 'number' ? cycle.stepIndex : -1;
-      const pendingExecution = running && !aiTool.invalid;
-      const parseError = aiTool.invalid
-        ? aiTool.error || '工具参数解析失败'
-        : '工具没有返回执行记录';
-      const invalidTool: BrowserChatToolCall = {
-        id: aiTool.id || `${cycle.id}:${aiToolIndex}`,
-        name: aiTool.name,
-        input: aiTool.input,
-        reason: aiTool.reason,
-        invalid: aiTool.invalid,
-        error: parseError,
-        ok: pendingExecution ? undefined : false,
-        result: parseError,
-      };
-      const invalidStep: StepExecutionResult = {
-        index: stepIndex,
-        messageId: cycle.messageId,
-        action: aiTool.name,
-        expected: aiTool.invalid ? '有效的工具参数' : '工具执行结果',
-        actual: parseError,
-        status: pendingExecution ? 'running' : 'failed',
-        tools: [invalidTool],
-      };
-      details.set(aiCycleToolKey(cycle.id, aiToolIndex), {
-        stepIndex,
-        step: invalidStep,
-        toolIndex: 0,
-        tool: invalidTool,
-      });
-    });
-  });
-
-  return details;
 }
 
 function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
@@ -1305,9 +967,6 @@ function browserChatToolLabel(name: string, input: unknown, t: (value: string) =
     memory: '记忆管理',
     skill: '读取 Skill',
     subagent: '子 Agent',
-    downloadFile: '下载文件',
-    generateFile: '生成文件',
-    readFile: '读取文件',
     readSubagent: '读取子 Agent',
     spawnSubagents: '子 Agent',
     waitForHumanVerification: '等待人工验证',
@@ -2063,6 +1722,41 @@ function browserChatUIMessageSteps(messages: BrowserChatUIMessage[], sessionId: 
     .flatMap((message) => message.parts.flatMap((part) => part.type === 'data-step' ? [part.data] : []));
 }
 
+function browserChatUIMessageOutputCycles(messages: BrowserChatUIMessage[], sessionId: string) {
+  return messages
+    .filter((message) => message.role === 'assistant' && message.metadata?.sessionId === sessionId)
+    .flatMap((message) => message.parts.flatMap((part) => part.type === 'data-outputCycle' ? [part.data] : []));
+}
+
+function appendMissingBrowserChatOutputCycles(
+  current: BrowserChatAiOutputCycle[] | undefined,
+  incoming: BrowserChatAiOutputCycle[],
+) {
+  if (!incoming.length) return current || emptyBrowserChatOutputCycles;
+  const ids = new Set((current || []).map((cycle) => cycle.id));
+  const additions = incoming.filter((cycle) => !ids.has(cycle.id));
+  return additions.length ? [...(current || []), ...additions] : current || emptyBrowserChatOutputCycles;
+}
+
+function browserChatUIMessageSubagents(messages: BrowserChatUIMessage[], sessionId: string) {
+  return messages
+    .filter((message) => message.role === 'assistant' && message.metadata?.sessionId === sessionId)
+    .flatMap((message) => message.parts.flatMap((part) => part.type === 'data-subagent' ? [part.data] : []));
+}
+
+function insertBrowserChatMessageChronologically(
+  current: BrowserChatMessage[],
+  message: BrowserChatMessage,
+) {
+  const createdAt = message.createdAt || '';
+  const index = current.findIndex((item) => (item.createdAt || '') > createdAt);
+  if (index < 0) {
+    current.push(message);
+    return;
+  }
+  current.splice(index, 0, message);
+}
+
 function overlayBrowserChatUIMessages(
   messages: BrowserChatMessage[],
   uiMessages: BrowserChatUIMessage[],
@@ -2087,7 +1781,7 @@ function overlayBrowserChatUIMessages(
         message.role === 'user' && clientMessageId && message.clientMessageId === clientMessageId
       ));
       if (userIndex >= 0) result[userIndex] = { ...result[userIndex], ...streamedUser };
-      else result.push(streamedUser);
+      else insertBrowserChatMessageChronologically(result, streamedUser);
       continue;
     }
     const streamed: BrowserChatMessage = {
@@ -2107,9 +1801,9 @@ function overlayBrowserChatUIMessages(
       || (clientMessageId && message.role === 'assistant' && message.clientMessageId === clientMessageId)
     ));
     if (index >= 0) result[index] = { ...result[index], ...streamed };
-    else result.push(streamed);
+    else insertBrowserChatMessageChronologically(result, streamed);
   }
-  return result.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  return result;
 }
 
 function normalizeSession(session: BrowserChatSession): BrowserChatSession {
@@ -2119,20 +1813,27 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
     consoleErrors: session.consoleErrors || [],
     history: normalizeBrowserChatHistory(session.history),
     logs: session.logs || [],
-    messages: (session.messages || []).map((message) => ({
-      ...message,
-      attachments: message.attachments || [],
-      content: message.role === 'assistant' && message.status === 'interrupted'
+    messages: (session.messages || []).map((message) => {
+      const content = message.role === 'assistant' && message.status === 'interrupted'
         ? browserChatInterruptedReply
-        : stringFromUnknown(message.content),
-      parts: Array.isArray(message.parts)
+        : stringFromUnknown(message.content);
+      const attachments = message.attachments || [];
+      const parts = Array.isArray(message.parts)
         ? message.parts
-        : stringFromUnknown(message.content).trim()
-          ? [{ type: 'text', text: stringFromUnknown(message.content) }]
-          : [],
-      role: message.role === 'assistant' ? 'assistant' : 'user',
-      stepIndexes: Array.isArray(message.stepIndexes) ? message.stepIndexes : [],
-    })),
+        : content.trim()
+          ? [{ type: 'text' as const, text: content }]
+          : [];
+      const role = message.role === 'assistant' ? 'assistant' as const : 'user' as const;
+      const stepIndexes = Array.isArray(message.stepIndexes) ? message.stepIndexes : [];
+      if (
+        content === message.content
+        && attachments === message.attachments
+        && parts === message.parts
+        && role === message.role
+        && stepIndexes === message.stepIndexes
+      ) return message;
+      return { ...message, attachments, content, parts, role, stepIndexes };
+    }),
     safetyMode: normalizeSafetyMode(session.safetyMode),
     modelProvider: modelSelection.provider,
     model: modelSelection.model,
@@ -2147,7 +1848,7 @@ function normalizeSession(session: BrowserChatSession): BrowserChatSession {
               ? 'failed'
               : 'idle'),
     networkErrors: session.networkErrors || [],
-    outputCycles: sortBrowserChatAiOutputCycles(session.outputCycles || []),
+    outputCycles: session.outputCycles || [],
     pendingToolConfirmation: session.busy && session.status === 'running'
       ? normalizeToolConfirmation(session.pendingToolConfirmation)
       : undefined,
@@ -2179,6 +1880,23 @@ function browserChatRealtimePatch(value: unknown): BrowserChatSessionRealtimePat
   return parseBrowserChatRealtimePatch<BrowserChatSessionRealtimePatch>(value);
 }
 
+function mergeBrowserChatRealtimeSubagents(
+  current: BrowserChatSubagentRecord[] | undefined,
+  incoming: Array<Partial<BrowserChatSubagentRecord> & Pick<BrowserChatSubagentRecord, 'id'>> | undefined,
+) {
+  const currentById = new Map((current || []).map((record) => [record.id, record]));
+  return mergeBrowserChatRealtimeRecords(current, incoming).map((record) => {
+    const previous = currentById.get(record.id);
+    if (!previous) return record;
+    if (record.updatedAt && previous.updatedAt && record.updatedAt < previous.updatedAt) return previous;
+    if (
+      (previous.status === 'stopped' || previous.status === 'passed' || previous.status === 'failed')
+      && (record.status === 'running' || record.status === 'queued')
+    ) return previous;
+    return { ...record, toolCount: Math.max(previous.toolCount || 0, record.toolCount || 0) };
+  });
+}
+
 function mergeBrowserChatSessionRealtimePatch(
   current: BrowserChatSession,
   patch: BrowserChatSessionRealtimePatch,
@@ -2198,7 +1916,7 @@ function mergeBrowserChatSessionRealtimePatch(
   // Gating them on the session header timestamp recreates the same apparent
   // freeze even when messages/steps are merged correctly.
   const outputCycles = mergeBrowserChatRealtimeRecords(current.outputCycles, sessionPatch.outputCycles);
-  const subagents = mergeBrowserChatRealtimeRecords(current.subagents, sessionPatch.subagents);
+  const subagents = mergeBrowserChatRealtimeSubagents(current.subagents, sessionPatch.subagents);
   return normalizeSession({
     ...current,
     ...(applySessionPatch ? sessionPatch : {}),
@@ -2213,6 +1931,43 @@ function mergeBrowserChatSessionRealtimePatch(
 
 function sessionSortTime(session: BrowserChatSession) {
   return session.updatedAt || session.createdAt || '';
+}
+
+function upsertBrowserChatSessionByRecency(
+  current: BrowserChatSession[],
+  incoming: BrowserChatSession,
+) {
+  const existingIndex = current.findIndex((item) => item.id === incoming.id);
+  if (existingIndex >= 0) {
+    const incomingTime = sessionSortTime(incoming);
+    const previousTime = existingIndex > 0 ? sessionSortTime(current[existingIndex - 1]) : undefined;
+    const followingTime = existingIndex + 1 < current.length
+      ? sessionSortTime(current[existingIndex + 1])
+      : undefined;
+    const remainsInPlace = (previousTime === undefined || previousTime >= incomingTime)
+      && (followingTime === undefined || incomingTime >= followingTime);
+    if (remainsInPlace) {
+      if (current[existingIndex] === incoming) return current;
+      const next = [...current];
+      next[existingIndex] = incoming;
+      return next;
+    }
+  }
+
+  const remaining = existingIndex < 0
+    ? [...current]
+    : [...current.slice(0, existingIndex), ...current.slice(existingIndex + 1)];
+  const incomingTime = sessionSortTime(incoming);
+  const insertionIndex = remaining.findIndex((item) => sessionSortTime(item) < incomingTime);
+  remaining.splice(insertionIndex < 0 ? remaining.length : insertionIndex, 0, incoming);
+  return remaining;
+}
+
+function removeBrowserChatSessionById(current: BrowserChatSession[], sessionId: string) {
+  const index = current.findIndex((item) => item.id === sessionId);
+  return index < 0
+    ? current
+    : [...current.slice(0, index), ...current.slice(index + 1)];
 }
 
 function sessionSidebarTime(session: BrowserChatSession, language: 'zh' | 'en') {
@@ -2255,321 +2010,6 @@ function sessionTitleAttachments(session: BrowserChatSession) {
 function sessionTitleParts(session: BrowserChatSession) {
   return browserChatSessionTitleParts(session.title, sessionTitleAttachments(session));
 }
-
-const BROWSER_CHAT_DOWNLOAD_EXTENSIONS = new Set([
-  '.7z',
-  '.apk',
-  '.bin',
-  '.bz2',
-  '.csv',
-  '.deb',
-  '.dmg',
-  '.doc',
-  '.docx',
-  '.exe',
-  '.gz',
-  '.ipa',
-  '.msi',
-  '.pkg',
-  '.ppt',
-  '.pptx',
-  '.rar',
-  '.rpm',
-  '.tar',
-  '.tgz',
-  '.xls',
-  '.xlsx',
-  '.xz',
-  '.zip',
-]);
-
-function normalizeBrowserChatMarkdownHref(href: string) {
-  const trimmed = href.trim();
-  if (!trimmed) return '';
-  if (/^[./?#/]/.test(trimmed)) {
-    try {
-      return new URL(trimmed, typeof window === 'undefined' ? 'http://127.0.0.1/' : window.location.href).toString();
-    } catch {
-      return '';
-    }
-  }
-  return normalizeEmbeddedBrowserAddress(trimmed);
-}
-
-function isBrowserChatDownloadHref(href: string) {
-  const normalizedHref = normalizeBrowserChatMarkdownHref(href);
-  if (!normalizedHref) return false;
-  try {
-    const parsed = new URL(normalizedHref);
-    const downloadValue = parsed.searchParams.get('download');
-    if (downloadValue !== null && !/^(0|false|no)$/i.test(downloadValue)) return true;
-    const attachmentValue = [
-      parsed.searchParams.get('content-disposition'),
-      parsed.searchParams.get('response-content-disposition'),
-    ].filter(Boolean).join(' ').toLowerCase();
-    if (attachmentValue.includes('attachment')) return true;
-    const pathname = decodeURIComponent(parsed.pathname || '').toLowerCase();
-    const extension = pathname.match(/\.([a-z0-9]{1,8})$/)?.[0] || '';
-    return BROWSER_CHAT_DOWNLOAD_EXTENSIONS.has(extension);
-  } catch {
-    return false;
-  }
-}
-
-function handleBrowserChatMarkdownLinkClick(event: ReactMouseEvent<HTMLAnchorElement>, href?: string) {
-  const rawHref = String(href || '').trim();
-  if (!rawHref || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-  if (rawHref.startsWith('#') || /^(javascript|mailto|tel):/i.test(rawHref)) return;
-  const url = normalizeBrowserChatMarkdownHref(rawHref);
-  if (!url) return;
-  if (isBrowserChatDownloadHref(rawHref)) {
-    const systemBridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
-    if (!systemBridge?.downloadUrl) return;
-    event.preventDefault();
-    systemBridge.downloadUrl({ url }).catch(() => undefined);
-    return;
-  }
-  const bridge = typeof window === 'undefined' ? undefined : window.webPilotEmbeddedBrowser;
-  if (!bridge) return;
-  event.preventDefault();
-  bridge.createTab({ url }).catch(() => undefined);
-}
-
-function BrowserChatMarkdownTable({ children }: { children: ReactNode }) {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const contentScrollRef = useRef<HTMLDivElement | null>(null);
-  const stickyHeaderRef = useRef<HTMLDivElement | null>(null);
-  const stickyScrollbarRef = useRef<HTMLDivElement | null>(null);
-  const stickyScrollbarContentRef = useRef<HTMLDivElement | null>(null);
-
-  useLayoutEffect(() => {
-    const root = rootRef.current;
-    const contentScroll = contentScrollRef.current;
-    const stickyHeader = stickyHeaderRef.current;
-    const stickyScrollbar = stickyScrollbarRef.current;
-    const stickyScrollbarContent = stickyScrollbarContentRef.current;
-    const contentTable = contentScroll?.querySelector<HTMLTableElement>('.table__content');
-    const messageList = root?.closest('.browser-chat-message-list') as HTMLElement | null;
-    if (!root || !contentScroll || !contentTable || !stickyHeader || !stickyScrollbar || !stickyScrollbarContent || !messageList) {
-      return undefined;
-    }
-
-    let frame = 0;
-    let synchronizingScroll = false;
-
-    const syncStickyHeader = () => {
-      const sourceHeader = contentTable.querySelector<HTMLTableSectionElement>('.table__header');
-      if (!sourceHeader) {
-        stickyHeader.replaceChildren();
-        return;
-      }
-      const clonedTable = contentTable.cloneNode(false) as HTMLTableElement;
-      const clonedHeader = sourceHeader.cloneNode(true) as HTMLTableSectionElement;
-      clonedTable.setAttribute('aria-hidden', 'true');
-      clonedTable.append(clonedHeader);
-      clonedTable.style.width = `${contentTable.offsetWidth}px`;
-      clonedTable.style.minWidth = `${contentTable.offsetWidth}px`;
-      const sourceColumns = sourceHeader.querySelectorAll<HTMLElement>('.table__column');
-      const clonedColumns = clonedHeader.querySelectorAll<HTMLElement>('.table__column');
-      sourceColumns.forEach((column, index) => {
-        const clonedColumn = clonedColumns[index];
-        if (!clonedColumn) return;
-        const width = column.getBoundingClientRect().width;
-        clonedColumn.style.maxWidth = `${width}px`;
-        clonedColumn.style.minWidth = `${width}px`;
-        clonedColumn.style.width = `${width}px`;
-      });
-      stickyHeader.replaceChildren(clonedTable);
-    };
-
-    const syncHorizontalPosition = (scrollLeft: number) => {
-      const clonedTable = stickyHeader.querySelector<HTMLTableElement>('.table__content');
-      if (clonedTable) clonedTable.style.transform = `translateX(${-scrollLeft}px)`;
-    };
-
-    const updateFloatingElements = () => {
-      frame = 0;
-      const messageListRect = messageList.getBoundingClientRect();
-      const contentRect = contentScroll.getBoundingClientRect();
-      const rootRect = root.getBoundingClientRect();
-      const viewportTop = messageListRect.top + messageList.clientTop;
-      const viewportBottom = viewportTop + messageList.clientHeight;
-      const viewportLeft = messageListRect.left + messageList.clientLeft;
-      const viewportRight = viewportLeft + messageList.clientWidth;
-      const visibleLeft = Math.max(contentRect.left, viewportLeft);
-      const visibleRight = Math.min(contentRect.right, viewportRight);
-      const visibleWidth = Math.max(0, visibleRight - visibleLeft);
-      const sourceHeader = contentTable.querySelector<HTMLElement>('.table__header');
-      const headerHeight = sourceHeader?.getBoundingClientRect().height || 0;
-      const headerVisible = Boolean(
-        headerHeight
-        && visibleWidth
-        && rootRect.top < viewportTop
-        && rootRect.bottom > viewportTop + headerHeight,
-      );
-      stickyHeader.classList.toggle('is-visible', headerVisible);
-      stickyHeader.style.left = `${visibleLeft}px`;
-      stickyHeader.style.top = `${viewportTop}px`;
-      stickyHeader.style.width = `${visibleWidth}px`;
-      syncHorizontalPosition(contentScroll.scrollLeft);
-
-      const horizontallyScrollable = contentScroll.scrollWidth > contentScroll.clientWidth + 1;
-      const scrollbarHeight = Math.max(12, stickyScrollbar.offsetHeight);
-      const scrollbarVisible = Boolean(
-        horizontallyScrollable
-        && visibleWidth
-        && rootRect.top < viewportBottom - scrollbarHeight
-        && rootRect.bottom > viewportBottom,
-      );
-      stickyScrollbar.classList.toggle('is-visible', scrollbarVisible);
-      stickyScrollbar.style.left = `${visibleLeft}px`;
-      stickyScrollbar.style.top = `${viewportBottom - scrollbarHeight}px`;
-      stickyScrollbar.style.width = `${visibleWidth}px`;
-      stickyScrollbarContent.style.width = `${contentScroll.scrollWidth}px`;
-      if (!synchronizingScroll && stickyScrollbar.scrollLeft !== contentScroll.scrollLeft) {
-        stickyScrollbar.scrollLeft = contentScroll.scrollLeft;
-      }
-    };
-
-    const scheduleUpdate = () => {
-      if (frame) return;
-      frame = requestAnimationFrame(updateFloatingElements);
-    };
-
-    const handleContentScroll = () => {
-      if (!synchronizingScroll) {
-        synchronizingScroll = true;
-        stickyScrollbar.scrollLeft = contentScroll.scrollLeft;
-        synchronizingScroll = false;
-      }
-      syncHorizontalPosition(contentScroll.scrollLeft);
-    };
-
-    const handleStickyScrollbarScroll = () => {
-      if (synchronizingScroll) return;
-      synchronizingScroll = true;
-      contentScroll.scrollLeft = stickyScrollbar.scrollLeft;
-      syncHorizontalPosition(stickyScrollbar.scrollLeft);
-      synchronizingScroll = false;
-    };
-
-    const refreshLayout = () => {
-      syncStickyHeader();
-      scheduleUpdate();
-    };
-
-    const resizeObserver = typeof ResizeObserver === 'function'
-      ? new ResizeObserver(refreshLayout)
-      : undefined;
-    resizeObserver?.observe(root);
-    resizeObserver?.observe(contentScroll);
-    resizeObserver?.observe(contentTable);
-    resizeObserver?.observe(messageList);
-    const mutationObserver = new MutationObserver(refreshLayout);
-    mutationObserver.observe(contentTable, { characterData: true, childList: true, subtree: true });
-    contentScroll.addEventListener('scroll', handleContentScroll, { passive: true });
-    stickyScrollbar.addEventListener('scroll', handleStickyScrollbarScroll, { passive: true });
-    messageList.addEventListener('scroll', scheduleUpdate, { passive: true });
-    window.addEventListener('resize', refreshLayout);
-    window.addEventListener('scroll', scheduleUpdate, true);
-    refreshLayout();
-
-    return () => {
-      if (frame) cancelAnimationFrame(frame);
-      resizeObserver?.disconnect();
-      mutationObserver.disconnect();
-      contentScroll.removeEventListener('scroll', handleContentScroll);
-      stickyScrollbar.removeEventListener('scroll', handleStickyScrollbarScroll);
-      messageList.removeEventListener('scroll', scheduleUpdate);
-      window.removeEventListener('resize', refreshLayout);
-      window.removeEventListener('scroll', scheduleUpdate, true);
-      stickyHeader.replaceChildren();
-    };
-  }, [children]);
-
-  return (
-    <div className="browser-chat-markdown-table-scroll table-root table-root--primary" ref={rootRef}>
-      <div aria-hidden="true" className="browser-chat-markdown-table-sticky-header" ref={stickyHeaderRef} />
-      <div className="table__scroll-container" ref={contentScrollRef}>
-        <table className="table__content">{children}</table>
-      </div>
-      <div aria-hidden="true" className="browser-chat-markdown-table-sticky-scrollbar" ref={stickyScrollbarRef}>
-        <div ref={stickyScrollbarContentRef} />
-      </div>
-    </div>
-  );
-}
-
-const BrowserChatSessionIdContext = createContext<string | undefined>(undefined);
-
-const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
-  const sessionId = useContext(BrowserChatSessionIdContext);
-  const normalizedMarkdown = useMemo(() => normalizeBrowserChatMarkdown(markdown), [markdown]);
-  const blocks = useMemo(() => splitBrowserChatChartBlocks(normalizedMarkdown), [normalizedMarkdown]);
-  return (
-    <div className="browser-chat-agent-markdown">
-      {blocks.map((block, index) => block.kind === 'chart' ? (
-        <BrowserChatChart chartId={block.chartId} key={`${block.chartId}:${index}`} sessionId={sessionId} />
-      ) : (
-        <ReactMarkdown
-          key={`markdown:${index}`}
-          rehypePlugins={[rehypeKatex]}
-          remarkPlugins={[remarkGfm, remarkMath, remarkBrowserChatCjkStrong]}
-          components={{
-            a: ({ href, onClick, ...props }) => (
-              <a
-                {...props}
-                href={href}
-                onClick={(event) => {
-                  onClick?.(event);
-                  handleBrowserChatMarkdownLinkClick(event, href);
-                }}
-                target="_blank"
-                rel="noopener noreferrer"
-              />
-            ),
-            table: ({ children }) => <BrowserChatMarkdownTable>{children}</BrowserChatMarkdownTable>,
-            thead: ({ children }) => <thead className="table__header">{children}</thead>,
-            tbody: ({ children }) => <tbody className="table__body">{children}</tbody>,
-            tr: ({ children }) => <tr className="table__row">{children}</tr>,
-            th: ({ children }) => <th className="table__column">{children}</th>,
-            td: ({ children }) => <td className="table__cell">{children}</td>,
-          }}
-        >
-          {block.markdown}
-        </ReactMarkdown>
-      ))}
-    </div>
-  );
-});
-
-const BrowserChatOrderedResponse = memo(function BrowserChatOrderedResponse({
-  fallbackText,
-  parts,
-}: {
-  fallbackText: string;
-  parts?: BrowserChatUIMessagePart[];
-}) {
-  const sessionId = useContext(BrowserChatSessionIdContext);
-  const responseParts = (parts || []).filter((part) => (
-    part.type === 'text' || part.type === 'data-chart' || part.type === 'data-ui'
-  ));
-  if (!responseParts.length) return fallbackText.trim() ? <BrowserChatMarkdown markdown={fallbackText} /> : null;
-  return <div className="browser-chat-ordered-response">{responseParts.map((part, index) => {
-    if (part.type === 'text') return <BrowserChatMarkdown key={`text:${index}`} markdown={part.text} />;
-    if (part.type === 'data-chart') {
-      return <BrowserChatChart chartId={part.data.chartId} key={part.id || `${part.data.chartId}:${index}`} sessionId={sessionId} />;
-    }
-    if (part.type === 'data-ui') {
-      return <BrowserChatDataUI
-        key={part.id || `ui:${index}`}
-        renderMarkdown={(markdown) => <BrowserChatMarkdown markdown={markdown} />}
-        tree={part.data.tree}
-      />;
-    }
-    return null;
-  })}</div>;
-});
 
 const BrowserChatDownloadCenter = memo(function BrowserChatDownloadCenter({
   anchorOnly = false,
@@ -4282,7 +3722,7 @@ type BrowserChatSubagentView = {
   instruction: string;
   createdAt: string;
   updatedAt: string;
-  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed';
+  status: 'queued' | 'running' | 'passed' | 'blocked' | 'failed' | 'stopped';
   content: string;
   summary?: string;
   resumable: boolean;
@@ -4296,6 +3736,8 @@ type BrowserChatSubagentPanelContextValue = {
   selectedSubagentId: string | null;
   closeSubagent: () => void;
   openSubagent: (subagentId: string) => void;
+  stopSubagent: (subagentId: string) => void | Promise<void>;
+  stoppingSubagentIds: ReadonlySet<string>;
 };
 
 const BrowserChatSubagentPanelContext = createContext<BrowserChatSubagentPanelContextValue | null>(null);
@@ -4315,6 +3757,7 @@ function browserChatClampSubagentPanelWidth(width: number) {
 
 function browserChatSubagentStatusPresentation(subagent: Pick<BrowserChatSubagentView, 'status' | 'summary'>) {
   if (subagent.status === 'passed') return { className: 'status-passed', label: '已完成' };
+  if (subagent.status === 'stopped') return { className: 'status-failed', label: '已停止' };
   if (subagent.status === 'failed' && subagent.summary?.trim()) return { className: 'status-partial', label: '已返回结果' };
   if (subagent.status === 'failed') return { className: 'status-failed', label: '执行失败' };
   if (subagent.status === 'blocked') return { className: 'status-blocked', label: '等待处理' };
@@ -4364,7 +3807,11 @@ const BrowserChatSubagentDetail = memo(function BrowserChatSubagentDetail({
     content: operationRunning ? subagent.content : subagent.summary || subagent.content,
     createdAt: subagent.createdAt,
     updatedAt: subagent.updatedAt,
-    status: subagent.status === 'queued' ? 'running' : subagent.status,
+    status: subagent.status === 'queued'
+      ? 'running'
+      : subagent.status === 'stopped'
+        ? 'interrupted'
+        : subagent.status,
     stepIndexes: subagent.steps.map((step) => step.index),
     activity: operationRunning && subagent.currentAction
       ? {
@@ -4602,11 +4049,13 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
       ) : null}
       {subagents.map((subagent) => {
         const status = browserChatSubagentStatusPresentation(subagent);
+        const stoppable = subagent.status === 'running' || subagent.status === 'queued';
+        const stopping = panel?.stoppingSubagentIds.has(subagent.id) ?? false;
         const pendingConfirmation = pendingToolConfirmation?.subagentId === subagent.id
           ? pendingToolConfirmation
           : undefined;
         return (
-          <div className="browser-chat-subagent-item" key={subagent.id}>
+          <div className={`browser-chat-subagent-item${stoppable ? ' is-stoppable' : ''}`} key={subagent.id}>
             <button
               aria-haspopup="dialog"
               aria-pressed={panel?.selectedSubagentId === subagent.id}
@@ -4633,6 +4082,18 @@ const BrowserChatSubagentList = memo(function BrowserChatSubagentList({
               </span>
               <PanelRight aria-hidden="true" className="browser-chat-subagent-row-open" size={15} />
             </button>
+            {stoppable ? (
+              <button
+                aria-label={t('停止子 Agent')}
+                className="browser-chat-subagent-stop"
+                disabled={stopping}
+                onClick={() => void panel?.stopSubagent(subagent.id)}
+                title={t('停止子 Agent')}
+                type="button"
+              >
+                {stopping ? <Loader2 className="spin" size={13} /> : <Square aria-hidden="true" fill="currentColor" size={12} />}
+              </button>
+            ) : null}
             <BrowserChatToolConfirmationActions
               pending={pendingConfirmation}
               resolvingConfirmationAction={resolvingConfirmationAction}
@@ -4808,23 +4269,6 @@ const BrowserChatProcessDisclosure = memo(function BrowserChatProcessDisclosure(
   );
 });
 
-const BrowserChatStreamingAnswer = memo(function BrowserChatStreamingAnswer({
-  hidden,
-  running,
-  text,
-}: {
-  hidden: boolean;
-  running: boolean;
-  text: string;
-}) {
-  if (hidden || !text.trim()) return null;
-  return (
-    <div className={`browser-chat-answer${running ? ' is-streaming' : ''}`}>
-      <BrowserChatMarkdown markdown={text} />
-    </div>
-  );
-});
-
 const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline({
   artifactFilesExpanded,
   logs: liveLogs,
@@ -4907,31 +4351,21 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
   const rawAiOutputCycles = useMemo(() => (
     sortBrowserChatAiOutputCycles(outputCycles.filter((cycle) => !cycle.subagentId))
   ), [outputCycles]);
-  const acceptedTerminalCycleId = message.status === 'passed'
-    ? rawAiOutputCycles[browserChatTerminalAnswerCycleIndex(rawAiOutputCycles)]?.id
-    : undefined;
   const aiOutputCycles = useMemo(() => rawAiOutputCycles
     .map((cycle) => {
-      const showCycleText = browserChatAiCycleTextIsAccepted(
-        message.status,
-        cycle,
-        cycle.id === acceptedTerminalCycleId,
-      );
-      if (showReasoning && showCycleText) return cycle;
+      if (showReasoning) return cycle;
       return {
         ...cycle,
         output: {
           ...cycle.output,
           parts: cycle.output.parts.filter((part) => (
-            (showReasoning || part.kind !== 'reasoning')
-            && (showCycleText || part.kind !== 'text')
+            part.kind !== 'reasoning'
           )),
-          reasoning: showReasoning ? cycle.output.reasoning : [],
-          texts: showCycleText ? cycle.output.texts : [],
+          reasoning: [],
         },
       };
     })
-    .filter((cycle) => hasAiOutputView(cycle.output)), [acceptedTerminalCycleId, message.status, rawAiOutputCycles, showReasoning]);
+    .filter((cycle) => hasAiOutputView(cycle.output)), [rawAiOutputCycles, showReasoning]);
   const terminalAnswerCycleIndex = message.status === 'passed'
     ? browserChatTerminalAnswerCycleIndex(aiOutputCycles)
     : -1;
@@ -5179,12 +4613,10 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               />
             )
           ))}
-          {running && !finalTextAnchoredToToolCycle ? (
-            <BrowserChatStreamingAnswer
-              hidden={hideManualVerificationStatusText}
-              running={textStreaming}
-              text={finalText}
-            />
+          {running && hasFinalResponse && !finalTextAnchoredToToolCycle ? (
+            <div className={`browser-chat-answer${textStreaming ? ' is-streaming' : ''}`}>
+              <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : finalText} parts={message.parts} />
+            </div>
           ) : null}
           {currentTimelineEntries.length ? (
             <div className="browser-chat-tool-stack browser-chat-current-tool-stack">
@@ -5371,9 +4803,6 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
                 ) : null}
               </div>
             ) : null}
-            {/* <time className="browser-chat-message-time" dateTime={messageUpdateTime(item)}>
-              最后更新 {formatLogTime(messageUpdateTime(item))}
-            </time> */}
           </>
         )}
         {item.role === 'assistant' ? (
@@ -5419,6 +4848,36 @@ function browserChatAssistantMessageHasVisibleText(message: BrowserChatMessage, 
     [],
     () => outputCycles.flatMap((cycle) => cycle.output.texts),
   );
+}
+
+const emptyBrowserChatSteps: StepExecutionResult[] = [];
+const emptyBrowserChatOutputCycles: BrowserChatAiOutputCycle[] = [];
+const emptyBrowserChatSubagents: BrowserChatSubagentRecord[] = [];
+const emptyBrowserChatLogRecords: BrowserChatLogRecord[] = [];
+const emptyBrowserChatUIMessages: BrowserChatUIMessage[] = [];
+
+function useBrowserChatRecordsByMessageId<TRecord extends { messageId?: string }>(records: TRecord[]) {
+  const previousGroupsRef = useRef(new Map<string, TRecord[]>());
+  return useMemo(() => {
+    const groups = new Map<string, TRecord[]>();
+    for (const record of records) {
+      if (!record.messageId) continue;
+      const group = groups.get(record.messageId) || [];
+      group.push(record);
+      groups.set(record.messageId, group);
+    }
+    for (const [messageId, group] of groups) {
+      const previous = previousGroupsRef.current.get(messageId);
+      if (
+        previous?.length === group.length
+        && group.every((record, index) => previous[index] === record)
+      ) {
+        groups.set(messageId, previous);
+      }
+    }
+    previousGroupsRef.current = groups;
+    return groups;
+  }, [records]);
 }
 
 const BrowserChatExecutedGroup = memo(function BrowserChatExecutedGroup({
@@ -5525,6 +4984,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onResolveToolConfirmation,
   onResumeHumanVerification,
   onSelectTool,
+  onStopSubagent,
   onShowLogs,
   pendingToolConfirmation,
   resolvingConfirmationAction,
@@ -5534,6 +4994,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   sessionAwaitingHuman,
   sessionId,
   sessionBusy,
+  stoppingSubagentIds,
   subagents,
   stepsByIndex,
 }: {
@@ -5558,6 +5019,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   onResolveToolConfirmation?: (confirmationId: string, action: BrowserChatToolConfirmationAction) => void | Promise<void>;
   onResumeHumanVerification?: () => void | Promise<void>;
   onSelectTool: (detail: BrowserChatToolDetail) => void;
+  onStopSubagent: (subagentId: string) => void | Promise<void>;
   onShowLogs: (messageId: string) => void;
   pendingToolConfirmation?: BrowserChatToolConfirmation;
   resolvingConfirmationAction?: BrowserChatToolConfirmationAction | null;
@@ -5567,6 +5029,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
   sessionAwaitingHuman?: boolean;
   sessionId?: string;
   sessionBusy: boolean;
+  stoppingSubagentIds: ReadonlySet<string>;
   subagents: BrowserChatSubagentRecord[];
   stepsByIndex: Map<number, StepExecutionResult>;
 }) {
@@ -5605,8 +5068,15 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     selectedSubagentId,
     closeSubagent,
     openSubagent,
-  }), [closeSubagent, openSubagent, selectedSubagentId]);
+    stopSubagent: onStopSubagent,
+    stoppingSubagentIds,
+  }), [closeSubagent, onStopSubagent, openSubagent, selectedSubagentId, stoppingSubagentIds]);
   const screenshotPreviewContext = useMemo(() => ({ open: openScreenshotPreview }), [openScreenshotPreview]);
+  const stepRecords = useMemo(() => [...stepsByIndex.values()], [stepsByIndex]);
+  const mainOutputCycles = useMemo(() => outputCycles.filter((cycle) => !cycle.subagentId), [outputCycles]);
+  const stepsByMessageId = useBrowserChatRecordsByMessageId(stepRecords);
+  const outputCyclesByMessageId = useBrowserChatRecordsByMessageId(mainOutputCycles);
+  const subagentsByMessageId = useBrowserChatRecordsByMessageId(subagents);
   const getScrollContainer = useCallback(() => {
     return scrollRef.current;
   }, []);
@@ -5614,7 +5084,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     currentAssistantMessageId: lastAssistantMessageId,
     sessionBusy,
   }), [lastAssistantMessageId, messages, sessionBusy]);
-  const lastMessage = displayMessages[displayMessages.length - 1];
   const expandedArtifactMessageId = useMemo(
     () => browserChatCurrentTurnAssistantMessageId(displayMessages),
     [displayMessages],
@@ -5629,21 +5098,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         || Boolean(sessionAwaitingHuman && message.id === lastAssistantMessageId)
         || browserChatAssistantMessageHasVisibleText(
           message,
-          outputCycles.filter((cycle) => cycle.messageId === message.id && !cycle.subagentId),
+          outputCyclesByMessageId.get(message.id) || emptyBrowserChatOutputCycles,
         )
       ),
       browserChatAssistantMessageHasExecutionMetadata,
     ),
-    [displayMessages, lastAssistantMessageId, logIndex, outputCycles, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
+    [displayMessages, lastAssistantMessageId, logIndex, outputCyclesByMessageId, pendingToolConfirmation?.messageId, sessionAwaitingHuman],
   );
-  const scrollKey = [
-    sessionId || '',
-    messages.length,
-    lastMessage?.id || '',
-    lastMessage?.updatedAt || '',
-    pendingToolConfirmation?.id || '',
-    sessionBusy ? 'busy' : 'idle',
-  ].join(':');
+  const firstMessageId = messages[0]?.id || '';
 
   const addLoadedHistoryHeight = useCallback(() => {
     const pending = pendingHistoryHeightRef.current;
@@ -5698,13 +5160,17 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     if (
       !sessionChanged
       && pendingHistoryHeight
-      && messages[0]?.id !== pendingHistoryHeight.firstMessageId
+      && firstMessageId !== pendingHistoryHeight.firstMessageId
     ) {
       settleHistoryHeight();
       return undefined;
     }
     if (earlierLoadInFlightRef.current) return undefined;
-    if (!initialPositioning && !sessionChanged && !followLatestRef.current) return undefined;
+    // Ongoing text/tool updates are handled by the coalesced observers below.
+    // Reading scrollHeight here on every streamed message forces a synchronous
+    // layout before React can paint and is the main source of timeline stalls.
+    if (!initialPositioning && !sessionChanged) return undefined;
+    if (!sessionChanged && !followLatestRef.current) return undefined;
     const scrollToBottom = () => {
       const container = getScrollContainer();
       if (!container) return;
@@ -5716,7 +5182,6 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
       setShowScrollToBottom(false);
     };
     scrollToBottom();
-    if (!initialPositioning && !sessionChanged) return undefined;
     // Streaming updates can render more frequently than animation frames. Waiting for
     // several stable frames here allowed every update to cancel the ready callback,
     // leaving the conversation permanently hidden behind the positioning overlay.
@@ -5725,7 +5190,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
     messageList?.setAttribute('data-scroll-ready', 'true');
     onInitialPositioned?.(sessionId);
     return undefined;
-  }, [getScrollContainer, messages, onInitialPositioned, scrollKey, sessionId, settleHistoryHeight]);
+  }, [firstMessageId, getScrollContainer, onInitialPositioned, sessionId, settleHistoryHeight]);
 
   const trackScrollPosition = useCallback(() => {
     const container = getScrollContainer();
@@ -5942,15 +5407,10 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
           );
         }
         const item = entry.item;
-        const declaredStepIndexes = item.stepIndexes || [];
-        const itemSteps = declaredStepIndexes.length
-          ? declaredStepIndexes
-            .map((stepIndex) => stepsByIndex.get(stepIndex))
-            .filter((step): step is StepExecutionResult => step?.messageId === item.id)
-          : [...stepsByIndex.values()].filter((step) => step.messageId === item.id);
-        const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : [];
-        const itemOutputCycles = outputCycles.filter((cycle) => cycle.messageId === item.id);
-        const itemSubagents = subagents.filter((subagent) => subagent.messageId === item.id);
+        const itemSteps = stepsByMessageId.get(item.id) || emptyBrowserChatSteps;
+        const itemLogs = item.role === 'assistant' ? browserChatLogsForMessage(item, logIndex) : emptyBrowserChatLogRecords;
+        const itemOutputCycles = outputCyclesByMessageId.get(item.id) || emptyBrowserChatOutputCycles;
+        const itemSubagents = subagentsByMessageId.get(item.id) || emptyBrowserChatSubagents;
         return (
           <BrowserChatMessageItem
             artifactFilesExpanded={item.id === expandedArtifactMessageId}
@@ -6996,14 +6456,6 @@ function embeddedBrowserDisplayUrl(tab?: EmbeddedBrowserTab) {
   return url;
 }
 
-function normalizeEmbeddedBrowserAddress(value: string) {
-  const trimmed = value.trim();
-  if (!trimmed) return '';
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || /^(about|data|file|blob):/i.test(trimmed)) return trimmed;
-  if (/^(localhost|127\.0\.0\.1|\[::1\])(?::|\/|$)/i.test(trimmed)) return `http://${trimmed}`;
-  return `https://${trimmed}`;
-}
-
 function EmbeddedBrowserTabFavicon({ faviconUrl }: { faviconUrl?: string }) {
   const [failed, setFailed] = useState(false);
 
@@ -7739,15 +7191,7 @@ function BrowserChatWebPreviewModal({
               type?: string;
               width?: number;
             };
-            if (message.type === 'frame') {
-              const legacyMessage = message as BrowserChatPreviewFrame & { data?: string };
-              frameCountersRef.current.received += 1;
-              queuePreviewFrame({
-                ...message,
-                imageUrl: legacyMessage.imageUrl || `data:${message.contentType};base64,${legacyMessage.data || ''}`,
-              });
-              frameStateRef.current = { tabs: message.tabs, url: message.url, viewport: message.viewport };
-            } else if (message.type === 'tabsChanged' && Array.isArray(message.tabs)) {
+            if (message.type === 'tabsChanged' && Array.isArray(message.tabs)) {
               setNativeControl(null);
               frameStateRef.current = { ...frameStateRef.current, tabs: message.tabs };
               setFrame((current) => current ? { ...current, tabs: message.tabs } : current);
@@ -9683,9 +9127,9 @@ export function BrowserChatWorkspace({
   const applySessionListPage = useCallback((incoming: BrowserChatSession[]) => {
     const normalized = incoming.map((item) => compactBrowserChatSessionForList(normalizeSession(item)));
     setSessions((current) => {
-      const byId = new Map(current.map((item) => [item.id, item]));
-      for (const item of normalized) byId.set(item.id, item);
-      return [...byId.values()].sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
+      let next = current;
+      for (const item of normalized) next = upsertBrowserChatSessionByRecency(next, item);
+      return next;
     });
   }, []);
   const {
@@ -9738,6 +9182,7 @@ export function BrowserChatWorkspace({
   const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
   const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
   const [resumingHumanVerification, setResumingHumanVerification] = useState(false);
+  const [stoppingSubagentIds, setStoppingSubagentIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState('');
   const [downloads, setDownloads] = useState<SystemDownloadItem[]>([]);
   const removedDownloadIdsRef = useRef(new Set<string>());
@@ -9788,21 +9233,25 @@ export function BrowserChatWorkspace({
     stop: stopCurrentUIMessage,
   } = useChat<BrowserChatUIMessage>({
     chat: currentUIChat,
-    throttle: 50,
+    throttle: 100,
   });
+  const currentUIMessageTransportActive = currentUIMessageStatus === 'submitted'
+    || currentUIMessageStatus === 'streaming';
+  const activeCurrentRequestUIMessages = currentUIMessageTransportActive
+    ? currentRequestUIMessages
+    : emptyBrowserChatUIMessages;
   const currentUIMessageOwnerRef = useRef(new Map<string, string>());
   useEffect(() => {
     const owners = new Map<string, string>();
-    for (const message of currentRequestUIMessages) {
-      const sessionId = message.metadata?.sessionId;
-      const clientMessageId = message.metadata?.clientMessageId;
-      const requestActive = currentUIMessageStatus === 'submitted' || currentUIMessageStatus === 'streaming';
-      if (sessionId && clientMessageId && (requestActive || message.metadata?.status === 'running' || message.metadata?.status === 'queued')) {
-        owners.set(sessionId, clientMessageId);
+    if (currentUIMessageTransportActive) {
+      for (const message of activeCurrentRequestUIMessages) {
+        const sessionId = message.metadata?.sessionId;
+        const clientMessageId = message.metadata?.clientMessageId;
+        if (sessionId && clientMessageId) owners.set(sessionId, clientMessageId);
       }
     }
     currentUIMessageOwnerRef.current = owners;
-  }, [currentRequestUIMessages, currentUIMessageStatus]);
+  }, [activeCurrentRequestUIMessages, currentUIMessageTransportActive]);
   const sessionUiKey = `${session?.userId || requestUserId}:${session?.id || 'new'}`;
   const selectedSessionRunning = isBrowserChatSessionRunning(session);
   const selectedRunningSession = selectedSessionRunning ? session : undefined;
@@ -9816,11 +9265,32 @@ export function BrowserChatWorkspace({
   );
   const steps = useMemo(() => {
     const persisted = session?.steps || [];
-    const streamed = browserChatUIMessageSteps(currentRequestUIMessages, session?.id || '');
-    const byIndex = new Map(persisted.map((step) => [step.index, step]));
-    for (const step of streamed) byIndex.set(step.index, step);
-    return [...byIndex.values()].sort((left, right) => left.index - right.index);
-  }, [currentRequestUIMessages, session?.id, session?.steps]);
+    const streamed = browserChatUIMessageSteps(activeCurrentRequestUIMessages, session?.id || '');
+    let merged = persisted;
+    for (const step of streamed) {
+      const existingIndex = merged.findIndex((item) => item.index === step.index);
+      if (existingIndex >= 0) {
+        if (merged[existingIndex] === step) continue;
+        const next = [...merged];
+        next[existingIndex] = step;
+        merged = next;
+        continue;
+      }
+      const insertionIndex = merged.findIndex((item) => item.index > step.index);
+      merged = insertionIndex < 0
+        ? [...merged, step]
+        : [...merged.slice(0, insertionIndex), step, ...merged.slice(insertionIndex)];
+    }
+    return merged;
+  }, [activeCurrentRequestUIMessages, session?.id, session?.steps]);
+  const outputCycles = useMemo(() => appendMissingBrowserChatOutputCycles(
+    session?.outputCycles,
+    browserChatUIMessageOutputCycles(activeCurrentRequestUIMessages, session?.id || ''),
+  ), [activeCurrentRequestUIMessages, session?.id, session?.outputCycles]);
+  const subagents = useMemo(() => mergeBrowserChatRealtimeSubagents(
+    session?.subagents,
+    browserChatUIMessageSubagents(activeCurrentRequestUIMessages, session?.id || ''),
+  ), [activeCurrentRequestUIMessages, session?.id, session?.subagents]);
   const logs = useMemo(() => session?.logs || [], [session?.logs]);
   const generationSkillsById = useMemo(() => new Map(skills.map((skill) => [skill.id, skill])), [skills]);
   const liveToolDialog = useMemo(() => {
@@ -9848,9 +9318,9 @@ export function BrowserChatWorkspace({
   }, [logs, steps, toolDialog]);
   const visibleMessages = useMemo(() => overlayBrowserChatUIMessages(
     messages,
-    currentRequestUIMessages,
+    activeCurrentRequestUIMessages,
     session?.id || '',
-  ), [currentRequestUIMessages, messages, session?.id]);
+  ), [activeCurrentRequestUIMessages, messages, session?.id]);
   const generatableMessageOptions = useMemo(() => visibleMessages.flatMap((message, messageIndex) => {
     if (message.role !== 'assistant' || message.status === 'running') return [];
     const declaredStepIndexes = new Set(message.stepIndexes || []);
@@ -10163,14 +9633,12 @@ export function BrowserChatWorkspace({
     }
   }, [browserChatApiUrl, loadingEarlierHistory, session]);
   const sidebarSessions = useMemo(() => {
-    const merged = new Map<string, BrowserChatSession>();
-    for (const item of sessions) merged.set(item.id, item);
-    if (session) merged.set(session.id, session);
-    return [...merged.values()]
-      .filter((item) => item.hasMessages || item.messages.length)
-      .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
+    const merged = session
+      ? upsertBrowserChatSessionByRecency(sessions, compactBrowserChatSessionForList(session))
+      : sessions;
+    return merged.filter((item) => item.hasMessages || item.messages.length);
   }, [session, sessions]);
-  const recentSessions = useMemo(() => sidebarSessions, [sidebarSessions]);
+  const recentSessions = sidebarSessions;
   const filteredRecentSessions = useMemo(() => {
     const query = historyFilter.trim().toLocaleLowerCase();
     if (!query) return recentSessions;
@@ -10376,8 +9844,7 @@ export function BrowserChatWorkspace({
       const existing = current.find((item) => item.id === normalized.id);
       const merged = mergeBrowserChatSessionWindow(existing, normalized);
       const accepted = isOlderSessionSnapshot(merged, existing) ? existing || merged : merged;
-      const next = [compactBrowserChatSessionForList(accepted), ...current.filter((item) => item.id !== normalized.id)];
-      return next.sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
+      return upsertBrowserChatSessionByRecency(current, compactBrowserChatSessionForList(accepted));
     });
     return normalized;
   }, []);
@@ -10526,25 +9993,40 @@ export function BrowserChatWorkspace({
     setModelId((current) => resolveRuntimeModelSelection(modelConfig, { model: current, provider: modelProvider }).model);
   }, [modelConfig, modelProvider]);
 
-  const handleRealtimeRefresh = useCallback((event: import('@/lib/realtime-refresh').RealtimeRefreshEvent) => {
-    if (event.deleted) {
-      interruptGuardsRef.current.delete(event.id);
-      setSessions((current) => current.filter((item) => item.id !== event.id));
-      if (activeSessionIdRef.current === event.id) {
-        activeSessionIdRef.current = null;
+  const handleRealtimeRefresh = useCallback((events: readonly RealtimeRefreshEvent[]) => {
+    const updates: Array<{
+      event: RealtimeRefreshEvent;
+      patch?: BrowserChatSessionRealtimePatch;
+    }> = [];
+    const deletedIds = new Set<string>();
+    for (const event of events) {
+      if (event.deleted) {
+        deletedIds.add(event.id);
+        interruptGuardsRef.current.delete(event.id);
+        updates.push({ event });
+        continue;
       }
-      setSession((current) => (current?.id === event.id ? null : current));
-      setSelectedSessionIds((current) => current.filter((id) => id !== event.id));
-      return;
+      const patch = browserChatRealtimePatch(event.patch);
+      if (patch) updates.push({ event, patch });
     }
-    const patch = browserChatRealtimePatch(event.patch);
-    if (!patch) return;
-    if (activeSessionIdRef.current === event.id) {
-      setSession((current) => {
-        if (current?.id !== event.id) return current;
+    if (!updates.length) return;
+    if (activeSessionIdRef.current && deletedIds.has(activeSessionIdRef.current)) {
+      activeSessionIdRef.current = null;
+    }
+    if (deletedIds.size) {
+      setSelectedSessionIds((current) => current.filter((id) => !deletedIds.has(id)));
+    }
+    setSession((current) => {
+      let next = current;
+      for (const { event, patch } of updates) {
+        if (event.deleted) {
+          if (next?.id === event.id) next = null;
+          continue;
+        }
+        if (!patch || next?.id !== event.id) continue;
         const ownedClientMessageId = currentUIMessageOwnerRef.current.get(event.id);
         const ownedMessageIds = new Set([
-          ...current.messages.filter((message) => (
+          ...next.messages.filter((message) => (
             ownedClientMessageId && message.clientMessageId === ownedClientMessageId
           )).map((message) => message.id),
           ...(patch.messages || []).filter((message) => (
@@ -10557,28 +10039,37 @@ export function BrowserChatWorkspace({
           steps: patch.steps?.filter((step) => !step.messageId || !ownedMessageIds.has(step.messageId)),
           removedMessageIds: patch.removedMessageIds?.filter((messageId) => !ownedMessageIds.has(messageId)),
         } : patch;
-        const merged = mergeBrowserChatSessionRealtimePatch(current, sessionPatch);
+        const merged = mergeBrowserChatSessionRealtimePatch(next, sessionPatch);
         const guarded = applyBrowserChatInterruptGuard(merged, interruptGuardsRef.current.get(event.id));
         if (guarded.release) interruptGuardsRef.current.delete(event.id);
-        return guarded.session;
-      });
-    }
+        next = guarded.session;
+      }
+      return next;
+    });
     setSessions((current) => {
-      const existing = current.find((item) => item.id === event.id);
-      const summaryIsCurrent = patch.summary && (!existing
-        || !existing.updatedAt
-        || !patch.summary.updatedAt
-        || patch.summary.updatedAt >= existing.updatedAt);
-      const nextSummary = summaryIsCurrent && patch.summary
-        ? normalizeSession(patch.summary)
-        : existing
-          ? mergeBrowserChatSessionRealtimePatch(existing, patch)
-          : undefined;
-      if (!nextSummary) return current;
-      const guarded = applyBrowserChatInterruptGuard(nextSummary, interruptGuardsRef.current.get(event.id));
-      if (guarded.release) interruptGuardsRef.current.delete(event.id);
-      return [compactBrowserChatSessionForList(guarded.session), ...current.filter((item) => item.id !== event.id)]
-        .sort((a, b) => sessionSortTime(b).localeCompare(sessionSortTime(a)));
+      let next = current;
+      for (const { event, patch } of updates) {
+        if (event.deleted) {
+          next = removeBrowserChatSessionById(next, event.id);
+          continue;
+        }
+        if (!patch) continue;
+        const existing = next.find((item) => item.id === event.id);
+        const summaryIsCurrent = patch.summary && (!existing
+          || !existing.updatedAt
+          || !patch.summary.updatedAt
+          || patch.summary.updatedAt >= existing.updatedAt);
+        const nextSummary = summaryIsCurrent && patch.summary
+          ? normalizeSession(patch.summary)
+          : existing
+            ? mergeBrowserChatSessionRealtimePatch(existing, patch)
+            : undefined;
+        if (!nextSummary) continue;
+        const guarded = applyBrowserChatInterruptGuard(nextSummary, interruptGuardsRef.current.get(event.id));
+        if (guarded.release) interruptGuardsRef.current.delete(event.id);
+        next = upsertBrowserChatSessionByRecency(next, compactBrowserChatSessionForList(guarded.session));
+      }
+      return next;
     });
   }, []);
 
@@ -10848,6 +10339,30 @@ export function BrowserChatWorkspace({
     } finally {
       window.clearTimeout(requestTimeout);
       releaseInterrupting();
+    }
+  }
+
+  async function stopSubagent(subagentId: string) {
+    const sessionId = session?.id;
+    const normalizedSubagentId = subagentId.trim();
+    if (!sessionId || !normalizedSubagentId || stoppingSubagentIds.has(normalizedSubagentId)) return;
+    setStoppingSubagentIds((current) => new Set(current).add(normalizedSubagentId));
+    setError('');
+    try {
+      const response = await fetch(browserChatApiUrl(
+        `/api/browser-chat/${encodeURIComponent(sessionId)}/subagents/${encodeURIComponent(normalizedSubagentId)}/stop`,
+      ), { method: 'POST' });
+      const data = await readApiJson<{ session: BrowserChatSession }>(response, '停止子 Agent 失败');
+      if (data.session) upsertSession(data.session, { activate: activeSessionIdRef.current === sessionId });
+    } catch (stopError) {
+      setError(stopError instanceof Error ? stopError.message : '停止子 Agent 失败');
+      await refreshSession(sessionId, { activate: activeSessionIdRef.current === sessionId }).catch(() => undefined);
+    } finally {
+      setStoppingSubagentIds((current) => {
+        const next = new Set(current);
+        next.delete(normalizedSubagentId);
+        return next;
+      });
     }
   }
 
@@ -11649,7 +11164,7 @@ export function BrowserChatWorkspace({
           lastAssistantMessageId={lastAssistantMessageId}
           logIndex={logIndex}
           messages={visibleMessages}
-          outputCycles={session?.outputCycles || []}
+          outputCycles={outputCycles}
           onGenerateAutomationCase={generateMessageAutomationCase}
           onGenerateSkill={generateMessageSkill}
           onDeleteQueuedMessage={deleteQueuedMessage}
@@ -11660,6 +11175,7 @@ export function BrowserChatWorkspace({
           onResolveToolConfirmation={resolveToolConfirmation}
           onResumeHumanVerification={resumeHumanVerification}
           onSelectTool={showToolDetails}
+          onStopSubagent={stopSubagent}
           onShowLogs={showMessageLogs}
           pendingToolConfirmation={session?.pendingToolConfirmation}
           resolvingConfirmationAction={resolvingConfirmationAction}
@@ -11669,7 +11185,8 @@ export function BrowserChatWorkspace({
           sessionAwaitingHuman={session?.turnState === 'awaiting_human'}
           sessionId={session?.id}
           sessionBusy={selectedSessionRunning}
-          subagents={session?.subagents || []}
+          stoppingSubagentIds={stoppingSubagentIds}
+          subagents={subagents}
           stepsByIndex={stepsByIndex}
         />
       ) : (
@@ -11748,30 +11265,18 @@ export function BrowserChatWorkspace({
   return (
     <BrowserChatReasoningVisibilityContext.Provider value={showReasoning}>
     <section className={sidebarCollapsed ? 'browser-chat-layout browser-chat-conversation-layout sidebar-collapsed' : 'browser-chat-layout browser-chat-conversation-layout'}>
-      <WorkspaceSidebar
+      <WorkspaceNavigationSidebar
+        activeKey="/browser-chat"
         collapsed={sidebarCollapsed}
-        collapseLabel={sidebarCollapsed ? t('展开侧边栏') : t('折叠侧边栏')}
         onToggleCollapse={toggleSidebarCollapsed}
         onThemeChange={setMode}
+        showAiOperations={requestUserId === '1'}
         themeMode={themeMode}
-        themeToggleLabel={themeMode === 'dark' ? t('切换到浅色模式') : t('切换到深色模式')}
-        themeToggleTitle={themeMode === 'dark' ? t('浅色模式') : t('深色模式')}
+        translate={t}
       >
-
-        <WorkspaceModeTabs
-          activeKey="/browser-chat"
-          aiOperationsLabel={t('AI 运营')}
-          ariaLabel={t('工作模式')}
-          automationLabel={t('自动化')}
-          collapsed={sidebarCollapsed}
-          conversationLabel={t('对话模式')}
-          settingsLabel={t('设置')}
-          showAiOperations={requestUserId === '1'}
-        />
-
         {renderSidebarDetail()}
 
-      </WorkspaceSidebar>
+      </WorkspaceNavigationSidebar>
 
       <main
         aria-busy={messageViewportPositioning}

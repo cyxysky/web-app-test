@@ -1,7 +1,7 @@
 'use client';
 
 import { Gauge, MessageCircleMore, PanelLeft, Settings, Workflow } from 'lucide-react';
-import { Tabs } from '@heroui/react';
+import { Tabs } from '@heroui/react/tabs';
 import { useRouter } from 'next/navigation';
 import { useEffect, useState, type ReactNode } from 'react';
 import type { ThemeMode } from '@/theme/ThemeProvider';
@@ -32,6 +32,15 @@ type WorkspaceModeTabsProps = {
   conversationLabel: string;
   settingsLabel: string;
   showAiOperations?: boolean;
+};
+
+type WorkspaceNavigationSidebarProps = Pick<
+  WorkspaceSidebarProps,
+  'children' | 'className' | 'collapsed' | 'onThemeChange' | 'onToggleCollapse' | 'themeMode'
+> & {
+  activeKey: WorkspaceModeKey;
+  showAiOperations?: boolean;
+  translate: (value: string) => string;
 };
 
 export function WorkspaceModeTabs({
@@ -147,5 +156,43 @@ export function WorkspaceSidebar({
         />
       </div>
     </aside>
+  );
+}
+
+export function WorkspaceNavigationSidebar({
+  activeKey,
+  children,
+  className,
+  collapsed,
+  onThemeChange,
+  onToggleCollapse,
+  showAiOperations,
+  themeMode,
+  translate,
+}: WorkspaceNavigationSidebarProps) {
+  const lightTheme = themeMode === 'dark';
+  return (
+    <WorkspaceSidebar
+      className={className}
+      collapsed={collapsed}
+      collapseLabel={translate(collapsed ? '展开侧边栏' : '折叠侧边栏')}
+      onToggleCollapse={onToggleCollapse}
+      onThemeChange={onThemeChange}
+      themeMode={themeMode}
+      themeToggleLabel={translate(lightTheme ? '切换到浅色模式' : '切换到深色模式')}
+      themeToggleTitle={translate(lightTheme ? '浅色模式' : '深色模式')}
+    >
+      <WorkspaceModeTabs
+        activeKey={activeKey}
+        aiOperationsLabel={translate('AI 运营')}
+        ariaLabel={translate('工作模式')}
+        automationLabel={translate('自动化')}
+        collapsed={collapsed}
+        conversationLabel={translate('对话模式')}
+        settingsLabel={translate('设置')}
+        showAiOperations={showAiOperations}
+      />
+      {children}
+    </WorkspaceSidebar>
   );
 }

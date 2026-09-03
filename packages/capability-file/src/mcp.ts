@@ -10,6 +10,11 @@ import { disposeUnoRuntime } from './node/office/uno.js';
 
 export type FileMcpOptions = NodeFileCapabilityOptions & {
   context?: CapabilityMcpServerOptions['context'];
+  configurations?: CapabilityMcpServerOptions['configurations'];
+  configStore?: CapabilityMcpServerOptions['configStore'];
+  configScope?: CapabilityMcpServerOptions['configScope'];
+  skillMode?: CapabilityMcpServerOptions['skillMode'];
+  skillToolName?: CapabilityMcpServerOptions['skillToolName'];
 };
 
 function createFileMcpCapability(options: FileMcpOptions): CapabilityProvider {
@@ -43,6 +48,11 @@ function serverOptions(options: FileMcpOptions): CapabilityMcpServerOptions {
     name: 'webpilot-file',
     version: '0.1.0',
     context: options.context,
+    configurations: options.configurations,
+    configStore: options.configStore,
+    configScope: options.configScope,
+    skillMode: options.skillMode,
+    skillToolName: options.skillToolName,
     providers: [createFileMcpCapability(options)],
   };
 }
