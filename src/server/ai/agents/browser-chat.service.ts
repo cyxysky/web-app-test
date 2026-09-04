@@ -2410,17 +2410,6 @@ function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMes
   const currentMessage = session.messages.find((message) => message.id === assistantMessageId);
   const currentContent = currentMessage?.content.trim() || '';
   preserveInterruptedModelContext(session, assistantMessageId, currentContent);
-  updateAssistantMessage(session, assistantMessageId, (message) => ({
-    ...message,
-    content: currentContent
-      ? currentContent.includes(browserChatInterruptionNote)
-        ? currentContent
-        : `${currentContent}\n\n${browserChatInterruptionNote}`
-      : browserChatInterruptedReply,
-    status: 'interrupted',
-    activity: undefined,
-    updatedAt: timestamp,
-  }));
   replaceSessionSteps(session, session.steps.map((step) => {
     if (step.status !== 'queued' && step.status !== 'running') return step;
     if (step.messageId !== assistantMessageId) return step;
@@ -2432,6 +2421,20 @@ function preserveInterruptedTurn(session: BrowserChatSessionRecord, assistantMes
       note: step.note?.includes(interruptionNote) ? step.note : [step.note, interruptionNote].filter(Boolean).join('\n'),
     };
   }));
+  updateAssistantMessage(session, assistantMessageId, (message) => {
+    const updated: BrowserChatMessage = {
+      ...message,
+      content: currentContent
+        ? currentContent.includes(browserChatInterruptionNote)
+          ? currentContent
+          : `${currentContent}\n\n${browserChatInterruptionNote}`
+        : browserChatInterruptedReply,
+      status: 'interrupted',
+      activity: undefined,
+      updatedAt: timestamp,
+    };
+    return { ...updated, parts: browserChatAssistantParts(session, updated) };
+  });
 }
 
 function shouldPreserveRuntimeTurn(existing: BrowserChatSessionRecord, fromDisk: BrowserChatSessionSnapshot) {
@@ -3167,6 +3170,10 @@ function schedulePersistAndNotify(sessionId: string) {
 }
 
 function persistInterruptedSessionInBackground(sessionId: string) {
+  // Publish the terminal message before the interrupt response returns so the
+  // active UI stream can finish with the complete interrupted turn. Durable
+  // storage remains asynchronous and must not delay cancellation.
+  publishBrowserChatUIStreamUpdate(sessionId);
   setTimeout(async () => {
     if (await persistAndNotify(sessionId, { mergePersisted: false })) return;
     schedulePersistAndNotify(sessionId);

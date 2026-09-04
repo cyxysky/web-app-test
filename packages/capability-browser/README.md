@@ -25,7 +25,12 @@ const provider = createNodeBrowserCapability({
 });
 ```
 
-Pass this provider to `mountAISDKCapabilities()` for AI SDK Agents. The returned
+Pass this provider to the framework-neutral `mountCapabilities()` entrypoint,
+map the resolved `browser` tool to the consuming TypeScript Agent framework,
+and inject the package Skill before Browser execution. See the complete
+[TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
+`mountAISDKCapabilities()` is the optional AI SDK convenience path. Its returned
 `agentOptions` contains both tools and eager/lazy Skill instructions; settings
 are loaded from the selected host configuration store before Browser runtime
 creation.

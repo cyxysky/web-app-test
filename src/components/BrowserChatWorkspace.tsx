@@ -39,9 +39,12 @@ import {
   ArrowLeft,
   ArrowRight,
   BadgeCheck,
+  BookOpen,
   Brain,
   Braces,
   Bug,
+  Cable,
+  ChartNoAxesCombined,
   Check,
   CircleAlert,
   CircleHelp,
@@ -51,6 +54,8 @@ import {
   Compass,
   CornerDownLeft,
   CheckCircle2,
+  Clapperboard,
+  Database,
   Download,
   FileOutput,
   FilePlus2,
@@ -59,6 +64,7 @@ import {
   Folder,
   FolderOpen,
   Gauge,
+  GitBranch,
   Globe,
   ImageIcon,
   ImageUp,
@@ -67,6 +73,7 @@ import {
   Loader2,
   Lock,
   MessageSquare,
+  MonitorCog,
   MoreHorizontal,
   MousePointer2,
   Network,
@@ -80,6 +87,7 @@ import {
   RefreshCw,
   Route,
   ScanSearch,
+  Search,
   ScrollText,
   SendHorizontal,
   Share2,
@@ -89,6 +97,7 @@ import {
   Sparkles,
   SquareArrowOutUpRight,
   Square,
+  SquareTerminal,
   Star,
   Trash2,
   UserRound,
@@ -963,14 +972,26 @@ function browserChatToolLabel(name: string, input: unknown, t: (value: string) =
     browserCode: '执行浏览器代码',
     contextCompression: '压缩上下文',
     chart: '生成图表',
+    codeSandbox: '代码沙箱',
+    communication: '通信',
+    computer: '计算机',
+    connectors: '连接器',
+    data: '数据',
     file: '文件操作',
     fileVisual: '视觉检查',
+    finalResponse: '生成回复',
+    git: 'Git',
+    knowledge: '知识库',
     memory: '记忆管理',
+    media: '媒体',
+    reportDefect: '报告缺陷',
+    research: '研究检索',
     skill: '读取 Skill',
     subagent: '子 Agent',
     readSubagent: '读取子 Agent',
     spawnSubagents: '子 Agent',
     waitForHumanVerification: '等待人工验证',
+    workflow: '工作流程',
   };
   if (labels[name]) return t(labels[name]);
 
@@ -1053,9 +1074,37 @@ function isSubagentSpawnTool(name: string, input: unknown) {
 
 function BrowserChatToolIcon({ input, name }: { input?: unknown; name: string }) {
   const lower = name.toLowerCase();
-  if (name === 'browser') return asRecord(input)?.action === 'code' ? <Braces size={13} /> : <Globe size={13} />;
+  const action = toolInputValue(asRecord(input), ['action']);
+  if (name === 'browser') return action === 'code' ? <Braces size={13} /> : <Globe size={13} />;
   if (name === 'browserCode') return <Braces size={13} />;
   if (name === 'contextCompression') return <Brain size={13} />;
+  if (name === 'codeSandbox') return <SquareTerminal size={13} />;
+  if (name === 'research') return <Search size={13} />;
+  if (name === 'connectors') return <Cable size={13} />;
+  if (name === 'knowledge') return <BookOpen size={13} />;
+  if (name === 'data') return <Database size={13} />;
+  if (name === 'media') {
+    if (action === 'transcribe') return <Volume2 size={13} />;
+    if (action === 'generateImage') return <Sparkles size={13} />;
+    if (action === 'ocr') return <ScanSearch size={13} />;
+    return <Clapperboard size={13} />;
+  }
+  if (name === 'communication') return action === 'send' ? <SendHorizontal size={13} /> : <MessageSquare size={13} />;
+  if (name === 'git') return <GitBranch size={13} />;
+  if (name === 'computer') {
+    if (action === 'click') return <MousePointer2 size={13} />;
+    if (action === 'type') return <PencilLine size={13} />;
+    if (action === 'key') return <CornerDownLeft size={13} />;
+    if (action === 'scroll') return <Route size={13} />;
+    if (action === 'screenshot') return <ImageIcon size={13} />;
+    return <MonitorCog size={13} />;
+  }
+  if (name === 'workflow') return <Workflow size={13} />;
+  if (name === 'chart') return <ChartNoAxesCombined size={13} />;
+  if (name === 'skill') return <Sparkles size={13} />;
+  if (name === 'memory') return <Brain size={13} />;
+  if (name === 'reportDefect') return <Bug size={13} />;
+  if (name === 'finalResponse') return <MessageSquare size={13} />;
   const filePresentation = browserChatFileToolPresentation(name, input);
   if (filePresentation) {
     const icons: Record<BrowserChatFileToolPresentationKey, ReactNode> = {
@@ -9329,7 +9378,6 @@ export function BrowserChatWorkspace({
   const {
     messages: currentRequestUIMessages,
     status: currentUIMessageStatus,
-    stop: stopCurrentUIMessage,
   } = useChat<BrowserChatUIMessage>({
     chat: currentUIChat,
     throttle: 100,
@@ -10132,7 +10180,17 @@ export function BrowserChatWorkspace({
             ownedClientMessageId && message.clientMessageId === ownedClientMessageId
           )).map((message) => message.id),
         ]);
-        const sessionPatch = ownedClientMessageId ? {
+        const ownedTurnReachedTerminalState = Boolean(ownedClientMessageId) && (
+          (patch.session.busy === false && patch.session.status !== 'running')
+          || (patch.messages || []).some((message) => (
+            message.role === 'assistant'
+            && message.clientMessageId === ownedClientMessageId
+            && Boolean(message.status)
+            && message.status !== 'running'
+            && message.status !== 'queued'
+          ))
+        );
+        const sessionPatch = ownedClientMessageId && !ownedTurnReachedTerminalState ? {
           ...patch,
           messages: patch.messages?.filter((message) => message.clientMessageId !== ownedClientMessageId),
           steps: patch.steps?.filter((step) => !step.messageId || !ownedMessageIds.has(step.messageId)),
@@ -10392,7 +10450,6 @@ export function BrowserChatWorkspace({
     }
     interruptingRef.current = true;
     setInterrupting(true);
-    await stopCurrentUIMessage().catch(() => undefined);
     setError('');
     const timestamp = new Date().toISOString();
     interruptGuardsRef.current.set(targetId, {

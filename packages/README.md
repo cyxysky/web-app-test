@@ -4,6 +4,21 @@ Each folder is an independently versioned and publishable npm package. Concrete
 capability cores do not import WebPilot application code; framework-specific
 dependencies are isolated behind explicit adapter entrypoints.
 
+## TypeScript Agent framework integration
+
+The primary integration path is framework-neutral:
+
+```text
+CapabilityProvider -> mountCapabilities() -> runtime tools and Skills -> Agent framework adapter
+```
+
+Any TypeScript Agent framework can register these packages by mapping the
+resolved JSON Schema tools to its native tool type. AI SDK and MCP are optional
+ready-made adapters, not the only supported runtimes. See the complete
+[TypeScript Agent framework integration guide](./capability-sdk/FRAMEWORK_INTEGRATION.md)
+for provider creation, mounting, tool conversion, Skill injection, execution,
+policy enforcement, result handling, and disposal.
+
 | Package | Responsibility |
 | --- | --- |
 | `@webpilot/capability-sdk` | Framework-neutral contracts and per-run registry |
@@ -34,11 +49,12 @@ package defaults, builds one configuration object per Capability id, and
 injects it through `CapabilityRunContext.configuration`. It includes memory,
 environment, JSON-file and TypeORM storage adapters; TypeORM uses the same
 Repository implementation for SQLite and PostgreSQL. Skills use one
-`CapabilitySkill` shape for AI SDK and MCP adapters. Concrete capability
-packages publish their Skills but never load or gate them during a capability
-call. The consuming Agent owns Skill preloading and tool availability. The AI
-SDK adapter exposes one-call mounting with eager or lazy Skill context, while
-MCP mounts the same providers and config store directly.
+`CapabilitySkill` shape for every TypeScript Agent framework integration.
+Concrete capability packages publish their Skills but never load or gate them during a capability
+call. The consuming Agent host owns Skill preloading and tool availability. A
+custom framework can adapt `CapabilityRunSnapshot.tools` directly; the AI SDK
+adapter exposes one-call mounting with eager or lazy Skill context, while MCP
+mounts the same providers and config store directly.
 
 Cloud images use exact published npm versions by building with:
 

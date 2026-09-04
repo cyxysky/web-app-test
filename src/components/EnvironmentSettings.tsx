@@ -49,6 +49,7 @@ import {
 import type { SensitiveDataEvaluationCase } from '@/lib/sensitive-data-evaluation';
 import { WorkspaceSidebarArchiveRow } from '@/components/WorkspaceSidebarArchive';
 import { useWorkspaceBrand } from '@/brand/WorkspaceBrandProvider';
+import { ExternalIntegrationSettings } from '@/components/ExternalIntegrationSettings';
 
 export {
   environmentSettingsTabs,
@@ -156,6 +157,8 @@ type VisibleEnvSetting = {
   definition: ReturnType<typeof runtimeEnvDefinition>;
 };
 
+const customRuntimeSettingKeys = new Set(['AGENT_COMMUNICATION_ALLOW_SEND', 'AGENT_DATA_ALLOW_WRITES']);
+
 function SettingsGroupCard({
   children,
   className = '',
@@ -235,6 +238,7 @@ type SystemBridge = {
   openDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
   readDownload?: (input: { id: string }) => Promise<{ ok: boolean; data?: ArrayBuffer; fileName?: string; error?: string }>;
   removeDownload?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
+  selectFile?: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
   selectDirectory: (input?: { defaultPath?: string }) => Promise<{ ok: boolean; canceled?: boolean; path?: string; error?: string }>;
   showDownloadInFolder?: (input: { id: string }) => Promise<{ ok: boolean; error?: string }>;
 };
@@ -2003,8 +2007,15 @@ export function EnvironmentSettings({
   const activeProviderDuplicateExtraRequestParameterKeys = duplicateExtraRequestParameterKeys(activeProviderExtraRequestParameterRows);
   const visibleEnvItems = items
     .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab && definition.hidden !== true);
+    .filter(({ item, definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab && definition.hidden !== true && !(activeTab === 'runtime' && customRuntimeSettingKeys.has(item.key)));
   const visibleEnvGroups = groupVisibleEnvSettings(activeTab, visibleEnvItems);
+  const communicationSendSetting = items
+    .map((item, index) => ({ item, index }))
+    .find(({ item }) => item.key === 'AGENT_COMMUNICATION_ALLOW_SEND');
+  const dataWriteSetting = items
+    .map((item, index) => ({ item, index }))
+    .find(({ item }) => item.key === 'AGENT_DATA_ALLOW_WRITES');
+  const visibleEnvCount = visibleEnvItems.length + (activeTab === 'runtime' ? 4 : 0);
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -2350,17 +2361,61 @@ export function EnvironmentSettings({
               <div className="settings-section-head">
                 <div>
                   <h2>{t(environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label || '')}</h2>
-                  <span>{t('{count} 项网页配置', { count: visibleEnvItems.length })}</span>
+                  <span>{t('{count} 项网页配置', { count: visibleEnvCount })}</span>
                 </div>
                 <button className="ui-button ui-button--primary" disabled={savingEnv || loading} onClick={saveEnv} type="button">
                   {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
                   {t('保存')}
                 </button>
               </div>
-              {visibleEnvItems.length ? (
+              {visibleEnvItems.length || activeTab === 'runtime' ? (
                 <div className="settings-group-stack">
+                  {activeTab === 'runtime' ? (
+                    <>
+                      <SettingsGroupCard initiallyOpen title={t('连接器')}>
+                        <ExternalIntegrationSettings
+                          accessToken={adminSettingsAccessToken}
+                          category="connector"
+                        />
+                      </SettingsGroupCard>
+                      <SettingsGroupCard initiallyOpen title={t('通信')}>
+                        <ExternalIntegrationSettings
+                          accessToken={adminSettingsAccessToken}
+                          category="communication"
+                          permission={{
+                            enabled: communicationSendSetting?.item.value === 'true',
+                            label: '允许 Agent 请求发送消息',
+                            description: '开启后请点击页面右上角保存；每次正式发送仍会暂停并等待你的确认。',
+                            onChange(enabled) {
+                              if (communicationSendSetting) update(communicationSendSetting.index, { value: String(enabled) });
+                            },
+                          }}
+                        />
+                      </SettingsGroupCard>
+                      <SettingsGroupCard initiallyOpen title={t('数据')}>
+                        <ExternalIntegrationSettings
+                          accessToken={adminSettingsAccessToken}
+                          category="data"
+                          permission={{
+                            enabled: dataWriteSetting?.item.value === 'true',
+                            label: '允许 Agent 执行数据写入',
+                            description: '默认只允许查询；开启后仍需将具体数据源设为“允许写入”，且每次写操作都要确认。',
+                            onChange(enabled) {
+                              if (dataWriteSetting) update(dataWriteSetting.index, { value: String(enabled) });
+                            },
+                          }}
+                        />
+                      </SettingsGroupCard>
+                      <SettingsGroupCard initiallyOpen title={t('研究')}>
+                        <ExternalIntegrationSettings
+                          accessToken={adminSettingsAccessToken}
+                          category="research"
+                        />
+                      </SettingsGroupCard>
+                    </>
+                  ) : null}
                   {visibleEnvGroups.map((group, groupIndex) => (
-                    <SettingsGroupCard initiallyOpen={groupIndex < 2} key={group.title} title={t(group.title)}>
+                    <SettingsGroupCard initiallyOpen={activeTab === 'runtime' ? false : groupIndex < 2} key={group.title} title={t(group.title)}>
                       {group.items.map(({ item, index, definition }) => (
                         <div className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}`} key={item.key}>
                           <div className="env-name" title={item.key}>

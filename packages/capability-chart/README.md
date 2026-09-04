@@ -13,9 +13,14 @@ import { createNodeChartCapability } from '@webpilot/capability-chart/node';
 const provider = createNodeChartCapability({ directory: './artifacts/charts' });
 ```
 
-Pass this provider to `mountAISDKCapabilities()` for AI SDK Agents. The returned
-`agentOptions` contains the chart tool and eager/lazy Skill instructions;
-settings are loaded before the chart runtime is created.
+Pass this provider to the framework-neutral `mountCapabilities()` entrypoint,
+map the resolved `chart` tool to the consuming TypeScript Agent framework, and
+inject the package Skill before chart execution. See the complete
+[TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
+`mountAISDKCapabilities()` remains available as the optional AI SDK convenience
+path. Its returned `agentOptions` contains the chart tool and eager/lazy Skill
+instructions; settings are loaded before the chart runtime is created.
 
 The included `webpilot-chart-mcp` executable stores each MCP run below
 `CAPABILITY_CHART_ARTIFACTS_DIR` (or `ARTIFACTS_DIR`).

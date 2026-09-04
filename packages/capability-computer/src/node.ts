@@ -113,11 +113,11 @@ function windowsDriverScriptPath() {
 
 async function executeWindowsAction(input: Record<string, unknown>) {
   const action = String(input.action || '').trim();
-  if (!['observe', 'screenshot', 'click', 'type', 'key', 'scroll', 'wait'].includes(action)) {
+  if (!['observe', 'launch', 'click', 'type', 'key', 'scroll', 'wait'].includes(action)) {
     throw new Error(`Unsupported computer action: ${action || '(empty)'}.`);
   }
   const timeoutMs = Math.min(300_000, Math.max(1_000, Number(input.timeoutMs) || 30_000));
-  const capture = action === 'observe' || action === 'screenshot';
+  const capture = action === 'observe';
   const temporaryDirectory = capture
     ? await mkdir(path.join(os.tmpdir(), 'webpilot-computer-driver'), { recursive: true }).then(() => path.join(os.tmpdir(), 'webpilot-computer-driver'))
     : undefined;
@@ -261,6 +261,47 @@ function screenshotBuffer(value: unknown) {
   return buffer;
 }
 
+function pngDimensions(buffer: Buffer) {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (buffer.length < 24 || !buffer.subarray(0, 8).equals(signature)) return undefined;
+  const width = buffer.readUInt32BE(16);
+  const height = buffer.readUInt32BE(20);
+  return width > 0 && height > 0 ? { width, height } : undefined;
+}
+
+function jpegDimensions(buffer: Buffer) {
+  if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return undefined;
+  let offset = 2;
+  while (offset + 3 < buffer.length) {
+    if (buffer[offset] !== 0xff) {
+      offset += 1;
+      continue;
+    }
+    while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+    const marker = buffer[offset];
+    offset += 1;
+    if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 1 >= buffer.length) return undefined;
+    const segmentLength = buffer.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > buffer.length) return undefined;
+    const isStartOfFrame = marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc
+      && marker >= 0xc0 && marker <= 0xcf;
+    if (isStartOfFrame && segmentLength >= 7) {
+      const height = buffer.readUInt16BE(offset + 3);
+      const width = buffer.readUInt16BE(offset + 5);
+      return width > 0 && height > 0 ? { width, height } : undefined;
+    }
+    offset += segmentLength;
+  }
+  return undefined;
+}
+
+function screenshotDimensions(buffer: Buffer, mediaType: 'image/jpeg' | 'image/png') {
+  const dimensions = mediaType === 'image/jpeg' ? jpegDimensions(buffer) : pngDimensions(buffer);
+  if (!dimensions) throw new Error(`Computer driver returned an invalid ${mediaType} screenshot.`);
+  return dimensions;
+}
+
 async function persistScreenshot(
   result: ComputerResult,
   context: CapabilityRunContext,
@@ -270,6 +311,7 @@ async function persistScreenshot(
   const screenshot = screenshotBuffer(payload?.screenshotBase64);
   if (!payload || !screenshot) return result;
   const mediaType = payload.mediaType === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+  const dimensions = screenshotDimensions(screenshot, mediaType);
   const extension = mediaType === 'image/jpeg' ? '.jpg' : '.png';
   const configuredDirectory = await resolveContextValue(directorySetting, context);
   const directory = path.resolve(configuredDirectory || path.join(
@@ -282,7 +324,7 @@ async function persistScreenshot(
   await writeFile(artifactId, screenshot, { flag: 'wx' });
   const observation = { ...payload };
   delete observation.screenshotBase64;
-  return { ...observation, artifactId, mediaType };
+  return { ...observation, ...dimensions, artifactId, mediaType };
 }
 
 function withScreenshotPersistence(

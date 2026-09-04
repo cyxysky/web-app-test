@@ -1,21 +1,19 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import ffmpegStaticPath from 'ffmpeg-static';
-import { DataSource } from 'typeorm';
 import type { CapabilityProvider, CapabilityRunContext } from '@webpilot/capability-sdk';
 import { createNodeCodeSandboxCapability } from '@webpilot/capability-code-sandbox/node';
 import { createResearchCapability } from '@webpilot/capability-research';
 import { createNodeResearchOperations } from '@webpilot/capability-research/node';
 import type { ResearchSource } from '@webpilot/capability-research';
-import { createMcpStreamableHttpConnector, createNodeConnectorsCapability } from '@webpilot/capability-connectors/node';
+import { createNodeConnectorsCapability } from '@webpilot/capability-connectors/node';
 import type { AgentConnector } from '@webpilot/capability-connectors';
 import { createNodeKnowledgeCapability } from '@webpilot/capability-knowledge/node';
 import { createDataCapability, createDataSourceRegistry, type AgentDataSource } from '@webpilot/capability-data';
-import { createTypeOrmAgentDataSource } from '@webpilot/capability-data/typeorm';
 import { createMediaCapability, type MediaOperations } from '@webpilot/capability-media';
 import { createFfmpegMediaOperations } from '@webpilot/capability-media/node';
-import { createJsonWebhookChannel, createNodeCommunicationCapability } from '@webpilot/capability-communication/node';
+import { createNodeCommunicationCapability } from '@webpilot/capability-communication/node';
 import type { CommunicationChannel } from '@webpilot/capability-communication';
 import { createNodeGitCapability } from '@webpilot/capability-git/node';
 import { createNodeComputerCapability } from '@webpilot/capability-computer/node';
@@ -23,130 +21,58 @@ import { createNodeWorkflowCapability } from '@webpilot/capability-workflow/node
 import type { BrowserCodeAttachmentBinding } from '@webpilot/capability-browser/node';
 import { artifactApiUrl } from '@/lib/artifacts';
 import { artifactPath, artifactsRoot } from '@/server/storage/paths';
+import { resolveExternalIntegrations } from '@/server/integrations/external-integration-vault';
+import {
+  createExternalCommunicationChannel,
+  createExternalDataSource,
+  createExternalIntegrationConnector,
+  createExternalResearchSearch,
+} from '@/server/integrations/external-integration-drivers';
 
 function safeSegment(value: unknown, fallback: string) {
   const normalized = String(value || '').trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   return normalized.slice(0, 160) || fallback;
 }
 
-function jsonArray(value: unknown) {
-  if (typeof value !== 'string' || !value.trim()) return [] as Record<string, unknown>[];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed)
-      ? parsed.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-      : [];
-  } catch {
-    return [];
-  }
+async function configuredConnectors(context: CapabilityRunContext): Promise<AgentConnector[]> {
+  const timeoutMs = Number(context.configuration.AGENT_CONNECTOR_TIMEOUT_MS) || 30_000;
+  return (await resolveExternalIntegrations('connector'))
+    .map((record) => createExternalIntegrationConnector(record, timeoutMs));
 }
 
-function optionalAuthorization(value: unknown) {
-  const text = typeof value === 'string' ? value.trim() : '';
-  return text ? { authorization: text } : undefined;
+async function configuredCommunicationChannels(context: CapabilityRunContext): Promise<CommunicationChannel[]> {
+  const timeoutMs = Number(context.configuration.AGENT_COMMUNICATION_TIMEOUT_MS) || 30_000;
+  return (await resolveExternalIntegrations('communication'))
+    .map((record) => createExternalCommunicationChannel(record, timeoutMs));
 }
 
-function researchSearch(context: CapabilityRunContext) {
-  const endpoint = String(context.configuration.AGENT_RESEARCH_SEARCH_ENDPOINT || '').trim();
-  if (!endpoint) return undefined;
-  return async (input: { query: string; limit: number; domains?: string[]; recencyDays?: number }, execution: { abortSignal?: AbortSignal }) => {
-    const timeout = AbortSignal.timeout(Number(context.configuration.AGENT_RESEARCH_TIMEOUT_MS) || 20_000);
-    const signal = execution.abortSignal ? AbortSignal.any([execution.abortSignal, timeout]) : timeout;
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      signal,
-      headers: { 'content-type': 'application/json', accept: 'application/json', ...optionalAuthorization(context.configuration.AGENT_RESEARCH_SEARCH_AUTHORIZATION) },
-      body: JSON.stringify(input),
-    });
-    const text = await response.text();
-    if (!response.ok) throw new Error(`Research search provider returned HTTP ${response.status}: ${text.slice(0, 1000)}`);
-    const payload = JSON.parse(text) as unknown;
-    const values = Array.isArray(payload) ? payload : payload && typeof payload === 'object' && Array.isArray((payload as Record<string, unknown>).results) ? (payload as { results: unknown[] }).results : [];
-    return values.slice(0, input.limit).flatMap((item, index): ResearchSource[] => {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
-      const record = item as Record<string, unknown>;
-      const url = typeof record.url === 'string' ? record.url : '';
-      if (!url) return [];
-      return [{
-        sourceId: typeof record.sourceId === 'string' ? record.sourceId : `source_${createHash('sha256').update(url).digest('hex').slice(0, 16)}`,
-        url,
-        title: typeof record.title === 'string' ? record.title : `Search result ${index + 1}`,
-        snippet: typeof record.snippet === 'string' ? record.snippet : undefined,
-        provider: 'configured-search',
-        retrievedAt: new Date().toISOString(),
-      }];
-    });
+async function configuredResearchSearch(context: CapabilityRunContext) {
+  const timeoutMs = Number(context.configuration.AGENT_RESEARCH_TIMEOUT_MS) || 20_000;
+  const searches = (await resolveExternalIntegrations('research'))
+    .map((record) => createExternalResearchSearch(record, timeoutMs));
+  if (!searches.length) return undefined;
+  return async (
+    input: { query: string; limit: number; domains?: string[]; recencyDays?: number },
+    execution: { invocationId: string; abortSignal?: AbortSignal },
+  ): Promise<ResearchSource[]> => {
+    const settled = await Promise.allSettled(searches.map((search) => search(input, execution)));
+    const successful = settled.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+    if (!successful.length && settled.every((result) => result.status === 'rejected')) {
+      throw new AggregateError(
+        settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []),
+        '所有研究搜索服务均请求失败。',
+      );
+    }
+    const unique = new Map(successful.map((source) => [source.url, source]));
+    return [...unique.values()].slice(0, input.limit);
   };
 }
 
-function configuredConnectors(context: CapabilityRunContext): AgentConnector[] {
-  return jsonArray(context.configuration.AGENT_CONNECTORS_JSON).flatMap((record) => {
-    const id = typeof record.id === 'string' ? record.id.trim() : '';
-    const url = typeof record.url === 'string' ? record.url.trim() : '';
-    if (!id || !url || record.kind !== 'mcp') return [];
-    const authorizationEnv = typeof record.authorizationEnv === 'string' ? record.authorizationEnv.trim() : '';
-    const authorization = authorizationEnv ? process.env[authorizationEnv] : undefined;
-    return [createMcpStreamableHttpConnector({
-      id,
-      name: typeof record.name === 'string' ? record.name : id,
-      url,
-      timeoutMs: Number(context.configuration.AGENT_CONNECTOR_TIMEOUT_MS) || 30_000,
-      headers: optionalAuthorization(authorization),
-    })];
-  });
-}
-
-function configuredCommunicationChannels(context: CapabilityRunContext): CommunicationChannel[] {
-  return jsonArray(context.configuration.AGENT_COMMUNICATION_WEBHOOKS_JSON).flatMap((record) => {
-    const id = typeof record.id === 'string' ? record.id.trim() : '';
-    const url = typeof record.url === 'string' ? record.url.trim() : '';
-    if (!id || !url) return [];
-    const authorizationEnv = typeof record.authorizationEnv === 'string' ? record.authorizationEnv.trim() : '';
-    return [createJsonWebhookChannel({ id, name: typeof record.name === 'string' ? record.name : id, url, timeoutMs: Number(context.configuration.AGENT_COMMUNICATION_TIMEOUT_MS) || 30_000, headers: optionalAuthorization(authorizationEnv ? process.env[authorizationEnv] : undefined) })];
-  });
-}
-
-async function configuredDataSources(context: CapabilityRunContext): Promise<AgentDataSource[]> {
+async function configuredDataSources(): Promise<AgentDataSource[]> {
   const sources: AgentDataSource[] = [];
   try {
-    for (const record of jsonArray(context.configuration.AGENT_DATA_SOURCES_JSON)) {
-      const id = typeof record.id === 'string' ? record.id.trim() : '';
-      const kind = typeof record.kind === 'string' ? record.kind.trim().toLowerCase() : '';
-      if (!id || (kind !== 'sqlite' && kind !== 'postgres')) continue;
-      const readOnly = record.readOnly !== false;
-      let dataSource: DataSource;
-      if (kind === 'sqlite') {
-        const database = String(record.database || '').trim();
-        if (!database) throw new Error(`Data source ${id} requires database.`);
-        dataSource = new DataSource({
-          type: 'better-sqlite3',
-          database: path.resolve(database),
-          readonly: readOnly,
-        });
-      } else {
-        const urlEnv = String(record.urlEnv || '').trim();
-        if (!urlEnv) throw new Error(`Data source ${id} requires urlEnv.`);
-        const url = process.env[urlEnv];
-        if (!url) throw new Error(`Data source ${id} references an unset environment variable.`);
-        dataSource = new DataSource({
-          type: 'postgres',
-          url,
-          ssl: record.ssl === true ? { rejectUnauthorized: record.rejectUnauthorized !== false } : false,
-        });
-      }
-      await dataSource.initialize();
-      const source = createTypeOrmAgentDataSource({
-        id,
-        name: typeof record.name === 'string' && record.name.trim() ? record.name.trim() : id,
-        source: dataSource,
-        readOnly,
-      });
-      sources.push({
-        ...source,
-        async dispose() {
-          if (dataSource.isInitialized) await dataSource.destroy();
-        },
-      });
+    for (const record of await resolveExternalIntegrations('data')) {
+      sources.push(await createExternalDataSource(record, 15_000));
     }
     return sources;
   } catch (error) {
@@ -196,10 +122,10 @@ export function createAgentInfrastructureProviders(input: {
 } = {}): CapabilityProvider[] {
   return [
     createNodeCodeSandboxCapability({ workspaceDirectory: (context) => artifactPath('agent-infrastructure', 'code', safeSegment(context.userId, 'shared'), safeSegment(context.runId, 'run')) }),
-    createResearchCapability({ createOperations: (context) => createNodeResearchOperations({ search: researchSearch(context), timeoutMs: Number(context.configuration.AGENT_RESEARCH_TIMEOUT_MS) || 20_000 }) }),
+    createResearchCapability({ createOperations: async (context) => createNodeResearchOperations({ search: await configuredResearchSearch(context), timeoutMs: Number(context.configuration.AGENT_RESEARCH_TIMEOUT_MS) || 20_000 }) }),
     createNodeConnectorsCapability({ connectors: configuredConnectors }),
     createNodeKnowledgeCapability({ directory: (context) => artifactPath('agent-infrastructure', 'knowledge', safeSegment(context.userId, 'shared')) }),
-    createDataCapability({ createRegistry: async (context) => createDataSourceRegistry(await configuredDataSources(context)) }),
+    createDataCapability({ createRegistry: async () => createDataSourceRegistry(await configuredDataSources()) }),
     createMediaCapability({ createOperations: (context) => mediaOperations({ context, attachments: input.attachmentBindings || [] }) }),
     createNodeCommunicationCapability({ channels: configuredCommunicationChannels, draftDirectory: (context) => artifactPath('agent-infrastructure', 'communication', safeSegment(context.userId, 'shared')) }),
     createNodeGitCapability({ repository: (context) => String(context.configuration.AGENT_GIT_REPOSITORY || '').trim() || process.cwd() }),

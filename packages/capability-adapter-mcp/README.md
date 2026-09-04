@@ -4,6 +4,11 @@ Expose Capability providers through MCP stdio or Streamable HTTP. Providers,
 configuration storage, tool registration, Skill instructions, and disposal are
 handled together.
 
+This package is an optional transport adapter. The same providers can be used
+directly by any TypeScript Agent framework through
+`@webpilot/capability-host`; see the
+[framework-neutral integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
 ```ts
 await serveCapabilityMcpStdio({
   providers,

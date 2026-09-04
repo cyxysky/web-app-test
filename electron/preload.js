@@ -146,6 +146,9 @@ contextBridge.exposeInMainWorld('webPilotSystem', {
   selectDirectory(input) {
     return ipcRenderer.invoke('webpilot:system:select-directory', input || {});
   },
+  selectFile(input) {
+    return ipcRenderer.invoke('webpilot:system:select-file', input || {});
+  },
   showDownloadInFolder(input) {
     return ipcRenderer.invoke('webpilot:system:show-download-in-folder', input || {});
   },

@@ -28,7 +28,10 @@ Office installation.
 
 Use the package directly with any agent framework, or register it with
 `@webpilot/capability-sdk` and adapt the resolved tools to the framework used by
-the application.
+the application. The
+[TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md)
+shows the complete `mountCapabilities()` registration, tool conversion, Skill
+injection, execution, result handling, and disposal flow.
 
 Import only the layer an application needs:
 
@@ -51,7 +54,7 @@ const provider = createNodeFileCapability({
 });
 ```
 
-For an AI SDK Agent, install `@webpilot/capability-file` and
+For the optional AI SDK adapter, install `@webpilot/capability-file` and
 `@webpilot/capability-adapter-ai-sdk`, then mount the provider in one call:
 
 ```ts

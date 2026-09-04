@@ -17,13 +17,22 @@ export * from './settings.js';
 
 export const computerCapabilityToolNames = Object.freeze({ computer: 'computer' } as const);
 
-const NORMALIZED_COORDINATE_MAX = 1000;
-
 export type ComputerCoordinateSpace = {
-  unit: 'normalized';
-  min: 0;
-  max: 1000;
+  unit: 'pixels';
   origin: 'top-left';
+  width: number;
+  height: number;
+};
+
+export type ComputerElement = {
+  id: string;
+  source: 'uia' | 'msaa' | 'ocr' | 'visual';
+  role: string;
+  name?: string;
+  text?: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  center: { x: number; y: number };
+  enabled?: boolean;
 };
 
 export type ComputerObservation = {
@@ -38,14 +47,24 @@ export type ComputerObservation = {
   artifactId?: string;
   mediaType?: string;
   screenshotBase64?: string;
-  elements?: unknown[];
+  elements?: ComputerElement[];
+  elementDiscovery?: {
+    uiaCount?: number;
+    msaaCount?: number;
+    ocrCount?: number;
+    visualCount?: number;
+    ocrUsed?: boolean;
+    visualUsed?: boolean;
+    errors?: string[];
+  };
   sequence?: number;
   coordinateSpace?: ComputerCoordinateSpace;
 };
 
 export interface ComputerDriver {
   execute(input: {
-    action: 'observe' | 'screenshot' | 'click' | 'type' | 'key' | 'scroll' | 'wait';
+    action: 'observe' | 'launch' | 'click' | 'type' | 'key' | 'scroll' | 'wait';
+    application?: string;
     x?: number;
     y?: number;
     text?: string;
@@ -61,18 +80,24 @@ export interface ComputerDriver {
   dispose?(): Promise<void>;
 }
 
-const normalizedX = z.number().int().min(0).max(NORMALIZED_COORDINATE_MAX).describe(
-  'Horizontal position in the current screenshot, normalized from 0 at the left edge to 1000 at the right edge. Never use raw image or display pixels.',
+const screenshotPixelX = z.number().int().min(0).max(100_000).describe(
+  'Exact horizontal pixel coordinate in the latest screenshot. Use the returned screenshot width; 0 is the left edge and width - 1 is the right edge.',
 );
-const normalizedY = z.number().int().min(0).max(NORMALIZED_COORDINATE_MAX).describe(
-  'Vertical position in the current screenshot, normalized from 0 at the top edge to 1000 at the bottom edge. Never use raw image or display pixels.',
+const screenshotPixelY = z.number().int().min(0).max(100_000).describe(
+  'Exact vertical pixel coordinate in the latest screenshot. Use the returned screenshot height; 0 is the top edge and height - 1 is the bottom edge.',
 );
 
 const parser = z.object({
-  action: z.enum(['observe', 'screenshot', 'click', 'type', 'key', 'scroll', 'wait']),
+  action: z.enum(['observe', 'launch', 'click', 'type', 'key', 'scroll', 'wait']),
   reason: z.string().trim().min(1).max(300),
-  x: normalizedX.optional(),
-  y: normalizedY.optional(),
+  application: z.string().trim().min(1).max(260).optional().describe(
+    'Exact desktop or Start-menu application name to open. Use action=launch for named applications instead of locating an icon by pixels.',
+  ),
+  elementId: z.string().trim().min(1).max(200).optional().describe(
+    'Element id from the latest observe result. Prefer this for click when an exact UIA, desktop-accessibility, OCR, or visual element matches the requested target.',
+  ),
+  x: screenshotPixelX.optional(),
+  y: screenshotPixelY.optional(),
   text: z.string().max(20_000).optional(),
   keys: z.array(z.string().trim().min(1).max(100)).min(1).max(20).optional(),
   deltaX: z.number().int().min(-100000).max(100000).optional(),
@@ -81,8 +106,19 @@ const parser = z.object({
   button: z.enum(['left', 'middle', 'right']).optional(),
   clickCount: z.number().int().min(1).max(3).optional(),
 }).strict().superRefine((input, context) => {
-  if (input.action === 'click' && (input.x === undefined || input.y === undefined)) {
-    context.addIssue({ code: 'custom', message: 'click requires normalized x and y coordinates.' });
+  const hasX = input.x !== undefined;
+  const hasY = input.y !== undefined;
+  if (input.action === 'click' && hasX !== hasY) {
+    context.addIssue({ code: 'custom', message: 'click requires both screenshot pixel x and y coordinates.' });
+  }
+  if (input.action === 'click' && !input.elementId && !hasX) {
+    context.addIssue({ code: 'custom', message: 'click requires elementId or screenshot pixel x and y coordinates.' });
+  }
+  if (input.action === 'click' && input.elementId && hasX) {
+    context.addIssue({ code: 'custom', message: 'click accepts elementId or x/y, not both.' });
+  }
+  if (input.action === 'launch' && !input.application) {
+    context.addIssue({ code: 'custom', path: ['application'], message: 'launch requires an application name.' });
   }
   if (input.action === 'type' && input.text === undefined) {
     context.addIssue({ code: 'custom', path: ['text'], message: 'type requires text.' });
@@ -120,29 +156,66 @@ function positiveDimension(value: unknown) {
     : undefined;
 }
 
-function physicalCoordinate(value: number, dimension: number) {
-  return Math.max(0, Math.min(
-    dimension - 1,
-    Math.round((value / NORMALIZED_COORDINATE_MAX) * (dimension - 1)),
-  ));
+function finiteInteger(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : undefined;
 }
 
-const normalizedCoordinateSpace = Object.freeze({
-  unit: 'normalized',
-  min: 0,
-  max: NORMALIZED_COORDINATE_MAX,
-  origin: 'top-left',
-} satisfies ComputerCoordinateSpace);
+function normalizeComputerElements(value: unknown, width: number, height: number) {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set<string>();
+  const elements: ComputerElement[] = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    const id = typeof record.id === 'string' ? record.id.trim() : '';
+    const source = record.source === 'uia' || record.source === 'msaa' || record.source === 'ocr' || record.source === 'visual'
+      ? record.source
+      : undefined;
+    const role = typeof record.role === 'string' ? record.role.trim() : '';
+    const boundsRecord = record.bounds && typeof record.bounds === 'object' && !Array.isArray(record.bounds)
+      ? record.bounds as Record<string, unknown>
+      : undefined;
+    const x = finiteInteger(boundsRecord?.x);
+    const y = finiteInteger(boundsRecord?.y);
+    const elementWidth = finiteInteger(boundsRecord?.width);
+    const elementHeight = finiteInteger(boundsRecord?.height);
+    if (
+      !id || ids.has(id) || !source || !role
+      || x === undefined || y === undefined || elementWidth === undefined || elementHeight === undefined
+      || x < 0 || y < 0 || elementWidth <= 0 || elementHeight <= 0
+      || x + elementWidth > width || y + elementHeight > height
+    ) continue;
+    ids.add(id);
+    elements.push({
+      id,
+      source,
+      role,
+      ...(typeof record.name === 'string' && record.name.trim() ? { name: record.name.trim() } : {}),
+      ...(typeof record.text === 'string' && record.text.trim() ? { text: record.text.trim() } : {}),
+      bounds: { x, y, width: elementWidth, height: elementHeight },
+      center: {
+        x: Math.min(width - 1, x + Math.floor(elementWidth / 2)),
+        y: Math.min(height - 1, y + Math.floor(elementHeight / 2)),
+      },
+      ...(typeof record.enabled === 'boolean' ? { enabled: record.enabled } : {}),
+    });
+  }
+  return elements;
+}
 
 export function createComputerTool(
   driver: ComputerDriver,
   configuration: CapabilityRunContext['configuration'],
 ) {
-  let latestScreenshotDimensions: { width: number; height: number } | undefined;
+  let latestObservation: {
+    width: number;
+    height: number;
+    elements: Map<string, ComputerElement>;
+  } | undefined;
 
   return defineCapabilityTool<ComputerToolInput, unknown>({
     name: 'computer',
-    description: 'Observe a configured desktop or perform one exact input action. Click x/y always use a normalized 0-1000 coordinate space relative to the latest screenshot: (0,0) is top-left and (1000,1000) is bottom-right.',
+    description: 'Observe a configured desktop or perform one exact input action. Observe always returns one fresh screenshot with its actual width, height, active window, and discoverable native-accessibility/OCR/visual elements. Prefer click elementId only when its returned name, text, role, and active window are consistent with the target; never substitute an unrelated element. Otherwise click x/y are direct physical pixels in that latest screenshot with no normalized conversion. Use action=launch for named desktop or Start-menu apps.',
     input: computerToolInput,
     policy: {
       concurrency: 'serial',
@@ -161,18 +234,49 @@ export function createComputerTool(
       }
 
       try {
-        if (input.action === 'click' && !latestScreenshotDimensions) {
-          throw new Error('Click requires a fresh successful observe or screenshot result first.');
+        if (input.action === 'click' && !latestObservation) {
+          throw new Error('Click requires a fresh successful observe result first.');
+        }
+        const selectedElement = input.action === 'click' && input.elementId
+          ? latestObservation?.elements.get(input.elementId)
+          : undefined;
+        if (input.action === 'click' && input.elementId && !selectedElement) {
+          throw new Error(`Element '${input.elementId}' is not present in the latest screenshot observation.`);
+        }
+        const clickPoint = input.action === 'click'
+          ? selectedElement?.center || { x: input.x!, y: input.y! }
+          : undefined;
+        if (
+          input.action === 'click'
+          && latestObservation
+          && clickPoint
+          && (
+            clickPoint.x >= latestObservation.width
+            || clickPoint.y >= latestObservation.height
+          )
+        ) {
+          throw new Error(
+            `Click pixel (${clickPoint.x}, ${clickPoint.y}) is outside the latest screenshot ${latestObservation.width}x${latestObservation.height}.`,
+          );
         }
 
+        const clickFrame = input.action === 'click' ? latestObservation : undefined;
+        const executedPoint = input.action === 'click' && clickFrame && clickPoint
+          ? {
+              pixels: clickPoint,
+              source: selectedElement ? 'element' as const : 'coordinates' as const,
+              ...(selectedElement ? {
+                elementId: selectedElement.id,
+                element: selectedElement,
+              } : {}),
+              referenceScreenshot: { width: clickFrame.width, height: clickFrame.height },
+            }
+          : undefined;
+        const driverAction = { ...input };
+        delete driverAction.elementId;
         const driverInput = {
-          ...input,
-          ...(input.action === 'click' && latestScreenshotDimensions
-            ? {
-                x: physicalCoordinate(input.x!, latestScreenshotDimensions.width),
-                y: physicalCoordinate(input.y!, latestScreenshotDimensions.height),
-              }
-            : {}),
+          ...driverAction,
+          ...(clickPoint ? clickPoint : {}),
           timeoutMs: normalizeBoundedInteger(
             configuration.AGENT_COMPUTER_TIMEOUT_MS,
             30000,
@@ -185,15 +289,34 @@ export function createComputerTool(
         const width = positiveDimension(observation.width);
         const height = positiveDimension(observation.height);
         if (observation.artifactId && width && height) {
-          latestScreenshotDimensions = { width, height };
-        } else if (input.action !== 'observe' && input.action !== 'screenshot') {
-          latestScreenshotDimensions = undefined;
+          const elements = normalizeComputerElements(observation.elements, width, height);
+          observation.elements = elements;
+          latestObservation = {
+            width,
+            height,
+            elements: new Map(elements.map((element) => [element.id, element])),
+          };
+        } else if (input.action !== 'observe') {
+          latestObservation = undefined;
         }
-        const data = { ...rawData, coordinateSpace: normalizedCoordinateSpace };
+        const data = {
+          ...rawData,
+          ...(width && height ? {
+            coordinateSpace: {
+              unit: 'pixels' as const,
+              origin: 'top-left' as const,
+              width,
+              height,
+            } satisfies ComputerCoordinateSpace,
+          } : {}),
+          ...(executedPoint ? { executedPoint } : {}),
+        };
 
         return {
           ok: true,
-          summary: `Computer ${input.action} completed.`,
+          summary: input.action === 'click'
+            ? 'Computer click input completed; the requested target outcome still requires observation.'
+            : `Computer ${input.action} completed.`,
           data,
           content: observation.artifactId
             ? [{ type: 'image' as const, artifactId: observation.artifactId, mediaType: observation.mediaType }]

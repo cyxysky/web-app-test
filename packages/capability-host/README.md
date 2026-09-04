@@ -7,6 +7,13 @@ three pieces that every Agent host otherwise has to rebuild:
 - resolve providers into one disposable tool snapshot;
 - expose a portable Skill catalog for eager or lazy context injection.
 
+`mountCapabilities()` is the primary entrypoint for custom TypeScript Agent
+frameworks. It does not create an AI SDK or MCP object. Consumers translate the
+returned `runtime.tools` to their framework's tool type and inject
+`runtime.skillCatalog` into that framework's instructions or Skill mechanism.
+See the [framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md) for the
+complete mapping and execution lifecycle.
+
 ```ts
 import {
   EnvironmentCapabilityConfigStore,

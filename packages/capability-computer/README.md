@@ -16,16 +16,36 @@ import { createNodeComputerCapability } from '@webpilot/capability-computer/node
 const computer = createNodeComputerCapability();
 ```
 
+Pass this provider to `mountCapabilities()`, map the resolved `computer` tool to
+the native tool type of the consuming TypeScript Agent framework, and inject the
+package Skill before the first desktop action. The host remains responsible for
+approval of input actions and for forwarding image content to models that
+support it. See the complete
+[TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
 Set `AGENT_COMPUTER_ENABLED=true`, or enable **Computer control** in the host's
 settings. A host may pass `screenshotDirectory` when screenshots should be
 published from an application-owned artifact directory; otherwise the package
 uses an isolated temporary directory.
 
-The model-facing `computer` tool uses normalized click coordinates: `x=0` is
-the left edge, `x=1000` is the right edge, `y=0` is the top edge, and `y=1000`
-is the bottom edge of the latest screenshot. The capability converts those
-values back to physical display pixels before calling the driver. This keeps
-clicks aligned when an AI provider resizes an image before visual inference.
+The model-facing `computer` tool returns the exact saved screenshot width and
+height. Click coordinates are direct pixels in that latest screenshot: `(0, 0)`
+is the top-left pixel and `(width - 1, height - 1)` is the bottom-right pixel.
+No normalized-coordinate conversion is performed before calling the driver.
+The tool rejects coordinates outside the latest screenshot bounds.
+
+On Windows, observations also discover foreground-window elements. Native UI
+Automation is preferred, with Windows desktop icons discovered through their
+legacy accessibility objects. When an application exposes no actionable
+controls, the built-in driver falls back to Windows OCR and generic
+visual-region detection. Each element includes a current-screenshot `bounds`, `center`, and
+ephemeral `elementId`. Pass that id to `action: "click"` instead of estimating
+coordinates. The capability resolves the id to physical pixels and invalidates
+the element map after the action.
+
+For named desktop or Start-menu applications, use `action: "launch"` with the
+visible shortcut name. This avoids locating an application icon by image
+coordinates when Windows already provides a stable application identity.
 
 ## Remote driver protocol
 
@@ -52,12 +72,26 @@ Example request:
 }
 ```
 
-The HTTP driver boundary receives physical pixel coordinates. Coordinate
-normalization is handled by the capability tool before this request is sent,
-so existing desktop-driver implementations do not need to implement image
-scaling themselves.
+Element-based click request:
 
-Supported actions are `observe`, `screenshot`, `click`, `type`, `key`,
+```json
+{
+  "action": "click",
+  "reason": "Activate the exact Login element returned by the latest observation",
+  "elementId": "visual:1788494725746:0",
+  "button": "left",
+  "clickCount": 1
+}
+```
+
+The HTTP driver boundary receives the same screenshot pixel coordinates supplied
+by the model. The Node adapter derives observation width and height from the
+persisted PNG or JPEG bytes so the returned dimensions describe the actual
+image, even if a remote driver supplied stale metadata.
+
+`observe` already captures and attaches one fresh screenshot; there is no
+separate duplicate screenshot action. Supported actions are `observe`,
+`launch`, `click`, `type`, `key`,
 `scroll`, and `wait`. An observation response can include `displayId`, `width`,
 `height`, `activeWindow`, `elements`, `sequence`, and a published screenshot's
 `artifactId` and `mediaType`. A remote driver can instead return

@@ -50,7 +50,15 @@ function stringifyPayloadForDisplay(value: unknown) {
 
 export function formatToolPayload(value: unknown) {
   if (value === undefined || value === null || value === '') return '';
-  if (typeof value === 'string') return stripAnsiControlCodes(value);
+  if (typeof value === 'string') {
+    const normalized = normalizeEmbeddedJson(value);
+    if (normalized === value) return stripAnsiControlCodes(value);
+    try {
+      return stripAnsiControlCodes(stringifyPayloadForDisplay(normalized));
+    } catch {
+      return stripAnsiControlCodes(value);
+    }
+  }
   try {
     return stripAnsiControlCodes(stringifyPayloadForDisplay(value));
   } catch {

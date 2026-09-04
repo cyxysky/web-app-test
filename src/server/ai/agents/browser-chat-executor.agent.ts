@@ -2649,18 +2649,35 @@ async function executeRuntimeStep(input: {
         appendedMessages.push({ role: 'user' as const, content });
       }
 
+      const retryVisualMessage = retryState && turnIndex === 0 && !appendedMessages.length
+        ? [...(previousMessages || [])].reverse().find((message) => {
+          if (message.role !== 'user' || !Array.isArray(message.content)) return false;
+          const text = message.content.flatMap((part) => (
+            part.type === 'text' && typeof part.text === 'string' ? [part.text] : []
+          )).join('\n');
+          return text.startsWith('[Document visual QA]')
+            || text.startsWith('[Attachment visual content]')
+            || text.startsWith('[Explicit visual evidence]');
+        })
+        : undefined;
+
       const sourceMessages = completeRuntimeModelToolChain(previousMessages?.length
         ? previousMessages.filter((message) => {
-            if (message.role !== 'user' || !Array.isArray(message.content)) return true;
+          if (message.role !== 'user' || !Array.isArray(message.content)) return true;
             const text = message.content.flatMap((part) => (
               part.type === 'text' && typeof part.text === 'string' ? [part.text] : []
             )).join('\n');
-            return !text.startsWith('[Document visual QA]')
-              && !text.startsWith('[Attachment visual content]')
-              && !text.startsWith('[Explicit visual evidence]');
+            const transientVisual = text.startsWith('[Document visual QA]')
+              || text.startsWith('[Attachment visual content]')
+              || text.startsWith('[Explicit visual evidence]');
+            return !transientVisual || message === retryVisualMessage;
           })
         : [...initialMessages]);
-      if (previousMessages?.length) messageImagePaths = [...initialUserReferenceImagePaths];
+      if (previousMessages?.length) {
+        messageImagePaths = retryVisualMessage
+          ? [...(retryState?.imagePaths || [])]
+          : [...initialUserReferenceImagePaths];
+      }
       lastPreparedResponsePrefixLength = previousMessages?.length
         ? Math.max(0, sourceMessages.length - initialMessages.length)
         : 0;
@@ -3474,6 +3491,64 @@ async function executeRuntimeStep(input: {
     }
   }
 
+  function compactInvalidParameterRetryState(state: RuntimeRetryState, recoveryAttempt: number) {
+    const goal = requirementOf(runtimeRecord).trim();
+    const previousSummary = state.messages.findLast((message) => (
+      textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
+    ));
+    const summary = fallbackRuntimeContinuationSummary({
+      goal,
+      stepIndex,
+      agentStep: state.agentStepOffset + 1,
+      previousSummary: previousSummary
+        ? sanitizeRuntimeContinuationSummary(
+          textFromUnknown(previousSummary.content).slice(runtimeContinuationSummaryMarker.length),
+        )
+        : '',
+      recentToolAttempts: formatCurrentToolAttemptSummary(durableTraces, 8),
+      runtimeState: continuationRuntimeStateFromTraces(durableTraces),
+    });
+    const messageBudgetTokens = recoveryAttempt <= 1 ? 8_000 : 3_000;
+    const candidateMessages = withoutRuntimePromptCacheMetadata(state.messages).filter((message) => {
+      const text = textFromUnknown(message.content).trim();
+      return !text.startsWith(runtimeContinuationSummaryMarker)
+        && !text.startsWith(runtimeContinuationDirectiveMarker)
+        && (!goal || text !== goal);
+    });
+    const selected = selectRecentRuntimeMessageBlocks(
+      atomicRuntimeModelMessageBlocks(candidateMessages),
+      (block) => estimateRuntimeMessageContext(block).totalTokens,
+      messageBudgetTokens,
+    );
+    const recoveryDirective = [
+      runtimeContinuationDirectiveMarker,
+      'The provider rejected the preceding request as InvalidParameter, so the runtime compacted older request context before retrying.',
+      'Continue from the summary and newest retained evidence. If visual evidence is missing or ambiguous, observe again.',
+      'Do not repeat a failed click unless fresh evidence clearly identifies the target and coordinates.',
+    ].join('\n');
+    const messages = completeRuntimeModelToolChain([
+      { role: 'user' as const, content: `${runtimeContinuationSummaryMarker}\n${summary}` },
+      ...selected.retainedBlocks.flat(),
+      { role: 'user' as const, content: recoveryDirective },
+    ]);
+    const retainedImageCount = estimateRuntimeMessageContext(messages).imageCount;
+    return {
+      state: {
+        ...state,
+        messages,
+        imagePaths: retainedImageCount > 0 ? state.imagePaths.slice(-retainedImageCount) : [],
+      },
+      details: {
+        action: 'compacted prepared context after provider InvalidParameter response',
+        recoveryAttempt,
+        messageBudgetTokens,
+        messageCountBefore: state.messages.length,
+        messageCountAfter: messages.length,
+        retainedImageCount,
+      },
+    };
+  }
+
   // Keep SDK retries disabled, but allow the runtime loop to retry transient upstream
   // disconnects with the prepared model messages. A provider-rejected tool exchange
   // is removed before retry because replaying that identical invalid chain cannot work.
@@ -3482,6 +3557,7 @@ async function executeRuntimeStep(input: {
   let lastError: unknown;
   let retryingAfterFailure = false;
   let lastRetryDecision: RuntimeRetryDecision | undefined;
+  let lastRetryRecovery: Record<string, unknown> | undefined;
   let retryDelayMs = 0;
   let attemptNumber = 0;
 
@@ -3507,6 +3583,7 @@ async function executeRuntimeStep(input: {
               consecutiveFailureLimit,
               execution: executionIdentity,
               retryDecision: lastRetryDecision,
+              ...(lastRetryRecovery ? { requestRecovery: lastRetryRecovery } : {}),
             },
           });
           ensureActive();
@@ -3524,6 +3601,7 @@ async function executeRuntimeStep(input: {
             delayMs: retryDelayMs,
             execution: executionIdentity,
             retryDecision: lastRetryDecision,
+            ...(lastRetryRecovery ? { requestRecovery: lastRetryRecovery } : {}),
             reusePreparedMessages: Boolean(retryState),
             messageCount: retryState?.messages.length,
             imageCount: retryState?.imagePaths.length,
@@ -3593,6 +3671,12 @@ async function executeRuntimeStep(input: {
       lastError = error;
       consecutiveRequestFailures += 1;
       lastRetryDecision = classifyRuntimeRetry(error, abortSignal);
+      lastRetryRecovery = undefined;
+      if (lastRetryDecision.recovery === 'compact-context' && lastRetryState?.messages.length) {
+        const compacted = compactInvalidParameterRetryState(lastRetryState, consecutiveRequestFailures);
+        lastRetryState = compacted.state;
+        lastRetryRecovery = compacted.details;
+      }
       const missingToolCallId = runtimeMissingToolCallId(error);
       if (missingToolCallId && lastRetryState?.messages.length) {
         lastRetryState = {
@@ -3632,6 +3716,7 @@ async function executeRuntimeStep(input: {
           finalFailure: !willRetry,
           execution: executionIdentity,
           retryDecision: lastRetryDecision,
+          ...(lastRetryRecovery ? { requestRecovery: lastRetryRecovery } : {}),
           ...(missingToolCallId ? {
             protocolRepair: {
               action: 'removed rejected tool call/result exchange from preserved context',
@@ -3673,6 +3758,7 @@ async function executeRuntimeStep(input: {
       consecutiveFailureLimit,
       decision: lastRetryDecision,
       retryDelayMs,
+      ...(lastRetryRecovery ? { requestRecovery: lastRetryRecovery } : {}),
     };
     throw lastError;
   }
@@ -3684,6 +3770,7 @@ async function executeRuntimeStep(input: {
     consecutiveFailureLimit,
     decision: lastRetryDecision,
     retryDelayMs,
+    ...(lastRetryRecovery ? { requestRecovery: lastRetryRecovery } : {}),
   };
   throw wrapped;
 }

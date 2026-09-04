@@ -15,6 +15,7 @@ export type RuntimeRetryCategory =
 export type RuntimeRetryDecision = {
   category: RuntimeRetryCategory;
   reason: string;
+  recovery?: 'compact-context';
   retryAfterMs?: number;
   retryable: boolean;
   statusCode?: number;
@@ -196,6 +197,21 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   }
   if (statusCode === 402 || isProviderBillingLimitMessage(message) || /\b(insufficient balance|payment required|billing quota)\b/.test(normalizedMessage)) {
     return { category: 'billing', reason: `provider balance is unavailable${statusCode ? ` (${statusCode})` : ''}`, retryable: false, statusCode };
+  }
+  if (
+    statusCode === 400
+    && (
+      code === 'INVALIDPARAMETER'
+      || /\binvalidparameter\b|\binvalid parameter\b|\ba parameter specified in the request is not valid\b/i.test(message)
+    )
+  ) {
+    return {
+      category: 'invalid-request',
+      reason: 'provider rejected request parameters; retry with compacted context',
+      recovery: 'compact-context',
+      retryable: true,
+      statusCode,
+    };
   }
   if (statusCode === 400 || statusCode === 404 || statusCode === 405 || statusCode === 410 || statusCode === 422 || nonRetryableCodes.has(code)) {
     return { category: 'invalid-request', reason: `deterministic request failure${statusCode ? ` (${statusCode})` : code ? ` (${code})` : ''}`, retryable: false, statusCode };

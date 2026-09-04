@@ -1243,6 +1243,361 @@
   min-width: 0;
 }
 
+.external-integration-settings {
+  display: grid;
+  min-width: 0;
+}
+
+.external-integration-toolbar,
+.external-integration-permission,
+.external-integration-row,
+.external-integration-empty {
+  align-items: center;
+  display: grid;
+  min-width: 0;
+}
+
+.external-integration-toolbar {
+  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 16px 0;
+}
+
+.external-integration-toolbar p {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0;
+  max-width: 72ch;
+}
+
+.external-integration-toolbar .ui-button {
+  white-space: nowrap;
+}
+
+.external-integration-permission {
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 16px 0;
+}
+
+.external-integration-permission > div,
+.external-integration-copy,
+.external-integration-empty > div,
+.external-integration-enabled-field > div,
+.external-integration-test-hint > div,
+.external-integration-test-result > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.external-integration-permission strong,
+.external-integration-empty strong,
+.external-integration-enabled-field strong,
+.external-integration-test-hint strong,
+.external-integration-test-result strong {
+  color: var(--foreground);
+  font-size: 13.5px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.external-integration-permission span,
+.external-integration-empty span,
+.external-integration-enabled-field span,
+.external-integration-test-hint span,
+.external-integration-test-result span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.external-integration-list {
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  display: grid;
+  min-width: 0;
+}
+
+.external-integration-row {
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  gap: 12px;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  padding: 13px 0;
+}
+
+.external-integration-row:last-child {
+  border-bottom: 0;
+}
+
+.external-integration-icon,
+.external-integration-modal-icon {
+  align-items: center;
+  color: var(--accent-strong);
+  display: inline-flex;
+  justify-content: center;
+}
+
+.external-integration-icon {
+  height: 32px;
+  width: 32px;
+}
+
+.external-integration-copy > div {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.external-integration-copy strong {
+  color: var(--foreground);
+  font-size: 13.5px;
+  font-weight: 720;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.external-integration-copy > span {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.external-integration-copy .is-enabled,
+.external-integration-copy .is-disabled {
+  font-size: 10.5px;
+  font-weight: 680;
+  white-space: nowrap;
+}
+
+.external-integration-copy .is-enabled {
+  color: var(--success);
+}
+
+.external-integration-copy .is-disabled {
+  color: var(--muted);
+}
+
+.external-integration-actions {
+  align-items: center;
+  display: flex;
+  gap: 3px;
+}
+
+.external-integration-actions .settings-toggle {
+  margin-right: 5px;
+}
+
+.external-integration-empty {
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  gap: 12px;
+  grid-template-columns: 34px minmax(0, 1fr);
+  padding: 20px 0;
+}
+
+.external-integration-loading {
+  align-items: center;
+  border-top: 1px solid color-mix(in srgb, var(--border) 62%, transparent);
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  gap: 8px;
+  justify-content: center;
+  min-height: 76px;
+}
+
+.external-integration-error,
+.external-integration-modal-error {
+  border-left: 2px solid var(--danger);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 0 0 14px;
+  padding: 4px 0 4px 9px;
+}
+
+.external-integration-modal {
+  max-height: min(86dvh, 700px) !important;
+  width: min(100%, 720px);
+}
+
+.external-integration-form {
+  align-content: start;
+  display: grid;
+  gap: 12px 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 0;
+}
+
+.external-integration-form > label {
+  align-content: start;
+  align-self: start;
+  color: var(--muted-strong);
+  display: grid;
+  font-size: 12px;
+  font-weight: 720;
+  gap: 6px;
+  grid-auto-rows: max-content;
+  min-width: 0;
+}
+
+.external-integration-form > label > span {
+  align-items: center;
+  display: flex;
+  gap: 7px;
+}
+
+.external-integration-form > label > span > small {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: 999px;
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 620;
+  line-height: 18px;
+  padding: 0 7px;
+}
+
+.external-integration-form .wide {
+  grid-column: 1 / -1;
+}
+
+.external-integration-form .settings-control {
+  justify-self: stretch;
+  width: 100%;
+}
+
+.external-integration-path-control {
+  align-items: center;
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-width: 0;
+}
+
+.external-integration-path-control .ui-button {
+  white-space: nowrap;
+}
+
+.external-integration-textarea {
+  min-height: 78px;
+  padding: 9px 11px;
+  resize: vertical;
+}
+
+.external-integration-clear-field {
+  appearance: none;
+  background: none;
+  border: 0;
+  color: var(--accent-strong);
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  margin-left: auto;
+  padding: 0;
+}
+
+.external-integration-clear-field:hover {
+  text-decoration: underline;
+}
+
+.external-integration-field-description {
+  color: var(--muted) !important;
+  font-size: 11px !important;
+  font-weight: 500 !important;
+  line-height: 1.5;
+}
+
+.external-integration-enabled-field {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  min-height: 54px;
+  padding-top: 10px;
+}
+
+.external-integration-test-hint,
+.external-integration-test-result {
+  align-items: flex-start;
+  display: flex;
+  font-size: 11px;
+  gap: 7px;
+  line-height: 1.5;
+  padding-top: 0;
+}
+
+.external-integration-test-hint svg,
+.external-integration-test-result svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.external-integration-test-hint {
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  border-radius: 10px;
+  color: var(--accent-strong);
+  padding: 11px 12px;
+}
+
+.external-integration-test-hint.is-waiting {
+  background: color-mix(in srgb, var(--accent) 11%, var(--panel));
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+}
+
+.external-integration-test-result {
+  color: var(--success);
+}
+
+.external-integration-modal-error {
+  margin-bottom: 0;
+}
+
+@media (max-width: 700px) {
+  .external-integration-toolbar {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .external-integration-toolbar .ui-button {
+    justify-self: start;
+  }
+
+  .external-integration-row {
+    grid-template-columns: 34px minmax(0, 1fr);
+  }
+
+  .external-integration-actions {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .external-integration-form {
+    grid-template-columns: 1fr;
+  }
+
+  .external-integration-form .wide {
+    grid-column: auto;
+  }
+
+  .external-integration-path-control {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .external-integration-path-control .ui-button {
+    justify-self: start;
+  }
+}
+
 .settings-toggle:disabled {
   cursor: not-allowed;
   opacity: 0.55;

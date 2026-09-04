@@ -3,6 +3,11 @@
 Mounts framework-neutral Capability providers as an AI SDK `ToolSet` and
 injectable Skill instructions.
 
+This package is an optional convenience adapter for AI SDK. Capability packages
+do not depend on it and can be registered with any TypeScript Agent framework
+through `@webpilot/capability-host`. See the
+[framework-neutral integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
 ```ts
 import { ToolLoopAgent } from 'ai';
 import {

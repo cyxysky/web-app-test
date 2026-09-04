@@ -1,6 +1,11 @@
 import { generateText } from 'ai';
 import { retrievalQueryTexts } from '@/lib/fuzzy-retrieval';
-import { aiMaxOutputTokens, aiRequestTimeoutMs, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import {
+  aiMaxOutputTokens,
+  aiRequestTimeoutMs,
+  aiTelemetry,
+  createAiRequestWatchdog,
+} from '@/server/ai/ai-sdk-runtime';
 import { getModel } from '@/server/ai/model';
 
 const retrievalQueryCache = new Map<string, string[]>();
@@ -30,22 +35,28 @@ export async function expandMultilingualRetrievalQuery(value: unknown) {
   const cached = retrievalQueryCache.get(key);
   if (cached) return cached;
 
+  const timeoutMs = Math.min(aiRequestTimeoutMs(), 10_000);
+  const requestWatchdog = createAiRequestWatchdog(undefined, timeoutMs);
+
   try {
-    const result = await generateText({
-      model: getModel(),
-      maxOutputTokens: aiMaxOutputTokens(768),
-      temperature: 0,
-      maxRetries: 0,
-      timeout: Math.min(aiRequestTimeoutMs(), 12_000),
-      telemetry: aiTelemetry('multilingual-retrieval-query-expansion'),
-      prompt: [
-        'Create search variants for matching a browser Skill and durable personal memory.',
-        'Return only one JSON array containing 6 to 16 short strings.',
-        'Include both Simplified Chinese and English variants, synonyms, abbreviations, and the same business entities.',
-        'Do not add new intent, names, identifiers, dates, or facts.',
-        `Query:\n${key}`,
-      ].join('\n'),
-    });
+    const result = await requestWatchdog.run(
+      generateText({
+        model: getModel(),
+        maxOutputTokens: aiMaxOutputTokens(768),
+        temperature: 0,
+        maxRetries: 0,
+        abortSignal: requestWatchdog.abortSignal,
+        timeout: timeoutMs,
+        telemetry: aiTelemetry('multilingual-retrieval-query-expansion'),
+        prompt: [
+          'Create search variants for matching a browser Skill and durable personal memory.',
+          'Return only one JSON array containing 6 to 16 short strings.',
+          'Include both Simplified Chinese and English variants, synonyms, abbreviations, and the same business entities.',
+          'Do not add new intent, names, identifiers, dates, or facts.',
+          `Query:\n${key}`,
+        ].join('\n'),
+      }),
+    );
     const variants = retrievalQueryTexts([...base, ...parsedVariants(result.text)]).slice(0, 24);
     const resolved = variants.length ? variants : base;
     cacheVariants(key, resolved);
@@ -53,5 +64,7 @@ export async function expandMultilingualRetrievalQuery(value: unknown) {
   } catch {
     cacheVariants(key, base);
     return base;
+  } finally {
+    requestWatchdog.dispose();
   }
 }

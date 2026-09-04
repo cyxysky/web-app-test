@@ -78,15 +78,6 @@ function ToolOutputViewer({ payload, wrap }: { payload: string; wrap: boolean })
   );
 }
 
-function rawToolResultPayload(value: unknown) {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
-
 function toolInputPayload(tool: BrowserChatToolCall) {
   if (!tool.reason) return formatToolPayload(tool.input);
   const input = tool.input && typeof tool.input === 'object' && !Array.isArray(tool.input)
@@ -121,10 +112,9 @@ export function BrowserChatToolDialog({
   const displayedInputPayload = inputPayload || emptyPayloadLabel;
   const completeResult = detail.tool.rawResult ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
-  // Diagnostics must expose the exact persisted tool result. In particular,
-  // do not unwrap `actual`: the outer result also carries runtime Skills,
-  // failure classification, screenshots, and trace data.
-  const resultPayload = rawToolResultPayload(completeResult);
+  // Keep the complete persisted result while expanding any embedded JSON text
+  // into structured values for the JSON viewer.
+  const resultPayload = formatToolPayload(completeResult);
   useEffect(() => () => {
     if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
   }, []);

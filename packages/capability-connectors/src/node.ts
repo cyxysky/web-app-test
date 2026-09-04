@@ -82,6 +82,15 @@ export function createOpenApiConnector(input: { id: string; name?: string; docum
   };
 }
 
-export function createNodeConnectorsCapability(input: { connectors: readonly AgentConnector[] | ((context: CapabilityRunContext) => readonly AgentConnector[]) }) {
-  return createConnectorsCapability({ createRegistry(context) { return createConnectorRegistry(typeof input.connectors === 'function' ? input.connectors(context) : input.connectors); } });
+export function createNodeConnectorsCapability(input: {
+  connectors: readonly AgentConnector[] | ((context: CapabilityRunContext) => readonly AgentConnector[] | Promise<readonly AgentConnector[]>);
+}) {
+  return createConnectorsCapability({
+    async createRegistry(context) {
+      const connectors = typeof input.connectors === 'function'
+        ? await input.connectors(context)
+        : input.connectors;
+      return createConnectorRegistry(connectors);
+    },
+  });
 }

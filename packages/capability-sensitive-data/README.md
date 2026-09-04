@@ -19,6 +19,14 @@ This is model middleware, not an Agent tool. It must wrap the final provider
 call so system messages, user/assistant text, tool arguments, and tool results
 are filtered consistently.
 
+For TypeScript Agent frameworks other than AI SDK, call the framework-neutral
+redaction client at the final model-provider boundary: transform the complete
+outbound model request immediately before the provider call, and do not apply it
+only to user text or individual tools. This package does not create a
+`CapabilityProvider` and must not be registered as an Agent tool. See the
+[TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md)
+for its position relative to ordinary Capability packages.
+
 ## Entrypoints
 
 - `@webpilot/capability-sensitive-data`: manifest, settings, configuration types, and portable HTTP client.

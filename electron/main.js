@@ -2371,6 +2371,19 @@ function registerEmbeddedBrowserIpc() {
 }
 
 function registerSystemIpc() {
+  registerIpcHandler('webpilot:system:select-file', async (_event, input) => {
+    const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
+      ? input.defaultPath.trim()
+      : undefined;
+    const result = await dialog.showOpenDialog(mainWindow, {
+      defaultPath,
+      properties: ['openFile'],
+      title: 'Select file',
+    });
+    if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
+    return { ok: true, path: result.filePaths[0] };
+  });
+
   registerIpcHandler('webpilot:system:select-directory', async (_event, input) => {
     const defaultPath = typeof input.defaultPath === 'string' && input.defaultPath.trim()
       ? input.defaultPath.trim()

@@ -120,6 +120,7 @@ export default function nextConfig(phase: string): NextConfig {
       return config;
     },
     serverExternalPackages: [
+      'ws',
       'typeorm',
       'better-sqlite3',
       'pg',
