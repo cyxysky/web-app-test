@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   applyUnoDraftPatch,
   applyUnoDraftPatchHunks,
+  applyUnoDraftReplacements,
   downloadFileArtifact,
   editUnoFileArtifact,
   formatFileArtifactResult,
@@ -277,7 +278,7 @@ describe('UNO file tool policies', () => {
     expect(formatted).toContain('slide-1/footer,slide-2/footer');
   });
 
-  it('applies Codex patches while preserving indentation on fuzzy-matched context', () => {
+  it('requires exact source indentation in Codex patch context', () => {
     const source = [
       'def create_document(job):',
       '    if enabled:',
@@ -290,13 +291,17 @@ describe('UNO file tool policies', () => {
       '*** Begin Patch',
       '*** Update File: draft.py',
       '@@',
-      ' if enabled:',
+      '     if enabled:',
       '-        title = "Old"',
       '+        title = "New"',
-      ' body = "Keep"',
+      '         body = "Keep"',
       '*** End Patch',
     ].join('\n'));
     expect(patched).toBe(source.replace('"Old"', '"New"'));
+    expect(() => applyUnoDraftPatch(source, [
+      '*** Begin Patch', '*** Update File: draft.py', '@@',
+      '-    title = "Old"', '+    title = "New"', '*** End Patch',
+    ].join('\n'))).toThrow('PATCH_TARGET_NOT_FOUND');
     expect(() => applyUnoDraftPatch(source, [
       '*** Begin Patch',
       '*** Update File: other.py',
@@ -341,7 +346,7 @@ describe('UNO file tool policies', () => {
     expect(source).toContain('        title = "Old"');
   });
 
-  it('keeps successful independent hunks when one hunk has stale context', () => {
+  it('rejects the complete atomic batch when one hunk has stale context', () => {
     const source = [
       'def create_document(job):',
       '    title = "Old"',
@@ -364,15 +369,13 @@ describe('UNO file tool policies', () => {
       '*** End Patch',
     ].join('\n'));
 
-    expect(result.source).toContain('    title = "New"');
-    expect(result.source).toContain('    body = "Current"');
-    expect(result.source).toContain('    deck.save(validate=True)');
-    expect(result).toMatchObject({ appliedHunks: 2, totalHunks: 3 });
+    expect(result.source).toBe(source);
+    expect(result).toMatchObject({ appliedHunks: 0, totalHunks: 3, blockedHunks: [1, 3] });
     expect(result.failedHunks).toHaveLength(1);
     expect(result.failedHunks[0]).toMatchObject({ hunk: 2 });
   });
 
-  it('treats already-applied and context-only hunks as satisfied without changing indentation', () => {
+  it('does not infer edit success from new text found elsewhere', () => {
     const source = [
       'def create_document(job):',
       '    title = "New"',
@@ -385,19 +388,39 @@ describe('UNO file tool policies', () => {
       '@@ def create_document(job):',
       '-    title = "Old"',
       '+    title = "New"',
-      '@@',
-      '     body = "Current"',
       '*** End Patch',
     ].join('\n'));
 
     expect(result.source).toBe(source);
     expect(result).toMatchObject({
       appliedHunks: 0,
-      alreadyAppliedHunks: 1,
-      ignoredHunks: 1,
-      totalHunks: 2,
+      alreadyAppliedHunks: 0,
+      ignoredHunks: 0,
+      totalHunks: 1,
     });
-    expect(result.failedHunks).toEqual([]);
+    expect(result.failedHunks[0].error).toContain('PATCH_TARGET_NOT_FOUND');
+    const replacement = applyUnoDraftReplacements(source, [{ oldText: 'missing = 1', newText: '    title = "New"' }]);
+    expect(replacement.alreadyAppliedHunks).toBe(0);
+    expect(replacement.failedHunks[0].error).toContain('OLD_TEXT_NOT_FOUND');
+  });
+
+  it('locates hunks on one snapshot and preserves conflict details in model output', () => {
+    const result = applyUnoDraftPatchHunks('first = 1\nfirst = 2\n', [
+      '*** Begin Patch', '*** Update File: draft.py', '@@',
+      '-first = 1', '+first = 2', '@@', '-first = 2', '+first = 3', '*** End Patch',
+    ].join('\n'));
+    expect(result.source).toBe('first = 2\nfirst = 3\n');
+    const atomic = applyUnoDraftReplacements('a\nb\n', [
+      { oldText: 'a', newText: 'A' }, { oldText: 'missing', newText: 'B' },
+    ]);
+    expect(atomic).toMatchObject({ source: 'a\nb\n', appliedHunks: 0, blockedHunks: [1] });
+    const formatted = JSON.parse(formatFileArtifactResult('file', JSON.stringify({
+      kind: 'uno-draft-validation', editStatus: 'partial-patch-applied', saved: true,
+      validation: 'passed', patchBaseDigest: 'current',
+      patchHunks: { applied: 1, failed: [{ hunk: 2, error: 'missing' }], total: 2 },
+    })) || '{}');
+    expect(formatted.patchBaseDigest).toBe('current');
+    expect(formatted.patchHunks.failed).toEqual([{ hunk: 2, error: 'missing' }]);
   });
 
   it('allows distant atomic hunks without treating their span as a full replacement', () => {
@@ -442,7 +465,7 @@ describe('UNO file tool policies', () => {
       '     return 1',
       '*** End Patch',
     ].join('\n'))).toThrow(
-      "Patch hunk 1 contains only context and no change. Replacement requires at least one '-old' line and one '+new' line",
+      'PATCH_MISSING_CHANGE_MARKERS',
     );
   });
 
@@ -535,7 +558,7 @@ describe('UNO file tool policies', () => {
     }
   });
 
-  it('rebases exact stale patches and returns already-satisfied retries as success', async () => {
+  it('rejects stale edits and confirms identical replay without repeating failed validation', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'webpilot-stale-patch-rebase-'));
     roots.push(root);
     const previousArtifacts = process.env.ARTIFACTS_DIR;
@@ -560,30 +583,37 @@ describe('UNO file tool policies', () => {
         `+    return ${newValue}`,
         '*** End Patch',
       ].join('\n');
-      expect((await editUnoFileArtifact({
+      const applied = await editUnoFileArtifact({
         documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
         patch: patch(1, 2), runId: 'chat_test',
-      })).ok).toBe(true);
+      });
+      expect(applied.ok).toBe(false); // The wrong entrypoint remains invalid.
+      const appliedPayload = JSON.parse(applied.actual || '{}');
+      expect(appliedPayload).toMatchObject({ editStatus: 'patch-applied', saved: true, validation: 'failed' });
 
       const rebased = await editUnoFileArtifact({
         documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
         patch: patch(2, 3), runId: 'chat_test',
       });
-      expect(rebased.ok, rebased.actual).toBe(true);
-      expect(JSON.parse(rebased.actual || '{}')).toMatchObject({ rebased: true, saved: true });
+      expect(rebased.ok, rebased.actual).toBe(false);
+      expect(JSON.parse(rebased.actual || '{}')).toMatchObject({ code: 'PATCH_BASE_DIGEST_MISMATCH', changed: false, saved: false });
 
       const repeated = await editUnoFileArtifact({
         documentId: 'stale-patch-rebase', baseDigest: initial.patchBaseDigest,
-        patch: patch(2, 3), runId: 'chat_test',
+        patch: patch(1, 2), runId: 'chat_test',
       });
-      expect(repeated.ok, repeated.actual).toBe(true);
+      expect(repeated.ok, repeated.actual).toBe(false);
       expect(JSON.parse(repeated.actual || '{}')).toMatchObject({
+        code: 'EDIT_REPLAY_CONFIRMED',
         editStatus: 'already-applied',
         changed: false,
         saved: true,
-        rebased: true,
+        validationStatus: 'failed',
       });
-      expect((await readUnoDraft({ documentId: 'stale-patch-rebase', runId: 'chat_test' })).actual).toContain('return 3');
+      const current = JSON.parse((await readUnoDraft({ documentId: 'stale-patch-rebase', runId: 'chat_test' })).actual || '{}');
+      expect(current.program).toContain('return 2');
+      expect(current.validationEvidence.checkedAt).toBe(appliedPayload.validationEvidence.checkedAt);
+      expect(current.patchBaseDigest).toBe(appliedPayload.patchBaseDigest);
     } finally {
       if (previousArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = previousArtifacts;

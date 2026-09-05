@@ -9,6 +9,7 @@ export * from './node/office/javascript.js';
 export * from './node/office/program-analysis.js';
 export * from './node/office/preview.js';
 export * from './node/office/render-validation.js';
+export * from './node/office/semantic.js';
 export * from './node/office/uno.js';
 export * from './node/office/validation.js';
 export * from './node/read.js';

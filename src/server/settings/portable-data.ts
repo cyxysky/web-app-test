@@ -6,7 +6,7 @@ import {
   scrypt,
 } from 'node:crypto';
 import { z } from 'zod';
-import { modelProviderDefinitions, modelProviderValues } from '@/config/settings';
+import { isModelProvider, modelProviderDefinitionsForConfig } from '@/config/settings';
 import {
   exportLoginAccountCredentials,
   importLoginAccountsQueued,
@@ -61,6 +61,7 @@ const memoryItemSchema = z.object({
 }).strict();
 
 const modelProviderSettingsSchema = z.object({
+  displayName: z.string().trim().max(80).optional(),
   enabled: z.boolean().optional(),
   defaultModel: z.string().trim().max(1_000).optional(),
   model: z.string().trim().min(1).max(1_000),
@@ -199,10 +200,10 @@ async function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, 
 
 function parseModelConfig(value: unknown): Pick<Awaited<ReturnType<typeof store.saveModelConfig>>, 'provider' | 'providers'> {
   const parsed = rawModelConfigSchema.parse(value);
-  if (!modelProviderValues.includes(parsed.provider as ModelProvider)) throw new Error('模型服务商无效');
+  if (!isModelProvider(parsed.provider)) throw new Error('模型服务商无效');
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
   for (const [providerValue, settings] of Object.entries(parsed.providers)) {
-    if (!modelProviderValues.includes(providerValue as ModelProvider)) throw new Error(`未知模型服务商：${providerValue}`);
+    if (!isModelProvider(providerValue)) throw new Error(`未知模型服务商：${providerValue}`);
     providers[providerValue as ModelProvider] = settings;
   }
   return { provider: parsed.provider as ModelProvider, providers };
@@ -234,10 +235,11 @@ export async function exportPortableData(input: {
   if (input.kind === 'model') {
     const saved = await store.getModelConfig();
     if (!saved) throw new Error('请先保存模型配置再导出');
-    const providers = Object.fromEntries(modelProviderDefinitions.map((definition) => {
+    const providers = Object.fromEntries(modelProviderDefinitionsForConfig(saved.providers).map((definition) => {
       const current = saved.providers[definition.value];
       if (!current) return [definition.value, undefined];
       return [definition.value, {
+        displayName: current.displayName,
         enabled: current.enabled === true,
         defaultModel: current.defaultModel,
         model: current.model,

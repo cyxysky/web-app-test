@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { access, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import JSZip from 'jszip';
@@ -9,15 +9,16 @@ import { PDFParse } from 'pdf-parse';
 import { chromium } from 'playwright';
 import sharp from 'sharp';
 import * as XLSX from 'xlsx';
-import { officePreviewExtensions, readableFileExtensions } from '../../formats.js';
+import { fileFormatForName, officePreviewExtensions, readableFileExtensions } from '../../formats.js';
 import { convertOfficeFile } from '../libreoffice.js';
 import { inspectRenderedPage, type OfficeArtifactIssue } from './validation.js';
+import { officeRenderEnvironmentFingerprint } from './runtime-fingerprint.js';
 
 export type FilePreviewResult = {
   imagePaths: string[];
   pageCount?: number;
   renderedPages: number[];
-  renderer: 'embedded-media' | 'html-preview' | 'libreoffice-pdf' | 'pdf' | 'unavailable';
+  renderer: 'image' | 'embedded-media' | 'html-preview' | 'libreoffice-pdf' | 'pdf' | 'unavailable';
   warning?: string;
   automaticChecks?: Array<{ pageNumber: number; width?: number; height?: number; issues: OfficeArtifactIssue[] }>;
 };
@@ -31,6 +32,28 @@ const htmlPageHeight = 1_358;
 const officeExtensions = officePreviewExtensions();
 const docxExtensions = new Set(['.docx']);
 const spreadsheetExtensions = readableFileExtensions('spreadsheet');
+const previewLocks = new Map<string, Promise<unknown>>();
+
+async function writeCacheFile(target: string, data: Buffer | string) {
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, data);
+    await rename(temporary, target);
+  } finally {
+    await unlink(temporary).catch(() => undefined);
+  }
+}
+
+async function withPreviewLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = previewLocks.get(key) || Promise.resolve();
+  const pending = previous.catch(() => undefined).then(operation);
+  previewLocks.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    if (previewLocks.get(key) === pending) previewLocks.delete(key);
+  }
+}
 
 export function normalizeFilePreviewPages(value: unknown, pageCount?: number) {
   const representative = pageCount && pageCount > maxFilePreviewPagesPerRead
@@ -55,7 +78,7 @@ function previewDirectory(input: {
 }) {
   if (!input.buffer && !input.cacheKey) throw new Error('Attachment preview requires a source buffer or stable cache key.');
   const digest = createHash('sha256')
-    .update('attachment-visual-v2\0')
+    .update('attachment-visual-v3-1400px\0')
     .update(input.extension)
     .update(input.cacheKey || input.buffer!)
     .digest('hex');
@@ -98,46 +121,53 @@ async function writeManifest(directory: string, manifest: VisualCacheManifest) {
   for (const check of compatiblePrevious?.automaticChecks || []) checksByPage.set(check.pageNumber, check);
   for (const check of manifest.automaticChecks || []) checksByPage.set(check.pageNumber, check);
   const automaticChecks = [...checksByPage.values()].sort((left, right) => left.pageNumber - right.pageNumber);
-  await writeFile(manifestPath, JSON.stringify({
+  await writeCacheFile(manifestPath, JSON.stringify({
     ...compatiblePrevious,
     ...manifest,
     ...(automaticChecks.length > 0 ? { automaticChecks } : {}),
-  } satisfies VisualCacheManifest), 'utf8');
+  } satisfies VisualCacheManifest));
 }
 
-async function renderPdfPages(buffer: Buffer, directory: string, requestedPages: unknown, renderer: 'libreoffice-pdf' | 'pdf') {
+async function renderPdfPages(buffer: Buffer, directory: string, requestedPages: unknown, renderer: 'libreoffice-pdf' | 'pdf'): Promise<FilePreviewResult> {
   const cached = await existingCache(directory, requestedPages);
-  if (cached && cached.renderer === renderer) return cached;
+  if (cached && cached.renderer === 'pdf') return { ...cached, renderer };
 
   const parser = new PDFParse({ data: Buffer.from(buffer) });
   try {
     const info = await parser.getInfo();
     const renderedPages = normalizeFilePreviewPages(requestedPages, info.total);
+    const missingPages = (await Promise.all(renderedPages.map(async (page) => (
+      await access(pageImagePath(directory, page), constants.R_OK).then(() => undefined, () => page)
+    )))).filter((page): page is number => page !== undefined);
+    // A new request may overlap earlier batches. Rasterize only missing pages.
+    if (!missingPages.length) {
+      const automaticChecks = await Promise.all(renderedPages.map(async (pageNumber) => ({
+        pageNumber, ...await inspectRenderedPage(pageImagePath(directory, pageNumber)),
+      })));
+      await writeManifest(directory, { automaticChecks, pageCount: info.total, renderer: 'pdf' });
+      return { ...(await existingCache(directory, renderedPages))!, renderer };
+    }
     const screenshots = await parser.getScreenshot({
       desiredWidth: 1_400,
       imageBuffer: true,
       imageDataUrl: false,
-      partial: renderedPages,
+      partial: missingPages,
     });
     await mkdir(directory, { recursive: true });
     const imagePaths: string[] = [];
     for (const page of screenshots.pages) {
       const target = pageImagePath(directory, page.pageNumber);
-      await writeFile(target, Buffer.from(page.data));
+      await writeCacheFile(target, Buffer.from(page.data));
       imagePaths.push(target);
     }
     const automaticChecks = await Promise.all(imagePaths.map(async (imagePath, index) => ({
       pageNumber: screenshots.pages[index].pageNumber,
       ...await inspectRenderedPage(imagePath),
     })));
-    await writeManifest(directory, { automaticChecks, pageCount: screenshots.total, renderer });
-    return {
-      imagePaths,
-      pageCount: screenshots.total,
-      renderedPages: screenshots.pages.map((page) => page.pageNumber),
-      renderer,
-      automaticChecks,
-    } satisfies FilePreviewResult;
+    await writeManifest(directory, { automaticChecks, pageCount: screenshots.total, renderer: 'pdf' });
+    const complete = await existingCache(directory, renderedPages);
+    if (!complete) throw new Error('PDF renderer did not produce all requested pages.');
+    return { ...complete, renderer };
   } finally {
     await parser.destroy();
   }
@@ -230,10 +260,36 @@ async function convertOfficeToPdf(absolutePath: string, extension: string, direc
     const pdf = await convertOfficeFile({ absolutePath, sourceExtension: extension, targetExtension: '.pdf' });
     if (pdf) {
       await mkdir(directory, { recursive: true });
-      await writeFile(cachedPdfPath, pdf);
+      await writeCacheFile(cachedPdfPath, pdf);
     }
     return pdf;
   }
+}
+
+/** Associate an artifact with the PDF already exported by its UNO worker. */
+export async function registerOfficePreview(input: {
+  absolutePath: string; previewPath: string; extension: string; previewRoot?: string;
+}) {
+  if (!officeExtensions.has(input.extension.toLowerCase())) return;
+  const [buffer, pdf, environment] = await Promise.all([
+    readFile(input.absolutePath), readFile(input.previewPath), officeRenderEnvironmentFingerprint(),
+  ]);
+  const directory = previewDirectory({
+    cacheKey: `${createHash('sha256').update(buffer).digest('hex')}:${environment}`,
+    extension: input.extension.toLowerCase(), root: input.previewRoot,
+  });
+  await withPreviewLock(directory, async () => {
+    await mkdir(directory, { recursive: true });
+    const cachedPath = path.join(directory, 'office-preview.pdf');
+    if (!(await readFile(cachedPath).catch(() => undefined))?.equals(pdf)) {
+      await writeCacheFile(cachedPath, pdf);
+    }
+  });
+}
+
+async function renderSharedPdf(buffer: Buffer, requestedPages: unknown, root: string | undefined, renderer: 'pdf' | 'libreoffice-pdf') {
+  const directory = previewDirectory({ buffer, extension: '.pdf', root });
+  return withPreviewLock(directory, () => renderPdfPages(buffer, directory, requestedPages, renderer));
 }
 
 async function renderDocxFallback(buffer: Buffer, directory: string, requestedPages: unknown, title: string) {
@@ -298,28 +354,60 @@ export async function renderFilePreview(input: {
   previewRoot?: string;
 }): Promise<FilePreviewResult> {
   const extension = input.extension.toLowerCase();
+  // Source bytes, not action names/artifact IDs, determine preview identity.
+  let sourceBuffer: Buffer;
+  try {
+    sourceBuffer = input.buffer || await readFile(input.absolutePath);
+  } catch (error) {
+    return { imagePaths: [], renderedPages: [], renderer: 'unavailable',
+      warning: `附件视觉预览无法读取源文件：${error instanceof Error ? error.message : String(error)}` };
+  }
+  const environment = officeExtensions.has(extension) ? await officeRenderEnvironmentFingerprint() : '';
   const directory = previewDirectory({
-    buffer: input.buffer,
-    cacheKey: input.cacheKey,
+    buffer: sourceBuffer,
+    ...(environment ? { cacheKey: `${createHash('sha256').update(sourceBuffer).digest('hex')}:${environment}` } : {}),
     extension,
     root: input.previewRoot,
   });
-  let sourceBuffer = input.buffer;
-  const getSourceBuffer = async () => {
-    sourceBuffer ||= await readFile(input.absolutePath);
-    return sourceBuffer;
-  };
+  const getSourceBuffer = async () => sourceBuffer;
   try {
+    if (fileFormatForName(`source${extension}`)?.kind === 'image') {
+      return await withPreviewLock(directory, async () => {
+        const cached = await existingCache(directory, [1]);
+        if (cached?.renderer === 'image') return cached;
+        // Send actual pixels, not just dimensions. Preserve the original asset
+        // and normalize orientation/resolution only in this content-addressed cache.
+        const image = await sharp(sourceBuffer).rotate()
+          .resize({ width: 1_600, height: 1_600, fit: 'inside', withoutEnlargement: true })
+          .png().toBuffer();
+        await mkdir(directory, { recursive: true });
+        const target = pageImagePath(directory, 1);
+        await writeCacheFile(target, image);
+        await writeManifest(directory, { pageCount: 1, renderer: 'image' });
+        return { imagePaths: [target], pageCount: 1, renderedPages: [1], renderer: 'image' } satisfies FilePreviewResult;
+      });
+    }
     if (extension === '.pdf') {
-      const cached = await existingCache(directory, input.pages);
-      if (cached && cached.renderer === 'pdf') return cached;
-      return await renderPdfPages(await getSourceBuffer(), directory, input.pages, 'pdf');
+      return await renderSharedPdf(sourceBuffer, input.pages, input.previewRoot, 'pdf');
     }
     if (officeExtensions.has(extension)) {
-      const cached = await existingCache(directory, input.pages);
-      if (cached && cached.renderer === 'libreoffice-pdf') return cached;
-      const pdf = await convertOfficeToPdf(input.absolutePath, extension, directory);
-      if (pdf) return await renderPdfPages(pdf, directory, input.pages, 'libreoffice-pdf');
+      const pdf = await withPreviewLock(directory, async () => {
+        // Convert the same byte snapshot used for the cache key, even if an
+        // upload/caller replaces the original file while this job is queued.
+        const snapshotPath = path.join(directory, `source${extension}`);
+        await mkdir(directory, { recursive: true });
+        try {
+          await access(path.join(directory, 'office-preview.pdf'), constants.R_OK);
+        } catch {
+          await writeCacheFile(snapshotPath, sourceBuffer);
+        }
+        try {
+          return await convertOfficeToPdf(snapshotPath, extension, directory);
+        } finally {
+          await unlink(snapshotPath).catch(() => undefined);
+        }
+      });
+      if (pdf) return await renderSharedPdf(pdf, input.pages, input.previewRoot, 'libreoffice-pdf');
       if (docxExtensions.has(extension)) {
         return await renderDocxFallback(await getSourceBuffer(), directory, input.pages, input.name);
       }

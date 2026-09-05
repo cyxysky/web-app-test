@@ -2,7 +2,7 @@ import {
   defaultModelForProvider,
   defaultModelProviderSettings,
   modelListForProvider,
-  modelProviderDefinitions,
+  modelProviderDefinitionsForConfig,
   migrateRuntimeEnvValue,
   runtimeEnvDefinitions,
 } from '@/config/settings';
@@ -12,7 +12,7 @@ import { store } from '@/server/db/store';
 
 function completeProviders(input?: Partial<Record<ModelProvider, ModelProviderSettings>>) {
   const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
+  for (const definition of modelProviderDefinitionsForConfig(input)) {
     const current = input?.[definition.value];
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, current);

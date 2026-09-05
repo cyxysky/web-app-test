@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { nextBrowserChatActivity } from '@/lib/browser-chat-activity';
 import { BrowserSession, type BrowserActionResult, type BrowserLiveInput, type BrowserLiveNativeEvent, type BrowserScreencastFrame, type BrowserTabSnapshot } from '@webpilot/capability-browser/node';
 import type {
   BrowserCodeAttachmentBinding,
@@ -198,6 +199,7 @@ export type BrowserChatMessage = {
     phase: string;
     label: string;
     updatedAt: string;
+    startedAt?: string;
   };
   status?: 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
@@ -1494,7 +1496,7 @@ async function readFileForSession(
   if (!attachment) {
     return {
       ok: false,
-      actual: '未找到可读取文件。请使用对话附件的 attachmentId，或 file action=download/action=generate 返回的 Artifact ID。',
+      actual: '未找到可读取的文件内容。readContent 使用上传附件的 attachmentId，或 render/download/convert 返回的 artifactId；读取生成源码请用 readSource + documentId。',
     };
   }
   const result = await readBrowserChatAttachment({
@@ -1743,7 +1745,7 @@ function conversationFileRegistry(
   ).reverse();
   const lines = [
     ...[...uploads.values()].map((attachment) => (
-      `- upload | name=${JSON.stringify(attachment.name)} | attachmentId=${attachment.id} | read=file(action=read, attachmentId=${JSON.stringify(attachment.id)})`
+      `- upload | name=${JSON.stringify(attachment.name)} | attachmentId=${attachment.id} | contentRead=file(action=readContent, attachmentId=${JSON.stringify(attachment.id)})`
     )),
     ...artifacts.flatMap((artifact) => {
       const relative = artifact.path
@@ -1753,13 +1755,16 @@ function conversationFileRegistry(
       const attachment = artifactId ? artifactAttachmentForSession(session, artifactId) : undefined;
       const absolutePath = attachment ? uploadedBrowserChatAttachmentPath(attachment, session.userId) : undefined;
       if (!artifactId || !absolutePath || !existsSync(absolutePath)) return [];
-      return [`- artifact | name=${JSON.stringify(artifact.fileName)} | artifactId=${artifactId} | documentId=${artifact.documentId || '-'} | read=file(action=read, artifactId=${JSON.stringify(artifactId)})`];
+      const sourceRead = artifact.documentId
+        ? `file(action=readSource, documentId=${JSON.stringify(artifact.documentId)})`
+        : 'not-listed; use file(action=list) to find an existing draft; do not infer source from file content';
+      return [`- artifact | name=${JSON.stringify(artifact.fileName)} | artifactId=${artifactId} | documentId=${artifact.documentId || '-'} | sourceRead=${sourceRead} | contentRead=file(action=readContent, artifactId=${JSON.stringify(artifactId)})`];
     }),
   ];
   if (!lines.length) return '';
   return [
     '[Conversation file registry — persistent runtime metadata]',
-    'Every listed file is shared by this conversation. Use its listed ID with file action=read; never guess a host path. Before Office generation, file action=plan returns the exact mounted asset names for job.asset_path(name).',
+    'For generation code or layout repair, use sourceRead (readSource + documentId). For Excel cell data/Word text/PDF text, use contentRead (readContent + artifactId/attachmentId). These are different objects: file content is NOT its generator source. For page images use visualIndex/visualRead + artifactId. Never guess a host path. plan returns exact asset names for job.asset_path(name).',
     ...lines.slice(0, 200),
   ].join('\n');
 }
@@ -2593,7 +2598,9 @@ function appendLog(
     updateAssistantMessage(session, logMessageId, (item) => ({
       ...item,
       activity: item.status === 'running' && runningActivity
-        ? { phase, label: runningActivity, updatedAt: timestamp }
+        ? {
+          ...nextBrowserChatActivity({ phase, label: runningActivity, timestamp, elapsedMs: input.elapsedMs, previous: item.activity }),
+        }
         : item.activity,
       stepIndexes: stepIndex
         ? Array.from(new Set([...(item.stepIndexes || []), stepIndex])).sort((a, b) => a - b)
@@ -4507,12 +4514,12 @@ function runningActivityFromLog(phase: string, message: string) {
   if (phase === 'ai:runtime:attempt') return message;
   if (phase === 'ai:context-compression:start') return '正在压缩上下文';
   if (phase === 'ai:context-compression:complete' || phase === 'ai:context-segmented') return '上下文压缩完成，正在准备模型输入';
-  if (phase === 'ai:runtime:request') return '正在请求 AI 模型';
+  if (phase === 'ai:runtime:request') return message.startsWith('等待 AI 首包') ? message : '等待 AI 首包';
+  if (phase === 'ai:runtime:response-headers' || phase === 'ai:runtime:receiving') return message;
   if (phase === 'ai:runtime:response') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:object') return 'AI 已返回，正在解析动作';
   if (phase === 'ai:runtime:attempt-failed' || phase === 'ai:runtime:retry') return message;
-  if (phase === 'ai:runtime:retry-exhausted') return 'AI 请求重试已耗尽';
-  if (phase === 'ai:runtime:retry-skipped') return 'AI 请求失败，该错误不可重试';
+  if (phase === 'ai:runtime:retry-exhausted' || phase === 'ai:runtime:retry-skipped') return message;
   if (phase === 'ai:runtime:attempt-succeeded') return 'AI 已返回，正在处理结果';
   if (phase === 'ai:runtime:partial') return '工具已执行，正在继续判断';
   if (phase === 'ai:context-compressed') return '正在压缩上下文';
@@ -5890,7 +5897,10 @@ async function runBrowserChatMessage(
               ...(blocks?.length ? { content: streamedText } : {}),
               activity: {
                 phase: 'ai:text:streaming',
-                label: 'AI 正在生成回复',
+                startedAt: message.activity?.startedAt || message.activity?.updatedAt || timestamp,
+                label: message.activity?.phase === 'ai:runtime:receiving' || message.activity?.phase === 'ai:text:streaming'
+                  ? message.activity.label
+                  : '正在接收 AI 回复',
                 updatedAt: timestamp,
               },
               status: 'running',
@@ -5900,6 +5910,14 @@ async function runBrowserChatMessage(
           });
           session.updatedAt = timestamp;
           scheduleBrowserChatTextStreamPublish(session.id, assistantMessageId);
+          persistAndNotify(session.id, { defer: true, mergePersisted: false });
+        },
+        onActiveModelCheckpoint: (activeMessages) => {
+          if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
+          session.modelContext = normalizeBrowserChatModelContext({
+            ...session.modelContext,
+            activeMessages: serializableBrowserChatModelMessages(activeMessages),
+          });
           persistAndNotify(session.id, { defer: true, mergePersisted: false });
         },
         onModelMessages: ({ activeMessages, turnMessages }) => {

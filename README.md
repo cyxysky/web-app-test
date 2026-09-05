@@ -1258,3 +1258,7 @@ file-webpilot-adapter
 三个内置能力完成真正解耦，大约需要 37–55 人日。若第一版只支持官方三个 `.wpp`，暂不开放任意第三方代码安装，可压缩到约 25–35 人日。
 
 最适合立即开始的第一步不是移动 File 或 Browser，而是先实现 `capability-sdk + registry`，然后用 Chart 跑通完整纵向链路。Chart 跑通后，接口是否合理会非常清楚，之后再处理体量最大的 File 和 Browser，返工风险最低。
+
+
+
+请在真实文件工作流中生成并最终交付一个“UNO 全能力视觉叙事.pptx”。必须先读取 system-file-artifact-runtime，使用 file 工具，documentId 固定为 uno-worldclass-pptx。 视觉标准：16:9，世界级编辑设计，兼具瑞士排版的精确、顶级科技品牌的克制和电影级视觉。深午夜蓝、钴蓝、暖白、少量琥珀。中文字体优先 Microsoft YaHei UI。标题至少 30pt，正文至少 17pt。禁止卡片墙、网页化 UI、廉价渐变、密集小字和装饰性图表。每页一个清晰目的，留白充足，所有文本、图表、表格、形状均保持原生可编辑。 必须 plan 选择 UNO；读取 unoApi 模块索引并查询所有 full/partial Presentation 模块，跳过 preserve-only 和 unsupported。使用原始 UNO 程序路径，实际覆盖：文档元数据；幻灯片增删、移动、复制；命名布局与 slot/grid/stack；标题、普通文本、自动缩小、富文本、原生项目符号、外部链接与内部跳转；图片 contain/crop/rotation/transparency/alt/source、带说明图片；矩形、圆角、线、渐变、旋转、连接线、CaptionShape、MeasureShape、ConnectorShape、原生分组；原生可编辑表格；所有已安装图表家族（column/bar/line/area/pie/donut/scatter/bubble/radar/stock，分布到少量图表页上且信息不拥挤）；时间线；页眉页脚；背景；转场；演讲者备注；页码字段；批注；媒体；形状动画；母版应用；自定义放映。 内容做成约 14 页的“2026 全球智能运营图谱”虚构演示：极简封面、目录、核心结论、趋势、区域组合、情景比较、原生表格、全图表图谱、流程/时间线、形状能力、媒体页、行动框架、附录。虚构数字必须自洽，并在备注说明为示例数据。图表要有单位、轴和合适图例；股票图使用合理 OHLC 数据；散点/气泡有清晰变量。每个对象都用稳定 elementId。 生成后 action=render，核对 automaticValidation、featureCounts、幻灯片数、原生图表/表格/图片/备注/媒体/动画等。visualRead 必须覆盖全部幻灯片，visualReport 完整通过后才可交付。发现溢出、碰撞、空白图表、图例遮挡、低对比度或字体过小，必须编辑同一 documentId 修复。 还要真实测试编辑：首次渲染后 action=read 获取 baseDigest，再 action=edit 对同一 documentId 做至少四种局部编辑（替换一处标题、修改一组图表数据、移动或复制一张幻灯片、调整一个原生形状/表格或转场），再次 render 并完整视觉 QA。最终只交付最新版 PPTX 和真实 downloadUrl，不要生成无用测试文件。

@@ -66,16 +66,17 @@ export default function nextConfig(phase: string): NextConfig {
       // whole barrel whenever a workspace route is compiled for the first time.
       optimizePackageImports: ['@heroui/react'],
     },
-    webpack(config, { dev }) {
+    webpack(config, { dev, isServer }) {
       if (dev) {
         // Webpack otherwise compiles every nested async import during the first
         // route request. Browser Chat owns optional, very large viewers and
-        // charting surfaces, so defer those chunks in both the client and server
-        // graphs until the user opens them. Route entries stay eager because
-        // Next manages their lifecycle.
+        // charting surfaces, so defer CLIENT imports until they are opened.
+        // The Node runtime has no module.hot: an inactive lazy-compilation proxy
+        // exports a Promise resolved only by HMR, so a provider import can wait
+        // forever even after Webpack compiles it. Never install these server proxies.
         config.experiments = {
           ...(config.experiments || {}),
-          lazyCompilation: {
+          lazyCompilation: isServer ? false : {
             entries: false,
             imports: true,
           },

@@ -1,7 +1,6 @@
 import { generateText } from 'ai';
 import { retrievalQueryTexts } from '@/lib/fuzzy-retrieval';
 import {
-  aiMaxOutputTokens,
   aiRequestTimeoutMs,
   aiTelemetry,
   createAiRequestWatchdog,
@@ -42,7 +41,6 @@ export async function expandMultilingualRetrievalQuery(value: unknown) {
     const result = await requestWatchdog.run(
       generateText({
         model: getModel(),
-        maxOutputTokens: aiMaxOutputTokens(768),
         temperature: 0,
         maxRetries: 0,
         abortSignal: requestWatchdog.abortSignal,

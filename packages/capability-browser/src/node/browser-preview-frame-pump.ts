@@ -87,7 +87,7 @@ export class BrowserPreviewFramePump<TFrame extends { capturedAt?: string }> {
     if (this.stopped || this.activeSend) return;
     const candidate = this.latest;
     if (!candidate || candidate.sequence <= this.transmittedSequence) return;
-    const send = Promise.resolve(this.options.onFrame(candidate.frame));
+    const send = Promise.resolve().then(() => this.options.onFrame(candidate.frame));
     this.activeSend = send;
     try {
       await send;

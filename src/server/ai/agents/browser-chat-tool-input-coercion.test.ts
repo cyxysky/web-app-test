@@ -9,7 +9,7 @@ test('deterministically converts supported scalar transport values', () => {
     action: 'generate', documentId: 'document-1', program: 'def create_document(job):\n    pass', render: false,
   });
   assert.deepEqual(coerceBrowserChatToolInput('file', { action: 'read', pages: '["1",2]', limit: '40' }), {
-    action: 'read', pages: [1, 2], limit: 40,
+    action: 'readContent', pages: [1, 2], limit: 40,
   });
 });
 

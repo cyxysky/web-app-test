@@ -602,20 +602,20 @@ test('supports Codex patches without numeric hunk counts', () => {
     '*** Begin Patch',
     '*** Update File: draft.py',
     '@@',
-    ' deck = job.presentation("deck")',
+    '     deck = job.presentation("deck")',
     '-    title = "Old"',
     '+    title = "New"',
-    ' deck.save()',
+    '     deck.save()',
     '*** End Patch',
   ].join('\n')), python.replace('"Old"', '"New"'));
-  assert.equal(applyUnoDraftPatch('same\ntarget\nsame\ntarget\n', [
+  assert.throws(() => applyUnoDraftPatch('same\ntarget\nsame\ntarget\n', [
     '*** Begin Patch',
     '*** Update File: draft.py',
     '@@',
     '-target',
     '+changed',
     '*** End Patch',
-  ].join('\n')), 'same\nchanged\nsame\ntarget\n');
+  ].join('\n')), /PATCH_TARGET_AMBIGUOUS/);
 });
 
 test('allows many distant atomic Codex patch hunks without treating their span as a full replacement', () => {

@@ -567,13 +567,22 @@ async function main() {
   const hostname = String(process.env.HOSTNAME || '127.0.0.1');
   const port = Math.max(1, Math.floor(Number(process.env.PORT || 3000)));
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
-  const { loadEnvConfig } = requireRuntimeDependency(appDir, '@next/env');
+  const { loadEnvConfig, updateInitialEnv } = requireRuntimeDependency(appDir, '@next/env');
   loadEnvConfig(appDir, dev);
+  // App modules may bundle another @next/env instance. Route all persisted
+  // setting updates to the same snapshot used by this native Next server.
+  globalThis[Symbol.for('webpilot.updateInitialRuntimeEnv')] = updateInitialEnv;
   const memoryMonitor = startProcessMemoryMonitor();
   process.env.WEBPILOT_REALTIME_PUBLISH_TOKEN ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_HEADER_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_IDENTITY_SECRET ||= randomBytes(32).toString('base64url');
   process.env.WEBPILOT_INTERNAL_REQUEST_TOKEN ||= randomBytes(32).toString('base64url');
+  // Next reloads its initial environment when routes or .env files change.
+  // Keep process-lifetime credentials in that snapshot, without persisting them.
+  updateInitialEnv(Object.fromEntries([
+    'WEBPILOT_REALTIME_PUBLISH_TOKEN', 'WEBPILOT_IDENTITY_HEADER_SECRET',
+    'WEBPILOT_IDENTITY_SECRET', 'WEBPILOT_INTERNAL_REQUEST_TOKEN',
+  ].map((key) => [key, process.env[key]])));
   const identityHeaderSecret = process.env.WEBPILOT_IDENTITY_HEADER_SECRET;
   const compiledConfig = dev ? undefined : loadCompiledNextConfig(appDir);
   const apiRuntimeSupervisor = splitRuntimeEnabled(dev, runtimeChildMode)

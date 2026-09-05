@@ -6,6 +6,7 @@ import { formatToolPayload } from '@/lib/browser-chat-format';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import { AppModal } from '@/components/ui/app-modal';
+import { browserChatToolOutcomeLabel } from '@/components/browser-chat-tool-error';
 
 type BrowserChatToolCall = NonNullable<StepExecutionResult['tools']>[number];
 
@@ -18,6 +19,8 @@ export type BrowserChatToolDialogDetail = {
 };
 
 function toolStatusLabel(tool: BrowserChatToolCall, step: StepExecutionResult) {
+  const outcome = browserChatToolOutcomeLabel(tool.rawResult ?? tool.error ?? tool.result);
+  if (outcome) return outcome;
   if (tool.recovered === true && tool.transient === true) return '已恢复';
   if (tool.ok === true) return '已完成';
   if (tool.ok === false) return '失败';
@@ -28,6 +31,7 @@ function toolStatusLabel(tool: BrowserChatToolCall, step: StepExecutionResult) {
 }
 
 function toolStatusTone(status: string) {
+  if (status.includes('校验失败') || status.includes('仍有冲突')) return 'warning';
   if (status === '失败') return 'danger';
   if (status === '已暂停') return 'warning';
   if (status === '执行中') return 'progress';
@@ -90,10 +94,16 @@ function toolInputPayload(tool: BrowserChatToolCall) {
 
 export function BrowserChatToolDialog({
   detail,
+  loading = false,
+  loadFailed = false,
+  onRetry,
   onClose,
   toolLabel,
 }: {
   detail: BrowserChatToolDialogDetail;
+  loading?: boolean;
+  loadFailed?: boolean;
+  onRetry?: () => void;
   onClose: () => void;
   toolLabel: (name: string, input: unknown) => string;
 }) {
@@ -110,11 +120,18 @@ export function BrowserChatToolDialog({
   // identical in the diagnostics dialog.
   const inputPayload = toolInputPayload(detail.tool);
   const displayedInputPayload = inputPayload || emptyPayloadLabel;
-  const completeResult = detail.tool.rawResult ?? detail.tool.result;
+  const completeResult = detail.tool.rawResult ?? detail.tool.error ?? detail.tool.result;
   const hasActualResult = completeResult !== undefined && completeResult !== null && completeResult !== '';
   // Keep the complete persisted result while expanding any embedded JSON text
   // into structured values for the JSON viewer.
   const resultPayload = formatToolPayload(completeResult);
+  const missingResultLabel = loading
+    ? '正在加载完整执行结果…'
+    : loadFailed
+      ? '完整执行结果加载失败，请重试。'
+      : detail.tool.ok === undefined && detail.step.status === 'running'
+        ? '工具正在执行，尚未返回结果。'
+        : '此调用已结束，但记录中缺少执行结果。';
   useEffect(() => () => {
     if (copiedResetTimer.current) clearTimeout(copiedResetTimer.current);
   }, []);
@@ -180,7 +197,9 @@ export function BrowserChatToolDialog({
                   {hasActualResult ? <button className="browser-chat-tool-copy-button" onClick={() => void copyPayload(resultPayload, 'output')} type="button">{copiedPayload === 'output' ? <Check size={15} /> : <Copy size={15} />}{t(copiedPayload === 'output' ? '已复制' : '复制')}</button> : null}
                 </div>
               </header>
-              {hasActualResult ? <ToolOutputViewer payload={resultPayload || emptyPayloadLabel} wrap={wrapOutput} /> : <ToolOutputViewer payload={t('该工具调用没有返回执行结果。')} wrap={wrapOutput} />}
+              {loading && hasActualResult ? <p role="status">{t('正在加载完整执行结果…')}</p> : null}
+              {loadFailed ? <p role="alert">{t('完整执行结果加载失败，请重试。')} {onRetry ? <button onClick={onRetry} type="button">{t('重试')}</button> : null}</p> : null}
+              <ToolOutputViewer payload={hasActualResult ? resultPayload || emptyPayloadLabel : t(missingResultLabel)} wrap={wrapOutput} />
             </section>
           </div>
         </div>

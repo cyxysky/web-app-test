@@ -244,6 +244,7 @@ export type ModelProvider =
   | 'openai-compatible'
   | 'openai-compatible-2'
   | 'openai-compatible-3'
+  | `openai-compatible-${number}`
   | 'openrouter'
   | 'perplexity'
   | 'togetherai'

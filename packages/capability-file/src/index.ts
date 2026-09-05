@@ -11,6 +11,8 @@ import {
 import { fileCapabilitySettings } from './settings.js';
 import { fileRuntimeSkill } from './runtime-skill.js';
 import { createFileToolInput } from './schema.js';
+import { fileActionInputIssues } from './action-guidance.js';
+import { normalizeFileToolInput } from './transport.js';
 import {
   fileActions,
   fileVisualActions,
@@ -90,16 +92,24 @@ export async function executeFileAction(
   input: FileToolInput,
   context: CapabilityExecutionContext,
 ): Promise<CapabilityResult> {
+  input = normalizeFileToolInput(input) as FileToolInput;
   if (!isFileAction(input.action)) {
     return {
       ok: false,
       error: {
         code: 'invalid-file-action',
-        message: 'file requires one action: list | read | download | convert | plan | generate | edit | unoApi | jsApi | render.',
+        message: 'file requires one action: list | readSource | readContent | download | convert | plan | generate | edit | unoApi | jsApi | render.',
       },
     };
   }
-  const handler = operations[input.action] as ((
+  const issues = fileActionInputIssues(input);
+  if (issues.length) {
+    return { ok: false, error: { code: 'file-action-input-mismatch', message: issues.map((issue) => `${issue.field}: ${issue.message}`).join('\n'), details: issues } };
+  }
+  // Text reads never attach page previews unless explicitly requested.
+  if (input.action === 'readContent') input = { ...input, includeVisuals: input.includeVisuals === true };
+  const readAlias = (input.action === 'readSource' || input.action === 'readContent') && !operations[input.action];
+  const handler = (readAlias ? operations.read : operations[input.action as FileAction]) as ((
     actionInput: FileToolInput & { action: FileAction },
     executionContext: CapabilityExecutionContext,
   ) => Promise<CapabilityResult>) | undefined;
@@ -113,7 +123,7 @@ export async function executeFileAction(
     };
   }
   try {
-    return await handler(input as FileToolInput & { action: FileAction }, context);
+    return await handler({ ...input, action: readAlias ? 'read' : input.action } as FileToolInput & { action: FileAction }, context);
   } catch (error) {
     return executionFailure('file', error);
   }
@@ -161,13 +171,17 @@ export function createFileTools(
   const tools: Record<string, ReturnType<typeof defineCapabilityTool>> = {
     [fileCapabilityToolNames.file]: defineCapabilityTool<FileToolInput, unknown>({
       name: fileCapabilityToolNames.file,
-      description: visualInputAvailable
-        ? 'List, read, download, convert, plan, generate, edit, inspect APIs for, render, and visually inspect file artifacts in a stable document workspace.'
-        : 'List, read, download, convert, plan, generate, edit, inspect APIs for, or render file artifacts in a stable document workspace.',
+      description: (visualInputAvailable
+        ? 'File workflow: readSource(documentId) reads editable Python/JavaScript; readContent(artifactId OR attachmentId) reads file text/data, NOT source. To repair layout: readSource → edit → render → visualIndex/visualRead → visualReport. list discovers drafts; plan selects engine; generate creates source; download fetches assets; convert changes file format; unoApi/jsApi describe the planned engine. Never substitute IDs or infer behavior from reason.'
+        : 'File workflow: readSource(documentId) reads editable Python/JavaScript; readContent(artifactId OR attachmentId) reads file text/data, NOT source. To repair: readSource → edit → render. list discovers drafts; plan selects engine; generate creates source; download fetches assets; convert changes file format; unoApi/jsApi describe the planned engine. No visual inspection is available; do not claim visual QA.')
+        + ' Design: original/high-design work starts with plan.design (bespoke audience, objective, distinct directions, selection and rhythm), then custom program composition. For fast conventional files, follow semanticGeneration.recommended, not available alone. Consistent visual rules do not mean identical page layouts.'
+        + ' Edit is atomic: prefer exact replacements, uniquely matched on one pre-edit snapshot; any conflict saves nothing. Preserve indentation; never rely on fuzzy matching. After saved=true, inspect validation separately and use the returned patchBaseDigest. Only an identical request confirmed by a saved edit receipt is deduplicated. unoApi exact module IDs return only that module.'
+        + ' Recovery: readSource/list return saved diagnostics, not a new execution. Check validationEvidence freshness. Do not infer bridge failure from NoneType or source correctness from a runtime blocker. Respect retryable/retryAfter; no unchanged retry loops.',
       input: createFileToolInput(visualInputAvailable),
       inputExamples: [
         { action: 'list', reason: 'List current file drafts' },
-        { action: 'read', reason: 'Read the current document source', documentId: 'travel-guide' },
+        { action: 'readSource', reason: 'Locate code to patch, without reading the PPTX or attaching screenshots', documentId: 'travel-guide', startLine: 1, endLine: 80 },
+        { action: 'readContent', reason: 'Inspect finished-file text/data, not the generator source', artifactId: 'exact-artifact-id-from-render', offset: 0, limit: 2000 },
         {
           action: 'plan',
           reason: 'Plan a presentation',
@@ -176,6 +190,18 @@ export function createFileTools(
           documentType: 'presentation',
           operation: 'create',
           intent: 'Create a concise travel guide presentation.',
+        },
+        {
+          action: 'generate',
+          reason: 'Create the planned presentation with semantic templates',
+          documentId: 'travel-guide',
+          spec: {
+            schemaVersion: '1.0',
+            theme: 'clean',
+            blocks: [
+              { id: 'cover', type: 'page', template: 'cover', title: 'Travel guide', subtitle: 'A concise itinerary' },
+            ],
+          },
         },
         { action: 'render', reason: 'Render the current document', documentId: 'travel-guide' },
         ...(visualInputAvailable ? [

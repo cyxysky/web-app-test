@@ -20,6 +20,23 @@ export type BrowserChatToolDetail = {
   tool: BrowserChatToolCall;
 };
 
+/** Realtime traces omit raw payloads; never let them erase fetched evidence. */
+export function mergeBrowserChatToolDetail(detail: BrowserChatToolDetail, live: BrowserChatToolDetail): BrowserChatToolDetail {
+  return {
+    ...detail,
+    ...live,
+    confirmationScreenshotUrl: live.confirmationScreenshotUrl ?? detail.confirmationScreenshotUrl,
+    tool: {
+      ...detail.tool,
+      ...live.tool,
+      ok: live.tool.ok ?? detail.tool.ok,
+      rawResult: detail.tool.rawResult ?? live.tool.rawResult,
+      result: detail.tool.result ?? live.tool.result,
+      error: detail.tool.error ?? live.tool.error,
+    },
+  };
+}
+
 export function aiCycleToolKey(cycleId: string, toolIndex: number) {
   return `${cycleId}:${toolIndex}`;
 }

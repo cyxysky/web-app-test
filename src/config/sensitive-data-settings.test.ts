@@ -20,7 +20,7 @@ const sensitiveDataSettingKeys = [
 
 describe('sensitive-data settings tab', () => {
   it('exposes a dedicated administrator-only tab', () => {
-    expect(environmentSettingsTabs).toContainEqual({ id: 'sensitive-data', label: '敏感数据过滤' });
+    expect(environmentSettingsTabs).toContainEqual(expect.objectContaining({ id: 'sensitive-data', label: '安全与隐私' }));
     expect(isAdministratorOnlySettingsTab('sensitive-data')).toBe(true);
   });
 

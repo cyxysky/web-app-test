@@ -2,6 +2,7 @@ import { asRecord, finiteNumber } from '@/lib/unknown-value';
 
 export type BrowserChatLogRecordLike = {
   details?: unknown;
+  elapsedMs?: number;
   message?: string;
   phase: string;
 };
@@ -33,7 +34,8 @@ function runtimeLogTimings(log: BrowserChatLogRecordLike) {
   if (!log.phase.endsWith('ai:runtime:response') && !log.phase.endsWith('ai:runtime:object')) return undefined;
   const details = parsedLogDetails(log.details);
   const payload = asRecord(details?.event) || asRecord(details?.value) || details;
-  return asRecord(asRecord(payload?.aiOutput)?.timings);
+  return asRecord(asRecord(payload?.aiOutput)?.timings)
+    || (typeof log.elapsedMs === 'number' ? { aiRequestElapsedMs: log.elapsedMs } : undefined);
 }
 
 function phaseMatches(log: BrowserChatLogRecordLike, phase: string) {
@@ -65,7 +67,8 @@ export function isBrowserChatAiInputOutputLog(log: BrowserChatLogRecordLike) {
 }
 
 export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
-  return phaseMatches(log, 'ai:runtime:attempt-failed')
+  return isBrowserChatAiTerminalFailureLog(log)
+    || phaseMatches(log, 'ai:runtime:attempt-failed')
     || phaseMatches(log, 'ai:runtime:retry')
     || phaseMatches(log, 'ai:runtime:retry-exhausted')
     || phaseMatches(log, 'ai:runtime:retry-skipped')
@@ -74,6 +77,15 @@ export function isBrowserChatAiFailureLog(log: BrowserChatLogRecordLike) {
     || phaseMatches(log, 'target:plan:validation:retry')
     || phaseMatches(log, 'target:plan:validation:error')
     || phaseMatches(log, 'target:plan:error');
+}
+
+export function isBrowserChatAiTerminalFailureLog(log: BrowserChatLogRecordLike) {
+  if (!phaseMatches(log, 'ai:runtime:attempt-succeeded')) return false;
+  const details = parsedLogDetails(log.details);
+  const payload = asRecord(details?.event) || asRecord(details?.value) || details;
+  return payload?.responseStatus === 'failed'
+    || payload?.responseStatus === 'blocked'
+    || ['length', 'content-filter', 'error'].includes(String(payload?.finishReason || ''));
 }
 
 export function isBrowserChatAiAttemptLog(log: BrowserChatLogRecordLike) {
@@ -93,6 +105,8 @@ export function isBrowserChatTargetPlanningLog(log: BrowserChatLogRecordLike) {
 
 export function isBrowserChatAiLog(log: BrowserChatLogRecordLike) {
   return isBrowserChatAiInputOutputLog(log)
+    || phaseMatches(log, 'ai:runtime:response-headers')
+    || phaseMatches(log, 'ai:runtime:receiving')
     || isBrowserChatAiAttemptLog(log)
     || isBrowserChatDocumentVisualQaLog(log)
     || isBrowserChatTargetPlanningLog(log);

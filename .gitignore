@@ -6,6 +6,7 @@
 /out
 /dist
 /packages/*/dist/
+/tmp
 /.capability-runtime/
 /.tmp
 /output

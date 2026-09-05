@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { TextArea } from '@heroui/react/textarea';
+import { InputGroup } from '@heroui/react/input-group';
 import Link from 'next/link';
 import { AlertCircle, ArrowLeft, ChevronDown, CircleCheck, Copy, FolderOpen, ImageIcon, KeyRound, Loader2, Maximize2, PencilLine, PlayCircle, Plus, RefreshCw, Save, Search, Trash2, X } from 'lucide-react';
 import { CustomSelect } from '@/components/CustomSelect';
@@ -9,9 +10,11 @@ import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { SkillsManager } from '@/components/SkillsManager';
 import {
   defaultModelForProvider,
+  isOpenAICompatibleProvider,
   modelListForProvider,
-  modelProviderDefinitions,
+  modelProviderDefinitionsForConfig,
   modelProviderDefinition,
+  openAICompatibleProviderIndex,
   runtimeEnvDefinition,
   uniqueModelIds,
   type SettingsTab,
@@ -157,20 +160,70 @@ type VisibleEnvSetting = {
   definition: ReturnType<typeof runtimeEnvDefinition>;
 };
 
+type SettingsSecondaryNavItem = {
+  id: string;
+  label: string;
+  meta?: string;
+};
+
 const customRuntimeSettingKeys = new Set(['AGENT_COMMUNICATION_ALLOW_SEND', 'AGENT_DATA_ALLOW_WRITES']);
+const browserRuntimeGroups = new Set(['浏览器 Agent']);
+const capabilityRuntimeGroups = new Set(['代码沙箱', '计算机', '文件能力', 'Git', '知识库', '媒体', '数据与文件']);
+const integrationAdvancedGroups = new Set(['连接器（高级）', '通信（高级）', '数据（高级）', '研究（高级）']);
+
+function SettingsSecondaryNav({
+  activeId,
+  items,
+  label,
+  onChange,
+}: {
+  activeId: string;
+  items: SettingsSecondaryNavItem[];
+  label: string;
+  onChange: (id: string) => void;
+}) {
+  return (
+    <aside className="settings-secondary-nav">
+      <span className="settings-secondary-nav-label">{label}</span>
+      <nav aria-label={label}>
+        {items.map((item) => (
+          <button
+            aria-current={activeId === item.id ? 'page' : undefined}
+            className={activeId === item.id ? 'active' : undefined}
+            key={item.id}
+            onClick={() => onChange(item.id)}
+            type="button"
+          >
+            <span>{item.label}</span>
+            {item.meta ? <small>{item.meta}</small> : null}
+          </button>
+        ))}
+      </nav>
+    </aside>
+  );
+}
 
 function SettingsGroupCard({
   children,
   className = '',
+  description,
+  forceOpen = false,
   initiallyOpen = true,
+  meta,
   title,
 }: {
   children: ReactNode;
   className?: string;
+  description?: string;
+  forceOpen?: boolean;
   initiallyOpen?: boolean;
+  meta?: string;
   title: string;
 }) {
   const [expanded, setExpanded] = useState(initiallyOpen);
+  useEffect(() => {
+    if (forceOpen) setExpanded(true);
+  }, [forceOpen]);
   return (
     <div className={`settings-group-card${expanded ? ' is-expanded' : ''}${className ? ` ${className}` : ''}`}>
       <button
@@ -179,8 +232,14 @@ function SettingsGroupCard({
         onClick={() => setExpanded((current) => !current)}
         type="button"
       >
-        <h3>{title}</h3>
-        <ChevronDown aria-hidden="true" size={17} />
+        <span className="settings-group-card-title">
+          <h3>{title}</h3>
+          {description ? <small>{description}</small> : null}
+        </span>
+        <span className="settings-group-card-summary">
+          {meta ? <small>{meta}</small> : null}
+          <ChevronDown aria-hidden="true" size={17} />
+        </span>
       </button>
       <div
         aria-hidden={!expanded}
@@ -211,7 +270,7 @@ function runtimeSettingGroup(tab: SettingsTab, key: string, configuredGroup?: st
     if (/^BROWSER_CHAT_/.test(key)) return '对话运行';
     if (/^AI_PERSONAL_MEMORY_/.test(key)) return '个性化记忆';
     if (/^AI_(?:CONTEXT|GLM_CONTEXT|IMAGE_CONTEXT|VISUAL_)/.test(key)) return '上下文管理';
-    return 'Agent 运行';
+    return 'Agent 运行时';
   }
   if (tab === 'debug') return key.startsWith('CODEX_') ? 'Codex CLI' : '调试与追踪';
   return '配置';
@@ -220,12 +279,65 @@ function runtimeSettingGroup(tab: SettingsTab, key: string, configuredGroup?: st
 function groupVisibleEnvSettings(tab: SettingsTab, settings: VisibleEnvSetting[]) {
   const groups = new Map<string, VisibleEnvSetting[]>();
   for (const setting of settings) {
-    const title = runtimeSettingGroup(tab, setting.item.key, setting.definition?.group);
+    const title = normalizeSettingsGroupTitle(tab, runtimeSettingGroup(tab, setting.item.key, setting.definition?.group));
     const group = groups.get(title) || [];
     group.push(setting);
     groups.set(title, group);
   }
   return [...groups.entries()].map(([title, items]) => ({ title, items }));
+}
+
+function normalizeSettingsGroupTitle(tab: SettingsTab, title: string) {
+  if (tab === 'runtime' && title === '工作流程（高级）') return '工作流程';
+  if (tab === 'integrations') return title.replace(/（高级）$/, '高级设置');
+  return title;
+}
+
+function envSettingDisplayTab(setting: VisibleEnvSetting): SettingsTab {
+  const sourceTab = setting.definition?.tab;
+  const group = runtimeSettingGroup(sourceTab || 'runtime', setting.item.key, setting.definition?.group);
+  if (sourceTab === 'runtime' && browserRuntimeGroups.has(group)) return 'browser';
+  if (sourceTab === 'runtime' && capabilityRuntimeGroups.has(group)) return 'capabilities';
+  if (sourceTab === 'runtime' && group === '个性化记忆') return 'memory';
+  if (sourceTab === 'debug' && group === '浏览器调试') return 'browser';
+  if (sourceTab === 'debug' && group === '工作流程（高级）') return 'runtime';
+  if (sourceTab === 'debug' && integrationAdvancedGroups.has(group)) return 'integrations';
+  if (customRuntimeSettingKeys.has(setting.item.key)) return 'integrations';
+  return sourceTab || 'runtime';
+}
+
+function envSettingSectionId(setting: VisibleEnvSetting) {
+  if (setting.item.key === 'AGENT_COMMUNICATION_ALLOW_SEND') return 'integration:communication';
+  if (setting.item.key === 'AGENT_DATA_ALLOW_WRITES') return 'integration:data';
+  const tab = envSettingDisplayTab(setting);
+  return normalizeSettingsGroupTitle(tab, runtimeSettingGroup(tab, setting.item.key, setting.definition?.group));
+}
+
+function envSettingIsContextuallyVisible(setting: VisibleEnvSetting, values: Map<string, string>) {
+  if (setting.item.key === 'BROWSER_SCREENCAST_QUALITY') return values.get('BROWSER_SCREENCAST_FORMAT') === 'jpeg';
+  if (setting.item.key.startsWith('BROWSER_PREVIEW_VIDEO_')) return values.get('BROWSER_PREVIEW_TRANSPORT') === 'video';
+  if (setting.item.key === 'BROWSER_VIEWPORT_WIDTH' || setting.item.key === 'BROWSER_VIEWPORT_HEIGHT') {
+    return values.get('BROWSER_VIEWPORT_MODE') === 'fixed';
+  }
+  if (setting.item.key === 'GLINER_SERVICE_URL' || setting.item.key === 'GLINER_SERVICE_API_KEY') {
+    return values.get('GLINER_RUNTIME_MODE') === 'external';
+  }
+  return true;
+}
+
+function envItemsFingerprint(items: EnvRow[]) {
+  return JSON.stringify(items.map(({ key, value, enabled, secret }) => ({ key, value, enabled, secret })));
+}
+
+function displayDefaultValue(key: string, value: string) {
+  if (!value) return '未设置';
+  if (key.endsWith('_MS') && Number.isFinite(Number(value))) {
+    const milliseconds = Number(value);
+    if (milliseconds >= 60_000 && milliseconds % 60_000 === 0) return `${milliseconds / 60_000} 分钟`;
+    if (milliseconds >= 1_000 && milliseconds % 1_000 === 0) return `${milliseconds / 1_000} 秒`;
+    return `${milliseconds} 毫秒`;
+  }
+  return value;
 }
 
 type SystemBridge = {
@@ -315,7 +427,7 @@ function personalMemoryDraftApiPath(draft: PersonalMemoryDraft) {
 
 function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
+  for (const definition of modelProviderDefinitionsForConfig(input?.providers)) {
     const current = input?.providers?.[definition.value];
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, { ...current, models });
@@ -357,7 +469,7 @@ function providerSettings(config: ModelConfig, provider: ModelProvider) {
 
 function extraRequestParameterDrafts(config: ModelConfig) {
   const drafts: Partial<Record<ModelProvider, ExtraRequestParameterDraft[]>> = {};
-  for (const definition of modelProviderDefinitions) {
+  for (const definition of modelProviderDefinitionsForConfig(config.providers)) {
     drafts[definition.value] = parseExtraRequestParameterPairs(
       providerSettings(config, definition.value).extraRequestParameters,
     ).map((pair, index) => ({
@@ -496,8 +608,15 @@ export function EnvironmentSettings({
   const { brandPrefix, brandText, setBrandPrefix, setBrandText } = useWorkspaceBrand();
   const [internalActiveTab, setInternalActiveTab] = useState<SettingsTab>('general');
   const [items, setItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
+  const [savedItems, setSavedItems] = useState<EnvRow[]>(() => initialData?.envItems || []);
+  const itemsRef = useRef(items);
   const [modelConfig, setModelConfig] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
   const [modelDraft, setModelDraft] = useState<ModelConfig>(() => createModelConfig(initialData?.modelConfig));
+  const [selectedModelProvider, setSelectedModelProvider] = useState<ModelProvider>(() => (
+    createModelConfig(initialData?.modelConfig).provider
+  ));
+  const modelDraftRef = useRef(modelDraft);
+  const providerListRef = useRef<HTMLDivElement>(null);
   const [extraRequestParameterRows, setExtraRequestParameterRows] = useState<Partial<Record<ModelProvider, ExtraRequestParameterDraft[]>>>(() => (
     extraRequestParameterDrafts(createModelConfig(initialData?.modelConfig))
   ));
@@ -515,11 +634,22 @@ export function EnvironmentSettings({
   const [loading, setLoading] = useState(!initialData && shouldLoadEnvironmentConfig && (!adminSettingsPasswordRequired || Boolean(adminSettingsAccessToken)));
   const [savingEnv, setSavingEnv] = useState(false);
   const [savingModel, setSavingModel] = useState(false);
+  const [envAutoSaveError, setEnvAutoSaveError] = useState('');
+  const [modelAutoSaveError, setModelAutoSaveError] = useState('');
+  const envFailedFingerprintRef = useRef('');
+  const modelFailedFingerprintRef = useRef('');
+  const [settingsSearch, setSettingsSearch] = useState('');
+  const [settingsSearchFocused, setSettingsSearchFocused] = useState(false);
+  const [highlightedSettingKey, setHighlightedSettingKey] = useState('');
+  const [activeSettingsSections, setActiveSettingsSections] = useState<Partial<Record<SettingsTab, string>>>({});
   const [sensitiveDataTestInput, setSensitiveDataTestInput] = useState('');
   const [sensitiveDataTestResult, setSensitiveDataTestResult] = useState<SensitiveDataTestResult | null>(null);
   const [sensitiveDataTestError, setSensitiveDataTestError] = useState('');
   const [testingSensitiveData, setTestingSensitiveData] = useState(false);
   const [sensitiveDataEvaluationCases, setSensitiveDataEvaluationCases] = useState<SensitiveDataEvaluationDraft[]>([]);
+  const [savedSensitiveDataEvaluationCases, setSavedSensitiveDataEvaluationCases] = useState<SensitiveDataEvaluationDraft[]>([]);
+  const sensitiveDataEvaluationCasesRef = useRef(sensitiveDataEvaluationCases);
+  const sensitiveDataEvaluationFailedFingerprintRef = useRef('');
   const [sensitiveDataEvaluationRun, setSensitiveDataEvaluationRun] = useState<SensitiveDataEvaluationRun | null>(null);
   const [selectedSensitiveDataEvaluationCaseId, setSelectedSensitiveDataEvaluationCaseId] = useState('');
   const [sensitiveDataEvaluationSearch, setSensitiveDataEvaluationSearch] = useState('');
@@ -552,6 +682,9 @@ export function EnvironmentSettings({
     if (!visibleSettingsTabs.some((item) => item.id === tab)) return;
     (onActiveTabChange || setInternalActiveTab)(tab);
   };
+  itemsRef.current = items;
+  modelDraftRef.current = modelDraft;
+  sensitiveDataEvaluationCasesRef.current = sensitiveDataEvaluationCases;
 
   function optionLabel(option: { label: string; value: string }) {
     if (option.label === '关闭' && option.value === 'false') return language === 'en' ? 'Off' : '关闭';
@@ -586,6 +719,7 @@ export function EnvironmentSettings({
         if (controller.signal.aborted) return;
         const drafts = sensitiveDataEvaluationDrafts(data.cases);
         setSensitiveDataEvaluationCases(drafts);
+        setSavedSensitiveDataEvaluationCases(drafts);
         setSelectedSensitiveDataEvaluationCaseId((current) => drafts.some((item) => item.id === current) ? current : drafts[0]?.id || '');
         setSensitiveDataEvaluationLoaded(true);
       } catch (error) {
@@ -600,6 +734,20 @@ export function EnvironmentSettings({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, adminSettingsAccessToken, adminSettingsPasswordRequired]);
 
+  useEffect(() => {
+    if (!highlightedSettingKey) return;
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.querySelector<HTMLElement>(`[data-setting-key="${CSS.escape(highlightedSettingKey)}"]`);
+      target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target?.focus({ preventScroll: true });
+    });
+    const timeout = window.setTimeout(() => setHighlightedSettingKey(''), 2400);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [activeTab, highlightedSettingKey]);
+
   async function load() {
     setLoading(true);
     try {
@@ -611,8 +759,10 @@ export function EnvironmentSettings({
       const modelData = await readApiJson<{ config?: Partial<ModelConfig> }>(modelResponse, t('读取模型配置失败'));
       const nextModel = createModelConfig(modelData.config);
       setItems(envData.saved || []);
+      setSavedItems(envData.saved || []);
       setModelConfig(nextModel);
       setModelDraft(nextModel);
+      setSelectedModelProvider(nextModel.provider);
       setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
     } finally {
       setLoading(false);
@@ -635,8 +785,9 @@ export function EnvironmentSettings({
   }
 
   async function saveEnv() {
+    const sourceFingerprint = envItemsFingerprint(items);
     setSavingEnv(true);
-    startGlobalLoading(t('正在保存环境配置'));
+    setEnvAutoSaveError('');
     try {
       const response = await fetch(withWebPilotBasePath('/api/settings/env'), {
         method: 'POST',
@@ -644,15 +795,25 @@ export function EnvironmentSettings({
         body: JSON.stringify({ items: items.map((item) => ({ ...item, enabled: true, secret: isSecret(item) })) }),
       });
       const data = await readApiJson<{ saved?: EnvRow[] }>(response, t('保存环境配置失败'));
-      setItems(data.saved || []);
+      const saved = data.saved || [];
+      envFailedFingerprintRef.current = '';
+      setSavedItems(saved);
+      if (envItemsFingerprint(itemsRef.current) === sourceFingerprint) setItems(saved);
       onRuntimeEnvSaved?.();
+    } catch (error) {
+      envFailedFingerprintRef.current = sourceFingerprint;
+      setEnvAutoSaveError(error instanceof Error ? t(error.message) : t('保存环境配置失败'));
+      throw error;
     } finally {
       setSavingEnv(false);
-      stopGlobalLoading();
     }
   }
 
   function selectProvider(provider: ModelProvider) {
+    setSelectedModelProvider(provider);
+  }
+
+  function selectDefaultProvider(provider: ModelProvider) {
     setModelDraft((current) => ({
       ...createModelConfig(current),
       provider,
@@ -665,7 +826,7 @@ export function EnvironmentSettings({
         ...current,
         providers: { ...current.providers },
       };
-      const provider = next.provider;
+      const provider = selectedModelProvider;
       return {
         ...next,
         providers: {
@@ -732,31 +893,40 @@ export function EnvironmentSettings({
   }
 
   function addOpenAICompatibleProvider() {
-    const compatibleProviders: ModelProvider[] = ['openai-compatible', 'openai-compatible-2', 'openai-compatible-3'];
-    setModelDraft((current) => {
-      const next = createModelConfig(current);
-      const provider = compatibleProviders.find((candidate) => {
-        const settings = providerSettings(next, candidate);
-        return !settings.enabled
-          && !settings.displayName?.trim()
-          && !settings.apiKey
-          && !settings.hasApiKey
-          && !settings.baseURL;
-      });
-      if (!provider) return next;
-      const sequence = compatibleProviders.indexOf(provider) + 1;
-      return {
-        ...next,
-        provider,
-        providers: {
-          ...next.providers,
-          [provider]: {
-            ...providerSettings(next, provider),
-            displayName: `OpenAI 兼容供应商 ${sequence}`,
-            enabled: true,
-          },
+    const next = createModelConfig(modelDraft);
+    const compatibleDefinitions = modelProviderDefinitionsForConfig(next.providers)
+      .filter((definition) => isOpenAICompatibleProvider(definition.value));
+    const availableDefinition = compatibleDefinitions.find((definition) => {
+      const settings = providerSettings(next, definition.value);
+      return !settings.enabled
+        && !settings.displayName?.trim()
+        && !settings.apiKey
+        && !settings.hasApiKey
+        && !settings.baseURL;
+    });
+    const sequence = availableDefinition
+      ? openAICompatibleProviderIndex(availableDefinition.value) || 1
+      : Math.max(0, ...compatibleDefinitions.map((definition) => openAICompatibleProviderIndex(definition.value) || 0)) + 1;
+    const provider = availableDefinition?.value
+      || `openai-compatible-${sequence}` as ModelProvider;
+    setModelDraft({
+      ...next,
+      providers: {
+        ...next.providers,
+        [provider]: {
+          ...providerSettings(next, provider),
+          displayName: `OpenAI 兼容供应商 ${sequence}`,
+          enabled: true,
         },
-      };
+      },
+    });
+    setSelectedModelProvider(provider);
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        providerListRef.current
+          ?.querySelector<HTMLButtonElement>(`button[data-provider="${provider}"]`)
+          ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
     });
   }
 
@@ -793,6 +963,7 @@ export function EnvironmentSettings({
     if (savingSensitiveDataEvaluation) return;
     const cases = validSensitiveDataEvaluationPayload();
     if (!cases) return;
+    const sourceFingerprint = JSON.stringify(cases);
     setSavingSensitiveDataEvaluation(true);
     setSensitiveDataEvaluationError('');
     try {
@@ -803,10 +974,15 @@ export function EnvironmentSettings({
       });
       const data = await readApiJson<{ cases?: SensitiveDataEvaluationCase[] }>(response, t('保存脱敏评测集失败'));
       const drafts = sensitiveDataEvaluationDrafts(data.cases);
-      setSensitiveDataEvaluationCases(drafts);
-      setSelectedSensitiveDataEvaluationCaseId((current) => drafts.some((item) => item.id === current) ? current : drafts[0]?.id || '');
+      sensitiveDataEvaluationFailedFingerprintRef.current = '';
+      setSavedSensitiveDataEvaluationCases(drafts);
+      if (JSON.stringify(sensitiveDataEvaluationPayload(sensitiveDataEvaluationCasesRef.current)) === sourceFingerprint) {
+        setSensitiveDataEvaluationCases(drafts);
+        setSelectedSensitiveDataEvaluationCaseId((current) => drafts.some((item) => item.id === current) ? current : drafts[0]?.id || '');
+      }
       setSensitiveDataEvaluationLoaded(true);
     } catch (error) {
+      sensitiveDataEvaluationFailedFingerprintRef.current = sourceFingerprint;
       setSensitiveDataEvaluationError(error instanceof Error ? t(error.message) : t('保存脱敏评测集失败'));
     } finally {
       setSavingSensitiveDataEvaluation(false);
@@ -883,7 +1059,7 @@ export function EnvironmentSettings({
         ...current,
         providers: { ...current.providers },
       };
-      const provider = next.provider;
+      const provider = selectedModelProvider;
       const currentSettings = providerSettings(next, provider);
       const normalizedModels = models.map((item) => item.trim()).filter(Boolean);
       const requestedModel = defaultModel || currentSettings.defaultModel || currentSettings.model || '';
@@ -955,16 +1131,16 @@ export function EnvironmentSettings({
   }
 
   async function saveModel() {
-    for (const definition of modelProviderDefinitions) {
+    for (const definition of modelProviderDefinitionsForConfig(modelDraft.providers)) {
       const duplicates = duplicateExtraRequestParameterKeys(extraRequestParameterRows[definition.value] || []);
       if (duplicates.length) {
-        window.alert(t('额外请求参数名不能重复：{keys}', { keys: duplicates.join(', ') }));
         return;
       }
     }
     const payload = createModelConfig(modelDraft || modelConfig);
+    const sourceFingerprint = JSON.stringify(payload);
     setSavingModel(true);
-    startGlobalLoading(t('正在保存模型配置'));
+    setModelAutoSaveError('');
     try {
       const response = await fetch(withWebPilotBasePath('/api/settings/model'), {
         method: 'POST',
@@ -973,13 +1149,19 @@ export function EnvironmentSettings({
       });
       const data = await readApiJson<{ config?: Partial<ModelConfig> }>(response, t('保存模型配置失败'));
       const nextModel = createModelConfig(data.config);
+      modelFailedFingerprintRef.current = '';
       setModelConfig(nextModel);
-      setModelDraft(nextModel);
-      setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
+      if (JSON.stringify(createModelConfig(modelDraftRef.current)) === sourceFingerprint) {
+        setModelDraft(nextModel);
+        setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
+      }
       onModelSaved?.();
+    } catch (error) {
+      modelFailedFingerprintRef.current = sourceFingerprint;
+      setModelAutoSaveError(error instanceof Error ? t(error.message) : t('保存模型配置失败'));
+      throw error;
     } finally {
       setSavingModel(false);
-      stopGlobalLoading();
     }
   }
 
@@ -992,6 +1174,7 @@ export function EnvironmentSettings({
     const nextModel = createModelConfig(data.config);
     setModelConfig(nextModel);
     setModelDraft(nextModel);
+    setSelectedModelProvider(nextModel.provider);
     setExtraRequestParameterRows(extraRequestParameterDrafts(nextModel));
     onModelSaved?.();
   }
@@ -1197,7 +1380,7 @@ export function EnvironmentSettings({
     }
   }
 
-  function renderSensitiveDataTestPanel() {
+  function renderSensitiveDataToolPanel(view: 'test' | 'evaluation') {
     const evaluationResults = new Map((sensitiveDataEvaluationRun?.results || []).map((item) => [item.id, item]));
     const selectedEvaluationCase = sensitiveDataEvaluationCases.find((item) => item.id === selectedSensitiveDataEvaluationCaseId)
       || sensitiveDataEvaluationCases[0];
@@ -1223,7 +1406,7 @@ export function EnvironmentSettings({
     ));
     return (
       <div className="settings-sensitive-data-tools">
-        <section className="settings-sensitive-data-test">
+        {view === 'test' ? <section className="settings-sensitive-data-test">
         <div className="settings-sensitive-data-test-head">
           <div>
             <h3>{t('敏感数据过滤测试')}</h3>
@@ -1286,18 +1469,15 @@ export function EnvironmentSettings({
             )}
           </div>
         ) : null}
-        </section>
-        <section className={`settings-sensitive-data-evaluation-workbench${sensitiveDataEvaluationExpanded ? ' is-expanded' : ''}`}>
+        </section> : null}
+        {view === 'evaluation' ? <section className={`settings-sensitive-data-evaluation-workbench${sensitiveDataEvaluationExpanded ? ' is-expanded' : ''}`}>
           <header className="evaluation-workbench-head">
             <div className="evaluation-workbench-title">
               <h3>{t('脱敏评测集')}</h3>
               <span>{t('配置可复用用例并批量评测。每个预期敏感原文单独占一行，系统按原文精确匹配统计通过率、精确率和召回率。')}</span>
             </div>
             <div className="evaluation-workbench-actions">
-              <button disabled={savingSensitiveDataEvaluation || loadingSensitiveDataEvaluation} onClick={saveSensitiveDataEvaluationCases} type="button">
-                {savingSensitiveDataEvaluation ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-                {t('保存评测集')}
-              </button>
+              {savingSensitiveDataEvaluation ? <span className="evaluation-autosave-status"><Loader2 className="spin" size={14} />{t('正在自动保存')}</span> : null}
               <button disabled={runningSensitiveDataEvaluation || loadingSensitiveDataEvaluation || !sensitiveDataEvaluationCases.length} onClick={runSensitiveDataEvaluation} type="button">
                 {runningSensitiveDataEvaluation ? <Loader2 className="spin" size={16} /> : <PlayCircle size={16} />}
                 {t(runningSensitiveDataEvaluation ? '正在评测' : '运行评测')}
@@ -1437,7 +1617,7 @@ export function EnvironmentSettings({
           ) : (
             <div className="settings-sensitive-data-test-empty">{t('暂无评测用例，点击“新增用例”开始配置。')}</div>
           )}
-        </section>
+        </section> : null}
       </div>
     );
   }
@@ -1996,26 +2176,180 @@ export function EnvironmentSettings({
     );
   }
 
+  function renderEnvSettingList(settings: VisibleEnvSetting[]) {
+    return settings.map(({ item, index, definition }) => (
+      <div
+        className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}${highlightedSettingKey === item.key ? ' is-highlighted' : ''}`}
+        data-setting-key={item.key}
+        key={item.key}
+        tabIndex={-1}
+      >
+        <div className="env-name">
+          <span className="settings-field-title-line">
+            <strong>{definition?.label ? t(definition.label) : item.key}</strong>
+            <small className={`settings-apply-badge is-${definition?.applyMode || 'runtime'}`}>{t(definition?.applyMode === 'startup' ? '重启后生效' : '即时生效')}</small>
+          </span>
+          <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
+          <small className="settings-field-default" title={item.key}>{t('默认值')}：{t(displayDefaultValue(item.key, definition?.defaultValue || ''))}</small>
+        </div>
+        <div className="settings-row-control">{renderRuntimeControl(item, index)}</div>
+      </div>
+    ));
+  }
+
+  const envDirty = envItemsFingerprint(items) !== envItemsFingerprint(savedItems);
+  const modelDirty = JSON.stringify(modelDraft) !== JSON.stringify(modelConfig);
+  const sensitiveDataEvaluationFingerprint = JSON.stringify(sensitiveDataEvaluationPayload(sensitiveDataEvaluationCases));
+  const sensitiveDataEvaluationDirty = sensitiveDataEvaluationFingerprint !== JSON.stringify(sensitiveDataEvaluationPayload(savedSensitiveDataEvaluationCases));
+
+  useEffect(() => {
+    const fingerprint = envItemsFingerprint(items);
+    if (
+      loading
+      || savingEnv
+      || !envDirty
+      || fingerprint === envFailedFingerprintRef.current
+      || (adminSettingsPasswordRequired && !adminSettingsAccessToken)
+    ) return;
+    const timeout = window.setTimeout(() => void saveEnv().catch(() => undefined), 700);
+    return () => window.clearTimeout(timeout);
+  // Saving is intentionally debounced from the complete settings snapshot.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminSettingsAccessToken, adminSettingsPasswordRequired, envDirty, items, loading, savingEnv]);
+
+  useEffect(() => {
+    const fingerprint = JSON.stringify(createModelConfig(modelDraft));
+    const hasDuplicateKeys = modelProviderDefinitionsForConfig(modelDraft.providers).some((definition) => (
+      duplicateExtraRequestParameterKeys(extraRequestParameterRows[definition.value] || []).length > 0
+    ));
+    if (
+      loading
+      || savingModel
+      || !modelDirty
+      || hasDuplicateKeys
+      || fingerprint === modelFailedFingerprintRef.current
+      || (adminSettingsPasswordRequired && !adminSettingsAccessToken)
+    ) return;
+    const timeout = window.setTimeout(() => void saveModel().catch(() => undefined), 700);
+    return () => window.clearTimeout(timeout);
+  // Saving is intentionally debounced from the complete provider snapshot.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminSettingsAccessToken, adminSettingsPasswordRequired, extraRequestParameterRows, loading, modelDirty, modelDraft, savingModel]);
+
+  useEffect(() => {
+    if (
+      !sensitiveDataEvaluationLoaded
+      || savingSensitiveDataEvaluation
+      || !sensitiveDataEvaluationDirty
+      || sensitiveDataEvaluationCases.some((item) => !item.text.trim())
+      || sensitiveDataEvaluationFingerprint === sensitiveDataEvaluationFailedFingerprintRef.current
+      || (adminSettingsPasswordRequired && !adminSettingsAccessToken)
+    ) return;
+    const timeout = window.setTimeout(() => void saveSensitiveDataEvaluationCases().catch(() => undefined), 700);
+    return () => window.clearTimeout(timeout);
+  // Evaluation cases use the same debounced auto-save behavior as the other settings.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adminSettingsAccessToken, adminSettingsPasswordRequired, savingSensitiveDataEvaluation, sensitiveDataEvaluationCases, sensitiveDataEvaluationDirty, sensitiveDataEvaluationFingerprint, sensitiveDataEvaluationLoaded]);
+
   const editingModelConfig = modelDraft || modelConfig;
-  const activeProvider = editingModelConfig.provider;
+  const activeProvider = selectedModelProvider;
   const activeProviderOption = modelProviderDefinition(activeProvider);
   const activeProviderSettings = providerSettings(editingModelConfig, activeProvider);
   const activeProviderModels = draftModelRows(activeProviderOption, activeProviderSettings);
+  const activeProviderDefaultModel = activeProviderSettings.defaultModel || activeProviderSettings.model || '';
   const activeProviderEnabled = activeProviderSettings.enabled === true;
   const activeProviderSupportsExtraRequestParameters = activeProvider === 'minimax' || activeProvider.startsWith('openai-compatible');
   const activeProviderExtraRequestParameterRows = extraRequestParameterRows[activeProvider] || [];
   const activeProviderDuplicateExtraRequestParameterKeys = duplicateExtraRequestParameterKeys(activeProviderExtraRequestParameterRows);
-  const visibleEnvItems = items
-    .map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }))
-    .filter(({ item, definition }) => activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' && definition?.tab === activeTab && definition.hidden !== true && !(activeTab === 'runtime' && customRuntimeSettingKeys.has(item.key)));
+  const configuredModelProviderDefinitions = modelProviderDefinitionsForConfig(editingModelConfig.providers);
+  const visibleModelProviders = configuredModelProviderDefinitions.filter((provider) => {
+    const compatibleIndex = openAICompatibleProviderIndex(provider.value);
+    if (!compatibleIndex || compatibleIndex === 1) return true;
+    const settings = editingModelConfig.providers?.[provider.value];
+    return Boolean(settings?.enabled || settings?.displayName?.trim() || settings?.apiKey || settings?.hasApiKey || settings?.baseURL);
+  });
+  const allEnvSettings = items.map((item, index) => ({ item, index, definition: runtimeEnvDefinition(item.key) }));
+  const envValues = new Map(items.map((item) => [item.key, item.value]));
+  const visibleEnvItems = allEnvSettings.filter((setting) => (
+    setting.definition?.hidden !== true
+    && !customRuntimeSettingKeys.has(setting.item.key)
+    && envSettingDisplayTab(setting) === activeTab
+    && envSettingIsContextuallyVisible(setting, envValues)
+  ));
   const visibleEnvGroups = groupVisibleEnvSettings(activeTab, visibleEnvItems);
+  const settingsSecondaryItems: SettingsSecondaryNavItem[] = [
+    ...(activeTab === 'integrations' ? [
+      { id: 'integration:connector', label: t('连接器') },
+      { id: 'integration:communication', label: t('通信') },
+      { id: 'integration:data', label: t('数据') },
+      { id: 'integration:research', label: t('研究') },
+    ] : []),
+    ...visibleEnvGroups.map((group) => ({
+      id: group.title,
+      label: t(group.title),
+      meta: String(group.items.length),
+    })),
+    ...(activeTab === 'sensitive-data' ? [
+      { id: 'sensitive:test', label: t('快速检测') },
+      { id: 'sensitive:evaluation', label: t('评测工作台') },
+    ] : []),
+  ];
+  const requestedSettingsSection = activeSettingsSections[activeTab];
+  const activeSettingsSection = settingsSecondaryItems.some((item) => item.id === requestedSettingsSection)
+    ? requestedSettingsSection!
+    : settingsSecondaryItems[0]?.id || '';
+  const activeEnvGroup = visibleEnvGroups.find((group) => group.title === activeSettingsSection);
   const communicationSendSetting = items
     .map((item, index) => ({ item, index }))
     .find(({ item }) => item.key === 'AGENT_COMMUNICATION_ALLOW_SEND');
   const dataWriteSetting = items
     .map((item, index) => ({ item, index }))
     .find(({ item }) => item.key === 'AGENT_DATA_ALLOW_WRITES');
-  const visibleEnvCount = visibleEnvItems.length + (activeTab === 'runtime' ? 4 : 0);
+  const activeTabUsesEnvSave = ['runtime', 'browser', 'capabilities', 'integrations', 'sensitive-data', 'memory', 'debug'].includes(activeTab);
+  const normalizedSettingsSearch = settingsSearch.trim().toLocaleLowerCase();
+  const settingsSearchResults = normalizedSettingsSearch ? [
+    ...environmentSettingsTabs.map((tab) => ({
+      key: `tab:${tab.id}`,
+      title: t(tab.label),
+      description: t(tab.description),
+      group: t('设置页面'),
+      tab: tab.id,
+    })),
+    ...configuredModelProviderDefinitions.map((provider) => ({
+      key: `tab:model:${provider.value}`,
+      title: t(provider.label),
+      description: t('模型供应商、模型列表和连接配置'),
+      group: t('模型与供应商'),
+      provider: provider.value,
+      tab: 'model' as const,
+    })),
+    ...allEnvSettings
+      .filter((setting) => setting.definition?.hidden !== true && visibleSettingsTabs.some((tab) => tab.id === envSettingDisplayTab(setting)))
+      .map((setting) => ({
+        key: setting.item.key,
+        title: t(setting.definition?.label || setting.item.key),
+        description: t(setting.definition?.description || '网页配置项。'),
+        group: t(normalizeSettingsGroupTitle(
+          envSettingDisplayTab(setting),
+          runtimeSettingGroup(envSettingDisplayTab(setting), setting.item.key, setting.definition?.group),
+        )),
+        section: envSettingSectionId(setting),
+        tab: envSettingDisplayTab(setting),
+      })),
+  ].filter((result) => (
+    `${result.title} ${result.description} ${result.group} ${result.key}`.toLocaleLowerCase().includes(normalizedSettingsSearch)
+  )).slice(0, 10) : [];
+
+  function openSettingsSearchResult(result: (typeof settingsSearchResults)[number]) {
+    setHighlightedSettingKey(result.key.startsWith('tab:') ? '' : result.key);
+    if ('provider' in result && result.provider) selectProvider(result.provider as ModelProvider);
+    if ('section' in result && result.section) {
+      setActiveSettingsSections((current) => ({ ...current, [result.tab]: result.section }));
+    }
+    setSettingsSearch('');
+    setSettingsSearchFocused(false);
+    selectTab(result.tab);
+  }
 
   return (
     <main className={embedded ? 'settings-workspace embedded' : 'settings-workspace'}>
@@ -2044,6 +2378,60 @@ export function EnvironmentSettings({
         ) : null}
 
         <div className="settings-content">
+          {showTabs ? (
+            <div className="settings-command-bar">
+              <div className="settings-global-search">
+                <InputGroup fullWidth>
+                  <InputGroup.Prefix><Search aria-hidden="true" size={17} /></InputGroup.Prefix>
+                  <InputGroup.Input
+                    aria-label={t('搜索设置')}
+                    onBlur={() => window.setTimeout(() => setSettingsSearchFocused(false), 120)}
+                    onChange={(event) => setSettingsSearch(event.target.value)}
+                    onFocus={() => setSettingsSearchFocused(true)}
+                    placeholder={t('搜索设置、参数或功能')}
+                    type="search"
+                    value={settingsSearch}
+                  />
+                  {settingsSearch ? (
+                    <InputGroup.Suffix>
+                      <button aria-label={t('清除搜索')} onClick={() => setSettingsSearch('')} type="button"><X size={15} /></button>
+                    </InputGroup.Suffix>
+                  ) : null}
+                </InputGroup>
+                {settingsSearchFocused && normalizedSettingsSearch ? (
+                  <div className="settings-search-results">
+                    {settingsSearchResults.length ? settingsSearchResults.map((result) => (
+                      <button key={`${result.tab}:${result.key}`} onClick={() => openSettingsSearchResult(result)} type="button">
+                        <span><strong>{result.title}</strong><small>{result.description}</small></span>
+                        <em>{result.group}</em>
+                      </button>
+                    )) : <div className="settings-search-empty">{t('没有找到相关设置')}</div>}
+                  </div>
+                ) : null}
+              </div>
+              <div className="settings-save-state">
+                {activeTab === 'model' ? (
+                  <DataTransferButtons
+                    authorizationToken={adminSettingsAccessToken}
+                    disabled={savingModel || loading}
+                    kind="model"
+                    onImported={reloadModelConfigAfterImport}
+                  />
+                ) : null}
+                {activeTab === 'model' ? (
+                  <span className={modelAutoSaveError ? 'is-error' : savingModel ? 'is-saving' : modelDirty ? 'is-dirty' : 'is-saved'} title={modelAutoSaveError || undefined}>
+                    {savingModel ? <Loader2 className="spin" size={14} /> : <span />}
+                    {t(modelAutoSaveError ? '自动保存失败，修改后重试' : savingModel ? '正在自动保存' : modelDirty ? '等待自动保存' : '已自动保存')}
+                  </span>
+                ) : activeTabUsesEnvSave ? (
+                  <span className={envAutoSaveError ? 'is-error' : savingEnv ? 'is-saving' : envDirty ? 'is-dirty' : 'is-saved'} title={envAutoSaveError || undefined}>
+                    {savingEnv ? <Loader2 className="spin" size={14} /> : <span />}
+                    {t(envAutoSaveError ? '自动保存失败，修改后重试' : savingEnv ? '正在自动保存' : envDirty ? '等待自动保存' : '已自动保存')}
+                  </span>
+                ) : <span className="is-saved"><CircleCheck size={14} />{t(activeTab === 'general' ? '更改自动保存' : '此页面单独保存')}</span>}
+              </div>
+            </div>
+          ) : null}
           {loading ? (
             <section className="settings-loading-panel" role="status" aria-live="polite">
               <LiquidGlassLoader />
@@ -2056,13 +2444,18 @@ export function EnvironmentSettings({
             <>
           {activeTab === 'general' ? (
             <section>
-              <div className="settings-section-head">
-                <div>
-                  <h2>{t('通用设置')}</h2>
-                  <span>{t('选择界面显示语言。')}</span>
-                </div>
-              </div>
-              <SettingsGroupCard title={t('基础设置')}>
+              <div className="settings-detail-workspace">
+                <SettingsSecondaryNav
+                  activeId="general:appearance"
+                  items={[{ id: 'general:appearance', label: t('基础设置') }]}
+                  label={t('设置项')}
+                  onChange={() => undefined}
+                />
+                <section className="settings-detail-panel">
+                  <header className="settings-detail-panel-head">
+                    <h3>{t('基础设置')}</h3>
+                    <span>{t('调整品牌、语言与界面颜色。')}</span>
+                  </header>
                 <div className="settings-row">
                   <div>
                     <strong>{t('品牌前缀')}</strong>
@@ -2132,51 +2525,65 @@ export function EnvironmentSettings({
                     />
                   </div>
                 </div>
-              </SettingsGroupCard>
+                </section>
+              </div>
             </section>
           ) : null}
 
           {activeTab === 'model' ? (
             <section className="settings-model-section">
-              <div className="settings-section-head">
-                <div>
-                  <h2>{t('模型配置')}</h2>
-                  <span>{t('每个服务商独立保存模型、Key 和 Base URL，切换服务商不会串用密钥。')}</span>
-                </div>
-                <div className="personal-memory-head-actions">
-                  <DataTransferButtons
-                    authorizationToken={adminSettingsAccessToken}
-                    disabled={savingModel || loading}
-                    kind="model"
-                    onImported={reloadModelConfigAfterImport}
-                  />
-                  <button className="ui-button ui-button--primary" disabled={savingModel || loading} onClick={saveModel} type="button">
-                    {savingModel ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                    {t('保存')}
-                  </button>
-                </div>
-              </div>
-              <div className="settings-group-stack settings-model-card">
-                <SettingsGroupCard className="settings-model-group" title={t('基础信息')}>
+              <div className="settings-model-workspace">
+                <aside className="settings-provider-rail">
+                  <div className="settings-provider-rail-head">
+                    <strong>{t('供应商')}</strong>
+                    <span>{t('{count} 个可用入口', { count: visibleModelProviders.length })}</span>
+                    <button
+                      aria-label={t('新增 OpenAI 兼容 API')}
+                      className="browser-chat-section-create settings-provider-create"
+                      onClick={addOpenAICompatibleProvider}
+                      title={t('新增 OpenAI 兼容 API')}
+                      type="button"
+                    >
+                      <Plus size={18} />
+                    </button>
+                  </div>
+                  <div className="settings-provider-list" ref={providerListRef}>
+                    {visibleModelProviders.map((provider) => {
+                      const settings = editingModelConfig.providers?.[provider.value];
+                      const enabled = settings?.enabled === true;
+                      return (
+                        <button
+                          aria-current={activeProvider === provider.value ? 'true' : undefined}
+                          className={activeProvider === provider.value ? 'active' : undefined}
+                          data-provider={provider.value}
+                          key={provider.value}
+                          onClick={() => selectProvider(provider.value)}
+                          type="button"
+                        >
+                          <span className="settings-provider-icon"><ModelBrandIcon model={settings?.defaultModel || provider.defaultModel} provider={provider.value} /></span>
+                          <span><strong>{settings?.displayName?.trim() || t(provider.label)}</strong><small>{enabled ? t('已启用') : t('未启用')}</small></span>
+                          <i className={enabled ? 'is-enabled' : undefined} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </aside>
+                <div className="settings-model-detail">
+                <section className="settings-detail-panel settings-model-group">
+                <header className="settings-detail-panel-head"><h3>{t('基础信息')}</h3><span>{t('配置供应商名称和可用状态。')}</span></header>
                 <div className="settings-row">
                   <div>
-                    <strong>{t('模型供应商')}</strong>
-                    <span>{t('选择要查看和编辑的模型服务供应商。')}</span>
+                    <strong>{t('默认服务商')}</strong>
+                    <span>{t('选择默认使用的 AI 模型服务提供商。')}</span>
                   </div>
                   <CustomSelect
                     className="settings-control"
-                    value={activeProvider}
-                    onChange={(nextValue) => selectProvider(nextValue as ModelProvider)}
-                    options={modelProviderDefinitions
-                      .filter((provider) => {
-                        if (provider.value !== 'openai-compatible-2' && provider.value !== 'openai-compatible-3') return true;
-                        const settings = editingModelConfig.providers?.[provider.value];
-                        return Boolean(settings?.enabled || settings?.displayName?.trim() || settings?.apiKey || settings?.hasApiKey || settings?.baseURL);
-                      })
-                      .map((provider) => ({
-                        label: editingModelConfig.providers?.[provider.value]?.displayName?.trim() || t(provider.label),
-                        value: provider.value,
-                      }))}
+                    value={editingModelConfig.provider}
+                    onChange={(nextValue) => selectDefaultProvider(nextValue as ModelProvider)}
+                    options={visibleModelProviders.map((provider) => ({
+                      label: editingModelConfig.providers?.[provider.value]?.displayName?.trim() || t(provider.label),
+                      value: provider.value,
+                    }))}
                   />
                 </div>
                 <div className="settings-row">
@@ -2207,18 +2614,22 @@ export function EnvironmentSettings({
                     <span />
                   </button>
                 </div>
-                <div className="settings-row settings-add-compatible-provider-row">
+                <div className="settings-row">
                   <div>
-                    <strong>{t('OpenAI 兼容 API')}</strong>
-                    <span>{t('新增一个可独立配置名称、Base URL、访问密钥和模型列表的供应商。')}</span>
+                    <strong>{t('默认模型')}</strong>
+                    <span>{t('从当前服务商配置的模型列表中选择默认模型。')}</span>
                   </div>
-                  <button className="ui-button" onClick={addOpenAICompatibleProvider} type="button">
-                    <Plus size={15} />
-                    {t('添加兼容供应商')}
-                  </button>
+                  <CustomSelect
+                    className="settings-control"
+                    disabled={!activeProviderModels.length}
+                    value={activeProviderDefaultModel}
+                    onChange={(nextModel) => updateActiveProviderSettings({ defaultModel: nextModel, model: nextModel })}
+                    options={activeProviderModels.map((model) => ({ label: model, value: model }))}
+                  />
                 </div>
-                </SettingsGroupCard>
-                <SettingsGroupCard className="settings-model-group" title={t('模型列表')}>
+                </section>
+                <section className="settings-detail-panel settings-model-group">
+                <header className="settings-detail-panel-head"><h3>{t('模型列表')}</h3><span>{t('管理该供应商在运行时可选择的模型。')}</span></header>
                 <div className="settings-row settings-model-list-row">
                   <div>
                     <span>{t('一个服务商可以维护多个模型，运行时可在下拉框里按服务商分组选择。')}</span>
@@ -2264,8 +2675,9 @@ export function EnvironmentSettings({
                     </button>
                   </div>
                 </div>
-                </SettingsGroupCard>
-                <SettingsGroupCard className="settings-model-group" initiallyOpen={false} title={t('连接配置')}>
+                </section>
+                <section className="settings-detail-panel settings-model-group">
+                <header className="settings-detail-panel-head"><h3>{t('连接配置')}</h3><span>{t('访问密钥、服务地址和附加请求参数。')}</span></header>
                 <div className="settings-row">
                   <div>
                     <strong>{t('访问密钥')}</strong>
@@ -2345,95 +2757,129 @@ export function EnvironmentSettings({
                     </div>
                   </div>
                 ) : null}
-                </SettingsGroupCard>
+                </section>
+                </div>
               </div>
             </section>
           ) : null}
 
           {activeTab === 'skills' ? <SkillsManager onChanged={onSkillsChanged} showTitle={showSectionTitles} userId={normalizedUserId} /> : null}
 
-          {activeTab === 'memory' ? renderPersonalMemoryPanel() : null}
+          {activeTab === 'memory' ? (
+            <div className="settings-memory-page">
+              {renderPersonalMemoryPanel()}
+              {visibleEnvGroups.length ? (
+                <section className="settings-secondary-section">
+                  <div className="settings-subsection-head">
+                    <div>
+                      <h3>{t('记忆运行策略')}</h3>
+                      <span>{t('控制记忆提炼、召回数量和注入上下文的预算。')}</span>
+                    </div>
+                  </div>
+                  <div className="settings-group-stack">
+                    {visibleEnvGroups.map((group) => (
+                      <SettingsGroupCard forceOpen={group.items.some(({ item }) => item.key === highlightedSettingKey)} key={group.title} meta={t('{count} 项设置', { count: group.items.length })} title={t(group.title)}>
+                        {group.items.map(({ item, index, definition }) => (
+                          <div
+                            className={`settings-row settings-env-row${highlightedSettingKey === item.key ? ' is-highlighted' : ''}`}
+                            data-setting-key={item.key}
+                            key={item.key}
+                            tabIndex={-1}
+                          >
+                            <div className="env-name">
+                              <span className="settings-field-title-line">
+                                <strong>{definition?.label ? t(definition.label) : item.key}</strong>
+                                <small className={`settings-apply-badge is-${definition?.applyMode || 'runtime'}`}>{t(definition?.applyMode === 'startup' ? '重启后生效' : '即时生效')}</small>
+                              </span>
+                              <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
+                              <small className="settings-field-default">{t('默认值')}：{t(displayDefaultValue(item.key, definition?.defaultValue || ''))}</small>
+                            </div>
+                            <div className="settings-row-control">{renderRuntimeControl(item, index)}</div>
+                          </div>
+                        ))}
+                      </SettingsGroupCard>
+                    ))}
+                  </div>
+                </section>
+              ) : null}
+            </div>
+          ) : null}
 
           {activeTab === 'accounts' ? renderLoginAccountsPanel() : null}
 
           {activeTab !== 'general' && activeTab !== 'model' && activeTab !== 'skills' && activeTab !== 'memory' && activeTab !== 'accounts' ? (
             <section>
-              <div className="settings-section-head">
-                <div>
-                  <h2>{t(environmentSettingsTabs.find((tab) => tab.id === activeTab)?.label || '')}</h2>
-                  <span>{t('{count} 项网页配置', { count: visibleEnvCount })}</span>
-                </div>
-                <button className="ui-button ui-button--primary" disabled={savingEnv || loading} onClick={saveEnv} type="button">
-                  {savingEnv ? <Loader2 className="spin" size={15} /> : <Save size={15} />}
-                  {t('保存')}
-                </button>
-              </div>
-              {visibleEnvItems.length || activeTab === 'runtime' ? (
-                <div className="settings-group-stack">
-                  {activeTab === 'runtime' ? (
-                    <>
-                      <SettingsGroupCard initiallyOpen title={t('连接器')}>
-                        <ExternalIntegrationSettings
-                          accessToken={adminSettingsAccessToken}
-                          category="connector"
-                        />
-                      </SettingsGroupCard>
-                      <SettingsGroupCard initiallyOpen title={t('通信')}>
-                        <ExternalIntegrationSettings
-                          accessToken={adminSettingsAccessToken}
-                          category="communication"
-                          permission={{
-                            enabled: communicationSendSetting?.item.value === 'true',
-                            label: '允许 Agent 请求发送消息',
-                            description: '开启后请点击页面右上角保存；每次正式发送仍会暂停并等待你的确认。',
-                            onChange(enabled) {
-                              if (communicationSendSetting) update(communicationSendSetting.index, { value: String(enabled) });
-                            },
-                          }}
-                        />
-                      </SettingsGroupCard>
-                      <SettingsGroupCard initiallyOpen title={t('数据')}>
-                        <ExternalIntegrationSettings
-                          accessToken={adminSettingsAccessToken}
-                          category="data"
-                          permission={{
-                            enabled: dataWriteSetting?.item.value === 'true',
-                            label: '允许 Agent 执行数据写入',
-                            description: '默认只允许查询；开启后仍需将具体数据源设为“允许写入”，且每次写操作都要确认。',
-                            onChange(enabled) {
-                              if (dataWriteSetting) update(dataWriteSetting.index, { value: String(enabled) });
-                            },
-                          }}
-                        />
-                      </SettingsGroupCard>
-                      <SettingsGroupCard initiallyOpen title={t('研究')}>
-                        <ExternalIntegrationSettings
-                          accessToken={adminSettingsAccessToken}
-                          category="research"
-                        />
-                      </SettingsGroupCard>
-                    </>
+              <div className="settings-detail-workspace">
+                <SettingsSecondaryNav
+                  activeId={activeSettingsSection}
+                  items={settingsSecondaryItems}
+                  label={t('配置分组')}
+                  onChange={(section) => setActiveSettingsSections((current) => ({ ...current, [activeTab]: section }))}
+                />
+                <div className="settings-detail-content">
+                  {activeSettingsSection === 'sensitive:test' ? renderSensitiveDataToolPanel('test') : null}
+                  {activeSettingsSection === 'sensitive:evaluation' ? renderSensitiveDataToolPanel('evaluation') : null}
+
+                  {activeSettingsSection === 'integration:connector' ? (
+                    <section className="settings-detail-panel">
+                      <header className="settings-detail-panel-head"><h3>{t('连接器')}</h3><span>{t('配置第三方服务入口和授权信息。')}</span></header>
+                      <ExternalIntegrationSettings accessToken={adminSettingsAccessToken} category="connector" />
+                    </section>
                   ) : null}
-                  {visibleEnvGroups.map((group, groupIndex) => (
-                    <SettingsGroupCard initiallyOpen={activeTab === 'runtime' ? false : groupIndex < 2} key={group.title} title={t(group.title)}>
-                      {group.items.map(({ item, index, definition }) => (
-                        <div className={`settings-row settings-env-row${definition?.control === 'textarea' ? ' prompt-row' : ''}`} key={item.key}>
-                          <div className="env-name" title={item.key}>
-                            <strong>{definition?.label ? t(definition.label) : item.key}</strong>
-                            <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
-                          </div>
-                          <div className="settings-row-control">
-                            {renderRuntimeControl(item, index)}
-                          </div>
-                        </div>
-                      ))}
-                    </SettingsGroupCard>
-                  ))}
+                  {activeSettingsSection === 'integration:communication' ? (
+                    <section className="settings-detail-panel">
+                      <header className="settings-detail-panel-head"><h3>{t('通信')}</h3><span>{t('消息发送保持逐次确认，避免意外外发。')}</span></header>
+                      <ExternalIntegrationSettings
+                        accessToken={adminSettingsAccessToken}
+                        category="communication"
+                        permission={{
+                          enabled: communicationSendSetting?.item.value === 'true',
+                          label: '允许 Agent 请求发送消息',
+                          description: '更改会自动保存；每次正式发送仍会暂停并等待你的确认。',
+                          onChange(enabled) {
+                            if (communicationSendSetting) update(communicationSendSetting.index, { value: String(enabled) });
+                          },
+                        }}
+                      />
+                    </section>
+                  ) : null}
+                  {activeSettingsSection === 'integration:data' ? (
+                    <section className="settings-detail-panel">
+                      <header className="settings-detail-panel-head"><h3>{t('数据')}</h3><span>{t('统一管理数据源，并单独控制写入权限。')}</span></header>
+                      <ExternalIntegrationSettings
+                        accessToken={adminSettingsAccessToken}
+                        category="data"
+                        permission={{
+                          enabled: dataWriteSetting?.item.value === 'true',
+                          label: '允许 Agent 执行数据写入',
+                          description: '默认只允许查询；更改会自动保存，每次写操作仍需要确认。',
+                          onChange(enabled) {
+                            if (dataWriteSetting) update(dataWriteSetting.index, { value: String(enabled) });
+                          },
+                        }}
+                      />
+                    </section>
+                  ) : null}
+                  {activeSettingsSection === 'integration:research' ? (
+                    <section className="settings-detail-panel">
+                      <header className="settings-detail-panel-head"><h3>{t('研究')}</h3><span>{t('配置搜索与研究数据来源。')}</span></header>
+                      <ExternalIntegrationSettings accessToken={adminSettingsAccessToken} category="research" />
+                    </section>
+                  ) : null}
+
+                  {activeEnvGroup ? (
+                    <section className="settings-detail-panel">
+                      <header className="settings-detail-panel-head">
+                        <h3>{t(activeEnvGroup.title)}</h3>
+                        <span>{t('{count} 项设置，修改后自动保存。', { count: activeEnvGroup.items.length })}</span>
+                      </header>
+                      {renderEnvSettingList(activeEnvGroup.items)}
+                    </section>
+                  ) : null}
+
+                  {!activeSettingsSection ? <div className="empty-state">{t('这个分类暂无配置。')}</div> : null}
                 </div>
-              ) : (
-                <div className="empty-state">{t('这个分类暂无配置。')}</div>
-              )}
-              {activeTab === 'sensitive-data' ? renderSensitiveDataTestPanel() : null}
+              </div>
             </section>
           ) : null}
             </>

@@ -33,6 +33,7 @@ export function createNodeBrowserOperations(
   options: NodeBrowserOperationsOptions,
 ): BrowserCapabilityOperations {
   options.session.configure(options.configuration);
+  const ensureStarted = options.ensureStarted || (() => options.session.ensureStarted());
   const credentials = () => typeof options.credentials === 'function'
     ? options.credentials()
     : options.credentials;
@@ -48,7 +49,7 @@ export function createNodeBrowserOperations(
         actual: 'Image operation rejected because this host does not provide model image input. Use exact Locator and boundingBox evidence instead.',
       });
     }
-    await options.ensureStarted?.();
+    await ensureStarted();
     return browserOperationToCapabilityResult(await options.session.executeBrowserCode({
       code: input.code,
       maxOutputChars: input.maxOutputChars,
@@ -60,13 +61,16 @@ export function createNodeBrowserOperations(
     }));
   };
   return {
-    readBrowserState: (_input: ReadBrowserStateInput, context) => execute({
-      code: readBrowserStateCode,
-      maxOutputChars: 40_000,
-    }, context),
+    async readBrowserState(_input: ReadBrowserStateInput, context) {
+      await ensureStarted();
+      return browserOperationToCapabilityResult(await options.session.readBrowserState({
+        abortSignal: context.abortSignal,
+        maxOutputChars: 40_000,
+      }));
+    },
     browserCode: (input: BrowserCodeInput, context) => execute(input, context),
     async waitForHumanVerification(input: WaitForHumanVerificationInput, context) {
-      await options.ensureStarted?.();
+      await ensureStarted();
       return browserOperationToCapabilityResult(
         await options.session.waitForManualVerification(input.maxMs, context.abortSignal),
       );

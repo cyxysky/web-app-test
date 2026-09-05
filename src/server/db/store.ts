@@ -1,10 +1,14 @@
+import { updateInitialEnv as updateBundledInitialEnv } from '@next/env';
 import {
   defaultModelByProvider,
   defaultModelForProvider,
   defaultModelProviderSettings,
+  isModelProvider,
   modelListForProvider,
-  modelProviderDefinitions,
+  modelProviderDefinition,
+  modelProviderDefinitionsForConfig,
   normalizeMiniMaxOpenAIBaseURL,
+  openAICompatibleProviderIndex,
   migrateRuntimeEnvValue,
   runtimeEnvDefinitions,
   runtimeEnvKeys,
@@ -60,7 +64,7 @@ function normalizeExtraRequestParameters(value: unknown) {
   }
 }
 
-const modelApiKeyEnv: Record<ModelProvider, string> = {
+const modelApiKeyEnv: Partial<Record<ModelProvider, string>> = {
   'ai-gateway': 'AI_GATEWAY_API_KEY',
   alibaba: 'ALIBABA_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
@@ -91,7 +95,7 @@ const modelApiKeyEnv: Record<ModelProvider, string> = {
   xai: 'XAI_API_KEY',
 };
 
-const modelBaseUrlEnv: Record<ModelProvider, string> = {
+const modelBaseUrlEnv: Partial<Record<ModelProvider, string>> = {
   'ai-gateway': 'AI_GATEWAY_BASE_URL',
   alibaba: 'ALIBABA_BASE_URL',
   anthropic: 'ANTHROPIC_BASE_URL',
@@ -129,13 +133,34 @@ const modelExtraRequestParametersEnv: Partial<Record<ModelProvider, string>> = {
   'openai-compatible-3': 'OPENAI_COMPATIBLE_3_EXTRA_REQUEST_PARAMETERS',
 };
 
+function openAICompatibleEnvironmentPrefix(provider: ModelProvider) {
+  const index = openAICompatibleProviderIndex(provider);
+  if (!index) return '';
+  return index === 1 ? 'OPENAI_COMPATIBLE' : `OPENAI_COMPATIBLE_${index}`;
+}
+
+function modelApiKeyEnvironment(provider: ModelProvider) {
+  const prefix = openAICompatibleEnvironmentPrefix(provider);
+  return prefix ? `${prefix}_API_KEY` : modelApiKeyEnv[provider] || '';
+}
+
+function modelBaseUrlEnvironment(provider: ModelProvider) {
+  const prefix = openAICompatibleEnvironmentPrefix(provider);
+  return prefix ? `${prefix}_BASE_URL` : modelBaseUrlEnv[provider] || '';
+}
+
+function modelExtraRequestParametersEnvironment(provider: ModelProvider) {
+  const prefix = openAICompatibleEnvironmentPrefix(provider);
+  return prefix ? `${prefix}_EXTRA_REQUEST_PARAMETERS` : modelExtraRequestParametersEnv[provider] || '';
+}
+
 function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecord | undefined {
   if (!input) return undefined;
-  const provider = modelProviderDefinitions.some((item) => item.value === input.provider)
+  const provider = isModelProvider(input.provider)
     ? input.provider
     : 'openrouter';
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
+  for (const definition of modelProviderDefinitionsForConfig(input.providers)) {
     const current = input.providers?.[definition.value];
     const models = modelListForProvider(definition, current);
     const model = defaultModelForProvider(definition, current);
@@ -157,36 +182,50 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
   return { provider, providers, updatedAt: input.updatedAt || now() };
 }
 
+function updateInitialEnv(values: Record<string, string | undefined>) {
+  const update = Reflect.get(globalThis, Symbol.for('webpilot.updateInitialRuntimeEnv'));
+  if (typeof update === 'function') update(values);
+  else updateBundledInitialEnv(values);
+}
+
 function applyModelConfig(config?: ModelConfigRecord) {
   const normalized = normalizeStoredModelConfig(config);
   if (!normalized) {
     process.env.AI_MODEL_PROVIDER_ENABLED = 'false';
     delete process.env.AI_PROVIDER;
     delete process.env.AI_MODEL;
+    updateInitialEnv({ AI_MODEL_PROVIDER_ENABLED: 'false', AI_PROVIDER: undefined, AI_MODEL: undefined });
     return;
   }
-  for (const definition of modelProviderDefinitions) {
+  const providerDefinitions = modelProviderDefinitionsForConfig(normalized.providers);
+  const modelEnvironmentKeys = ['AI_MODEL_PROVIDER_ENABLED', 'AI_PROVIDER', 'AI_MODEL'];
+  for (const definition of providerDefinitions) {
     const settings = normalized.providers[definition.value] || defaultModelProviderSettings(definition.value);
-    const keyEnv = modelApiKeyEnv[definition.value];
+    const keyEnv = modelApiKeyEnvironment(definition.value);
+    if (keyEnv) modelEnvironmentKeys.push(keyEnv);
     if (keyEnv) process.env[keyEnv] = settings.apiKey || '';
-    const baseUrlEnv = modelBaseUrlEnv[definition.value];
+    const baseUrlEnv = modelBaseUrlEnvironment(definition.value);
+    if (baseUrlEnv) modelEnvironmentKeys.push(baseUrlEnv);
     if (baseUrlEnv) process.env[baseUrlEnv] = settings.baseURL || definition.defaultBaseURL || '';
-    const extraRequestParametersEnv = modelExtraRequestParametersEnv[definition.value];
+    const extraRequestParametersEnv = modelExtraRequestParametersEnvironment(definition.value);
+    if (extraRequestParametersEnv) modelEnvironmentKeys.push(extraRequestParametersEnv);
     if (extraRequestParametersEnv) process.env[extraRequestParametersEnv] = settings.extraRequestParameters || '';
   }
   const activeProvider = normalized.providers[normalized.provider]?.enabled
     ? normalized.provider
-    : modelProviderDefinitions.find((definition) => normalized.providers[definition.value]?.enabled)?.value;
+    : providerDefinitions.find((definition) => normalized.providers[definition.value]?.enabled)?.value;
   if (!activeProvider) {
     process.env.AI_MODEL_PROVIDER_ENABLED = 'false';
     delete process.env.AI_PROVIDER;
     delete process.env.AI_MODEL;
+    updateInitialEnv(Object.fromEntries(modelEnvironmentKeys.map((key) => [key, process.env[key]])));
     return;
   }
   const active = normalized.providers[activeProvider] || defaultModelProviderSettings(activeProvider);
   process.env.AI_MODEL_PROVIDER_ENABLED = 'true';
   process.env.AI_PROVIDER = activeProvider;
-  process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[activeProvider];
+  process.env.AI_MODEL = active.defaultModel || active.model || defaultModelByProvider[activeProvider] || modelProviderDefinition(activeProvider).defaultModel;
+  updateInitialEnv(Object.fromEntries(modelEnvironmentKeys.map((key) => [key, process.env[key]])));
 }
 
 function normalizeSkillItems(items: string[] | undefined, limit: number) {
@@ -352,7 +391,11 @@ export const store = {
     const existing = normalizeStoredModelConfig(data.modelConfig);
     const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
     const timestamp = now();
-    for (const definition of modelProviderDefinitions) {
+    const providerDefinitions = modelProviderDefinitionsForConfig({
+      ...existing?.providers,
+      ...input.providers,
+    });
+    for (const definition of providerDefinitions) {
       const provider = definition.value;
       const current = input.providers[provider];
       const previous = existing?.providers[provider];
@@ -408,6 +451,7 @@ export const store = {
       if (!item && deploymentValue !== undefined && configuredValue === deploymentValue) continue;
       if (!configuredValue.trim() && deploymentValue?.trim()) continue;
       process.env[definition.key] = configuredValue;
+      updateInitialEnv({ [definition.key]: configuredValue });
     }
     applyModelConfig(data.modelConfig);
     return data.runtimeEnv;

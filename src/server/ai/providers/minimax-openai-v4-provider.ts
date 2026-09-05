@@ -219,7 +219,14 @@ function transformMiniMaxRequestBody(
     }
     return message;
   }) : body.messages;
-  return { ...body, messages, ...extraRequestParameters, reasoning_split: true };
+  const requestBody: Record<string, unknown> = { ...body, messages, ...extraRequestParameters, reasoning_split: true };
+  // MiniMax now uses max_completion_tokens. Preserve an explicit provider
+  // override without also sending the SDK's lower, deprecated max_tokens.
+  if (requestBody.max_completion_tokens === undefined && requestBody.max_tokens !== undefined) {
+    requestBody.max_completion_tokens = requestBody.max_tokens;
+  }
+  delete requestBody.max_tokens;
+  return requestBody;
 }
 
 function detailsFromMetadata(metadata: SharedV4ProviderMetadata | undefined) {

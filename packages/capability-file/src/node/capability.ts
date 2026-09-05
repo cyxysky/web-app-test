@@ -61,6 +61,15 @@ export function fileOperationToCapabilityResult(
       : result.actual;
   const imagePaths = result.referenceImagePaths?.filter(Boolean) || [];
   const operationRecord = record(operationData);
+  // A summary must not repeat a serialized source/validation payload. Keep
+  // the complete value once in data; adapters can display this short label.
+  const explicitSummary = result.summary?.trim();
+  const sourceRange = record(operationRecord?.sourceLineRange);
+  const summary = explicitSummary && !/^[{\[]/.test(explicitSummary)
+    ? explicitSummary.slice(0, 300)
+    : operationRecord?.readKind === 'source' || operationRecord?.kind === 'uno-draft'
+      ? `Source ${String(operationRecord.documentId || '')}: ${sourceRange ? `lines ${sourceRange.startLine}-${sourceRange.endLine}` : 'source index'}.`
+      : `File operation completed${typeof operationRecord?.kind === 'string' ? `: ${operationRecord.kind}` : ''}.`;
   const data = imagePaths.length
     ? operationRecord
       ? { ...operationRecord, referenceImagePaths: imagePaths }
@@ -97,7 +106,7 @@ export function fileOperationToCapabilityResult(
   ];
   return {
     ok: true,
-    summary: result.summary || result.actual,
+    summary,
     data,
     content: content.length ? content : undefined,
   };
@@ -140,20 +149,21 @@ export async function createNodeFileOperations(
       await workspace.listOfficeDrafts({ runId }),
       'file-list-failed',
     ),
-    read: async (input, context) => {
-      if (input.documentId) {
-        return fileOperationToCapabilityResult(await workspace.readUnoDraft({
-          runId,
-          documentId: input.documentId,
-          path: input.path,
-          startLine: input.startLine,
-          endLine: input.endLine,
-        }), 'file-read-failed');
-      }
+    readSource: async (input) => fileOperationToCapabilityResult(await workspace.readUnoDraft({
+      runId,
+      documentId: input.documentId,
+      path: input.path,
+      startLine: input.startLine,
+      endLine: input.endLine,
+      includeDiagnostics: input.includeDiagnostics,
+    }), 'file-read-source-failed'),
+    readContent: async (input, context) => {
       if (!options.readFile) {
         return unavailable('Reading external attachments requires a host-provided readFile adapter.');
       }
-      return fileOperationToCapabilityResult(await options.readFile(input, context, runContext), 'file-read-failed');
+      return fileOperationToCapabilityResult(await options.readFile({
+        ...input, includeVisuals: input.includeVisuals === true,
+      }, context, runContext), 'file-read-content-failed');
     },
     download: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.downloadFileArtifact({
@@ -184,6 +194,7 @@ export async function createNodeFileOperations(
         documentType: input.documentType,
         operation: input.operation,
         intent: input.intent,
+        design: input.design,
         sourceAttachmentId: input.sourceAttachmentId,
         attachmentBindings,
       }),
@@ -213,6 +224,7 @@ export async function createNodeFileOperations(
         runId,
         documentId: input.documentId,
         program: input.program,
+        spec: input.spec,
         replaceExisting: input.replaceExisting,
         baseDigest: input.baseDigest,
         render: input.render,
@@ -230,6 +242,7 @@ export async function createNodeFileOperations(
         path: input.path,
         program: input.program,
         patch: input.patch,
+        replacements: input.replacements,
         baseDigest: input.baseDigest,
         render: input.render,
         includeVisualVerification,
@@ -251,6 +264,9 @@ export async function createNodeFileOperations(
       'file-render-failed',
     ),
   };
+  file.read = (input, context) => input.documentId
+    ? file.readSource!({ ...input, action: 'readSource' }, context)
+    : file.readContent!({ ...input, action: 'readContent' }, context);
 
   const visual = options.visualInputAvailable && options.readFileVisuals ? {
     index: executeVisual,

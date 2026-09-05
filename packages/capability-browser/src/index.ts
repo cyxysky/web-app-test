@@ -108,6 +108,8 @@ export const browserToolInput = defineCapabilityInput(
 export type BrowserOperationResult = {
   ok: boolean;
   actual: string;
+  data?: unknown;
+  summary?: string;
   failureCategory?: string;
   referenceImagePath?: string;
   referenceImagePaths?: string[];
@@ -136,7 +138,7 @@ export function browserOperationToCapabilityResult(
       },
     };
   }
-  return { ok: true, summary: result.actual, data: envelope };
+  return { ok: true, summary: result.summary || result.actual, data: envelope };
 }
 
 export function browserOperationFromCapabilityResult(

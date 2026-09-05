@@ -6,6 +6,10 @@ export type BrowserChatFileToolPresentationKey =
   | 'edit-draft'
   | 'file-visual-index'
   | 'file-visual-read'
+  | 'file-visual-report'
+  | 'convert-file'
+  | 'list-drafts'
+  | 'js-api'
   | 'plan-document'
   | 'read-attachment'
   | 'read-draft'
@@ -35,9 +39,11 @@ export function browserChatFileToolPresentation(
 
   if (action === 'visualIndex') return { key: 'file-visual-index', label: '获取截图列表' };
   if (action === 'visualRead') return { key: 'file-visual-read', label: '查看页面截图' };
+  if (action === 'readSource') return { key: 'read-draft', label: '读取生成源码' };
+  if (action === 'readContent') return { key: 'read-file', label: '读取文件内容' };
 
   if (action === 'read') {
-    if (textValue(record?.documentId)) return { key: 'read-draft', label: '读取草稿' };
+    if (textValue(record?.documentId)) return { key: 'read-draft', label: '读取生成源码' };
     const readsVisualPages = record?.includeVisuals === true
       || textValue(record?.includeVisuals).toLowerCase() === 'true'
       || (Array.isArray(record?.pages) && record.pages.length > 0);
@@ -47,6 +53,10 @@ export function browserChatFileToolPresentation(
   }
 
   const presentations: Record<string, BrowserChatFileToolPresentation> = {
+    list: { key: 'list-drafts', label: '列出文档草稿' },
+    convert: { key: 'convert-file', label: '转换文件格式' },
+    jsApi: { key: 'js-api', label: '查询 JavaScript API' },
+    visualReport: { key: 'file-visual-report', label: '提交视觉检查' },
     download: { key: 'download-file', label: '下载文件' },
     edit: { key: 'edit-draft', label: '修改草稿' },
     generate: { key: 'create-draft', label: '创建草稿' },

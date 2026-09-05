@@ -4,7 +4,7 @@ import {
   defaultModelByProvider,
   defaultModelForProvider,
   modelListForProvider,
-  modelProviderDefinitions,
+  modelProviderDefinitionsForConfig,
   modelProviderDefinition,
 } from '@/config/settings';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
@@ -46,7 +46,7 @@ function readProviderSettings(value: unknown): Partial<Record<ModelProvider, Mod
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const input = value as Record<string, unknown>;
   const result: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
-  for (const definition of modelProviderDefinitions) {
+  for (const definition of modelProviderDefinitionsForConfig(input)) {
     const raw = input[definition.value];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
     const item = raw as Record<string, unknown>;
@@ -109,7 +109,9 @@ export async function POST(request: NextRequest) {
       const providersInput = readProviderSettings(body.providers);
       if (!Object.keys(providersInput).length) {
         const definition = modelProviderDefinition(provider);
-        const bodyModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : defaultModelByProvider[provider];
+        const bodyModel = typeof body.model === 'string' && body.model.trim()
+          ? body.model.trim()
+          : defaultModelByProvider[provider] || definition.defaultModel;
         const models = modelListForProvider(definition, { model: bodyModel });
         const model = defaultModelForProvider(definition, { models, model: bodyModel });
         providersInput[provider] = {

@@ -68,6 +68,10 @@ export function compactBrowserChatLogForClient<TLog extends BrowserChatClientLog
         usage: aiOutput.usage,
       },
       execution: details?.execution,
+      ...(details?.truncated === true ? {
+        truncated: true,
+        originalCharacters: details.originalCharacters,
+      } : {}),
     });
     return compactedDetails.length < log.details.length
       ? { ...log, details: compactedDetails }

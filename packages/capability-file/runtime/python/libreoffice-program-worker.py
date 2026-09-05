@@ -8,6 +8,7 @@ import builtins
 import contextlib
 import hashlib
 import inspect
+import io
 import json
 import math
 import re
@@ -19,6 +20,8 @@ import time
 import unicodedata
 import uuid
 import zipfile
+import posixpath
+import xml.etree.ElementTree as ET
 from html import unescape
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +60,52 @@ def size(width, height):
 
 
 POINT_TO_100TH_MM = 2540.0 / 72.0
+
+_CJK_FONT = 'Noto Sans CJK SC'
+_CJK_FONT_PATTERN = re.compile(r'cjk|source han|noto (?:sans|serif) (?:sc|tc)|yahei|simsun|simhei|dengxian|fangsong|kaiti|pingfang|heiti|songti|wenkai|[\u3400-\u9fff]', re.I)
+
+
+def configure_cjk_font(job):
+    """Resolve a real CJK family once per worker, from the renderer's inventory."""
+    global _CJK_FONT
+    try:
+        toolkit = job.context.ServiceManager.createInstanceWithContext('com.sun.star.awt.Toolkit', job.context)
+        device = toolkit.createScreenCompatibleDevice(1, 1)
+        families = {str(font.Name).casefold(): str(font.Name) for font in device.getFontDescriptors()}
+        for name in ('Microsoft YaHei', 'Microsoft YaHei UI', 'Noto Sans CJK SC', 'Source Han Sans SC',
+                     'Noto Sans SC', 'PingFang SC', 'WenQuanYi Micro Hei', 'SimSun'):
+            if name.casefold() in families:
+                _CJK_FONT = families[name.casefold()]
+                return
+        job.runtime_diagnostics.append({'code': 'CJK_FONT_UNAVAILABLE', 'severity': 'warning',
+                                        'message': 'No preferred CJK font is installed; Chinese layout may use font substitution.'})
+    except Exception:
+        job.runtime_diagnostics.append({'code': 'CJK_FONT_INVENTORY_UNAVAILABLE', 'severity': 'warning',
+                                        'message': 'The renderer font inventory is unavailable; verify Chinese font substitution.'})
+
+
+def apply_text_font(target, font_name=None, font_size=None, bold=None, italic=None):
+    """UNO stores Latin, Asian and complex-script typography separately."""
+    properties = {}
+    if font_name:
+        properties['CharFontName'] = str(font_name)
+        properties['CharFontNameAsian'] = str(font_name) if _CJK_FONT_PATTERN.search(str(font_name)) else _CJK_FONT
+        properties['CharFontNameComplex'] = str(font_name)
+    for name, value in (
+        ('CharHeight', float(font_size) if font_size is not None else None),
+        ('CharWeight', (150.0 if bold else 100.0) if bold is not None else None),
+        ('CharPosture', uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE') if italic is not None else None),
+    ):
+        if value is not None:
+            for suffix in ('', 'Asian', 'Complex'):
+                properties[name + suffix] = value
+    # Optional script properties differ across legacy chart implementations.
+    info = target.getPropertySetInfo()
+    if info is None:
+        return
+    for name, value in properties.items():
+        if info.hasPropertyByName(name):
+            setattr(target, name, value)
 
 
 def office_color(value, name='color'):
@@ -332,6 +381,177 @@ def _patch_pptx_native_bullets(job, entries):
     return entries
 
 
+def _materialize_authored_chart_data(entries, chart_path, xml):
+    """Back newly authored literal chart caches with an actual editable workbook.
+
+    Never replace an existing externalData relationship (imported workbook,
+    formulas or lineage). This is called only for this job's authored charts.
+    """
+    c = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+    r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+    s = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    root = ET.fromstring(xml)
+    if root.find('{%s}externalData' % c) is not None:
+        return xml
+    columns = []
+
+    def column_name(number):
+        name = ''
+        while number:
+            number, remainder = divmod(number - 1, 26)
+            name = chr(65 + remainder) + name
+        return name
+
+    def materialize(match):
+        kind, block = match.group(1), match.group(0)
+        ref = ET.fromstring('<root xmlns:c="%s">%s</root>' % (c, block))[0]
+        cache = ref.find('{%s}%sCache' % (c, 'num' if kind == 'numRef' else 'str'))
+        if cache is None:
+            raise RuntimeError('Authored chart data has no literal cache; cannot create an editable workbook safely.')
+        points = {}
+        count_node = cache.find('{%s}ptCount' % c)
+        count = int(count_node.get('val', '0')) if count_node is not None else 0
+        for pt in cache.findall('{%s}pt' % c):
+            idx = int(pt.get('idx'))
+            value = pt.findtext('{%s}v' % c, '')
+            if idx < 0 or idx >= count or idx in points:
+                raise RuntimeError('Authored chart cache has invalid or duplicate point indices.')
+            if kind == 'numRef' and not math.isfinite(float(value)):
+                raise RuntimeError('Authored chart cache has a non-finite number.')
+            points[idx] = value
+        if count < 1 or count > 1048575:
+            raise RuntimeError('Authored chart cache has an unsupported point count.')
+        # UNO pads unequal-length role series to the longest series. Trim only
+        # absent trailing slots, never real points or internal missing values.
+        effective_count = max(points, default=-1) + 1
+        if 0 < effective_count < count:
+            count = effective_count
+            block = re.sub(r'<c:ptCount\b[^>]*/>', '<c:ptCount val="%s"/>' % count, block, count=1)
+        columns.append((kind, count, points))
+        col = column_name(len(columns))
+        formula = 'Data!$%s$2:$%s$%s' % (col, col, count + 1)
+        if count == 1:
+            formula = 'Data!$%s$2' % col
+        block, changed = re.subn(r'<c:f>.*?</c:f>', '<c:f>' + formula + '</c:f>', block, count=1, flags=re.DOTALL)
+        if changed != 1:
+            raise RuntimeError('Authored chart reference has no formula to bind to its workbook.')
+        return block
+
+    xml = re.sub(r'<c:(numRef|strRef)\b[^>]*>.*?</c:\1>', materialize, xml, flags=re.DOTALL)
+    expected = sum(1 for item in root.iter() if item.tag in {'{%s}numRef' % c, '{%s}strRef' % c})
+    if not columns or len(columns) != expected or len(columns) > 16384:
+        raise RuntimeError('Authored chart data references could not all be materialized.')
+    worksheet = ET.Element('worksheet', xmlns=s)
+    sheet_data = ET.SubElement(worksheet, 'sheetData')
+    rows = {}
+    for column_index, (kind, count, points) in enumerate(columns, 1):
+        col = column_name(column_index)
+        for row_number, value in [(1, 'Source %s' % column_index)] + [(idx + 2, value) for idx, value in sorted(points.items())]:
+            rows.setdefault(row_number, []).append((col, value, row_number == 1 or kind == 'strRef'))
+    for number, values in sorted(rows.items()):
+        row = ET.SubElement(sheet_data, 'row', r=str(number))
+        for col, value, is_text in values:
+            cell = ET.SubElement(row, 'c', r=col + str(number), t='inlineStr' if is_text else 'n')
+            if is_text:
+                ET.SubElement(ET.SubElement(cell, 'is'), 't', {'xml:space': 'preserve'}).text = value
+            else:
+                ET.SubElement(cell, 'v').text = value
+    buffer = io.BytesIO()
+    ct = 'http://schemas.openxmlformats.org/package/2006/content-types'
+    rel_ns = 'http://schemas.openxmlformats.org/package/2006/relationships'
+    with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as workbook:
+        workbook.writestr('[Content_Types].xml', '<Types xmlns="%s"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>' % ct)
+        workbook.writestr('_rels/.rels', '<Relationships xmlns="%s"><Relationship Id="rId1" Type="%s/officeDocument" Target="xl/workbook.xml"/></Relationships>' % (rel_ns, r))
+        workbook.writestr('xl/workbook.xml', '<workbook xmlns="%s" xmlns:r="%s"><sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>' % (s, r))
+        workbook.writestr('xl/_rels/workbook.xml.rels', '<Relationships xmlns="%s"><Relationship Id="rId1" Type="%s/worksheet" Target="worksheets/sheet1.xml"/></Relationships>' % (rel_ns, r))
+        workbook.writestr('xl/worksheets/sheet1.xml', ET.tostring(worksheet, encoding='utf-8', xml_declaration=True))
+    basename = 'webpilot-' + posixpath.basename(chart_path).replace('.xml', '.xlsx')
+    workbook_path = 'ppt/embeddings/' + basename
+    if workbook_path in entries:
+        raise RuntimeError('Authored chart workbook would overwrite an existing embedded asset.')
+    entries[workbook_path] = buffer.getvalue()
+    rel_path = posixpath.join(posixpath.dirname(chart_path), '_rels', posixpath.basename(chart_path) + '.rels')
+    rel_xml = entries[rel_path].decode('utf-8') if rel_path in entries else '<Relationships xmlns="%s"></Relationships>' % rel_ns
+    ids = {item.get('Id') for item in ET.fromstring(rel_xml)}
+    rel_id = 'rIdWebpilotData'
+    while rel_id in ids:
+        rel_id += '_'
+    # Preserve OPC's default-namespace spelling: some LibreOffice package
+    # readers reject an otherwise equivalent ns0-prefixed Types/Relationships.
+    relationship = '<Relationship Id="%s" Type="%s/package" Target="../embeddings/%s"/>' % (rel_id, r, basename)
+    if rel_xml.count('</Relationships>') != 1:
+        raise RuntimeError('Cannot safely extend the authored chart relationship part.')
+    entries[rel_path] = rel_xml.replace('</Relationships>', relationship + '</Relationships>').encode('utf-8')
+    types_xml = entries['[Content_Types].xml'].decode('utf-8')
+    override = '<Override PartName="/%s" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>' % workbook_path
+    if types_xml.count('</Types>') != 1:
+        raise RuntimeError('Cannot safely extend the Office package content types.')
+    entries['[Content_Types].xml'] = types_xml.replace('</Types>', override + '</Types>').encode('utf-8')
+    external = '<c:externalData r:id="%s"><c:autoUpdate val="0"/></c:externalData>' % rel_id
+    # CT_ChartSpace externalData follows txPr and precedes printSettings/userShapes/extLst.
+    before = re.search(r'<c:(?:printSettings|userShapes|extLst)\b', xml[xml.index('</c:chart>') + len('</c:chart>'):])
+    offset = xml.index('</c:chart>') + len('</c:chart>')
+    at = offset + before.start() if before else xml.rfind('</c:chartSpace>')
+    return xml[:at] + external + xml[at:]
+
+
+def _patch_pptx_chart_style(job, entries):
+    """Persist authored chart intent where Office clients disagree on omitted defaults.
+
+    Resolve shape names through slide relationships; never rewrite imported charts
+    merely because they happen to have the same chart type or package index.
+    """
+    requests = job.ooxml_patches.get('nativeChartStyle') or {}
+    if not requests:
+        return entries
+    ns = {'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+          'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+          'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'}
+    for slide_path in list(entries):
+        if not re.fullmatch(r'ppt/slides/slide\d+\.xml', slide_path):
+            continue
+        root = ET.fromstring(entries[slide_path])
+        rel_path = posixpath.join(posixpath.dirname(slide_path), '_rels', posixpath.basename(slide_path) + '.rels')
+        if rel_path not in entries:
+            continue
+        relations = {item.get('Id'): item.get('Target') for item in ET.fromstring(entries[rel_path])
+                     if item.get('TargetMode') != 'External'}
+        for frame in root.findall('.//p:graphicFrame', ns):
+            name = frame.find('.//p:cNvPr', ns)
+            chart = frame.find('.//c:chart', ns)
+            request = requests.get(name.get('name')) if name is not None else None
+            if request is None or chart is None:
+                continue
+            target = relations.get(chart.get('{%s}id' % ns['r']))
+            if not target:
+                raise RuntimeError('Authored chart has no exported relationship.')
+            chart_path = posixpath.normpath(posixpath.join(posixpath.dirname(slide_path), target)) if not target.startswith('/') else target.lstrip('/')
+            if not chart_path.startswith('ppt/charts/') or chart_path not in entries:
+                raise RuntimeError('Authored chart relationship did not resolve to a PPTX chart part.')
+            xml = entries[chart_path].decode('utf-8')
+            if request['kind'] == 'bubble':
+                def labels(match):
+                    block = re.sub(r'<c:showBubbleSize\b[^>]*/>', '', match.group(0))
+                    value = '1' if request['showValues'] else '0'
+                    # showBubbleSize has its own OOXML default, independent of showVal.
+                    block = re.sub(r'(<c:showPercent\b[^>]*/>)', r'\1<c:showBubbleSize val="' + value + '"/>', block, count=1)
+                    return block
+                xml = re.sub(r'<c:dLbls\b[^>]*>.*?</c:dLbls>', labels, xml, flags=re.DOTALL)
+            if request['kind'] == 'stock':
+                def stock_series(match):
+                    block = re.sub(r'<c:marker\b[^>]*>.*?</c:marker>', '', match.group(0), flags=re.DOTALL)
+                    # CT_LineSer marker follows spPr and precedes dPt/dLbls/data.
+                    marker = '<c:marker><c:symbol val="none"/></c:marker>'
+                    if '</c:spPr>' in block:
+                        block = block.replace('</c:spPr>', '</c:spPr>' + marker, 1)
+                    else:
+                        block = re.sub(r'(<c:order\b[^>]*/>)', r'\1' + marker, block, count=1)
+                    return block
+                xml = re.sub(r'<c:ser\b[^>]*>.*?</c:ser>', stock_series, xml, flags=re.DOTALL)
+            entries[chart_path] = _materialize_authored_chart_data(entries, chart_path, xml).encode('utf-8')
+    return entries
+
+
 def _patch_pptx_slide_order(job, entries):
     order = list(job.ooxml_patches.get('slideOrder') or [])
     if not order:
@@ -407,14 +627,34 @@ def _patch_pptx_shape_animations(job, entries):
     requests = list(job.ooxml_patches.get('shapeAnimations') or [])
     if not requests:
         return entries
+    slide_xml = {
+        name: value.decode('utf-8', errors='replace')
+        for name, value in entries.items()
+        if re.fullmatch(r'ppt/slides/slide\d+\.xml', name)
+    }
     by_slide = {}
     for request in requests:
-        by_slide.setdefault(int(request.get('slide') or 0), []).append(request)
-    for slide, slide_requests in by_slide.items():
-        name = f'ppt/slides/slide{slide}.xml'
-        xml = entries.get(name, b'').decode('utf-8', errors='replace')
-        if not xml:
-            raise ValueError(f'Cannot persist shape animation because {name} is missing.')
+        marker = str(request.get('artifactName') or '')
+        preferred = f'ppt/slides/slide{int(request.get("slide") or 0)}.xml'
+        matches = [
+            name for name, xml in slide_xml.items()
+            if _pptx_animation_target_id(xml, marker) is not None
+        ]
+        if preferred in matches:
+            target = preferred
+        elif len(matches) == 1:
+            # Slide duplication and logical reordering change the physical
+            # slideN.xml number after animation registration. Resolve by the
+            # stable exported shape marker instead of trusting a stale index.
+            target = matches[0]
+        else:
+            raise ValueError(
+                f'Cannot persist shape animation because marker {marker!r} '
+                f'matched {len(matches)} physical slide parts.'
+            )
+        by_slide.setdefault(target, []).append(request)
+    for name, slide_requests in by_slide.items():
+        xml = slide_xml[name]
         # If LibreOffice serialized native timing, retain its complete timing
         # graph. Some releases accept the legacy Effect property but silently
         # omit the graph; synthesize the equivalent entrance sequence only in
@@ -500,6 +740,7 @@ def postprocess_ooxml(job):
         entries = _patch_pptx_native_bullets(job, entries)
         entries = _patch_pptx_slide_order(job, entries)
         entries = _patch_pptx_shape_animations(job, entries)
+        entries = _patch_pptx_chart_style(job, entries)
     elif suffix == '.docx':
         entries = _patch_docx_protection(job, entries)
     temporary = job.output_path.with_name(f'.{job.output_path.name}.{uuid.uuid4().hex}.tmp')
@@ -507,6 +748,10 @@ def postprocess_ooxml(job):
         with zipfile.ZipFile(temporary, 'w') as output:
             for info in infos:
                 output.writestr(info, entries[info.filename])
+            original_names = {info.filename for info in infos}
+            for name, content in entries.items():
+                if name not in original_names:
+                    output.writestr(name, content, compress_type=zipfile.ZIP_DEFLATED)
         temporary.replace(job.output_path)
     finally:
         if temporary.exists():
@@ -609,6 +854,9 @@ class DocumentJob:
     feature_counts: dict = field(default_factory=dict, compare=False)
     ooxml_patches: dict = field(default_factory=dict, compare=False)
 
+    def __post_init__(self):
+        configure_cjk_font(self)
+
     @property
     def output_url(self):
         return self.output_path.as_uri()
@@ -675,7 +923,31 @@ class DocumentJob:
         factories = {'word': 'private:factory/swriter', 'spreadsheet': 'private:factory/scalc', 'presentation': 'private:factory/simpress'}
         if kind not in factories:
             raise ValueError(f'Unsupported document type: {kind}')
-        return self.desktop.loadComponentFromURL(factories[kind], '_blank', 0, (self.property('Hidden', True),))
+        component = self.desktop.loadComponentFromURL(factories[kind], '_blank', 0, (self.property('Hidden', True),))
+        if component is None:
+            raise RuntimeError(f'UNO_WORKER_INTERNAL_ERROR: LibreOffice returned no component for {kind}; source validation did not complete.')
+        # New documents get explicit CJK defaults; imported document styles are
+        # never globally rewritten by opening them for a local edit.
+        if kind in {'word', 'spreadsheet'}:
+            family = component.StyleFamilies.getByName('ParagraphStyles' if kind == 'word' else 'CellStyles')
+            standard = family.getByName('Standard' if kind == 'word' else 'Default')
+            apply_text_font(standard, font_name=_CJK_FONT, font_size=11)
+        # Built-in headings and slide styles can override the Standard style's
+        # Asian font. Normalize only the CJK family, preserving Latin design.
+        for family_name in component.StyleFamilies.getElementNames():
+            if kind == 'word' and family_name != 'ParagraphStyles':
+                continue
+            if kind == 'spreadsheet' and family_name != 'CellStyles':
+                continue
+            family = component.StyleFamilies.getByName(family_name)
+            for style_name in family.getElementNames():
+                target = family.getByName(style_name)
+                # Impress table templates are style containers, not text
+                # styles; their property-set metadata can be None.
+                info = target.getPropertySetInfo()
+                if info is not None and info.hasPropertyByName('CharFontNameAsian'):
+                    target.CharFontNameAsian = _CJK_FONT
+        return component
 
     def new_document(self, kind=None):
         raise RuntimeError("Direct job.new_document() is worker-owned. Use job.writer(), job.presentation(), or job.spreadsheet().")
@@ -725,13 +997,30 @@ class DocumentJob:
             location['callColumn'] = matches[-1]['column']
         return location
 
-    def register_element(self, element_id, kind, target=None, locator=None, force_artifact_name=False):
+    def register_element(self, element_id, kind, target=None, locator=None, force_artifact_name=False,
+                         update_existing=False):
         requested_value = str(element_id or '').strip()
         if (not requested_value or len(requested_value) > 128
                 or re.search(r'[\x00-\x20\x7f]', requested_value)):
             raise ValueError(
                 'elementId must contain 1-128 non-whitespace characters. Unicode names, including Chinese, are supported.'
             )
+
+        source_location = self._source_location()
+        previous = self.element_records.get(requested_value)
+        # Setters may legitimately change the same Calc target more than once.
+        # Compare target coordinates, not mutable dimensions; real collisions
+        # (different kind/target, or object creation) still get a unique ID.
+        mutable_keys = {'row-height': {'height'}, 'column-width': {'width'}}.get(kind, set())
+        def target_identity(value):
+            return {key: item for key, item in (value or {}).items() if key not in mutable_keys}
+        if (update_existing and previous and locator
+                and previous['kind'] == kind
+                and target_identity(previous.get('locator')) == target_identity(locator)):
+            for key in ('line', 'column', 'callLine', 'callColumn'):
+                previous.pop(key, None)
+            previous.update({**source_location, 'locator': dict(locator)})
+            return previous
 
         value = requested_value
         duplicate_index = 1
@@ -740,7 +1029,6 @@ class DocumentJob:
             suffix = f'-{duplicate_index}'
             value = f'{requested_value[:128 - len(suffix)]}{suffix}'
 
-        source_location = self._source_location()
         if value != requested_value:
             first = self.element_records[requested_value]
             self.runtime_diagnostics.append({
@@ -914,6 +1202,31 @@ class WriterLayout(OfficeUnitConversion):
         cursor.gotoEnd(False)
         return cursor
 
+    def _paragraph_cursor(self, paragraph_style=None):
+        cursor = self._end_cursor()
+        # Keep explicit page breaks and inline fields, but do not inherit the
+        # preceding heading/list/hyperlink's direct formatting.
+        for name in ('CharStyleName', 'CharFontName', 'CharFontNameAsian', 'CharFontNameComplex',
+                     'CharHeight', 'CharHeightAsian', 'CharHeightComplex', 'CharWeight',
+                     'CharWeightAsian', 'CharWeightComplex', 'CharPosture', 'CharPostureAsian',
+                     'CharPostureComplex', 'CharColor', 'CharUnderline', 'HyperLinkURL',
+                     'ParaKeepTogether', 'ParaSplit', 'ParaLeftMargin', 'ParaRightMargin',
+                     'ParaFirstLineIndent', 'ParaAdjust', 'ParaLineSpacing', 'ParaTopMargin',
+                     'ParaBottomMargin', 'ParaBackColor'):
+            cursor.setPropertyToDefault(name)
+        cursor.ParaStyleName = str(paragraph_style or 'Standard')
+        cursor.NumberingStyleName = ''
+        cursor.CharHidden = False
+        cursor.ParaOrphans, cursor.ParaWidows = 2, 2
+        cursor.ParaIsForbiddenRules = True
+        return cursor
+
+    def _finish_block(self, cursor):
+        cursor.gotoEnd(False)
+        self._component.Text.insertControlCharacter(
+            cursor, uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK'), False)
+        self._paragraph_cursor()
+
     def _page_style(self):
         styles = self._component.StyleFamilies.getByName('PageStyles')
         return styles.getByName(styles.getElementNames()[0])
@@ -1005,23 +1318,34 @@ class WriterLayout(OfficeUnitConversion):
             style.FooterText.insertTextContent(cursor, bookmark, True)
         return self
 
-    def add_paragraph(self, element_id, value='', font_size=11, bold=False, italic=False, color=0x000000,
-                      align='LEFT', line_spacing=1.3, space_before=0, space_after=180, paragraph_style=None):
-        cursor = self._end_cursor()
-        cursor.NumberingStyleName = ''
-        cursor.CharHidden = False
-        if paragraph_style:
-            cursor.ParaStyleName = str(paragraph_style)
-        cursor.CharHeight = float(font_size)
-        cursor.CharWeight = 150.0 if bold else 100.0
-        cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE')
-        cursor.CharColor = office_color(color, 'Writer text color')
-        cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
-        spacing = uno.createUnoStruct('com.sun.star.style.LineSpacing')
-        spacing.Mode, spacing.Height = 0, max(100, int(float(line_spacing) * 100))
-        cursor.ParaLineSpacing = spacing
-        cursor.ParaTopMargin = max(0, int(space_before))
-        cursor.ParaBottomMargin = max(0, int(space_after))
+    def add_paragraph(self, element_id, value='', font_size=None, bold=None, italic=None, color=None,
+                      align=None, line_spacing=None, space_before=None, space_after=None,
+                      paragraph_style=None, font_name=None, keep_with_next=None):
+        cursor = self._paragraph_cursor(paragraph_style)
+        if not paragraph_style:
+            font_size = 11 if font_size is None else font_size
+            bold, italic = bool(bold), bool(italic)
+            color = 0x000000 if color is None else color
+            align = align or 'LEFT'
+            line_spacing = 1.3 if line_spacing is None else line_spacing
+            space_before = 0 if space_before is None else space_before
+            space_after = 180 if space_after is None else space_after
+        apply_text_font(cursor, font_name=font_name, font_size=font_size, bold=bold, italic=italic)
+        if color is not None:
+            cursor.CharColor = office_color(color, 'Writer text color')
+        if align is not None:
+            cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
+        if line_spacing is not None:
+            spacing = uno.createUnoStruct('com.sun.star.style.LineSpacing')
+            spacing.Mode, spacing.Height = 0, max(100, int(float(line_spacing) * 100))
+            cursor.ParaLineSpacing = spacing
+        if space_before is not None:
+            cursor.ParaTopMargin = max(0, int(space_before))
+        if space_after is not None:
+            cursor.ParaBottomMargin = max(0, int(space_after))
+        if keep_with_next is not None:
+            cursor.ParaKeepTogether = bool(keep_with_next)
+            cursor.ParaSplit = not bool(keep_with_next)
         self._paragraph_count += 1
         record = self.job.register_element(element_id, 'paragraph', None, {'paragraph': self._paragraph_count})
         self._insert_bookmarked_text(self._component.Text, cursor, record, value)
@@ -1029,12 +1353,13 @@ class WriterLayout(OfficeUnitConversion):
         self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
         return self
 
-    def add_heading(self, element_id, value, level=1, color=0x1F2937, align='LEFT'):
+    def add_heading(self, element_id, value, level=1, color=0x1F2937, align='LEFT', font_name=None,
+                    font_size=None):
         sizes = {1: 24, 2: 18, 3: 15, 4: 13}
         level = min(4, max(1, int(level)))
         return self.add_paragraph(
             element_id, value,
-            font_size=sizes[level],
+            font_size=float(font_size) if font_size is not None else sizes[level],
             bold=True,
             color=color,
             align=align,
@@ -1042,18 +1367,23 @@ class WriterLayout(OfficeUnitConversion):
             space_before=220 if level > 1 else 0,
             space_after=180,
             paragraph_style=f'Heading {level}',
+            font_name=font_name,
+            keep_with_next=True,
         )
 
-    def add_title(self, element_id, value, color=0x1F2937, align='LEFT'):
+    def add_title(self, element_id, value, color=0x1F2937, align='LEFT', font_name=None,
+                  font_size=None):
         """Add a document title without exposing Writer style internals."""
-        return self.add_heading(element_id, value, level=1, color=color, align=align)
+        return self.add_heading(
+            element_id, value, level=1, color=color, align=align,
+            font_name=font_name, font_size=font_size,
+        )
 
-    def add_bullets(self, element_id, values, level=0, font_size=11, color=0x000000):
+    def add_bullets(self, element_id, values, level=0, font_size=11, color=0x000000, font_name=None):
         list_level = max(0, int(level))
         for index, value in enumerate(values):
-            cursor = self._end_cursor()
-            cursor.CharHidden = False
-            cursor.CharHeight = float(font_size)
+            cursor = self._paragraph_cursor()
+            apply_text_font(cursor, font_name=font_name, font_size=font_size, bold=False, italic=False)
             cursor.CharColor = office_color(color, 'Writer list color')
             cursor.ParaBottomMargin = 80
             cursor.NumberingStyleName = 'List 1'
@@ -1071,17 +1401,20 @@ class WriterLayout(OfficeUnitConversion):
         trailing_cursor.CharHidden = False
         return self
 
-    def add_numbered_list(self, element_id, values, level=0, font_size=11, color=0x000000):
-        """Add a native numbered list in normal Writer flow."""
+    def add_numbered_list(self, element_id, values, level=0, font_size=11, color=0x000000, font_name=None,
+                          start=1, continue_numbering=False):
+        """Start a new native list; opt into continuing the preceding list."""
         list_level = max(0, int(level))
         for index, value in enumerate(values):
-            cursor = self._end_cursor()
-            cursor.CharHidden = False
-            cursor.CharHeight = float(font_size)
+            cursor = self._paragraph_cursor()
+            apply_text_font(cursor, font_name=font_name, font_size=font_size, bold=False, italic=False)
             cursor.CharColor = office_color(color, 'Writer list color')
             cursor.ParaBottomMargin = 80
             cursor.NumberingStyleName = 'Numbering 123'
             cursor.NumberingLevel = list_level
+            cursor.ParaIsNumberingRestart = index == 0 and not continue_numbering
+            if index == 0 and not continue_numbering:
+                cursor.NumberingStartValue = max(1, min(32767, int(start)))
             self._paragraph_count += 1
             record = self.job.register_element(
                 f'{element_id}/{index + 1}', 'numbered-list-item', None,
@@ -1111,7 +1444,9 @@ class WriterLayout(OfficeUnitConversion):
             'Query the corresponding unoApi module and use one of its installed facade examples.'
         )
 
-    def add_table(self, element_id, rows, column_widths=None, header=True, font_size=10):
+    def add_table(self, element_id, rows, column_widths=None, header=True, font_size=10,
+                  font_name=None, header_fill=0xE8EEF7, header_color=0x0F172A,
+                  body_color=0x1E293B):
         data = [list(row) for row in rows]
         if not data or not data[0]:
             raise ValueError('Writer table requires at least one row and one column')
@@ -1144,13 +1479,17 @@ class WriterLayout(OfficeUnitConversion):
             for column_index, value in enumerate(row):
                 name = f'{self._column_name(column_index)}{row_index + 1}'
                 cell = table.getCellByName(name)
-                cell.String = str(value)
+                cell.String = '' if value is None else str(value)
                 cell_cursor = cell.createTextCursor()
                 cell_cursor.gotoEnd(True)
-                cell_cursor.CharHeight = float(font_size)
+                apply_text_font(cell_cursor, font_name=font_name, font_size=font_size,
+                                bold=bool(header and row_index == 0), italic=False)
+                cell_cursor.CharColor = office_color(
+                    header_color if header and row_index == 0 else body_color,
+                    'Writer table text color',
+                )
                 if header and row_index == 0:
-                    cell_cursor.CharWeight = 150.0
-                    cell.BackColor = 0xE8EEF7
+                    cell.BackColor = office_color(header_fill, 'Writer table header fill')
         # Establish an ordinary flow paragraph after the table. Without this,
         # Writer can anchor the next inline object to the table's terminal row
         # and export it with a one-line height in DOCX.
@@ -1163,10 +1502,9 @@ class WriterLayout(OfficeUnitConversion):
         self._tables[str(element_id)] = table
         return table
 
-    def add_inline_image(self, element_id, asset_name, width=None, height=None, align='CENTER', space_after=180):
-        cursor = self._end_cursor()
-        cursor.NumberingStyleName = ''
-        cursor.CharHidden = False
+    def add_inline_image(self, element_id, asset_name, width=None, height=None, align='CENTER', space_after=180,
+                         alt_text=None, title=None):
+        cursor = self._paragraph_cursor()
         cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
         cursor.ParaBottomMargin = max(0, int(space_after))
         image = self._component.createInstance('com.sun.star.text.TextGraphicObject')
@@ -1184,6 +1522,11 @@ class WriterLayout(OfficeUnitConversion):
             image.Graphic = graphic
         else:
             image.GraphicURL = asset_url
+        try:
+            image.Description = str(alt_text or '')
+            image.Title = str(title or '')
+        except Exception:
+            pass
         image.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AS_CHARACTER')
         bounds = self.job.document_bounds(self._component)
         intrinsic = source_image_dimensions(asset_path)
@@ -1240,7 +1583,6 @@ class WriterLayout(OfficeUnitConversion):
         cursor.ParaBottomMargin = 0
         record = self.job.register_element(element_id, 'page-break', None, {'paragraph': self._paragraph_count + 1})
         self._insert_bookmarked_text(self._component.Text, cursor, record, '')
-        cursor.BreakType = uno.Enum('com.sun.star.style.BreakType', 'PAGE_BEFORE')
         paragraph_break = uno.getConstantByName('com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK')
         self._component.Text.insertControlCharacter(cursor, paragraph_break, False)
         following_cursor = self._end_cursor()
@@ -1248,9 +1590,9 @@ class WriterLayout(OfficeUnitConversion):
         following_cursor.CharHidden = False
         try:
             following_cursor.ParaStyleName = 'Standard'
-            # PAGE_BEFORE belongs to the paragraph that starts the new page.
-            # Clearing it here caused add_page_break() to register successfully
-            # while DOCX contained no page-break artifact at all.
+            # A Writer page break is a paragraph property.  Apply it only to the
+            # following paragraph; applying PAGE_BEFORE to both sides produces
+            # a blank page between every two authored sections after DOCX export.
             following_cursor.BreakType = uno.Enum('com.sun.star.style.BreakType', 'PAGE_BEFORE')
         except Exception:
             pass
@@ -1285,17 +1627,14 @@ class WriterLayout(OfficeUnitConversion):
         if not values:
             raise ValueError('Writer rich paragraph requires at least one run.')
         text = self._component.Text
-        cursor = self._end_cursor()
-        cursor.NumberingStyleName = ''
-        cursor.CharHidden = False
-        if paragraph_style:
-            cursor.ParaStyleName = str(paragraph_style)
+        cursor = self._paragraph_cursor(paragraph_style)
         cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
         spacing = uno.createUnoStruct('com.sun.star.style.LineSpacing')
         spacing.Mode, spacing.Height = 0, max(100, int(float(line_spacing) * 100))
         cursor.ParaLineSpacing = spacing
         cursor.ParaTopMargin, cursor.ParaBottomMargin = max(0, int(space_before)), max(0, int(space_after))
-        start = cursor.Start
+        base_font = cursor.CharFontName
+        base_size, base_weight, base_posture, base_color = cursor.CharHeight, cursor.CharWeight, cursor.CharPosture, cursor.CharColor
         inserted = 0
         for item in values:
             run = dict(item) if isinstance(item, dict) else {'text': str(item)}
@@ -1306,18 +1645,16 @@ class WriterLayout(OfficeUnitConversion):
             text.insertString(cursor, value, False)
             run_cursor = text.createTextCursorByRange(cursor)
             run_cursor.goLeft(len(value), True)
+            run_cursor.HyperLinkURL = str(link or '')
             if link:
-                run_cursor.HyperLinkURL = str(link)
                 run_cursor.HyperLinkTarget = '_blank'
                 self.job.record_feature('externalHyperlink')
-            run_cursor.CharHeight = float(run.get('font_size', 11))
-            run_cursor.CharWeight = 150.0 if run.get('bold') else 100.0
-            run_cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if run.get('italic') else 'NONE')
-            run_cursor.CharColor = office_color(run.get('color', 0x000000), 'Writer rich-text color')
-            if run.get('font_name'):
-                run_cursor.CharFontName = str(run['font_name'])
-            if run.get('underline'):
-                run_cursor.CharUnderline = uno.getConstantByName('com.sun.star.awt.FontUnderline.SINGLE')
+            apply_text_font(run_cursor, font_name=run.get('font_name') or base_font,
+                            font_size=run.get('font_size', base_size), bold=run.get('bold', base_weight > 100),
+                            italic=run.get('italic', base_posture.value != 'NONE'))
+            run_cursor.CharColor = office_color(run.get('color', base_color if base_color >= 0 else 0), 'Writer rich-text color')
+            run_cursor.CharUnderline = uno.getConstantByName(
+                'com.sun.star.awt.FontUnderline.SINGLE' if run.get('underline') else 'com.sun.star.awt.FontUnderline.NONE')
             inserted += len(value)
         if inserted <= 0:
             raise ValueError('Writer rich paragraph contains no visible text.')
@@ -1345,10 +1682,11 @@ class WriterLayout(OfficeUnitConversion):
             except Exception:
                 pass
         mapping = {
-            'font_size': ('CharHeight', float),
             'space_before': ('ParaTopMargin', int), 'space_after': ('ParaBottomMargin', int),
-            'font_name': ('CharFontName', str),
+            'keep_with_next': ('ParaKeepTogether', bool),
         }
+        apply_text_font(target, font_name=style.get('font_name'), font_size=style.get('font_size'),
+                        bold=style.get('bold'), italic=style.get('italic'))
         for key, (property_name, converter) in mapping.items():
             if key in style:
                 setattr(target, property_name, converter(style[key]))
@@ -1356,10 +1694,10 @@ class WriterLayout(OfficeUnitConversion):
             target.CharColor = office_color(style['color'], 'Writer paragraph-style color')
         if 'background' in style:
             target.ParaBackColor = office_color(style['background'], 'Writer paragraph-style background')
-        if 'bold' in style:
-            target.CharWeight = 150.0 if style['bold'] else 100.0
-        if 'italic' in style:
-            target.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if style['italic'] else 'NONE')
+        if 'line_spacing' in style:
+            spacing = uno.createUnoStruct('com.sun.star.style.LineSpacing')
+            spacing.Mode, spacing.Height = 0, max(100, int(float(style['line_spacing']) * 100))
+            target.ParaLineSpacing = spacing
         if 'align' in style:
             target.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(style['align']).upper())
         self.job.register_element(element_id, 'paragraph-style', target, {'style': str(name)})
@@ -1374,7 +1712,8 @@ class WriterLayout(OfficeUnitConversion):
         link_cursor.goLeft(len(value), True)
         link_cursor.HyperLinkURL = str(url)
         link_cursor.HyperLinkTarget = '_blank'
-        link_cursor.CharHeight, link_cursor.CharColor = float(font_size), office_color(color, 'Writer link color')
+        apply_text_font(link_cursor, font_size=font_size)
+        link_cursor.CharColor = office_color(color, 'Writer link color')
         link_cursor.CharUnderline = uno.getConstantByName('com.sun.star.awt.FontUnderline.SINGLE')
         record = self.job.register_element(element_id, 'hyperlink', None, {'url': str(url)})
         bookmark = self._component.createInstance('com.sun.star.text.Bookmark')
@@ -1413,6 +1752,11 @@ class WriterLayout(OfficeUnitConversion):
         if text_before:
             self._component.Text.insertString(cursor, str(text_before), False)
         field = self._component.createInstance(services[key])
+        if key in {'page-number', 'page-count'} and hasattr(field, 'NumberingType'):
+            # Force Arabic digits for portable DOCX output. Otherwise the field
+            # can inherit a section/page-style Roman numbering format even when
+            # it appears inline in ordinary report body text.
+            field.NumberingType = uno.getConstantByName('com.sun.star.style.NumberingType.ARABIC')
         self._component.Text.insertTextContent(cursor, field, False)
         if text_after:
             self._component.Text.insertString(cursor, str(text_after), False)
@@ -1448,7 +1792,7 @@ class WriterLayout(OfficeUnitConversion):
         self.job.record_feature('documentIndex')
         return self
 
-    def add_cross_reference(self, element_id, bookmark_name, part='text'):
+    def add_cross_reference(self, element_id, bookmark_name, part='text', text_before='', text_after=''):
         parts = {
             'text': 'TEXT', 'page': 'PAGE', 'chapter': 'CHAPTER',
             'number': 'NUMBER', 'number-no-context': 'NUMBER_NO_CONTEXT',
@@ -1466,7 +1810,11 @@ class WriterLayout(OfficeUnitConversion):
                 f'com.sun.star.text.ReferenceFieldPart.{parts[key]}'
             )
             cursor = self._end_cursor()
+            if text_before:
+                self._component.Text.insertString(cursor, str(text_before), False)
             self._component.Text.insertTextContent(cursor, field, False)
+            if text_after:
+                self._component.Text.insertString(cursor, str(text_after), False)
         except Exception as error:
             raise ValueError('Writer could not create the requested bookmark cross-reference.') from error
         self.job.register_element(element_id, 'cross-reference', field, {
@@ -1475,7 +1823,7 @@ class WriterLayout(OfficeUnitConversion):
         self.job.record_feature('crossReference')
         return self
 
-    def add_note(self, element_id, text, kind='footnote', label=None):
+    def add_note(self, element_id, text, kind='footnote', label=None, text_before='', text_after=''):
         normalized = str(kind).strip().lower()
         if normalized not in {'footnote', 'endnote'}:
             raise ValueError("Writer note kind must be 'footnote' or 'endnote'.")
@@ -1484,7 +1832,11 @@ class WriterLayout(OfficeUnitConversion):
         if label:
             note.Label = str(label)
         cursor = self._end_cursor()
+        if text_before:
+            self._component.Text.insertString(cursor, str(text_before), False)
         self._component.Text.insertTextContent(cursor, note, False)
+        if text_after:
+            self._component.Text.insertString(cursor, str(text_after), False)
         note.String = str(text)
         self.job.register_element(element_id, normalized, note, {'kind': normalized})
         self.job.record_feature(normalized)
@@ -1535,6 +1887,8 @@ class WriterLayout(OfficeUnitConversion):
         frame.String = str(text)
         self.job.register_element(element_id, 'text-frame', frame, {'anchor': str(anchor).upper()})
         self.job.record_feature('textFrame')
+        if str(anchor).upper() == 'AS_CHARACTER':
+            self._finish_block(cursor)
         return self
 
     def add_section(self, element_id, name, columns=1, protected=False):
@@ -1607,9 +1961,10 @@ class WriterLayout(OfficeUnitConversion):
             embedded.CLSID = '078B7ABA-54FC-457F-8551-6147e776a997'
             embedded.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AS_CHARACTER')
             embedded.Size = size(int(width), int(height))
-            cursor = self._end_cursor()
+            cursor = self._paragraph_cursor()
             self._component.Text.insertTextContent(cursor, embedded, False)
             embedded.Model.Formula = str(formula)
+            self._finish_block(cursor)
         except Exception as error:
             raise ValueError('Writer could not create the requested native formula object.') from error
         self.job.register_element(element_id, 'formula', embedded, {'formula': str(formula)})
@@ -1619,7 +1974,8 @@ class WriterLayout(OfficeUnitConversion):
     def add_chart(self, element_id, categories, values, width=12000, height=7000,
                   chart_type='column', series_name='Values', title=None,
                   x_axis_title=None, y_axis_title=None, show_legend=False,
-                  show_values=True):
+                  show_values=True, series_color=0x0B4F8A, background=0xFFFFFF,
+                  wall_color=0xF8FAFC, grid_color=0xD5DEE8, text_color=0x111827):
         if len(categories) != len(values) or not categories:
             raise ValueError('Writer chart categories and values must be non-empty and have equal length.')
         try:
@@ -1627,7 +1983,7 @@ class WriterLayout(OfficeUnitConversion):
             embedded.CLSID = '12DCAE26-281F-416F-A234-C3086127382E'
             embedded.AnchorType = uno.Enum('com.sun.star.text.TextContentAnchorType', 'AS_CHARACTER')
             embedded.Size = size(int(width), int(height))
-            cursor = self._end_cursor()
+            cursor = self._paragraph_cursor()
             self._component.Text.insertTextContent(cursor, embedded, False)
             chart = embedded.Model
             diagrams = {
@@ -1676,12 +2032,48 @@ class WriterLayout(OfficeUnitConversion):
                     diagram.DataCaption = int(uno.getConstantByName('com.sun.star.chart.ChartDataCaption.VALUE'))
                 except Exception:
                     pass
+            # Chart1 exposes styling through several optional UNO property
+            # sets. Apply a restrained default palette where available while
+            # keeping compatibility with older LibreOffice builds.
+            for target, property_name, value, label in (
+                (chart.Area, 'FillColor', background, 'Writer chart background'),
+                (getattr(diagram, 'Wall', None), 'FillColor', wall_color, 'Writer chart wall'),
+            ):
+                if target is None:
+                    continue
+                try:
+                    setattr(target, property_name, office_color(value, label))
+                except Exception:
+                    pass
+            try:
+                series = diagram.getDataRowProperties(0)
+                series.FillColor = office_color(series_color, 'Writer chart series')
+                series.LineColor = office_color(series_color, 'Writer chart series line')
+            except Exception:
+                pass
+            try:
+                diagram.YAxis.MainGrid.LineColor = office_color(grid_color, 'Writer chart grid')
+            except Exception:
+                pass
+            for target in (
+                getattr(chart, 'Title', None), getattr(diagram, 'XAxis', None),
+                getattr(diagram, 'YAxis', None), getattr(diagram, 'XAxisTitle', None),
+                getattr(diagram, 'YAxisTitle', None),
+            ):
+                if target is None:
+                    continue
+                try:
+                    target.CharColor = office_color(text_color, 'Writer chart text')
+                    apply_text_font(target, font_name=_CJK_FONT)
+                except Exception:
+                    pass
         except ValueError:
             raise
         except Exception as error:
             raise ValueError('Writer could not create the requested native editable chart.') from error
         self.job.register_element(element_id, 'chart', embedded, {'chartType': str(chart_type)})
         self.job.record_feature('nativeChart')
+        self._finish_block(cursor)
         return self
 
     def set_doc_info(self, title=None, subject=None, author=None, description=None, keywords=None):
@@ -1714,6 +2106,16 @@ class WriterLayout(OfficeUnitConversion):
         }
         if suffix not in filters:
             raise ValueError(f'Unsupported Writer output extension: {suffix}')
+        # Refresh native TOCs and indexes after the full document has been
+        # authored so exported DOCX/PDF previews contain the final headings.
+        try:
+            indexes = self._component.DocumentIndexes
+            for index in range(indexes.Count):
+                indexes.getByIndex(index).update()
+        except Exception:
+            # Older LibreOffice builds may expose indexes without update().
+            # Saving must remain available in that compatibility case.
+            pass
         save_document(self._component, self.job)
         return self
 
@@ -1801,6 +2203,7 @@ class PresentationShape:
 
     def remove(self):
         self.slide._page.remove(self._shape)
+        self.deck.job.element_records.pop(self.element_id, None)
         return self.slide
 
     def bring_to_front(self):
@@ -1826,16 +2229,24 @@ class PresentationTable(PresentationShape):
         return self._shape.Model
 
     def set_cell(self, column, row, value, **style):
-        cell = self._table.getCellByPosition(int(column), int(row))
+        columns, rows = self._table.Columns.Count, self._table.Rows.Count
+        if (isinstance(column, bool) or isinstance(row, bool)
+                or not isinstance(column, int) or not isinstance(row, int)
+                or not 0 <= column < columns or not 0 <= row < rows):
+            raise ValueError(
+                f'PRESENTATION_TABLE_CELL_OUT_OF_RANGE: table.set_cell(column, row, value) uses ZERO-based '
+                f'column then row indices. Received column={column!r}, row={row!r}; '
+                f'valid columns are 0..{columns - 1}, rows 0..{rows - 1}. '
+                'Correct the intended cell coordinates; do not remove the table edit.'
+            )
+        cell = self._table.getCellByPosition(column, row)
         cell.String = '' if value is None else str(value)
         cursor = cell.createTextCursor()
         cursor.gotoEnd(True)
-        if 'font_size' in style:
-            cursor.CharHeight = float(style['font_size'])
+        apply_text_font(cursor, font_name=style.get('font_name'), font_size=style.get('font_size'),
+                        bold=style.get('bold'), italic=style.get('italic'))
         if 'color' in style:
             cursor.CharColor = office_color(style['color'], 'table text color')
-        if 'bold' in style:
-            cursor.CharWeight = 150.0 if style['bold'] else 100.0
         if 'background' in style:
             cell.FillColor = office_color(style['background'], 'table background')
         if 'align' in style:
@@ -1857,6 +2268,12 @@ class PresentationTable(PresentationShape):
             end_column, end_row = coordinates(end_cell)
             left, right = sorted((start_column, end_column))
             top, bottom = sorted((start_row, end_row))
+            if right >= self._table.Columns.Count or bottom >= self._table.Rows.Count:
+                raise ValueError(
+                    f'PRESENTATION_TABLE_CELL_OUT_OF_RANGE: merge({start_cell!r}, {end_cell!r}) exceeds '
+                    f'the {self._table.Rows.Count}-row, {self._table.Columns.Count}-column table. '
+                    'Use existing A1 cell addresses. Merge changes data and layout; it is not a no-op.'
+                )
             cell_range = self._table.getCellRangeByPosition(left, top, right, bottom)
             if cell_range is None:
                 raise ValueError(f'Cannot select table range {start_cell}:{end_cell}.')
@@ -2189,16 +2606,12 @@ class PresentationSlide:
             run_cursor = shape.Text.createTextCursorByRange(cursor)
             run_cursor.goLeft(len(value), True)
             options = self.deck._normalized_text_options({**base, **run})
-            if 'font_size' in options:
-                run_cursor.CharHeight = float(options['font_size'])
+            apply_text_font(run_cursor, font_name=options.get('font_name') or _CJK_FONT,
+                            font_size=options.get('font_size'), bold=bool(options.get('bold')), italic=bool(options.get('italic')))
             if 'color' in options:
                 run_cursor.CharColor = office_color(options['color'], 'rich-text color')
-            if options.get('bold'):
-                run_cursor.CharWeight = 150.0
-            if options.get('italic'):
-                run_cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC')
-            if options.get('underline'):
-                run_cursor.CharUnderline = uno.getConstantByName('com.sun.star.awt.FontUnderline.SINGLE')
+            run_cursor.CharUnderline = uno.getConstantByName(
+                'com.sun.star.awt.FontUnderline.SINGLE' if options.get('underline') else 'com.sun.star.awt.FontUnderline.NONE')
         return shape
 
     def add_bullets(self, element_id, items, slot=None, box=None, level=0, style=None):
@@ -2392,7 +2805,19 @@ class PresentationSlide:
         )
 
     def animate(self, shape, effect='fade', speed='medium'):
-        target = shape if isinstance(shape, PresentationShape) else self.select_shape('animation-target', **dict(shape))
+        if isinstance(shape, PresentationShape):
+            target = shape
+        elif isinstance(shape, dict) and shape and set(shape) <= {'index', 'name', 'text'}:
+            target = self.select_shape('animation-target', **shape)
+        else:
+            raise ValueError(
+                'PRESENTATION_ANIMATION_TARGET_INVALID: slide.animate exists, but shape must be the '
+                'PresentationShape returned by slide.add_shape()/select_shape(), or an index/name/text '
+                'selector dictionary. A bare elementId string is not a shape. Keep the returned shape '
+                'in a variable and pass it to animate; do not remove animation as unsupported.'
+            )
+        if target.slide is not self:
+            raise ValueError('PRESENTATION_ANIMATION_TARGET_INVALID: the animation target belongs to another slide.')
         return self.deck.set_animation(target, effect=effect, speed=speed)
 
     def apply_master(self, index=None, name=None):
@@ -2540,14 +2965,11 @@ class PresentationLayout(OfficeUnitConversion):
                            rotation=None, line_spacing=None, **_unused):
         cursor = shape.Text.createTextCursor()
         cursor.gotoEnd(True)
-        if font_size is not None:
-            cursor.CharHeight = float(font_size)
+        apply_text_font(cursor, font_name=font_name, font_size=font_size, bold=bold, italic=italic)
+        if not font_name and not str(cursor.CharFontNameAsian or '').strip():
+            cursor.CharFontNameAsian = _CJK_FONT
         if color is not None:
             cursor.CharColor = office_color(color, 'text color')
-        if bold is not None:
-            cursor.CharWeight = 150.0 if bool(bold) else 100.0
-        if italic is not None:
-            cursor.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE')
         if underline is not None:
             cursor.CharUnderline = uno.getConstantByName(
                 'com.sun.star.awt.FontUnderline.SINGLE' if underline else 'com.sun.star.awt.FontUnderline.NONE'
@@ -2558,8 +2980,6 @@ class PresentationLayout(OfficeUnitConversion):
             )
         if align is not None:
             cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', str(align).upper())
-        if font_name:
-            cursor.CharFontName = str(font_name)
         if line_spacing is not None:
             spacing = uno.createUnoStruct('com.sun.star.style.LineSpacing')
             spacing.Mode, spacing.Height = 0, max(100, int(float(line_spacing) * 100))
@@ -2888,6 +3308,16 @@ class PresentationLayout(OfficeUnitConversion):
         if resolved < 0 or resolved >= len(self._logical_pages):
             raise ValueError(f'Presentation slide index {index!r} is outside 1-{len(self._logical_pages)}.')
         page = self._logical_pages.pop(resolved)
+        page_name = str(getattr(page, 'Name', '') or '')
+        page_record = next((
+            record for record in self.job.element_records.values()
+            if record.get('kind') == 'slide' and record.get('artifactName') == page_name
+        ), None)
+        if page_record:
+            page_element_id = str(page_record.get('elementId') or '')
+            for registered_id in list(self.job.element_records):
+                if registered_id == page_element_id or registered_id.startswith(page_element_id + '/'):
+                    self.job.element_records.pop(registered_id, None)
         self._component.DrawPages.remove(page)
         return self
 
@@ -3011,7 +3441,9 @@ class PresentationLayout(OfficeUnitConversion):
                     'message': (
                         f'Presentation content {element_id!r} overlaps existing {existing.get("elementId")!r} '
                         f'by {ratio:.0%} of the smaller box. Use another layout slot/box, shorten the text, '
-                        'or set allow_overlap=True only for an intentional overlay.'
+                        'and allocate separate space for independently readable content. '
+                        'Do not add allow_overlap or fade an image merely to bypass this error; '
+                        'intentional layering must be justified by the design brief and inspected visually.'
                     ),
                 }
                 self.job.layout_issues.append(issue)
@@ -3073,6 +3505,11 @@ class PresentationLayout(OfficeUnitConversion):
         shape.String = str(text)
         cursor = shape.Text.createTextCursor()
         cursor.gotoEnd(True)
+        # A new Impress text shape can still inherit a Latin-only Asian font
+        # despite document style defaults. Set the new text's CJK family
+        # explicitly; do not rewrite fonts on imported/selected shapes.
+        if not font_name:
+            cursor.CharFontNameAsian = _CJK_FONT
         self._format_text_shape(
             shape, font_size=font_size, color=color, bold=bold, italic=italic,
             underline=underline, strike=strike, align=align, font_name=font_name,
@@ -3086,9 +3523,10 @@ class PresentationLayout(OfficeUnitConversion):
                 f'for elementId={element_id!r}.'
             )
         estimated_lines = presentation_text_line_count(text, requested_width, requested_font_size, inset)
-        estimated_height = presentation_text_height(requested_font_size, estimated_lines, inset)
+        effective_line_spacing = 1.15 if line_spacing is None else float(line_spacing)
+        estimated_height = presentation_text_height(requested_font_size, estimated_lines, inset, effective_line_spacing)
         minimum_lines = presentation_text_line_count(text, requested_width, minimum_font_size, inset)
-        minimum_height = presentation_text_height(minimum_font_size, minimum_lines, inset)
+        minimum_height = presentation_text_height(minimum_font_size, minimum_lines, inset, effective_line_spacing)
         shape.Position, shape.Size = point(int(x), int(y)), size(requested_width, requested_height)
         shape.TextAutoGrowHeight = True
         libreoffice_height = max(requested_height, int(getattr(shape.Size, 'Height', requested_height)))
@@ -3107,6 +3545,7 @@ class PresentationLayout(OfficeUnitConversion):
             unreadable = fit_mode == 'none' or fitted_font_size + tolerance < minimum_font_size
             if unreadable:
                 record = self.job.element_records.get(str(element_id), {})
+                suggested_height = max(estimated_height, libreoffice_height)
                 self.job.layout_issues.append({
                     'code': 'PRESENTATION_TEXT_OVERFLOW', 'severity': 'error', 'elementId': str(element_id),
                     'line': record.get('line'), 'column': record.get('column'),
@@ -3114,11 +3553,15 @@ class PresentationLayout(OfficeUnitConversion):
                     'message': (
                         f'Text requires an estimated {fitted_font_size:.2f}pt font to fit '
                         f'{requested_width}x{requested_height} (1/100 mm), '
-                        f'below min_font_size={minimum_font_size:g}; requestedFontSize={requested_font_size:g}, '
+                        f'fit={fit_mode}, min_font_size={minimum_font_size:g}; requestedFontSize={requested_font_size:g}, '
                         f'estimatedLines={estimated_lines}, estimatedHeight={estimated_height}, '
                         f'minimumHeight={minimum_height}, libreOfficeHeight={libreoffice_height}, '
-                        f'effectiveMeasuredHeight={measured_height}. Increase the box, use deck.text_height(), '
-                        'shorten the copy, or split the layout.'
+                        f'effectiveMeasuredHeight={measured_height}, lineSpacing={effective_line_spacing:g}. '
+                        f'At the current width and requested font, try a height of at least '
+                        f'{math.ceil(suggested_height / 2540 * 100) / 100:.2f} inches '
+                        f'({math.ceil(suggested_height / 100 * 10) / 10:.1f} mm). '
+                        'Reallocate the surrounding layout too; do not expand into adjacent content. '
+                        'Alternatively shorten the copy or split the layout; preserve the readable font size.'
                     ),
                 })
             if fit_mode == 'shrink':
@@ -3679,11 +4122,8 @@ class PresentationLayout(OfficeUnitConversion):
                     pass
                 cursor = cell.createTextCursor()
                 cursor.gotoEnd(True)
-                cursor.CharHeight = float(font_size)
-                cursor.CharWeight = 150.0 if is_header else 100.0
+                apply_text_font(cursor, font_name=font_name or _CJK_FONT, font_size=font_size, bold=is_header)
                 cursor.CharColor = office_color(header_color if is_header else body_color, 'table text color')
-                if font_name:
-                    cursor.CharFontName = str(font_name)
                 alignment = 'CENTER' if is_header or column_index > 0 else str(first_column_align).upper()
                 cursor.ParaAdjust = uno.Enum('com.sun.star.style.ParagraphAdjust', alignment)
                 try:
@@ -3749,6 +4189,78 @@ class PresentationLayout(OfficeUnitConversion):
             raise ValueError('Presentation chart requires at least one data series.')
         return labels, names, rows
 
+    @staticmethod
+    def _chart_role_data(diagram_service, categories, values=None, series=None, series_name='Values'):
+        """Validate data roles before creating UNO objects; never infer X from labels."""
+        family = diagram_service.rsplit('.', 1)[-1]
+        if family not in ('XYDiagram', 'BubbleDiagram', 'StockDiagram'):
+            return None
+
+        def numbers(data, role):
+            if not isinstance(data, (list, tuple)) or not data:
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: {family} {role} requires a non-empty numeric list.')
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in data):
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: {family} {role} must contain finite numbers, not nested lists or labels.')
+            return tuple(float(v) for v in data)
+
+        items = series
+        if family == 'XYDiagram' and items is None:
+            items = [{'name': series_name, 'x': categories, 'y': values}]
+        if family == 'StockDiagram' and isinstance(items, (list, tuple)) and len(items) == 4 and all(isinstance(s, dict) and 'values' in s for s in items):
+            # Legacy documented order is Open, High, Low, Close (not four independent series).
+            items = [{'name': series_name, **dict(zip(('open', 'high', 'low', 'close'), (s['values'] for s in items)))}]
+        if not isinstance(items, (list, tuple)) or not items:
+            raise ValueError('CHART_DATA_ROLE_INVALID: use series=[{name, x:[...], y:[...]}] for scatter; add sizes:[...] for bubble; stock uses {name, open, high, low, close}.')
+        groups, rows, names = [], [], []
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: series {index + 1} must be an object with named data roles.')
+            if 'values' in item and any(key in item for key in ('x', 'y', 'sizes', 'open', 'high', 'low', 'close')):
+                raise ValueError('CHART_DATA_ROLE_INVALID: choose named role arrays OR values point tuples, not both.')
+            name = str(item.get('name') or series_name)
+            if family == 'StockDiagram':
+                roles = [('values-first', item.get('open')), ('values-max', item.get('high')),
+                         ('values-min', item.get('low')), ('values-last', item.get('close'))]
+            else:
+                x, y, sizes = item.get('x'), item.get('y'), item.get('sizes')
+                points = item.get('values')
+                if x is None and y is None and isinstance(points, (list, tuple)) and points and isinstance(points[0], (list, tuple)):
+                    width = 3 if family == 'BubbleDiagram' else 2
+                    if any(not isinstance(p, (list, tuple)) or len(p) != width for p in points):
+                        raise ValueError(f'CHART_DATA_ROLE_INVALID: {family} point tuples must each have {width} numbers.')
+                    x, y = [p[0] for p in points], [p[1] for p in points]
+                    if width == 3:
+                        sizes = [p[2] for p in points]
+                elif x is None and y is None and family == 'XYDiagram':
+                    x, y = categories, points
+                roles = [('values-x', x), ('values-y', y)]
+                if family == 'BubbleDiagram':
+                    roles.append(('values-size', sizes))
+            parsed = [(role, numbers(data, f'series {index + 1} {role}')) for role, data in roles]
+            lengths = {len(data) for _, data in parsed}
+            if len(lengths) != 1:
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: series {index + 1} role arrays must have equal lengths; got {sorted(lengths)}.')
+            if family == 'BubbleDiagram' and any(v <= 0 for v in parsed[2][1]):
+                raise ValueError('CHART_DATA_ROLE_INVALID: bubble sizes must be positive; do not drop or flatten the size role.')
+            if family == 'StockDiagram':
+                if not isinstance(categories, (list, tuple)) or len(categories) != len(parsed[0][1]):
+                    raise ValueError('CHART_DATA_ROLE_INVALID: stock categories must match the OHLC sample count.')
+                for point_index, (opening, high, low, close) in enumerate(zip(*(data for _, data in parsed))):
+                    if not low <= min(opening, close) <= max(opening, close) <= high:
+                        raise ValueError(f'CHART_DATA_ROLE_INVALID: stock sample {point_index + 1} must satisfy low <= open/close <= high.')
+            group = []
+            for role, data in parsed:
+                group.append((role, len(rows)))
+                rows.append(data)
+                label_role = 'values-size' if family == 'BubbleDiagram' else 'values-last' if family == 'StockDiagram' else 'values-y'
+                names.append(name if role == label_role else f'{name} {role}')
+            groups.append(group)
+        count = max(map(len, rows))
+        # Internal chart tables are rectangular. Missing samples remain NaN, never invented zeroes.
+        rows = [row + (float('nan'),) * (count - len(row)) for row in rows]
+        labels = [str(v) for v in categories] if family == 'StockDiagram' else [''] * count
+        return labels, names, rows, groups
+
     def _add_native_chart(self, element_id, page, box, diagram_service, categories, values=None,
                           series=None, colors=None, font_size=12, show_legend=False,
                           series_name='Values', color_points=False, title=None,
@@ -3757,7 +4269,8 @@ class PresentationLayout(OfficeUnitConversion):
                           background=None, legend_position='right'):
         """Insert one native editable Impress chart with its own embedded data table."""
         area = self._rect(box)
-        labels, series_names, rows = self._chart_series(
+        role_data = self._chart_role_data(diagram_service, categories, values, series, series_name)
+        labels, series_names, rows = role_data[:3] if role_data else self._chart_series(
             categories, values=values, series=series, series_name=series_name,
         )
         page_bounds = self.bounds()
@@ -3808,6 +4321,7 @@ class PresentationLayout(OfficeUnitConversion):
         page_index = int((page_record or {}).get('locator', {}).get('slide') or 1)
         record = self.job.register_element(element_id, 'chart', chart, {'slide': page_index, 'shape': int(page.getCount())})
         record['layout'] = {**area, 'role': 'content', 'allowOverlap': False}
+        record['chartTitle'] = str(title or '').strip()
 
         chart_document = chart.Model
         if chart_document is None:
@@ -3838,6 +4352,28 @@ class PresentationLayout(OfficeUnitConversion):
         except Exception:
             pass
         chart_document.HasLegend = bool(show_legend)
+        if role_data:
+            provider = chart_document.getDataProvider()
+            chart_type = chart_document.getFirstDiagram().getCoordinateSystems()[0].getChartTypes()[0]
+            native_series = []
+            for group in role_data[3]:
+                data_series = self.job.context.ServiceManager.createInstanceWithContext('com.sun.star.chart2.DataSeries', self.job.context)
+                sequences = []
+                for role, row_index in group:
+                    sequence = provider.createDataSequenceByRangeRepresentation(str(row_index))
+                    sequence.Role = role
+                    labeled = self.job.context.ServiceManager.createInstanceWithContext('com.sun.star.chart2.data.LabeledDataSequence', self.job.context)
+                    labeled.setValues(sequence)
+                    if role == chart_type.getRoleOfSequenceForSeriesLabel():
+                        labeled.setLabel(provider.createDataSequenceByRangeRepresentation(f'label {row_index}'))
+                    sequences.append(labeled)
+                data_series.setData(tuple(sequences))
+                native_series.append(data_series)
+            chart_type.setDataSeries(tuple(native_series))
+            if diagram_service.endswith('StockDiagram'):
+                chart_type.Japanese = True
+                chart_type.ShowFirst = True
+                chart_type.ShowHighLow = True
         chart_document.HasMainTitle = bool(str(title or '').strip())
         chart_document.HasSubTitle = False
         if chart_document.HasMainTitle:
@@ -3896,7 +4432,7 @@ class PresentationLayout(OfficeUnitConversion):
                 pass
             style_chart_surface(chart_document.Legend)
             try:
-                chart_document.Legend.CharHeight = float(max(8, min(14, font_size)))
+                apply_text_font(chart_document.Legend, font_name=_CJK_FONT, font_size=max(8, min(14, font_size)))
             except Exception:
                 pass
         try:
@@ -3922,7 +4458,7 @@ class PresentationLayout(OfficeUnitConversion):
         for axis_getter in ('getXAxis', 'getYAxis'):
             try:
                 axis = getattr(diagram, axis_getter)()
-                axis.CharHeight = float(font_size)
+                apply_text_font(axis, font_name=_CJK_FONT, font_size=font_size)
             except Exception:
                 pass
         for property_name, text_size in (
@@ -3930,13 +4466,16 @@ class PresentationLayout(OfficeUnitConversion):
             ('XAxisTitle', max(9, float(font_size))),
             ('YAxisTitle', max(9, float(font_size))),
         ):
+            # Chart1 title getters can CREATE a title even after HasMainTitle=False.
+            if not {'Title': title, 'XAxisTitle': x_axis_title, 'YAxisTitle': y_axis_title}[property_name]:
+                continue
             try:
                 text_target = getattr(chart_document, property_name)
                 if text_target is not None:
-                    text_target.CharHeight = float(text_size)
+                    apply_text_font(text_target, font_name=_CJK_FONT, font_size=text_size)
             except Exception:
                 pass
-        series_palette = self._chart_palette(len(rows), colors)
+        series_palette = self._chart_palette(len(role_data[3]) if role_data else len(rows), colors)
         for row_index, series_color in enumerate(series_palette):
             try:
                 row_properties = diagram.getDataRowProperties(row_index)
@@ -3961,11 +4500,15 @@ class PresentationLayout(OfficeUnitConversion):
 
     def add_chart(self, element_id, page, box, chart_type, categories, values=None, series=None,
                   colors=None, font_size=12, show_legend=None, stacked=False,
-                  percent=False, vertical=None, lines=True, symbols=True, dim3d=False,
+                  percent=False, vertical=None, lines=True, symbols=None, dim3d=False,
                   color_by_point=None, series_name='Values', title=None,
                   x_axis_title=None, y_axis_title=None, show_values=None,
                   show_category_name=None, show_percent=None, background=None,
-                  legend_position='right'):
+                  legend_position='right', alt_text=None,
+                  x_axis_min=None, x_axis_max=None, y_axis_min=None, y_axis_max=None,
+                  x_axis_scale='linear', y_axis_scale='linear', axis_position='outside',
+                  series_transparency=None, line_width=1.5, font_name=None,
+                  font_color=0x334155, grid_color=0xD9DEE2, gridlines=True):
         """Add any chart family natively supported by LibreOffice's UNO chart module."""
         aliases = {
             'area': 'AreaDiagram',
@@ -3984,15 +4527,49 @@ class PresentationLayout(OfficeUnitConversion):
         if service_name is None:
             supported = ', '.join(sorted(aliases))
             raise ValueError(f'Unsupported native presentation chart type {chart_type!r}. Supported types: {supported}.')
+        if symbols is None:
+            symbols = normalized in ('line', 'xy', 'scatter')
+        if series_transparency is None:
+            series_transparency = 45 if service_name == 'FilledNetDiagram' else 0
+        if (isinstance(series_transparency, bool) or not isinstance(series_transparency, (int, float))
+                or not math.isfinite(series_transparency) or not 0 <= series_transparency <= 100):
+            raise ValueError('CHART_STYLE_INVALID: series_transparency must be 0..100 (0=opaque).')
+        if not isinstance(line_width, (int, float)) or isinstance(line_width, bool) or not math.isfinite(line_width) or line_width < 0:
+            raise ValueError('CHART_STYLE_INVALID: line_width must be a non-negative number in points.')
+        if axis_position not in ('outside', 'zero'):
+            raise ValueError("CHART_STYLE_INVALID: axis_position must be 'outside' or 'zero'.")
+        for axis_name, scale in (('x', x_axis_scale), ('y', y_axis_scale)):
+            if scale not in ('linear', 'log10'):
+                raise ValueError(f"CHART_STYLE_INVALID: {axis_name}_axis_scale must be 'linear' or 'log10'.")
+            if scale == 'log10' and service_name not in ('XYDiagram', 'BubbleDiagram'):
+                raise ValueError('CHART_STYLE_INVALID: log10 scales currently require scatter or bubble numeric axes.')
+            if scale == 'log10':
+                data = self._chart_role_data(f'com.sun.star.chart.{service_name}', categories, values, series, series_name)
+                role = 'values-x' if axis_name == 'x' else 'values-y'
+                numbers = [v for group in data[3] for key, row in group if key == role for v in data[2][row] if math.isfinite(v)]
+                if any(v <= 0 for v in numbers):
+                    raise ValueError(f'CHART_DATA_ROLE_INVALID: {axis_name} log10 axis requires strictly positive data; use linear, do not alter the data.')
+        for axis_name, minimum, maximum in (('x', x_axis_min, x_axis_max), ('y', y_axis_min, y_axis_max)):
+            for value in (minimum, maximum):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)):
+                    raise ValueError(f'CHART_DATA_ROLE_INVALID: {axis_name}_axis_min/max must be finite numbers.')
+            if minimum is not None and maximum is not None and minimum >= maximum:
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: {axis_name}_axis_min must be less than {axis_name}_axis_max.')
+            scale = x_axis_scale if axis_name == 'x' else y_axis_scale
+            if scale == 'log10' and any(value is not None and value <= 0 for value in (minimum, maximum)):
+                raise ValueError(f'CHART_DATA_ROLE_INVALID: {axis_name} log10 bounds must be positive.')
         if show_legend is None:
             show_legend = series is not None or normalized in ('pie', 'donut', 'doughnut')
         color_points = normalized in ('pie', 'donut', 'doughnut') if color_by_point is None else bool(color_by_point)
         if show_percent is None:
-            show_percent = bool(percent) or normalized in ('pie', 'donut', 'doughnut')
+            show_percent = bool(percent) or (normalized in ('pie', 'donut', 'doughnut') and bool(show_legend) and not (show_values or show_category_name))
         if show_values is None:
-            show_values = normalized not in ('bubble', 'scatter', 'xy', 'stock', 'pie', 'donut', 'doughnut')
+            # Dense families need an explicit opt-in; one value label per mark
+            # is not a safe default for multiple lines, areas or radar polygons.
+            point_count = len(categories or [])
+            show_values = normalized in ('bar', 'column') and point_count <= 8 and len(series or [None]) == 1
         if show_category_name is None:
-            show_category_name = normalized in ('pie', 'donut', 'doughnut') and not bool(show_legend)
+            show_category_name = normalized in ('pie', 'donut', 'doughnut') and not bool(show_legend) and not (show_values or show_percent)
         if normalized in ('pie', 'donut', 'doughnut'):
             crowded_labels = sum(bool(value) for value in (show_values, show_category_name, show_percent))
             if crowded_labels > 1:
@@ -4013,6 +4590,13 @@ class PresentationLayout(OfficeUnitConversion):
             show_percent=bool(show_percent), background=background,
             legend_position=legend_position,
         )
+        try:
+            if title:
+                chart['shape'].Title = str(title)
+            if alt_text:
+                chart['shape'].Description = str(alt_text)
+        except Exception:
+            pass
         diagram = chart['diagram']
         for property_name, property_value in (
             ('Stacked', bool(stacked)), ('Percent', bool(percent)), ('Dim3D', bool(dim3d)),
@@ -4036,6 +4620,109 @@ class PresentationLayout(OfficeUnitConversion):
                 )
             except Exception:
                 pass
+        # Chart1 scatter row styling addresses underlying X/Y rows rather than
+        # plotted series. Apply the final palette through Chart2 after its
+        # line/symbol template changes, so the supplied colors cannot shift.
+        if service_name in ('XYDiagram', 'BubbleDiagram'):
+            data_series = chart['document'].getFirstDiagram().getCoordinateSystems()[0].getChartTypes()[0].getDataSeries()
+            for item, color in zip(data_series, self._chart_palette(len(data_series), colors)):
+                item.Color = color
+                item.BorderColor = color
+                if service_name == 'XYDiagram':
+                    symbol = item.Symbol
+                    symbol.FillColor = color
+                    symbol.BorderColor = color
+                    item.Symbol = symbol
+        horizontal = service_name == 'BarDiagram' and bool(normalized == 'bar' if vertical is None else vertical)
+        # Public x/y titles and bounds refer to physical screen axes. UNO's
+        # logical X axis remains categorical when a bar chart is rotated.
+        if horizontal:
+            for enabled, prop, value in (('HasXAxisTitle', 'XAxisTitle', y_axis_title), ('HasYAxisTitle', 'YAxisTitle', x_axis_title)):
+                setattr(diagram, enabled, bool(value))
+                if value:
+                    getattr(diagram, prop).String = str(value)
+        for getter, minimum, maximum in ((('getYAxis' if horizontal else 'getXAxis'), x_axis_min, x_axis_max),
+                                          (('getXAxis' if horizontal else 'getYAxis'), y_axis_min, y_axis_max)):
+            if minimum is None and maximum is None:
+                continue
+            if service_name in ('PieDiagram', 'DonutDiagram'):
+                raise ValueError('CHART_DATA_ROLE_INVALID: pie/donut charts have no numeric axes.')
+            axis = getattr(diagram, getter)()
+            if minimum is not None:
+                axis.AutoMin = False
+                axis.Min = float(minimum)
+            if maximum is not None:
+                axis.AutoMax = False
+                axis.Max = float(maximum)
+        coordinate = chart['document'].getFirstDiagram().getCoordinateSystems()[0]
+        for index, scale in enumerate((x_axis_scale, y_axis_scale)):
+            if service_name in ('PieDiagram', 'DonutDiagram'):
+                break
+            axis = coordinate.getAxisByDimension(1 - index if horizontal else index, 0)
+            if scale == 'log10':
+                spec = axis.getScaleData()
+                spec.Scaling = self.job.context.ServiceManager.createInstanceWithContext('com.sun.star.chart2.LogarithmicScaling', self.job.context)
+                axis.setScaleData(spec)
+            if service_name not in ('NetDiagram', 'FilledNetDiagram'):
+                axis.CrossoverPosition = uno.Enum('com.sun.star.chart.ChartAxisPosition', 'START' if axis_position == 'outside' else 'ZERO')
+                axis.LabelPosition = uno.Enum('com.sun.star.chart.ChartAxisLabelPosition', 'OUTSIDE_START' if axis_position == 'outside' else 'NEAR_AXIS')
+            apply_text_font(axis, font_name=font_name or _CJK_FONT, font_size=font_size)
+            axis.CharColor = office_color(font_color)
+            axis.LineColor = office_color(grid_color)
+            grid = axis.getGridProperties()
+            grid.LineColor = office_color(grid_color)
+            grid.LineWidth = 15
+            grid.Show = bool(gridlines and index == 1)
+        # Apply labels and marks after ALL Chart1 template operations. They can
+        # otherwise be reset, or retain a default font/marker after export.
+        for native_type in coordinate.getChartTypes():
+            final_series = native_type.getDataSeries()
+            final_palette = self._chart_palette(len(final_series), colors)
+            for series_index, item in enumerate(final_series):
+                label = uno.createUnoStruct('com.sun.star.chart2.DataPointLabel')
+                label.ShowNumber = bool(show_values)
+                label.ShowNumberInPercent = bool(show_percent)
+                label.ShowCategoryName = bool(show_category_name)
+                label.ShowLegendSymbol = False
+                item.Label = label
+                apply_text_font(item, font_name=font_name or _CJK_FONT, font_size=font_size)
+                item.CharColor = office_color(font_color)
+                item.Transparency = int(series_transparency)
+                item.LineWidth = int(round(float(line_width) * POINT_TO_100TH_MM))
+                if service_name in ('LineDiagram', 'XYDiagram', 'NetDiagram', 'FilledNetDiagram', 'StockDiagram'):
+                    symbol = item.Symbol
+                    enabled = bool(symbols and service_name != 'StockDiagram')
+                    symbol.Style = uno.Enum('com.sun.star.chart2.SymbolStyle', 'STANDARD' if enabled else 'NONE')
+                    if enabled:
+                        # AUTO lets the exporter replace the authored color. Explicit
+                        # native symbols preserve both palette and series distinction.
+                        symbol.StandardSymbol = series_index % 8
+                        symbol.FillColor = office_color(final_palette[series_index])
+                        symbol.BorderColor = office_color(final_palette[series_index])
+                        symbol.Size = size(300, 300)
+                    item.Symbol = symbol
+        # Chart1's HasMainTitle setter can recreate a default "main-title", even
+        # when assigned True again. Enable it before restoring text/style and
+        # never toggle it after formatting. Template operations above may reset it.
+        chart['document'].HasMainTitle = bool(str(title or '').strip())
+        if str(title or '').strip():
+            chart['document'].Title.String = str(title)
+        targets = []
+        if show_legend:
+            targets.append(chart['document'].Legend)
+        if title:
+            targets.append(chart['document'].Title)
+        if x_axis_title:
+            targets.append(diagram.YAxisTitle if horizontal else diagram.XAxisTitle)
+        if y_axis_title:
+            targets.append(diagram.XAxisTitle if horizontal else diagram.YAxisTitle)
+        for target in targets:
+            if target is not None:
+                apply_text_font(target, font_name=font_name or _CJK_FONT, font_size=font_size)
+                target.CharColor = office_color(font_color)
+        self.job.ooxml_patches.setdefault('nativeChartStyle', {})[str(chart['shape'].Name)] = {
+            'kind': normalized, 'showValues': bool(show_values),
+        }
         chart['chartType'] = normalized
         return chart
 
@@ -4187,12 +4874,39 @@ class PresentationLayout(OfficeUnitConversion):
         row_gap = min(self.mm(5), max(0, area['height'] // max(8, row_count * 8)))
         bands = self.stack(row_count, box=area, gap=row_gap)
         point_size = self.mm(3.2)
+        planned_rows = []
+        required_band_height = 0
+        overflowing_events = []
         for row_index, band in enumerate(bands):
             start = row_index * per_row
             row_items = items[start:start + per_row]
             row_palette = palette[start:start + len(row_items)]
             track_gap = min(self.mm(2), max(0, band['width'] // max(8, len(row_items) * 8)))
             tracks = self.grid(len(row_items), 1, box=band, gap=track_gap)
+            measurements = []
+            for local_index, ((title, body), track) in enumerate(zip(row_items, tracks)):
+                title_height = self.estimate_text_box(title, track['width'], title_size, 0, title_size)['height']
+                body_height = self.estimate_text_box(body, track['width'], body_size, 0, body_size)['height'] if body else 0
+                needed = title_height + body_height + (self.mm(1) if body else 0)
+                required_band_height = max(required_band_height, 2 * (needed + self.mm(4)))
+                if band['height'] // 2 - self.mm(4) < needed:
+                    overflowing_events.append(start + local_index + 1)
+                measurements.append((title_height, body_height))
+            planned_rows.append((band, row_items, row_palette, tracks, measurements))
+        if overflowing_events:
+            # Preflight every event before adding shapes. Use the maximum possible
+            # inter-row gap so the suggestion remains safe after height increases.
+            minimum_height = required_band_height * row_count + self.mm(5) * (row_count - 1) + row_count
+            raise ValueError(
+                f'Presentation timeline {element_id!r} has insufficient height for events {overflowing_events}. '
+                f'At the current width, font sizes and {per_row} items per row, reserve height >= '
+                f'{math.ceil(minimum_height / 25.4) / 100:.2f} in ({math.ceil(minimum_height / 10) / 10:.1f} mm); '
+                f'current height={area["height"] / 2540:.2f} in. This bound accounts for all events. '
+                'Allocate that space without overlapping neighboring content, or shorten event text. '
+                'Changing items per row changes both track width and row count; do not assume it reduces total height.'
+            )
+        for row_index, (band, row_items, row_palette, tracks, measurements) in enumerate(planned_rows):
+            start = row_index * per_row
             axis_y = band['y'] + band['height'] // 2
             self.add_connector(
                 f'{element_id}/row-{row_index + 1}/axis', page, band['x'], axis_y,
@@ -4215,19 +4929,8 @@ class PresentationLayout(OfficeUnitConversion):
                     'width': track['width'],
                     'height': band['height'] // 2 - self.mm(4),
                 }
-                title_height = self.estimate_text_box(
-                    title, track['width'], title_size, 0, title_size
-                )['height']
-                body_height = self.estimate_text_box(
-                    body, track['width'], body_size, 0, body_size
-                )['height'] if body else 0
+                title_height, body_height = measurements[local_index]
                 text_gap = self.mm(1) if body else 0
-                if event_box['height'] < title_height + body_height + text_gap:
-                    raise ValueError(
-                        f'Presentation timeline {element_id!r} needs a taller box for event {index + 1} '
-                        f'({title!r}). Increase its height, shorten the event text, or lower '
-                        'max_items_per_row so each track is wider.'
-                    )
                 text_rows = self.stack(
                     2 if body else 1,
                     box=event_box,
@@ -4384,7 +5087,12 @@ class PresentationLayout(OfficeUnitConversion):
                 continue
             matches.append(master)
         if len(matches) != 1:
-            raise ValueError(f'Presentation master selector matched {len(matches)} masters; provide exact index or name.')
+            raise ValueError(
+                f'PRESENTATION_MASTER_SELECTOR_INVALID: selector matched {len(matches)} masters. '
+                f'Master indices are ONE-based (1..{self._component.MasterPages.Count}); '
+                f'available masters: {self.masters()!r}. Copy an exact index/name from deck.masters(); '
+                'zero matches does not mean master support is unavailable.'
+            )
         slide._page.MasterPage = matches[0]
         self.job.record_feature('masterLayoutAssignment')
         return slide
@@ -4396,7 +5104,11 @@ class PresentationLayout(OfficeUnitConversion):
             for position, slide_index in enumerate(slide_indices):
                 resolved = int(slide_index) - 1
                 if resolved < 0 or resolved >= self._component.DrawPages.Count:
-                    raise ValueError(f'Custom show slide index {slide_index!r} is outside the deck.')
+                    raise ValueError(
+                        f'PRESENTATION_CUSTOM_SHOW_INDEX_INVALID: slide index {slide_index!r} is outside '
+                        f'1..{self._component.DrawPages.Count}. Custom show indices are ONE-based; '
+                        'use [1] for the first slide. Correct the indices instead of removing the custom show.'
+                    )
                 show.insertByIndex(position, self._component.DrawPages.getByIndex(resolved))
             if shows.hasByName(str(name)):
                 shows.replaceByName(str(name), show)
@@ -4576,14 +5288,21 @@ class SpreadsheetSheet:
     def named_range(self, element_id, name, cell_range):
         return self.workbook.add_named_range(self._id(element_id), self._sheet, name, cell_range)
 
-    def add_chart(self, element_id, cell_range, box, chart_type='column', title=None, legend=True):
+    def add_chart(self, element_id, cell_range, box, chart_type='column', title=None, legend=True,
+                  alt_text=None, anchor=None, reserve_space=False):
         return self.workbook.add_chart(
             self._id(element_id), self._sheet, cell_range, box,
             chart_type=chart_type, title=title, legend=legend,
+            alt_text=alt_text, anchor=anchor, reserve_space=reserve_space,
         )
 
-    def add_image(self, element_id, asset_name, box):
-        return self.workbook.add_image(self._id(element_id), self._sheet, asset_name, box)
+    def add_image(self, element_id, asset_name, box, contain=False, padding=0,
+                  alt_text=None, title=None, anchor=None, reserve_space=False):
+        return self.workbook.add_image(
+            self._id(element_id), self._sheet, asset_name, box,
+            contain=contain, padding=padding, alt_text=alt_text, title=title,
+            anchor=anchor, reserve_space=reserve_space,
+        )
 
     def print_setup(self, element_id, **options):
         return self.workbook.set_print_setup(self._id(element_id), self._sheet, **options)
@@ -4630,6 +5349,16 @@ class SpreadsheetLayout(OfficeUnitConversion):
     def __init__(self, job, component):
         self.job, self._component = job, component
 
+    def set_doc_info(self, title=None, subject=None, author=None, description=None, keywords=None):
+        properties = self._component.DocumentProperties
+        for name, value in (('Title', title), ('Subject', subject), ('Author', author), ('Description', description)):
+            if value is not None:
+                setattr(properties, name, str(value))
+        if keywords is not None:
+            properties.Keywords = tuple(str(value) for value in keywords)
+        self.job.record_feature('documentProperties')
+        return self
+
     @staticmethod
     def _column_name(index):
         value = int(index) + 1
@@ -4652,6 +5381,28 @@ class SpreadsheetLayout(OfficeUnitConversion):
         for character in value:
             index = index * 26 + ord(character) - 64
         return index - 1
+
+    @staticmethod
+    def _drawing_area(sheet, box, anchor=None, reserve_space=False):
+        area = PresentationLayout._rect(box, default_unit='hmm')
+        if not anchor:
+            return area
+        cell = sheet.getCellRangeByName(str(anchor))
+        try:
+            position = cell.Position
+            area = {
+                **area,
+                'x': int(position.X) + area['x'],
+                'y': int(position.Y) + area['y'],
+            }
+        except Exception as error:
+            raise ValueError(f'Cannot anchor drawing to worksheet cell {anchor!r}.') from error
+        if reserve_space:
+            row_index = int(cell.RangeAddress.StartRow)
+            target = sheet.Rows.getByIndex(row_index)
+            relative_y = area['y'] - int(position.Y)
+            target.Height = max(int(target.Height), relative_y + area['height'] + 300)
+        return area
 
     def add_worksheet(self, element_id, name):
         sheets = self._component.Sheets
@@ -4718,7 +5469,7 @@ class SpreadsheetLayout(OfficeUnitConversion):
             cell.Formula = value
         else:
             cell.String = '' if value is None else str(value)
-        record = self.job.register_element(element_id, 'cell', cell, {'sheet': str(sheet.Name), 'row': int(row) + 1, 'column': int(column) + 1})
+        record = self.job.register_element(element_id, 'cell', cell, {'sheet': str(sheet.Name), 'row': int(row) + 1, 'column': int(column) + 1}, update_existing=True)
         try:
             self._component.NamedRanges.addNewByName(record['artifactName'], cell.AbsoluteName, cell.CellAddress, 0)
         except Exception:
@@ -4731,7 +5482,7 @@ class SpreadsheetLayout(OfficeUnitConversion):
         record = self.job.register_element(element_id, 'range', None, {
             'sheet': str(sheet.Name), 'startRow': int(start_row) + 1, 'startColumn': int(start_column) + 1,
             'rows': len(rows), 'columns': max(len(values) for values in rows),
-        })
+        }, update_existing=True)
         try:
             end_column = int(start_column) + max(len(values) for values in rows) - 1
             end_row = int(start_row) + len(rows) - 1
@@ -4759,7 +5510,7 @@ class SpreadsheetLayout(OfficeUnitConversion):
         target = sheet.getCellRangeByName(str(cell_range))
         record = self.job.register_element(element_id, 'cell-format', target, {
             'sheet': str(sheet.Name), 'range': str(cell_range),
-        })
+        }, update_existing=True)
         try:
             base = sheet.getCellByPosition(
                 int(target.RangeAddress.StartColumn),
@@ -4770,18 +5521,11 @@ class SpreadsheetLayout(OfficeUnitConversion):
             )
         except Exception:
             pass
-        if font_size is not None:
-            target.CharHeight = float(font_size)
-        if bold is not None:
-            target.CharWeight = 150.0 if bool(bold) else 100.0
-        if italic is not None:
-            target.CharPosture = uno.Enum('com.sun.star.awt.FontSlant', 'ITALIC' if italic else 'NONE')
+        apply_text_font(target, font_name=font_name, font_size=font_size, bold=bold, italic=italic)
         if underline is not None:
             target.CharUnderline = uno.getConstantByName(
                 'com.sun.star.awt.FontUnderline.SINGLE' if underline else 'com.sun.star.awt.FontUnderline.NONE'
             )
-        if font_name is not None:
-            target.CharFontName = str(font_name)
         if color is not None:
             target.CharColor = office_color(color, 'cell text color')
         if background is not None:
@@ -4829,7 +5573,7 @@ class SpreadsheetLayout(OfficeUnitConversion):
         target.Width = int(width)
         self.job.register_element(element_id, 'column-width', target, {
             'sheet': str(sheet.Name), 'column': index + 1, 'width': int(width),
-        })
+        }, update_existing=True)
         return self
 
     def set_row_height(self, element_id, sheet, row, height):
@@ -4840,7 +5584,7 @@ class SpreadsheetLayout(OfficeUnitConversion):
         target.Height = int(height)
         self.job.register_element(element_id, 'row-height', target, {
             'sheet': str(sheet.Name), 'row': index + 1, 'height': int(height),
-        })
+        }, update_existing=True)
         return self
 
     def merge_cells(self, element_id, sheet, cell_range):
@@ -4945,8 +5689,8 @@ class SpreadsheetLayout(OfficeUnitConversion):
             target.CellBackColor = office_color(style['background'], 'conditional format background')
         if 'color' in style:
             target.CharColor = office_color(style['color'], 'conditional format color')
-        if 'bold' in style:
-            target.CharWeight = 150.0 if style['bold'] else 100.0
+        apply_text_font(target, font_name=style.get('font_name'), font_size=style.get('font_size'),
+                        bold=style.get('bold'), italic=style.get('italic'))
         return name
 
     def add_conditional_format(self, element_id, sheet, cell_range, operator, formula, **style):
@@ -5026,8 +5770,9 @@ class SpreadsheetLayout(OfficeUnitConversion):
         self.job.record_feature('namedRange')
         return self
 
-    def add_chart(self, element_id, sheet, cell_range, box, chart_type='column', title=None, legend=True):
-        area = PresentationLayout._rect(box, default_unit='hmm')
+    def add_chart(self, element_id, sheet, cell_range, box, chart_type='column', title=None, legend=True,
+                  alt_text=None, anchor=None, reserve_space=False):
+        area = self._drawing_area(sheet, box, anchor=anchor, reserve_space=reserve_space)
         target = sheet.getCellRangeByName(str(cell_range))
         rectangle = uno.createUnoStruct('com.sun.star.awt.Rectangle')
         rectangle.X, rectangle.Y = area['x'], area['y']
@@ -5068,14 +5813,87 @@ class SpreadsheetLayout(OfficeUnitConversion):
         if title:
             chart.HasMainTitle = True
             chart.Title.String = str(title)
+        # Use a restrained, high-contrast palette instead of LibreOffice's
+        # legacy gray plot wall and saturated default series colors.
+        palette = (0x0B4F8A, 0x2558D8, 0xD97706, 0x0F9F8F, 0x6D5BD0, 0xE25555)
+        try:
+            chart.Area.FillColor = 0xFFFFFF
+        except Exception:
+            pass
+        try:
+            diagram.Wall.FillColor = 0xF8FAFC
+            diagram.Wall.LineColor = 0xD5DEE8
+        except Exception:
+            pass
+        for index, color in enumerate(palette):
+            try:
+                series = diagram.getDataRowProperties(index)
+                series.FillColor = color
+                series.LineColor = color
+            except Exception:
+                pass
+            try:
+                point_style = diagram.getDataPointProperties(index, 0)
+                point_style.FillColor = color
+                point_style.LineColor = color
+            except Exception:
+                pass
+        try:
+            diagram.YAxis.MainGrid.LineColor = 0xD5DEE8
+        except Exception:
+            pass
+        for target in (
+            getattr(chart, 'Title', None), getattr(diagram, 'XAxis', None),
+            getattr(diagram, 'YAxis', None),
+        ):
+            if target is None:
+                continue
+            try:
+                target.CharColor = 0x111827
+                apply_text_font(target, font_name=_CJK_FONT)
+            except Exception:
+                pass
+        try:
+            if title:
+                embedded.Title = str(title)
+            if alt_text:
+                embedded.Description = str(alt_text)
+        except Exception:
+            pass
         self.job.record_feature('nativeChart')
         return self
 
-    def add_image(self, element_id, sheet, asset_name, box):
-        area = PresentationLayout._rect(box, default_unit='hmm')
+    def add_image(self, element_id, sheet, asset_name, box, contain=False, padding=0,
+                  alt_text=None, title=None, anchor=None, reserve_space=False):
+        area = self._drawing_area(sheet, box, anchor=anchor, reserve_space=reserve_space)
+        if contain:
+            inset = max(0, int(padding))
+            available_width = area['width'] - inset * 2
+            available_height = area['height'] - inset * 2
+            if available_width <= 0 or available_height <= 0:
+                raise ValueError(f'Spreadsheet image {element_id!r} padding leaves no usable area.')
+            intrinsic = source_image_dimensions(self.job.asset_path(asset_name))
+            if intrinsic and float(intrinsic[0]) > 0 and float(intrinsic[1]) > 0:
+                scale = min(available_width / float(intrinsic[0]), available_height / float(intrinsic[1]))
+                width = max(1, int(round(float(intrinsic[0]) * scale)))
+                height = max(1, int(round(float(intrinsic[1]) * scale)))
+            else:
+                width, height = available_width, available_height
+            area = {
+                **area,
+                'x': area['x'] + inset + (available_width - width) // 2,
+                'y': area['y'] + inset + (available_height - height) // 2,
+                'width': width,
+                'height': height,
+            }
         shape = self._component.createInstance('com.sun.star.drawing.GraphicObjectShape')
         shape.Position, shape.Size = point(area['x'], area['y']), size(area['width'], area['height'])
         shape.GraphicURL = uno.systemPathToFileUrl(str(self.job.asset_path(asset_name)))
+        try:
+            shape.Description = str(alt_text or '')
+            shape.Title = str(title or '')
+        except Exception:
+            pass
         sheet.DrawPage.add(shape)
         self.job.register_element(element_id, 'image', shape, {'sheet': str(sheet.Name)})
         self.job.record_feature('embeddedImage')
@@ -5602,8 +6420,15 @@ def facade_value_schemas(document_type):
             'chartSeries': {
                 'singleSeries': "values=[12, 18, 27], series_name='Revenue'",
                 'multipleSeries': "series=[{'name': 'Actual', 'values': [12, 18]}, {'name': 'Plan', 'values': [14, 20]}]",
+                'scatter': "categories=[]; series=[{'name':'Samples', 'x':[1,2,4], 'y':[8,13,21]}]. Each series may have its own numeric X values and sample count. Never use category strings as X or flatten pairs.",
+                'bubble': "categories=[]; series=[{'name':'Samples', 'x':[1,2], 'y':[8,13], 'sizes':[4,9]}]. Positive sizes are required. Per-series X/Y/sizes lengths must agree; different series may have different counts.",
+                'stock': "categories=['Day 1','Day 2']; series=[{'name':'Price', 'open':[10,12], 'high':[14,16], 'low':[8,11], 'close':[12,15]}]. Four equal-length roles are required, with low <= open/close <= high. They are not four unrelated lines.",
+                'pointTupleCompatibility': "Scatter also accepts values=[[x,y], ...], bubble values=[[x,y,size], ...]. Do not combine tuple values and named role arrays. Prefer named arrays in new code.",
+                'axisBounds': 'Optional numeric x_axis_min/x_axis_max/y_axis_min/y_axis_max control visible axis bounds; each minimum must be below its maximum. For bubbles near plot edges, expand the axis range and chart box, not x/y/sizes data. Data overlap can be intrinsic; never move samples or change relative sizes to disguise it.',
+                'axisScales': "scatter/bubble accept x_axis_scale='linear'|'log10' and y_axis_scale='linear'|'log10'. Log scales preserve stored data and require all values/bounds positive; explicitly label the scale. axis_position='outside' (default) keeps axes/ticks on plot edges; 'zero' requests internal zero crossing. x/y titles and bounds refer to physical horizontal/vertical axes, including bar.",
+                'appearance': "font_name, font_color, grid_color, gridlines=True, line_width=1.5 (pt), series_transparency=0..100. title=None suppresses the internal title, including for single series. symbols=None enables marks only for line/scatter; stock always suppresses marks. Filled-radar defaults to 45% transparency. Dense line/area/radar/scatter/bubble/stock families default show_values=False. Set True only after budgeting label space. Use shared theme helpers rather than repeated per-point styling.",
                 'chartTypes': ['area', 'bar', 'column', 'bubble', 'donut', 'doughnut', 'filled-radar', 'line', 'pie', 'radar', 'scatter', 'stock'],
-                'labelRule': 'Always supply semantic category strings, non-placeholder series names, a title, axis titles for Cartesian charts, and visible legend/data labels appropriate to the chart.',
+                'labelRule': 'Category charts require semantic categories; scatter/bubble use numeric X and may pass categories=[]. Supply meaningful series names, axis units and appropriate labels. Pie/donut: legend + percent-only OR category-only without legend, never multiple label modes.',
             },
             'timelineEvent': {
                 'accepted': ["{'title': '1990', 'body': 'Milestone'}", "('1990', 'Milestone')"],
@@ -5730,13 +6555,16 @@ slide.connect('connector-shape', 'source-node', 'target-node',
 # EllipseShape, CustomShape, CaptionShape, MeasureShape, LineShape, TextShape,
 # GraphicObject, and ConnectorShape.""",
             'nativeTableAndEdit': """table = slide.add_table('metrics', [
-    ['Metric', 'Actual', 'Plan'], ['Revenue', '190', '180'], ['Margin', '31%', '29%'],
+    ['Metric', 'Actual', 'Plan'], ['Revenue', '190', '180'], ['Margin', '31%', '29%'], ['', '', ''],
 ], box=(0.8, 1.6, 6.0, 3.2), column_weights=[2, 1, 1], header=True,
     header_fill='#0F172A', header_color='#FFFFFF', body_fill='#F8FAFC',
     alternate_fill='#FFFFFF', body_color='#1E293B', font_size=14,
     font_name='Calibri', first_column_align='LEFT')
 table.set_cell(1, 1, '195', bold=True, color='#166534')
+# set_cell uses zero-based (column, row). Merge uses existing A1 addresses;
+# reserve an empty notes row so merging does not combine business data.
 table.merge('A4', 'C4')
+table.set_cell(0, 3, 'Illustrative data', font_size=11)
 # Use header=False when the first row is ordinary body data. col_widths is a
 # compatibility alias for column_weights; never pass both names together.
 plain = slide.add_table('plain-data', [['A', '1'], ['B', '2']],
@@ -5751,9 +6579,23 @@ plain = slide.add_table('plain-data', [['A', '1'], ['B', '2']],
             'nativePieChart': """slide.add_chart(
     'mix-chart', 'donut', ['Hardware', 'Software', 'Services'],
     box=(0.8, 1.5, 5.4, 4.8), values=[42, 36, 22], series_name='Revenue mix',
-    title='Revenue mix', show_legend=True, show_values=True,
-    show_category_name=True, show_percent=True,
+    title='Revenue mix', show_legend=True, show_values=False,
+    show_category_name=False, show_percent=True,
     colors=['#2563EB', '#10B981', '#F59E0B'])""",
+            'nativeRoleCharts': """scatter_slide = deck.slide('scatter-example', layout='blank')
+scatter_slide.add_chart('samples', 'scatter', [], box=(0.8,1.5,11.7,4.8),
+    series=[{'name':'Samples', 'x':[1,2,4], 'y':[8,13,21]}],
+    title='Latency vs compute', x_axis_title='Compute', y_axis_title='Latency (ms)', lines=False)
+# X, Y and size are separate numeric roles, NOT three independent series.
+bubble_slide = deck.slide('bubble-example', layout='blank')
+bubble_slide.add_chart('cost', 'bubble', [], box=(0.8,1.5,11.7,4.8),
+    series=[{'name':'Models', 'x':[1,2], 'y':[8,13], 'sizes':[4,9]}],
+    title='Cost vs compute', x_axis_title='Compute', y_axis_title='Cost')
+# One candle series, ordered Open / High / Low / Close.
+stock_slide = deck.slide('stock-example', layout='blank')
+stock_slide.add_chart('price', 'stock', ['Day 1','Day 2'], box=(0.8,1.5,11.7,4.8),
+    series=[{'name':'Price', 'open':[10,12], 'high':[14,16], 'low':[8,11], 'close':[12,15]}],
+    title='Price interval', x_axis_title='Day', y_axis_title='Price', show_legend=False)""",
             'timeline': """slide.add_timeline('roadmap', [
     {'title': 'Q1', 'body': 'Research'}, {'title': 'Q2', 'body': 'Prototype'},
     {'title': 'Q3', 'body': 'Pilot'}, {'title': 'Q4', 'body': 'Launch'},
@@ -5775,10 +6617,10 @@ slide.add_comment('review-comment', 'Verify source date.', author='Reviewer')"""
 shape = slide.add_shape('animated-card', box=(6.7, 1.5, 5.2, 1.0),
     shape_type='round-rectangle', fill='#DBEAFE')
 slide.animate(shape, effect='fade', speed='medium')
-slide.apply_master(index=0)
+slide.apply_master(index=deck.masters()[0]['index'])  # master indices are one-based
 slide.add_field('page-number', field_type='page-number',
     box=(11.8, 7.0, 0.7, 0.25), style={'font_size': 10, 'align': 'RIGHT'})
-deck.add_custom_show('Executive review', [0])""",
+deck.add_custom_show('Executive review', [1])  # custom show slide indices are one-based""",
             'existingDeckEdit': """deck = job.presentation('source', source_name='source.pptx')
 slide = deck.select_slide('target-slide', index=2)
 shape = slide.select_shape('target-title', text='Old title')
@@ -5932,7 +6774,7 @@ def facade_module_example_keys(document_type):
             'presentation.image@2': ['captionedImage', 'imagePlacementVariants'],
             'presentation.shape@2': ['shapesAndConnector', 'specializedShapeCapabilities'],
             'presentation.table@1': ['nativeTableAndEdit'],
-            'presentation.chart@2': ['nativeColumnChart', 'nativePieChart'],
+            'presentation.chart@2': ['nativeColumnChart', 'nativePieChart', 'nativeRoleCharts'],
             'presentation.transition@1': ['backgroundTransitionAndNotes'],
             'presentation.professional@1': ['backgroundTransitionAndNotes', 'professionalFeatures'],
             'presentation.timeline@2': ['timeline'],
@@ -6006,7 +6848,7 @@ def office_facade_cookbook(document_type, query=''):
             {'id': 'presentation.image@2', 'support': 'full', 'kind': 'core', 'keywords': ['image', 'crop', 'rotate', 'contain', 'caption', 'alt', 'source'], 'signature': "slide.add_image(element_id, asset_name, slot=None, box=None, contain=True, padding=0, crop=None, rotation=0, transparency=0, alt_text=None, title=None, source=None); slide.add_captioned_image(element_id, asset_name, caption, source=None, alt_text=None, ..., caption_height=0.62)", 'validation': ['bounds', 'aspect-ratio', 'embedded-media', 'accessibility-metadata', 'visible-identification']},
             {'id': 'presentation.shape@2', 'support': 'full', 'kind': 'native', 'keywords': ['shape', 'connector', 'caption', 'measure', 'background', 'gradient', 'group'], 'signature': "slide.add_shape(element_id,slot=None,box=None,shape_type='rectangle|round-rectangle|ellipse|line|diamond|triangle|right-triangle|parallelogram|trapezoid|pentagon|hexagon|octagon|star|caption|measure',fill=None,line=None,gradient=None,rotation=0,...); slide.connect(element_id, source_box_or_child_id, target_box_or_child_id, end_arrow=True, start_arrow_width=None, end_arrow_width=None, ...); never emulate an arrowhead with a separate triangle because the triangle box touching a target does not place its apex on the connector endpoint; slide.set_background(color, transparency=0); slide.set_background(style,start_color,end_color,angle=0); slide.group(element_id, shapes)", 'validation': ['bounds', 'overlap', 'featureCounts']},
             {'id': 'presentation.table@1', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'editable'], 'signature': "slide.add_table(element_id, rows, slot=None, box=None, column_weights=None, header=True, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT'); col_widths is accepted as an alias for column_weights", 'validation': ['native-object', 'bounds', 'overlap']},
-            {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right', **options); background defaults transparent; pie/donut must not combine multiple label modes; semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds', 'reopen-size']},
+            {'id': 'presentation.chart@2', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'graph', 'editable', 'area', 'bar', 'bubble', 'donut', 'line', 'pie', 'radar', 'scatter', 'stock', 'label', 'legend', 'axis'], 'signature': "slide.add_chart(element_id, chart_type, categories, slot=None, box=None, values=None, series=None, series_name='Values', title=None, alt_text=None, x_axis_title=None, y_axis_title=None, show_legend=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right', **options); background defaults transparent; pie/donut must not combine multiple label modes; semantic category strings are preserved in PPTX", 'validation': ['native-chart', 'embedded-data', 'category-labels', 'bounds', 'reopen-size']},
             {'id': 'presentation.transition@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['transition', 'fade', 'wipe'], 'signature': "slide.set_transition(effect='fade', speed='medium')", 'validation': ['feature-count', 'reopen']},
             {'id': 'presentation.professional@1', 'support': 'partial', 'kind': 'native', 'keywords': ['animation', 'notes', 'comments', 'media', 'custom-show', 'master', 'field'], 'signature': "slide.set_notes(element_id,text); slide.add_comment(...); slide.add_media(...); slide.animate(shape,...); slide.apply_master(...); slide.add_field(...); deck.add_custom_show(name, slide_indices)", 'validation': ['notes', 'comments', 'media', 'animation', 'master-layout', 'fields']},
             {'id': 'presentation.timeline@2', 'support': 'full', 'kind': 'component', 'keywords': ['timeline', 'process'], 'signature': "slide.add_timeline(element_id, events, slot=None, box=None, colors=None, title_size=14, body_size=10, text_color=0x334155, max_items_per_row=6); dense timelines automatically wrap to multiple rows", 'validation': ['bounds', 'overlap']},
@@ -6042,10 +6884,10 @@ def office_facade_cookbook(document_type, query=''):
         signatures = [item['signature'] for item in capabilities if item.get('signature')]
     elif document_type == 'word':
         capabilities = [
-            {'id': 'writer.flow@2', 'support': 'full', 'kind': 'core', 'keywords': ['paragraph', 'heading', 'title', 'flow', 'rich-text'], 'signature': "document.add_paragraph(...); document.add_heading(...); document.add_rich_paragraph(element_id, runs,...); document.replace_text(element_id, old_text, new_text, replace_all=True)", 'validation': ['pagination', 'content']},
+            {'id': 'writer.flow@2', 'support': 'full', 'kind': 'core', 'keywords': ['paragraph', 'heading', 'title', 'flow', 'rich-text'], 'signature': "document.add_paragraph(...); document.add_heading(element_id,value,level=1,color=0x1F2937,align='LEFT',font_name=None,font_size=None); document.add_title(element_id,value,color=0x1F2937,align='LEFT',font_name=None,font_size=None); document.add_rich_paragraph(element_id, runs,...); document.replace_text(element_id, old_text, new_text, replace_all=True)", 'validation': ['pagination', 'content']},
             {'id': 'writer.styles@1', 'support': 'full', 'kind': 'native', 'keywords': ['style', 'format'], 'signature': "document.define_paragraph_style(element_id, name, parent='Standard', **style)", 'validation': ['styles', 'reopen']},
             {'id': 'writer.list@1', 'support': 'full', 'kind': 'core', 'keywords': ['bullet', 'numbered', 'list'], 'signature': "document.add_bullets(element_id, values, **style); document.add_numbered_list(element_id, values, **style)", 'validation': ['pagination', 'content']},
-            {'id': 'writer.table@2', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'repeat-header', 'merge'], 'signature': "document.add_table(element_id, rows, column_widths=None, header=True, font_size=10); document.merge_table_cells(element_id, table_element_id, start_cell, end_cell)", 'validation': ['native-table', 'pagination']},
+            {'id': 'writer.table@2', 'support': 'full', 'kind': 'native', 'keywords': ['table', 'repeat-header', 'merge'], 'signature': "document.add_table(element_id, rows, column_widths=None, header=True, font_size=10, font_name=None, header_fill=0xE8EEF7, header_color=0x0F172A, body_color=0x1E293B); document.merge_table_cells(element_id, table_element_id, start_cell, end_cell)", 'validation': ['native-table', 'pagination']},
             {'id': 'writer.image-frame@1', 'support': 'full', 'kind': 'native', 'keywords': ['image', 'picture', 'inline', 'frame'], 'signature': "document.add_inline_image(...); document.add_text_frame(element_id,text,width,height,anchor='AS_CHARACTER',background=None)", 'validation': ['embedded-media', 'bounds', 'anchors']},
             {'id': 'writer.page-style@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['page', 'margin', 'size', 'section'], 'signature': "document.feature('writer.page-style@1',...); document.add_section(element_id,name,columns=1,protected=False); document.add_page_break(element_id)", 'validation': ['page-geometry', 'sections']},
             {'id': 'writer.header-footer@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['header', 'footer'], 'signature': "document.feature('writer.header-footer@1', element_id, header='...', footer='...')", 'validation': ['reopen', 'content']},
@@ -6089,7 +6931,7 @@ def office_facade_cookbook(document_type, query=''):
             {'id': 'calc.freeze-merge@1', 'support': 'full', 'kind': 'recipe', 'keywords': ['freeze', 'merge'], 'signature': "sheet.freeze(element_id='freeze-panes',rows=1,columns=0); sheet.merge(element_id,cell_range)", 'validation': ['freeze-panes', 'merged-ranges']},
             {'id': 'calc.validation-conditional@1', 'support': 'full', 'kind': 'native', 'keywords': ['data-validation', 'conditional-format'], 'signature': "sheet.data_validation(element_id,cell_range,validation_type,**options); sheet.conditional_format(element_id,cell_range,operator,formula,**style)", 'validation': ['data-validations', 'conditional-formats']},
             {'id': 'calc.sort-filter-names-outline@1', 'support': 'full', 'kind': 'native', 'keywords': ['sort', 'filter', 'named-range', 'subtotal', 'group', 'outline'], 'signature': "sheet.sort(...); sheet.auto_filter(...); sheet.named_range(...); sheet.group(...); sheet.ungroup(...); sheet.subtotals(...) ", 'validation': ['sort', 'filters', 'defined-names', 'outlines', 'subtotals']},
-            {'id': 'calc.chart-image@1', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'image', 'drawing'], 'signature': "sheet.add_chart(element_id,cell_range,box,chart_type='column',title=None,legend=True); sheet.add_image(element_id,asset_name,box)", 'validation': ['native-charts', 'images', 'drawings']},
+            {'id': 'calc.chart-image@1', 'support': 'full', 'kind': 'native', 'keywords': ['chart', 'image', 'drawing'], 'signature': "sheet.add_chart(element_id,cell_range,box,chart_type='column',title=None,legend=True,alt_text=None,anchor=None,reserve_space=False); sheet.add_image(element_id,asset_name,box,contain=False,padding=0,alt_text=None,title=None,anchor=None,reserve_space=False)", 'validation': ['native-charts', 'images', 'drawings']},
             {'id': 'calc.comments-links@1', 'support': 'full', 'kind': 'native', 'keywords': ['comment', 'hyperlink'], 'signature': "sheet.add_comment(...); sheet.add_hyperlink(...) ", 'validation': ['comments', 'hyperlinks']},
             {'id': 'calc.print-protection@1', 'support': 'full', 'kind': 'native', 'keywords': ['print', 'protection'], 'signature': "sheet.print_setup(...); sheet.protect(password=''); sheet.unprotect(password='')", 'validation': ['print-setup', 'protection']},
             {'id': 'calc-pivot-scenario-goalseek@1', 'support': 'partial', 'kind': 'native', 'keywords': ['pivot', 'datapilot', 'scenario', 'goal-seek'], 'signature': "sheet.add_pivot(...); sheet.add_scenario(...); sheet.goal_seek(...) ", 'validation': ['pivot-tables', 'scenarios', 'formula-result']},
@@ -6142,9 +6984,15 @@ def office_facade_cookbook(document_type, query=''):
         'keywords': item.get('keywords', []),
         'exampleGroups': module_examples.get(item['id'], []),
     } for item in capabilities]
-    query_terms = [term for term in re.split(r'[^a-z0-9_.-]+', normalized_query) if term]
-    selected = []
-    if normalized_query:
+    # Module IDs are identities, not search terms. In particular @1 must never
+    # become a search for every signature containing the digit 1.
+    selected = [item for item in capabilities if normalized_query and normalized_query in {
+        str(item.get('id', '')).lower(), str(item.get('id', '')).lower().split('@', 1)[0],
+    }]
+    module_query = bool(re.fullmatch(r'(?:presentation|spreadsheet|calc|writer)\.[a-z0-9_.-]+(?:@\d+)?', normalized_query))
+    query_terms = [term for term in re.split(r'[^a-z0-9_.-]+', re.sub(r'@\d+\b', '', normalized_query)) if term and not term.isdigit()]
+    query_match_mode = 'exact-module' if selected else 'module-not-found' if module_query else 'keyword' if query_terms else 'index'
+    if not selected and not module_query and query_terms:
         for item in capabilities:
             identity = str(item.get('id', '')).lower()
             identity_without_version = identity.split('@', 1)[0]
@@ -6155,7 +7003,7 @@ def office_facade_cookbook(document_type, query=''):
                 str(item.get('signature', '')),
                 *[str(value) for value in item.get('keywords', [])],
             ]).lower()
-            if normalized_query in {identity, identity_without_version} or any(term in haystack for term in query_terms):
+            if all(term in haystack for term in query_terms):
                 selected.append(item)
     selected_example_keys = []
     for item in selected:
@@ -6167,6 +7015,18 @@ def office_facade_cookbook(document_type, query=''):
     for text in [*[str(item.get('signature') or '') for item in selected], *selected_examples.values()]:
         receiver_methods.update(re.findall(r'\b(job|document|workbook|sheet|deck|slide|shape|table)\.([A-Za-z_]\w*)\s*\(', text))
     api_reference = [item for item in facade_api_reference(document_type) if (item['receiver'], item['method']) in receiver_methods]
+    value_schemas = facade_value_schemas(document_type)
+    if document_type == 'presentation':
+        # Keep common geometry/text contracts, but do not repeat unrelated
+        # chart roles and shape/timeline options in every module response.
+        methods = {method for _, method in receiver_methods}
+        if 'add_chart' not in methods:
+            value_schemas.pop('chartSeries', None)
+        if not methods.intersection({'add_shape', 'set_background'}):
+            value_schemas.pop('shapeStyle', None)
+            value_schemas.pop('gradient', None)
+        if 'add_timeline' not in methods:
+            value_schemas.pop('timelineEvent', None)
     support_matrix = {
         level: [item['id'] for item in selected if item.get('support', 'full') == level]
         for level in ('full', 'partial', 'preserve-only', 'unsupported')
@@ -6177,6 +7037,7 @@ def office_facade_cookbook(document_type, query=''):
             'delivery': 'module-index',
             'query': normalized_query or None,
             'queryMatched': False,
+            'queryMatchMode': query_match_mode,
             'rules': shared_rules,
             'moduleIndex': module_index,
         }
@@ -6185,6 +7046,7 @@ def office_facade_cookbook(document_type, query=''):
         'delivery': 'module-executable-cookbook',
         'query': normalized_query,
         'queryMatched': True,
+        'queryMatchMode': query_match_mode,
         'matchedModules': [item['id'] for item in selected],
         'moduleIndex': module_index,
         'capabilities': selected,
@@ -6193,7 +7055,7 @@ def office_facade_cookbook(document_type, query=''):
         'rules': shared_rules,
         'facadeSignatures': [item['signature'] for item in api_reference],
         'apiReference': api_reference,
-        'valueSchemas': facade_value_schemas(document_type),
+        'valueSchemas': value_schemas,
         'examples': selected_examples,
         'examplesAreInstalledFacadeUsage': True,
         'exampleCoverage': 'All example groups registered for every matched module are included without pagination.',
@@ -6413,7 +7275,7 @@ details.getCellByPosition(0, 0).String = 'Detail' ''',
             "deck.add_image_contain(element_id, page, asset_name, box, padding=0, layout_role='content', allow_overlap=False)",
             "deck.add_text_link(element_id, page, text, box, url=None, target_slide_id=None, font_size=18, color=0x2563EB, bold=False, italic=False, align='LEFT', font_name=None, min_font_size=None, padding=0, valign='CENTER', layout_role='content', allow_overlap=False)",
             "deck.add_native_table(element_id, page, box, rows, column_weights=None, header_fill=0x0F172A, header_color=0xFFFFFF, body_fill=0xF8FAFC, alternate_fill=0xFFFFFF, body_color=0x1E293B, font_size=11, font_name=None, first_column_align='LEFT')",
-            "deck.add_chart(element_id, page, box, chart_type, categories, values=None, series=None, colors=None, font_size=12, show_legend=None, stacked=False, percent=False, vertical=None, lines=True, symbols=True, dim3d=False, color_by_point=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right'); transparent background is default; chart_type: area, bar, column, bubble, donut/doughnut, filled-radar, line, radar, pie, stock, xy/scatter",
+            "deck.add_chart(element_id, page, box, chart_type, categories, values=None, series=None, colors=None, font_size=12, show_legend=None, stacked=False, percent=False, vertical=None, lines=True, symbols=None, dim3d=False, color_by_point=None, series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=None, show_category_name=None, show_percent=None, background=None, legend_position='right', alt_text=None, x_axis_min=None, x_axis_max=None, y_axis_min=None, y_axis_max=None, x_axis_scale='linear', y_axis_scale='linear', axis_position='outside', series_transparency=None, line_width=1.5, font_name=None, font_color=0x334155, grid_color=0xD9DEE2, gridlines=True); transparent background and no internal title are default; chart_type: area, bar, column, bubble, donut/doughnut, filled-radar, line, radar, pie, stock, xy/scatter",
             "deck.add_bar_chart(element_id, page, box, categories, values, colors=None, font_size=12, color=0x334155, baseline_color=0xCBD5E1, value_format='{value:g}', series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=True, show_legend=False)",
             "deck.add_line_chart(element_id, page, box, categories, values, color=0x2563EB, point_fill=0xFFFFFF, label_color=0x334155, font_size=12, value_format='{value:g}', series_name='Values', title=None, x_axis_title=None, y_axis_title=None, show_values=True, show_legend=False)",
             "deck.add_area_chart(element_id, page, box, categories, values=None, series=None, colors=None, font_size=10, show_legend=None, stacked=False, percent=False)",
@@ -6928,12 +7790,31 @@ def verify_presentation_charts(component, element_map=None):
                         problem = 'native chart reopened without its embedded chart model or diagram'
                 except Exception:
                     problem = 'native chart reopened without a readable embedded chart model'
+            if not problem and 'chartTitle' in mapped:
+                try:
+                    title_object = chart_model.getTitleObject()
+                    actual_title = ''.join(item.getString() for item in title_object.getText()) if title_object else ''
+                    if actual_title.strip() != mapped['chartTitle']:
+                        issues.append(map_issue({
+                            'severity': 'error', 'type': 'presentation_chart_title_mismatch',
+                            'description': (
+                                f'Native chart title changed during export: expected {mapped["chartTitle"]!r}, '
+                                f'got {actual_title!r}. This is a renderer/exporter fidelity failure; '
+                                'preserve the authored title and fix the runtime, not the source text.'
+                            ),
+                        }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
+                except Exception as error:
+                    issues.append(map_issue({
+                        'severity': 'error', 'type': 'presentation_chart_title_unverified',
+                        'description': f'Could not verify native chart title after export: {error}. Preserve the source and inspect the renderer.',
+                    }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
             if problem:
                 issues.append(map_issue({
                     'severity': 'error', 'type': 'presentation_chart_degenerated',
                     'description': (
                         f'{problem}. The OLE2 chart did not survive the LibreOffice PPTX round trip; '
-                        'replace it with a stable facade chart configuration or a deliberate vector-chart component.'
+                        'inspect the renderer and use a stable native chart configuration. '
+                        'Do not replace required editable/native charts with images or vectors without user approval.'
                     ),
                 }, element_map or [], shape_name, {'slide': page_index + 1, 'shape': shape_index + 1}))
     for expected in expected_charts:
@@ -6946,7 +7827,8 @@ def verify_presentation_charts(component, element_map=None):
                 'locator': expected.get('locator'),
                 'description': (
                     'Native chart is missing after the LibreOffice PPTX round trip. '
-                    'Replace the unstable OLE2 chart with a deliberate vector-chart component.'
+                    'Inspect the exporter and preserve required native/editable chart coverage; '
+                    'do not silently replace the missing chart with an image or vector component.'
                 ),
             })
     return {
@@ -7390,6 +8272,31 @@ def emit_progress(phase, message, current=None, total=None):
     sys.stderr.flush()
 
 
+def document_attribute_error(error, program):
+    """Attribute errors inside the facade are not evidence of a bad draft API call."""
+    worker_path = Path(__file__).resolve()
+    program_path = Path(program).resolve()
+    origin = None
+    trace = error.__traceback__
+    while trace is not None:
+        filename = Path(trace.tb_frame.f_code.co_filename).resolve()
+        if filename in (worker_path, program_path):
+            origin = (filename, trace.tb_frame.f_code.co_name, trace.tb_lineno)
+        trace = trace.tb_next
+    if origin is not None and origin[0] == worker_path:
+        return RuntimeError(
+            f'UNO_WORKER_INTERNAL_ERROR: {origin[1]} at worker line {origin[2]}: {error}. '
+            'The renderer failed internally; this does not identify a draft source defect. '
+            'Do not edit the draft, query unoApi, or repeat the same render to repair this error. '
+            'Report the runtime failure and retry only after the renderer is fixed.'
+        )
+    return RuntimeError(
+        f'UNO draft attempted an unavailable member: {error}. '
+        'Query the corresponding unoApi module, copy its exact installed signature and example, '
+        'and edit the current draft.py without another feature-discovery call.'
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--program')
@@ -7445,11 +8352,7 @@ def main():
                     heartbeat_stop.set()
                     heartbeat.join(timeout=1)
             except AttributeError as error:
-                raise RuntimeError(
-                    f'UNO draft attempted an unavailable member: {error}. '
-                    'Query the corresponding unoApi module, copy its exact installed signature and example, '
-                    'and edit the current draft.py without another feature-discovery call.'
-                ) from error
+                raise document_attribute_error(error, program) from error
         if args.required_source_asset and args.required_source_asset not in job.opened_documents:
             raise RuntimeError(
                 f'Existing-file modification must open {args.required_source_asset!r} through source_name on a stable facade or expert.open_document(...). '

@@ -108,6 +108,9 @@ function normalizedDownloadFileType(value: string | undefined | null) {
 function resolveDownloadUrl(input: NodeFileDownloadInput) {
   const raw = String(input.url || input.urlOrPath || input.path || '').trim();
   if (!raw) throw new Error('download requires url, path, or urlOrPath.');
+  if (/^[a-z]:[\\/]|^\\\\|^file:/i.test(raw)) {
+    throw new Error('download accepts HTTP(S) URLs or page-relative URL paths, not operating-system file paths. Use an uploaded/host-bound attachment asset; do not retry this path with sourcePageUrl.');
+  }
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
   const sourcePageUrl = String(input.sourcePageUrl || '').trim();
   if (!sourcePageUrl) {

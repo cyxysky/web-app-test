@@ -1,6 +1,6 @@
 import { generateText, Output } from 'ai';
 import { z } from 'zod';
-import { aiMaxOutputTokens, aiReasoningEffort, aiRequestTimeoutMs, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiReasoningEffort, aiRequestTimeoutMs, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel } from '@/server/ai/model';
 import { skillContentSchema, type SkillRecord, type StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 
@@ -119,7 +119,6 @@ export async function generateSkillFromBrowserHistory(input: {
 
   const result = await generateText({
     model: getModel(),
-    maxOutputTokens: aiMaxOutputTokens(4_096),
     temperature: 0.2,
     reasoning: aiReasoningEffort(),
     timeout: aiRequestTimeoutMs(),

@@ -68,6 +68,7 @@ import {
   Globe,
   ImageIcon,
   ImageUp,
+  Info,
   KeyRound,
   Library,
   Loader2,
@@ -139,6 +140,7 @@ import { browserChatCurrentTurnAssistantMessageId } from '@/components/browser-c
 import {
   aiCycleToolKey,
   buildAiCycleToolDetailMap,
+  mergeBrowserChatToolDetail,
   hasAiOutputView,
   stringFromUnknown,
   toolInputSignature,
@@ -160,6 +162,7 @@ import {
 import { parseJsonObjectText, stripAnsiControlCodes } from '@/lib/browser-chat-format';
 import {
   browserChatToolFailureSummary,
+  browserChatToolOutcomeLabel,
   browserChatToolValidationSummary,
 } from '@/components/browser-chat-tool-error';
 import {
@@ -209,6 +212,7 @@ import { LiquidGlassLoader } from '@/components/LiquidGlassLoader';
 import { AnimatedCircularProgressBar } from '@/components/ui/animated-circular-progress-bar';
 import { BlurFade } from '@/components/ui/blur-fade';
 import { BorderBeam } from '@/components/ui/border-beam';
+import { stripBrowserChatContextMarkers } from '@/lib/browser-chat-visible-text';
 import { NumberTicker } from '@/components/ui/number-ticker';
 import { ProgressiveBlur } from '@/components/ui/progressive-blur';
 import { RainbowButton } from '@/components/ui/rainbow-button';
@@ -298,6 +302,7 @@ type BrowserChatMessage = {
     phase: string;
     label: string;
     updatedAt: string;
+    startedAt?: string;
   };
   status?: 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
 };
@@ -607,12 +612,14 @@ function BrowserChatTransientLogDialog({
   const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [loadError, setLoadError] = useState<string>();
   const requestRef = useRef<AbortController | null>(null);
 
   const loadPage = useCallback(async (nextCursor?: string) => {
     requestRef.current?.abort();
     const controller = new AbortController();
     requestRef.current = controller;
+    setLoadError(undefined);
     if (nextCursor) setLoadingMore(true);
     else setLoading(true);
     try {
@@ -626,9 +633,8 @@ function BrowserChatTransientLogDialog({
       setCursor(page.history.cursor);
       setHasMore(page.history.hasMore);
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === 'AbortError')) {
-        setHasMore(false);
-      }
+      if (controller.signal.aborted) return;
+      setLoadError(error instanceof Error ? error.message : String(error));
     } finally {
       if (requestRef.current === controller) requestRef.current = null;
       if (!controller.signal.aborted) {
@@ -661,12 +667,14 @@ function BrowserChatTransientLogDialog({
   return (
     <BrowserChatLogDialog
       entries={visibleBrowserChatExecutionLogs(entries)}
+      loadError={loadError}
       hasMore={hasMore}
       loading={loading}
       loadingMore={loadingMore}
       messageContent={messageContent}
       onClose={onClose}
       onLoadMore={cursor ? () => loadPage(cursor) : undefined}
+      onRetry={() => loadPage(cursor)}
       summaryEntries={entries}
     />
   );
@@ -908,6 +916,8 @@ function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
 }
 
 function toolStatusLabel(tool: BrowserChatToolCall) {
+  const outcome = browserChatToolOutcomeLabel(tool.rawResult ?? tool.error ?? tool.result);
+  if (outcome) return outcome;
   if (isRecoveredTransientTool(tool)) return '已恢复';
   if (tool.ok === true) return '已完成';
   if (tool.ok === false) return '失败';
@@ -923,7 +933,8 @@ function browserChatToolPresentation(
   if (!tool || !step) return { isActive: false, stateClass: '', status: '已请求' };
   const isActive = turnRunning && step.status === 'running' && tool.ok === undefined && !supersededByLaterRequest;
   const inferredFailed = !isActive && tool.ok === undefined && step.status === 'failed';
-  const failed = (tool.ok === false && !isRecoveredTransientTool(tool)) || inferredFailed;
+  const failed = Boolean(browserChatToolOutcomeLabel(tool.rawResult ?? tool.error ?? tool.result))
+    || (tool.ok === false && !isRecoveredTransientTool(tool)) || inferredFailed;
   return {
     isActive,
     stateClass: failed ? ' is-failed' : isActive ? ' is-running' : '',
@@ -1113,6 +1124,10 @@ function BrowserChatToolIcon({ input, name }: { input?: unknown; name: string })
       'edit-draft': <PencilLine size={13} />,
       'file-visual-index': <ScanSearch size={13} />,
       'file-visual-read': <ImageIcon size={13} />,
+      'file-visual-report': <FileText size={13} />,
+      'convert-file': <FileText size={13} />,
+      'list-drafts': <FileText size={13} />,
+      'js-api': <FileText size={13} />,
       'plan-document': <ClipboardCheck size={13} />,
       'read-attachment': <Paperclip size={13} />,
       'read-draft': <FileSearch size={13} />,
@@ -2778,8 +2793,8 @@ function BrowserChatToolContextTokenInfo({ tool }: { tool: BrowserChatToolCall }
   const deltaText = delta === undefined
     ? undefined
     : delta >= 0
-      ? t('本次调用增加 {count} Token', { count: formatTokens(delta) })
-      : t('本次调用减少 {count} Token', { count: formatTokens(Math.abs(delta)) });
+      ? t('请求间上下文增加 {count} Token', { count: formatTokens(delta) })
+      : t('请求间上下文减少 {count} Token', { count: formatTokens(Math.abs(delta)) });
   const beforeText = before === undefined
     ? undefined
     : t('调用前：{count} Token', { count: formatTokens(before) });
@@ -2851,7 +2866,7 @@ function BrowserChatToolContextTokenInfo({ tool }: { tool: BrowserChatToolCall }
       {beforeText ? <span>{beforeText}</span> : null}
       {afterText ? <span>{afterText}</span> : null}
       {!deltaText && !beforeText && !afterText ? <span>{t('暂无上下文 Token 统计')}</span> : null}
-      <small>{t('估算包含文本、工具定义、截图等全部模型输入。')}</small>
+      <small>{t('估算包含文本、工具定义、截图等全部模型输入。同批工具共享请求间增量，不是该工具独占的返回量，也不能逐项相加。')}</small>
       <span className="browser-chat-tool-context-divider" aria-hidden="true" />
       <strong>{t('耗时')}</strong>
       {toolElapsedText ? <span>{toolElapsedText}</span> : null}
@@ -3414,9 +3429,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
     <>
       {toolCalls.map(({ tool, toolIndex }) => {
         const label = browserChatToolLabel(tool.name, tool.input, t);
-        const failureMeta = tool.ok === false
-          ? browserChatToolFailureSummary(tool.rawResult ?? tool.error ?? tool.result)
-          : undefined;
+        const failureMeta = browserChatToolFailureSummary(tool.rawResult ?? tool.error ?? tool.result);
         const meta = tool.invalid
           ? browserChatToolValidationSummary(tool.error || tool.result)
           : compactText(failureMeta || tool.reason || browserChatToolMeta(tool.name, tool.input, t), 150);
@@ -3541,12 +3554,12 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
   > = [];
   for (const part of output.parts) {
     if (part.kind === 'reasoning') {
-      const text = output.reasoning[part.index];
+      const text = stripBrowserChatContextMarkers(output.reasoning[part.index] || '');
       if (showReasoning && text) orderedParts.push({ kind: 'reasoning', part, text });
       continue;
     }
     if (part.kind === 'text') {
-      const text = output.texts[part.index];
+      const text = stripBrowserChatContextMarkers(output.texts[part.index] || '');
       if (text) orderedParts.push({ kind: 'text', part, text });
       continue;
     }
@@ -3583,9 +3596,7 @@ const BrowserChatAiCycleLine = memo(function BrowserChatAiCycleLine({
         const { tool, toolDetail } = entry;
         const executedTool = toolDetail.tool;
         const label = browserChatToolLabel(executedTool.name, executedTool.input, t);
-        const failureMeta = executedTool.ok === false
-          ? browserChatToolFailureSummary(executedTool.rawResult ?? executedTool.error ?? executedTool.result)
-          : undefined;
+        const failureMeta = browserChatToolFailureSummary(executedTool.rawResult ?? executedTool.error ?? executedTool.result);
         const meta = executedTool.invalid
           ? browserChatToolValidationSummary(executedTool.error || executedTool.result)
           : failureMeta || executedTool.reason || tool.reason || browserChatToolMeta(executedTool.name, executedTool.input, t);
@@ -4706,7 +4717,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
               detail={runningActivityLabel}
               label={t('AI 正在处理当前请求')}
               showElapsed
-              startedAt={message.activity?.updatedAt}
+              startedAt={message.activity?.startedAt || message.createdAt}
             />
           ) : null}
         </BrowserChatProcessDisclosure>
@@ -9207,6 +9218,25 @@ const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   );
 });
 
+const BrowserChatToast = memo(function BrowserChatToast({ message }: { message: string }) {
+  const [visible, setVisible] = useState(true);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setVisible(false), 5_000);
+    return () => window.clearTimeout(timeout);
+  }, []);
+
+  if (!visible) return null;
+  return (
+    <div className="browser-chat-toast-layer">
+      <div aria-atomic="true" aria-live="assertive" className="browser-chat-toast" role="alert">
+        <Info aria-hidden="true" className="browser-chat-toast-icon" size={22} strokeWidth={2} />
+        <span>{message}</span>
+      </div>
+    </div>
+  );
+});
+
 export function BrowserChatWorkspace({
   defaultUserId,
   initialSidebarCollapsed = false,
@@ -9325,6 +9355,7 @@ export function BrowserChatWorkspace({
   const [loadingEarlierHistory, setLoadingEarlierHistory] = useState(false);
   const [logDialogMessageId, setLogDialogMessageId] = useState<string | null>(null);
   const [toolDialog, setToolDialog] = useState<BrowserChatToolDetail | null>(null);
+  const [toolDialogLoadState, setToolDialogLoadState] = useState<'idle' | 'loading' | 'loaded' | 'failed'>('idle');
   const toolDialogAbortRef = useRef<AbortController | null>(null);
   const [resolvingConfirmationId, setResolvingConfirmationId] = useState<string | null>(null);
   const [resolvingConfirmationAction, setResolvingConfirmationAction] = useState<BrowserChatToolConfirmationAction | null>(null);
@@ -9448,7 +9479,7 @@ export function BrowserChatWorkspace({
         const toolIndex = (step.tools || []).findIndex((tool) => tool.id === toolDialog.tool.id);
         if (toolIndex < 0) continue;
         const tool = step.tools?.[toolIndex];
-        if (tool) resolvedDetail = { stepIndex: step.index, step, toolIndex, tool };
+        if (tool) resolvedDetail = mergeBrowserChatToolDetail(toolDialog, { stepIndex: step.index, step, toolIndex, tool });
         break;
       }
     }
@@ -9722,17 +9753,18 @@ export function BrowserChatWorkspace({
     toolDialogAbortRef.current = controller;
     setToolDialog(detail);
     const messageId = detail.step.messageId;
+    setToolDialogLoadState(messageId ? 'loading' : 'idle');
     if (!messageId) return;
     void loadMessageRecords(messageId, { signal: controller.signal })
       .then((records) => {
         if (controller.signal.aborted) return;
         const step = records.steps.find((item) => item.index === detail.stepIndex);
-        if (!step) return;
+        if (!step) throw new Error('Tool step is not yet available in persisted records.');
         const toolIndex = detail.tool.id
           ? (step.tools || []).findIndex((tool) => tool.id === detail.tool.id)
           : detail.toolIndex;
         const tool = step.tools?.[toolIndex];
-        if (!tool) return;
+        if (!tool) throw new Error('Tool call is not yet available in persisted records.');
         const confirmation = toolUserActionForTool(records.logs, step.index, tool.name, tool.input);
         setToolDialog((current) => {
           if (!current || current.stepIndex !== detail.stepIndex || current.tool.id !== detail.tool.id) return current;
@@ -9744,8 +9776,11 @@ export function BrowserChatWorkspace({
             toolIndex,
           };
         });
+        setToolDialogLoadState('loaded');
       })
-      .catch(() => undefined)
+      .catch(() => {
+        if (!controller.signal.aborted) setToolDialogLoadState('failed');
+      })
       .finally(() => {
         if (toolDialogAbortRef.current === controller) toolDialogAbortRef.current = null;
       });
@@ -10979,9 +11014,11 @@ export function BrowserChatWorkspace({
                   ref={recentSessionListEndRef}
                 >
                   {loadingMoreSessions ? (
-                    <span aria-live="polite" role="status">
+                    <span aria-label={t('正在加载更多对话')} aria-live="polite" role="status">
                       <Loader2 className="spin" size={13} />
-                      {t('正在加载更多对话')}
+                      <span className="browser-chat-history-scroll-sentinel-label" aria-hidden="true">
+                        {t('正在加载更多对话')}
+                      </span>
                     </span>
                   ) : null}
                 </li>
@@ -11315,6 +11352,8 @@ export function BrowserChatWorkspace({
     </header>
   ) : null;
 
+  const chatErrorMessage = stripAnsiControlCodes(error || session?.error || '');
+
   const renderChatPane = () => (
     <div className={`${hasChatContent ? 'browser-chat-chat-pane has-messages' : 'browser-chat-chat-pane'}${embeddedBrowserActive ? ' embedded-chat' : ''}`}>
       {renderChatPaneHeader()}
@@ -11378,8 +11417,14 @@ export function BrowserChatWorkspace({
         </div>
       ) : null}
 
+      {chatErrorMessage ? (
+        <BrowserChatToast
+          key={`${session?.id || 'workspace'}:${chatErrorMessage}`}
+          message={t(chatErrorMessage)}
+        />
+      ) : null}
+
       <div className="browser-chat-composer-shell">
-        {error || session?.error ? <div className="error">{t(stripAnsiControlCodes(error || session?.error || ''))}</div> : null}
         <BrowserChatComposer
           key={`composer:${sessionUiKey}`}
           attachments={attachments}
@@ -11525,6 +11570,9 @@ export function BrowserChatWorkspace({
       {liveToolDialog ? (
         <BrowserChatToolDialog
           detail={liveToolDialog}
+          loading={toolDialogLoadState === 'loading'}
+          loadFailed={toolDialogLoadState === 'failed'}
+          onRetry={() => showToolDetails(liveToolDialog)}
           onClose={closeToolDetails}
           toolLabel={(name, input) => browserChatToolLabel(name, input, t)}
         />

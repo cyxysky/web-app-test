@@ -5,7 +5,13 @@ import { browserChatFileToolPresentation } from './browser-chat-file-tool-presen
 test('distinguishes draft source, ordinary file, attachment, and visual page reads', () => {
   assert.deepEqual(browserChatFileToolPresentation('file', {
     action: 'read', documentId: 'solar-ppt',
-  }), { key: 'read-draft', label: '读取草稿' });
+  }), { key: 'read-draft', label: '读取生成源码' });
+  assert.deepEqual(browserChatFileToolPresentation('file', {
+    action: 'readSource', documentId: 'solar-ppt',
+  }), { key: 'read-draft', label: '读取生成源码' });
+  assert.deepEqual(browserChatFileToolPresentation('file', {
+    action: 'readContent', artifactId: 'generated/solar-ppt/deadbeef/file.pptx',
+  }), { key: 'read-file', label: '读取文件内容' });
   assert.deepEqual(browserChatFileToolPresentation('file', {
     action: 'read', artifactId: 'generated/solar-ppt/deadbeef/file.pptx',
   }), { key: 'read-file', label: '读取文件' });

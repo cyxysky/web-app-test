@@ -30,14 +30,15 @@ export type FileAttachmentReadResult = {
 
 export type FileVisualInput = FileVisualToolInput;
 
-export const FILE_READ_MIN_CHARACTERS = 20_000;
+export const FILE_READ_MIN_CHARACTERS = 1;
+export const FILE_READ_DEFAULT_CHARACTERS = 8_000;
 export const FILE_READ_MAX_CHARACTERS = 40_000;
 
 export function normalizeFileReadLimit(value: unknown) {
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number)
     ? Math.min(FILE_READ_MAX_CHARACTERS, Math.max(FILE_READ_MIN_CHARACTERS, Math.floor(number)))
-    : FILE_READ_MIN_CHARACTERS;
+    : FILE_READ_DEFAULT_CHARACTERS;
 }
 
 const visualQaPageCheckNames = [
@@ -67,6 +68,12 @@ function assertVisualQaDeckChecks(checks: OfficeVisualQaDeckChecks | undefined) 
   for (const name of visualQaDeckCheckNames) {
     const status = checks[name];
     if (status !== 'passed' && status !== 'failed') throw new Error(`deckReview requires check ${name}`);
+    if (status === 'failed') failed.push(name);
+  }
+  for (const name of ['designIntent', 'compositionRhythm', 'contentConsistency', 'sourceTraceability'] as const) {
+    const status = checks[name];
+    if (status === undefined) continue;
+    if (status !== 'passed' && status !== 'failed') throw new Error(`deckReview has invalid check ${name}`);
     if (status === 'failed') failed.push(name);
   }
   return failed;
@@ -179,7 +186,7 @@ export async function readFileAttachment(input: {
     const resolvedAttachment = size === attachment.size ? attachment : { ...attachment, size };
     if (attachment.kind !== 'tab' && size === 0) throw new Error('文件内容为空，无法解析。');
     const kind = attachmentKind(resolvedAttachment);
-    const buffer = input.includeVisuals && kind !== 'tab' && kind !== 'image'
+    const buffer = input.includeVisuals && kind !== 'tab'
       ? await readFile(input.absolutePath!)
       : undefined;
     const [content, visuals] = await Promise.all([
@@ -204,12 +211,15 @@ export async function readFileAttachment(input: {
       visuals.warning || '',
     ].filter(Boolean) : [];
     return {
-      ok: true,
+      ok: !(input.includeVisuals && kind === 'image' && !visuals?.imagePaths.length),
       actual: [
+        '读取类型：文件内容（readContent）；以下是从文件解析出的文本/数据，不是生成此文件的 Python/JavaScript 源码。修改生成逻辑请用 readSource + documentId；缺少 documentId 时先 list。',
         `文件：${resolvedAttachment.name}`,
         `类型：${resolvedAttachment.type || 'unknown'}；大小：${formatSize(resolvedAttachment.size)}；解析器：${attachmentKind(resolvedAttachment)}`,
         '原始附件：服务器保留原始字节；文本、结构和视觉预览均从该原件按需派生。',
         ...visualSummary,
+        ...(input.includeVisuals && kind === 'image' && !visuals?.imagePaths.length
+          ? ['图片像素未能附加；以下仅为元数据，不能据此确认图片主体或视觉质量。请使用可解码的图片素材。'] : []),
         `字符区间：${offset}-${nextOffset} / ${content.length}${nextOffset < content.length ? `；仍有内容，下次 offset=${nextOffset}` : '；已到末尾'}`,
         '',
         slice || '[该区间没有可读文本]',

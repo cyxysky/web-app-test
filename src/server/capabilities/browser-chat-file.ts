@@ -59,6 +59,7 @@ function createBrowserChatFileOperations(
           path: input.path,
           startLine: input.startLine,
           endLine: input.endLine,
+          includeDiagnostics: input.includeDiagnostics,
           runId,
         }), 'file-read-failed');
       }
@@ -128,6 +129,7 @@ function createBrowserChatFileOperations(
         program: input.program,
         baseDigest: input.baseDigest,
         patch: input.patch,
+        replacements: input.replacements,
         render: input.render,
         abortSignal: context.abortSignal,
         onProgress: progressReporter(context),

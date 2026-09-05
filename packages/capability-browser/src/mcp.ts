@@ -8,12 +8,12 @@ import {
 import {
   defineCapabilityInput,
   defineCapabilityTool,
+  raceWithAbort,
   type CapabilityProvider,
   type CapabilityResult,
   type CapabilityRunContext,
 } from '@webpilot/capability-sdk';
 import { z } from 'zod';
-import { readBrowserStateCode } from './node/capability.js';
 import {
   BrowserSession,
   type BrowserActionResult,
@@ -56,24 +56,16 @@ export type BrowserMcpSessionManagerOptions = {
   sessionOptions?: BrowserSessionOptions;
 };
 
-function parsedActual(actual: string): unknown {
-  try {
-    return JSON.parse(actual) as unknown;
-  } catch {
-    return actual;
-  }
-}
-
 function browserResult(
   id: string,
   result: BrowserActionResult,
 ): CapabilityResult {
   const data = {
     browserSessionId: id,
-    result: parsedActual(result.actual),
+    result: result.data ?? result.actual,
   };
   return result.ok
-    ? { ok: true, summary: result.actual, data }
+    ? { ok: true, summary: result.summary || result.actual, data }
     : {
         ok: false,
         error: {
@@ -102,7 +94,7 @@ export class BrowserMcpSessionManager {
       : 15 * 60_000;
   }
 
-  async open(inputValue: z.infer<typeof openParser>): Promise<CapabilityResult> {
+  async open(inputValue: z.infer<typeof openParser>, abortSignal?: AbortSignal): Promise<CapabilityResult> {
     if (this.#sessions.size + this.#openingSessions >= this.#maxSessions) {
       return {
         ok: false,
@@ -123,9 +115,9 @@ export class BrowserMcpSessionManager {
       browserCodeStateSessionId: id,
     });
     try {
-      await session.start();
+      await raceWithAbort(session.start(), abortSignal);
       if (inputValue.url) {
-        const result = await session.open(inputValue.url);
+        const result = await session.open(inputValue.url, { abortSignal });
         if (!result.ok) {
           await session.close({ force: true }).catch(() => undefined);
           return browserResult(id, result);
@@ -184,11 +176,13 @@ export class BrowserMcpSessionManager {
     inputValue: z.infer<typeof snapshotParser>,
     abortSignal?: AbortSignal,
   ) {
-    return this.code({
-      browserSessionId: inputValue.browserSessionId,
-      code: readBrowserStateCode,
-      maxOutputChars: inputValue.maxOutputChars,
-    }, abortSignal);
+    return this.#enqueue(inputValue.browserSessionId, async (managed) => browserResult(
+      inputValue.browserSessionId,
+      await managed.session.readBrowserState({
+        abortSignal,
+        maxOutputChars: inputValue.maxOutputChars,
+      }),
+    ));
   }
 
   async close(id: string): Promise<CapabilityResult> {
@@ -313,7 +307,7 @@ export function createBrowserMcpCapability(options: BrowserMcpOptions = {}): Cap
             name: 'browser.open',
             description: 'Open a new persistent browser session and return its explicit browserSessionId.',
             input: input(openParser),
-            execute: (value) => manager.open(value),
+            execute: (value, execution) => manager.open(value, execution.abortSignal),
           }),
           code: defineCapabilityTool({
             name: 'browser.code',

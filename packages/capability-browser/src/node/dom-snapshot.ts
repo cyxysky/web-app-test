@@ -73,12 +73,8 @@ const computedStyles = [
   'display',
   'visibility',
   'opacity',
-  'pointer-events',
   'cursor',
-  'overflow-x',
-  'overflow-y',
   'position',
-  'z-index',
   'content-visibility',
 ];
 

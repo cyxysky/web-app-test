@@ -84,7 +84,7 @@ export type BrowserChatUIDataTypes = {
   step: StepExecutionResult;
   outputCycle: BrowserChatAiOutputCycle;
   subagent: BrowserChatSubagentRecord;
-  activity: { phase: string; label: string; updatedAt: string };
+  activity: { phase: string; label: string; updatedAt: string; startedAt?: string };
 };
 
 export type BrowserChatUIMessage = UIMessage<BrowserChatUIMessageMetadata, BrowserChatUIDataTypes>;

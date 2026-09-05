@@ -8,6 +8,7 @@ import {
   stripAnsiControlCodes,
 } from './browser-chat-format';
 import { asRecord } from './unknown-value';
+import { stripBrowserChatContextMarkers } from './browser-chat-visible-text';
 
 export function stringFromUnknown(value: unknown): string {
   if (typeof value === 'string') return stripAnsiControlCodes(value).trim();
@@ -60,11 +61,11 @@ function normalizeAiContentPart(part: unknown): BrowserChatAiOutputView {
   if (!record) return { parts: [], reasoning: [], texts: [], tools: [] };
   const type = String(record.type || '').toLowerCase();
   if (type === 'reasoning') {
-    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
+    const text = stripBrowserChatContextMarkers(stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value));
     return { parts: text ? [{ index: 0, kind: 'reasoning' }] : [], reasoning: text ? [text] : [], texts: [], tools: [] };
   }
   if (type === 'text') {
-    const text = stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value);
+    const text = stripBrowserChatContextMarkers(stringFromUnknown(record.text ?? record.content ?? record.reasoning ?? record.value));
     return { parts: text ? [{ index: 0, kind: 'text' }] : [], reasoning: [], texts: text ? [text] : [], tools: [] };
   }
   if (type === 'tool-call' || type === 'tool_call') {

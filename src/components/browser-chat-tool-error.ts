@@ -32,6 +32,13 @@ function officeSourceValidationFailure(value: unknown) {
     if (depth > 7 || current === null || current === undefined) return undefined;
     if (typeof current === 'string') {
       const parsed = parsedJsonValue(current);
+      if (parsed === undefined && /^Office source(?:-unit)? validation failed:/.test(current)) {
+        return {
+          kind: 'uno-draft-validation', validation: 'failed',
+          saved: /workingSourceSaved=true/.test(current),
+          error: current.match(/(?:^|;\s*)error=([^;]+)/)?.[1] || '源码校验未通过',
+        };
+      }
       return parsed === undefined ? undefined : visit(parsed, depth + 1);
     }
     if (Array.isArray(current)) {
@@ -52,8 +59,9 @@ function officeSourceValidationFailure(value: unknown) {
         : '';
     if (
       validation === 'failed'
-      && (kind === 'uno-draft-validation' || kind === 'office-source-unit-validation')
+      && (kind.startsWith('uno-draft-') || kind === 'office-source-unit-validation')
     ) return record;
+    if (record.editStatus === 'partial-patch-applied') return record;
     for (const key of ['actual', 'rawResult', 'result', 'error', 'cause']) {
       const match = visit(record[key], depth + 1);
       if (match) return match;
@@ -102,9 +110,21 @@ function localizedOfficeSourceMessage(message: string) {
   return message.replace(/\.$/, '');
 }
 
+export function browserChatToolOutcomeLabel(value: unknown) {
+  const failure = officeSourceValidationFailure(value);
+  if (!failure) return undefined;
+  if (failure.validation === 'failed' || failure.validationStatus === 'failed') {
+    return failure.saved === true ? '已保存，校验失败' : '校验失败';
+  }
+  return '部分已保存，仍有冲突';
+}
+
 export function browserChatToolFailureSummary(value: unknown) {
   const failure = officeSourceValidationFailure(value);
   if (!failure) return undefined;
+  if (failure.editStatus === 'partial-patch-applied' && failure.validation !== 'failed' && failure.validationStatus !== 'failed') {
+    return '部分修改已保存；请读取当前源码和新版本摘要，仅修复返回的冲突项。';
+  }
   const diagnostics = Array.isArray(failure.diagnostics)
     ? failure.diagnostics.map(officeSourceDiagnostic).filter((item): item is OfficeSourceDiagnostic => Boolean(item))
     : [];

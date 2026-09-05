@@ -1,19 +1,26 @@
-export const browserChatInterruptedTurnContextMarker =
-  '[Historical context only: the preceding browser-chat turn was interrupted before completion. Preserve completed tool results, but never quote or copy this marker into a response.]';
-
-const browserChatContextOnlyMarkers = [
-  browserChatInterruptedTurnContextMarker,
-  '[This response was interrupted by the user before completion.]',
-  '[The user interrupted this turn before the assistant produced text. Any completed tool messages remain valid conversation history.]',
-] as const;
+import { stripBrowserChatContextMarkers } from '../../../lib/browser-chat-visible-text';
+export { browserChatInterruptedTurnContextMarker } from '../../../lib/browser-chat-visible-text';
 
 const privateToolProtocolPattern = /(?:<(?:minimax:)?tool_call\b[^>]*>|<function_calls\b[^>]*>|<invoke\b[^>]*>|[◁＜]\s*(?:tool_call|function_calls|invoke)\s*[▷＞])/i;
 
 export function containsPrivateToolProtocol(value: string | undefined) {
-  return privateToolProtocolPattern.test(value || '');
+  return privateToolProtocolPattern.test(value || '') || isTextualToolCallStub(value);
+}
+
+// Some providers imitate a transcript instead of emitting tool_calls. Only
+// recognize a whole response with a matching name and arguments, not prose
+// discussing tools or quoted examples. Detection never authorizes execution.
+function isTextualToolCallStub(value: string | undefined) {
+  const match = (value || '').trim().match(/^\[Tool call:\s*([\w.-]+)\]\s*(\{[\s\S]*\})$/i);
+  if (!match) return false;
+  try {
+    const call = JSON.parse(match[2]);
+    return call?.name === match[1] && call.arguments !== null && typeof call.arguments === 'object' && !Array.isArray(call.arguments);
+  } catch { return false; }
 }
 
 function removePrivateToolProtocol(value: string) {
+  if (isTextualToolCallStub(value)) return '';
   let text = value
     .replace(/<(?:minimax:)?tool_call\b[^>]*>[\s\S]*?<\/(?:minimax:)?tool_call\s*>/gi, '')
     .replace(/<function_calls\b[^>]*>[\s\S]*?<\/function_calls\s*>/gi, '')
@@ -24,12 +31,7 @@ function removePrivateToolProtocol(value: string) {
 }
 
 export function normalizeBrowserChatFinalReplyText(value: string | undefined) {
-  return browserChatContextOnlyMarkers.reduce(
-    (text, marker) => text.replaceAll(marker, ''),
-    removePrivateToolProtocol((value || '').replace(/\r\n?/g, '\n')),
-  )
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  return stripBrowserChatContextMarkers(removePrivateToolProtocol((value || '').replace(/\r\n?/g, '\n')));
 }
 
 export function isBrowserChatDomObservationText(value: string | undefined) {

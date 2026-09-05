@@ -3,6 +3,101 @@ export type OfficeCellValue = string | number | boolean | null;
 
 export type OfficeDocumentKind = 'presentation' | 'spreadsheet' | 'word';
 
+export type OfficeThemePreset = 'clean' | 'editorial' | 'executive' | 'signal';
+
+/** Authoring decisions, not a claim that the rendered artifact passed design review. */
+export type OfficeDesignBrief = {
+  mode: 'template' | 'bespoke';
+  audience?: string;
+  objective?: string;
+  reference?: string;
+  directions?: Array<{
+    id: string;
+    concept: string;
+    composition: string;
+    typography: string;
+    imagery: string;
+  }>;
+  selectedDirection?: string;
+  selectionReason?: string;
+  rhythm?: string;
+  preserve?: string[];
+  avoid?: string[];
+};
+
+export type OfficeThemeColors = {
+  accent: string;
+  background: string;
+  border: string;
+  muted: string;
+  primary: string;
+  secondary: string;
+  surface: string;
+  text: string;
+};
+
+export type OfficeThemeFonts = {
+  body: string;
+  heading: string;
+  mono: string;
+};
+
+export type OfficeThemeTypography = {
+  body: number;
+  caption: number;
+  heading: number;
+  metric: number;
+  title: number;
+};
+
+/** Versioned design tokens shared by semantic Word, PowerPoint, and Excel generation. */
+export type OfficeThemeDefinition = {
+  colors?: Partial<OfficeThemeColors>;
+  fonts?: Partial<OfficeThemeFonts>;
+  preset?: OfficeThemePreset;
+  typography?: Partial<OfficeThemeTypography>;
+  version?: '1';
+};
+
+export type OfficeSemanticTemplate =
+  | 'cover'
+  | 'section'
+  | 'content'
+  | 'two-column'
+  | 'comparison'
+  | 'kpi'
+  | 'chart'
+  | 'image'
+  | 'reference'
+  | 'report'
+  | 'worksheet';
+
+/** Layout guardrails are enabled by default for semantic generation. */
+export type OfficeLayoutPolicy = {
+  enabled?: boolean;
+  imageFit?: 'contain';
+  maxCharactersPerSlide?: number;
+  maxContentUnitsPerSlide?: number;
+  maxListItemsPerSlide?: number;
+  maxTableColumns?: number;
+  maxTableRowsPerSlide?: number;
+  minPresentationBodyFontSize?: number;
+  minSpreadsheetFontSize?: number;
+  minWordBodyFontSize?: number;
+  mode?: 'repair' | 'strict';
+  overflow?: 'error' | 'shrink' | 'split';
+  safeMargin?: number;
+};
+
+export type OfficeLayoutDiagnostic = {
+  blockId?: string;
+  code: string;
+  message: string;
+  pageId?: string;
+  repaired?: boolean;
+  severity: 'error' | 'info' | 'warning';
+};
+
 export type OfficeVisualQaCheckStatus = 'failed' | 'not-applicable' | 'passed';
 
 export type OfficeVisualQaPageChecks = {
@@ -23,6 +118,11 @@ export type OfficeVisualQaDeckChecks = {
   colorConsistency: 'failed' | 'passed';
   spacingRhythm: 'failed' | 'passed';
   componentConsistency: 'failed' | 'passed';
+  /** Required for briefs explicitly planned as bespoke; optional for legacy drafts. */
+  designIntent?: 'failed' | 'passed';
+  compositionRhythm?: 'failed' | 'passed';
+  contentConsistency?: 'failed' | 'passed';
+  sourceTraceability?: 'failed' | 'passed';
 };
 
 export type OfficeVisualQaIssue = {
@@ -104,6 +204,36 @@ export type OfficeBlock = {
   rows?: OfficeCellValue[][];
   source?: string;
   style?: OfficeBlockStyle;
+  subtitle?: string;
+  template?: OfficeSemanticTemplate;
+  svg?: string;
+  text?: string;
+  title?: string;
+  unoProperties?: Record<string, unknown>;
+  unoService?: string;
+  [property: string]: unknown;
+};
+
+/** Author-facing recursive block. IDs are optional because the semantic compiler assigns stable ones. */
+export type OfficeSemanticBlockInput = {
+  id?: string;
+  type: OfficeBlockType | (string & {});
+  alt?: string;
+  breakBefore?: 'page';
+  caption?: string;
+  children?: OfficeSemanticBlockInput[];
+  columns?: Array<{ blocks?: OfficeSemanticBlockInput[]; width?: number | string }>;
+  data?: unknown;
+  items?: unknown[];
+  language?: string;
+  level?: number;
+  markdown?: string;
+  name?: string;
+  rows?: OfficeCellValue[][];
+  source?: string;
+  style?: OfficeBlockStyle;
+  subtitle?: string;
+  template?: OfficeSemanticTemplate;
   svg?: string;
   text?: string;
   title?: string;
@@ -142,19 +272,47 @@ export type OfficeDocumentSpec = {
   document: OfficeDocumentSettings;
   documentType: OfficeDocumentKind;
   fileName: string;
+  /** Semantic document contract version. Omitted values use the current stable version. */
+  schemaVersion?: '1.0';
+  /** Versioned preset or a preset with scoped token overrides. */
+  theme?: OfficeThemePreset | OfficeThemeDefinition;
+  /** Deterministic layout constraints; enabled with repair mode by default. */
+  layout?: OfficeLayoutPolicy;
 };
 
-/** A semantic plan plus the model-owned, executable UNO draft. No block tree is rendered from this type. */
+/** Compact create input; fileName and documentType may be supplied by an existing plan. */
+export type OfficeSemanticDocumentInput = Omit<OfficeDocumentSpec, 'blocks' | 'document' | 'documentType' | 'fileName'> & {
+  blocks: OfficeSemanticBlockInput[];
+  document?: OfficeDocumentSettings;
+  documentType?: OfficeDocumentKind;
+  fileName?: string;
+};
+
+/** A planned document plus its executable draft; semantic create specs compile into the same source workflow. */
 export type OfficeDocumentDraft = {
   createdAt: string;
   documentId: string;
   documentType: OfficeDocumentKind;
   fileName: string;
   intent?: string;
+  design?: OfficeDesignBrief;
   /** Create a new file or modify a user-supplied Office document in place. */
   operation?: 'create' | 'modify';
   /** Program runtime selected when the workspace is planned. Existing-file modification always uses UNO. */
   generator?: 'javascript' | 'uno';
+  /** Metadata for a compact semantic spec compiled into the ordinary executable draft pipeline. */
+  semantic?: {
+    diagnostics: OfficeLayoutDiagnostic[];
+    layout: Required<OfficeLayoutPolicy>;
+    schemaVersion: '1.0';
+    theme: OfficeThemeDefinition & {
+      colors: OfficeThemeColors;
+      fonts: OfficeThemeFonts;
+      preset: OfficeThemePreset;
+      typography: OfficeThemeTypography;
+      version: '1';
+    };
+  };
   /** Digest of the most recently delivered executable facade module. */
   unoApiCatalogDigest?: string;
   /** First module delivery time. */
@@ -173,11 +331,27 @@ export type OfficeDocumentDraft = {
   program?: string;
   /** SHA-256 of the workspace draft.py content, used to detect split-brain metadata. */
   sourceDigest?: string;
+  /** Receipt committed with source bytes. Only the identical latest edit at this resulting revision is replayable. */
+  lastSourceEdit?: {
+    requestDigest: string;
+    beforeDigest: string;
+    afterDigest: string;
+    totalHunks: number;
+  };
   /** Digest of the current source after static analysis, execution, reopen, and structural validation pass. */
   validatedSourceDigest?: string;
   validationStatus?: 'failed' | 'pending' | 'passed';
-  /** Consecutive failed validations for the current repair sequence. */
+  /** Failed validations in this repair sequence; may have different causes and source versions. Not a bridge retry count. */
   validationFailureCount?: number;
+  /** Source/worker revision actually checked, not the time the draft was last read or saved. */
+  validationEvidence?: {
+    sourceDigest: string;
+    workerDigest: string | null;
+    checkedAt: string;
+    scope: 'document' | 'source-unit';
+    sourceUnitPath?: string;
+    stage: 'static-analysis' | 'execution' | 'artifact-validation' | 'complete';
+  };
   validationDiagnostics?: Array<{
     code?: string;
     column?: number;

@@ -24,7 +24,7 @@ import {
   type NodeFileDownloader,
 } from './download.js';
 import { sanitizeNodeArtifactFileName, type NodeArtifactUrlResolver } from './artifacts.js';
-import { inspectUnoApi, isUnoBridgeStartupError } from './office/uno.js';
+import { inspectUnoApi, isUnoBridgeStartupError, isUnoStylePropertyInfoError, isUnoWorkerInternalError } from './office/uno.js';
 import { validateOfficeArtifact, type OfficeElementMapEntry } from './office/validation.js';
 import { validateOfficeRendererMatrix } from './office/render-validation.js';
 import {
@@ -35,10 +35,15 @@ import {
 import type {
   OfficeDocumentDraft,
   OfficeDocumentKind,
+  OfficeSemanticDocumentInput,
   OfficeVisualQaDeckChecks,
   OfficeVisualQaPageChecks,
 } from '../office/types.js';
-import { renderFilePreview, type FilePreviewResult } from './office/preview.js';
+import { registerOfficePreview, renderFilePreview, type FilePreviewResult } from './office/preview.js';
+import { officeGenerationRuntimeFingerprint } from './office/runtime-fingerprint.js';
+import { beginOfficeValidation, currentUnoWorkerDigest, officeValidationEvidence } from './office/validation-evidence.js';
+import { compileOfficeSemanticDocument } from './office/semantic.js';
+import { officeDesignBriefSchema, officeDesignGuidance, missingDesignReviewChecks } from '../design-guidance.js';
 
 export type NodeFileWorkspaceHost = {
   artifactsRoot: string;
@@ -120,7 +125,7 @@ function officeOperationWasInterrupted(error: unknown, abortSignal?: AbortSignal
 }
 
 const TOOL_ERROR_MAX_CHARACTERS = 6_000;
-const OFFICE_PIPELINE_VERSION = 'office-pipeline-v11-pptxgenjs-layout-units';
+const OFFICE_PIPELINE_VERSION = 'office-pipeline-v13-cjk-shared-preview';
 const VISUAL_QA_PAGE_CHECKS = [
   'overlap', 'clipping', 'alignment', 'spacing', 'typography', 'contrast',
   'visualHierarchy', 'chartTableLegibility', 'imageQuality',
@@ -152,6 +157,11 @@ function failedDeckVisualChecks(checks: OfficeVisualQaDeckChecks | undefined) {
     if (status !== 'passed' && status !== 'failed') invalid.push(name);
     else if (status === 'failed') failed.push(name);
   }
+  for (const name of ['designIntent', 'compositionRhythm', 'contentConsistency', 'sourceTraceability'] as const) {
+    if (checks[name] === undefined) continue;
+    if (checks[name] !== 'passed' && checks[name] !== 'failed') invalid.push(name);
+    else if (checks[name] === 'failed') failed.push(name);
+  }
   return { invalid, failed };
 }
 
@@ -161,6 +171,7 @@ export type PlanArtifactInput = {
   fileName?: string | null;
   documentType?: OfficeDocumentKind;
   intent?: string;
+  design?: OfficeDocumentDraft['design'];
   operation?: 'create' | 'modify';
   sourceAttachmentId?: string;
   attachmentBindings?: FileAttachmentBinding[];
@@ -170,6 +181,8 @@ export type GenerateUnoProgramInput = {
   runId?: string;
   documentId?: string;
   program?: string;
+  /** Compact semantic create input compiled into the existing validated UNO draft pipeline. */
+  spec?: OfficeSemanticDocumentInput;
   /** Required with baseDigest for an intentional complete source replacement. */
   replaceExisting?: boolean;
   baseDigest?: string;
@@ -196,6 +209,8 @@ export type EditUnoProgramInput = {
   baseDigest?: string;
   /** Codex apply_patch document. Each well-formed @@ hunk is applied independently. */
   patch?: string;
+  /** Exact, unique source replacements; mutually exclusive with patch. */
+  replacements?: Array<{ oldText: string; newText: string }>;
   program?: string;
   render?: boolean;
   includeVisualVerification?: boolean;
@@ -217,9 +232,10 @@ export type ReadUnoDraftInput = {
   runId?: string;
   documentId?: string;
   path?: string;
-  /** Optional one-based global source window, including when path is supplied. */
+  /** One-based window; unit-relative when an existing source-unit path is supplied. */
   startLine?: number;
   endLine?: number;
+  includeDiagnostics?: boolean;
 };
 
 export type RenderArtifactInput = {
@@ -232,6 +248,15 @@ export type RenderArtifactInput = {
 };
 
 type ArtifactToolPayload = {
+  documentType?: OfficeDocumentKind;
+  sourceFileName?: string;
+  sourceDocument?: OfficeDocumentDraft['sourceDocument'];
+  semanticGeneration?: ReturnType<typeof semanticGenerationPlan>;
+  design?: OfficeDocumentDraft['design'];
+  designGuidance?: ReturnType<typeof officeDesignGuidance>;
+  workflow?: OfficeDocumentDraft['workflow'];
+  reused?: boolean;
+  instruction?: string;
   artifactId?: string;
   kind?: string;
   fileName?: string;
@@ -256,6 +281,20 @@ type ArtifactToolPayload = {
   validationStatus?: string;
   validationFailureCount?: number;
   saved?: boolean;
+  editStatus?: string;
+  patchHunks?: {
+    applied: number;
+    alreadyApplied?: number;
+    failed: UnoDraftPatchHunkFailure[];
+    blocked?: number[];
+    total: number;
+  };
+  nextAction?: Record<string, unknown>;
+  sourceRepairRequired?: boolean;
+  sourceValidity?: string;
+  retryable?: boolean;
+  retryAfter?: string;
+  validationEvidence?: OfficeDocumentDraft['validationEvidence'];
   message?: string;
   error?: string;
   recoverySuggestion?: string;
@@ -269,6 +308,7 @@ type ArtifactToolPayload = {
     locator?: Record<string, unknown>;
     message?: string;
     page?: number;
+    repairHint?: string;
     severity?: string;
     shapes?: number[];
     sourceExcerpt?: string;
@@ -291,17 +331,23 @@ type ArtifactToolPayload = {
 function compactToolText(value: unknown, limit = TOOL_ERROR_MAX_CHARACTERS) {
   const text = String(value || '');
   if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n… ${text.length - limit} additional characters omitted; use the structured diagnostics and bounded source reads.`;
+  // Python's actionable exception is at the end, after the call stack.
+  // Preserve both origin and cause instead of truncating away the actual error.
+  const tailSize = Math.min(900, Math.floor(limit / 2));
+  const headSize = limit - tailSize;
+  return `${text.slice(0, headSize)}\n… ${text.length - limit} characters omitted …\n${text.slice(-tailSize)}`;
 }
 
 function compactValidationDiagnosticsForTool(
   diagnostics: OfficeDocumentDraft['validationDiagnostics'],
 ): NonNullable<OfficeDocumentDraft['validationDiagnostics']> {
   const values = diagnostics || [];
-  return values.map((diagnostic) => ({
-    ...diagnostic,
-    message: compactToolText(diagnostic.message, 1_500),
-  }));
+  return values.map((diagnostic) => {
+    const normalized = isUnoStylePropertyInfoError(diagnostic.message)
+      ? { ...diagnoseOfficeProgramRuntimeError('', diagnostic.message)[0] }
+      : diagnostic;
+    return { ...normalized, message: compactToolText(normalized.message, 1_500) };
+  });
 }
 
 function compactWorkflowForTool(workflow: OfficeDocumentDraft['workflow']) {
@@ -401,6 +447,33 @@ function configuredOfficeGenerator(fileName: string, operation: 'create' | 'modi
   }
   if (configured === 'auto' && javascriptOfficeExtensions.has(extension)) return 'javascript';
   return 'uno';
+}
+
+function semanticGenerationPlan(
+  operation: 'create' | 'modify',
+  generator: OfficeDocumentDraft['generator'],
+  design: ReturnType<typeof officeDesignGuidance>,
+) {
+  const available = operation === 'create' && generator === 'uno';
+  const recommended = available && design.mode === 'template';
+  return {
+    available,
+    schemaVersion: '1.0',
+    defaultTheme: 'clean',
+    defaultLayout: { enabled: true, mode: 'repair', overflow: 'split', imageFit: 'contain' },
+    recommended,
+    ...(available ? {
+      nextAction: recommended ? 'generate' : 'unoApi',
+      input: recommended ? 'spec' : 'program',
+      note: recommended
+        ? 'Semantic generation skips API-catalog authoring; theme tokens may be customized. Fixed geometry is a convenience for conventional files, not a requirement for original design.'
+        : 'Bespoke design should use a custom program so the compiler does not replace composition with fixed templates. Query only the API modules needed for the selected direction.',
+    } : {
+      reason: operation === 'modify'
+        ? 'Existing files preserve their original layout through the raw UNO editing workflow.'
+        : 'This workspace is configured for JavaScript program authoring.',
+    }),
+  };
 }
 
 async function plannedSourceDocument(input: PlanArtifactInput, assets: DocumentAsset[]) {
@@ -648,7 +721,7 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
             : diagnostic.target ? `@${diagnostic.target}` : '';
         const identity = [diagnostic.severity, diagnostic.code].filter(Boolean).join(':') || 'issue';
         const rawMessage = String(diagnostic.message || '');
-        const terminalMessage = diagnostic.code === 'UNO_RUNTIME_ERROR'
+        const terminalMessage = diagnostic.code === 'UNO_RUNTIME_ERROR' || rawMessage.startsWith('Traceback (most recent call last):')
           ? rawMessage.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) || rawMessage
           : rawMessage;
         const message = terminalMessage
@@ -675,7 +748,7 @@ function compactOfficeFailure(payload: ArtifactToolPayload) {
     : [];
   return [
     `error=${error}`,
-    payload.validationFailureCount ? `consecutiveValidationFailures=${payload.validationFailureCount}` : '',
+    payload.validationFailureCount ? `validationFailureCount=${payload.validationFailureCount} (repair sequence; mixed causes, not bridge retries)` : '',
     diagnostics.length ? `diagnostics=${diagnostics.join(' | ')}` : '',
     repairHints.length ? `repairHints=${repairHints.join(' | ')}` : '',
     payload.recoverySuggestion ? `recovery=${String(payload.recoverySuggestion).replace(/\s+/g, ' ').trim().slice(0, 500)}` : '',
@@ -688,7 +761,13 @@ export function officeValidationRepairHints(
 ) {
   const codes = new Set(diagnostics.map((diagnostic) => String(diagnostic.code || '')).filter(Boolean));
   const combinedError = [errorText, ...diagnostics.map((diagnostic) => diagnostic.message || '')].join('\n');
+  if (codes.has('UNO_WORKER_INTERNAL_ERROR') || codes.has('UNO_STYLE_PROPERTY_INFO_MISSING') || isUnoWorkerInternalError(combinedError)) {
+    return ['The renderer failed internally; preserve the current source. Do not edit the draft, query unoApi, or repeat the same render. Report the runtime error and retry only after the renderer is fixed.'];
+  }
   const hints: string[] = [];
+  if (codes.has('OFFICE_ARTIFACT_REOPEN_FAILED')) {
+    hints.push('The file was saved but LibreOffice could not reopen it. A prior DisposedException does not prove a startup failure. Inspect the exported package, relationships and export compatibility; preserve the draft and do not guess source edits or repeatedly restart. Native editability and render validity remain unverified for this output.');
+  }
   if (diagnostics.length > 1) {
     hints.push(`The preflight returned ${diagnostics.length} diagnostics. Put every independent, non-overlapping repair into one Codex-format patch with separate @@ hunks; separate only repairs whose context or dependencies conflict.`);
   }
@@ -697,6 +776,18 @@ export function officeValidationRepairHints(
   }
   if (codes.has('PYTHON_UNDEFINED_NAME')) {
     hints.push('Define the reported name before first use or replace it with the intended existing variable. Repair the exact sourceExcerpt; do not use numbered batch replacement for a local name error.');
+  }
+  if (codes.has('PYTHON_INDEX_OUT_OF_RANGE')) {
+    hints.push('This is a source indexing error, not a UNO bridge startup failure. Compare the data length, loop bounds, and allocated grid/stack cell count. stack(n) returns n cells; grid(columns, rows) returns columns*rows cells. Fix the allocation and dependent geometry together; do not truncate data or suppress the exception.');
+  }
+  if (codes.has('PRESENTATION_TABLE_CELL_OUT_OF_RANGE')) {
+    hints.push('table.set_cell uses zero-based (column, row), while table.merge uses existing A1 addresses. Check both dimensions and preserve the intended data; merging populated cells is a real data/layout change, not a no-op demo.');
+  }
+  if (codes.has('PRESENTATION_ANIMATION_TARGET_INVALID')) {
+    hints.push('animate is supported. Pass the shape object returned by add_shape/select_shape, or an exact selector dictionary; do not pass a bare elementId and do not delete the requested animation.');
+  }
+  if (codes.has('PRESENTATION_MASTER_SELECTOR_INVALID') || codes.has('PRESENTATION_CUSTOM_SHOW_INDEX_INVALID')) {
+    hints.push('Master and custom-show slide indices are one-based, unlike table cell coordinates. Use deck.masters() for exact master selectors and [1] for the first slide in a show. Correct indices without deleting these supported features.');
   }
   if (codes.has('UNO_PYTHON_IMPORT_UNSUPPORTED')) {
     hints.push('Remove the raw UNO import and replace the affected block with a method copied from the corresponding queried facade module. Never substitute enums, structs, constants, or service calls.');
@@ -717,7 +808,7 @@ export function officeValidationRepairHints(
     hints.push('The source mixes point font sizes with an undersized 1/100 mm geometry box. Replace the hand-sized height with deck.text_height()/estimate_text_box(), or use add_text_box/card/footer; keep min_font_size readable.');
   }
   if (codes.has('PRESENTATION_OVERLAP')) {
-    hints.push('The layout preflight returned the complete overlap set for the document. Repair every independent reported pair in one patch, preserving exact source indentation; use allow_overlap=True only for a deliberate overlay.');
+    hints.push('The layout preflight returned the complete overlap set. Repair every independent pair in one patch by reallocating real space: move/resize image and text boxes together, or use a content-specific composition. Do not merely add allow_overlap, relabel content as background/decoration, fade imagery into an unrequested watermark, or shrink important copy to bypass checks. Intentional overlays must belong to the design brief and remain visibly legible in actual QA.');
   }
   if (codes.has('FACADE_METHOD_ON_RAW_UNO_DOCUMENT')) {
     hints.push('Replace the raw document receiver with job.presentation/job.writer/job.spreadsheet and keep every operation on its returned slide, flow-document, or A1 worksheet facade.');
@@ -797,25 +888,27 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
   if (toolName !== 'file') return undefined;
   try {
     const payload = JSON.parse(actual || '{}') as ArtifactToolPayload;
-    if (payload.kind === 'uno-draft-patch-conflict') {
-      return [
-        `Office patch rejected: Document ID: ${payload.documentId}`,
-        `code=${payload.code || 'PATCH_BASE_DIGEST_MISMATCH'}`,
-        payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
-        payload.expectedBaseDigest ? `currentDigest=${payload.expectedBaseDigest}` : '',
-        payload.suppliedBaseDigest ? `suppliedDigest=${payload.suppliedBaseDigest}` : '',
-        payload.error || 'Read the current source and prepare a new patch from the exact returned program.',
-      ].filter(Boolean).join('; ');
-    }
-    if (payload.kind === 'uno-draft-patch-no-changes') {
-      return [
-        `Office patch already satisfied: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}`,
-        `code=${payload.code || 'PATCH_NO_CHANGES'}`,
-        payload.sourceUnitPath ? `sourceUnitPath=${payload.sourceUnitPath}` : '',
-        payload.patchBaseDigest ? `patchBaseDigest=${payload.patchBaseDigest}` : '',
-        payload.validationStatus ? `validationStatus=${payload.validationStatus}` : '',
-        payload.message || payload.error || '',
-      ].filter(Boolean).join('; ');
+    // Edit receipts and conflicts are a protocol, not a prose success summary.
+    // Keep historical partial results readable too; never hide their failed hunks.
+    if (payload.editStatus || payload.patchHunks || payload.kind === 'uno-draft-patch-conflict' || payload.kind === 'uno-draft-patch-no-changes') {
+      return JSON.stringify({
+        kind: payload.kind, code: payload.code, documentId: payload.documentId,
+        editStatus: payload.editStatus, changed: payload.changed, saved: payload.saved,
+        sourceUnitPath: payload.sourceUnitPath, patchBaseDigest: payload.patchBaseDigest,
+        expectedBaseDigest: payload.expectedBaseDigest, suppliedBaseDigest: payload.suppliedBaseDigest,
+        patchHunks: payload.patchHunks, validation: payload.validation || payload.validationStatus,
+        validationEvidence: payload.validationEvidence, sourceRepairRequired: payload.sourceRepairRequired,
+        sourceValidity: payload.sourceValidity, retryable: payload.retryable, retryAfter: payload.retryAfter,
+        diagnostics: payload.diagnostics, repairHints: payload.repairHints,
+        // Diagnostics already contain the actionable errors. Repeating the
+        // same exception as error + workflow.error can exceed the realtime
+        // limit, break its JSON and hide the saved/validation distinction.
+        // The original full result remains in the trace/detail endpoint.
+        workflow: payload.workflow ? { ...payload.workflow, error: undefined } : undefined,
+        message: payload.message, error: payload.diagnostics?.length ? undefined : payload.error,
+        recoverySuggestion: payload.recoverySuggestion,
+        nextAction: payload.nextAction,
+      });
     }
     if (payload.kind === 'document-plan') {
       const assets = Array.isArray((payload as Record<string, unknown>).availableAssets)
@@ -823,7 +916,17 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
           .map((asset) => typeof asset.assetName === 'string' ? asset.assetName : '')
           .filter(Boolean)
         : [];
-      return `Document planned: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; operation=${payload.operation || 'create'}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}; Mounted conversation assets: ${assets.length ? assets.join(', ') : '(none)'}. Use only these exact names with the returned cookbook asset API.`;
+      // Routing and design decisions must survive the model-facing compaction.
+      // Do not turn this back into an identity-only string or include the draft source.
+      return JSON.stringify({
+        kind: payload.kind, documentId: payload.documentId, fileName: payload.fileName,
+        documentType: payload.documentType, operation: payload.operation || 'create',
+        generator: payload.generator || 'uno', sourceCharacters: payload.sourceCharacters || 0,
+        sourceFileName: payload.sourceFileName, sourceDocument: payload.sourceDocument,
+        semanticGeneration: payload.semanticGeneration, design: payload.design,
+        designGuidance: payload.designGuidance, workflow: payload.workflow,
+        reused: payload.reused, instruction: payload.instruction, availableAssets: assets,
+      });
     }
     if (payload.kind === 'uno-program' || payload.kind === 'office-program') {
       return `Office source updated: ${payload.fileName || 'artifact'}; Document ID: ${payload.documentId}; generator=${payload.generator || 'uno'}; sourceCharacters=${payload.sourceCharacters || 0}`;
@@ -861,6 +964,11 @@ export function formatFileArtifactResult(toolName: string, actual?: string) {
       targetLine,
       payload.url && payload.url !== target ? `Open: ${payload.url}` : '',
       typeof payload.bytes === 'number' ? `size=${payload.bytes} bytes` : '',
+      payload.kind === 'download' && /\.(?:png|jpe?g|webp|gif|avif|bmp|svg)$/i.test(fileName)
+        ? `Asset identity is NOT verified by its filename or a successful download. Before placing it, call readContent with artifactId=${payload.artifactId}, includeVisuals=true, and inspect the pixels. Verify subject/brand and aspect ratio; never label a generic or unrelated image as the requested product.`
+        : payload.kind === 'download' && /\.pdf$/i.test(fileName)
+          ? `Document text has not been read. Use readContent with artifactId=${payload.artifactId} for extracted evidence; do not decode PDF bytes as source text.`
+          : '',
       compactAutomaticValidation(payload),
       compactVisualVerification(payload),
     ].filter(Boolean).join('; ');
@@ -888,7 +996,7 @@ function draftLockPath(runId: string | undefined, documentId: string) {
   return path.join(artifactDir(runId, 'document-drafts'), `${sanitizeFileName(documentId, 'document')}.lock`);
 }
 
-function requireDocumentId(value: string | undefined, action: 'read' | 'generate' | 'edit' | 'render') {
+function requireDocumentId(value: string | undefined, action: 'readSource' | 'generate' | 'edit' | 'render') {
   const documentId = String(value || '').trim();
   if (!DOCUMENT_ID_PATTERN.test(documentId)) {
     throw new Error(`file action=${action} requires the stable documentId returned by action=plan.`);
@@ -915,7 +1023,7 @@ async function resolveEditDocumentId(
   const candidates = drafts.map((draft) => draft.documentId).join(', ') || '(none)';
   throw new Error(
     `file action=edit could not infer documentId because this conversation has ${drafts.length} editable drafts: ${candidates}. `
-    + 'Copy documentId from the latest action=read result.',
+    + 'Copy documentId from list or the latest readSource result; artifactId is not a source identity.',
   );
 }
 
@@ -1106,6 +1214,7 @@ export type OfficeDraftCatalogEntry = {
   validatedSourceDigest: string | null;
   validationStatus: OfficeDocumentDraft['validationStatus'] | null;
   validationFailureCount: number;
+  validationEvidence?: ReturnType<typeof officeValidationEvidence>;
   renderedDigest: string | null;
   visualQaDigest: string | null;
   visualQaFailedPages?: number[];
@@ -1126,6 +1235,7 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
     throw error;
   }
   const catalog: OfficeDraftCatalogEntry[] = [];
+  const workerDigest = await currentUnoWorkerDigest();
   for (const entry of entries) {
     if (!entry.isFile() || entry.name.startsWith('.') || !entry.name.endsWith('.json')) continue;
     const documentId = entry.name.slice(0, -'.json'.length);
@@ -1142,6 +1252,7 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
         validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || null,
         validationFailureCount: draft.validationFailureCount || 0,
+        validationEvidence: officeValidationEvidence(draft, workerDigest),
         renderedDigest: draft.renderedDigest || null,
         visualQaDigest: draft.visualQaDigest || null,
         visualQaFailedPages: failedReviews.map((review) => review.pageNumber),
@@ -1163,7 +1274,9 @@ export async function listOfficeDraftCatalog(runId: string | undefined): Promise
 export async function listOfficeDrafts(input: { runId?: string }): Promise<FileArtifactOperationResult> {
   try {
     const drafts = await listOfficeDraftCatalog(input.runId);
-    return { ok: true, actual: JSON.stringify({ kind: 'office-draft-catalog', drafts }) };
+    return { ok: true, actual: JSON.stringify({ kind: 'office-draft-catalog', drafts: drafts.map((draft) => ({
+      ...draft, sourceRead: { action: 'readSource', documentId: draft.documentId },
+    })) }) };
   } catch (error) {
     return { ok: false, actual: `Office draft list failed: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -1173,9 +1286,11 @@ export async function officeDraftCatalogForPrompt(runId: string | undefined) {
   const drafts = await listOfficeDraftCatalog(runId);
   if (!drafts.length) return '';
   return [
-    '[Current Office draft catalog - trusted runtime metadata]',
+    '[Current Office draft catalog - saved validation may be historical]',
     'Resume an existing logical document with its exact documentId. Do not guess an ID or create a replacement unless the user explicitly requests a new document.',
-    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | validationFailureCount=${draft.validationFailureCount} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | visualQaDeckStatus=${draft.visualQaDeckStatus || 'none'}${draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? ` | visualQaFailedPages=${draft.visualQaFailedPages?.join(',') || 'none'} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
+    'For source/diagnostics: file(action=readSource, documentId=...). Read one code window, then edit. readContent + artifactId reads the finished file, NOT its source. Digests listed below are state metadata; get edit.baseDigest from readSource.patchBaseDigest.',
+    'validationFailureCount counts failed validations in the repair sequence, possibly with different sources/causes. It is NOT a bridge retry count. validationEvidence freshness=stale/unknown cannot justify a current infrastructure blocker: on task resumption, obtain one fresh render result, then act on that result without unchanged retry loops. A current source-unit check is not full-document validation.',
+    ...drafts.slice(0, 100).map((draft) => `- documentId=${draft.documentId} | type=${draft.documentType} | file=${JSON.stringify(draft.fileName)} | state=${draft.state} | validationStatus=${draft.validationStatus || 'none'} | validationEvidence=${JSON.stringify(draft.validationEvidence ? { freshness: draft.validationEvidence.freshness, reason: draft.validationEvidence.reason, checkedAt: draft.validationEvidence.checkedAt, scope: draft.validationEvidence.scope, stage: draft.validationEvidence.stage } : null)} | validationFailureCount=${draft.validationFailureCount} | sourceDigest=${draft.sourceDigest || 'none'} | validatedSourceDigest=${draft.validatedSourceDigest || 'none'} | renderedDigest=${draft.renderedDigest || 'none'} | visualQaDigest=${draft.visualQaDigest || 'none'} | visualQaDeckStatus=${draft.visualQaDeckStatus || 'none'}${draft.visualQaFailedPages?.length || draft.visualQaDeckStatus === 'failed' ? ` | visualQaFailedPages=${draft.visualQaFailedPages?.join(',') || 'none'} | visualQaFailures=${JSON.stringify(draft.visualQaFailureSummary || [])}` : ''} | updatedAt=${draft.updatedAt}`),
   ].join('\n');
 }
 
@@ -1251,8 +1366,12 @@ type ParsedSourceUnit = {
   symbolName?: string;
 };
 
-const LARGE_SOURCE_LINE_THRESHOLD = 300;
-const MAX_SOURCE_READ_LINES = 240;
+// Office generators often contain dense Python statements. Large source
+// windows can consume tens of thousands of model tokens and trigger a loop in
+// which context compaction discards the source before the edit is submitted.
+// Keep reads small and stream repairs as one bounded read followed by one edit.
+const LARGE_SOURCE_LINE_THRESHOLD = 120;
+const MAX_SOURCE_READ_LINES = 80;
 const SOURCE_UNIT_START = /^\s*(?:#|\/\/)\s*@webpilot-unit\s+([A-Za-z0-9][A-Za-z0-9._/-]{0,159})\s*$/;
 const SOURCE_UNIT_END = /^\s*(?:#|\/\/)\s*@webpilot-endunit\s*$/;
 
@@ -1626,7 +1745,7 @@ function draftSourceLineCount(source: string) {
 
 // TypeScript port of OpenAI Codex's Apache-2.0 apply-patch algorithm:
 // codex-rs/apply-patch/src/{parser,seek_sequence,file_update}.rs. The Office
-// tool uses the same grammar and matching order without invoking Codex itself.
+// tool retains the grammar, but requires unique exact matches on one snapshot.
 type CodexDraftPatchChunk = {
   changeContext?: string;
   contextLineIndices: Array<[number, number]>;
@@ -1728,59 +1847,67 @@ function codexDraftPatchChunkHasChange(chunk: CodexDraftPatchChunk) {
     || chunk.oldLines.some((line, index) => line !== chunk.newLines[index]);
 }
 
-function normalizeCodexPatchMatchLine(value: string) {
-  return value.trim().replace(/[‐‑‒–—―−]/g, '-').replace(/[‘’‚‛]/g, "'")
-    .replace(/[“”„‟]/g, '"').replace(/[            　]/g, ' ');
-}
-
-/** Port of Codex apply-patch seek_sequence: exact, rstrip, trim, Unicode-normalized. */
-function seekCodexPatchSequence(lines: string[], pattern: string[], start: number, eof: boolean) {
+/** Whitespace and punctuation are source, not normalization opportunities. */
+function seekCodexPatchSequence(lines: string[], pattern: string[], start: number, eof: boolean, end = lines.length) {
   if (!pattern.length) return start;
-  if (pattern.length > lines.length) return undefined;
-  const finalStart = Math.max(0, lines.length - pattern.length);
-  const searchStart = eof ? Math.max(start, finalStart) : start;
-  const upper = lines.length - pattern.length;
-  const find = (normalize: (value: string) => string) => {
-    for (let index = searchStart; index <= upper; index += 1) {
-      if (pattern.every((line, offset) => normalize(lines[index + offset]) === normalize(line))) return index;
+  const upper = end - pattern.length;
+  const searchStart = eof ? Math.max(start, lines.length - pattern.length) : start;
+  let found: number | undefined;
+  for (let index = searchStart; index <= upper; index += 1) {
+    if (pattern.every((line, offset) => lines[index + offset] === line)) {
+      if (found !== undefined) {
+        throw new Error(`PATCH_TARGET_AMBIGUOUS: exact matches on lines ${found + 1} and ${index + 1}. Include more unchanged context or use a readSource source-unit path. Nothing was saved.`);
+      }
+      found = index;
     }
-    return undefined;
-  };
-  return find((value) => value)
-    ?? find((value) => value.trimEnd())
-    ?? find((value) => value.trim())
-    ?? find(normalizeCodexPatchMatchLine);
+  }
+  return found;
 }
 
 type CodexDraftReplacement = [start: number, oldLength: number, newLines: string[]];
 
 function codexDraftPatchReplacements(originalLines: string[], chunks: CodexDraftPatchChunk[]) {
   const replacements: CodexDraftReplacement[] = [];
-  let lineIndex = 0;
   for (const chunk of chunks) {
+    let lineIndex = 0;
+    let scopeEnd = originalLines.length;
     if (chunk.changeContext !== undefined) {
       const contextIndex = seekCodexPatchSequence(originalLines, [chunk.changeContext], lineIndex, false);
       if (contextIndex === undefined) throw new Error(`Failed to find patch context '${chunk.changeContext}' in draft.py.`);
       lineIndex = contextIndex + 1;
+      // A Python function/class anchor cannot drift into a later declaration.
+      if (/^\s*(?:async\s+def|def|class)\s/.test(chunk.changeContext)) {
+        const indent = chunk.changeContext.match(/^[\t ]*/)?.[0].length || 0;
+        for (let index = lineIndex; index < originalLines.length; index += 1) {
+          const line = originalLines[index];
+          if (line.trim() && !line.trimStart().startsWith('#') && (line.match(/^[\t ]*/)?.[0].length || 0) <= indent) {
+            scopeEnd = index;
+            break;
+          }
+        }
+      }
     }
     if (!chunk.oldLines.length) {
+      if (chunk.changeContext !== undefined) {
+        throw new Error('PATCH_INSERTION_ANCHOR_REQUIRED: include the exact anchor as an unchanged hunk line for an insertion. A context-free insertion only appends at EOF.');
+      }
       replacements.push([originalLines.length, 0, [...chunk.newLines]]);
       continue;
     }
     let pattern = chunk.oldLines;
     let newLines = chunk.newLines;
-    let startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
-    if (startIndex === undefined && pattern.at(-1) === '') {
+    let startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile, scopeEnd);
+    if (startIndex === undefined && pattern.length > 1 && pattern.at(-1) === '') {
       pattern = pattern.slice(0, -1);
       if (newLines.at(-1) === '') newLines = newLines.slice(0, -1);
-      startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, chunk.isEndOfFile);
+      // An EOF newline is not an extra blank source line. Never drop a blank in the middle.
+      startIndex = seekCodexPatchSequence(originalLines, pattern, lineIndex, true, scopeEnd);
     }
     if (startIndex === undefined) {
-      throw new Error(`Failed to find expected lines in draft.py:\n${chunk.oldLines.join('\n')}`);
+      throw new Error('PATCH_TARGET_NOT_FOUND: copy the exact current program, including indentation and punctuation. No fuzzy match or already-applied guess was used.');
     }
 
-    // Codex's preserve-line-endings mode leaves context lines in place. This
-    // also guarantees that fuzzy context matching cannot rewrite indentation.
+    // Leave unchanged context in place so neighboring hunks may share context.
     let oldStart = 0;
     let newStart = 0;
     for (const [oldContext, newContext] of chunk.contextLineIndices) {
@@ -1798,57 +1925,46 @@ function codexDraftPatchReplacements(originalLines: string[], chunks: CodexDraft
     if (oldStart !== pattern.length || newStart !== newLines.length) {
       replacements.push([startIndex + oldStart, pattern.length - oldStart, newLines.slice(newStart)]);
     }
-    lineIndex = startIndex + pattern.length;
   }
   return replacements.sort((left, right) => left[0] - right[0]);
 }
 
-function applyCodexDraftPatchUpdate(source: string, chunks: CodexDraftPatchChunk[]) {
-  const hasFinalNewline = source.endsWith('\n');
-  const lines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
-  const replacements = codexDraftPatchReplacements(lines, chunks);
-  const changedLineCount = replacements.reduce(
-    (total, [, oldLength, newLines]) => total + Math.max(oldLength, newLines.length),
-    0,
-  );
-  for (const [start, oldLength, newLines] of [...replacements].reverse()) {
-    lines.splice(start, oldLength, ...newLines);
-  }
-  return {
-    changedLineCount,
-    source: `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`,
-  };
-}
-
-/** Apply Codex's file-oriented patch algorithm atomically in memory. */
+/** Strict atomic wrapper, also used by direct callers. */
 export function applyUnoDraftPatch(source: string, patchText: string) {
-  const normalized = normalizedDraftSource(source);
-  let edited = normalized;
-  let changedLineCount = 0;
-  const updates = parseCodexDraftPatch(patchText);
-  const noOpHunkIndex = updates.flat().findIndex((chunk) => !codexDraftPatchChunkHasChange(chunk));
-  if (noOpHunkIndex >= 0) {
-    throw new Error(
-      `Patch hunk ${noOpHunkIndex + 1} contains only context and no change. `
-      + "Replacement requires at least one '-old' line and one '+new' line; insertion requires a '+new' line; deletion requires a '-old' line.",
-    );
-  }
-  for (const chunks of updates) {
-    const update = applyCodexDraftPatchUpdate(edited, chunks);
-    edited = update.source;
-    changedLineCount += update.changedLineCount;
-  }
-  if (edited === normalized) throw new Error('Codex patch completed without changing draft.py.');
-  if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
-    throw new Error('Near-complete source replacement through one edit is blocked. Keep the same draft and split the repair into focused Codex-format hunks based on the latest read.');
-  }
-  return edited;
+  const result = applyUnoDraftPatchHunks(source, patchText);
+  if (result.failedHunks.length) throw new Error(result.failedHunks.map((failure) => `hunk ${failure.hunk}: ${failure.error}`).join('\n'));
+  return result.source;
 }
 
 export type UnoDraftPatchHunkFailure = {
   hunk: number;
   error: string;
+  sourceContext?: { startLine: number; endLine: number; lineNumberBasis: string; content: string };
 };
+
+/** Diagnostic only: a unique unchanged line can locate a small recovery window,
+ * but it must never authorize an approximate source replacement. */
+function replacementConflictSourceContext(source: string, oldText: string) {
+  const lines = source.split('\n');
+  const requested = oldText.split('\n');
+  for (const [offset, line] of requested.entries()) {
+    const anchor = line.trim();
+    if (anchor.length < 16) continue;
+    const matches = lines.flatMap((candidate, index) => candidate.trim() === anchor ? [index] : []);
+    if (matches.length !== 1) continue;
+    const start = Math.max(0, matches[0] - Math.min(offset, 4));
+    const window: string[] = [];
+    for (const candidate of lines.slice(start, start + 12)) {
+      if (window.join('\n').length + candidate.length > 1800) break;
+      window.push(candidate);
+    }
+    if (!window.length) return undefined;
+    return { startLine: start + 1, endLine: start + window.length,
+      lineNumberBasis: '1-based within the requested source unit, or the full draft when no path was supplied',
+      content: window.join('\n') };
+  }
+  return undefined;
+}
 
 export type UnoDraftPatchResult = {
   source: string;
@@ -1857,154 +1973,170 @@ export type UnoDraftPatchResult = {
   failedHunks: UnoDraftPatchHunkFailure[];
   ignoredHunks: number;
   totalHunks: number;
+  blockedHunks: number[];
 };
 
-type ExecutableCodexDraftPatchChunk = {
-  chunk: CodexDraftPatchChunk;
-  hunk: number;
-};
-
-function recoverContextPairDraftPatchChunks(
-  source: string,
-  chunks: CodexDraftPatchChunk[],
-): ExecutableCodexDraftPatchChunk[] | undefined {
-  if (!chunks.length || chunks.length % 2 !== 0) return undefined;
-  const hasFinalNewline = source.endsWith('\n');
-  const sourceLines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
-  const recovered: ExecutableCodexDraftPatchChunk[] = [];
-  for (let index = 0; index < chunks.length; index += 2) {
-    const before = chunks[index];
-    const after = chunks[index + 1];
-    if (codexDraftPatchChunkHasChange(before) || codexDraftPatchChunkHasChange(after)) return undefined;
-    if (!before.oldLines.length || !after.oldLines.length) return undefined;
-    if (
-      before.oldLines.length === after.oldLines.length
-      && before.oldLines.every((line, lineIndex) => line === after.oldLines[lineIndex])
-    ) return undefined;
-    let searchStart = 0;
-    if (before.changeContext !== undefined) {
-      const contextIndex = seekCodexPatchSequence(sourceLines, [before.changeContext], 0, false);
-      if (contextIndex === undefined) return undefined;
-      searchStart = contextIndex + 1;
-    }
-    const beforeExists = seekCodexPatchSequence(
-      sourceLines,
-      before.oldLines,
-      searchStart,
-      before.isEndOfFile,
-    ) !== undefined;
-    const afterExists = seekCodexPatchSequence(
-      sourceLines,
-      after.oldLines,
-      searchStart,
-      after.isEndOfFile,
-    ) !== undefined;
-    if (!beforeExists && !afterExists) return undefined;
-    recovered.push({
-      chunk: {
-        changeContext: before.changeContext,
-        contextLineIndices: [],
-        isEndOfFile: before.isEndOfFile || after.isEndOfFile,
-        oldLines: [...before.oldLines],
-        newLines: [...after.oldLines],
-      },
-      hunk: index + 1,
-    });
-  }
-  return recovered;
+function sourceEditRangesOverlap(a: { start: number; end: number }, b: { start: number; end: number }) {
+  // Insertions on a replacement boundary have ambiguous ordering; require one combined edit.
+  if (a.start === a.end) return a.start >= b.start && a.start <= b.end;
+  if (b.start === b.end) return b.start >= a.start && b.start <= a.end;
+  return a.start < b.end && b.start < a.end;
 }
 
-function codexDraftPatchChunkAlreadyApplied(source: string, chunk: CodexDraftPatchChunk) {
-  const hasFinalNewline = source.endsWith('\n');
-  const lines = (hasFinalNewline ? source.slice(0, -1) : source).split('\n');
-  let searchStart = 0;
-  if (chunk.changeContext !== undefined) {
-    const contextIndex = seekCodexPatchSequence(lines, [chunk.changeContext], 0, false);
-    if (contextIndex === undefined) return false;
-    searchStart = contextIndex + 1;
-  }
-  let oldPattern = chunk.oldLines;
-  if (oldPattern.at(-1) === '') oldPattern = oldPattern.slice(0, -1);
-  if (oldPattern.length && seekCodexPatchSequence(lines, oldPattern, searchStart, chunk.isEndOfFile) !== undefined) {
-    return false;
-  }
-  let newPattern = chunk.newLines;
-  if (newPattern.at(-1) === '') newPattern = newPattern.slice(0, -1);
-  if (!newPattern.length) return false;
-  return seekCodexPatchSequence(lines, newPattern, searchStart, chunk.isEndOfFile) !== undefined;
-}
-
-/**
- * Apply a syntactically valid Codex patch one @@ hunk at a time. This keeps the
- * Codex parser, seek order, fuzzy matching, and whitespace-preserving replacement
- * algorithm while preventing one stale independent hunk from rolling back every
- * other repair in the model's batch.
- */
+/** Locate ALL hunks on the original snapshot, then commit ALL or NONE. */
 export function applyUnoDraftPatchHunks(source: string, patchText: string): UnoDraftPatchResult {
   const normalized = normalizedDraftSource(source);
-  let edited = normalized;
-  let changedLineCount = 0;
-  let appliedHunks = 0;
-  let alreadyAppliedHunks = 0;
+  const hasFinalNewline = normalized.endsWith('\n');
+  const lines = normalized ? (hasFinalNewline ? normalized.slice(0, -1) : normalized).split('\n') : [];
+  const candidates: Array<{ start: number; end: number; newLines: string[]; hunk: number }> = [];
   const failedHunks: UnoDraftPatchHunkFailure[] = [];
   const parsedChunks = parseCodexDraftPatch(patchText).flat();
   const changedChunks = parsedChunks
     .map((chunk, index) => ({ chunk, hunk: index + 1 }))
     .filter(({ chunk }) => codexDraftPatchChunkHasChange(chunk));
-  const recoveredContextPairs = changedChunks.length
-    ? undefined
-    : recoverContextPairDraftPatchChunks(normalized, parsedChunks);
-  if (!changedChunks.length && !recoveredContextPairs) {
+  if (changedChunks.length !== parsedChunks.length) {
+    const hunk = parsedChunks.findIndex((chunk) => !codexDraftPatchChunkHasChange(chunk)) + 1;
     throw new Error(
-      'Patch contains only matching context and no unambiguous source change. '
-      + "Use '-old' plus '+new' for replacement, '+new' for insertion, or '-old' for deletion; "
-      + 'the editor also accepts consecutive context-only @@ blocks when they form complete old/new pairs.',
+      `PATCH_MISSING_CHANGE_MARKERS: hunk ${hunk} has no source change. No hunks were saved. `
+      + "Use '-old' and '+new' in the SAME @@ hunk, followed by the full source indentation. "
+      + 'Two context-only @@ blocks are NOT an old/new replacement. '
+      + 'For indentation repairs use replacements: [{oldText: exact current source, newText: corrected source}] instead of patch. '
+      + 'Do not add comments just to force a byte change.',
     );
   }
-  const executableChunks = recoveredContextPairs || changedChunks;
-  const ignoredHunks = recoveredContextPairs ? 0 : parsedChunks.length - executableChunks.length;
-  executableChunks.forEach(({ chunk, hunk }) => {
+  changedChunks.forEach(({ chunk, hunk }) => {
     try {
-      const update = applyCodexDraftPatchUpdate(edited, [chunk]);
-      if (update.source === edited) throw new Error('Hunk completed without changing draft.py.');
-      edited = update.source;
-      changedLineCount += update.changedLineCount;
-      appliedHunks += 1;
-    } catch (error) {
-      if (codexDraftPatchChunkAlreadyApplied(edited, chunk)) {
-        alreadyAppliedHunks += 1;
-        return;
+      for (const [start, oldLength, newLines] of codexDraftPatchReplacements(lines, [chunk])) {
+        candidates.push({ start, end: start + oldLength, newLines, hunk });
       }
+    } catch (error) {
       failedHunks.push({
         hunk,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   });
-  if (!appliedHunks && !alreadyAppliedHunks && !ignoredHunks) {
-    const detail = failedHunks.map((failure) => `hunk ${failure.hunk}: ${failure.error}`).join('\n');
-    throw new Error(detail || 'Codex patch completed without changing draft.py.');
+  const overlapping = new Set<number>();
+  for (let i = 0; i < candidates.length; i += 1) {
+    for (let j = i + 1; j < candidates.length; j += 1) {
+      if (sourceEditRangesOverlap(candidates[i], candidates[j])) {
+        overlapping.add(candidates[i].hunk);
+        overlapping.add(candidates[j].hunk);
+      }
+    }
   }
+  for (const hunk of overlapping) failedHunks.push({ hunk, error: 'PATCH_TARGET_OVERLAP: combine changes to the same source range into one hunk. No hunks were saved.' });
+  if (failedHunks.length) return {
+    source: normalized, appliedHunks: 0, alreadyAppliedHunks: 0, failedHunks, ignoredHunks: 0, totalHunks: parsedChunks.length,
+    blockedHunks: changedChunks.filter(({ hunk }) => !failedHunks.some((failure) => failure.hunk === hunk)).map(({ hunk }) => hunk),
+  };
+  const changedLineCount = candidates.reduce((sum, item) => sum + Math.max(item.end - item.start, item.newLines.length), 0);
   if (changedLineCount >= 100 && changedLineCount / Math.max(1, draftSourceLineCount(normalized)) >= 0.6) {
     throw new Error('Near-complete source replacement through one edit is blocked. Keep the same draft and split the repair into focused Codex-format hunks based on the latest read.');
   }
+  for (const item of candidates.sort((a, b) => b.start - a.start)) lines.splice(item.start, item.end - item.start, ...item.newLines);
   return {
-    source: edited,
-    appliedHunks,
-    alreadyAppliedHunks,
+    source: `${lines.join('\n')}${hasFinalNewline ? '\n' : ''}`,
+    appliedHunks: changedChunks.length,
+    alreadyAppliedHunks: 0,
     failedHunks,
-    ignoredHunks,
+    ignoredHunks: 0,
     totalHunks: parsedChunks.length,
+    blockedHunks: [],
   };
+}
+
+/** Exact replacements avoid diff-marker/indentation ambiguity. Match one snapshot. */
+export function applyUnoDraftReplacements(
+  source: string,
+  replacements: Array<{ oldText: string; newText: string }>,
+): UnoDraftPatchResult {
+  const normalized = normalizedDraftSource(source);
+  if (!Array.isArray(replacements) || !replacements.length || replacements.length > 50
+    || replacements.some((item) => !item || typeof item.oldText !== 'string' || !item.oldText.length || typeof item.newText !== 'string')
+    || replacements.reduce((sum, item) => sum + item.oldText.length + item.newText.length, 0) > 200_000) {
+    throw new Error('replacements requires 1-50 oldText/newText pairs, nonempty oldText, at most 200000 total characters.');
+  }
+  const positions = (text: string) => {
+    const found: number[] = [];
+    for (let start = 0; text && start <= normalized.length - text.length;) {
+      const index = normalized.indexOf(text, start);
+      if (index < 0) break;
+      start = index + 1;
+      // Three leading spaces must not match inside a four-space indent.
+      const lineStart = normalized.lastIndexOf('\n', index - 1) + 1;
+      if (/^[\t ]/.test(text) && index > lineStart && /^[\t ]*$/.test(normalized.slice(lineStart, index))) continue;
+      found.push(index);
+      if (found.length > 1) break;
+    }
+    return found;
+  };
+  const failedHunks: UnoDraftPatchHunkFailure[] = [];
+  let alreadyAppliedHunks = 0;
+  const candidates: Array<{ start: number; end: number; text: string; hunk: number }> = [];
+  replacements.forEach((item, index) => {
+    const hunk = index + 1;
+    const oldText = normalizedDraftSource(item.oldText);
+    const newText = normalizedDraftSource(item.newText);
+    const found = positions(oldText);
+    if (found.length !== 1) {
+      const sourceContext = failedHunks.length < 3 ? replacementConflictSourceContext(normalized, oldText) : undefined;
+      failedHunks.push({ hunk, error: found.length
+        ? 'OLD_TEXT_AMBIGUOUS: include surrounding unchanged source until oldText matches exactly once.'
+        : 'OLD_TEXT_NOT_FOUND: copy oldText from the exact source, preserving indentation and quote/backslash characters. JSON transport escapes are not extra characters in the Python source. Use sourceContext below when sufficient; otherwise read only the missing local window. No fuzzy matching is performed.',
+        ...(sourceContext ? { sourceContext } : {}) });
+    } else if (oldText === newText) {
+      alreadyAppliedHunks += 1;
+    } else {
+      candidates.push({ start: found[0], end: found[0] + oldText.length, text: newText, hunk });
+    }
+  });
+  const overlapping = new Set<number>();
+  for (let i = 0; i < candidates.length; i += 1) {
+    for (let j = i + 1; j < candidates.length; j += 1) {
+      if (sourceEditRangesOverlap(candidates[i], candidates[j])) {
+        overlapping.add(candidates[i].hunk);
+        overlapping.add(candidates[j].hunk);
+      }
+    }
+  }
+  for (const hunk of overlapping) failedHunks.push({ hunk, error: 'OVERLAPPING_REPLACEMENTS: combine overlapping changes into a single oldText/newText pair.' });
+  if (failedHunks.length) return {
+    source: normalized, appliedHunks: 0, alreadyAppliedHunks, failedHunks, ignoredHunks: 0, totalHunks: replacements.length,
+    blockedHunks: candidates.filter((item) => !overlapping.has(item.hunk)).map((item) => item.hunk),
+  };
+  const applicable = candidates;
+  let edited = normalized;
+  let changedLines = 0;
+  for (const item of applicable.sort((a, b) => b.start - a.start)) {
+    changedLines += Math.max(draftSourceLineCount(normalized.slice(item.start, item.end)), draftSourceLineCount(item.text));
+    edited = edited.slice(0, item.start) + item.text + edited.slice(item.end);
+  }
+  if (changedLines >= 100 && changedLines / draftSourceLineCount(normalized) >= 0.6) {
+    throw new Error('Near-complete source replacement is blocked. Use focused replacements from the latest readSource.');
+  }
+  if (!applicable.length && !alreadyAppliedHunks) {
+    throw new Error(failedHunks.map((item) => `replacement ${item.hunk}: ${item.error}`).join('\n'));
+  }
+  return { source: edited, appliedHunks: applicable.length, alreadyAppliedHunks, failedHunks, ignoredHunks: 0, totalHunks: replacements.length, blockedHunks: [] };
 }
 
 async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<FileArtifactOperationResult> {
   try {
     const documentId = String(input.documentId || '').trim();
-    if (!documentId) return { ok: false, actual: 'file action=read requires documentId when reading an Office source draft.' };
+    if (!documentId) return { ok: false, actual: 'file action=readSource requires documentId. To inspect file text/data instead, use readContent with artifactId or attachmentId.' };
     const draft = await loadDraft(input.runId, documentId);
     if (!draft.program) return { ok: false, actual: `Office draft ${documentId} has no source yet; call action=generate first.` };
-    const units = sourceUnitsForDraft(draft.program, draft);
+    let units: ParsedSourceUnit[] = [];
+    let sourceIndexError: string | undefined;
+    try {
+      units = sourceUnitsForDraft(draft.program, draft);
+    } catch (error) {
+      sourceIndexError = error instanceof Error ? error.message : String(error);
+      if (!/^(?:Office source unit |Duplicate Office source unit path:)/.test(sourceIndexError)) throw error;
+      // A broken optional index must not make the actual source unreadable.
+      // Keep validation strict, but allow exact global-window repairs.
+    }
     const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
     const requestedUnit = sourceUnitForRequestedPath(units, requestedPath);
     const hasBoundedFallback = Boolean(
@@ -2058,37 +2190,43 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<FileArtif
     const returnedSource = omitLargeProgram
       ? ''
       : readableLines.slice(localRangeStart - 1, localRangeEnd).join('\n');
+    const diagnostics = draft.validationDiagnostics || [];
     return {
       ok: true,
       actual: JSON.stringify({
         kind: 'uno-draft',
+        readKind: 'source',
+        sourceIndexError,
+        sourceIndexRecovery: sourceIndexError
+          ? 'Source-unit markers are malformed. Read/edit by global startLine/endLine without path using patchBaseDigest; repair the markers. The source buffer is still available and no render is required.'
+          : undefined,
+        sourceLanguage: draft.generator === 'javascript' ? 'javascript' : 'python',
         documentId: draft.documentId,
-        documentType: draft.documentType,
-        fileName: draft.fileName,
-        operation: draft.operation || 'create',
-        generator: draft.generator || 'uno',
         sourceFileName: path.basename(draftProgramPath(input.runId, documentId, draft.generator)),
-        sourceDocument: draft.sourceDocument ? {
-          attachmentId: draft.sourceDocument.attachmentId,
-          assetName: draft.sourceDocument.assetName,
-          fileName: draft.sourceDocument.fileName,
-        } : undefined,
-        sourceDigest: sourceDigest(readableSource),
+        // Recover the brief after compaction without replaying it on every bounded code read.
+        design: !explicitRange && !requestedUnit ? draft.design : undefined,
         sourceUnitDigest: requestedUnit ? sourceDigest(readableSource) : undefined,
         // A patch is optimistic-concurrency controlled against the complete
         // draft, even when the read was scoped to one unit. edit accepts this
         // digest both with and without the optional source-unit path.
         patchBaseDigest: sourceDigest(draft.program),
-        validatedSourceDigest: draft.validatedSourceDigest || null,
         validationStatus: draft.validationStatus || 'pending',
+        validationEvidence: officeValidationEvidence(draft, await currentUnoWorkerDigest()),
         validationFailureCount: draft.validationFailureCount || 0,
-        validationDiagnostics: compactValidationDiagnosticsForTool(draft.validationDiagnostics),
-        workflow: compactWorkflowForTool(draft.workflow),
+        validationFailureCountMeaning: 'Failed validations in this repair sequence; may have different causes/source versions. Not a count of bridge startup failures.',
+        diagnosticCounts: {
+          errors: diagnostics.filter((item) => item.severity === 'error').length,
+          warnings: diagnostics.filter((item) => item.severity === 'warning').length,
+        },
+        // Reading code is not a replay of the full document validation report.
+        // Keep saved diagnostics available explicitly, including genuine errors.
+        validationDiagnostics: input.includeDiagnostics === true
+          ? compactValidationDiagnosticsForTool(diagnostics) : undefined,
         sourceUnitPath: requestedUnit?.path,
         requestedPathIgnored: hasBoundedFallback ? requestedPath : undefined,
         sourceUnitKind: requestedUnit?.kind,
         sourceUnitGlobalLines: requestedUnit ? { startLine: requestedUnit.startLine, endLine: requestedUnit.endLine } : undefined,
-        sourceUnitCount: units.length,
+        sourceUnitCount: !explicitRange && !requestedUnit ? units.length : undefined,
         sourceUnits: !explicitRange && !requestedUnit
           ? units.map((unit) => ({
             inferred: unit.inferred === true,
@@ -2100,6 +2238,16 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<FileArtif
           }))
           : undefined,
         lineCount: totalReadableLines,
+        returnedLineCount: omitLargeProgram ? 0 : localRangeEnd - localRangeStart + 1,
+        requestedRangeTruncated: !omitLargeProgram && rangeEnd < requestedRangeEnd,
+        nextRead: !omitLargeProgram && rangeEnd < requestedRangeEnd ? {
+          action: 'readSource', documentId: draft.documentId,
+          ...(requestedUnit ? { path: requestedUnit.path } : {}),
+          startLine: requestedUnit && !unitRelativeRange ? localRangeEnd + 1 : rangeEnd + 1,
+          endLine: requestedUnit && !unitRelativeRange
+            ? Math.min(localRangeEnd + MAX_SOURCE_READ_LINES, totalReadableLines)
+            : Math.min(rangeEnd + MAX_SOURCE_READ_LINES, requestedRangeEnd),
+        } : undefined,
         programOmitted: omitLargeProgram || undefined,
         sourceLineRange: omitLargeProgram ? undefined : {
           startLine: rangeStart,
@@ -2112,9 +2260,11 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<FileArtif
         },
         readGuidance: omitLargeProgram
           ? `This ${totalReadableLines}-line ${requestedUnit ? 'source unit' : 'draft'} is too large for an unbounded read. ${requestedUnit ? `Read the same path ${requestedUnit.path} with ` : 'Read one sourceUnits path, or use '}startLine/endLine around the reported diagnostic (maximum ${MAX_SOURCE_READ_LINES} lines). If endLine exceeds EOF it is automatically clamped. The returned program preserves exact whitespace for a Codex-format patch.`
-          : undefined,
+          : rangeEnd < requestedRangeEnd
+            ? 'Only sourceLineRange is included in program. Continue with nextRead only if those remaining lines are needed; do not reread this window. lineCount is the total size of the source/unit, not the amount returned.'
+            : undefined,
         patchGuidance: omitLargeProgram ? undefined
-          : `program is exact unnumbered source. Submit a Codex patch using *** Begin Patch, *** Update File: draft.py, @@ hunks, and *** End Patch with patchBaseDigest${requestedUnit ? `; path=${requestedUnit.path} is optional because patchBaseDigest identifies the complete current draft` : ''}. Never emit unified-diff line counts. Unchanged context preserves the source's original indentation.`,
+          : 'Use patchBaseDigest as edit.baseDigest. Prefer replacements:[{oldText,newText}] for small fixes; copy exact program whitespace. All edits locate unique targets on this pre-edit snapshot and commit together or none do. No fuzzy matching or stale-version rebase. In patch, put -old/+new in the same @@ hunk, separate from ALL source indentation. Inspect saved and validation separately.',
         readFallbackGuidance: hasBoundedFallback
           ? `The requested path ${requestedPath} is not a known source unit, so the supplied startLine/endLine were applied to the complete draft instead.`
           : undefined,
@@ -2127,6 +2277,18 @@ async function readUnoDraftUnlocked(input: ReadUnoDraftInput): Promise<FileArtif
 }
 
 export async function getUnoApi(input: UnoApiInput): Promise<FileArtifactOperationResult> {
+  const documentId = String(input.documentId || '').trim();
+  if (!documentId) return getUnoApiUnlocked(input);
+  try {
+    // Catalog delivery updates draft metadata. Serialize it with edit/render so
+    // an API read cannot write back an older program or erase its edit receipt.
+    return await withDraftLock(input.runId, documentId, () => getUnoApiUnlocked({ ...input, documentId }));
+  } catch (error) {
+    return { ok: false, actual: `UNO API inspection failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+async function getUnoApiUnlocked(input: UnoApiInput): Promise<FileArtifactOperationResult> {
   const documentId = String(input.documentId || '').trim();
   if (!documentId) {
     return { ok: false, actual: 'file action=unoApi requires a stable documentId. It may be queried before plan only when documentType is also provided.' };
@@ -2196,7 +2358,7 @@ export async function getUnoApi(input: UnoApiInput): Promise<FileArtifactOperati
 }
 
 export async function getOfficeJsApi(
-  input: Pick<UnoApiInput, 'runId' | 'documentId' | 'documentType'>,
+  input: Pick<UnoApiInput, 'runId' | 'documentId' | 'documentType' | 'query'>,
 ): Promise<FileArtifactOperationResult> {
   const documentId = String(input.documentId || '').trim();
   if (!documentId) {
@@ -2217,7 +2379,11 @@ export async function getOfficeJsApi(
   if ((draft.generator || 'uno') !== 'javascript') {
     return {
       ok: false,
-      actual: `Document ${documentId} uses UNO generation. JavaScript API guidance is unavailable for this draft; call action=unoApi instead.`,
+      actual: JSON.stringify({
+        kind: 'office-api-engine-mismatch', documentId, generator: 'uno',
+        error: 'This is a Python/UNO draft. jsApi was not executed. Do not retry jsApi or rewrite the draft in JavaScript.',
+        nextCall: { action: 'unoApi', documentId, ...(input.query ? { query: input.query } : {}) },
+      }),
     };
   }
   if (input.documentType && input.documentType !== draft.documentType) {
@@ -2306,12 +2472,12 @@ const pageBreak = new Paragraph({ children: [new PageBreak()] });`,
         'For DOCX images, read local bytes from await job.assetPath(exactName) and pass them to ImageRun. Do not pass a path string as ImageRun data.',
         'DOCX Table.rows must contain TableRow instances, and each TableRow.children must contain TableCell instances; plain nested arrays are invalid.',
         'Insert a DOCX page break with a PageBreak child inside a Paragraph.',
-        'To inspect an already-downloaded image asset, call file action=read with its exact artifactId. That result reports dimensions and aspect ratio from the saved bytes; do not probe a remote thumbnail URL with browserCode.',
+        'To inspect an already-downloaded image asset, call file action=readContent with its exact artifactId. To read generation code, use readSource + documentId instead.',
         'Do not fetch remote URLs from the draft; download assets with the file tool first.',
         'JavaScript mode creates PPTX, DOCX, or XLSX directly. A .pdf target is supported by creating the matching Office source for documentType and converting it with local LibreOffice.',
         'For PDF, still write to job.outputPath exactly as shown; its temporary extension is already the correct .pptx, .docx, or .xlsx source format.',
         'Existing-file modification remains UNO-based.',
-        'Every action=edit atomically applies one Codex-format patch before validation. Repair all independent non-overlapping diagnostics in one patch with separate @@ hunks; call action=read for the exact current source and patchBaseDigest.',
+        'Every action=edit applies source patch hunks before validation. Call readSource for one diagnostic-focused code window and its patchBaseDigest, then edit before reading another window. Combine only repairs whose exact source is already present.',
       ],
       recipes,
       completeDocument: examples[documentType],
@@ -2422,6 +2588,7 @@ export function generatedVerificationIssues(diagnostics: unknown) {
     line?: number;
     locator?: Record<string, unknown>;
     page?: number;
+    repairHint?: string;
     shapes?: number[];
     description: string;
     severity: 'error' | 'warning';
@@ -2442,7 +2609,7 @@ export function generatedVerificationIssues(diagnostics: unknown) {
         elementIds,
         line: issue.line || primaryElement?.line,
         locator: issue.locator || primaryElement?.locator || (page ? { slide: page, ...(shapes?.length ? { shapes } : {}) } : undefined),
-        message: issue.description,
+        message: issue.repairHint ? `${issue.description} Repair: ${issue.repairHint}` : issue.description,
         page,
         severity: issue.severity === 'error' ? 'error' as const : 'warning' as const,
         shapes,
@@ -2558,9 +2725,14 @@ async function clearValidationCacheFiles(cache: ReturnType<typeof validationCach
   ]);
 }
 
-function documentAssetsFingerprint(assets: DocumentAsset[]) {
+function documentAssetsFingerprint(assets: DocumentAsset[], runtimeFingerprint: string, draft: OfficeDocumentDraft) {
   return createHash('sha256').update(JSON.stringify({
     pipelineVersion: OFFICE_PIPELINE_VERSION,
+    runtimeFingerprint,
+    generator: draft.generator,
+    documentType: draft.documentType,
+    fileName: draft.fileName,
+    sourceDocument: draft.sourceDocument,
     assets: assets.map((asset) => ({
     assetName: asset.assetName,
     bytes: asset.bytes,
@@ -2583,14 +2755,21 @@ async function generateValidatedDraftCandidate(input: {
   // workspace is only replaced after every validation gate succeeds.
   await input.onProgress?.({ phase: 'assets', message: '正在同步文件素材' });
   const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
-  const assetFingerprint = documentAssetsFingerprint(assets);
+  const assetFingerprint = documentAssetsFingerprint(assets, await officeGenerationRuntimeFingerprint(), input.draft);
   const extension = path.extname(input.draft.fileName).toLowerCase();
   const cache = validationCachePaths(input.runId, input.draft, extension);
   try {
-    const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as { assetFingerprint?: string; diagnostics?: unknown };
+    const metadata = JSON.parse(await readFile(cache.metadataPath, 'utf8')) as {
+      assetFingerprint?: string; diagnostics?: unknown; artifactDigest?: string; previewDigest?: string;
+    };
     if (metadata.assetFingerprint === assetFingerprint) {
       const artifactMetadata = await stat(cache.artifactPath);
       const previewMetadata = await stat(cache.previewPath).catch(() => undefined);
+      if (!artifactMetadata.isFile() || metadata.artifactDigest !== await sha256File(cache.artifactPath)
+        || (metadata.previewDigest && metadata.previewDigest !== await sha256File(cache.previewPath))
+        || (input.draft.generator === 'uno' && !metadata.previewDigest)) {
+        throw new Error('Cached Office artifact or preview changed; regenerate the candidate.');
+      }
       return {
         assets,
         cacheHit: true,
@@ -2626,7 +2805,11 @@ async function generateValidatedDraftCandidate(input: {
       abortSignal: input.abortSignal,
       onProgress: input.onProgress,
     });
-    await writeFile(cache.metadataPath, JSON.stringify({ assetFingerprint, diagnostics: generated.diagnostics }), 'utf8');
+    await writeFile(cache.metadataPath, JSON.stringify({
+      assetFingerprint, diagnostics: generated.diagnostics,
+      artifactDigest: await sha256File(generated.outputPath),
+      previewDigest: generated.previewPath ? await sha256File(generated.previewPath) : undefined,
+    }), 'utf8');
     cacheCompleted = true;
     return { assets, cacheHit: false, generated };
   } finally {
@@ -2647,6 +2830,7 @@ async function prepareValidatedDraft(input: {
 }): Promise<ValidatedDraftCandidate> {
   if (!input.draft.program) throw new Error(`Office draft ${input.draft.documentId} has no source yet; call action=generate first.`);
   try {
+    await beginOfficeValidation(input.draft);
     input.draft.validationStatus = 'pending';
     input.draft.workflow = { state: 'validating', checkpointAt: new Date().toISOString() };
     await input.onProgress?.({ phase: 'static-analysis', message: '正在检查脚本语法和确定性错误' });
@@ -2672,7 +2856,9 @@ async function prepareValidatedDraft(input: {
       Object.assign(error, { diagnostics: staticDiagnostics });
       throw error;
     }
-    let candidate = await generateValidatedDraftCandidate(input);
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'execution';
+    const candidate = await generateValidatedDraftCandidate(input);
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'artifact-validation';
     await input.onProgress?.({ phase: 'artifact-validation', message: '正在执行统一 Office、字体和嵌入图片检查' });
     const unoStrict = input.draft.generator === 'uno';
     const elementMap = unoStrict ? generatedElementMap(candidate.generated.diagnostics) : [];
@@ -2688,20 +2874,8 @@ async function prepareValidatedDraft(input: {
       requireElementIds: unoStrict && input.draft.operation !== 'modify',
       validationProfile: unoStrict ? 'uno-strict' : 'basic',
     });
-    if (!validation.passed && candidate.cacheHit) {
-      const cache = validationCachePaths(input.runId, input.draft, candidate.generated.extension);
-      await clearValidationCacheFiles(cache);
-      candidate = await generateValidatedDraftCandidate(input);
-      validation = await validateOfficeArtifact({
-        absolutePath: candidate.generated.outputPath,
-        sourceAbsolutePath,
-        elementMap: unoStrict ? generatedElementMap(candidate.generated.diagnostics) : undefined,
-        featureCounts: unoStrict ? generatedFeatureCounts(candidate.generated.diagnostics) : undefined,
-        extension: candidate.generated.extension,
-        requireElementIds: unoStrict && input.draft.operation !== 'modify',
-        validationProfile: unoStrict ? 'uno-strict' : 'basic',
-      });
-    }
+    // Candidate byte digests are checked before reuse. Re-executing identical
+    // source cannot repair a deterministic validation failure; report it once.
     const capabilityIssues = unoStrict
       ? missingRequestedPresentationCapabilityDiagnostics(input.draft, candidate.generated.diagnostics)
       : [];
@@ -2719,6 +2893,7 @@ async function prepareValidatedDraft(input: {
       validation = await includeRendererValidation(validation, candidate.generated.previewPath);
     }
     input.draft.validationStatus = 'passed';
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'complete';
     input.draft.validationFailureCount = 0;
     input.draft.validatedSourceDigest = sourceDigest(input.draft.program);
     input.draft.validationDiagnostics = [
@@ -2747,8 +2922,11 @@ async function prepareValidatedDraft(input: {
     await saveDraft(input.runId, input.draft);
     return { ...candidate, validation };
   } catch (error) {
-    if ((input.draft.generator === 'uno' && isUnoBridgeStartupError(error))
-      || officeOperationWasInterrupted(error, input.abortSignal)) {
+    if (officeOperationWasInterrupted(error, input.abortSignal)) throw error;
+    if (input.draft.generator === 'uno' && (isUnoBridgeStartupError(error) || isUnoWorkerInternalError(error))) {
+      input.draft.validationStatus = 'pending';
+      input.draft.validationDiagnostics = diagnoseOfficeProgramRuntimeError(input.draft.program, error instanceof Error ? error.message : String(error));
+      input.draft.workflow = { state: 'failed', checkpointAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) };
       throw error;
     }
     const explicitDiagnostics = error && typeof error === 'object' && 'diagnostics' in error
@@ -2795,7 +2973,6 @@ async function validateDraft(input: {
     const visualVerification = needsOfficePreview
       ? await currentNodeFileWorkspaceHost().renderPreview({
           absolutePath: candidate.generated.previewPath!,
-          cacheKey: `${sourceDigest(input.draft.program || '')}:validation`,
           extension: '.pdf',
           name: input.draft.fileName,
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
@@ -2809,14 +2986,18 @@ async function validateDraft(input: {
       actual: JSON.stringify({
         kind: 'uno-draft-validation',
         documentId: input.draft.documentId,
+        sourceRead: { action: 'readSource', documentId: input.draft.documentId },
+        nextAction: { action: 'render', documentId: input.draft.documentId },
         fileName: input.draft.fileName,
         generator: input.draft.generator || 'uno',
         sourceDigest: sourceDigest(input.draft.program || ''),
         sourceCharacters: input.draft.program?.length || 0,
         validationStatus: input.draft.validationStatus,
+        validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
         generationDiagnostics: candidate.generated.diagnostics,
+        semantic: input.draft.semantic,
         automaticValidation: candidate.validation,
         workflow: input.draft.workflow,
         qualityGate: officeQualityGate(candidate.validation, visualVerification),
@@ -2827,6 +3008,8 @@ async function validateDraft(input: {
     const source = input.draft.program || '';
     const validationError = error instanceof Error ? error.message : String(error);
     const transientUnoFailure = input.draft.generator === 'uno' && isUnoBridgeStartupError(error);
+    const workerFailure = input.draft.generator === 'uno' && isUnoWorkerInternalError(error);
+    const infrastructureFailure = transientUnoFailure || workerFailure;
     let saveError: string | undefined;
     try {
       await saveWorkingDraft(input.runId, input.draft);
@@ -2836,8 +3019,10 @@ async function validateDraft(input: {
     return {
       ok: false,
       actual: JSON.stringify({
-        kind: transientUnoFailure ? 'uno-infrastructure-retry' : 'uno-draft-validation',
+        kind: workerFailure ? 'uno-infrastructure-error' : transientUnoFailure ? 'uno-infrastructure-retry' : 'uno-draft-validation',
+        ...(infrastructureFailure ? { sourceRepairRequired: false, sourceValidity: 'unverified', retryable: false, retryAfter: 'runtime-change-or-confirmed-recovery' } : {}),
         documentId: input.draft.documentId,
+        sourceRead: { action: 'readSource', documentId: input.draft.documentId },
         fileName: input.draft.fileName,
         generator: input.draft.generator || 'uno',
         changed: input.documentChanged || false,
@@ -2845,13 +3030,11 @@ async function validateDraft(input: {
         sourceDigest: sourceDigest(source),
         sourceCharacters: source.length,
         lineCount: draftSourceLineCount(source),
-        validation: transientUnoFailure ? 'pending' : 'failed',
-        validationFailureCount: transientUnoFailure ? input.draft.validationFailureCount || 0 : input.draft.validationFailureCount || 1,
-        diagnostics: transientUnoFailure ? [{
-          code: 'UNO_BRIDGE_STARTUP',
-          severity: 'error',
-          message: compactToolText(validationError),
-        }] : compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
+        validation: infrastructureFailure ? 'pending' : 'failed',
+        validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
+        validationFailureCount: infrastructureFailure ? input.draft.validationFailureCount || 0 : input.draft.validationFailureCount || 1,
+        diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
+        semantic: input.draft.semantic,
         repairHints: transientUnoFailure
           ? ['LibreOffice startup retries were exhausted before source validation completed; the current source was preserved.']
           : officeValidationRepairHints(input.draft.validationDiagnostics || [], validationError),
@@ -2879,6 +3062,7 @@ async function validateDraftSourceUnit(input: {
   const previewPath = path.join(directory, `.unit-${suffix}.preview.pdf`);
   try {
     if (!input.draft.program) throw new Error('The Office draft has no working source.');
+    await beginOfficeValidation(input.draft, input.sourceUnitPath);
     const units = sourceUnitsForDraft(input.draft.program, input.draft);
     const unit = units.find((candidate) => candidate.path === input.sourceUnitPath);
     if (!unit) throw new Error(`Office source unit ${input.sourceUnitPath} does not exist.`);
@@ -2897,6 +3081,7 @@ async function validateDraftSourceUnit(input: {
     await writeFile(sourcePath, isolatedSource, 'utf8');
     const assets = await syncDocumentAssets(input.runId, input.attachmentBindings);
     await input.onProgress?.({ phase: 'unit-execute', message: `正在隔离执行 ${input.sourceUnitPath}` });
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'execution';
     const generated = await generateFileToPaths({
       ...input.draft,
       programPath: sourcePath,
@@ -2908,6 +3093,7 @@ async function validateDraftSourceUnit(input: {
       abortSignal: input.abortSignal,
       onProgress: input.onProgress,
     });
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'artifact-validation';
     const unoStrict = input.draft.generator === 'uno';
     const elementMap = unoStrict ? generatedElementMap(generated.diagnostics) : [];
     const sourceAbsolutePath = input.draft.operation === 'modify' && input.draft.sourceDocument
@@ -2944,6 +3130,7 @@ async function validateDraftSourceUnit(input: {
       state.status = 'passed';
     }
     input.draft.validationStatus = 'pending';
+    if (input.draft.validationEvidence) input.draft.validationEvidence.stage = 'complete';
     input.draft.validationDiagnostics = [
       ...staticAnalysis.diagnostics.map((diagnostic) => ({ ...diagnostic, unitPath: input.sourceUnitPath })),
       ...validation.issues.map((issue) => ({ ...issue, unitPath: input.sourceUnitPath })),
@@ -2965,6 +3152,7 @@ async function validateDraftSourceUnit(input: {
         sourceUnitPath: input.sourceUnitPath,
         sourceUnitDigest: sourceDigest(unit.content),
         validation: 'passed',
+        validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
         renderable: input.draft.validatedSourceDigest === sourceDigest(input.draft.program),
         assets: assets.map(describeDocumentAsset),
         automaticValidation: validation,
@@ -2983,12 +3171,14 @@ async function validateDraftSourceUnit(input: {
       : undefined;
     const errorText = error instanceof Error ? error.message : String(error);
     const transientUnoFailure = input.draft.generator === 'uno' && isUnoBridgeStartupError(error);
+    const workerFailure = input.draft.generator === 'uno' && isUnoWorkerInternalError(error);
     const diagnostics = explicitDiagnostics || (input.draft.generator === 'uno'
       ? diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)
       : undefined);
-    if (transientUnoFailure) {
+    if (transientUnoFailure || workerFailure) {
+      if (state) state.status = 'pending';
       input.draft.validationStatus = 'pending';
-      input.draft.validationDiagnostics = [];
+      input.draft.validationDiagnostics = diagnostics || [];
       input.draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
       let saveError: string | undefined;
       try {
@@ -2999,15 +3189,21 @@ async function validateDraftSourceUnit(input: {
       return {
         ok: false,
         actual: JSON.stringify({
-          kind: 'uno-infrastructure-retry',
+          kind: workerFailure ? 'uno-infrastructure-error' : 'uno-infrastructure-retry',
+          sourceRepairRequired: false,
+          sourceValidity: 'unverified',
+          retryable: false,
+          retryAfter: 'runtime-change-or-confirmed-recovery',
           documentId: input.draft.documentId,
           sourceUnitPath: input.sourceUnitPath,
           validation: 'pending',
+          validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
           saved: !saveError,
           renderable: true,
           sourceDigest: sourceDigest(input.draft.program || ''),
-          diagnostics: [{ code: 'UNO_BRIDGE_STARTUP', severity: 'error', message: compactToolText(errorText) }],
-          repairHints: ['LibreOffice startup retries were exhausted before source-unit validation completed; the current source was preserved.'],
+          diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
+          repairHints: workerFailure ? officeValidationRepairHints([], errorText)
+            : ['LibreOffice startup retries were exhausted before source-unit validation completed; the current source was preserved.'],
           error: compactToolText(saveError ? `${errorText}\nWorking source save failed: ${saveError}` : errorText),
           workflow: compactWorkflowForTool(input.draft.workflow),
         }),
@@ -3031,6 +3227,7 @@ async function validateDraftSourceUnit(input: {
         documentId: input.draft.documentId,
         sourceUnitPath: input.sourceUnitPath,
         validation: 'failed',
+        validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
         saved: !saveError,
         renderable: false,
         sourceDigest: sourceDigest(input.draft.program || ''),
@@ -3088,7 +3285,6 @@ async function renderDraft(input: {
     const visualVerification = needsOfficePreview
       ? await currentNodeFileWorkspaceHost().renderPreview({
           absolutePath: candidate.generated.previewPath!,
-          cacheKey: `${digest}:render`,
           extension: '.pdf',
           name: target.fileName,
           previewRoot: artifactDir(input.runId, 'attachment-previews'),
@@ -3102,29 +3298,44 @@ async function renderDraft(input: {
 
     // Only action=render publishes the already-validated candidate. Keep the
     // previous artifact intact until the replacement binary is fully written.
+    const publicationReused = input.draft.renderedDigest === digest
+      && input.draft.renderedFileName === target.fileName
+      && await sha256File(target.filePath).catch(() => '') === await sha256File(candidate.generated.outputPath);
     await input.onProgress?.({ phase: 'publish', message: '正在发布最终文件' });
-    publishCandidatePath = path.join(dir, `.render-${randomUUID()}${candidate.generated.extension}`);
-    await copyFile(candidate.generated.outputPath, publishCandidatePath);
-    await rename(publishCandidatePath, target.filePath);
-    publishCandidatePath = undefined;
+    if (!publicationReused) {
+      publishCandidatePath = path.join(dir, `.render-${randomUUID()}${candidate.generated.extension}`);
+      await copyFile(candidate.generated.outputPath, publishCandidatePath);
+      await rename(publishCandidatePath, target.filePath);
+      publishCandidatePath = undefined;
+    }
     const artifact = artifactResultPayload({
       kind: 'generated',
       fileName: target.fileName,
       filePath: target.filePath,
       bytes: candidate.generated.bytes,
     });
+    if (candidate.generated.previewPath) {
+      await registerOfficePreview({
+        absolutePath: target.filePath,
+        previewPath: candidate.generated.previewPath,
+        extension: candidate.generated.extension,
+        previewRoot: artifactDir(input.runId, 'attachment-previews'),
+      });
+    }
     input.draft.renderedArtifactId = artifact.artifactId;
     input.draft.renderedFileName = target.fileName;
     input.draft.renderedDigest = digest;
-    input.draft.visualQaArtifactId = undefined;
-    input.draft.visualQaDigest = undefined;
-    input.draft.visualQaPageCount = undefined;
-    input.draft.visualQaSeenPages = [];
-    input.draft.visualQaReviews = [];
-    input.draft.visualQaDeckReview = undefined;
-    input.draft.visualQaPageDigests = [];
+    if (!publicationReused) {
+      input.draft.visualQaArtifactId = undefined;
+      input.draft.visualQaDigest = undefined;
+      input.draft.visualQaPageCount = undefined;
+      input.draft.visualQaSeenPages = [];
+      input.draft.visualQaReviews = [];
+      input.draft.visualQaDeckReview = undefined;
+      input.draft.visualQaPageDigests = [];
+    }
     input.draft.workflow = {
-      state: visualVerification ? 'qa-pending' : 'completed',
+      state: visualVerification && input.draft.visualQaDigest !== digest ? 'qa-pending' : 'completed',
       checkpointAt: new Date().toISOString(),
       renderedDigest: digest,
     };
@@ -3135,10 +3346,14 @@ async function renderDraft(input: {
       actual: JSON.stringify({
         ...artifact,
         documentId: input.draft.documentId,
+        sourceRead: { action: 'readSource', documentId: input.draft.documentId },
+        contentRead: { action: 'readContent', artifactId: artifact.artifactId, includeVisuals: false },
         sourceDigest: digest,
+        validationEvidence: officeValidationEvidence(input.draft, await currentUnoWorkerDigest()),
         renderedDigest: digest,
         documentChanged: input.documentChanged || false,
         cacheHit: candidate.cacheHit,
+        publicationReused,
         availableAssets: candidate.assets.map(describeDocumentAsset),
         generationDiagnostics: candidate.generated.diagnostics,
         automaticValidation: candidate.validation,
@@ -3166,24 +3381,54 @@ async function renderDraft(input: {
       referenceImagePaths: visualVerification?.imagePaths.length ? visualVerification.imagePaths : undefined,
     };
   } catch (error) {
-    if (input.draft.generator === 'uno' && isUnoBridgeStartupError(error)) {
+    const workerFailure = input.draft.generator === 'uno' && isUnoWorkerInternalError(error);
+    const errorText = error instanceof Error ? error.message : String(error);
+    let diagnosticSaveError: string | undefined;
+    if (!officeOperationWasInterrupted(error, input.abortSignal)) {
+      try {
+        // A render failure must replace obsolete saved diagnostics too. Keep
+        // the same source; only the evidence from this attempt is refreshed.
+        await saveWorkingDraft(input.runId, input.draft);
+      } catch (saveError) {
+        diagnosticSaveError = saveError instanceof Error ? saveError.message : String(saveError);
+      }
+    }
+    const validationEvidence = officeValidationEvidence(input.draft, await currentUnoWorkerDigest());
+    if (workerFailure || (input.draft.generator === 'uno' && isUnoBridgeStartupError(error))) {
       return {
         ok: false,
         actual: JSON.stringify({
-          kind: 'office-render-infrastructure-retry',
+          kind: workerFailure ? 'office-render-infrastructure-error' : 'office-render-infrastructure-retry',
+          sourceRepairRequired: false,
+          sourceValidity: 'unverified',
+          retryable: false,
+          retryAfter: 'runtime-change-or-confirmed-recovery',
           documentId: input.draft.documentId,
           sourceDigest: sourceDigest(input.draft.program || ''),
           sourceUnchanged: true,
-          diagnostics: [{
-            code: 'UNO_BRIDGE_STARTUP',
-            severity: 'error',
-            message: compactToolText(error instanceof Error ? error.message : String(error)),
-          }],
-          error: 'LibreOffice could not start after isolated retries. The Office source was unchanged and validation did not complete.',
+          validationEvidence,
+          diagnosticSaveError,
+          diagnostics: compactValidationDiagnosticsForTool(diagnoseOfficeProgramRuntimeError(input.draft.program || '', errorText)),
+          repairHints: officeValidationRepairHints([], error instanceof Error ? error.message : String(error)),
+          error: workerFailure
+            ? 'LibreOffice worker failed internally. Preserve the source and report the runtime failure; retry only after the renderer is fixed.'
+            : 'LibreOffice could not start after isolated retries. The Office source was unchanged and validation did not complete.',
         }),
       };
     }
-    return { ok: false, actual: `file rendering failed: ${error instanceof Error ? error.message : String(error)}` };
+    return { ok: false, actual: JSON.stringify({
+      kind: 'office-render-failure',
+      documentId: input.draft.documentId,
+      sourceDigest: sourceDigest(input.draft.program || ''),
+      sourceUnchanged: true,
+      validation: input.draft.validationStatus || 'pending',
+      validationEvidence,
+      validationFailureCount: input.draft.validationFailureCount || 0,
+      diagnosticSaveError,
+      diagnostics: compactValidationDiagnosticsForTool(input.draft.validationDiagnostics),
+      repairHints: officeValidationRepairHints(input.draft.validationDiagnostics, errorText),
+      error: errorText,
+    }) };
   } finally {
     if (publishCandidatePath) await unlink(publishCandidatePath).catch(() => undefined);
   }
@@ -3200,6 +3445,13 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
     }
     if (!String(input.fileName || '').trim()) return { ok: false, actual: 'file action=plan requires fileName.' };
     if (!input.documentType) return { ok: false, actual: 'file action=plan requires documentType.' };
+    const designResult = input.design === undefined ? undefined : officeDesignBriefSchema.safeParse(input.design);
+    if (designResult && !designResult.success) return { ok: false, actual: JSON.stringify({
+      kind: 'document-design-invalid', code: 'DESIGN_BRIEF_INVALID', saved: false,
+      documentId, issues: designResult.error.issues.map((issue) => ({ field: `design.${issue.path.join('.')}`, message: issue.message })),
+      instruction: 'Correct only the initial design brief in plan. No source or file was changed.',
+    }) };
+    const requestedDesign = designResult?.success ? designResult.data : undefined;
     const requestedFileName = sanitizeFileName(input.fileName, `document-${Date.now()}.pdf`);
     let existing: OfficeDocumentDraft | undefined;
     try {
@@ -3233,8 +3485,12 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
           sourceDocument: existing.sourceDocument,
           sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
           sourceCharacters: existing.program?.length || 0,
+          semanticGeneration: semanticGenerationPlan(existing.operation || 'create', existing.generator || 'uno', officeDesignGuidance(existing)),
+          design: existing.design,
+          designGuidance: officeDesignGuidance(existing),
           workflow: existing.workflow,
           reused: true,
+          instruction: input.design ? 'Authored workspace reused without replacing its original design brief or source. Apply user-authorized revisions through edit; do not regenerate merely to change planning metadata.' : undefined,
         }),
       };
     }
@@ -3244,6 +3500,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
     if (existing) {
       existing.fileName = requestedFileName;
       existing.intent = input.intent ?? existing.intent;
+      existing.design = requestedDesign ?? existing.design;
       existing.operation = sourcePlan.operation;
       existing.generator = generator;
       existing.sourceDocument = sourcePlan.sourceDocument;
@@ -3260,6 +3517,9 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
           sourceDocument: existing.sourceDocument,
           sourceFileName: path.basename(draftProgramPath(input.runId, existing.documentId, existing.generator)),
           sourceCharacters: 0,
+          semanticGeneration: semanticGenerationPlan(existing.operation || 'create', existing.generator || 'uno', officeDesignGuidance(existing)),
+          design: existing.design,
+          designGuidance: officeDesignGuidance(existing),
           workflow: existing.workflow,
           reused: true,
         }),
@@ -3272,6 +3532,7 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
       documentType: input.documentType,
       fileName: requestedFileName,
       intent: input.intent,
+      design: requestedDesign,
       operation: sourcePlan.operation,
       generator,
       sourceDocument: sourcePlan.sourceDocument,
@@ -3289,6 +3550,9 @@ async function planFileArtifactUnlocked(input: PlanArtifactInput): Promise<FileA
       sourceDocument: draft.sourceDocument,
       sourceFileName: path.basename(draftProgramPath(input.runId, draft.documentId, draft.generator)),
       sourceCharacters: 0,
+      semanticGeneration: semanticGenerationPlan(draft.operation || 'create', draft.generator || 'uno', officeDesignGuidance(draft)),
+      design: draft.design,
+      designGuidance: officeDesignGuidance(draft),
       workflow: draft.workflow,
       instruction: draft.operation === 'modify'
         ? `Open the existing file through the matching high-level facade with source_name=${JSON.stringify(draft.sourceDocument?.assetName)}. Query the unoApi existing-object module, then copy its selectors and preserve-only policy; raw UNO and job.expert are not model-facing. Do not recreate the document.`
@@ -3303,8 +3567,11 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
   try {
     const documentId = String(input.documentId || '').trim();
     if (!documentId) return { ok: false, actual: 'file action=generate requires documentId from action=plan.' };
-    const program = String(input.program || '').trim();
-    if (!program) return { ok: false, actual: 'file action=generate requires a runnable source draft in program. A small validated skeleton followed by action=edit is recommended, but a complete runnable initial program is also allowed.' };
+    const submittedProgram = String(input.program || '').trim();
+    const semanticSpec = input.spec && typeof input.spec === 'object' ? input.spec : undefined;
+    if (Boolean(submittedProgram) === Boolean(semanticSpec)) {
+      return { ok: false, actual: 'file action=generate requires exactly one of program or spec.' };
+    }
     let persistedDraft: OfficeDocumentDraft;
     try {
       persistedDraft = await loadDraft(input.runId, documentId);
@@ -3316,6 +3583,59 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
         return { ok: false, actual: `Office draft ${documentId} is not planned. Call action=plan before action=generate.` };
       }
       throw error;
+    }
+    let program = submittedProgram;
+    let semantic: OfficeDocumentDraft['semantic'];
+    if (semanticSpec) {
+      if ((persistedDraft.operation || 'create') !== 'create') {
+        return {
+          ok: false,
+          actual: 'Semantic generation is available only for new documents. Existing-file modification must preserve the source through the UNO program workflow.',
+        };
+      }
+      if (semanticSpec.documentType && semanticSpec.documentType !== persistedDraft.documentType) {
+        return {
+          ok: false,
+          actual: `Semantic spec documentType=${semanticSpec.documentType} does not match the planned ${persistedDraft.documentType} workspace.`,
+        };
+      }
+      if (semanticSpec.fileName && sanitizeFileName(semanticSpec.fileName, '') !== persistedDraft.fileName) {
+        return {
+          ok: false,
+          actual: `Semantic spec fileName=${semanticSpec.fileName} does not match the planned fileName=${persistedDraft.fileName}.`,
+        };
+      }
+      let compiled: ReturnType<typeof compileOfficeSemanticDocument>;
+      try {
+        compiled = compileOfficeSemanticDocument({
+          ...semanticSpec,
+          documentType: persistedDraft.documentType,
+          fileName: persistedDraft.fileName,
+        }, persistedDraft.generator || 'uno');
+      } catch (error) {
+        const diagnostics = error && typeof error === 'object' && 'diagnostics' in error
+          ? (error as { diagnostics?: unknown }).diagnostics
+          : undefined;
+        return {
+          ok: false,
+          actual: JSON.stringify({
+            kind: 'semantic-document-validation',
+            documentId,
+            fileName: persistedDraft.fileName,
+            documentType: persistedDraft.documentType,
+            saved: false,
+            diagnostics,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        };
+      }
+      program = compiled.program;
+      semantic = {
+        schemaVersion: '1.0',
+        theme: compiled.theme,
+        layout: compiled.layout,
+        diagnostics: compiled.diagnostics,
+      };
     }
     const existingProgram = persistedDraft.program || '';
     const existingDigest = sourceDigest(existingProgram);
@@ -3344,6 +3664,9 @@ async function generateUnoFileArtifactUnlocked(input: GenerateUnoProgramInput): 
     }
     const draft = structuredClone(persistedDraft);
     draft.program = program;
+    delete draft.lastSourceEdit;
+    if (semantic) draft.semantic = semantic;
+    else delete draft.semantic;
     draft.validationStatus = 'pending';
     draft.validationFailureCount = 0;
     draft.validationDiagnostics = [];
@@ -3366,87 +3689,124 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
     if (typeof input.program === 'string' && input.program.trim()) {
       return {
         ok: false,
-        actual: 'file action=edit requires a Codex-format patch rather than a complete program. Read the current source and patchBaseDigest, then submit or correct the focused patch; do not switch to generate for an edit or validation failure.',
+        actual: 'file action=edit requires exact oldText/newText replacements or a Codex-format patch, not a complete program. Read current source and patchBaseDigest; do not switch to generate after an edit or validation failure.',
       };
     }
     const persistedDraft = await loadDraft(input.runId, documentId);
     if (!persistedDraft.program) return { ok: false, actual: `Office draft ${documentId} has no program yet; call action=generate first.` };
     const requestedPath = input.path ? normalizedSourceUnitPath(input.path) : undefined;
-    const sourceUnits = sourceUnitsForDraft(persistedDraft.program, persistedDraft);
+    // Global edits do not need a valid optional source-unit index. Otherwise
+    // an unmatched marker prevents the very edit required to repair it.
+    const sourceUnits = requestedPath ? sourceUnitsForDraft(persistedDraft.program, persistedDraft) : [];
     const requestedUnit = sourceUnitForRequestedPath(sourceUnits, requestedPath);
-    if (requestedPath && !requestedUnit) {
-      const available = sourceUnits.map((unit) => unit.path).join(', ') || '(none)';
-      return { ok: false, actual: `Office source unit ${requestedPath} does not exist. Available source units: ${available}. Read the current source unit or a bounded window, then submit a Codex-format patch.` };
-    }
     const editableSource = requestedUnit?.content ?? persistedDraft.program;
-    const editableDigest = sourceDigest(editableSource);
     const draftDigest = sourceDigest(persistedDraft.program);
     const draft = structuredClone(persistedDraft);
     const patchText = typeof input.patch === 'string' ? input.patch : '';
     const hasPatch = Boolean(patchText.trim());
-    if (!hasPatch) {
-      return { ok: false, actual: "file action=edit requires a Codex patch from '*** Begin Patch' through '*** End Patch'." };
+    const hasReplacements = input.replacements !== undefined;
+    if (hasPatch === hasReplacements) {
+      return { ok: false, actual: 'file action=edit requires exactly one of patch or replacements (exact oldText/newText pairs). For indentation repairs prefer replacements.' };
     }
     const baseDigest = String(input.baseDigest || '').trim().toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(baseDigest)) {
-      return { ok: false, actual: 'file action=edit patch requires baseDigest copied from the latest action=read result.' };
+      return { ok: false, actual: 'file action=edit patch requires baseDigest copied from the latest readSource.patchBaseDigest, not an artifactId or a render digest.' };
     }
-    const rebased = baseDigest !== draftDigest;
+    if (hasReplacements && (!Array.isArray(input.replacements) || input.replacements.some((item) => !item || typeof item.oldText !== 'string' || typeof item.newText !== 'string'))) {
+      return { ok: false, actual: JSON.stringify({
+        kind: 'uno-draft-patch-conflict', code: 'PATCH_INPUT_REJECTED', editStatus: 'rejected',
+        documentId, changed: false, saved: false, patchBaseDigest: draftDigest,
+        error: 'replacements must be an array of literal oldText/newText string pairs. No source was changed.',
+      }) };
+    }
+    const requestDigest = sourceDigest(JSON.stringify({
+      baseDigest, path: requestedPath || null,
+      patch: hasPatch ? normalizedDraftSource(patchText).trim() : null,
+      replacements: hasReplacements ? input.replacements!.map((item) => ({ oldText: normalizedDraftSource(item.oldText), newText: normalizedDraftSource(item.newText) })) : null,
+    }));
+    const receipt = persistedDraft.lastSourceEdit;
+    if (receipt?.requestDigest === requestDigest && receipt.afterDigest === draftDigest && receipt.beforeDigest === baseDigest) {
+      return { ok: persistedDraft.validationStatus !== 'failed', actual: JSON.stringify({
+        kind: 'uno-draft-patch-no-changes', code: 'EDIT_REPLAY_CONFIRMED', editStatus: 'already-applied',
+        documentId, changed: false, saved: true, patchBaseDigest: draftDigest, sourceUnitPath: requestedPath,
+        patchHunks: { applied: 0, alreadyApplied: receipt.totalHunks, failed: [], blocked: [], total: receipt.totalHunks },
+        validationStatus: persistedDraft.validationStatus || 'pending',
+        diagnostics: compactValidationDiagnosticsForTool(persistedDraft.validationDiagnostics),
+        message: 'The identical edit is confirmed by its saved receipt and current source revision. No source write or validation was repeated. Saved source is not proof of successful validation.',
+      }) };
+    }
+    if (baseDigest !== draftDigest) {
+      return { ok: false, actual: JSON.stringify({
+        kind: 'uno-draft-patch-conflict', code: 'PATCH_BASE_DIGEST_MISMATCH', editStatus: 'rejected',
+        documentId, changed: false, saved: false, patchBaseDigest: draftDigest,
+        expectedBaseDigest: draftDigest, suppliedBaseDigest: baseDigest, sourceUnitPath: requestedPath,
+        error: 'Source revision changed and this request is not a confirmed replay. No automatic rebase or source write was performed. Read only the affected source window and prepare the edit again.',
+        nextAction: { action: 'readSource', documentId, ...(requestedUnit ? { path: requestedPath } : {}) },
+      }) };
+    }
+    if (requestedPath && !requestedUnit) {
+      return { ok: false, actual: JSON.stringify({
+        kind: 'uno-draft-patch-conflict', code: 'SOURCE_UNIT_NOT_FOUND', editStatus: 'rejected',
+        documentId, changed: false, saved: false, patchBaseDigest: draftDigest,
+        error: `Unknown source unit ${requestedPath}. Read the current source index; do not guess a path.`,
+        nextAction: { action: 'readSource', documentId },
+      }) };
+    }
     let patchResult: UnoDraftPatchResult;
     try {
-      patchResult = applyUnoDraftPatchHunks(editableSource, patchText);
+      patchResult = hasReplacements
+        ? applyUnoDraftReplacements(editableSource, input.replacements!)
+        : applyUnoDraftPatchHunks(editableSource, patchText);
     } catch (error) {
-      if (!rebased) throw error;
-      return {
-        ok: false,
-        actual: JSON.stringify({
-          kind: 'uno-draft-patch-conflict',
-          code: 'PATCH_BASE_DIGEST_MISMATCH',
-          documentId,
-          sourceUnitPath: requestedUnit?.path,
-          expectedBaseDigest: draftDigest,
-          expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
-          suppliedBaseDigest: baseDigest,
-          error: `The current source changed after the patch was prepared and the exact-context patch could not be rebased safely: ${error instanceof Error ? error.message : String(error)}. Read it again and regenerate only the conflicting hunks from the exact returned program.`,
-        }),
-      };
+      const errorText = error instanceof Error ? error.message : String(error);
+      return { ok: false, actual: JSON.stringify({
+        kind: 'uno-draft-patch-conflict', code: 'PATCH_INPUT_REJECTED', editStatus: 'rejected', documentId,
+        changed: false, saved: false, patchBaseDigest: draftDigest, error: errorText,
+        recoverySuggestion: 'No source was changed. Correct the edit format or size using the source already in context; readSource only if the exact target is missing.',
+      }) };
     }
-    if (rebased && patchResult.failedHunks.length) {
+    if (patchResult.failedHunks.length) {
       return {
         ok: false,
         actual: JSON.stringify({
           kind: 'uno-draft-patch-conflict',
-          code: 'PATCH_BASE_DIGEST_MISMATCH',
+          code: 'PATCH_ATOMIC_CONFLICT',
+          editStatus: 'rejected', changed: false, saved: false, patchBaseDigest: draftDigest,
           documentId,
           sourceUnitPath: requestedUnit?.path,
           expectedBaseDigest: draftDigest,
-          expectedSourceUnitDigest: requestedUnit ? editableDigest : undefined,
           suppliedBaseDigest: baseDigest,
           patchHunks: {
             applied: 0,
             alreadyApplied: patchResult.alreadyAppliedHunks,
             failed: patchResult.failedHunks,
+            blocked: patchResult.blockedHunks,
             ignored: patchResult.ignoredHunks,
             total: patchResult.totalHunks,
           },
-          error: 'The source changed after this patch was prepared. Some hunks still conflict, so no part of the stale patch was saved. Read the current source and retry only those conflicts.',
+          error: 'Atomic edit rejected: no hunks were saved. Resolve the reported conflicts using the exact sourceContext when available, keep the blocked valid hunks in the corrected batch, and resubmit against the current source. Do not treat blocked hunks as applied. The context is diagnostic evidence, not an automatically matched replacement.',
+          nextAction: patchResult.failedHunks.every((failure) => failure.sourceContext)
+            ? undefined
+            : { action: 'readSource', documentId, ...(requestedPath ? { path: requestedPath } : {}) },
         }),
       };
     }
     const edited = patchResult.source;
     draft.program = requestedUnit ? replaceSourceUnit(persistedDraft.program, requestedUnit, edited) : edited;
+    // A raw source patch detaches the executable draft from its compact semantic input.
+    // Validation still applies, but stale theme/reflow provenance must not be reported.
+    delete draft.semantic;
     if (draft.program === normalizedDraftSource(persistedDraft.program)) {
       return {
-        ok: true,
+        ok: patchResult.failedHunks.length === 0 && persistedDraft.validationStatus !== 'failed',
         actual: JSON.stringify({
           kind: 'uno-draft-patch-no-changes',
           code: 'PATCH_NO_CHANGES',
-          editStatus: 'already-applied',
+          editStatus: 'no-change',
           documentId,
           fileName: draft.fileName,
           changed: false,
           saved: true,
-          rebased,
           patchHunks: {
             applied: patchResult.appliedHunks,
             alreadyApplied: patchResult.alreadyAppliedHunks,
@@ -3460,12 +3820,15 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
           sourceUnitPath: requestedUnit?.path,
           lineCount: draftSourceLineCount(editableSource),
           validationStatus: persistedDraft.validationStatus || 'pending',
-          message: 'The patch target is already satisfied. No source bytes needed to change.',
+          message: persistedDraft.validationStatus === 'failed'
+              ? 'These exact source changes are already present, but validation still fails. Repair the saved diagnostics; do not force byte changes with comments.'
+              : 'The patch target is already satisfied. No source bytes needed to change.',
         }),
       };
     }
     draft.validationStatus = 'pending';
     draft.validationDiagnostics = [];
+    draft.lastSourceEdit = { requestDigest, beforeDigest: draftDigest, afterDigest: sourceDigest(draft.program), totalHunks: patchResult.totalHunks };
     invalidateActiveVisualQa(draft);
     draft.workflow = { state: 'authoring', checkpointAt: new Date().toISOString() };
     const currentValidationUnit = requestedUnit;
@@ -3484,58 +3847,36 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
         failure = { error: validationResult.actual || 'validation failed' };
       }
       const patchWasSaved = failure.saved === true;
+      const infrastructureFailure = failure.sourceRepairRequired === false;
       return {
-        // Editing and validation are separate outcomes. A saved patch is a
-        // successful mutation even when automatic validation discovers errors.
-        ok: patchWasSaved,
+        // Preserve the editor buffer, but do not report a broken document as success.
+        ok: false,
         actual: JSON.stringify({
           ...failure,
           editStatus: failure.saved === true ? 'patch-applied' : 'save-failed',
           patchHunks: {
-            applied: patchResult.appliedHunks,
+            applied: patchWasSaved ? patchResult.appliedHunks : 0,
             alreadyApplied: patchResult.alreadyAppliedHunks,
             failed: patchResult.failedHunks,
             ignored: patchResult.ignoredHunks,
             total: patchResult.totalHunks,
           },
-          rebased,
-          changed: true,
+          changed: patchWasSaved,
           saved: patchWasSaved,
-          sourceDigest: sourceDigest(draft.program || ''),
+          patchBaseDigest: patchWasSaved ? sourceDigest(draft.program || '') : draftDigest,
+          ...(!infrastructureFailure ? { nextAction: { action: 'readSource', documentId, includeDiagnostics: true } } : {}),
+          sourceDigest: patchWasSaved ? sourceDigest(draft.program || '') : draftDigest,
           sourceCharacters: draft.program?.length || 0,
           diagnostics: failure.diagnostics || draft.validationDiagnostics || [],
-          validation: 'failed',
-          recoverySuggestion: failure.recoverySuggestion
-            || 'The current working source and diagnostics were saved. Publication remains unavailable while the current source is invalid.',
+          validation: infrastructureFailure ? 'pending' : 'failed',
+          recoverySuggestion: !patchWasSaved ? 'Source save failed. Read the persisted source before retrying; candidate edits are not confirmed as saved.' : failure.recoverySuggestion
+            || (infrastructureFailure
+              ? 'Validation did not complete because of a renderer failure, not a demonstrated source defect. Preserve the applied edits and follow repairHints; do not change source or replay edits to repair the runtime.'
+              : 'Source saved, validation FAILED. Do not replay applied edits or add comments to force a change. Read the failing block and repair it with exact oldText/newText replacements and this patchBaseDigest. Rendering remains blocked.'),
           workflow: compactWorkflowForTool(draft.workflow),
         }),
       };
     }
-    if (patchResult.failedHunks.length) {
-      let payload: Record<string, unknown> = {};
-      try {
-        payload = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
-      } catch {
-        payload = { actual: validationResult.actual };
-      }
-      return {
-        ok: true,
-        actual: JSON.stringify({
-          ...payload,
-          editStatus: 'partial-patch-applied',
-          patchHunks: {
-            applied: patchResult.appliedHunks,
-            alreadyApplied: patchResult.alreadyAppliedHunks,
-            failed: patchResult.failedHunks,
-            ignored: patchResult.ignoredHunks,
-            total: patchResult.totalHunks,
-          },
-          rebased,
-          recoverySuggestion: 'Successful independent hunks were saved. Read the current source and use its new patchBaseDigest before retrying only the reported conflicting hunks.',
-        }),
-      };
-    }
-    if (!rebased && !patchResult.alreadyAppliedHunks && !patchResult.ignoredHunks) return validationResult;
     let payload: Record<string, unknown> = {};
     try {
       payload = JSON.parse(String(validationResult.actual || '{}')) as Record<string, unknown>;
@@ -3547,7 +3888,9 @@ async function editUnoFileArtifactUnlocked(input: EditUnoProgramInput): Promise<
       actual: JSON.stringify({
         ...payload,
         editStatus: 'patch-applied',
-        rebased,
+        changed: true,
+        saved: true,
+        patchBaseDigest: sourceDigest(draft.program || ''),
         patchHunks: {
           applied: patchResult.appliedHunks,
           alreadyApplied: patchResult.alreadyAppliedHunks,
@@ -3730,6 +4073,13 @@ export async function recordOfficeVisualQaProgress(input: {
             ...(issue.severity ? { severity: issue.severity } : {}),
           })).filter((issue) => issue.type && issue.description);
           const checkResult = failedDeckVisualChecks(payload.deckReview.checks);
+          const missingDesignChecks = missingDesignReviewChecks(draft.design, payload.deckReview.checks);
+          if (missingDesignChecks.length) return { ok: false, actual: JSON.stringify({
+            kind: 'file-design-review-incomplete', code: 'DESIGN_REVIEW_REQUIRED',
+            documentId: draft.documentId, artifactId: identity.artifactId,
+            missingChecks: missingDesignChecks, selectedDirection: draft.design?.selectedDirection,
+            instruction: 'Include designIntent, compositionRhythm, contentConsistency and sourceTraceability in deckReview.checks. In observation cite page-specific layout comparisons, recomputed chart/callout arithmetic and actually accessed source rows/periods. Pixel checks alone cannot verify facts. Preserve failed checks and explain missing evidence. No re-render is needed unless a real source defect is found.',
+          }) };
           if (observation.length < 30) return { ok: false, actual: 'File visual deckReview rejected: a concrete cross-page observation of at least 30 characters is required.' };
           if (checkResult.invalid.length) return { ok: false, actual: `File visual deckReview rejected: missing or invalid checks: ${checkResult.invalid.join(', ')}.` };
           if (payload.deckReview.status !== 'passed' && payload.deckReview.status !== 'failed') return { ok: false, actual: 'File visual deckReview rejected: status must be passed or failed.' };
@@ -3750,7 +4100,8 @@ export async function recordOfficeVisualQaProgress(input: {
       const completePassingReview = pageCount > 0
         && Array.from({ length: pageCount }, (_, index) => index + 1)
           .every((pageNumber) => reviews.get(pageNumber)?.status === 'passed');
-      const completeDeckReview = draft.visualQaDeckReview?.status === 'passed';
+      const completeDeckReview = draft.visualQaDeckReview?.status === 'passed'
+        && missingDesignReviewChecks(draft.design, draft.visualQaDeckReview?.checks).length === 0;
       draft.visualQaDigest = completeCoverage && completePassingReview && completeDeckReview ? identity.renderedDigest : undefined;
       draft.workflow = {
         state: draft.visualQaDigest === identity.renderedDigest ? 'completed' : 'qa-pending',
@@ -3772,6 +4123,7 @@ export async function recordOfficeVisualQaProgress(input: {
             reviewedPageCount: draft.visualQaReviews?.length || 0,
             failedPages: (draft.visualQaReviews || []).filter((review) => review.status === 'failed').map((review) => review.pageNumber),
             deckReviewStatus: draft.visualQaDeckReview?.status || null,
+            requiredDesignChecks: officeDesignGuidance(draft).requiredDeckChecks,
             complete: draft.visualQaDigest === identity.renderedDigest && completeCoverage && completePassingReview && completeDeckReview,
           },
         }),
@@ -3795,7 +4147,7 @@ async function renderFileArtifactUnlocked(input: RenderArtifactInput): Promise<F
 
 export async function readUnoDraft(input: ReadUnoDraftInput): Promise<FileArtifactOperationResult> {
   try {
-    const documentId = requireDocumentId(input.documentId, 'read');
+    const documentId = requireDocumentId(input.documentId, 'readSource');
     return await withDraftLock(input.runId, documentId, () => readUnoDraftUnlocked({ ...input, documentId }));
   } catch (error) {
     return { ok: false, actual: `Office draft read failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -3881,7 +4233,7 @@ function structuredFileOperationResult(
   if (result.data !== undefined || result.error) return result;
   const data = legacyOperationData(result.actual);
   if (result.ok) {
-    return { ...result, data, summary: result.summary || result.actual };
+    return { ...result, data };
   }
   return {
     ...result,

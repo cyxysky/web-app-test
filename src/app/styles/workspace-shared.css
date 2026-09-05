@@ -745,19 +745,35 @@
     flex: 0 0 36px;
     height: 36px;
     min-width: 36px;
+    overflow: visible;
     padding: 0;
+    position: relative;
     width: 36px;
   }
 
   .browser-chat-layout.sidebar-collapsed .workspace-mode-tabs [data-slot="tabs-tab"] > svg {
     flex: 0 0 17px;
     height: 17px;
+    stroke-width: 1.9;
     width: 17px;
   }
 
   .browser-chat-layout.sidebar-collapsed .workspace-mode-tabs [data-slot="tabs-tab"]:is([aria-selected="true"], [data-selected="true"]) {
-    background: var(--app-surface-hover) !important;
+    background: transparent !important;
+    box-shadow: none !important;
     color: var(--accent-strong);
+  }
+
+  .browser-chat-layout.sidebar-collapsed .workspace-mode-tabs [data-slot="tabs-tab"]:is([aria-selected="true"], [data-selected="true"])::before {
+    background: var(--accent-strong);
+    border-radius: 999px;
+    content: "";
+    height: 18px;
+    left: -8px;
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 2px;
   }
 
   .browser-chat-layout.sidebar-collapsed .workspace-mode-tabs [data-slot="tabs-indicator"] {
@@ -1815,7 +1831,7 @@
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .workspace-sidebar-archive-row-open {
-    padding-left: 20px;
+    padding-left: 8px;
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .workspace-sidebar-archive-row.active,
@@ -1824,15 +1840,15 @@
   }
 
   .browser-chat-layout:not(.sidebar-collapsed) .workspace-sidebar-archive .workspace-sidebar-archive-row.active:not(.selecting)::before {
-    background: #1fa8a2;
-    border-radius: 50%;
-    bottom: auto;
-    height: 5px;
-    left: 6px;
+    background: var(--accent-strong);
+    border-radius: 999px;
+    bottom: 7px;
+    height: auto;
+    left: 0;
     pointer-events: none;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 5px;
+    top: 7px;
+    transform: none;
+    width: 2px;
     z-index: 1;
   }
 
@@ -2206,7 +2222,19 @@
 
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row.active,
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row.active:hover {
-    background: var(--sidebar-active);
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row.active:not(.selecting)::before {
+    background: var(--accent-strong);
+    border-radius: 999px;
+    bottom: 9px;
+    content: "";
+    left: 0;
+    position: absolute;
+    top: 9px;
+    width: 2px;
   }
 
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row-open {
@@ -2226,6 +2254,12 @@
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row-icon {
     color: var(--muted-strong);
     display: inline-flex;
+  }
+
+  .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row-icon > svg {
+    height: 17px;
+    stroke-width: 1.9;
+    width: 17px;
   }
 
   .browser-chat-layout.sidebar-collapsed .workspace-sidebar-archive-row-corner-status {

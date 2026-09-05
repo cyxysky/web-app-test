@@ -3,7 +3,7 @@ import { generateText } from 'ai';
 import { z } from 'zod';
 import { fuzzyRetrievalScore } from '@/lib/fuzzy-retrieval';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
-import { aiMaxOutputTokens, aiTelemetry } from '@/server/ai/ai-sdk-runtime';
+import { aiTelemetry } from '@/server/ai/ai-sdk-runtime';
 import { getModel, getModelSettings } from '@/server/ai/model';
 import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
 import {
@@ -932,7 +932,6 @@ export async function extractPersonalMemoryFromTurn(input: {
   });
   const result = await generateText({
     model: getModel(),
-    maxOutputTokens: aiMaxOutputTokens(4_096),
     temperature: 0.1,
     maxRetries: 3,
     prompt,

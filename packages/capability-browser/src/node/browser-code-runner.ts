@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, mkdirSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse } from 'acorn';
@@ -305,7 +305,7 @@ type PendingExecution = {
 const maxDiagnosticChars = 4_000;
 const defaultBrowserCodeKernelReadyTimeoutMs = 10_000;
 const defaultBrowserCodeExecutionTimeoutMs = 90_000;
-export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 34;
+export const BROWSER_CODE_KERNEL_RUNTIME_REVISION = 35;
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number) {
   const parsed = typeof value === 'number' ? value : Number(value);
@@ -2996,7 +2996,17 @@ function browserCodeKernelMain() {
 }
 
 function childSource() {
-  return `const __name = (target) => target;\n(${browserCodeKernelMain.toString()})();`;
+  // Keep the stdin entry self-contained. The kernel runs in a separate CommonJS
+  // process, so module-scope helpers are not part of the serialized closure.
+  // Declaring them explicitly here prevents rarely used APIs such as
+  // page.setTextSelection() from failing with a late ReferenceError.
+  return [
+    'const __name = (target) => target;',
+    `const readEditableText = ${readEditableText.toString()};`,
+    `const applyEditableTextSelection = ${applyEditableTextSelection.toString()};`,
+    `const resolveEditableTextSelection = ${resolveEditableTextSelection.toString()};`,
+    `(${browserCodeKernelMain.toString()})();`,
+  ].join('\n');
 }
 
 function browserCodeModuleReadRoots(environment: Readonly<Record<string, string | undefined>> = process.env) {
@@ -3007,7 +3017,11 @@ function browserCodeModuleReadRoots(environment: Readonly<Record<string, string 
   return Array.from(new Set(roots));
 }
 
-function browserCodeChildArgs(tempDir: string, environment?: Readonly<Record<string, string | undefined>>) {
+function browserCodeChildArgs(
+  tempDir: string,
+  entryPath: string,
+  environment?: Readonly<Record<string, string | undefined>>,
+) {
   return [
     '--permission',
     '--experimental-vm-modules',
@@ -3017,7 +3031,7 @@ function browserCodeChildArgs(tempDir: string, environment?: Readonly<Record<str
     '--max-old-space-size=128',
     '--max-semi-space-size=32',
     '--stack-size=4096',
-    '-',
+    entryPath,
   ];
 }
 
@@ -3108,8 +3122,8 @@ export class BrowserCodeKernel {
     }
 
     const maxOutputChars = typeof input.maxOutputChars === 'number'
-      ? Math.max(1_000, Math.floor(input.maxOutputChars))
-      : undefined;
+      ? Math.min(200_000, Math.max(1_000, Math.floor(input.maxOutputChars)))
+      : 40_000;
     let attachmentBindings: BrowserCodeAttachmentBinding[] = [];
     if (/\battachmentVault\s*\.\s*setInputFiles\s*\(/i.test(browserCodeWithoutComments(input.code))) {
       try {
@@ -3203,7 +3217,14 @@ export class BrowserCodeKernel {
 
     const kernelId = randomUUID();
     const tempDir = path.join(os.tmpdir(), 'webpilot-browser-code', kernelId);
-    mkdirSync(tempDir, { recursive: true });
+    const entryPath = path.join(tempDir, 'browser-code-kernel.cjs');
+    try {
+      mkdirSync(tempDir, { recursive: true });
+      writeFileSync(entryPath, childSource(), 'utf8');
+    } catch (error) {
+      removeBrowserCodeTempDir(tempDir);
+      return Promise.reject(error);
+    }
     this.tempDir = tempDir;
     this.stderr = '';
     const readyPromise = new Promise<void>((resolve, reject) => {
@@ -3213,10 +3234,10 @@ export class BrowserCodeKernel {
     this.readyPromise = readyPromise;
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, browserCodeChildArgs(tempDir, this.options.environment), {
+      child = spawn(process.execPath, browserCodeChildArgs(tempDir, entryPath, this.options.environment), {
         cwd: process.cwd(),
         env: browserCodeChildEnv(tempDir, this.options.environment),
-        stdio: ['pipe', 'ignore', 'pipe', 'ipc'],
+        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
         windowsHide: true,
       });
     } catch (error) {
@@ -3229,7 +3250,6 @@ export class BrowserCodeKernel {
     this.child = child;
     this.childStartedAt = Date.now();
     this.executionCount = 0;
-    child.stdin?.end(childSource(), 'utf8');
     child.stderr?.on('data', (chunk: Buffer) => {
       this.stderr = `${this.stderr}${chunk.toString('utf8')}`.slice(-maxDiagnosticChars);
     });

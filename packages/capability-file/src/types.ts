@@ -5,6 +5,8 @@ import type {
 } from '@webpilot/capability-sdk';
 import type {
   OfficeDocumentKind,
+  OfficeDesignBrief,
+  OfficeSemanticDocumentInput,
   OfficeVisualQaCheckStatus,
   OfficeVisualQaDeckChecks,
   OfficeVisualQaIssue,
@@ -13,6 +15,9 @@ import type {
 
 export const fileActions = [
   'list',
+  'readSource',
+  'readContent',
+  /** Legacy transport alias; not advertised to models. */
   'read',
   'download',
   'convert',
@@ -23,6 +28,8 @@ export const fileActions = [
   'jsApi',
   'render',
 ] as const;
+
+export const fileModelActions = fileActions.filter((action) => action !== 'read');
 
 export const fileVisualToolActions = [
   'visualIndex',
@@ -48,15 +55,20 @@ export type FileToolInput = {
   operation?: FileOperation;
   sourceAttachmentId?: string;
   intent?: string;
+  design?: OfficeDesignBrief;
   url?: string;
   path?: string;
   startLine?: number;
   endLine?: number;
+  includeDiagnostics?: boolean;
   urlOrPath?: string;
   program?: string;
+  /** Compact semantic create spec. Generate accepts exactly one of spec or program. */
+  spec?: OfficeSemanticDocumentInput;
   baseDigest?: string;
   replaceExisting?: boolean;
   patch?: string;
+  replacements?: Array<{ oldText: string; newText: string }>;
   render?: boolean;
   includeVisuals?: boolean;
   offset?: number;

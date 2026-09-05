@@ -17,18 +17,34 @@
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav {
     align-content: start;
     display: grid;
-    gap: 2px;
+    gap: 14px;
     min-width: 0;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-settings-nav-group {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+  }
+
+  .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-settings-nav-label {
+    color: var(--muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    line-height: 20px;
+    padding: 0 10px;
+    text-transform: uppercase;
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button {
     align-items: center;
     appearance: none;
     background: transparent;
-    border: 0;
-    border-radius: 6px;
+    border: 1px solid transparent;
+    border-radius: 5px;
     box-shadow: none;
-    color: var(--muted-strong);
+    color: var(--muted);
     cursor: pointer;
     display: flex;
     font: inherit;
@@ -47,13 +63,14 @@
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button:hover {
-    background: color-mix(in srgb, var(--foreground) 3.5%, transparent);
+    background: transparent;
     color: var(--foreground);
   }
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active,
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button.active:hover {
     background: transparent !important;
+    border-color: transparent;
     box-shadow: none !important;
     color: var(--foreground);
     font-weight: 600;
@@ -72,9 +89,10 @@
 
   .settings-workspace-route:not(.sidebar-collapsed) .browser-chat-subnav button > svg:not(.browser-chat-settings-tab-lock) {
     animation: none;
-    color: var(--muted-strong);
+    color: var(--muted);
     flex: 0 0 16px;
     height: 16px;
+    stroke-width: 1.9;
     transform: none;
     width: 16px;
   }
@@ -97,4 +115,12 @@
     margin-left: 4px;
     transform: none;
   }
+}
+
+.settings-workspace-route.sidebar-collapsed .browser-chat-settings-nav-label {
+  display: none;
+}
+
+.settings-workspace-route.sidebar-collapsed .browser-chat-settings-nav-group {
+  display: contents;
 }

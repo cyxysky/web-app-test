@@ -5,5 +5,6 @@ export * from './office/javascript.js';
 export * from './office/program-analysis.js';
 export * from './office/preview.js';
 export * from './office/render-validation.js';
+export * from './office/semantic.js';
 export * from './office/uno.js';
 export * from './office/validation.js';

@@ -13,7 +13,7 @@ import type {
   WindowWithAiDomRuntime,
 } from './browser-session.js';
 
-export const AI_DOM_RUNTIME_VERSION = 28;
+export const AI_DOM_RUNTIME_VERSION = 29;
 
 export function installAccessibilitySnapshotExportControl() {
   if (window.top !== window) return;
@@ -88,6 +88,16 @@ export function installAccessibilitySnapshotExportControl() {
 
 export function installAiBrowserPageRuntime(runtimeVersion: number) {
   const win = window as WindowWithAiDomRuntime;
+  if (typeof (win as Window & { __name?: unknown }).__name !== 'function') {
+    Object.defineProperty(win, '__name', {
+      configurable: true,
+      enumerable: false,
+      value(target: Function, value: string) {
+        try { Object.defineProperty(target, 'name', { configurable: true, value }); } catch {}
+        return target;
+      },
+    });
+  }
   const mouseCursorId = '__ai_mouse_cursor__';
   const mountMouseCursor = () => {
     const existing = document.getElementById(mouseCursorId);
@@ -200,6 +210,21 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   }
 
   const mutationState = win.__aiDomMutationState || { epoch: 0, lastMutationAt: Date.now() };
+  if (mutationState.document !== document) {
+    try { mutationState.observer?.disconnect(); } catch {}
+    mutationState.document = document;
+    mutationState.observer = undefined;
+    mutationState.epoch = 0;
+    mutationState.lastMutationAt = Date.now();
+    mutationState.activeSurfaceSignature = undefined;
+    mutationState.pendingMutations = [];
+    mutationState.pendingMutationKeys = new WeakMap<Node, Set<string>>();
+    mutationState.pendingOverflow = false;
+    mutationState.journalMutations = [];
+    mutationState.journalOverflow = false;
+    mutationState.interactionCounts = {};
+    mutationState.interactionSequence = 0;
+  }
   win.__aiDomMutationState = mutationState;
   if (!mutationState.observer) {
     mutationState.observer = new MutationObserver((mutations) => {
@@ -245,11 +270,51 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     });
   }
 
+  mutationState.interactionCounts ||= {};
+  mutationState.interactionSequence = Number(mutationState.interactionSequence) || 0;
+  const interactionTypes = [
+    'click', 'auxclick', 'contextmenu', 'dblclick', 'input', 'change', 'focusin', 'focusout',
+    'keydown', 'keyup', 'mousemove', 'mouseover', 'wheel', 'scroll', 'dragstart', 'dragover', 'drop',
+  ];
+  if (mutationState.interactionListenerDocument && mutationState.interactionListener) {
+    for (const type of interactionTypes) {
+      try {
+        mutationState.interactionListenerDocument.removeEventListener(
+          type,
+          mutationState.interactionListener,
+          { capture: true },
+        );
+      } catch {}
+    }
+  }
+  const markInteraction = (event: Event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) return;
+    mutationState.interactionSequence = Number(mutationState.interactionSequence) + 1;
+    mutationState.interactionCounts![event.type] = (mutationState.interactionCounts![event.type] || 0) + 1;
+    mutationState.lastInteractionType = event.type;
+    mutationState.lastInteractionAt = Date.now();
+  };
+  for (const type of interactionTypes) {
+    document.addEventListener(type, markInteraction, { capture: true, passive: true });
+  }
+  mutationState.interactionListenerDocument = document;
+  mutationState.interactionListener = markInteraction;
+
   if (win.__aiDomRuntime?.version === runtimeVersion) return;
 
   const skippedTags = new Set(['script', 'style', 'noscript', 'template', 'meta', 'link', 'head', 'br', 'hr', 'wbr']);
   const nativeActionableTags = new Set(['button', 'details', 'input', 'option', 'select', 'summary', 'textarea']);
   const normalize = (value?: string | null) => String(value || '').replace(/\s+/g, ' ').trim();
+  let activeComputedStyleCache: WeakMap<Element, CSSStyleDeclaration> | undefined;
+
+  function runtimeComputedStyle(element: Element) {
+    const cached = activeComputedStyleCache?.get(element);
+    if (cached) return cached;
+    const style = window.getComputedStyle(element);
+    activeComputedStyleCache?.set(element, style);
+    return style;
+  }
 
   function isOverlay(element: Element) {
     return Boolean(element.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__'));
@@ -284,7 +349,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
 
   function isDisplayNone(element: Element) {
     try {
-      return window.getComputedStyle(element).display === 'none';
+      return runtimeComputedStyle(element).display === 'none';
     } catch {
       return false;
     }
@@ -303,7 +368,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     const tag = element.tagName.toLowerCase();
     if (skippedTags.has(tag)) return false;
     if (element.hasAttribute('hidden')) return false;
-    const style = window.getComputedStyle(element);
+    const style = runtimeComputedStyle(element);
     if (!style || style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
     if (options.requirePointerEvents && style.pointerEvents === 'none') return false;
     if (Number(style.opacity || '1') <= 0.01) return false;
@@ -356,11 +421,11 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   }
 
   function hasPointerCursor(element: Element) {
-    const style = window.getComputedStyle(element);
+    const style = runtimeComputedStyle(element);
     if (!/\bpointer\b/i.test(style.cursor || '')) return false;
     const parent = flatParentElement(element);
     if (!parent) return true;
-    const parentStyle = window.getComputedStyle(parent);
+    const parentStyle = runtimeComputedStyle(parent);
     if (!/\bpointer\b/i.test(parentStyle.cursor || '')) return true;
     return /(?:^|;)\s*cursor\s*:\s*pointer\b/i.test(element.getAttribute('style') || '');
   }
@@ -602,7 +667,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
 
   function visibleDomStyle(element: Element) {
     try {
-      return window.getComputedStyle(element);
+      return runtimeComputedStyle(element);
     } catch {
       return undefined;
     }
@@ -700,7 +765,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
     const shouldInspectCssHover = signals.some((signal) => !/^listener:(mousedown|mouseup|pointerdown|pointerup|touchstart|keydown)$/.test(signal));
     const className = typeof element.className === 'string' ? element.className : '';
     if (shouldInspectCssHover && (hoverElements.has(element) || /(^|\s)hover[:_-]/.test(className))) signals.push('hover-css');
-    const style = window.getComputedStyle(element);
+    const style = runtimeComputedStyle(element);
     if (/^(auto|scroll)$/.test(style.overflowY)
       && element.children.length >= 3
       && (element as HTMLElement).clientHeight > 0
@@ -811,7 +876,7 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   }
 
   function visibleDomRect(element: Element, viewportClip: BrowserUseViewportClip) {
-    const style = window.getComputedStyle(element);
+    const style = runtimeComputedStyle(element);
     if (
       style.visibility !== 'visible'
       || style.display === 'none'
@@ -1359,6 +1424,9 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
   }
 
   function visibleDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean; viewportClip?: BrowserUseViewportClip }) {
+    const previousStyleCache = activeComputedStyleCache;
+    activeComputedStyleCache = new WeakMap<Element, CSSStyleDeclaration>();
+    try {
     const state = visibleDomState();
     if (!options.preserveExistingRefs) state.refToElement.clear();
 
@@ -1394,9 +1462,15 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       },
     });
     return { frameElements, items, stateKey: state.instanceId, viewport: rawViewport };
+    } finally {
+      activeComputedStyleCache = previousStyleCache;
+    }
   }
 
   function fullDomSnapshot(options: { maxChars: number; maxElements: number; preserveExistingRefs?: boolean }) {
+    const previousStyleCache = activeComputedStyleCache;
+    activeComputedStyleCache = new WeakMap<Element, CSSStyleDeclaration>();
+    try {
     const state = visibleDomState();
     if (!options.preserveExistingRefs) state.refToElement.clear();
 
@@ -1448,6 +1522,9 @@ export function installAiBrowserPageRuntime(runtimeVersion: number) {
       },
     });
     return { frameElements, items, stateKey: state.instanceId, viewport };
+    } finally {
+      activeComputedStyleCache = previousStyleCache;
+    }
   }
 
   function discardDomChanges() {

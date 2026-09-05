@@ -3,7 +3,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createConnection, createServer } from 'node:net';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Worker as PlaywrightWorker } from 'playwright';
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, ConsoleMessage, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Response, Worker as PlaywrightWorker } from 'playwright';
 import { raceWithAbort, type CapabilityConfiguration } from '@webpilot/capability-sdk';
 import {
   resolveBrowserOutputPixelRatio,
@@ -15,6 +15,7 @@ import {
   BrowserPreviewFramePump,
   type BrowserPreviewFramePumpMetrics,
 } from './browser-preview-frame-pump.js';
+import { browserPreviewVideoMaximumDimensions } from './browser-preview-video-settings.js';
 import {
   boundedNonNegativeIntegerEnv,
   boundedPositiveIntegerEnv,
@@ -201,6 +202,10 @@ export type { BrowserActiveSurface, BrowserPageObservation } from './browser-pag
 export type BrowserActionResult = {
   ok: boolean;
   actual: string;
+  /** Structured result payload. Callers should prefer this over parsing actual. */
+  data?: unknown;
+  /** Compact transport-facing description that does not duplicate a large actual payload. */
+  summary?: string;
   /** Results from prerequisite tools executed inside this same model tool call, in execution order. */
   prerequisiteResults?: Array<{
     toolName: string;
@@ -253,6 +258,13 @@ export type BrowserActionResult = {
     overflow: boolean;
     observation?: BrowserPageObservation;
   };
+};
+
+export type BrowserStateSnapshot = {
+  tabs: BrowserTabSnapshot[];
+  activePage: { url: string; title: string };
+  pageState: string;
+  truncated?: boolean;
 };
 
 export type BrowserDependencyFailure = {
@@ -736,6 +748,13 @@ type AiDomMutationStateSnapshot = {
   epoch: number;
   lastMutationAt: number;
   activeSurfaceSignature?: string;
+  document?: Document;
+  interactionCounts?: Record<string, number>;
+  interactionListener?: EventListener;
+  interactionListenerDocument?: Document;
+  interactionSequence?: number;
+  lastInteractionAt?: number;
+  lastInteractionType?: string;
 };
 
 type NavigationDomStabilitySample = {
@@ -762,90 +781,6 @@ type BrowserActionVerification = {
   ok: boolean;
   detail: string;
 };
-
-const aiDomMutationObserverScript = `(() => {
-  const win = window;
-  if (typeof win.__name !== 'function') {
-    Object.defineProperty(win, '__name', {
-      configurable: true,
-      enumerable: false,
-      value(target, value) {
-        try { Object.defineProperty(target, 'name', { configurable: true, value }); } catch {}
-        return target;
-      },
-    });
-  }
-  const state = win.__aiDomMutationState || { epoch: 0, lastMutationAt: Date.now() };
-  if (state.document !== document) {
-    try { state.observer?.disconnect(); } catch {}
-    state.document = document;
-    state.observer = undefined;
-    state.epoch = 0;
-    state.lastMutationAt = Date.now();
-    state.activeSurfaceSignature = undefined;
-    state.pendingMutations = [];
-    state.pendingMutationKeys = new WeakMap();
-    state.pendingOverflow = false;
-    state.journalMutations = [];
-    state.journalOverflow = false;
-    state.interactionCounts = {};
-    state.interactionSequence = 0;
-    state.interactionListenersInstalled = false;
-  }
-  state.interactionCounts = state.interactionCounts || {};
-  state.interactionSequence = Number(state.interactionSequence) || 0;
-  win.__aiDomMutationState = state;
-  if (!state.observer) {
-    state.observer = new MutationObserver((mutations) => {
-      let meaningful = false;
-      for (const mutation of mutations) {
-        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
-        if (!target || !target.closest || !target.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) {
-          meaningful = true;
-          break;
-        }
-      }
-      if (!meaningful) return;
-      state.pendingMutations = state.pendingMutations || [];
-      state.journalMutations = state.journalMutations || [];
-      for (const mutation of mutations) {
-        if (state.journalMutations.length >= 10000) state.journalOverflow = true;
-        else state.journalMutations.push(mutation);
-        if (state.pendingMutations.length >= 500) {
-          state.pendingOverflow = true;
-          continue;
-        }
-        state.pendingMutations.push(mutation);
-      }
-      state.epoch += 1;
-      state.lastMutationAt = Date.now();
-    });
-    state.observer.observe(document, { attributes: true, characterData: true, childList: true, subtree: true });
-  }
-  // document.open()/page.setContent() may clear listeners while retaining the
-  // same Window and state object. Rebind on every runtime revision instead of
-  // trusting a stale boolean left by the previous document lifecycle.
-  const interactionTypes = ['click', 'auxclick', 'contextmenu', 'dblclick', 'input', 'change', 'focusin', 'focusout', 'keydown', 'keyup', 'mousemove', 'mouseover', 'wheel', 'scroll', 'dragstart', 'dragover', 'drop'];
-  if (state.interactionListenerDocument && state.interactionListener) {
-    for (const type of interactionTypes) {
-      try { state.interactionListenerDocument.removeEventListener(type, state.interactionListener, { capture: true }); } catch {}
-    }
-  }
-  const markInteraction = (event) => {
-    const target = event.target instanceof Element ? event.target : null;
-    if (target && target.closest('#__ai_candidate_overlay__, #__ai_mouse_cursor__, #__ai_dom_export_control__')) return;
-    state.interactionSequence += 1;
-    state.interactionCounts[event.type] = (state.interactionCounts[event.type] || 0) + 1;
-    state.lastInteractionType = event.type;
-    state.lastInteractionAt = Date.now();
-  };
-  for (const type of interactionTypes) {
-    document.addEventListener(type, markInteraction, { capture: true, passive: true });
-  }
-  state.interactionListenerDocument = document;
-  state.interactionListener = markInteraction;
-  state.interactionListenersInstalled = true;
-})()`;
 
 type SnapshotReference = {
   uid: string;
@@ -1267,9 +1202,14 @@ type SharedBrowserState = {
     ownership: SharedBrowserOwnership;
   }>;
   idleTimer?: ReturnType<typeof setTimeout>;
+  closingPromise?: Promise<void>;
+  generation: number;
+  lifecycle: 'idle' | 'initializing' | 'ready' | 'closing' | 'failed';
   managedProfileDir?: string;
   environment?: BrowserRuntimeEnvironment;
 };
+
+export type BrowserSessionLifecycleState = 'idle' | 'starting' | 'ready' | 'closing' | 'closed' | 'failed';
 const sharedBrowserStates = ((globalThis as typeof globalThis & {
   __webPilotSharedBrowserStates?: Map<string, SharedBrowserState>;
 }).__webPilotSharedBrowserStates ??= new Map<string, SharedBrowserState>());
@@ -1277,9 +1217,11 @@ const sharedBrowserStates = ((globalThis as typeof globalThis & {
 function sharedBrowserStateFor(runtimeKey: string) {
   let state = sharedBrowserStates.get(runtimeKey);
   if (!state) {
-    state = { refCount: 0 };
+    state = { generation: 0, lifecycle: 'idle', refCount: 0 };
     sharedBrowserStates.set(runtimeKey, state);
   }
+  state.generation ??= 0;
+  state.lifecycle ??= state.context ? 'ready' : state.initPromise ? 'initializing' : 'idle';
   return state;
 }
 
@@ -1311,6 +1253,25 @@ async function timedBrowserStep<T>(
   } finally {
     if (timings) timings[name] = (timings[name] || 0) + Date.now() - startedAt;
   }
+}
+
+async function mapWithConcurrency<T, TResult>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<TResult>,
+) {
+  if (!items.length) return [] as TResult[];
+  const results = new Array<TResult>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(items.length, Math.max(1, Math.floor(concurrency))) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 function sharedBrowserKey(input: {
@@ -1675,33 +1636,50 @@ async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: Sh
     return;
   }
 
+  if (sharedBrowserState.closingPromise) return sharedBrowserState.closingPromise;
+
   if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
   sharedBrowserState.idleTimer = undefined;
-
-  const { browser, browserServer, context, ownership } = sharedBrowserState;
-  const managedProfileDir = sharedBrowserState.managedProfileDir;
-  let managedProfileBrowserClosed = false;
-  if (ownership === 'persistent') {
-    await context?.close().catch(() => undefined);
-    managedProfileBrowserClosed = true;
-  } else if (ownership === 'launched') {
-    await browser?.close().catch(() => undefined);
-    managedProfileBrowserClosed = true;
-  } else if (ownership === 'connected' && (force || environment.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
-    if (force) managedProfileBrowserClosed = await closeConnectedBrowserProcess(browser);
-    await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
+  const closeGeneration = sharedBrowserState.generation;
+  sharedBrowserState.lifecycle = 'closing';
+  const closingPromise = (async () => {
+    const { browser, browserServer, context, ownership } = sharedBrowserState;
+    const managedProfileDir = sharedBrowserState.managedProfileDir;
+    let managedProfileBrowserClosed = false;
+    if (ownership === 'persistent') {
+      await context?.close().catch(() => undefined);
+      managedProfileBrowserClosed = true;
+    } else if (ownership === 'launched') {
+      await browser?.close().catch(() => undefined);
+      managedProfileBrowserClosed = true;
+    } else if (ownership === 'connected' && (force || environment.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
+      if (force) managedProfileBrowserClosed = await closeConnectedBrowserProcess(browser);
+      await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
+    }
+    await browserServer?.close().catch(() => undefined);
+    if (sharedBrowserState.generation !== closeGeneration) return;
+    sharedBrowserState.browser = undefined;
+    sharedBrowserState.browserServer = undefined;
+    sharedBrowserState.browserCodeConnection = undefined;
+    sharedBrowserState.context = undefined;
+    sharedBrowserState.ownership = undefined;
+    sharedBrowserState.initPromise = undefined;
+    sharedBrowserState.key = undefined;
+    sharedBrowserState.managedProfileDir = undefined;
+    sharedBrowserState.environment = undefined;
+    sharedBrowserState.generation += 1;
+    sharedBrowserState.lifecycle = 'idle';
+    if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir, environment);
+  })();
+  sharedBrowserState.closingPromise = closingPromise;
+  try {
+    await closingPromise;
+  } catch (error) {
+    sharedBrowserState.lifecycle = 'failed';
+    throw error;
+  } finally {
+    if (sharedBrowserState.closingPromise === closingPromise) sharedBrowserState.closingPromise = undefined;
   }
-  await browserServer?.close().catch(() => undefined);
-  sharedBrowserState.browser = undefined;
-  sharedBrowserState.browserServer = undefined;
-  sharedBrowserState.browserCodeConnection = undefined;
-  sharedBrowserState.context = undefined;
-  sharedBrowserState.ownership = undefined;
-  sharedBrowserState.initPromise = undefined;
-  sharedBrowserState.key = undefined;
-  sharedBrowserState.managedProfileDir = undefined;
-  sharedBrowserState.environment = undefined;
-  if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir, environment);
 }
 
 async function acquireSharedBrowser(input: {
@@ -1717,6 +1695,7 @@ async function acquireSharedBrowser(input: {
 }): Promise<SharedBrowserLease> {
   const runtimeKey = input.runtimeKey?.trim() || 'global';
   const sharedBrowserState = sharedBrowserStateFor(runtimeKey);
+  await sharedBrowserState.closingPromise?.catch(() => undefined);
   if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
   sharedBrowserState.idleTimer = undefined;
   const key = input.runtimeKey ? `runtime:${runtimeKey}` : sharedBrowserKey(input);
@@ -1729,6 +1708,8 @@ async function acquireSharedBrowser(input: {
 
   const browserStillConnected = !sharedBrowserState.browser || sharedBrowserState.browser.isConnected();
   if (!sharedBrowserState.initPromise || sharedBrowserState.key !== key || !browserStillConnected || !sharedBrowserState.context) {
+    const initGeneration = ++sharedBrowserState.generation;
+    sharedBrowserState.lifecycle = 'initializing';
     sharedBrowserState.key = key;
     sharedBrowserState.managedProfileDir = input.managedProfileDir;
     sharedBrowserState.environment = input.environment;
@@ -1788,12 +1769,21 @@ async function acquireSharedBrowser(input: {
         contextOptions: input.contextOptions,
       });
     })().then((lease) => {
+      if (sharedBrowserState.generation !== initGeneration) throw new Error('Shared browser initialization was superseded.');
       sharedBrowserState.browser = lease.browser;
       sharedBrowserState.browserServer = 'browserServer' in lease ? lease.browserServer : undefined;
       sharedBrowserState.browserCodeConnection = lease.browserCodeConnection;
       sharedBrowserState.context = lease.context;
       sharedBrowserState.ownership = lease.ownership;
+      sharedBrowserState.lifecycle = 'ready';
       return lease;
+    }).catch((error) => {
+      if (sharedBrowserState.generation === initGeneration) {
+        sharedBrowserState.lifecycle = 'failed';
+        sharedBrowserState.initPromise = undefined;
+        sharedBrowserState.key = undefined;
+      }
+      throw error;
     });
   }
 
@@ -1828,6 +1818,9 @@ export class BrowserSession {
   private browserCodeConnection?: BrowserCodeConnection;
   private browserCodeKernel?: BrowserCodeKernel;
   private browserCodeKernelRevision?: number;
+  private lifecycle: BrowserSessionLifecycleState = 'idle';
+  private startPromise?: Promise<void>;
+  private closePromise?: Promise<void>;
   private context?: BrowserContext;
   private page?: Page;
   private networkErrors: string[] = [];
@@ -1864,10 +1857,12 @@ export class BrowserSession {
   private managedProfileDir?: string;
   private livePreviewStateListeners = new Set<BrowserLivePreviewStateListener>();
   private livePreviewNativeListeners = new Set<(event: BrowserLiveNativeEvent) => void>();
+  private activeScreencasts = new Set<BrowserScreencastHandle>();
   private liveDialogOpenedWaiters = new Set<(page: Page) => void>();
   private pendingLiveDialogs = new Map<string, { descriptor: BrowserLiveDialog; dialog: Dialog; page: Page }>();
   private pendingLiveFileInputs = new Map<string, { element: ElementHandle<HTMLInputElement>; page: Page }>();
   private livePreviewTabsNotifyScheduled = false;
+  private contextPageListener?: (page: Page) => void;
   private pageDiscoveryListener?: (page: Page) => void;
   private pageGroupInitScriptPages = new WeakSet<Page>();
   private pageGroupMarkPromises = new WeakMap<Page, Promise<void>>();
@@ -1879,7 +1874,9 @@ export class BrowserSession {
   private livePreviewBackgroundPageUntil = new WeakMap<Page, number>();
   private livePreviewBackgroundPopupOpeners = new WeakSet<Page>();
   private livePreviewDownloadGestureUntil = new WeakMap<Page, number>();
-  private livePreviewDownloadListenerPages = new WeakSet<Page>();
+  private livePreviewDownloadListeners = new Map<Page, (download: PlaywrightDownload) => void>();
+  private pageListenerDisposers = new Map<Page, () => void>();
+  private pageOwnershipCloseListeners = new Map<Page, () => void>();
   private configuredViewportKeyByPage = new WeakMap<Page, string>();
   private livePreviewNativeTabRefreshAt = 0;
   private livePreviewTabIdSequence = 0;
@@ -1897,7 +1894,6 @@ export class BrowserSession {
   private accessibilitySnapshotExportControlInstalled = false;
   private accessibilitySnapshotExporter?: () => Promise<AccessibilitySnapshotExportControlResult>;
   private visitedOrigins = new Set<string>();
-  private observedPageLinks = new Map<string, { url: string; title: string }>();
   private readonly pageGroupId: string;
   private capabilityConfiguration: CapabilityConfiguration;
   private browserSurface: BrowserSessionSurface = 'external';
@@ -1906,7 +1902,6 @@ export class BrowserSession {
   constructor(private readonly options: BrowserSessionOptions = {}) {
     this.capabilityConfiguration = Object.freeze({ ...options.configuration });
     this.pageGroupId = normalizePageGroupId(options.runId);
-    registerBrowserSession(this);
   }
 
   /** Applies host-loaded settings before a lazily created session is started. */
@@ -1925,6 +1920,16 @@ export class BrowserSession {
 
   private configuredValue(key: string) {
     return this.capabilityConfiguration[key] ?? process.env[key];
+  }
+
+  private snapshotFrameConcurrency() {
+    return boundedPositiveIntegerEnv(
+      'BROWSER_SNAPSHOT_FRAME_CONCURRENCY',
+      4,
+      1,
+      16,
+      this.runtimeEnvironment(),
+    );
   }
 
   isUsable() {
@@ -2021,6 +2026,8 @@ export class BrowserSession {
       }
       await child.ensurePageGroup(page);
       if (restorePage && !restorePage.isClosed()) await restorePage.bringToFront().catch(() => undefined);
+      child.lifecycle = 'ready';
+      registerBrowserSession(child);
       return child;
     } catch (error) {
       await child.close({ force: true }).catch(() => undefined);
@@ -2037,6 +2044,31 @@ export class BrowserSession {
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
   async start() {
+    if (this.closePromise) await this.closePromise;
+    if (this.lifecycle === 'ready' && this.isUsable()) return;
+    if (this.startPromise) return this.startPromise;
+    if (this.lifecycle === 'ready') await this.closeNow({ force: true });
+
+    this.lifecycle = 'starting';
+    const attempt = this.startNow();
+    this.startPromise = attempt;
+    try {
+      await attempt;
+      this.lifecycle = 'ready';
+    } catch (error) {
+      this.lifecycle = 'failed';
+      await this.closeNow({ force: true }).catch(() => undefined);
+      throw error;
+    } finally {
+      if (this.startPromise === attempt) this.startPromise = undefined;
+    }
+  }
+
+  async ensureStarted() {
+    await this.start();
+  }
+
+  private async startNow() {
     // A stale browser can restart this instance in place, so turn-scoped tools
     // keep their BrowserSession identity while it reconnects to the tab group.
     registerBrowserSession(this);
@@ -2055,7 +2087,7 @@ export class BrowserSession {
       : headless
         ? `--window-size=${headlessFallbackViewport.width},${headlessFallbackViewport.height + 120}`
         : '';
-    const ignoreHTTPSErrors = environment.BROWSER_IGNORE_HTTPS_ERRORS !== 'false';
+    const ignoreHTTPSErrors = environment.BROWSER_IGNORE_HTTPS_ERRORS === 'true';
     const useElectronEmbeddedBrowser = this.browserSurface === 'electron-embedded';
     const forceBundledBrowser = isolated || (environment.AI_WEB_TEST_FORCE_PLAYWRIGHT_BROWSER === 'true' && !useElectronEmbeddedBrowser);
     const channel = forceBundledBrowser ? undefined : environment.BROWSER_CHANNEL?.trim() || undefined;
@@ -2438,17 +2470,16 @@ export class BrowserSession {
   private async prepareContext(context: BrowserContext, options: { claimPages?: boolean } = {}) {
     if (!preparedContextInitScripts.has(context)) {
       preparedContextInitScripts.add(context);
-      await context.addInitScript({ content: aiDomMutationObserverScript }).catch((error) => {
-        preparedContextInitScripts.delete(context);
-        throw error;
-      });
       await context.addInitScript(installAiBrowserPageRuntime, AI_DOM_RUNTIME_VERSION).catch((error) => {
         preparedContextInitScripts.delete(context);
         throw error;
       });
     }
     if (options.claimPages === false) return;
-    context.on('page', (page) => this.claimPage(page, { makeActive: false }));
+    if (!this.contextPageListener) {
+      this.contextPageListener = (page) => { this.claimPage(page, { makeActive: false }); };
+      context.on('page', this.contextPageListener);
+    }
     for (const page of context.pages()) this.claimPage(page, { makeActive: false });
   }
 
@@ -2544,7 +2575,8 @@ export class BrowserSession {
       this.pageGroupMarkPromises.set(page, markPromise);
       void markPromise;
       this.notifyLivePreviewTabsChanged();
-      page.once('close', () => {
+      const onOwnedPageClose = () => {
+        this.detachPageListeners(page);
         this.ownedPages.delete(page);
         livePreviewVisibilityOwners.delete(page);
         if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
@@ -2552,7 +2584,9 @@ export class BrowserSession {
           this.page = this.sessionPages()[0];
         }
         this.notifyLivePreviewTabsChanged();
-      });
+      };
+      this.pageOwnershipCloseListeners.set(page, onOwnedPageClose);
+      page.once('close', onOwnedPageClose);
     }
     if (options.makeActive !== false) this.page = page;
     return true;
@@ -2560,6 +2594,7 @@ export class BrowserSession {
 
   private releaseOwnedPage(page: Page) {
     if (!this.ownedPages.delete(page)) return;
+    this.detachPageListeners(page);
     livePreviewVisibilityOwners.delete(page);
     if (sharedPageOwners.get(page) === this.pageGroupId) sharedPageOwners.delete(page);
     if (this.page === page) this.page = this.sessionPages()[0];
@@ -2677,7 +2712,6 @@ export class BrowserSession {
     const installedRevision = `${AI_DOM_RUNTIME_VERSION}:${navigationRevision}`;
     if (this.browserRuntimeInstalledRevisionByFrame.get(frame) === installedRevision) return;
     try {
-      await target.evaluate(aiDomMutationObserverScript);
       await target.evaluate(installAiBrowserPageRuntime, AI_DOM_RUNTIME_VERSION);
       this.browserRuntimeInstalledRevisionByFrame.set(frame, installedRevision);
     } catch {
@@ -2801,7 +2835,10 @@ export class BrowserSession {
     this.livePreviewBackgroundPageUntil ||= new WeakMap<Page, number>();
     this.livePreviewBackgroundPopupOpeners ||= new WeakSet<Page>();
     this.livePreviewDownloadGestureUntil ||= new WeakMap<Page, number>();
-    this.livePreviewDownloadListenerPages ||= new WeakSet<Page>();
+    this.livePreviewDownloadListeners ||= new Map<Page, (download: PlaywrightDownload) => void>();
+    this.pageListenerDisposers ||= new Map<Page, () => void>();
+    this.pageOwnershipCloseListeners ||= new Map<Page, () => void>();
+    this.activeScreencasts ||= new Set<BrowserScreencastHandle>();
     this.livePreviewTabIds ||= new WeakMap<Page, string>();
     this.nativeTabIdByPage ||= new WeakMap<Page, number>();
     if (!Number.isFinite(this.livePreviewExplicitPageSelectionAt)) this.livePreviewExplicitPageSelectionAt = 0;
@@ -3050,12 +3087,15 @@ export class BrowserSession {
     await this.refreshSessionGroupPages({ forceNativeRefresh: true });
     const environment = this.runtimeEnvironment();
     const format = options.video
-      ? resolveBrowserPreviewImageFormat(environment.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT || 'png')
+      ? resolveBrowserPreviewImageFormat(environment.BROWSER_PREVIEW_VIDEO_SOURCE_FORMAT || 'jpeg')
       : resolveBrowserPreviewImageFormat(environment.BROWSER_SCREENCAST_FORMAT);
     const contentType: BrowserScreencastFrame['contentType'] = format === 'png' ? 'image/png' : 'image/jpeg';
     const rawQuality = Number(environment.BROWSER_SCREENCAST_QUALITY ?? 90);
     const quality = Math.min(100, Math.max(40, Math.floor(Number.isFinite(rawQuality) ? rawQuality : 90)));
     const currentFrameIntervalMs = () => browserPreviewFrameIntervalMs(environment.BROWSER_PREVIEW_FPS);
+    const targetFps = browserPreviewFramesPerSecond(environment.BROWSER_PREVIEW_FPS);
+    const nativeFrameStride = Math.max(1, Math.round(60 / targetFps));
+    const maximumDimensions = browserPreviewVideoMaximumDimensions(environment);
     let stopped = false;
     let stopPromise: Promise<void> | undefined;
     let page: Page | undefined;
@@ -3074,12 +3114,15 @@ export class BrowserSession {
       data: string;
       metadata?: { deviceHeight?: number; deviceWidth?: number };
       outputViewport: { width: number; height: number };
+      sequence: number;
     } | undefined;
     let outputTimer: ReturnType<typeof setTimeout> | undefined;
     let nextOutputAt = Date.now();
     let nextPageRefreshAt = 0;
     let pageRefreshPromise: Promise<void> | undefined;
     let nativeFrames = 0;
+    let nativeFrameSequence = 0;
+    let emittedNativeFrameSequence = 0;
     let resolveInitialFrame: (() => void) | undefined;
     const initialFrameReady = new Promise<void>((resolve) => { resolveInitialFrame = resolve; });
     const framePump = new BrowserPreviewFramePump<BrowserScreencastFrame>({
@@ -3141,6 +3184,7 @@ export class BrowserSession {
           height: Math.max(1, Math.floor(Number(metadata?.deviceHeight) || viewport.height)),
           width: Math.max(1, Math.floor(Number(metadata?.deviceWidth) || viewport.width)),
         },
+        sequence: ++nativeFrameSequence,
       };
       resolveInitialFrame?.();
       resolveInitialFrame = undefined;
@@ -3227,8 +3271,10 @@ export class BrowserSession {
         nativeFrameListener = listener;
         nextClient.on('Page.screencastFrame', listener);
         await nextClient.send('Page.startScreencast', {
-          everyNthFrame: 1,
+          everyNthFrame: nativeFrameStride,
           format,
+          maxHeight: maximumDimensions.height,
+          maxWidth: maximumDimensions.width,
           ...(format === 'jpeg' ? { quality } : {}),
         });
         return { client: nextClient, page: nextActivePage };
@@ -3242,6 +3288,8 @@ export class BrowserSession {
     const emitLatestFrame = () => {
       const latest = latestNativeFrame;
       if (!latest || latest.capturedPage.isClosed() || this.activePage !== latest.capturedPage) return;
+      if (latest.sequence <= emittedNativeFrameSequence) return;
+      emittedNativeFrameSequence = latest.sequence;
       pushOutputFrame(
         latest.capturedPage,
         latest.data,
@@ -3321,7 +3369,8 @@ export class BrowserSession {
       await stopScreencast(false);
       throw error;
     }
-    return {
+    let handle: BrowserScreencastHandle;
+    handle = {
       metrics: () => {
         const metrics = framePump.metrics();
         return {
@@ -3332,13 +3381,19 @@ export class BrowserSession {
           maxConcurrentCaptures: 1,
           nativeFrames,
           nativeFps: nativeFrames / Math.max(0.001, metrics.elapsedSeconds),
-          targetFps: browserPreviewFramesPerSecond(environment.BROWSER_PREVIEW_FPS),
+          targetFps,
         };
       },
       stop: async () => {
-        await stopScreencast(false);
+        try {
+          await stopScreencast(false);
+        } finally {
+          this.activeScreencasts.delete(handle);
+        }
       },
     };
+    this.activeScreencasts.add(handle);
+    return handle;
   }
 
   private async liveFileControlForElement(
@@ -3896,46 +3951,48 @@ export class BrowserSession {
   // module before page-console collection was removed. Those listeners can
   // outlive a hot reload while the controlled browser session stays open.
   private attachLivePreviewDownloadListener(page: Page) {
-    this.livePreviewDownloadListenerPages ||= new WeakSet<Page>();
-    if (this.livePreviewDownloadListenerPages.has(page)) return;
-    this.livePreviewDownloadListenerPages.add(page);
-    page.on('download', (download) => {
+    this.livePreviewDownloadListeners ||= new Map<Page, (download: PlaywrightDownload) => void>();
+    if (this.livePreviewDownloadListeners.has(page)) return;
+    const listener = (download: PlaywrightDownload) => {
       void this.captureLivePreviewDownload(page, download);
-    });
+    };
+    this.livePreviewDownloadListeners.set(page, listener);
+    page.on('download', listener);
   }
 
   private attachPageListeners(page: Page) {
     // This listener is versioned separately from the long-lived page listener set
     // so an existing controlled page also gains download relay after a dev reload.
     this.attachLivePreviewDownloadListener(page);
+    this.pageListenerDisposers ||= new Map<Page, () => void>();
     if (this.attachedPages.has(page)) return;
     this.attachedPages.add(page);
     this.navigationSequenceByPage.set(page, this.navigationSequenceByPage.get(page) || 0);
     for (const frame of page.frames()) this.rememberVisitedOrigin(frame.url());
     page.setDefaultTimeout(8000);
-    page.on('framenavigated', (frame) => {
+    const onFrameNavigated = (frame: Frame) => {
       this.browserRuntimeRevisionByFrame.set(frame, (this.browserRuntimeRevisionByFrame.get(frame) || 0) + 1);
       this.rememberVisitedOrigin(frame.url());
       if (frame !== page.mainFrame()) return;
       this.domChangeErrorFingerprintsByPage.set(page, new Set());
       this.navigationSequenceByPage.set(page, (this.navigationSequenceByPage.get(page) || 0) + 1);
       this.notifyLivePreviewTabsChanged();
-    });
-    page.on('domcontentloaded', () => {
+    };
+    const onDomContentLoaded = () => {
       const frame = page.mainFrame();
       this.browserRuntimeRevisionByFrame.set(frame, (this.browserRuntimeRevisionByFrame.get(frame) || 0) + 1);
-    });
-    page.on('console', (message) => {
+    };
+    const onConsole = (message: ConsoleMessage) => {
       const text = message.text();
       if (message.type() === 'error' && !shouldIgnoreConsoleError(text)) {
         this.recordDomChangeError(page, 'console', text);
       }
-    });
-    page.on('pageerror', (error) => {
+    };
+    const onPageError = (error: Error) => {
       const text = unknownErrorMessage(error);
       this.recordDomChangeError(page, 'page', text);
-    });
-    page.on('dialog', (dialog: Dialog) => {
+    };
+    const onDialog = (dialog: Dialog) => {
       if (this.livePreviewNativeListeners.size > 0) {
         const dialogId = randomUUID();
         const rawDialogType = dialog.type();
@@ -3963,11 +4020,11 @@ export class BrowserSession {
         const message = `Could not dismiss JavaScript dialog: ${unknownErrorMessage(error)}`;
         this.recordDomChangeError(page, 'dialog', message);
       });
-    });
-    page.on('request', (request) => {
+    };
+    const onRequest = (request: Request) => {
       this.recordHttpRequest(page, request);
-    });
-    page.on('response', (response) => {
+    };
+    const onResponse = (response: Response) => {
       const request = response.request();
       const record = this.httpRequestByRequest.get(request) || this.recordHttpRequest(page, request);
       record.status = response.status();
@@ -3976,8 +4033,8 @@ export class BrowserSession {
       if (record.status === 408 || record.status === 429 || record.status >= 500) {
         this.queueBrowserCodeDependencyFailure(request, record);
       }
-    });
-    page.on('requestfailed', (request) => {
+    };
+    const onRequestFailed = (request: Request) => {
       const record = this.httpRequestByRequest.get(request) || this.recordHttpRequest(page, request);
       const errorText = request.failure()?.errorText || '';
       record.failed = true;
@@ -3986,9 +4043,42 @@ export class BrowserSession {
       if (shouldIgnoreNetworkFailure(request.url(), errorText)) return;
       const message = `${request.method()} ${request.url()} ${errorText}`;
       this.networkErrors.push(message);
+      if (this.networkErrors.length > 200) this.networkErrors.splice(0, this.networkErrors.length - 200);
       this.recordDomChangeError(page, 'network', message);
       this.queueBrowserCodeDependencyFailure(request, record);
+    };
+    page.on('framenavigated', onFrameNavigated);
+    page.on('domcontentloaded', onDomContentLoaded);
+    page.on('console', onConsole);
+    page.on('pageerror', onPageError);
+    page.on('dialog', onDialog);
+    page.on('request', onRequest);
+    page.on('response', onResponse);
+    page.on('requestfailed', onRequestFailed);
+    this.pageListenerDisposers.set(page, () => {
+      page.off('framenavigated', onFrameNavigated);
+      page.off('domcontentloaded', onDomContentLoaded);
+      page.off('console', onConsole);
+      page.off('pageerror', onPageError);
+      page.off('dialog', onDialog);
+      page.off('request', onRequest);
+      page.off('response', onResponse);
+      page.off('requestfailed', onRequestFailed);
+      this.attachedPages.delete(page);
     });
+  }
+
+  private detachPageListeners(page: Page) {
+    this.pageListenerDisposers ||= new Map<Page, () => void>();
+    this.livePreviewDownloadListeners ||= new Map<Page, (download: PlaywrightDownload) => void>();
+    this.pageListenerDisposers.get(page)?.();
+    this.pageListenerDisposers.delete(page);
+    const downloadListener = this.livePreviewDownloadListeners.get(page);
+    if (downloadListener) page.off('download', downloadListener);
+    this.livePreviewDownloadListeners.delete(page);
+    const closeListener = this.pageOwnershipCloseListeners.get(page);
+    if (closeListener) page.off('close', closeListener);
+    this.pageOwnershipCloseListeners.delete(page);
   }
 
   private async captureLivePreviewDownload(page: Page, download: PlaywrightDownload) {
@@ -4136,14 +4226,24 @@ export class BrowserSession {
   }
 
   // 打开目标页面先等待导航提交，再在有限的 DOM 静默窗口后生成新快照。
-  async open(url: string): Promise<BrowserActionResult> {
+  async open(url: string, options: { abortSignal?: AbortSignal; timeoutMs?: number } = {}): Promise<BrowserActionResult> {
     const previousGeneration = this.snapshotGeneration;
-    const beforeUrl = this.activePage.url();
+    const page = this.activePage;
+    const beforeUrl = page.url();
+    const timeoutMs = options.timeoutMs ?? boundedPositiveIntegerEnv(
+      'BROWSER_NAVIGATION_TIMEOUT_MS',
+      30_000,
+      1_000,
+      5 * 60_000,
+      this.runtimeEnvironment(),
+    );
+    options.abortSignal?.throwIfAborted();
     let navigationNote = '';
     try {
-      await this.activePage.goto(url, { waitUntil: 'commit', timeout: 0 });
+      await raceWithAbort(page.goto(url, { waitUntil: 'commit', timeout: timeoutMs }), options.abortSignal);
     } catch (error) {
-      const currentUrl = this.activePage.url();
+      options.abortSignal?.throwIfAborted();
+      const currentUrl = page.url();
       const unchanged = currentUrl === beforeUrl && currentUrl !== url;
       if (!currentUrl || isBlankBrowserUrlLike(currentUrl) || unchanged) {
         return {
@@ -4159,6 +4259,81 @@ export class BrowserSession {
       previousGeneration,
       { postNavigation: true },
     );
+  }
+
+  async readBrowserState(options: { abortSignal?: AbortSignal; maxOutputChars?: number } = {}): Promise<BrowserActionResult> {
+    const maxOutputChars = Math.min(200_000, Math.max(1_000, Math.floor(options.maxOutputChars ?? 40_000)));
+    const page = this.activePage;
+    options.abortSignal?.throwIfAborted();
+    const [observation, title] = await raceWithAbort(Promise.all([
+      this.readPageObservation(),
+      page.title().catch(() => ''),
+    ]), options.abortSignal);
+
+    let targetFrame = page.mainFrame();
+    if (observation.activeSurface?.framePath) {
+      targetFrame = page.frames().find((frame) => this.getFramePath(frame) === observation.activeSurface?.framePath) || targetFrame;
+    }
+    let target = targetFrame.locator('body');
+    if (observation.activeSurface?.selector) {
+      const surface = targetFrame.locator(observation.activeSurface.selector).filter({ visible: true }).first();
+      if (await surface.count().catch(() => 0)) target = surface;
+    }
+    const ariaSnapshot = await raceWithAbort(
+      target.ariaSnapshot({ timeout: 5_000 }).catch(async () => {
+        const text = await target.innerText({ timeout: 1_500 }).catch(() => '');
+        return text ? `[text-fallback]\n${text.slice(0, 12_000)}` : '[snapshot unavailable]';
+      }),
+      options.abortSignal,
+    );
+    const pageState = [
+      `[page-state] ${JSON.stringify(observation)}`,
+      '[ax-tree scope=active]',
+      ariaSnapshot,
+    ].join('\n');
+
+    let tabs = this.getTabsSnapshot()
+      .slice(0, 100)
+      .map((tab) => ({ ...tab, url: tab.url.slice(0, 4_000) }));
+    let payload: BrowserStateSnapshot = {
+      tabs,
+      activePage: { url: page.url().slice(0, 4_000), title: title.slice(0, 2_000) },
+      pageState,
+    };
+    let actual = JSON.stringify(payload, null, 2);
+    if (actual.length > maxOutputChars) {
+      const overflow = actual.length - maxOutputChars;
+      payload = {
+        ...payload,
+        pageState: payload.pageState.slice(0, Math.max(0, payload.pageState.length - overflow - 200)),
+        truncated: true,
+      };
+      actual = JSON.stringify(payload, null, 2);
+    }
+    while (actual.length > maxOutputChars && tabs.length > 1) {
+      tabs = tabs.slice(0, Math.max(1, Math.floor(tabs.length / 2)));
+      payload = { ...payload, tabs, truncated: true };
+      actual = JSON.stringify(payload, null, 2);
+    }
+    if (actual.length > maxOutputChars) {
+      payload = {
+        ...payload,
+        tabs: payload.tabs.slice(0, 1).map((tab) => ({ ...tab, url: tab.url.slice(0, 200) })),
+        activePage: {
+          url: payload.activePage.url.slice(0, 300),
+          title: payload.activePage.title.slice(0, 200),
+        },
+        pageState: '',
+        truncated: true,
+      };
+      actual = JSON.stringify(payload, null, 2);
+    }
+    return {
+      ok: true,
+      actual,
+      data: payload,
+      summary: `Read ${payload.tabs.length} browser tab${payload.tabs.length === 1 ? '' : 's'} and the active page state.`,
+    };
   }
 
 
@@ -4217,9 +4392,6 @@ export class BrowserSession {
           }).catch(() => ({ structuredText: '', interactiveCandidates: [] as PageInteractiveCandidate[], links: [] as Array<{ url: string; title: string }> }));
         },
       );
-      for (const link of observation.links) {
-        this.observedPageLinks.set(link.url.toLowerCase(), link);
-      }
       const label = framePath ? `[iframe ${framePath}${frame.url() ? ` ${frame.url()}` : ''}]` : '';
       append(label, observation.structuredText);
       if (!options.includeInteractiveCandidates || !observation.interactiveCandidates.length) continue;
@@ -4821,6 +4993,8 @@ export class BrowserSession {
     return {
       ok: true,
       actual: JSON.stringify(output, null, 2),
+      data: output,
+      summary: `Read ${output.length} HTTP request record${output.length === 1 ? '' : 's'} from the active tab.`,
     };
   }
 
@@ -5045,26 +5219,31 @@ export class BrowserSession {
       : undefined;
     const effectiveOk = execution.ok && !reportedFailure;
     const effectiveError = execution.error || reportedFailure;
+    const payload = {
+      ok: effectiveOk,
+      result: execution.value ?? null,
+      error: effectiveError ?? null,
+      aborted: execution.aborted === true,
+      elapsedMs: execution.elapsedMs,
+      ...(execution.kernelReset ? {
+        kernelReset: {
+          ...execution.kernelReset,
+          note: 'The persistent browserCode kernel was recycled to release memory. Top-level JavaScript bindings from earlier cells are no longer available.',
+        },
+      } : {}),
+      finalPage: { url: finalUrl, title: finalTitle },
+      ...(inferredActivity.verification ? { verification: inferredActivity.verification } : {}),
+      ...(actualDomChanges ? { domChanges: actualDomChanges } : {}),
+      images: emittedImagePaths.map((filePath) => ({ fileName: path.basename(filePath) })),
+      imageErrors: emittedImageErrors,
+    };
     const result: BrowserActionResult = {
       ok: effectiveOk,
-      actual: JSON.stringify({
-        ok: effectiveOk,
-        result: execution.value ?? null,
-        error: effectiveError ?? null,
-        aborted: execution.aborted === true,
-        elapsedMs: execution.elapsedMs,
-        ...(execution.kernelReset ? {
-          kernelReset: {
-            ...execution.kernelReset,
-            note: 'The persistent browserCode kernel was recycled to release memory. Top-level JavaScript bindings from earlier cells are no longer available.',
-          },
-        } : {}),
-        finalPage: { url: finalUrl, title: finalTitle },
-        ...(inferredActivity.verification ? { verification: inferredActivity.verification } : {}),
-        ...(actualDomChanges ? { domChanges: actualDomChanges } : {}),
-        images: emittedImagePaths.map((filePath) => ({ fileName: path.basename(filePath) })),
-        imageErrors: emittedImageErrors,
-      }, null, 2),
+      actual: JSON.stringify(payload, null, 2),
+      data: payload,
+      summary: effectiveOk
+        ? `browserCode completed in ${execution.elapsedMs}ms at ${finalUrl || 'the active page'}.`
+        : effectiveError || 'browserCode execution failed.',
       referenceImagePath: emittedImagePaths[0],
       referenceImagePaths: emittedImagePaths,
       verification: inferredActivity.verification,
@@ -5099,17 +5278,45 @@ export class BrowserSession {
     };
   }
 
+  getLifecycleState(): BrowserSessionLifecycleState {
+    return this.lifecycle ||= this.isUsable() ? 'ready' : 'idle';
+  }
+
   // 返回本次会话采集到的关键网络失败。
   getNetworkErrors() {
-    return this.networkErrors;
+    return [...this.networkErrors];
   }
 
   // 关闭浏览器；调试场景可选择保留窗口。
   async close(options: { closePages?: boolean; force?: boolean; keepOpen?: boolean; preservePages?: boolean } = {}) {
+    if (this.closePromise) return this.closePromise;
+    const pendingStart = this.startPromise;
+    const closeAttempt = (async () => {
+      await pendingStart?.catch(() => undefined);
+      this.lifecycle = 'closing';
+      await this.closeNow(options);
+      this.lifecycle = this.isUsable() ? 'ready' : 'closed';
+    })();
+    this.closePromise = closeAttempt;
+    try {
+      await closeAttempt;
+    } catch (error) {
+      this.lifecycle = 'failed';
+      throw error;
+    } finally {
+      if (this.closePromise === closeAttempt) this.closePromise = undefined;
+    }
+  }
+
+  private async closeNow(options: { closePages?: boolean; force?: boolean; keepOpen?: boolean; preservePages?: boolean } = {}) {
     const shouldKeepOpen = !options.force && (
-      options.keepOpen === true
+      options.keepOpen === true && this.isUsable()
     );
     let disposeLocalState = false;
+    const activeScreencasts = [...(this.activeScreencasts || [])];
+    this.activeScreencasts ||= new Set<BrowserScreencastHandle>();
+    this.activeScreencasts.clear();
+    await Promise.all(activeScreencasts.map((handle) => handle.stop().catch(() => undefined)));
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
     this.browserCodeKernelRevision = undefined;
@@ -5119,10 +5326,16 @@ export class BrowserSession {
         this.childBrowserSessions.clear();
         await Promise.all(children.map((child) => child.close({ closePages: true, force: options.force }).catch(() => undefined)));
       }
+      if (shouldKeepOpen && this.browserOwnership !== 'shared') return;
+      if (this.context && this.contextPageListener) {
+        this.context.off('page', this.contextPageListener);
+        this.contextPageListener = undefined;
+      }
       if (this.context && this.pageDiscoveryListener) {
         this.context.off('page', this.pageDiscoveryListener);
         this.pageDiscoveryListener = undefined;
       }
+      for (const page of [...(this.pageListenerDisposers?.keys() || [])]) this.detachPageListeners(page);
       if (this.browserOwnership === 'shared') {
         if ((this.parentBrowserSession || this.browserSurface !== 'electron-embedded') && !shouldKeepOpen && !options.preservePages) {
           await this.closeOwnedPages();
@@ -6293,13 +6506,13 @@ export class BrowserSession {
     targets?: Array<{ frame: Frame; framePath?: string; frameUrl?: string }>,
   ) {
     const frameTargets = targets || await this.snapshotFrameTargets();
-    const entries = await Promise.all(frameTargets.map(async (target) => {
+    const entries = await mapWithConcurrency(frameTargets, this.snapshotFrameConcurrency(), async (target) => {
       await this.ensureBrowserPageRuntime(target.frame);
       const state = await target.frame.evaluate(() => (
         (window as WindowWithAiDomRuntime).__aiDomMutationState || { epoch: 0, lastMutationAt: 0 }
       )).catch(() => ({ epoch: -1, lastMutationAt: 0 }));
       return [this.snapshotMutationKey(target), state.epoch] as const;
-    }));
+    });
     return Object.fromEntries(entries);
   }
 
@@ -6315,7 +6528,7 @@ export class BrowserSession {
 
   private async readNavigationDomStabilitySample(): Promise<NavigationDomStabilitySample> {
     const frameTargets = await this.snapshotFrameTargets();
-    const entries = await Promise.all(frameTargets.map(async (target) => {
+    const entries = await mapWithConcurrency(frameTargets, this.snapshotFrameConcurrency(), async (target) => {
       await this.ensureBrowserPageRuntime(target.frame);
       const state = await target.frame.evaluate(() => {
         const mutation = (window as WindowWithAiDomRuntime).__aiDomMutationState;
@@ -6334,7 +6547,7 @@ export class BrowserSession {
         epoch: state.epoch,
         lastMutationAt: state.lastMutationAt,
       };
-    }));
+    });
     if (entries.some((entry) => !entry)) return { ready: false, signature: '' };
     const resolved = entries.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
     return {
@@ -8384,7 +8597,7 @@ export class BrowserSession {
     let epoch = 0;
     let overflow = false;
 
-    const frameDeltas = await Promise.all(frames.map(async (frame) => {
+    const frameDeltas = await mapWithConcurrency(frames, this.snapshotFrameConcurrency(), async (frame) => {
       const framePath = frame === mainFrame ? undefined : this.getFramePath(frame);
       if (frame !== mainFrame && framePath === undefined) return undefined;
       await this.ensureBrowserPageRuntime(frame);
@@ -8393,7 +8606,7 @@ export class BrowserSession {
         return runtime?.visibleDomDelta();
       }).catch(() => undefined);
       return delta ? { delta, frame, framePath } : undefined;
-    }));
+    });
 
     for (const entry of frameDeltas) {
       if (!entry) continue;
@@ -8591,7 +8804,7 @@ export class BrowserSession {
       viewportClip?: BrowserUseViewportClip;
     };
 
-    const snapshots = await Promise.all(frames.slice(0, frameLimit).map(async (frame): Promise<FullFrameSnapshot | undefined> => {
+    const snapshots = await mapWithConcurrency(frames.slice(0, frameLimit), this.snapshotFrameConcurrency(), async (frame): Promise<FullFrameSnapshot | undefined> => {
       const framePath = this.getFramePath(frame);
       if (framePath === undefined) return undefined;
       const snapshot = await timedBrowserStep(timings, 'readFrameFullDomSnapshotMs', () => this.readFullDomSnapshot(frame, maxElements, maxChars, preserveExistingRefs));
@@ -8601,7 +8814,7 @@ export class BrowserSession {
         frameUrl: frame.url() || undefined,
         snapshot,
       };
-    }));
+    });
     return snapshots.filter((snapshot): snapshot is FullFrameSnapshot => Boolean(snapshot));
   }
 
@@ -8626,7 +8839,7 @@ export class BrowserSession {
       viewportClip: BrowserUseViewportClip;
     };
 
-    const snapshots = await Promise.all(frames.slice(0, frameLimit).map(async (frame): Promise<VisibleFrameSnapshot | undefined> => {
+    const snapshots = await mapWithConcurrency(frames.slice(0, frameLimit), this.snapshotFrameConcurrency(), async (frame): Promise<VisibleFrameSnapshot | undefined> => {
       const framePath = this.getFramePath(frame);
       if (framePath === undefined) return undefined;
       const box = await timedBrowserStep(timings, 'getVisibleFrameBoxMs', () => frame.frameElement().then((handle) => handle.boundingBox()).catch(() => undefined));
@@ -8653,7 +8866,7 @@ export class BrowserSession {
         snapshot,
         viewportClip,
       };
-    }));
+    });
     return snapshots.filter((snapshot): snapshot is VisibleFrameSnapshot => Boolean(snapshot));
   }
 

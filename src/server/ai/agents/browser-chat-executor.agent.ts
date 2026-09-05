@@ -8,7 +8,7 @@ import { chartCapabilityManifest, chartCapabilityToolNames } from '@webpilot/cap
 import { EnvironmentCapabilityConfigStore, mountAISDKCapabilities } from '@webpilot/capability-adapter-ai-sdk';
 import type { AiRequestSnapshot, AiToolContextSnapshot, BrowserOperationRecord, StepExecutionResult, StepToolCall, VisualFrameRecord } from '@/server/ai/schemas/runtime.schema';
 import { getModel, getModelSettings } from '@/server/ai/model';
-import { aiMaxOutputTokens, aiReasoningEffort, aiRuntimeRequestTimeoutMs, aiStreamTimeouts, aiTelemetry, createAiRequestWatchdog } from '@/server/ai/ai-sdk-runtime';
+import { AiFirstChunkTimeoutError, aiReasoningEffort, aiRuntimeRequestTimeoutMs, aiStreamTimeouts, aiTelemetry, createAiRequestWatchdog } from '@/server/ai/ai-sdk-runtime';
 import { structuredLog } from '@/server/observability/runtime-observability';
 import { buildCodexObjectPrompt, currentRuntimeTimePromptLine, customRuntimePromptFromEnv } from '@/server/ai/prompts/runtime-agent.prompt';
 import {
@@ -16,7 +16,6 @@ import {
   type BrowserActionResult,
 } from '@webpilot/capability-browser/node';
 import {
-  readBrowserStateCode,
   type BrowserCodeAttachmentBinding,
   type BrowserCodeCredentialBinding,
 } from '@webpilot/capability-browser/node';
@@ -28,6 +27,7 @@ import {
   aiSdkToolResultRequiresContinuation,
 } from './ai-sdk-finish-state';
 import { browserCodeServiceFileDeliveryViolation } from './browser-chat-file-delivery';
+import { fileToolModelOutput } from './browser-chat-file-model-output';
 import { fileArtifactRuntimeSkillId } from '@webpilot/capability-file/runtime-skill';
 import {
   activeBrowserRuntimeSkillId,
@@ -35,6 +35,7 @@ import {
   hiddenRuntimeSkillIds,
   requireHiddenRuntimeSkillRead,
   hiddenRuntimeSkillIdsReadFromTraces,
+  hiddenRuntimeSkillIdsInModelContext,
   runtimeToolTypesWithLoadedSkills,
 } from './hidden-runtime-skills';
 import { subagentRuntimeSkillId } from './subagent-runtime-skill';
@@ -484,7 +485,7 @@ function userFacingToolResult(name: string, result?: BrowserActionResult, _max =
   void _max;
   if (!result) return undefined;
   if (!result.ok && providerToolSchemaError(result.actual)) return userFacingInfrastructureError(result.actual);
-  if (name === 'file') return formatFileArtifactResult(name, result.actual);
+  if (name === 'file') return formatFileArtifactResult(name, result.actual) ?? result.actual;
   return result.actual;
 }
 
@@ -1191,19 +1192,12 @@ async function executeTracedBrowserAction(input: {
   return result;
 }
 
-function initialBrowserStateCode() {
-  return readBrowserStateCode;
-}
-
 async function readCurrentBrowserState(
   session: BrowserSession,
   options: { runId?: string; stepIndex?: number; abortSignal?: AbortSignal } = {},
 ): Promise<BrowserActionResult> {
-  return session.executeBrowserCode({
-    code: initialBrowserStateCode(),
+  return session.readBrowserState({
     maxOutputChars: 40_000,
-    runId: options.runId || 'browser-state',
-    stepIndex: options.stepIndex || 0,
     abortSignal: options.abortSignal,
   });
 }
@@ -1360,7 +1354,7 @@ async function makeBrowserTools(
     readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
     readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
     readSkill?: BrowserChatReadSkill;
-    onReferenceImage?: (input: { path: string; source: string }) => void;
+    onReferenceImage?: (input: { path: string; source: string; label?: string }) => void;
     ensureBrowserStarted?: () => Promise<void>;
     attachmentBindings?: BrowserCodeAttachmentBinding[];
     credentialBindings?: BrowserCodeCredentialBinding[];
@@ -1491,7 +1485,13 @@ async function makeBrowserTools(
             const screenshotId = Array.isArray(screenshotIds) && typeof screenshotIds[index] === 'string'
               ? screenshotIds[index]
               : undefined;
-            referenceOptions?.onReferenceImage?.({ path, source: screenshotId ? `${source}:${screenshotId}` : source });
+            const fileInput = name === 'file' && input && typeof input === 'object'
+              ? input as Record<string, unknown> : undefined;
+            const artifactLabel = fileInput?.artifactId || fileInput?.attachmentId || fileInput?.documentId;
+            referenceOptions?.onReferenceImage?.({
+              path, source: screenshotId ? `${source}:${screenshotId}` : source,
+              label: artifactLabel ? `${String(artifactLabel)}${screenshotId ? ` / ${screenshotId}` : ` / image ${index + 1}`}` : undefined,
+            });
           }
         }
         const resultForModel = name === 'browser' && action === 'code' && imagePaths.length
@@ -1599,6 +1599,11 @@ async function makeBrowserTools(
         },
       }
     : capabilityRuntime.tools) as ToolSet;
+  const mountedFileTool = capabilityTools[fileCapabilityToolNames.file];
+  if (mountedFileTool) capabilityTools[fileCapabilityToolNames.file] = {
+    ...mountedFileTool,
+    toModelOutput: fileToolModelOutput,
+  };
 
   const sharedTools: ToolSet = {
     reportDefect: tool({
@@ -1686,7 +1691,7 @@ async function makeBrowserTools(
       }), execution),
     }),
     skill: tool({
-      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${hiddenRuntimeSkillIds().join(', ')}; successful reads remain loaded only for the current Agent run.`,
+      description: `Read a Skill by exact id. Hidden runtime Skills for this mode are ${hiddenRuntimeSkillIds().join(', ')}. A successful read can be reused while its exact current content remains in the active tool history; reread only when missing, compacted away, or changed.`,
       inputSchema: withToolInputExamples(z.preprocess((value) => {
         if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
         const record = value as Record<string, unknown>;
@@ -1773,7 +1778,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
     `- User-role messages beginning with ${runtimeOperationalContextMarker}, ${runtimeCurrentTimeMarker}, [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. The newest runtime snapshot supersedes older snapshots. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.`,
     '- Treat user-specified dates, times, locations, quantities, names, and option values as exact business constraints. Never silently replace an unavailable value with a nearby, rounded, first-suggestion, or default value; preserve the requested value and ask the user or report the blocker.',
-    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. A file is delivered only when file action=download or a rendered file action=generate/edit/render succeeds with a current-session Artifact download URL. Include every such URL in the final answer and never label another file successful.',
+    '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. Delivery requires a successful file action=download/convert/render with a current-session Artifact download URL. generate/edit success alone only saves and validates source. Include every delivered URL in the final answer and never label another file successful.',
     '- Copy every delivered Artifact downloadUrl exactly from the successful tool result. Never construct, absolutize, repair, or infer an Artifact URL from a sessionId, artifactId, hostname, or file name, and never call a URL an absolute filesystem path. Before finalizing Office/PDF work, reconcile the original requirements with automaticValidation.formatChecks, validation issues, and visual-QA scope. Visual QA proves page layout only; it does not prove requested native charts, formulas, images, comments, footnotes, or other semantic features. A missing, zero-count, unsupported, failed, or unverified required feature must be reported as a limitation, never as fully passed.',
     '- If agent.state tracks task stage, coverage, status, issues, or artifacts, update those records before the final answer so no pending/generated/failed field contradicts a complete claim. Do not set an overall complete/passed state while any required item remains pending, unsupported, failed, or unverified unless the user explicitly accepted a partial result.',
     `- Use chart when an Apache ECharts visualization materially improves the answer. Read Skill ${chartRuntimeSkillId} first and follow its indexed API guidance. After every successful create, reference the exact returned chartId from a finalResponse chart block. Never invent a chart id or use one from a failed call.`,
@@ -2191,6 +2196,7 @@ async function executeRuntimeStep(input: {
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
+  onActiveModelCheckpoint?: (messages: ModelMessage[]) => void | Promise<void>;
   onContextCompression?: (update: {
     activeMessages: ModelMessage[];
     contextCompression: BrowserChatModelContextCompression;
@@ -2292,6 +2298,11 @@ async function executeRuntimeStep(input: {
     // This watchdog is deliberately separate from the user/session abort
     // signal: its timeout is retryable, while a user cancellation is terminal.
     const runtimeRequestTimeoutMs = aiRuntimeRequestTimeoutMs();
+    const streamTimeouts = aiStreamTimeouts(runtimeRequestTimeoutMs);
+    const retryLabel = executionIdentity.attemptNumber > 1
+      ? lastError instanceof AiFirstChunkTimeoutError ? '（首包超时后重试）' : '（重试）'
+      : '';
+    const attemptLabel = `第 ${executionIdentity.attemptNumber}/${runtimeRequestConsecutiveFailureLimit()} 次请求${retryLabel}`;
     const requestWatchdog = createAiRequestWatchdog(abortSignal, runtimeRequestTimeoutMs);
     const onAttemptDebug: ExecutionDebug | undefined = onDebug
       ? (event) => onDebug({
@@ -2340,11 +2351,12 @@ async function executeRuntimeStep(input: {
     type PendingObservationMessage = {
       text: string;
       imagePaths: string[];
+      imageLabels?: Record<string, string>;
     };
     const pendingObservationMessages: PendingObservationMessage[] = [];
     const queuedReferenceImageKeys = new Set<string>();
     const reportedDocumentVisualSources = new Set<string>();
-    const queueReferenceImage = ({ path, source }: { path: string; source: string }) => {
+    const queueReferenceImage = ({ path, source, label }: { path: string; source: string; label?: string }) => {
       const documentVisualQa = source === 'file:generate' || source === 'file:edit' || source.startsWith('file:visualRead');
       const normalizedSource = source.startsWith('file:visualRead:') ? 'file:visualRead' : source;
       const referenceKey = `${source}\u0000${path}`;
@@ -2364,12 +2376,14 @@ async function executeRuntimeStep(input: {
       }
       const text = documentVisualQa
       ? '[Document visual QA]\nThe attached images are the exact pages returned by the latest file action=visualRead. Inspect the pixels for clipping, overlap, hierarchy, typography, contrast, alignment, chart/table legibility, image quality, and page-edge defects. Use the screenshot IDs from the tool result when reporting evidence. If any page fails, patch the same current source, render a replacement artifact, and inspect only that new artifact.'
-        : source === 'file:read'
+        : source === 'file:read' || source === 'file:readContent'
           ? '[Attachment visual content]\nThe file tool rendered or extracted this image from the source attachment. Analyze its layout, images, tables, and charts together with the extracted structure and text.'
           : '[Explicit visual evidence]\nA tool returned this image and attached it to the next model request. Analyze the image directly as fresh evidence.';
       const existingObservation = pendingObservationMessages.find((observation) => observation.text === text);
-      if (existingObservation) existingObservation.imagePaths.push(path);
-      else pendingObservationMessages.push({ text, imagePaths: [path] });
+      if (existingObservation) {
+        existingObservation.imagePaths.push(path);
+        if (label) (existingObservation.imageLabels ||= {})[path] = label;
+      } else pendingObservationMessages.push({ text, imagePaths: [path], imageLabels: label ? { [path]: label } : undefined });
       if (documentVisualQa && !reportedDocumentVisualSources.has(normalizedSource)) {
         reportedDocumentVisualSources.add(normalizedSource);
         void onAttemptDebug?.({
@@ -2642,6 +2656,8 @@ async function executeRuntimeStep(input: {
         for (const imagePath of observation.imagePaths) {
           const image = await readScreenshotForAi(imagePath).catch(() => undefined);
           if (image) {
+            const label = observation.imageLabels?.[imagePath];
+            if (label) content.push({ type: 'text', text: `Image identity: ${JSON.stringify(label)}` });
             content.push({ type: 'file', data: image.data, mediaType: image.mediaType });
             appendedImagePaths.push(imagePath);
           }
@@ -2909,6 +2925,11 @@ async function executeRuntimeStep(input: {
         compactedSourceMessageCount = sourceMessages.length;
       }
       lastPreparedMessages = [...messagesToSend];
+      // A native tool loop can run for many minutes inside one runtime step.
+      // Persist completed exchanges BEFORE the next network request: waiting
+      // for executeRuntimeStep to return loses all of them on interruption.
+      await input.onActiveModelCheckpoint?.(withoutRuntimePromptCacheMetadata(messagesToSend));
+      ensureActive();
       rememberRetryState({
         messages: [...messagesToSend],
         imagePaths: [...attachedImagePaths],
@@ -2956,7 +2977,6 @@ async function executeRuntimeStep(input: {
         messages,
         temperature: 0.1,
         reasoning: aiReasoningEffort(),
-        maxOutputTokens: aiMaxOutputTokens(),
         maxRetries: 0,
         abortSignal: requestWatchdog.abortSignal,
         timeout: runtimeRequestTimeoutMs,
@@ -3131,6 +3151,26 @@ async function executeRuntimeStep(input: {
       let publishedStepText = '';
       let publishedFinalBlocksSignature = '';
       const streamedToolInputs = new Map<string, { json: string; toolName: string }>();
+      let receivedChunks = 0;
+      let lastReceiveProgressAt = 0;
+      let lastReceiveKind = '';
+      const reportReceiving = async (kind: string) => {
+        if (requestWatchdog.abortSignal.aborted) return;
+        requestWatchdog.firstChunkReceived();
+        requestWatchdog.touch();
+        receivedChunks += 1;
+        const timestamp = Date.now();
+        if (kind === lastReceiveKind && timestamp - lastReceiveProgressAt < 10_000) return;
+        lastReceiveProgressAt = timestamp;
+        lastReceiveKind = kind;
+        const elapsedMs = timestamp - (stepStartedAt.get(toolExecutionGate.stepNumber) || timestamp);
+        await onAttemptDebug?.({
+          phase: 'ai:runtime:receiving',
+          stepIndex,
+          message: `正在接收 AI 响应（${kind}） · ${attemptLabel}`,
+          details: { elapsedMs, receivedChunks, kind, agentStepIndex: retryAgentStepOffset + toolExecutionGate.stepNumber + 1 },
+        });
+      };
       const publishStepText = async (text: string, stepNumber: number) => {
         const visibleText = containsPrivateToolProtocol(text)
           ? ''
@@ -3183,18 +3223,26 @@ async function executeRuntimeStep(input: {
         stepStartedAt.set(stepNumber, Date.now());
         streamedStepText = '';
         publishedStepText = '';
+        receivedChunks = 0;
+        lastReceiveProgressAt = 0;
+        lastReceiveKind = '';
         await onAttemptDebug?.({
           phase: 'ai:runtime:request',
           stepIndex,
-          message: 'AI request started; waiting for browser action decision. agent step ' + agentStepLabel(retryAgentStepOffset + stepNumber) + '.',
+          message: `等待 AI 首包（${streamTimeouts.firstChunkMs / 1000} 秒超时） · ${attemptLabel} · 模型步骤 ${agentStepLabel(retryAgentStepOffset + stepNumber)}`,
           details: aiRequestLogDetails(aiRequest, {
             provider: getModelSettings().provider,
             model: getModelSettings().model,
             agentStepIndex: retryAgentStepOffset + stepNumber + 1,
             nativeToolLoop: true,
             toolLoopAgent: input.useToolLoopAgent === true,
+            reasoning: aiReasoningEffort() ?? 'provider-default',
+            firstChunkTimeoutMs: streamTimeouts.firstChunkMs,
           }, prepared.modelMessagesForLog),
         });
+        // The SDK arms its first-content timer only after doStream resolves.
+        // Cover provider initialization and the HTTP response-header wait too.
+        requestWatchdog.waitForFirstChunk(streamTimeouts.firstChunkMs);
         return {
           instructions: prepared.system,
           messages: prepared.messages,
@@ -3222,8 +3270,11 @@ async function executeRuntimeStep(input: {
       } : undefined;
       const onAgentLanguageModelCallEnd = async (event: {
         content: ReadonlyArray<unknown>;
+        finishReason?: string;
+        usage?: unknown;
         performance: { responseTimeMs: number };
       }) => {
+        requestWatchdog.firstChunkReceived();
         const responseTimeMs = finiteContextStat(event.performance.responseTimeMs);
         const turnIndex = toolExecutionGate.stepNumber;
         for (const part of event.content) {
@@ -3242,16 +3293,21 @@ async function executeRuntimeStep(input: {
           : normalizeBrowserChatFinalReplyText(modelText);
         const startedAt = stepStartedAt.get(turnIndex) || Date.now();
         const elapsedMs = responseTimeMs ?? elapsedSince(startedAt);
+        const toolCallCount = event.content.filter((part) => recordFromUnknown(part).type === 'tool-call').length;
+        const responseSummary = visibleText || (toolCallCount > 0
+          ? `AI returned no text; requested ${toolCallCount} tool call(s).`
+          : 'AI returned no displayable text or tool call.');
         await onAttemptDebug?.({
           phase: 'ai:runtime:response',
           stepIndex,
-          message: trimDebugText(visibleText || 'AI returned no text; tool call completed.', 220)
+          message: trimDebugText(responseSummary, 220)
+            + '; finish reason ' + (event.finishReason || 'unknown')
             + '; agent step ' + agentStepLabel(retryAgentStepOffset + turnIndex)
             + '; AI ' + elapsedMs + 'ms',
           details: aiResponseLogDetails({
             aiRequest,
             modelMessages: stepModelMessagesForLog.get(turnIndex),
-            response: { content: event.content, text: visibleText },
+            response: { finishReason: event.finishReason, usage: event.usage, content: event.content, text: visibleText },
             elapsedMs,
             ...(responseTimeMs !== undefined ? { aiElapsedMs: responseTimeMs } : {}),
             stepStartedAt: startedAt,
@@ -3320,14 +3376,42 @@ async function executeRuntimeStep(input: {
         if (visibleText) await publishStepText(visibleText, turnIndex);
       };
       const timeout = {
-        ...aiStreamTimeouts(runtimeRequestTimeoutMs),
+        ...streamTimeouts,
         tools: {
           spawnSubagentsMs: boundedInteger(process.env.AI_SUBAGENT_LOOP_TIMEOUT_MS, 600_000, 1_000, 3_600_000),
         },
       };
+      const runtimeModel = getModel();
+      const observedModel = typeof runtimeModel !== 'string' && runtimeModel.specificationVersion === 'v4'
+        ? {
+            ...runtimeModel,
+            doGenerate: runtimeModel.doGenerate.bind(runtimeModel),
+            doStream: async (...args: Parameters<typeof runtimeModel.doStream>) => {
+              const response = await runtimeModel.doStream(...args);
+              if (requestWatchdog.abortSignal.aborted) throw requestWatchdog.abortSignal.reason;
+              await onAttemptDebug?.({
+                phase: 'ai:runtime:response-headers',
+                stepIndex,
+                message: `已建立响应流，等待 AI 首包 · ${attemptLabel}`,
+                details: { elapsedMs: Date.now() - (stepStartedAt.get(toolExecutionGate.stepNumber) || Date.now()) },
+              });
+              return {
+                ...response,
+                stream: response.stream.pipeThrough(new TransformStream({
+                  async transform(part, controller) {
+                    if (part.type === 'reasoning-delta') await reportReceiving('推理');
+                    else if (part.type === 'text-delta') await reportReceiving('正文');
+                    else if (part.type === 'tool-input-start' || part.type === 'tool-input-delta' || part.type === 'tool-call') await reportReceiving('工具参数');
+                    controller.enqueue(part);
+                  },
+                })),
+              };
+            },
+          }
+        : runtimeModel;
       let streamedRequestError: unknown;
       const agentSettings = {
-        model: getModel(),
+        model: observedModel,
         tools: toolsForRequest,
         toolOrder: stableToolOrder,
         runtimeContext,
@@ -3340,7 +3424,6 @@ async function executeRuntimeStep(input: {
         onStepEnd: onAgentStepEnd,
         temperature: 0.1,
         reasoning: aiReasoningEffort(),
-        maxOutputTokens: aiMaxOutputTokens(),
         maxRetries: 0,
         repairToolCall,
         onError: ({ error }: { error: unknown }) => {
@@ -3349,11 +3432,11 @@ async function executeRuntimeStep(input: {
         telemetry: aiTelemetry(input.useToolLoopAgent ? 'browser-chat-subagent-tool-loop-agent' : 'browser-chat-agent-loop'),
       };
       const result = input.useToolLoopAgent
-        ? await new ToolLoopAgent(agentSettings).stream({
+        ? await requestWatchdog.run(new ToolLoopAgent(agentSettings).stream({
           messages: initialMessages,
           abortSignal: requestWatchdog.abortSignal,
           timeout,
-        })
+        }))
         : streamText({
           ...agentSettings,
           messages: initialMessages,
@@ -3398,7 +3481,11 @@ async function executeRuntimeStep(input: {
         ]));
         requestWatchdog.dispose();
       } catch (error) {
-        throw streamedRequestError || error;
+        // Preserve the independent first-packet timeout instead of the SDK's
+        // generic abort error, so the retry UI can explain what timed out.
+        throw requestWatchdog.abortSignal.reason instanceof AiFirstChunkTimeoutError
+          ? requestWatchdog.abortSignal.reason
+          : streamedRequestError || error;
       }
       if (streamedRequestError) throw streamedRequestError;
       const responseToolCallCount = responseMessages.reduce((count, message) => (
@@ -3421,6 +3508,15 @@ async function executeRuntimeStep(input: {
       );
       const modelSettings = getModelSettings();
       const miniMaxRuntime = /minimax/i.test(`${modelSettings.provider} ${modelSettings.model}`);
+      // Provider adapters may expose internal/reasoning-only text in
+      // resultText even though nothing is displayable to the user. Treat that
+      // the same as an empty response when deciding whether a completed tool
+      // round needs another model step. Otherwise MiniMax can stop immediately
+      // after reading a required runtime Skill and never execute the governed
+      // file call requested by the user.
+      const displayableResultText = containsPrivateToolProtocol(resultText || latestText)
+        ? ''
+        : normalizeBrowserChatFinalReplyText(resultText || latestText);
       if (miniMaxRuntime && containsPrivateToolProtocol(resultText || latestText) && toolCallCount === 0) {
         privateToolProtocolFailures += 1;
         if (lastRetryState) {
@@ -3439,7 +3535,7 @@ async function executeRuntimeStep(input: {
       }
       if (aiSdkEmptyStopRequiresRetry({
         finishReason: resultFinishReason,
-        responseText: resultText,
+        responseText: displayableResultText,
         toolCallCount,
       })) {
         const error = new Error('No output generated: provider returned stop with reasoning only and no displayable text or tool call.');
@@ -3449,7 +3545,7 @@ async function executeRuntimeStep(input: {
       const finishState = aiSdkFinishState(resultFinishReason, {
         runtimeContinuationRequired: aiSdkToolResultRequiresContinuation({
           finishReason: resultFinishReason,
-          responseText: resultText,
+          responseText: displayableResultText,
           toolCallCount,
           toolResultCount,
         }),
@@ -3487,6 +3583,7 @@ async function executeRuntimeStep(input: {
       }
       throw error;
     } finally {
+      requestWatchdog.dispose();
       await browserToolRuntime.dispose();
     }
   }
@@ -3695,11 +3792,14 @@ async function executeRuntimeStep(input: {
         : retryExhausted
           ? 'ai:runtime:retry-exhausted'
           : 'ai:runtime:retry-skipped';
+      const failureReason = error instanceof AiFirstChunkTimeoutError
+        ? `首包超时 ${error.timeoutMs / 1000} 秒`
+        : lastRetryDecision.category === 'request-timeout' ? '请求超时' : lastRetryDecision.category;
       const failureMessage = willRetry
-        ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；${retryDelayMs}ms 后将进行第 ${attemptNumber + 1}/${consecutiveFailureLimit} 次请求。`
+        ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${failureReason}）；${retryDelayMs}ms 后将进行第 ${attemptNumber + 1}/${consecutiveFailureLimit} 次请求。`
         : retryExhausted
-          ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；已用完 ${consecutiveFailureLimit} 次请求机会，本轮最终失败。`
-          : `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${lastRetryDecision.category}）；该错误不可重试，本轮最终失败。`;
+          ? `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${failureReason}）；已用完 ${consecutiveFailureLimit} 次请求机会，本轮最终失败。`
+          : `第 ${attemptNumber}/${consecutiveFailureLimit} 次 AI 请求失败（${failureReason}）；该错误不可重试，本轮最终失败。`;
       await onDebug?.({
         phase: failurePhase,
         stepIndex,
@@ -3850,6 +3950,7 @@ export async function executeInteractiveBrowserTurn(input: {
     activeMessages: ModelMessage[];
     turnMessages: ModelMessage[];
   }) => void | Promise<void>;
+  onActiveModelCheckpoint?: (messages: ModelMessage[]) => void | Promise<void>;
   onContextCompression?: (update: {
     activeMessages: ModelMessage[];
     contextCompression: BrowserChatModelContextCompression;
@@ -3888,9 +3989,9 @@ export async function executeInteractiveBrowserTurn(input: {
   let finalBlocks: BrowserChatFinalBlock[] = [];
   let endedWithFinalAnswer = false;
   let browserStatePreflightComplete = false;
-  // Runtime Skills are scoped to this Agent run. Every model step and both
-  // tool protocols share successful reads, but a new invocation starts empty.
-  const loadedHiddenRuntimeSkillIds = new Set<string>();
+  // A resumed run may already contain the full installed Skill in completed
+  // tool evidence. Reuse it only on exact content match, never from summaries.
+  const loadedHiddenRuntimeSkillIds = hiddenRuntimeSkillIdsInModelContext(input.conversation || []);
   while (true) {
     ensureActive();
     const stepIndex = Math.max(input.initialStepIndex || 0, ...steps.map((step) => step.index)) + 1;
@@ -3949,6 +4050,10 @@ export async function executeInteractiveBrowserTurn(input: {
         memoryTools: input.memoryTools,
         useToolLoopAgent: input.useToolLoopAgent,
         onTextStream: input.onTextStream,
+        onActiveModelCheckpoint: async (messages) => {
+          activeModelMessages = [...messages];
+          await input.onActiveModelCheckpoint?.(messages);
+        },
         onContextCompression: async (update) => {
           activeModelMessages = [...update.activeMessages];
           activeContinuationSummary = update.contextCompression.continuationSummary;
@@ -4438,7 +4543,7 @@ async function executeCodexRuntimeObject(input: {
   ensureBrowserStarted?: () => Promise<void>;
   onVisualContextChange?: (snapshot: ReturnType<VisualContextManager['snapshot']>) => void | Promise<void>;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
-  onReferenceImage?: (input: { path: string; source: string }) => void;
+  onReferenceImage?: (input: { path: string; source: string; label?: string }) => void;
 }) {
   const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readFileVisuals, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   const loadedHiddenRuntimeSkillIds = input.loadedHiddenRuntimeSkillIds || new Set<string>();
@@ -4638,7 +4743,12 @@ async function executeCodexRuntimeObject(input: {
     : undefined;
   for (const [index, imagePath] of [...new Set(imagePaths)].entries()) {
     const screenshotId = typeof screenshotIds?.[index] === 'string' ? screenshotIds[index] : undefined;
-    onReferenceImage?.({ path: imagePath, source: screenshotId ? `${imageSource}:${screenshotId}` : imageSource });
+    const artifactLabel = type === 'file'
+      ? normalizedParams.artifactId || normalizedParams.attachmentId || normalizedParams.documentId : undefined;
+    onReferenceImage?.({
+      path: imagePath, source: screenshotId ? `${imageSource}:${screenshotId}` : imageSource,
+      label: artifactLabel ? `${String(artifactLabel)}${screenshotId ? ` / ${screenshotId}` : ` / image ${index + 1}`}` : undefined,
+    });
   }
   const fileResult = result.ok ? formatFileArtifactResult(type, result.actual) : undefined;
   return { text: fileResult || toolConsistentAssistantText(message, type), executed: true };

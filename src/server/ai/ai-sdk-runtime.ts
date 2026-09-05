@@ -48,10 +48,20 @@ export class AiRequestWatchdogTimeoutError extends Error {
   }
 }
 
+export class AiFirstChunkTimeoutError extends AiRequestWatchdogTimeoutError {
+  constructor(timeoutMs: number) {
+    super(timeoutMs);
+    this.name = 'AiFirstChunkTimeoutError';
+    this.message = `AI first chunk timed out after ${timeoutMs}ms (including response headers).`;
+  }
+}
+
 export function createAiRequestWatchdog(parentSignal?: AbortSignal, timeoutMs = aiRequestTimeoutMs()) {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   let paused = false;
+  let firstChunkDeadline: number | undefined;
+  let firstChunkTimeoutMs: number | undefined;
   let timeoutReject: ((reason: unknown) => void) | undefined;
   const abortFromParent = () => controller.abort(parentSignal?.reason);
   if (parentSignal) {
@@ -66,14 +76,28 @@ export function createAiRequestWatchdog(parentSignal?: AbortSignal, timeoutMs = 
     clear();
     if (paused || controller.signal.aborted) return;
     timer = setTimeout(() => {
-      const error = new AiRequestWatchdogTimeoutError(timeoutMs);
+      const error = firstChunkTimeoutMs === undefined
+        ? new AiRequestWatchdogTimeoutError(timeoutMs)
+        : new AiFirstChunkTimeoutError(firstChunkTimeoutMs);
       controller.abort(error);
       timeoutReject?.(error);
-    }, timeoutMs);
+    }, firstChunkDeadline === undefined ? timeoutMs : Math.max(0, firstChunkDeadline - Date.now()));
   };
   return {
     abortSignal: controller.signal,
     touch: arm,
+    waitForFirstChunk(ms: number) {
+      paused = false;
+      firstChunkTimeoutMs = ms;
+      firstChunkDeadline = Date.now() + ms;
+      arm();
+    },
+    firstChunkReceived() {
+      if (firstChunkDeadline === undefined) return;
+      firstChunkDeadline = undefined;
+      firstChunkTimeoutMs = undefined;
+      arm();
+    },
     pause() {
       paused = true;
       clear();
@@ -107,20 +131,15 @@ export function createAiRequestWatchdog(parentSignal?: AbortSignal, timeoutMs = 
   };
 }
 
-export function aiMaxOutputTokens(fallback = 32_768) {
-  return Math.min(131_072, positiveInteger(process.env.AI_MAX_OUTPUT_TOKENS, fallback));
-}
-
 export function aiStreamTimeouts(requestTimeoutMs = aiRequestTimeoutMs()) {
   const requestMs = requestTimeoutMs;
   const toolMs = positiveInteger(process.env.AI_TOOL_TIMEOUT_MS, 120_000);
-  // A stale per-stream setting must never undercut the active request
-  // deadline. The first chunk has its own SDK timer, so enforce the same
-  // lower bound here rather than only on the outer watchdog.
+  // First output is independent of the much longer agent/tool deadline.
+  // The runtime watchdog also covers provider setup and response-header wait.
   const configuredFirstChunkMs = positiveInteger(process.env.AI_STREAM_FIRST_CHUNK_TIMEOUT_MS, requestMs);
   const configuredChunkMs = positiveInteger(process.env.AI_STREAM_CHUNK_TIMEOUT_MS, requestMs);
   return {
-    firstChunkMs: Math.max(requestMs, configuredFirstChunkMs),
+    firstChunkMs: configuredFirstChunkMs,
     // AI SDK keeps the inter-chunk timer running while a tool executes. Keep
     // it above the complete tool window so a successful long-running tool does
     // not abort the stream before the following model step can begin.

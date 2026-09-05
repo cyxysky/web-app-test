@@ -22,7 +22,7 @@ import { normalizeBoundedNumberSetting, type CapabilitySettingDefinition } from 
 
 export { defaultGlinerOpenLabelModel, defaultLiquidPiiModel };
 
-export type SettingsTab = 'general' | 'model' | 'browser' | 'sensitive-data' | 'runtime' | 'skills' | 'memory' | 'accounts' | 'debug';
+export type SettingsTab = 'general' | 'model' | 'runtime' | 'browser' | 'capabilities' | 'integrations' | 'sensitive-data' | 'skills' | 'memory' | 'accounts' | 'debug';
 
 export type ModelProviderDefinition = {
   value: ModelProvider;
@@ -187,13 +187,62 @@ export const modelProviderDefinitions: ModelProviderDefinition[] = [
 
 export const modelProviderValues = modelProviderDefinitions.map((item) => item.value);
 
+export type OpenAICompatibleModelProvider = 'openai-compatible' | `openai-compatible-${number}`;
+
+export function openAICompatibleProviderIndex(value: unknown) {
+  const provider = String(value || '').trim().toLowerCase();
+  if (provider === 'openai-compatible') return 1;
+  const match = provider.match(/^openai-compatible-(\d+)$/);
+  if (!match) return undefined;
+  const index = Number.parseInt(match[1], 10);
+  return Number.isSafeInteger(index) && index >= 2 ? index : undefined;
+}
+
+export function isOpenAICompatibleProvider(value: unknown): value is OpenAICompatibleModelProvider {
+  return typeof value === 'string'
+    && value === value.trim().toLowerCase()
+    && openAICompatibleProviderIndex(value) !== undefined;
+}
+
+export function isModelProvider(value: unknown): value is ModelProvider {
+  if (typeof value !== 'string' || value !== value.trim().toLowerCase()) return false;
+  const provider = String(value || '').trim().toLowerCase();
+  return modelProviderDefinitions.some((item) => item.value === provider)
+    || isOpenAICompatibleProvider(provider);
+}
+
+export function modelProviderDefinitionsForConfig(providers?: object | null) {
+  const known = new Set(modelProviderDefinitions.map((definition) => definition.value));
+  const custom = Object.keys(providers || {})
+    .filter((provider): provider is ModelProvider => isOpenAICompatibleProvider(provider) && !known.has(provider))
+    .sort((left, right) => (
+      (openAICompatibleProviderIndex(left) || 0) - (openAICompatibleProviderIndex(right) || 0)
+    ));
+  return [
+    ...modelProviderDefinitions,
+    ...custom.map((provider) => modelProviderDefinition(provider)),
+  ];
+}
+
 export const defaultModelByProvider = modelProviderDefinitions.reduce((acc, item) => {
   acc[item.value] = item.defaultModel;
   return acc;
 }, {} as Record<ModelProvider, string>);
 
 export function modelProviderDefinition(provider: ModelProvider) {
-  return modelProviderDefinitions.find((item) => item.value === provider) || modelProviderDefinitions[0];
+  const existing = modelProviderDefinitions.find((item) => item.value === provider);
+  if (existing) return existing;
+  const compatibleIndex = openAICompatibleProviderIndex(provider);
+  if (compatibleIndex) {
+    return {
+      value: provider,
+      label: `OpenAI Compatible ${compatibleIndex}`,
+      defaultModel: 'custom-model',
+      keyLabel: `Compatible API ${compatibleIndex} Key`,
+      baseUrlLabel: `Compatible API ${compatibleIndex} Base URL`,
+    } satisfies ModelProviderDefinition;
+  }
+  return modelProviderDefinitions[0];
 }
 
 export function uniqueModelIds(values: Array<string | undefined | null>) {
@@ -255,8 +304,7 @@ const applicationRuntimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_CUSTOM_SYSTEM_PROMPT', label: '附加系统规则', description: '追加到内置 Agent Loop 运行提示词末尾的用户规则；不会替换、覆盖或削弱原有提示词。', tab: 'runtime', defaultValue: '', control: 'textarea' },
   { key: 'AI_REQUEST_TIMEOUT_MS', label: 'AI 请求超时', description: '单次模型请求首个响应及普通非流式调用的最长等待时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_RUNTIME_REQUEST_TIMEOUT_MS', label: 'Agent 模型请求超时', description: 'Agent Loop 单轮模型请求的最长等待时间；大上下文或长推理模型可能需要数分钟，默认 600000 毫秒。', tab: 'runtime', defaultValue: '600000', control: 'number' },
-  { key: 'AI_MAX_OUTPUT_TOKENS', label: 'AI 最大输出 Token', description: '显式传给模型的单次最大输出 token，避免未知模型被兼容层自动限制为 4096。', tab: 'runtime', defaultValue: '32768', control: 'number', min: 256, max: 131072, step: 256 },
-  { key: 'AI_STREAM_FIRST_CHUNK_TIMEOUT_MS', label: 'AI 首块响应超时', description: '流式模型请求等待首个内容块的最长时间；留空时跟随 AI 请求超时。', tab: 'runtime', defaultValue: '120000', control: 'number' },
+  { key: 'AI_STREAM_FIRST_CHUNK_TIMEOUT_MS', label: 'AI 首块响应超时', description: '等待首个有效内容块的最长时间（毫秒）；Agent 请求包含等待响应头的时间，独立于较长的轮次和工具超时，不会被自动抬高。留空时跟随请求超时。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_STREAM_CHUNK_TIMEOUT_MS', label: 'AI 流式分块超时', description: '流式响应相邻内容块之间允许的最长等待时间；Agent 工具循环会自动为工具执行预留完整时间。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_TOOL_TIMEOUT_MS', label: 'AI 工具执行超时', description: '单次 AI 工具执行的默认最长时间；模型请求与工具执行分别计时。', tab: 'runtime', defaultValue: '120000', control: 'number' },
   { key: 'AI_REASONING_EFFORT', label: 'AI 推理强度', description: '统一控制支持该能力的模型推理强度；默认由提供商决定。', tab: 'runtime', defaultValue: 'provider-default', control: 'select', options: [{ label: '提供商默认', value: 'provider-default' }, { label: '无', value: 'none' }, { label: '极低', value: 'minimal' }, { label: '低', value: 'low' }, { label: '中', value: 'medium' }, { label: '高', value: 'high' }, { label: '极高', value: 'xhigh' }] },

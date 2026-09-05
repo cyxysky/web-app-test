@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import type { LanguageModelV4 } from '@ai-sdk/provider';
 import type { generateText } from 'ai';
-import { normalizeMiniMaxOpenAIBaseURL } from '@/config/settings';
+import { isOpenAICompatibleProvider, normalizeMiniMaxOpenAIBaseURL, openAICompatibleProviderIndex } from '@/config/settings';
 import { ensureAiSdkTelemetryRegistered } from '@/server/ai/ai-sdk-telemetry';
 import { filterSensitiveData } from '@/server/capabilities/sensitive-data';
 
@@ -36,6 +36,7 @@ type AiProvider =
   | 'openai-compatible'
   | 'openai-compatible-2'
   | 'openai-compatible-3'
+  | `openai-compatible-${number}`
   | 'openrouter'
   | 'perplexity'
   | 'togetherai'
@@ -141,7 +142,7 @@ function lazyLanguageModel(
 }
 
 function openAiCompatibleModel(
-  provider: 'llama-cpp' | 'lmstudio' | 'ollama' | 'openai-compatible' | 'openai-compatible-2' | 'openai-compatible-3',
+  provider: 'llama-cpp' | 'lmstudio' | 'ollama' | 'openai-compatible' | `openai-compatible-${number}`,
   modelId: string,
   baseUrlEnvironmentName: string,
   defaultBaseURL: string,
@@ -248,9 +249,20 @@ export function getModel(): GenerateTextModel {
   if (provider === 'lmstudio') return openAiCompatibleModel(provider, model, 'LMSTUDIO_BASE_URL', 'http://localhost:1234/v1', 'LMSTUDIO_API_KEY', 'LMSTUDIO_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'llama-cpp') return openAiCompatibleModel(provider, model, 'LLAMA_CPP_BASE_URL', 'http://localhost:8080/v1', 'LLAMA_CPP_API_KEY', 'LLAMA_CPP_EXTRA_REQUEST_PARAMETERS');
   if (provider === 'ollama') return openAiCompatibleModel(provider, model, 'OLLAMA_BASE_URL', 'http://localhost:11434/v1', 'OLLAMA_API_KEY', 'OLLAMA_EXTRA_REQUEST_PARAMETERS');
-  if (provider === 'openai-compatible') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_BASE_URL', '', 'OPENAI_COMPATIBLE_API_KEY', 'OPENAI_COMPATIBLE_EXTRA_REQUEST_PARAMETERS');
-  if (provider === 'openai-compatible-2') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_2_BASE_URL', '', 'OPENAI_COMPATIBLE_2_API_KEY', 'OPENAI_COMPATIBLE_2_EXTRA_REQUEST_PARAMETERS');
-  if (provider === 'openai-compatible-3') return openAiCompatibleModel(provider, model, 'OPENAI_COMPATIBLE_3_BASE_URL', '', 'OPENAI_COMPATIBLE_3_API_KEY', 'OPENAI_COMPATIBLE_3_EXTRA_REQUEST_PARAMETERS');
+  if (isOpenAICompatibleProvider(provider)) {
+    const openAICompatibleIndex = openAICompatibleProviderIndex(provider) || 1;
+    const environmentPrefix = openAICompatibleIndex === 1
+      ? 'OPENAI_COMPATIBLE'
+      : `OPENAI_COMPATIBLE_${openAICompatibleIndex}`;
+    return openAiCompatibleModel(
+      provider,
+      model,
+      `${environmentPrefix}_BASE_URL`,
+      '',
+      `${environmentPrefix}_API_KEY`,
+      `${environmentPrefix}_EXTRA_REQUEST_PARAMETERS`,
+    );
+  }
   if (provider === 'minimax') return lazyLanguageModel(provider, model, async () => {
     const baseURL = miniMaxOpenAIBaseURL();
     const { createMiniMaxOpenAIV4 } = await import('@/server/ai/providers/minimax-openai-v4-provider');
@@ -304,7 +316,7 @@ export function getModel(): GenerateTextModel {
 export function getModelSettings() {
   const override = modelSettingsStorage.getStore();
   const provider = normalizeProvider(override?.provider || process.env.AI_PROVIDER);
-  const defaults: Record<AiProvider, string> = {
+  const defaults: Partial<Record<AiProvider, string>> = {
     'ai-gateway': 'openai/gpt-5.5',
     alibaba: 'qwen-plus',
     anthropic: 'claude-sonnet-4-5',
@@ -336,7 +348,7 @@ export function getModelSettings() {
   };
   return {
     provider,
-    model: override?.model || process.env.AI_MODEL || defaults[provider],
+    model: override?.model || process.env.AI_MODEL || defaults[provider] || 'custom-model',
     supportsImageInput: override?.supportsImageInput === true,
   };
 }
@@ -402,8 +414,11 @@ function normalizeProvider(value: string | undefined): AiProvider {
   if (provider === 'ollama') return 'ollama';
   if (provider === 'openai') return 'openai';
   if (provider === 'openai-compatible' || provider === 'openai-compatible-1' || provider === 'openai-compatible-api' || provider === 'custom-openai' || provider === 'custom-openai-1') return 'openai-compatible';
-  if (provider === 'openai-compatible-2' || provider === 'custom-openai-2') return 'openai-compatible-2';
-  if (provider === 'openai-compatible-3' || provider === 'custom-openai-3') return 'openai-compatible-3';
+  const compatibleMatch = provider.match(/^(?:openai-compatible|custom-openai)-(\d+)$/);
+  if (compatibleMatch) {
+    const index = Number.parseInt(compatibleMatch[1], 10);
+    if (Number.isSafeInteger(index) && index >= 2) return `openai-compatible-${index}`;
+  }
   if (provider === 'perplexity') return 'perplexity';
   if (provider === 'together' || provider === 'togetherai' || provider === 'together-ai') return 'togetherai';
   if (provider === 'vercel' || provider === 'v0') return 'vercel';

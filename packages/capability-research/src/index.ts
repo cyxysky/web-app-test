@@ -6,7 +6,10 @@ export * from './runtime-skill.js';
 export * from './settings.js';
 
 export const researchCapabilityToolNames = Object.freeze({ research: 'research' } as const);
-export type ResearchSource = { sourceId: string; url: string; title: string; snippet?: string; content?: string; provider?: string; retrievedAt: string; mediaType?: string };
+export type ResearchSource = { sourceId: string; url: string; title: string; snippet?: string; content?: string; provider?: string; retrievedAt: string; mediaType?: string; truncated?: boolean; returnedCharacters?: number; instruction?: string };
+export class ResearchOperationError extends Error {
+  constructor(public readonly code: string, message: string, public readonly retryable = false) { super(message); }
+}
 export interface ResearchOperations {
   search?(input: { query: string; limit: number; domains?: string[]; recencyDays?: number }, context: CapabilityExecutionContext): Promise<ResearchSource[]>;
   fetch(input: { url: string; maxChars: number }, context: CapabilityExecutionContext): Promise<ResearchSource>;
@@ -36,21 +39,24 @@ export const researchCapabilityManifest = Object.freeze({
 } satisfies CapabilityManifest);
 
 export function createResearchTool(operations: ResearchOperations, configuration: CapabilityRunContext['configuration']) {
+  const schema = z.toJSONSchema(parser);
+  if (!operations.search) schema.properties!.action = { type: 'string', const: 'fetch' };
   return defineCapabilityTool<ResearchToolInput, ResearchSource | ResearchSource[]>({
     name: researchCapabilityToolNames.research,
-    description: 'Search public sources or fetch and extract one exact public HTTP(S) document. Every result carries provenance metadata for citation.',
-    input: researchToolInput,
+    description: `${operations.search ? 'Search public sources or fetch' : 'Search is NOT configured. Only fetch is available: fetch'} one exact public HTTP(S) text/HTML/JSON document. PDF and Office files require file download then readContent; never treat binary bytes as source text. Every result carries provenance metadata for citation.`,
+    input: defineCapabilityInput<ResearchToolInput>(schema as Readonly<Record<string, unknown>>, (value) => parser.parse(value)),
     policy: { concurrency: 'parallel', concurrencyGroup: 'research-network', permissions: researchCapabilityManifest.permissions },
     async execute(input, context) {
       try {
         if (input.action === 'search') {
-          if (!operations.search) return { ok: false, error: { code: 'research-search-unavailable', message: 'No search provider is configured.' } };
+          if (!operations.search) return { ok: false, error: { code: 'research-search-unavailable', message: 'Search is not configured. Do not retry search. Fetch a known authoritative URL or use the available browser to discover one.', retryable: false } };
           const sources = await operations.search({ query: input.query!, limit: input.limit || 8, domains: input.domains, recencyDays: input.recencyDays }, context);
           return { ok: true, summary: `Found ${sources.length} research source(s).`, data: sources };
         }
         const source = await operations.fetch({ url: input.url!, maxChars: normalizeBoundedInteger(configuration.AGENT_RESEARCH_MAX_CONTENT_CHARS, 30_000, 1_000, 200_000) }, context);
-        return { ok: true, summary: `Fetched research source: ${source.title || source.url}.`, data: source };
+        return { ok: true, summary: `Fetched research source (retrieval only, claims not verified): ${source.title || source.url}.`, data: { ...source, evidenceStatus: 'retrieved-unverified', verificationInstruction: 'Match every material claim to an actual source row, period, unit and basis. Derive chart values and narrative ratios from the same verified dataset. Do not infer missing records from a truncated response.' } };
       } catch (error) {
+        if (error instanceof ResearchOperationError) return { ok: false, error: { code: error.code, message: error.message, retryable: error.retryable } };
         return { ok: false, error: { code: 'research-operation-failed', message: error instanceof Error ? error.message : String(error), retryable: true } };
       }
     },

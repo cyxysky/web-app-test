@@ -98,6 +98,36 @@ export function hiddenRuntimeSkillContent(skillId: string) {
   return hiddenRuntimeSkills[skillId as keyof typeof hiddenRuntimeSkills]?.content;
 }
 
+/** Reuse only full, current-version Skill text still present in tool evidence.
+ * A summary, user assertion or previous read ID is not sufficient after compaction. */
+export function hiddenRuntimeSkillIdsInModelContext(messages: ReadonlyArray<{ role: string; content: unknown }>) {
+  const loaded = new Set<string>();
+  const record = (value: unknown): Record<string, unknown> | undefined => {
+    if (typeof value === 'string') { try { value = JSON.parse(value); } catch { return undefined; } }
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  };
+  for (const message of messages) {
+    if (message.role !== 'tool' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part?.type !== 'tool-result') continue;
+      const output = record(part.output);
+      const result = record(output?.value);
+      if (!result) continue;
+      if (part.toolName === 'skill' && result.ok === true) {
+        for (const [id, skill] of Object.entries(hiddenRuntimeSkills)) {
+          if (result.actual === skill.content) loaded.add(id);
+        }
+      }
+      const gate = record(result.actual);
+      if (result.ok === false && gate?.code === 'RUNTIME_SKILL_CONTENT_RETURNED'
+        && typeof gate.requiredSkillId === 'string'
+        && gate.skillContent === hiddenRuntimeSkillContent(gate.requiredSkillId)
+        && typeof gate.skillContent === 'string') loaded.add(gate.requiredSkillId);
+    }
+  }
+  return loaded;
+}
+
 export function requiredHiddenRuntimeSkillId(
   toolName: string,
   input: unknown,

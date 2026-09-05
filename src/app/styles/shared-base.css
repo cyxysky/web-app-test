@@ -874,6 +874,14 @@ a:not([data-slot], [data-slot] *) {
   padding-inline: 0;
 }
 
+.browser-chat-layout.sidebar-collapsed .browser-chat-history-scroll-sentinel > span {
+  gap: 0;
+}
+
+.browser-chat-layout.sidebar-collapsed .browser-chat-history-scroll-sentinel-label {
+  display: none;
+}
+
 .browser-chat-layout.sidebar-collapsed .browser-chat-recent-header {
   display: none;
 }
@@ -1294,9 +1302,22 @@ body.is-dragging-embedded-tab * {
 /* Expanded sidebar: use one active surface across primary and secondary navigation. */
 .browser-chat-layout:not(.sidebar-collapsed) :is(.browser-chat-subnav button.active, .browser-chat-subnav button.active:hover),
 :root[data-theme="dark"] .browser-chat-layout:not(.sidebar-collapsed) :is(.browser-chat-subnav button.active, .browser-chat-subnav button.active:hover) {
-  background: var(--app-surface-active);
+  background: transparent;
   box-shadow: none;
   color: var(--foreground);
+  font-weight: 600;
+  position: relative;
+}
+
+.browser-chat-layout:not(.sidebar-collapsed) .browser-chat-subnav button.active::before {
+  background: var(--accent-strong);
+  border-radius: 999px;
+  bottom: 7px;
+  content: "";
+  left: 0;
+  position: absolute;
+  top: 7px;
+  width: 2px;
 }
 
 /* Collapsed sidebar: consistent optical rhythm and compact active state. */
@@ -1322,9 +1343,10 @@ body.is-dragging-embedded-tab * {
 
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-sidebar :where(.browser-chat-brand .ui-icon-button, .browser-chat-theme-toggle, .browser-chat-subnav button) > svg:not(.spin) {
-  flex: 0 0 auto;
-  height: 20px;
-  width: 20px;
+  flex: 0 0 17px;
+  height: 17px;
+  stroke-width: 1.9;
+  width: 17px;
 }
 
 .browser-chat-layout.sidebar-collapsed :is(.browser-chat-subnav button.active)::before {

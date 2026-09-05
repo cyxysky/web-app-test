@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
 import { resolveLibreOfficePythonExecutable } from '../libreoffice.js';
-import { resolveUnoProgramWorker } from './uno.js';
+import { isUnoStylePropertyInfoError, isUnoWorkerInternalError, resolveUnoProgramWorker } from './uno.js';
 
 export type OfficeProgramDiagnostic = {
   callColumn?: number;
@@ -177,7 +177,8 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       ' return lines or [0.0]',
       'def signature_issue(function, call, skip_first=False):',
       ' params = function_parameters(function)',
-      ' if skip_first and params: params = params[1:]',
+      ' is_static = any((isinstance(decorator,ast.Name) and decorator.id == "staticmethod") or (isinstance(decorator,ast.Attribute) and decorator.attr == "staticmethod") for decorator in function.decorator_list)',
+      ' if skip_first and params and not is_static: params = params[1:]',
       ' positional = [arg for arg in call.args if not isinstance(arg,ast.Starred)]',
       ' if len(positional) != len(call.args): return None',
       ' keyword_names = [keyword.arg for keyword in call.keywords if keyword.arg is not None]',
@@ -491,12 +492,15 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       ' if worker_path and worker_path.is_file():',
       '  try:',
       '   worker_tree = ast.parse(worker_path.read_text(encoding="utf-8"), filename=str(worker_path))',
-      '   wanted = {"DocumentJob","WriterLayout","PresentationLayout","PresentationSlide","PresentationShape","PresentationTable","SpreadsheetLayout","SpreadsheetSheet"}',
+      '   wanted = {"DocumentJob","OfficeUnitConversion","WriterLayout","PresentationLayout","PresentationSlide","PresentationShape","PresentationTable","SpreadsheetLayout","SpreadsheetSheet"}',
       '   for class_node in worker_tree.body:',
       '    if isinstance(class_node,ast.ClassDef) and class_node.name in wanted:',
       '     worker_classes[class_node.name] = {member.name:member for member in class_node.body if isinstance(member,(ast.FunctionDef,ast.AsyncFunctionDef)) and not member.name.startswith("_")}',
       '   if "PresentationTable" in worker_classes and "PresentationShape" in worker_classes:',
       '    worker_classes["PresentationTable"] = {**worker_classes["PresentationShape"], **worker_classes["PresentationTable"]}',
+      '   if "OfficeUnitConversion" in worker_classes:',
+      '    for layout_class in ("WriterLayout","PresentationLayout","SpreadsheetLayout"):',
+      '     if layout_class in worker_classes: worker_classes[layout_class] = {**worker_classes["OfficeUnitConversion"], **worker_classes[layout_class]}',
       '  except (OSError,SyntaxError,UnicodeError) as worker_error:',
       '   diagnostics.append({"code":"FACADE_AST_UNAVAILABLE","message":f"Installed facade signatures could not be loaded: {worker_error}","severity":"warning"})',
       ' else:',
@@ -555,7 +559,9 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       '      add("UNO_API_METHOD_UNKNOWN",node,f"{receiver_name} is a {receiver_type} facade, which has no public method {method!r}. Query unoApi for the corresponding module and copy an installed example.","error")',
       '     else:',
       '      issue = signature_issue(function,node,True)',
-      '      if issue: add("UNO_API_SIGNATURE_MISMATCH",node,f"Installed facade signature {receiver_type}.{method} {issue}. Query unoApi for this module and copy its exact signature and example.","error")',
+      '      if issue:',
+      '       installed_args = ast.unparse(function.args).removeprefix("self, ")',
+      '       add("UNO_API_SIGNATURE_MISMATCH",node,f"Installed facade signature {receiver_type}.{method} {issue}. Exact installed call: {receiver_name}.{method}({installed_args}). Correct the call using this signature; query only this unoApi module if its value schema/example is still needed.","error")',
       '     if receiver_type == "PresentationSlide" and method == "add_table":',
       '      allowed = {"element_id","rows","slot","box","column_weights","col_widths","header","header_fill","header_color","body_fill","alternate_fill","body_color","font_size","font_name","first_column_align"}',
       '      supplied = {keyword.arg for keyword in node.keywords if keyword.arg is not None}',
@@ -576,10 +582,18 @@ async function pythonDiagnostics(source: string): Promise<OfficeProgramDiagnosti
       '       chart_numbers = [static_number(value,{}) for value in chart_box.elts[:4]]',
       '       if all(value is not None for value in chart_numbers):',
       '        chart_width,chart_height = chart_numbers[2],chart_numbers[3]',
-      '        text_features = [call_value(node,99,name) for name in ("title","x_axis_title","y_axis_title","show_legend")]',
+      '        circular = chart_type in {"pie","donut","doughnut"}',
+      '        legend_node = call_value(node,99,"show_legend")',
+      '        legend_default = legend_node is None or (isinstance(legend_node,ast.Constant) and legend_node.value is None)',
+      '        series_node = call_value(node,99,"series")',
+      '        series_present = series_node is not None and not (isinstance(series_node,ast.Constant) and series_node.value is None)',
+      '        has_legend = (isinstance(legend_node,ast.Constant) and legend_node.value is True) or (legend_default and (circular or series_present))',
+      '        minimum_width = ((125 if circular else 120) if has_legend else 90) / 25.4',
+      '        if chart_width + 0.001 < minimum_width: add("PRESENTATION_CHART_BOX_TOO_SMALL",node,f"Presentation {chart_type or \'chart\'} width={chart_width:g}in is too small for its native plot/legend; reserve at least {minimum_width:.3f}in. Fix all reported chart boxes together without shrinking neighbors below their minimums.","error")',
+      '        text_features = [call_value(node,99,name) for name in ("title","x_axis_title","y_axis_title")]',
       '        has_text_features = any(value is not None and not (isinstance(value,ast.Constant) and value.value in (None,False,"")) for value in text_features)',
-      '        if has_text_features and chart_height < 2.84: add("PRESENTATION_CHART_BOX_TOO_SMALL",node,f"Presentation chart height={chart_height:g}in is too small for titles/axes/legend; use at least 2.84in or remove nonessential chart text.","error")',
-      '        if chart_type in {"pie","donut","doughnut"} and chart_width < 4.92: add("PRESENTATION_CHART_BOX_TOO_SMALL",node,f"Presentation {chart_type} width={chart_width:g}in is too small for sectors, labels, and a legend; use at least 4.92in.","error")',
+      '        minimum_height = (65 if circular else (72 if has_text_features else 56)) / 25.4',
+      '        if chart_height + 0.001 < minimum_height: add("PRESENTATION_CHART_BOX_TOO_SMALL",node,f"Presentation chart height={chart_height:g}in is too small for its native content; reserve at least {minimum_height:.3f}in (labels may require more).","error")',
       '      if chart_type in {"pie","donut","doughnut"}:',
       '       label_nodes = [call_value(node,99,name) for name in ("show_values","show_category_name","show_percent")]',
       '       label_modes = sum(1 for value in label_nodes if isinstance(value,ast.Constant) and value.value is True)',
@@ -719,6 +733,17 @@ export async function analyzeOfficeProgram(source: string, generator: 'javascrip
 }
 
 export function diagnoseOfficeProgramRuntimeError(source: string, errorText: string): OfficeProgramDiagnostic[] {
+  if (isUnoStylePropertyInfoError(errorText)) {
+    return [{
+      code: 'UNO_STYLE_PROPERTY_INFO_MISSING',
+      target: 'worker.style.getPropertySetInfo()',
+      message: 'Worker font initialization dereferenced empty style property metadata: getPropertySetInfo() returned None. This does NOT mean _new_document() returned None or that the UNO bridge failed to start. Source/API edits and repeated restarts do not repair this worker bug. Check validationEvidence before treating a historical traceback as current.\nOriginal error:\n' + errorText.trim(),
+      severity: 'error',
+    }];
+  }
+  if (isUnoWorkerInternalError(errorText)) {
+    return [{ code: 'UNO_WORKER_INTERNAL_ERROR', message: errorText.trim(), severity: 'error' }];
+  }
   const structuredLayout = errorText.match(/__WEBPILOT_LAYOUT_DIAGNOSTICS__(\[[^\r\n]*\])/)?.[1];
   if (structuredLayout) {
     try {
@@ -770,8 +795,12 @@ export function diagnoseOfficeProgramRuntimeError(source: string, errorText: str
   const draftLines = draftTracebackLineNumbers(errorText, sourceLines.length);
   const line = draftLines.at(-1);
   let code = 'UNO_RUNTIME_ERROR';
-  if (/NameError:\s*name ['"][^'"]+['"] is not defined/i.test(errorText)) code = 'PYTHON_UNDEFINED_NAME';
+  const contractCode = errorText.match(/\b(CHART_(?:DATA_ROLE|STYLE)_INVALID|PRESENTATION_(?:TABLE_CELL_OUT_OF_RANGE|ANIMATION_TARGET_INVALID|MASTER_SELECTOR_INVALID|CUSTOM_SHOW_INDEX_INVALID)):/)?.[1];
+  if (contractCode) code = contractCode;
+  else if (/NameError:\s*name ['"][^'"]+['"] is not defined/i.test(errorText)) code = 'PYTHON_UNDEFINED_NAME';
+  else if (/IndexError:\s*(?:list|tuple) index out of range/i.test(errorText)) code = 'PYTHON_INDEX_OUT_OF_RANGE';
   else if (/(?:Unable to connect to LibreOffice UNO|couldn'?t connect to (?:pipe|socket))/i.test(errorText)) code = 'UNO_BRIDGE_STARTUP';
+  else if (/LibreOffice could not reopen the generated document|Generated file does not reopen as /i.test(errorText)) code = 'OFFICE_ARTIFACT_REOPEN_FAILED';
   else if (/(?:com\.sun\.star\.lang\.DisposedException|Binary URP bridge disposed|bridge disposed during call)/i.test(errorText)) code = 'UNO_BRIDGE_DISPOSED';
   else if (/Presentation geometry (?:requires non-negative position and positive size|exceeds slide bounds)/i.test(errorText)) code = 'PRESENTATION_GEOMETRY_INVALID';
   else if (/Presentation text cannot fit without becoming unreadable/i.test(errorText)) code = 'PRESENTATION_TEXT_OVERFLOW';
@@ -783,7 +812,9 @@ export function diagnoseOfficeProgramRuntimeError(source: string, errorText: str
     code,
     ...(line ? { line, column: 1 } : {}),
     ...(elementId ? { elementId } : {}),
-    message: errorText.trim(),
+    message: code.startsWith('CHART_')
+      ? errorText.trim().split(/\r?\n/).filter((entry) => entry.includes(`${code}:`)).at(-1) || errorText.trim()
+      : errorText.trim(),
     severity: 'error',
   };
   const sourceExcerpt = diagnosticSourceExcerpt(source, diagnostic, draftLines);

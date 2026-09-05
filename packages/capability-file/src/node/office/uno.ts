@@ -55,6 +55,17 @@ export function isUnoBridgeStartupError(error: unknown) {
   return UNO_BRIDGE_STARTUP_PATTERN.test(error instanceof Error ? error.message : String(error));
 }
 
+export function isUnoWorkerInternalError(error: unknown) {
+  return /\bUNO_WORKER_INTERNAL_ERROR:/.test(error instanceof Error ? error.message : String(error))
+    || isUnoStylePropertyInfoError(error);
+}
+
+export function isUnoStylePropertyInfoError(error: unknown) {
+  const text = error instanceof Error ? error.message : String(error);
+  return /getPropertySetInfo\(\)\.hasPropertyByName/.test(text)
+    && /NoneType.*has no attribute ['"]hasPropertyByName['"]/.test(text);
+}
+
 export async function resolveUnoProgramWorker(options: {
   runtimeRoot?: string;
   workerPath?: string;
@@ -332,7 +343,9 @@ export async function inspectUnoApi(input: {
   // Cache each exact installed module independently. Repeating a module query
   // is free, while unrelated modules stay out of the model context.
   const normalizedQuery = String(input.query || '').trim().toLowerCase();
-  const cacheKey = `${input.documentType}:${normalizedQuery || '__index__'}`;
+  const workerPath = await resolveUnoProgramWorker();
+  const workerDigest = workerPath ? createHash('sha256').update(await readFile(workerPath)).digest('hex') : 'missing-worker';
+  const cacheKey = `${workerDigest}:${input.documentType}:${normalizedQuery || '__index__'}`;
   let pending = UNO_FACADE_CATALOG_CACHE.get(cacheKey);
   if (!pending) {
     pending = inspectUnoApiUncached({
@@ -340,6 +353,7 @@ export async function inspectUnoApi(input: {
       query: normalizedQuery || undefined,
       limit: 120,
     });
+    if (UNO_FACADE_CATALOG_CACHE.size >= 128) UNO_FACADE_CATALOG_CACHE.delete(UNO_FACADE_CATALOG_CACHE.keys().next().value!);
     UNO_FACADE_CATALOG_CACHE.set(cacheKey, pending);
     pending.catch(() => {
       if (UNO_FACADE_CATALOG_CACHE.get(cacheKey) === pending) {

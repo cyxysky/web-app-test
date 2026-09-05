@@ -36,6 +36,8 @@ function normalizedAction(value: unknown) {
   const normalized = value.trim().toLowerCase();
   if (['unoapi', 'uno-api', 'uno_api'].includes(normalized)) return 'unoApi';
   if (['jsapi', 'js-api', 'js_api'].includes(normalized)) return 'jsApi';
+  if (['readsource', 'read-source', 'read_source'].includes(normalized)) return 'readSource';
+  if (['readcontent', 'read-content', 'read_content'].includes(normalized)) return 'readContent';
   if (['visualindex', 'visual-index', 'visual_index', 'visual.index'].includes(normalized)) return 'visualIndex';
   if (['visualread', 'visual-read', 'visual_read', 'visual.read'].includes(normalized)) return 'visualRead';
   if (['visualreport', 'visual-report', 'visual_report', 'visual.report'].includes(normalized)) return 'visualReport';
@@ -56,12 +58,15 @@ export function normalizeFileToolInput(value: unknown) {
   if (!source) return value;
   const input: JsonRecord = { ...source };
   if ('action' in input) input.action = normalizedAction(input.action);
+  // Preserve old integrations while giving models two unambiguous actions.
+  // Conflicting identities are rejected by validation, never silently ignored.
+  if (input.action === 'read') input.action = input.documentId ? 'readSource' : 'readContent';
   if ('documentType' in input) input.documentType = normalizedDocumentType(input.documentType);
   if (input.action === 'plan' && !input.documentType) {
     const inferred = documentTypeFromFileName(input.fileName);
     if (inferred) input.documentType = inferred;
   }
-  for (const key of ['render', 'includeVisuals', 'replaceExisting']) {
+  for (const key of ['render', 'includeVisuals', 'includeDiagnostics', 'replaceExisting']) {
     if (key in input) input[key] = booleanFromString(input[key]);
   }
   for (const key of ['limit', 'offset', 'startLine', 'endLine']) {
@@ -71,6 +76,9 @@ export function normalizeFileToolInput(value: unknown) {
   if (Array.isArray(input.pages)) input.pages = input.pages.map(numberFromString);
   if ('screenshotIds' in input) input.screenshotIds = arrayFromJsonString(input.screenshotIds);
   if ('reviews' in input) input.reviews = arrayFromJsonString(input.reviews);
+  if ('replacements' in input) input.replacements = arrayFromJsonString(input.replacements);
   if ('deckReview' in input) input.deckReview = jsonValueFromString(input.deckReview);
+  if ('spec' in input) input.spec = jsonValueFromString(input.spec);
+  if ('design' in input) input.design = jsonValueFromString(input.design);
   return input;
 }

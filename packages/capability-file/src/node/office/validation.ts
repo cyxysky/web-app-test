@@ -163,7 +163,8 @@ async function validatePresentationPackage(zip: JSZip, issues: OfficeArtifactIss
       const transform = block.match(/<[ap]:xfrm\b[^>]*>[\s\S]*?<[ap]:off\b[^>]*\bx="(-?\d+)"[^>]*\by="(-?\d+)"[^>]*\/>[\s\S]*?<[ap]:ext\b[^>]*\bcx="(-?\d+)"[^>]*\bcy="(-?\d+)"[^>]*\/>[\s\S]*?<\/[ap]:xfrm>/i);
       if (!transform) continue;
       const [x, y, width, height] = transform.slice(1).map(Number);
-      if (requireElementIds && (!objectName || !objectName.startsWith('wp_'))) {
+      const nativeMediaObject = /<a:videoFile\b|<p14:media\b|ppaction:\/\/media/i.test(block);
+      if (requireElementIds && !nativeMediaObject && (!objectName || !objectName.startsWith('wp_'))) {
         issues.push({ code: 'PPTX_ELEMENT_ID_MISSING', message: `${slide.name} contains a generated object without a stable elementId marker.`, severity: 'error', target: slide.name });
       }
       // DrawingML serializes a legal horizontal/vertical line with one zero
@@ -184,7 +185,14 @@ async function validatePresentationPackage(zip: JSZip, issues: OfficeArtifactIss
     }
     if (requireElementIds) {
       for (const name of [...xml.matchAll(/\bname="(wp_[^"]+)"/g)].map((match) => match[1])) {
-        const mapped = elementMap.find((entry) => entry.artifactName === name);
+        // LibreOffice appends a numeric suffix when a whole slide is
+        // duplicated (for example "wp_agenda_title 1"). The duplicated
+        // object still carries the stable marker of its source object; treat
+        // that serialization suffix as a derived copy, not an unmapped shape.
+        const duplicateBaseName = name.replace(/\s+\d+$/, '');
+        const mapped = elementMap.find((entry) => (
+          entry.artifactName === name || entry.artifactName === duplicateBaseName
+        ));
         if (!mapped) issues.push({ code: 'PPTX_UNMAPPED_GENERATED_OBJECT', message: `${name} is embedded in ${slide.name} but absent from the source element map.`, severity: 'error', target: slide.name });
       }
     }
@@ -241,8 +249,21 @@ async function officePackageFormatChecks(zip: JSZip, extension: string, featureC
     const slides = Object.values(zip.files).filter((entry) => !entry.dir && /^ppt\/slides\/slide\d+\.xml$/i.test(entry.name));
     const slideXml = await Promise.all(slides.map((entry) => entry.async('string')));
     const nativeChartCount = fileNames.filter((name) => /^ppt\/charts\/chart\d+\.xml$/i.test(name)).length;
+    const chartTypeCounts: Record<string, number> = {};
+    for (const name of fileNames.filter((entry) => /^ppt\/charts\/chart\d+\.xml$/i.test(entry))) {
+      const xml = await zip.file(name)!.async('string');
+      for (const match of xml.matchAll(/<c:(barChart|lineChart|areaChart|pieChart|doughnutChart|scatterChart|bubbleChart|radarChart|stockChart)\b[^>]*>([\s\S]*?)<\/c:\1>/g)) {
+        const type = match[1] === 'barChart'
+          ? (/<c:barDir\b[^>]*\bval="bar"/.test(match[2]) ? 'bar' : 'column')
+          : match[1] === 'radarChart'
+            ? (/<c:radarStyle\b[^>]*\bval="filled"/.test(match[2]) ? 'filled-radar' : 'radar')
+            : match[1] === 'doughnutChart' ? 'donut' : match[1].replace(/Chart$/, '');
+        chartTypeCounts[type] = (chartTypeCounts[type] || 0) + 1;
+      }
+    }
     return {
       presentation: {
+        chartTypeCounts,
         animationCount: slideXml.reduce((count, xml) => count + (xml.match(/<p:anim(?:Effect|Motion|Rot|Scale|Clr)?\b/gi) || []).length, 0),
         chartCount: nativeChartCount,
         commentCount: fileNames.filter((name) => /^ppt\/comments\/comment\d+\.xml$/i.test(name)).length,
@@ -514,10 +535,47 @@ export async function validateOfficeArtifact(input: {
       issues.push({ code: 'UNREADABLE_EMBEDDED_IMAGE', message: `Embedded image ${entry.name} could not be decoded.`, severity: 'warning', target: entry.name });
     }
   }
-  if (strictUnoValidation && elementMap.length) {
+  // Calc cells, ranges, widths, merges, print settings and several other
+  // worksheet primitives do not have an OOXML field that can retain the
+  // facade's diagnostic artifactName. Requiring those markers made every
+  // feature-rich XLSX fail strict validation even though the workbook and its
+  // feature counts were valid, and encouraged destructive removal of required
+  // elementId arguments. Keep strict serialized-marker enforcement for Writer
+  // and Impress, whose bookmarks/drawing names have stable OOXML homes; XLSX
+  // remains traceable through the returned elementMap plus semantic checks.
+  if (strictUnoValidation && elementMap.length && extension !== '.xlsx') {
     const searchableXml = (await Promise.all(xmlEntries.map((entry) => entry.async('string')))).join('\n');
+    const nonSerializedKinds = new Set([
+      'alphabetical-index',
+      'bookmark',
+      'comment',
+      'content-control',
+      'cross-reference',
+      'endnote',
+      'existing-shape',
+      'field',
+      'footnote',
+      'formula',
+      'mail-merge-field',
+      'media',
+      'merged-table-cells',
+      'paragraph-style',
+      'section',
+      'slide-comment',
+      'slide-transition',
+      'speaker-notes',
+      'table-of-contents',
+      'text-frame',
+      'text-replacement',
+    ]);
     for (const element of elementMap) {
       if (['presentation', 'word-document', 'workbook', 'page-style', 'slide', 'worksheet'].includes(element.kind)) continue;
+      // These entries describe editing operations or OOXML features whose
+      // native serialization has no stable drawing-name/bookmark field. They
+      // remain traceable in the element map and feature counts, while strict
+      // marker checks continue to cover authored shapes, tables, images and
+      // Writer flow objects that do have a durable OOXML marker location.
+      if (nonSerializedKinds.has(element.kind)) continue;
       if (element.artifactName && !searchableXml.includes(element.artifactName)) {
         issues.push(mappedIssue({
           code: 'ELEMENT_MAPPING_NOT_EMBEDDED',

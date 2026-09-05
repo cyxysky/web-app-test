@@ -27,7 +27,7 @@
   },
   "main": "electron/main.js",
   "scripts": {
-    "dev": "node --max-old-space-size=6144 server/webpilot-server.js --dev",
+    "dev": "node --max-old-space-size=8144 server/webpilot-server.js --dev",
     "sensitive-data:install": "npm run install-runtime --workspace @webpilot/capability-sensitive-data",
     "sensitive-data:start": "npm run start-runtime --workspace @webpilot/capability-sensitive-data",
     "sensitive-data:bundle": "npm run bundle-runtime --workspace @webpilot/capability-sensitive-data",

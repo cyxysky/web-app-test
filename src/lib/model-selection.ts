@@ -1,9 +1,10 @@
 import {
   defaultModelByProvider,
   defaultModelForProvider,
+  isModelProvider,
   modelListForProvider,
   modelProviderDefinition,
-  modelProviderDefinitions,
+  modelProviderDefinitionsForConfig,
 } from '@/config/settings';
 import type { ModelConfigRecord, ModelProvider } from '@/server/ai/schemas/runtime.schema';
 
@@ -26,7 +27,7 @@ const modelSelectionSeparator = '::model::';
 
 export function normalizeModelProvider(value?: unknown, fallback: ModelProvider = 'openrouter'): ModelProvider {
   const provider = String(value || '').trim().toLowerCase();
-  return modelProviderDefinitions.some((item) => item.value === provider) ? provider as ModelProvider : fallback;
+  return isModelProvider(provider) ? provider : fallback;
 }
 
 export function modelSelectionValue(provider: ModelProvider, model: string) {
@@ -36,7 +37,7 @@ export function modelSelectionValue(provider: ModelProvider, model: string) {
 export function parseModelSelectionValue(value: string): { provider: ModelProvider; model: string } {
   const [providerValue, encodedModel = ''] = value.split(modelSelectionSeparator);
   const provider = normalizeModelProvider(providerValue);
-  const fallback = defaultModelByProvider[provider];
+  const fallback = defaultModelByProvider[provider] || modelProviderDefinition(provider).defaultModel;
   try {
     return { provider, model: decodeURIComponent(encodedModel) || fallback };
   } catch {
@@ -54,7 +55,7 @@ export function isModelProviderEnabled(config: RuntimeModelConfig | null | undef
 
 export function enabledModelProviders(config: RuntimeModelConfig | null | undefined) {
   if (!config) return [];
-  return modelProviderDefinitions
+  return modelProviderDefinitionsForConfig(config.providers)
     .map((definition) => definition.value)
     .filter((provider) => isModelProviderEnabled(config, provider));
 }
@@ -124,7 +125,7 @@ export function modelSelectionDiagnosticLabel(
 
 export function modelSelectionOptionsForConfig(config: RuntimeModelConfig | null | undefined): RuntimeModelOption[] {
   if (!config) return [];
-  return modelProviderDefinitions.flatMap((provider) => {
+  return modelProviderDefinitionsForConfig(config.providers).flatMap((provider) => {
     if (!isModelProviderEnabled(config, provider.value)) return [];
     const models = modelsForProvider(config, provider.value);
     const providerLabel = config.providers?.[provider.value]?.displayName?.trim() || provider.label;

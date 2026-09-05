@@ -8,6 +8,7 @@ import { BrowserChatPayloadDetails } from '@/components/BrowserChatPayloadDetail
 import {
   isBrowserChatAiFailureLog,
   isBrowserChatAiLog,
+  isBrowserChatAiTerminalFailureLog,
   isBrowserChatContextCompressionLog,
   isBrowserChatDocumentVisualQaLog,
   isBrowserChatScreenshotPerformanceLog,
@@ -49,7 +50,10 @@ function aiLogRequestPayload(details?: Record<string, unknown>) {
 }
 
 function aiLogResponsePayload(details?: Record<string, unknown>) {
-  return details?.aiOutput !== undefined ? formatToolPayload(details.aiOutput) : '';
+  if (!details) return '';
+  // Older oversized responses contain only a truncation envelope and preview.
+  // Keep that evidence visible even though the aiOutput structure is missing.
+  return formatToolPayload(details.aiOutput ?? details);
 }
 
 function aiLogPayloadDetails(details?: Record<string, unknown>) {
@@ -103,7 +107,8 @@ function isAiAttemptStartLog(log: BrowserChatLogDialogRecord) {
 }
 
 function isTerminalFailureLog(log: BrowserChatLogDialogRecord) {
-  return phaseMatches(log, 'ai:runtime:retry-exhausted')
+  return isBrowserChatAiTerminalFailureLog(log)
+    || phaseMatches(log, 'ai:runtime:retry-exhausted')
     || phaseMatches(log, 'ai:runtime:error')
     || phaseMatches(log, 'chat:runtime:request-aborted')
     || phaseMatches(log, 'conversation:context:error')
@@ -189,11 +194,13 @@ function browserChatLogMatchesFilter(log: BrowserChatLogDialogRecord, filter: Br
 }
 
 function browserChatLogEventTitle(log: BrowserChatLogDialogRecord) {
+  if (isBrowserChatAiFailureLog(log)) return 'AI 请求异常';
   if (phaseMatches(log, 'ai:runtime:attempt')) return 'AI 请求已开始';
-  if (phaseMatches(log, 'ai:runtime:request')) return 'AI 输入已发送';
+  if (phaseMatches(log, 'ai:runtime:request')) return '等待 AI 首包';
+  if (phaseMatches(log, 'ai:runtime:response-headers')) return '已建立 AI 响应流';
+  if (phaseMatches(log, 'ai:runtime:receiving')) return '正在接收 AI 响应';
   if (phaseMatches(log, 'ai:runtime:response') || phaseMatches(log, 'ai:runtime:object')) return '模型已返回';
   if (phaseMatches(log, 'ai:runtime:attempt-succeeded')) return 'AI 请求正常结束';
-  if (isBrowserChatAiFailureLog(log)) return 'AI 请求异常';
   if (isBrowserChatDocumentVisualQaLog(log)) return '文档视觉质检';
   if (isBrowserChatToolLifecycleLog(log)) return '工具调用';
   if (isBrowserChatContextCompressionLog(log)) return contextCompressionLabel(log) || '上下文';
@@ -352,7 +359,11 @@ function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded:
   const isToolLifecycleLog = isBrowserChatToolLifecycleLog(log);
   const isConversationSummaryRequest = log.phase === 'conversation:context:request';
   const isConversationSummaryResponse = log.phase === 'conversation:context:response';
-  if (!parsed) return null;
+  if (!parsed) return (
+    <div className="browser-chat-log-details">
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={log.details} title={t('日志详情')} />
+    </div>
+  );
   const payloadDetails = aiLogPayloadDetails(parsed) || parsed;
   const requestPayload = isAiRequestLog
     ? aiLogRequestPayload(payloadDetails)
@@ -383,9 +394,12 @@ function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded:
   // instead of selecting only execution/trace or normalizing nested JSON.
   const toolPayload = isToolLifecycleLog ? log.details : '';
   const performancePayload = isBrowserChatScreenshotPerformanceLog(log) ? screenshotPerformancePayload(parsed) : '';
-  if (!requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload) return null;
+  const fallbackPayload = !requestPayload && !responsePayload && !timingPayload && !performancePayload && !errorPayload && !toolPayload
+    ? log.details
+    : '';
   return (
     <div className="browser-chat-log-details">
+      <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={fallbackPayload} title={t('日志详情')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" defaultOpen payload={timingPayload} title={t('耗时明细')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={requestPayload} title={t('AI 输入 JSON')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" defaultOpen payload={responsePayload} title={t('AI 输出 JSON')} />
@@ -600,20 +614,24 @@ function BrowserChatVirtualLogList({ allEntries, rounds }: { allEntries: Browser
 
 export function BrowserChatLogDialog({
   entries,
+  loadError,
   hasMore = false,
   loading = false,
   loadingMore = false,
   onClose,
   onLoadMore,
+  onRetry,
   summaryEntries,
 }: {
   entries: BrowserChatLogDialogRecord[];
+  loadError?: string;
   hasMore?: boolean;
   loading?: boolean;
   loadingMore?: boolean;
   messageContent?: string;
   onClose: () => void;
   onLoadMore?: () => void | Promise<void>;
+  onRetry?: () => void | Promise<void>;
   summaryEntries: BrowserChatLogDialogRecord[];
 }) {
   const { t } = useI18n();
@@ -706,10 +724,17 @@ export function BrowserChatLogDialog({
           {filteredRounds.length ? (
             <BrowserChatVirtualLogList allEntries={entries} rounds={filteredRounds} />
           ) : (
-            <p className="browser-chat-log-empty">
-              {t(loading ? '正在加载日志' : entries.length ? '无匹配日志' : '暂无日志')}
-            </p>
+            <div className="browser-chat-log-empty" role={loadError ? 'alert' : undefined}>
+              <p>{loadError ? t('加载日志失败：{error}', { error: loadError }) : t(loading ? '正在加载日志' : entries.length ? '无匹配日志' : '暂无日志')}</p>
+              {loadError && onRetry ? <button disabled={loading} onClick={() => void onRetry()} type="button">{t('重试')}</button> : null}
+            </div>
           )}
+          {loadError && entries.length ? (
+            <div role="alert">
+              <p>{t('加载日志失败：{error}', { error: loadError })}</p>
+              {onRetry ? <button disabled={loading || loadingMore} onClick={() => void onRetry()} type="button">{t('重试')}</button> : null}
+            </div>
+          ) : null}
           {hasMore && onLoadMore ? (
             <button
               className="browser-chat-log-load-more"

@@ -1,12 +1,19 @@
 import path from 'node:path';
 import { stat } from 'node:fs/promises';
 import { fileFormatForExtension, generatedFileExtensions, normalizedFileExtension } from '../formats.js';
-import type { OfficeBlock, OfficeCellValue, OfficeDocumentSpec } from '../office/types.js';
+import type {
+  OfficeCellValue,
+  OfficeDocumentSpec,
+  OfficeSemanticBlockInput,
+  OfficeSemanticDocumentInput,
+} from '../office/types.js';
 import { generateOfficeJsProgramDocument } from './office/javascript.js';
+import { compileOfficeSemanticDocument } from './office/semantic.js';
 import { generateUnoProgramDocument } from './office/uno.js';
 
 export type GeneratedFileCell = OfficeCellValue;
-export type GeneratedFileInput = OfficeDocumentSpec;
+export type GeneratedFileInput = OfficeSemanticDocumentInput
+  & Required<Pick<OfficeDocumentSpec, 'documentType' | 'fileName'>>;
 
 export type GeneratedFileOutput = {
   buffer: Buffer;
@@ -20,7 +27,7 @@ const wordExtensions = new Set(['.doc', '.docx', '.odt']);
 const spreadsheetExtensions = new Set(['.xls', '.xlsx', '.ods']);
 const presentationExtensions = new Set(['.ppt', '.pptx', '.odp']);
 
-function childBlocks(block: OfficeBlock) {
+function childBlocks(block: OfficeSemanticBlockInput) {
   return [
     ...(Array.isArray(block.children) ? block.children : []),
     ...(Array.isArray(block.columns)
@@ -29,11 +36,11 @@ function childBlocks(block: OfficeBlock) {
   ];
 }
 
-function flattenBlocks(blocks: OfficeBlock[]): OfficeBlock[] {
+function flattenBlocks(blocks: OfficeSemanticBlockInput[]): OfficeSemanticBlockInput[] {
   return blocks.flatMap((block) => [block, ...flattenBlocks(childBlocks(block))]);
 }
 
-function blockText(block: OfficeBlock): string {
+function blockText(block: OfficeSemanticBlockInput): string {
   if (block.type === 'table' && Array.isArray(block.rows)) {
     return block.rows.map((row) => row.map((cell) => cell === null ? '' : String(cell)).join('\t')).join('\n');
   }
@@ -97,17 +104,23 @@ export async function generateFileBuffer(input: (GeneratedFileInput | Pick<Offic
     if (!content) throw new Error('Text file generation requires at least one textual block.');
     return { buffer: Buffer.from(`${content}\n`, 'utf8'), extension };
   }
-  if (!input.program?.trim() && !input.programPath) throw new Error('Office document generation requires a saved source draft from file action=generate or action=edit.');
+  const semantic = 'blocks' in input && Array.isArray(input.blocks) && input.blocks.length > 0 && !input.program?.trim() && !input.programPath
+    ? compileOfficeSemanticDocument(input, input.generator || 'uno')
+    : undefined;
+  if (!semantic && !input.program?.trim() && !input.programPath) {
+    throw new Error('Office document generation requires a saved source draft (program/programPath) or a non-empty semantic document spec.');
+  }
   validateOfficeTarget(input, extension);
-  const generator = input.generator || 'javascript';
+  const generator = input.generator || (semantic ? 'uno' : 'javascript');
+  const source = input.programPath ? { sourcePath: input.programPath } : { sourceCode: semantic?.program || input.program };
   const generated = generator === 'javascript' ? await generateOfficeJsProgramDocument({
-    ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
+    ...source,
     fileName: path.basename(input.fileName),
     documentType: input.documentType,
     assetsPath: input.assetsPath,
     abortSignal: input.abortSignal,
   }) : await generateUnoProgramDocument({
-    ...(input.programPath ? { sourcePath: input.programPath } : { sourceCode: input.program }),
+    ...source,
     fileName: path.basename(input.fileName),
     documentType: input.documentType,
     assetsPath: input.assetsPath,
@@ -116,14 +129,15 @@ export async function generateFileBuffer(input: (GeneratedFileInput | Pick<Offic
   });
   return {
     buffer: generated.buffer || (() => { throw new Error('Office generator did not return an in-memory artifact.'); })(),
-    diagnostics: generated.report,
+    diagnostics: semantic ? { runtime: generated.report, semantic: semantic.diagnostics } : generated.report,
     extension,
     previewPdf: generated.previewPdf,
   };
 }
 
 export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'documentType' | 'fileName'> & {
-  programPath: string;
+  programPath?: string;
+  spec?: OfficeSemanticDocumentInput;
   outputPath: string;
   previewPath: string;
   assetsPath?: string;
@@ -135,10 +149,23 @@ export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'docum
   const extension = supportedGeneratedFileExtension(input.fileName);
   if (!extension || generatedTextExtensions.has(extension)) throw new Error('Path-based generation requires an Office or PDF target.');
   validateOfficeTarget(input, extension);
-  const generator = input.generator || 'javascript';
+  if (Boolean(input.programPath) === Boolean(input.spec)) throw new Error('Path-based generation requires exactly one of programPath or spec.');
+  const generator = input.generator || (input.spec ? 'uno' : 'javascript');
+  if (input.spec?.documentType !== undefined && input.spec.documentType !== input.documentType) {
+    throw new Error(`Semantic spec documentType=${input.spec.documentType} does not match output documentType=${input.documentType}.`);
+  }
+  if (input.spec?.fileName !== undefined && path.basename(input.spec.fileName) !== path.basename(input.fileName)) {
+    throw new Error(`Semantic spec fileName=${input.spec.fileName} does not match output fileName=${input.fileName}.`);
+  }
+  const semantic = input.spec ? compileOfficeSemanticDocument({
+    ...input.spec,
+    documentType: input.documentType,
+    fileName: input.fileName,
+  }, generator) : undefined;
+  const source = input.programPath ? { sourcePath: input.programPath } : { sourceCode: semantic!.program };
   const generated = generator === 'javascript'
     ? await generateOfficeJsProgramDocument({
-        sourcePath: input.programPath,
+        ...source,
         fileName: path.basename(input.fileName),
         documentType: input.documentType,
         assetsPath: input.assetsPath,
@@ -148,7 +175,7 @@ export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'docum
         onProgress: input.onProgress,
       })
     : await generateUnoProgramDocument({
-        sourcePath: input.programPath,
+        ...source,
         fileName: path.basename(input.fileName),
         documentType: input.documentType,
         assetsPath: input.assetsPath,
@@ -160,7 +187,7 @@ export async function generateFileToPaths(input: Pick<OfficeDocumentSpec, 'docum
       });
   return {
     bytes: (await stat(input.outputPath)).size,
-    diagnostics: generated.report,
+    diagnostics: semantic ? { runtime: generated.report, semantic: semantic.diagnostics } : generated.report,
     extension,
     outputPath: input.outputPath,
     previewPath: input.previewPath,

@@ -1,22 +1,25 @@
 'use client';
 
-import { useCallback, useLayoutEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useState, type FormEvent } from 'react';
 import {
   Bot,
   Brain,
   Braces,
   Bug,
+  Cable,
+  Gauge,
   KeyRound,
   Loader2,
   Lock,
+  Palette,
   PanelLeft,
   ShieldCheck,
-  SlidersHorizontal,
-  SquareTerminal,
+  Wrench,
   X,
 } from 'lucide-react';
 import { EnvironmentSettings, type EnvironmentSettingsInitialData } from '@/components/EnvironmentSettings';
 import {
+  environmentSettingsTabGroups,
   environmentSettingsTabsForUser,
   isAdministratorOnlySettingsTab,
 } from '@/components/environment-settings-model';
@@ -34,15 +37,18 @@ import { AppInput } from '@/components/ui/app-input';
 import { AppModal } from '@/components/ui/app-modal';
 
 function SettingsTabIcon({ tab }: { tab: SettingsTab }) {
+  if (tab === 'general') return <Palette size={15} />;
   if (tab === 'model') return <Bot size={15} />;
   if (tab === 'browser') return <PanelLeft size={15} />;
   if (tab === 'sensitive-data') return <ShieldCheck size={15} />;
-  if (tab === 'runtime') return <SquareTerminal size={15} />;
+  if (tab === 'runtime') return <Gauge size={15} />;
+  if (tab === 'capabilities') return <Wrench size={15} />;
+  if (tab === 'integrations') return <Cable size={15} />;
   if (tab === 'skills') return <Braces size={15} />;
   if (tab === 'memory') return <Brain size={15} />;
   if (tab === 'accounts') return <KeyRound size={15} />;
   if (tab === 'debug') return <Bug size={15} />;
-  return <SlidersHorizontal size={15} />;
+  return <Palette size={15} />;
 }
 
 export function SettingsWorkspace({
@@ -99,7 +105,24 @@ export function SettingsWorkspace({
       return;
     }
     setActiveTab(tab);
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', tab);
+      window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    }
   }
+
+  useEffect(() => {
+    const selectTabFromLocation = () => {
+      const tab = new URL(window.location.href).searchParams.get('tab') as SettingsTab | null;
+      if (tab && visibleSettingsTabs.some((item) => item.id === tab)) selectSettingsTab(tab);
+    };
+    selectTabFromLocation();
+    window.addEventListener('popstate', selectTabFromLocation);
+    return () => window.removeEventListener('popstate', selectTabFromLocation);
+  // The visible tab list is fixed for the lifetime of the settings route.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function submitAdminSettingsPassword(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -117,6 +140,9 @@ export function SettingsWorkspace({
       const nextTab = pendingAdminSettingsTab;
       setAdminSettingsAccessToken(data.token);
       setActiveTab(nextTab);
+      const url = new URL(window.location.href);
+      url.searchParams.set('tab', nextTab);
+      window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
       setPendingAdminSettingsTab(null);
       setAdminSettingsPassword('');
     } catch (error) {
@@ -139,23 +165,35 @@ export function SettingsWorkspace({
       >
         <section className="browser-chat-sidebar-section browser-chat-settings-section">
           <nav className="browser-chat-subnav" aria-label={t('环境配置分类')}>
-            {visibleSettingsTabs.map((tab) => (
-              <button
-                aria-current={selectedTab === tab.id ? 'page' : undefined}
-                aria-label={t(tab.label)}
-                className={selectedTab === tab.id ? 'active' : undefined}
-                key={tab.id}
-                onClick={() => selectSettingsTab(tab.id)}
-                title={t(tab.label)}
-                type="button"
-              >
-                <SettingsTabIcon tab={tab.id} />
-                <span>{t(tab.label)}</span>
-                {adminSettingsLocked && isAdministratorOnlySettingsTab(tab.id)
-                  ? <Lock className="browser-chat-settings-tab-lock" size={13} />
-                  : null}
-              </button>
-            ))}
+            {environmentSettingsTabGroups.map((group) => {
+              const tabs = group.tabs.flatMap((tabId) => {
+                const tab = visibleSettingsTabs.find((item) => item.id === tabId);
+                return tab ? [tab] : [];
+              });
+              if (!tabs.length) return null;
+              return (
+                <div className="browser-chat-settings-nav-group" key={group.id}>
+                  <span className="browser-chat-settings-nav-label">{t(group.label)}</span>
+                  {tabs.map((tab) => (
+                    <button
+                      aria-current={selectedTab === tab.id ? 'page' : undefined}
+                      aria-label={t(tab.label)}
+                      className={selectedTab === tab.id ? 'active' : undefined}
+                      key={tab.id}
+                      onClick={() => selectSettingsTab(tab.id)}
+                      title={t(tab.description)}
+                      type="button"
+                    >
+                      <SettingsTabIcon tab={tab.id} />
+                      <span>{t(tab.label)}</span>
+                      {adminSettingsLocked && isAdministratorOnlySettingsTab(tab.id)
+                        ? <Lock className="browser-chat-settings-tab-lock" size={13} />
+                        : null}
+                    </button>
+                  ))}
+                </div>
+              );
+            })}
           </nav>
         </section>
       </WorkspaceNavigationSidebar>

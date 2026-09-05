@@ -6,7 +6,7 @@ installBrowserSessionShutdownHooks();
 
 serveBrowserMcpStdio({
   sessionOptions: {
-    headless: process.env.BROWSER_HEADLESS !== 'false',
+    headless: (process.env.HEADLESS_BROWSER ?? process.env.BROWSER_HEADLESS) !== 'false',
     isolated: process.env.BROWSER_MCP_ISOLATED !== 'false',
   },
 });
