@@ -269,15 +269,17 @@ function BrowserChatMarkdownTable({ children }: { children: ReactNode }) {
 }
 
 export const BrowserChatSessionIdContext = createContext<string | undefined>(undefined);
+export const BrowserChatAutomationRunIdContext = createContext<string | undefined>(undefined);
 
 export const BrowserChatMarkdown = memo(function BrowserChatMarkdown({ markdown }: { markdown: string }) {
   const sessionId = useContext(BrowserChatSessionIdContext);
+  const automationRunId = useContext(BrowserChatAutomationRunIdContext);
   const normalizedMarkdown = useMemo(() => normalizeBrowserChatMarkdown(markdown), [markdown]);
   const blocks = useMemo(() => splitBrowserChatChartBlocks(normalizedMarkdown), [normalizedMarkdown]);
   return (
     <div className="browser-chat-agent-markdown">
       {blocks.map((block, index) => block.kind === 'chart' ? (
-        <BrowserChatChart chartId={block.chartId} key={`${block.chartId}:${index}`} sessionId={sessionId} />
+        <BrowserChatChart chartId={block.chartId} key={`${block.chartId}:${index}`} sessionId={sessionId} automationRunId={automationRunId} />
       ) : (
         <ReactMarkdown
           key={`markdown:${index}`}
@@ -319,6 +321,7 @@ export const BrowserChatOrderedResponse = memo(function BrowserChatOrderedRespon
   parts?: BrowserChatUIMessagePart[];
 }) {
   const sessionId = useContext(BrowserChatSessionIdContext);
+  const automationRunId = useContext(BrowserChatAutomationRunIdContext);
   const responseParts = (parts || []).filter((part) => (
     part.type === 'text' || part.type === 'data-chart' || part.type === 'data-ui'
   ));
@@ -326,7 +329,7 @@ export const BrowserChatOrderedResponse = memo(function BrowserChatOrderedRespon
   return <div className="browser-chat-ordered-response">{responseParts.map((part, index) => {
     if (part.type === 'text') return <BrowserChatMarkdown key={`text:${index}`} markdown={part.text} />;
     if (part.type === 'data-chart') {
-      return <BrowserChatChart chartId={part.data.chartId} key={part.id || `${part.data.chartId}:${index}`} sessionId={sessionId} />;
+      return <BrowserChatChart chartId={part.data.chartId} key={part.id || `${part.data.chartId}:${index}`} sessionId={sessionId} automationRunId={automationRunId} />;
     }
     if (part.type === 'data-ui') {
       return <BrowserChatDataUI

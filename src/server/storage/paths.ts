@@ -10,6 +10,10 @@ export function artifactsRoot() {
   return path.resolve(/*turbopackIgnore: true*/ process.env.ARTIFACTS_DIR || path.join(appDataRoot(), 'artifacts'));
 }
 
+export function codeSandboxRoot(...segments: string[]) {
+  return path.join(path.resolve(/*turbopackIgnore: true*/ process.env.CODE_SANDBOX_DIR || path.join(appDataRoot(), 'code-sandbox')), ...segments);
+}
+
 export function artifactPath(...segments: string[]) {
   return path.join(artifactsRoot(), ...segments);
 }

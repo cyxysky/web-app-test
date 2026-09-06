@@ -66,6 +66,7 @@ export async function readModelSettingsState() {
     config: {
       provider: saved?.provider || 'openrouter',
       providers,
+      providerOrder: saved?.providerOrder,
       updatedAt: saved?.updatedAt || '',
     },
   };

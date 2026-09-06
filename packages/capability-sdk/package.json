@@ -10,6 +10,10 @@
     "FRAMEWORK_INTEGRATION.md"
   ],
   "exports": {
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"

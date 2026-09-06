@@ -13,8 +13,14 @@ export const browserOperationRecordSchema = z.object({
   sourceToolIndex: z.number().optional(),
 });
 
+export const skillResourceSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  content: z.string().max(100_000),
+});
+
 export const skillContentSchema = z.object({
   details: z.string().default(''),
+  resources: z.array(skillResourceSchema).max(20).optional(),
 });
 
 export function parseSkillContent(value: unknown) {
@@ -270,6 +276,7 @@ export type ModelProviderSettings = {
 
 export type ModelConfigRecord = {
   provider: ModelProvider;
+  providerOrder?: ModelProvider[];
   providers: Partial<Record<ModelProvider, ModelProviderSettings>>;
   updatedAt: string;
 };

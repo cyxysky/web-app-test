@@ -3,17 +3,22 @@ import { PHASE_DEVELOPMENT_SERVER } from 'next/constants';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { resolveWorkspaceBrand } from './electron/product-brand';
+import { applyOrbitEnvironment } from './server/orbit-environment';
 
 // Next compiles TypeScript configuration through a temporary
 // next.config.compiled.js. import.meta.url points at that transient file, which
 // has already been removed by the time the exported config runs on Windows.
 const projectRoot = process.cwd();
+applyOrbitEnvironment();
 const configFilePath = resolve(projectRoot, 'next.config.ts');
 const configRevision = createHash('sha256').update(readFileSync(configFilePath)).digest('hex');
-const configuredBasePath = String(process.env.WEBPILOT_BASE_PATH || '').trim().replace(/^\/+|\/+$/g, '');
+const configuredBasePath = String(process.env.ORBIT_BASE_PATH ?? process.env.WEBPILOT_BASE_PATH ?? '').trim().replace(/^\/+|\/+$/g, '');
 const basePath = configuredBasePath ? `/${configuredBasePath}` : '';
-const brandPrefix = String(process.env.WEBPILOT_BRAND_PREFIX || 'DOMP').trim() || 'DOMP';
-const brandText = String(process.env.WEBPILOT_BRAND_TEXT || 'WebPilot').trim() || 'WebPilot';
+const { brandPrefix, brandText } = resolveWorkspaceBrand({
+  prefix: process.env.ORBIT_BRAND_PREFIX ?? process.env.WEBPILOT_BRAND_PREFIX,
+  text: process.env.ORBIT_BRAND_TEXT ?? process.env.WEBPILOT_BRAND_TEXT,
+});
 const serverRole = process.env.WEBPILOT_SERVER_ROLE === 'runtime' ? 'runtime' : 'ui';
 const capabilitySource = process.env.WEBPILOT_CAPABILITY_SOURCE === 'npm' ? 'npm' : 'workspace';
 
@@ -47,6 +52,9 @@ export default function nextConfig(phase: string): NextConfig {
     // directory. Sharing .next lets dev hot updates corrupt next build manifests.
     distDir: phase === PHASE_DEVELOPMENT_SERVER ? `.next-dev-${serverRole}` : '.next',
     env: {
+      NEXT_PUBLIC_ORBIT_BASE_PATH: basePath,
+      NEXT_PUBLIC_ORBIT_BRAND_PREFIX: brandPrefix,
+      NEXT_PUBLIC_ORBIT_BRAND_TEXT: brandText,
       NEXT_PUBLIC_WEBPILOT_BASE_PATH: basePath,
       NEXT_PUBLIC_WEBPILOT_BRAND_PREFIX: brandPrefix,
       NEXT_PUBLIC_WEBPILOT_BRAND_TEXT: brandText,

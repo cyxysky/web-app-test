@@ -74,6 +74,11 @@ export type FileToolInput = {
   offset?: number;
   limit?: number;
   pages?: number[];
+  /** Content selectors; pages remains the visual-preview selector. */
+  sheet?: string;
+  range?: string;
+  contentPages?: number[];
+  section?: string;
   query?: string;
   screenshotIds?: string[];
   reviews?: FileVisualReview[];
@@ -83,7 +88,7 @@ export type FileToolInput = {
 
 export type FileReadInput = Pick<
   FileToolInput,
-  'attachmentId' | 'artifactId' | 'includeVisuals' | 'limit' | 'offset' | 'pages'
+  'attachmentId' | 'artifactId' | 'includeVisuals' | 'limit' | 'offset' | 'pages' | 'sheet' | 'range' | 'contentPages' | 'section'
 >;
 
 export type FileAttachmentBinding = {

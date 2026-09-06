@@ -11,6 +11,32 @@ Applications inject artifact storage and optional persistent `agent.state`
 services through `BrowserSessionOptions.host`. Browser Chat, databases, defect
 reporting, model selection, and the Agent loop remain host responsibilities.
 
+Session operations serialize preparation, execution and result collection together,
+including live input and tab switching. Independent sessions can still run concurrently.
+Closing a session cancels queued work and drains active cleanup before releasing it.
+
+`state` / `browser.snapshot` accept `scope: 'active' | 'all'`, an exact `frame`
+path (`main` for the main frame), a unique `selector`, literal `query`, and
+`maxOutputChars`. Pass a returned `nextCursor` as `cursor` to continue the same
+immutable capture. Keep the selection unchanged; cursors expire after two minutes,
+navigation, a new capture, or a code action. `capturedAt` describes historical
+capture time, so re-check live locators before acting on a continuation page.
+
+Code results include `executionState`: attempted actions, completed Playwright calls,
+execution phase, outcome and `requiresStateRefresh`. A timeout/abort/crash has an
+unknown outcome once execution started; read live state before retrying. A completed
+Playwright call alone is not proof that the application's business operation succeeded.
+`kernelReset.reason` also covers timeout, abort and crash; JavaScript bindings are lost.
+
+Hosts can set `host.receiveDownload` to persist actual browser download bytes,
+including authenticated, POST-generated and blob downloads. The File package exports
+`createNodeFileDownloadReceiver({ artifactsRoot, artifactUrl })` for this contract.
+Code results expose `downloads` with artifact IDs usable by File `readContent`.
+Without this adapter, the existing live-preview URL relay remains available.
+
+The session facade delegates shared browser leases, scheduling, state pagination and
+download lifecycle to separate internal modules; existing public imports are preserved.
+
 ```ts
 import { BrowserSession, createNodeBrowserCapability } from '@webpilot/capability-browser/node';
 

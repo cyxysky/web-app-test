@@ -15,10 +15,10 @@ function xmlAttribute(value: unknown) {
 }
 
 export function activeSkills(skills: SkillRecord[]) {
-  return skills.filter((skill) => skill.status === 'ready').slice(0, 8);
+  return [...new Map(skills.filter((skill) => skill.status === 'ready').map((skill) => [skill.id, skill])).values()];
 }
 
-function skillRelevanceScore(skill: SkillRecord, query: unknown) {
+export function skillRelevanceScore(skill: SkillRecord, query: unknown) {
   return Math.max(
     fuzzyRetrievalScore(query, [skill.title]) * 8,
     fuzzyRetrievalScore(query, [skill.description]) * 5,
@@ -41,7 +41,9 @@ export function runtimeSkills(
       relevance: skillRelevanceScore(skill, query),
     }))
     .filter((item) => !retrievalQueryTexts(query).length || item.relevance >= 3.8)
-    .sort((left, right) => right.relevance - left.relevance)
+    .sort((left, right) => right.relevance - left.relevance || left.skill.id.localeCompare(right.skill.id))
+    .filter((item) => !loadedSkillIds.has(item.skill.id))
+    .slice(0, 8)
     .map((item) => item.skill);
   return activeSkills([
     ...activeExplicitlySelected,

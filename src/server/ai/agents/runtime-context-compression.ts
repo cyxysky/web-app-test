@@ -1,5 +1,6 @@
 import type { ModelMessage } from 'ai';
 import { isRuntimePromptCacheMetadataMessage } from './runtime-prompt-cache';
+import { parseRuntimeSemanticSummary } from './runtime-semantic-summary';
 
 type RuntimeContinuationState = {
   blockers?: unknown;
@@ -370,7 +371,7 @@ export function buildRuntimeContinuationSummaryPrompt(input: {
   thresholdTokens: number;
 }) {
   return [
-    'You are incrementally compressing a WebPilot browser-agent loop so the SAME user request can continue in a fresh model context.',
+    'You are incrementally compressing an Orbit agent loop so the SAME user request can continue in a fresh model context.',
     'Return concise JSON only. Do not use markdown.',
     '',
     'Required JSON shape:',
@@ -407,6 +408,12 @@ export function fallbackRuntimeContinuationSummary(input: {
   runtimeState: RuntimeContinuationState;
   stepIndex: number;
 }) {
+  const semantic = parseRuntimeSemanticSummary(input.previousSummary);
+  if (semantic) {
+    // Routine checkpoints must not turn a validated v2 state back into a legacy
+    // prose/array summary or discard its instruction coverage and source refs.
+    return JSON.stringify({ ...semantic, currentState: continuationText(input.runtimeState.currentState, input.runtimeState.pageUnderstanding, semantic.currentState) });
+  }
   const previous = parsedRuntimeContinuationSummary(input.previousSummary) || {};
   const runtimeNextStep = continuationText(input.runtimeState.nextStep);
   const authoritativeDirective = continuationText(...continuationStrings(input.runtimeState.userConstraints));

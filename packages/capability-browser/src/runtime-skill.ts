@@ -41,6 +41,10 @@ These are model tools, not JavaScript globals:
 - \`browser({ action: "code", reason, code, maxOutputChars? })\` executes one JavaScript cell. \`reason\` is a concise description of the exact read/action; \`code\` is 1-40,000 characters; \`maxOutputChars\`, when supplied, is at least 1,000.
 - \`browser({ action: "waitForHumanVerification", reason, maxMs? })\` pauses for user-owned CAPTCHA, OTP, QR, login, identity, or device verification.
 
+State reads optionally accept scope (active/all), exact frame path (main for the main frame), a unique selector, literal query, and maxOutputChars. Pass nextCursor as cursor to continue the same immutable capture; keep selection unchanged. Read live state again after navigation, another capture, or a code action. Continuation is historical evidence, not a fresh DOM observation.
+
+Code results may include executionState and downloads. executionState distinguishes attempted actions from completed Playwright calls and marks timeout/abort/crash outcomes unknown after execution starts. Refresh live state before retrying; never replay a submission solely because the cell timed out. kernelReset also reports timeout/aborted/crashed and means previous JavaScript bindings are gone. downloads contains persisted artifact IDs when the host supplies a receiver; pass those artifact IDs to file readContent/convert instead of fetching the export URL again.
+
 The outer browser action=code result is \`{ ok, actual, failureCategory?, dependencyFailures?, referenceImagePaths? }\`. \`actual\` is JSON text containing \`{ ok, result, error, aborted, elapsedMs, finalPage, verification?, domChanges?, images, imageErrors }\`. Parse the tool result semantically: \`domChanges\` is only the incremental journal caused by that cell, not a full snapshot; \`dependencyFailures\` is a once-only queue of recent request failures and HTTP 408/429/5xx observations. Failed results preserve the complete error and failure classification without generated recovery prose.
 
 ## Cell syntax and result contract

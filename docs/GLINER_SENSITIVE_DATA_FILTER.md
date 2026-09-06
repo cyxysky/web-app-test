@@ -1,6 +1,6 @@
 # 当前项目敏感数据过滤方案
 
-> 核查日期：2026-08-28。本文以当前代码为准，描述 WebPilot 在调用 AI 模型前实际执行的敏感数据过滤链路。
+> 核查日期：2026-08-28。本文以当前代码为准，描述 Orbit 在调用 AI 模型前实际执行的敏感数据过滤链路。
 
 ## 1. 方案结论
 
@@ -242,7 +242,7 @@ sidecar 使用进程内锁串行执行一次完整推理，避免多个请求同
 "elapsedMs": 4,
 "finalPage": {
 "url": "[https://domp.shterm.com/login](https://domp.shterm.com/login)",
-"title": "Login to DOMP"
+"title": "Login to business system"
 },
 "images": [],
 "imageErrors": [],

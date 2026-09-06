@@ -1,6 +1,6 @@
 # TypeScript Agent framework integration
 
-WebPilot Capability packages are framework-neutral. AI SDK and MCP are optional
+Orbit Capability packages are framework-neutral. AI SDK and MCP are optional
 adapters, not requirements. Any TypeScript Agent framework can consume a
 Capability package when it can expose named tools with JSON Schema inputs and
 invoke asynchronous TypeScript functions.

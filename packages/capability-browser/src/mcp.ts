@@ -31,6 +31,11 @@ const codeParser = z.object({
 }).strict();
 const snapshotParser = z.object({
   browserSessionId,
+  scope: z.enum(['active', 'all']).optional(),
+  frame: z.string().trim().min(1).max(200).optional(),
+  selector: z.string().trim().min(1).max(2000).optional(),
+  query: z.string().trim().min(1).max(300).optional(),
+  cursor: z.string().min(1).max(1000).optional(),
   maxOutputChars: z.number().int().min(1_000).max(200_000).optional(),
 }).strict();
 const closeParser = z.object({ browserSessionId }).strict();
@@ -179,6 +184,7 @@ export class BrowserMcpSessionManager {
     return this.#enqueue(inputValue.browserSessionId, async (managed) => browserResult(
       inputValue.browserSessionId,
       await managed.session.readBrowserState({
+        ...inputValue,
         abortSignal,
         maxOutputChars: inputValue.maxOutputChars,
       }),

@@ -61,7 +61,7 @@ export const DEFAULT_SENSITIVE_DATA_EVALUATION_CASES: SensitiveDataEvaluationCas
     text: [
       '【供应链与安全审计记录】',
       '客户名称：远山智造；实施方：华为技术有限公司；涉及产品：PAM特权访问管理系统。',
-      '合同号DOMP-CN-2026-0918；项目代号NOVA-SZ-042；年度预算约3.5亿元。',
+      '合同号ORBT-CN-2026-0918；项目代号NOVA-SZ-042；年度预算约3.5亿元。',
       '业务联系人王晓雯，职位为区域销售总监，当前岗位是供应链计划专员，工号A10397，管理员用户名ops.admin。',
       '目标年薪45万元/年，联系电话021-6123-4567，工作邮箱service@qizhi.cn。',
       '实名资料包含身份证号320311198806153274、出生日期1988年6月15日、护照号G87654321。',
@@ -72,7 +72,7 @@ export const DEFAULT_SENSITIVE_DATA_EVALUATION_CASES: SensitiveDataEvaluationCas
       '远山智造',
       '华为技术有限公司',
       'PAM特权访问管理系统',
-      'DOMP-CN-2026-0918',
+      'ORBT-CN-2026-0918',
       'NOVA-SZ-042',
       '3.5亿元',
       '王晓雯',
@@ -97,7 +97,7 @@ export const DEFAULT_SENSITIVE_DATA_EVALUATION_CASES: SensitiveDataEvaluationCas
     name: '综合业务场景 · 人力与项目回款',
     text: [
       '【人力与项目回款记录】',
-      '客户名称：蓝鲸医疗；合同相对方：阿里云计算有限公司；交付产品：DOMP研发管理系统。',
+      '客户名称：蓝鲸医疗；合同相对方：阿里云计算有限公司；交付产品：企业研发管理系统。',
       '框架合同编码NDA/SH/2026/0032；项目编码IPD/2026/0097；本期回款金额￥500,000。',
       '审批人欧阳子轩，职位为首席财务官，所在岗位是高级测试工程师，员工IDEID-2026-7788，堡垒机用户名user_chenjf。',
       '试用期薪资税前30K/月，海外电话+86 13912345678，账单邮箱finance.ops@example.org。',
@@ -108,7 +108,7 @@ export const DEFAULT_SENSITIVE_DATA_EVALUATION_CASES: SensitiveDataEvaluationCas
     expectedValues: [
       '蓝鲸医疗',
       '阿里云计算有限公司',
-      'DOMP研发管理系统',
+      '企业研发管理系统',
       'NDA/SH/2026/0032',
       'IPD/2026/0097',
       '￥500,000',

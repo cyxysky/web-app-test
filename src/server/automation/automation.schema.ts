@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { browserOperationRecordSchema } from '@/server/ai/schemas/runtime.schema';
+import { browserChatFinalBlockSchema } from '@/lib/browser-chat-ui-message';
 
 const timestampSchema = z.string().trim().min(1);
 const nonEmptyStringSchema = z.string().trim().min(1);
@@ -19,6 +20,9 @@ export const automationCaseRecordSchema = z.object({
   sourceMessageIds: z.array(nonEmptyStringSchema),
   targetUrl: nonEmptyStringSchema,
   instruction: nonEmptyStringSchema,
+  guidance: z.string().optional(),
+  completionCriteria: z.string().optional(),
+  outputRequirements: z.string().optional(),
   operations: z.array(automationOperationRecordSchema),
   createdAt: timestampSchema,
   updatedAt: timestampSchema,
@@ -39,7 +43,7 @@ export const automationRunStatusSchema = z.enum([
 export const automationRunStepRecordSchema = z.object({
   operationIndex: z.number().int().nonnegative(),
   name: nonEmptyStringSchema,
-  status: z.enum(['fixed', 'repaired', 'failed']),
+  status: z.enum(['running', 'passed', 'fixed', 'repaired', 'failed', 'blocked']),
   actual: z.string(),
   fixedResult: z.string().optional(),
   repairSteps: z.array(z.unknown()).optional(),
@@ -79,6 +83,8 @@ export const automationRunRecordSchema = z.object({
   steps: z.array(automationRunStepRecordSchema),
   log: z.array(automationRunLogEntrySchema),
   error: z.string().optional(),
+  output: z.string().optional(),
+  outputBlocks: z.array(browserChatFinalBlockSchema).optional(),
   lease: automationRunLeaseSchema.optional(),
   startedAt: timestampSchema.optional(),
   finishedAt: timestampSchema.optional(),
@@ -136,6 +142,18 @@ export type AutomationScheduleRecord = z.infer<typeof automationScheduleRecordSc
 export type CreateAutomationCaseInput = Omit<AutomationCaseRecord, 'id' | 'createdAt' | 'updatedAt'> & {
   id?: string;
 };
+
+export const automationTaskUpdateSchema = z.object({
+  title: z.string().trim().min(1).max(160).optional(),
+  description: z.string().trim().max(500).optional(),
+  instruction: z.string().trim().min(1).max(100_000).optional(),
+  targetUrl: z.string().trim().max(4_000).optional(),
+  guidance: z.string().trim().max(100_000).optional(),
+  completionCriteria: z.string().trim().max(20_000).optional(),
+  outputRequirements: z.string().trim().max(20_000).optional(),
+}).strict();
+
+export type UpdateAutomationCaseInput = z.infer<typeof automationTaskUpdateSchema>;
 
 export type CreateAutomationRunInput = Omit<
   AutomationRunRecord,

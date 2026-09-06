@@ -36,8 +36,8 @@ import { useTheme } from '@/theme/ThemeProvider';
 
 const rangeOptions = [7, 30, 90] as const;
 
-function compactNumber(value: number) {
-  return new Intl.NumberFormat('zh-CN', {
+function formatCompactNumber(value: number, language: string) {
+  return new Intl.NumberFormat(language === 'en' ? 'en-US' : 'zh-CN', {
     maximumFractionDigits: value >= 1000 ? 1 : 0,
     notation: value >= 10_000 ? 'compact' : 'standard',
   }).format(value || 0);
@@ -54,11 +54,11 @@ function duration(value: number) {
   return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1000)}s`;
 }
 
-function dateTime(value: string) {
+function formatDateTime(value: string, language: string) {
   if (!value) return '—';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(language === 'en' ? 'en-US' : 'zh-CN', {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
@@ -119,11 +119,12 @@ function ChartShell({ children, description, title }: { children: ReactNode; des
 }
 
 function UsageTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
+  const { t } = useI18n();
   const maximum = Math.max(1, ...points.map((point) => point.chatTasks + point.automationRuns));
   const labelEvery = points.length <= 7 ? 1 : points.length <= 30 ? 5 : 15;
   return (
     <div
-      aria-label="对话任务与自动化运行使用趋势"
+      aria-label={t("对话任务与自动化运行使用趋势")}
       className="ai-operations-chart"
       role="img"
     >
@@ -135,7 +136,7 @@ function UsageTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
             <div
               className="ai-operations-chart-column"
               key={point.date}
-              title={`${point.date}：对话 ${point.chatTasks}，自动化 ${point.automationRuns}`}
+              title={t('{date}：对话 {chat}，自动化 {automation}', { date: point.date, chat: point.chatTasks, automation: point.automationRuns })}
             >
               <div className="ai-operations-chart-column-track">
                 <div
@@ -154,18 +155,19 @@ function UsageTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
         })}
       </div>
       <div className="ai-operations-chart-legend">
-        <span><i className="is-chat" />对话任务</span>
-        <span><i className="is-automation" />自动化运行</span>
+        <span><i className="is-chat" />{t("对话任务")}</span>
+        <span><i className="is-automation" />{t("自动化运行")}</span>
       </div>
     </div>
   );
 }
 
 function OutcomeTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
+  const { t } = useI18n();
   const maximum = Math.max(1, ...points.map((point) => point.passed + point.failed + point.blocked + point.interrupted));
   const labelEvery = points.length <= 7 ? 1 : points.length <= 30 ? 5 : 15;
   return (
-    <div aria-label="任务执行结果趋势" className="ai-operations-chart" role="img">
+    <div aria-label={t("任务执行结果趋势")} className="ai-operations-chart" role="img">
       <div className="ai-operations-chart-grid" aria-hidden="true"><span /><span /><span /><span /></div>
       <div className="ai-operations-chart-columns">
         {points.map((point, index) => {
@@ -174,7 +176,7 @@ function OutcomeTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
             <div
               className="ai-operations-chart-column"
               key={point.date}
-              title={`${point.date}：成功 ${point.passed}，失败 ${point.failed}，阻塞 ${point.blocked}，中断 ${point.interrupted}`}
+              title={t('{date}：成功 {passed}，失败 {failed}，阻塞 {blocked}，中断 {interrupted}', { date: point.date, passed: point.passed, failed: point.failed, blocked: point.blocked, interrupted: point.interrupted })}
             >
               <div className="ai-operations-chart-column-track">
                 <div
@@ -194,9 +196,9 @@ function OutcomeTrendChart({ points }: { points: AiOperationsTrendPoint[] }) {
         })}
       </div>
       <div className="ai-operations-chart-legend">
-        <span><i className="is-passed" />成功</span>
-        <span><i className="is-blocked" />阻塞</span>
-        <span><i className="is-failed" />失败/中断</span>
+        <span><i className="is-passed" />{t("成功")}</span>
+        <span><i className="is-blocked" />{t("阻塞")}</span>
+        <span><i className="is-failed" />{t("失败/中断")}</span>
       </div>
     </div>
   );
@@ -213,7 +215,9 @@ export function AiOperationsWorkspace({
   initialData: AiOperationsDashboardData;
   initialSidebarCollapsed?: boolean;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
+  const compactNumber = useCallback((value: number) => formatCompactNumber(value, language), [language]);
+  const dateTime = (value: string) => formatDateTime(value, language);
   const { mode: themeMode, setMode } = useTheme();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(initialSidebarCollapsed);
   const [data, setData] = useState(initialData);
@@ -260,15 +264,15 @@ export function AiOperationsWorkspace({
   const overview = data.overview;
   const maximumSystemTasks = Math.max(1, ...data.systems.map((item) => item.totalTasks));
   const trendUserOptions = useMemo(() => [
-    { label: '全部用户', description: '查看公司整体使用趋势', value: '' },
+    { label: t('全部用户'), description: t('查看公司整体使用趋势'), value: '' },
     ...data.trendUsers.map((item) => ({
-      description: `${item.totalTasks} 个任务 · ${compactNumber(item.totalTokens)} Token`,
-      label: `用户 ${item.userId}`,
-      selectedLabel: `用户 ${item.userId}`,
+      description: t('{count} 个任务 · {tokens} Token', { count: item.totalTasks, tokens: compactNumber(item.totalTokens) }),
+      label: t('用户 {id}', { id: item.userId }),
+      selectedLabel: t('用户 {id}', { id: item.userId }),
       value: item.userId,
     })),
-  ], [data.trendUsers]);
-  const trendScopeLabel = trendUserId ? `用户 ${trendUserId}` : '全部用户';
+  ], [data.trendUsers, compactNumber, t]);
+  const trendScopeLabel = trendUserId ? t('用户 {id}', { id: trendUserId }) : t('全部用户');
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed ai-operations-layout' : 'browser-chat-layout ai-operations-layout'}>
@@ -331,9 +335,9 @@ export function AiOperationsWorkspace({
             </div> : null}
           </header>
 
-          <div className="ai-operations-page-tabs" role="tablist" aria-label="AI 运营子页面">
-            <button aria-selected={activeView === 'overview'} className={activeView === 'overview' ? 'active' : undefined} onClick={() => setActiveView('overview')} role="tab" type="button">运营概览</button>
-            <button aria-selected={activeView === 'runtime'} className={activeView === 'runtime' ? 'active' : undefined} onClick={() => setActiveView('runtime')} role="tab" type="button">后端状态</button>
+          <div className="ai-operations-page-tabs" role="tablist" aria-label={t("AI 运营子页面")}>
+            <button aria-selected={activeView === 'overview'} className={activeView === 'overview' ? 'active' : undefined} onClick={() => setActiveView('overview')} role="tab" type="button">{t("运营概览")}</button>
+            <button aria-selected={activeView === 'runtime'} className={activeView === 'runtime' ? 'active' : undefined} onClick={() => setActiveView('runtime')} role="tab" type="button">{t("后端状态")}</button>
           </div>
 
           <div hidden={activeView !== 'overview'}>
@@ -341,7 +345,7 @@ export function AiOperationsWorkspace({
           <div className="ai-operations-meta-row">
             <span>{t('时区')}：{data.timezone}</span>
             <span>{t('更新时间')}：{dateTime(data.generatedAt)}</span>
-            {error ? <strong role="alert">{error}</strong> : null}
+            {error ? <strong role="alert">{t(error)}</strong> : null}
           </div>
 
           <section className="ai-operations-panel ai-operations-runtime-panel">
@@ -349,13 +353,13 @@ export function AiOperationsWorkspace({
             <div className="ai-operations-metric-grid" aria-label={t('系统与运营总览')}>
               <MetricCard detail={`${overview.automationRuns} ${t('次范围内运行')}`} icon={Workflow} label={t('启用的执行计划')} value={overview.enabledSchedules} />
               <MetricCard detail={data.timezone} icon={Clock3} label={t('数据生成时间')} value={dateTime(data.generatedAt)} />
-              <MetricCard detail={`${overview.chatTasks} 对话 · ${overview.automationRuns} 自动化`} icon={Activity} label={t('任务总量')} value={compactNumber(overview.totalTasks)} />
-              <MetricCard detail={`${overview.passed} 个成功结果`} icon={Gauge} label={t('任务成功率')} tone="success" value={percent(overview.successRate)} />
-              <MetricCard detail={`${overview.failed} 失败 · ${overview.blocked} 阻塞`} icon={CircleAlert} label={t('异常任务')} tone={overview.failed || overview.blocked ? 'danger' : 'default'} value={compactNumber(overview.failed + overview.blocked)} />
-              <MetricCard detail={`${overview.enabledSchedules} 个计划已启用`} icon={Workflow} label={t('当前执行中')} tone={overview.runningNow ? 'warning' : 'default'} value={compactNumber(overview.runningNow)} />
+              <MetricCard detail={t('{chat} 对话 · {automation} 自动化', { chat: overview.chatTasks, automation: overview.automationRuns })} icon={Activity} label={t('任务总量')} value={compactNumber(overview.totalTasks)} />
+              <MetricCard detail={t('{count} 个成功结果', { count: overview.passed })} icon={Gauge} label={t('任务成功率')} tone="success" value={percent(overview.successRate)} />
+              <MetricCard detail={t('{failed} 失败 · {blocked} 阻塞', { failed: overview.failed, blocked: overview.blocked })} icon={CircleAlert} label={t('异常任务')} tone={overview.failed || overview.blocked ? 'danger' : 'default'} value={compactNumber(overview.failed + overview.blocked)} />
+              <MetricCard detail={t('{count} 个计划已启用', { count: overview.enabledSchedules })} icon={Workflow} label={t('当前执行中')} tone={overview.runningNow ? 'warning' : 'default'} value={compactNumber(overview.runningNow)} />
               <MetricCard detail={`P95 ${duration(overview.p95DurationMs)}`} icon={Timer} label={t('平均耗时')} value={duration(overview.averageDurationMs)} />
-              <MetricCard detail={`${overview.repairs} 次恢复或修复`} icon={Wrench} label={t('AI 自动修复')} value={compactNumber(overview.repairs)} />
-              <MetricCard detail={`${overview.modelCalls} 次进程内模型调用`} icon={Bot} label={t('模型 Token')} value={compactNumber(overview.inputTokens + overview.outputTokens)} />
+              <MetricCard detail={t('{count} 次恢复或修复', { count: overview.repairs })} icon={Wrench} label={t('AI 自动修复')} value={compactNumber(overview.repairs)} />
+              <MetricCard detail={t('{count} 次进程内模型调用', { count: overview.modelCalls })} icon={Bot} label={t('模型 Token')} value={compactNumber(overview.inputTokens + overview.outputTokens)} />
               <MetricCard detail={t('统计范围内有任务的用户')} icon={Users} label={t('活跃用户')} value={compactNumber(overview.activeUsers)} />
             </div>
           </section>
@@ -408,7 +412,7 @@ export function AiOperationsWorkspace({
                       id: 'task',
                     },
                     { accessor: (item) => item.userId, cell: (item) => item.userId, header: t('用户'), id: 'user' },
-                    { accessor: (item) => item.status, cell: (item) => <span className={`ai-operations-status is-${item.status}`}>{statusLabel(item.status)}</span>, header: t('状态'), id: 'status' },
+                    { accessor: (item) => item.status, cell: (item) => <span className={`ai-operations-status is-${item.status}`}>{t(statusLabel(item.status))}</span>, header: t('状态'), id: 'status' },
                     { accessor: (item) => item.target, cell: (item) => item.target, header: t('目标'), id: 'target' },
                     { accessor: (item) => item.time, cell: (item) => dateTime(item.time), header: t('时间'), id: 'time' },
                   ]}
@@ -447,7 +451,7 @@ export function AiOperationsWorkspace({
                     { accessor: (item) => item.totalTasks, cell: (item) => item.totalTasks, header: t('任务'), id: 'tasks' },
                     {
                       accessor: (item) => item.totalTokens,
-                      cell: (item) => <><strong>{compactNumber(item.totalTokens)}</strong><br /><small>输入 {compactNumber(item.inputTokens)} · 输出 {compactNumber(item.outputTokens)}</small></>,
+                      cell: (item) => <><strong>{compactNumber(item.totalTokens)}</strong><br /><small>{t('输入 {input} · 输出 {output}', { input: compactNumber(item.inputTokens), output: compactNumber(item.outputTokens) })}</small></>,
                       header: t('Token 用量'),
                       id: 'tokens',
                     },

@@ -499,7 +499,7 @@
   }
 }
 
-@container settings-pane (max-width: 480px) {
+@container settings-extra-parameters (max-width: 440px) {
   .settings-extra-parameter-input-row {
     grid-template-columns: minmax(0, 1fr) 38px;
   }
@@ -518,11 +518,12 @@
 
 /* Cohesive settings information architecture and visual system. */
 .settings-workspace-route {
-  --settings-page-bg: #f5f7fa;
-  --settings-surface: #ffffff;
-  --settings-surface-subtle: #f8fafc;
-  --settings-border: #e1e6ed;
-  --settings-border-strong: #cfd7e3;
+  --settings-page-bg: var(--panel);
+  --settings-surface: var(--panel);
+  --settings-surface-subtle: var(--panel-soft);
+  --settings-border: var(--border);
+  --settings-border-strong: var(--border-strong);
+  --settings-selection-bg: var(--panel-warm);
   --settings-text: #172033;
   --settings-muted: #657085;
   --settings-accent-soft: color-mix(in srgb, var(--accent) 10%, #ffffff);
@@ -534,6 +535,7 @@
   --settings-surface-subtle: #101318;
   --settings-border: #272c34;
   --settings-border-strong: #343b46;
+  --settings-selection-bg: color-mix(in srgb, var(--foreground) 4%, var(--settings-page-bg));
   --settings-text: #f2f4f7;
   --settings-muted: #9ca5b4;
   --settings-accent-soft: color-mix(in srgb, var(--accent) 14%, #15181d);
@@ -1045,7 +1047,50 @@
   overflow-y: auto;
 }
 
-.settings-provider-list button {
+.settings-provider-row {
+  align-items: center;
+  border-radius: 9px;
+  display: flex;
+  min-width: 0;
+  position: relative;
+}
+
+.settings-provider-row.is-dragging {
+  background: var(--settings-page-bg);
+  box-shadow: 0 4px 14px #0002;
+  z-index: 1;
+}
+
+.settings-provider-drag-handle {
+  align-items: center;
+  align-self: stretch;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--settings-muted);
+  cursor: grab;
+  display: flex;
+  flex: 0 0 22px;
+  justify-content: center;
+  padding: 0;
+  touch-action: none;
+}
+
+.settings-provider-drag-handle:active,
+.settings-provider-row.is-dragging .settings-provider-drag-handle {
+  cursor: grabbing;
+}
+
+.settings-provider-drag-handle:hover {
+  color: var(--settings-text);
+}
+
+.settings-provider-drag-handle:focus-visible {
+  outline: 2px solid var(--settings-muted);
+  outline-offset: -2px;
+}
+
+.settings-provider-select {
   align-items: center;
   background: transparent;
   border: 1px solid transparent;
@@ -1053,36 +1098,38 @@
   color: var(--settings-text);
   cursor: pointer;
   display: grid;
+  flex: 1;
   gap: 9px;
   grid-template-columns: 28px minmax(0, 1fr) 8px;
   min-height: 48px;
-  padding: 6px 10px;
+  min-width: 0;
+  padding: 6px 10px 6px 0;
   text-align: left;
 }
 
-.settings-provider-list button:hover:not(.active) {
+.settings-provider-select:hover {
   background: transparent;
   color: var(--settings-text);
 }
 
-.settings-provider-list button.active {
-  background: color-mix(in srgb, var(--foreground) 4%, var(--settings-page-bg));
+.settings-provider-row.active {
+  background: var(--settings-selection-bg);
   border-color: transparent !important;
   box-shadow: none;
   color: var(--settings-text);
 }
 
-.settings-provider-list button.active:is(:focus, :focus-visible) {
+.settings-provider-row.active .settings-provider-select:focus:not(:focus-visible) {
   border-color: transparent !important;
   box-shadow: none !important;
   outline: none;
 }
 
-.settings-provider-list button.active::before {
+.settings-provider-select::before {
   content: none;
 }
 
-.settings-provider-list button.active > span:nth-child(2) strong {
+.settings-provider-row.active .settings-provider-select > span:nth-child(2) strong {
   color: var(--settings-text);
   font-weight: 600;
 }
@@ -1104,37 +1151,37 @@
   width: 16px;
 }
 
-.settings-provider-list button > span:nth-child(2) {
+.settings-provider-select > span:nth-child(2) {
   display: grid;
   gap: 2px;
   min-width: 0;
 }
 
-.settings-provider-list button strong,
-.settings-provider-list button small {
+.settings-provider-select strong,
+.settings-provider-select small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.settings-provider-list button strong {
+.settings-provider-select strong {
   font-size: 12.5px;
   font-weight: 600;
 }
 
-.settings-provider-list button small {
+.settings-provider-select small {
   color: var(--settings-muted);
   font-size: 10.5px;
 }
 
-.settings-provider-list button > i {
+.settings-provider-select > i {
   background: #7b8798;
   border-radius: 999px;
   height: 6px;
   width: 6px;
 }
 
-.settings-provider-list button > i.is-enabled {
+.settings-provider-select > i.is-enabled {
   background: #35a06f;
   box-shadow: 0 0 0 3px color-mix(in srgb, #35a06f 12%, transparent);
 }
@@ -1421,7 +1468,7 @@
     padding-bottom: 8px;
   }
 
-  .settings-provider-list button {
+  .settings-provider-row {
     flex: 0 0 190px;
   }
 

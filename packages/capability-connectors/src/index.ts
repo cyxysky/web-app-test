@@ -66,8 +66,14 @@ export function createConnectorsTool(registry: ConnectorRegistry, configuration:
         const operation = operations.find((candidate) => candidate.id === input.operationId);
         if (!operation) return { ok: false, error: { code: 'connector-operation-not-found', message: `Unknown operation ${input.operationId} on connector ${connector.id}.` } };
         const value = await connector.call(operation.id, input.arguments || {}, context);
+        if (value && typeof value === 'object' && 'isError' in value && value.isError === true) {
+          const result = value as { content?: Array<{ type?: string; text?: string }> };
+          return { ok: false, error: { code: 'connector-operation-failed', retryable: false,
+            message: (result.content || []).filter((item) => item.type === 'text').map((item) => item.text || '').join('\n') || 'MCP tool reported an error.',
+            details: boundedResult(value, 10_000) } };
+        }
         return { ok: true, summary: `Connector operation ${connector.id}/${operation.id} completed.`, data: boundedResult(value, normalizeBoundedInteger(configuration.AGENT_CONNECTOR_MAX_RESULT_CHARS, 50_000, 1_000, 500_000)) };
-      } catch (error) { return { ok: false, error: { code: 'connector-call-failed', message: error instanceof Error ? error.message : String(error), retryable: true } }; }
+      } catch (error) { return { ok: false, error: { code: 'connector-call-failed', message: error instanceof Error ? error.message : String(error), retryable: Boolean(error && typeof error === 'object' && 'retryable' in error && error.retryable) } }; }
     },
   });
 }

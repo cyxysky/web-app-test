@@ -1,3 +1,7 @@
+import { disposeOnce } from './execution.js';
+export { CapabilityTaskQueue, type CapabilityTaskOptions } from './task-queue.js';
+export { readBoundedResponseText } from './http.js';
+export { createCapabilityExecutor, disposeOnce, type CapabilityExecutionPolicyOptions } from './execution.js';
 export type JsonSchema = Readonly<Record<string, unknown>>;
 
 export type CapabilityInputSchema<TInput> = {
@@ -7,7 +11,7 @@ export type CapabilityInputSchema<TInput> = {
 
 export type CapabilityContent =
   | { type: 'text'; text: string }
-  | { type: 'image'; artifactId: string; mediaType?: string }
+  | { type: 'image'; artifactId: string; mediaType?: string; data?: string }
   | { type: 'artifact'; artifactId: string; downloadUrl?: string; mediaType?: string }
   | { type: 'ui'; renderer: string; resourceId: string };
 
@@ -163,7 +167,7 @@ export function createCapabilityRuntime<TTools extends CapabilityToolSet>(input:
   return {
     tools: input.tools,
     health: input.health || (() => Promise.resolve({ status: 'healthy' })),
-    dispose: input.dispose || (() => Promise.resolve()),
+    dispose: disposeOnce(input.dispose || (() => Promise.resolve())),
   };
 }
 
@@ -176,6 +180,7 @@ export type ResolvedCapabilityTool = {
 };
 
 export type CapabilityRunSnapshot = {
+  abortSignal?: AbortSignal;
   manifests: readonly CapabilityManifest[];
   skills: readonly CapabilitySkill[];
   tools: Readonly<Record<string, ResolvedCapabilityTool>>;
@@ -202,18 +207,37 @@ export class CapabilityRegistry {
     configurations?: Readonly<Record<string, CapabilityConfiguration>>;
     enabledCapabilityIds?: ReadonlySet<string>;
     allowedToolNames?: ReadonlySet<string>;
+    onDisposeError?: (error: AggregateError) => void;
   }): Promise<CapabilityRunSnapshot> {
     const runtimes: CapabilityRuntime[] = [];
     const manifests: CapabilityManifest[] = [];
     const skills: CapabilitySkill[] = [];
     const skillOwners = new Map<string, string>();
     const tools: Record<string, ResolvedCapabilityTool> = {};
+    const activeInvocations = new Set<Promise<unknown>>();
+    const lifetime = new AbortController();
+    const abortSignal = input.context.abortSignal ? AbortSignal.any([input.context.abortSignal, lifetime.signal]) : lifetime.signal;
+    const dispose = disposeOnce(async () => {
+      lifetime.abort(new Error('Capability run disposed.'));
+      await Promise.allSettled([...activeInvocations]);
+      const errors: unknown[] = [];
+      // Providers may depend on resources mounted before them.
+      for (const runtime of [...runtimes].reverse()) {
+        try { await runtime.dispose(); } catch (error) { errors.push(error); }
+      }
+      if (errors.length) {
+        const error = new AggregateError(errors, 'Capability resource cleanup failed.');
+        if (input.onDisposeError) input.onDisposeError(error);
+        else throw error;
+      }
+    });
     try {
       for (const provider of this.#providers.values()) {
         const manifest = provider.manifest;
         if (input.enabledCapabilityIds && !input.enabledCapabilityIds.has(manifest.id)) continue;
         const runtime = await provider.createRuntime({
           ...input.context,
+          abortSignal,
           configuration: input.configurations?.[manifest.id] || input.context.configuration || {},
         });
         runtimes.push(runtime);
@@ -236,20 +260,33 @@ export class CapabilityRegistry {
             capabilityVersion: manifest.version,
             internalId: `${manifest.id}:${registeredName}`,
             publicName,
-            tool,
+            tool: Object.freeze({
+              ...tool,
+              execute(value: unknown, context: CapabilityExecutionContext) {
+                const signal = context.abortSignal ? AbortSignal.any([abortSignal, context.abortSignal]) : abortSignal;
+                const invocation = Promise.resolve().then(() => {
+                  signal.throwIfAborted();
+                  return tool.execute(value, { ...context, abortSignal: signal });
+                });
+                activeInvocations.add(invocation);
+                void invocation.then(() => activeInvocations.delete(invocation), () => activeInvocations.delete(invocation));
+                return invocation;
+              },
+            }),
           });
         }
       }
       return Object.freeze({
+        abortSignal,
         manifests: Object.freeze(manifests),
         skills: Object.freeze(skills),
         tools: Object.freeze(tools),
-        dispose: async () => {
-          await Promise.allSettled([...runtimes].reverse().map((runtime) => runtime.dispose()));
-        },
+        dispose,
       });
     } catch (error) {
-      await Promise.allSettled([...runtimes].reverse().map((runtime) => runtime.dispose()));
+      try { await dispose(); } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], 'Capability mounting and cleanup failed.', { cause: error });
+      }
       throw error;
     }
   }

@@ -96,10 +96,10 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
   const usedMemoryIds = context.usedMemoryIds || new Set<string>();
   const currentUrl = () => context.getCurrentUrl?.() || context.currentUrl || '';
   const currentDomain = () => normalizePersonalMemoryDomain(currentUrl());
-  const markUsedOnce = (ids: string[]) => {
+  const markUsedOnce = async (ids: string[]) => {
     const unusedIds = Array.from(new Set(ids.filter((id) => id && !usedMemoryIds.has(id))));
     if (!unusedIds.length) return;
-    markPersonalMemoryItemsUsed(unusedIds);
+    await markPersonalMemoryItemsUsed(unusedIds);
     unusedIds.forEach((id) => usedMemoryIds.add(id));
   };
 
@@ -158,7 +158,7 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
             domain: currentDomain(),
             limit,
           });
-          markUsedOnce(results.map((result) => result.item.id));
+          await markUsedOnce(results.map((result) => result.item.id));
           return {
             items: results.map((result) => ({
               ...toolMemoryItem(result.item),
@@ -197,7 +197,9 @@ export function createPersonalMemoryTools(context: PersonalMemoryToolContext): T
           if (!existing || (existing.userId !== userId && existing.shared)) {
             throw new Error('Personal memory was not found or is not editable by the current user.');
           }
-          const item = await updatePersonalMemoryItem(id, patch, userId);
+          const item = await updatePersonalMemoryItem(id, { ...patch, evidence }, userId, {
+            sourceSessionId: context.sourceSessionId, sourceMessageIds: context.sourceMessageIds, sourceUrl: currentUrl(),
+          });
           if (!item) throw new Error('Personal memory was not found.');
           return { item: toolMemoryItem(item) };
         }

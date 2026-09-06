@@ -5,7 +5,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const root = path.resolve(__dirname, '..');
-const distributionRoot = path.join(root, 'dist-server', 'WebPilot-Server');
+const distributionRoot = path.join(root, 'dist-server', 'Orbit-Server');
 const installerWorkRoot = path.join(root, 'dist-server', '.server-installer');
 const installerOutputRoot = path.join(root, 'dist-server');
 const winSwVersion = '2.12.0';
@@ -72,8 +72,8 @@ function createServiceXml() {
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<service>',
     '  <id>WebPilotServer</id>',
-    '  <name>WebPilot Server</name>',
-    '  <description>WebPilot HTTP and WebSocket backend service.</description>',
+    '  <name>Orbit Server</name>',
+    '  <description>Orbit HTTP and WebSocket backend service.</description>',
     '  <executable>%BASE%\\node.exe</executable>',
     '  <arguments>webpilot-server.js</arguments>',
     '  <workingdirectory>%BASE%\\server</workingdirectory>',
@@ -106,20 +106,20 @@ function createNsisScript({ iconPath, licensePath, nodePath, outputPath, package
     'Unicode true',
     'RequestExecutionLevel admin',
     'SetCompressor /SOLID lzma',
-    `Name "WebPilot Server ${nsisEscape(version)}"`,
-    'BrandingText "WebPilot Server"',
+    `Name "Orbit Server ${nsisEscape(version)}"`,
+    'BrandingText "Orbit Server"',
     `OutFile "${escaped.outputPath}"`,
-    'InstallDir "$PROGRAMFILES64\\WebPilot Server"',
+    'InstallDir "$PROGRAMFILES64\\Orbit Server"',
     'InstallDirRegKey HKLM "Software\\WebPilot\\Server" "InstallLocation"',
     `Icon "${escaped.iconPath}"`,
     `UninstallIcon "${escaped.iconPath}"`,
     `VIProductVersion "${windowsVersion(version)}"`,
-    'VIAddVersionKey "ProductName" "WebPilot Server"',
+    'VIAddVersionKey "ProductName" "Orbit Server"',
     `VIAddVersionKey "ProductVersion" "${nsisEscape(version)}"`,
     `VIAddVersionKey "FileVersion" "${nsisEscape(version)}"`,
-    'VIAddVersionKey "CompanyName" "WebPilot"',
-    'VIAddVersionKey "FileDescription" "WebPilot Server Installer"',
-    'VIAddVersionKey "LegalCopyright" "Copyright WebPilot"',
+    'VIAddVersionKey "CompanyName" "Orbit"',
+    'VIAddVersionKey "FileDescription" "Orbit Server Installer"',
+    'VIAddVersionKey "LegalCopyright" "Copyright Orbit"',
     '',
     '!include "MUI2.nsh"',
     '!include "x64.nsh"',
@@ -131,7 +131,7 @@ function createNsisScript({ iconPath, licensePath, nodePath, outputPath, package
     '!insertmacro MUI_PAGE_INSTFILES',
     '!define MUI_FINISHPAGE_RUN "$WINDIR\\explorer.exe"',
     '!define MUI_FINISHPAGE_RUN_PARAMETERS "http://127.0.0.1:3000"',
-    '!define MUI_FINISHPAGE_RUN_TEXT "Open WebPilot Server"',
+    '!define MUI_FINISHPAGE_RUN_TEXT "Open Orbit Server"',
     '!insertmacro MUI_PAGE_FINISH',
     '!insertmacro MUI_UNPAGE_CONFIRM',
     '!insertmacro MUI_UNPAGE_INSTFILES',
@@ -139,14 +139,14 @@ function createNsisScript({ iconPath, licensePath, nodePath, outputPath, package
     '',
     'Function .onInit',
     '  ${IfNot} ${RunningX64}',
-    '    MessageBox MB_ICONSTOP "WebPilot Server requires 64-bit Windows."',
+    '    MessageBox MB_ICONSTOP "Orbit Server requires 64-bit Windows."',
     '    Abort',
     '  ${EndIf}',
     '  SetRegView 64',
     '  SetShellVarContext all',
     'FunctionEnd',
     '',
-    'Section "WebPilot Server" SEC_SERVER',
+    'Section "Orbit Server" SEC_SERVER',
     '  SetOutPath "$INSTDIR"',
     '  IfFileExists "$INSTDIR\\WebPilotService.exe" 0 service_stopped',
     '    ExecWait \'"$INSTDIR\\WebPilotService.exe" stop\' $0',
@@ -164,29 +164,34 @@ function createNsisScript({ iconPath, licensePath, nodePath, outputPath, package
     `  File /oname=WinSW-LICENSE.txt "${escaped.licensePath}"`,
     '  WriteUninstaller "$INSTDIR\\Uninstall.exe"',
     '  WriteRegStr HKLM "Software\\WebPilot\\Server" "InstallLocation" "$INSTDIR"',
-    '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "DisplayName" "WebPilot Server"',
+    '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "DisplayName" "Orbit Server"',
     '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "DisplayVersion" "' + nsisEscape(version) + '"',
-    '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "Publisher" "WebPilot"',
+    '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "Publisher" "Orbit"',
     '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "InstallLocation" "$INSTDIR"',
     '  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "UninstallString" \'"$INSTDIR\\Uninstall.exe"\'',
     '  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "NoModify" 1',
     '  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer" "NoRepair" 1',
-    '  CreateDirectory "$SMPROGRAMS\\WebPilot Server"',
-    '  CreateShortCut "$SMPROGRAMS\\WebPilot Server\\Open WebPilot Server.lnk" "$WINDIR\\explorer.exe" "http://127.0.0.1:3000"',
-    '  CreateShortCut "$SMPROGRAMS\\WebPilot Server\\Windows Services.lnk" "$SYSDIR\\mmc.exe" "services.msc"',
-    '  CreateShortCut "$SMPROGRAMS\\WebPilot Server\\Uninstall.lnk" "$INSTDIR\\Uninstall.exe"',
+    '  Delete "$SMPROGRAMS\\WebPilot Server\\Open WebPilot Server.lnk"',
+    '  Delete "$SMPROGRAMS\\WebPilot Server\\Windows Services.lnk"',
+    '  Delete "$SMPROGRAMS\\WebPilot Server\\Uninstall.lnk"',
+    '  RMDir "$SMPROGRAMS\\WebPilot Server"',
+    '  CreateDirectory "$SMPROGRAMS\\Orbit Server"',
+    '  CreateShortCut "$SMPROGRAMS\\Orbit Server\\Open Orbit Server.lnk" "$WINDIR\\explorer.exe" "http://127.0.0.1:3000"',
+    '  CreateShortCut "$SMPROGRAMS\\Orbit Server\\Windows Services.lnk" "$SYSDIR\\mmc.exe" "services.msc"',
+    '  CreateShortCut "$SMPROGRAMS\\Orbit Server\\Uninstall.lnk" "$INSTDIR\\Uninstall.exe"',
+    '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall delete rule name="Orbit Server (TCP 3000)"\' $0',
     '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall delete rule name="WebPilot Server (TCP 3000)"\' $0',
-    '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall add rule name="WebPilot Server (TCP 3000)" dir=in action=allow protocol=TCP localport=3000 profile=domain,private\' $0',
+    '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall add rule name="Orbit Server (TCP 3000)" dir=in action=allow protocol=TCP localport=3000 profile=domain,private\' $0',
     '  ExecWait \'"$INSTDIR\\WebPilotService.exe" install\' $0',
     '  IntCmp $0 0 service_installed service_install_failed service_install_failed',
     '  service_install_failed:',
-    '    MessageBox MB_ICONSTOP "The WebPilot Server Windows service could not be installed (exit code $0)."',
+    '    MessageBox MB_ICONSTOP "The Orbit Server Windows service could not be installed (exit code $0)."',
     '    Abort',
     '  service_installed:',
     '  ExecWait \'"$INSTDIR\\WebPilotService.exe" start\' $0',
     '  IntCmp $0 0 service_started service_start_failed service_start_failed',
     '  service_start_failed:',
-    '    MessageBox MB_ICONEXCLAMATION "WebPilot Server was installed, but the service could not be started (exit code $0). Check $APPDATA\\WebPilot\\logs."',
+    '    MessageBox MB_ICONEXCLAMATION "Orbit Server was installed, but the service could not be started (exit code $0). Check $APPDATA\\WebPilot\\logs."',
     '  service_started:',
     'SectionEnd',
     '',
@@ -197,12 +202,12 @@ function createNsisScript({ iconPath, licensePath, nodePath, outputPath, package
     '    ExecWait \'"$INSTDIR\\WebPilotService.exe" stop\' $0',
     '    ExecWait \'"$INSTDIR\\WebPilotService.exe" uninstall\' $0',
     '  service_removed:',
-    '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall delete rule name="WebPilot Server (TCP 3000)"\' $0',
+    '  ExecWait \'"$SYSDIR\\netsh.exe" advfirewall firewall delete rule name="Orbit Server (TCP 3000)"\' $0',
     '  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WebPilotServer"',
     '  DeleteRegKey HKLM "Software\\WebPilot\\Server"',
-    '  RMDir /r "$SMPROGRAMS\\WebPilot Server"',
+    '  RMDir /r "$SMPROGRAMS\\Orbit Server"',
     '  RMDir /r "$INSTDIR"',
-    '  MessageBox MB_ICONINFORMATION "WebPilot Server was removed. Runtime data remains in $APPDATA\\WebPilot."',
+    '  MessageBox MB_ICONINFORMATION "Orbit Server was removed. Runtime data remains in $APPDATA\\WebPilot."',
     'SectionEnd',
     '',
   ].join('\r\n');
@@ -274,7 +279,7 @@ function run(command, args, options = {}) {
 
 async function main() {
   if (process.platform !== 'win32' || process.arch !== 'x64') {
-    throw new Error('The WebPilot Server installer can only be built on 64-bit Windows.');
+    throw new Error('The Orbit Server installer can only be built on 64-bit Windows.');
   }
   assertSupportedNodeVersion();
   assertServerPackage();
@@ -292,8 +297,8 @@ async function main() {
   fs.rmSync(installerWorkRoot, { recursive: true, force: true });
   fs.mkdirSync(installerWorkRoot, { recursive: true });
   const serviceConfigPath = path.join(installerWorkRoot, 'WebPilotService.xml');
-  const scriptPath = path.join(installerWorkRoot, 'WebPilot-Server.nsi');
-  const outputPath = path.join(installerOutputRoot, `WebPilot-Server-Setup-${version}-x64.exe`);
+  const scriptPath = path.join(installerWorkRoot, 'Orbit-Server.nsi');
+  const outputPath = path.join(installerOutputRoot, `Orbit-Server-Setup-${version}-x64.exe`);
   fs.writeFileSync(serviceConfigPath, createServiceXml(), 'utf8');
   fs.writeFileSync(scriptPath, createNsisScript({
     iconPath,
@@ -313,7 +318,7 @@ async function main() {
     env: { ...process.env, ...(makeNsis.env || {}) },
   });
   if (!fs.existsSync(outputPath)) throw new Error(`NSIS did not create the expected installer: ${outputPath}`);
-  console.log(`WebPilot Server installer created:\n  ${outputPath}`);
+  console.log(`Orbit Server installer created:\n  ${outputPath}`);
 }
 
 if (require.main === module) {

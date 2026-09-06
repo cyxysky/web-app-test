@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "WebPilot QA Session Tab Grouper",
+  "name": "Orbit Session Tab Grouper",
   "version": "1.0.0",
-  "description": "Groups WebPilot QA browser-session tabs in Chrome's native tab strip.",
+  "description": "Groups Orbit browser-session tabs in Chrome's native tab strip.",
+  "icons": {
+    "16": "icons/orbit-16.png",
+    "32": "icons/orbit-32.png",
+    "48": "icons/orbit-48.png",
+    "128": "icons/orbit-128.png"
+  },
   "permissions": ["tabs", "tabGroups", "storage"],
   "background": {
     "service_worker": "service-worker.js"

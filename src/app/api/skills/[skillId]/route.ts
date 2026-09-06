@@ -26,7 +26,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
 export async function PUT(request: NextRequest, context: RouteContext) {
   const { skillId } = await context.params;
   try {
-    const body = await parseJsonRequest(request, skillRequestSchema.omit({ id: true }), { maxBytes: 256 * 1024 });
+    const body = await parseJsonRequest(request, skillRequestSchema.omit({ id: true }), { maxBytes: 8 * 1024 * 1024 });
     const userId = requestUserId(request);
     return runIdempotentJson(request, {
       fingerprint: idempotencyFingerprint({ skillId, ...body }),

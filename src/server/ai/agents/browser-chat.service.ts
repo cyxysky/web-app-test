@@ -55,6 +55,9 @@ import {
   appendTerminalBrowserChatTurn,
   compactBrowserChatModelTranscript,
   normalizeBrowserChatModelContext,
+  browserChatActiveMessages,
+  browserChatTranscript,
+  archiveBrowserChatContextMessages,
   serializableBrowserChatModelMessages,
   type BrowserChatModelContext,
 } from '@/server/ai/agents/browser-chat-model-context';
@@ -97,18 +100,16 @@ import {
   type BrowserChatTurnState,
 } from '@/server/ai/agents/browser-chat-session-state';
 import { recoverOrphanedBrowserChatSession } from '@/server/ai/agents/browser-chat-session-recovery';
-import {
-  formatLoadedSkillsForPrompt,
-  formatSkillReferencesForUser,
-  formatSkillSummariesForPrompt,
-  runtimeSkills,
-} from '@/server/ai/agents/skill-context';
-import { expandMultilingualRetrievalQuery } from '@/server/ai/retrieval-query';
+import { formatSkillReferencesForUser } from '@/server/ai/agents/skill-context';
+import { createRuntimeKnowledgeResolver, type RuntimeKnowledgeState } from './runtime-knowledge-context';
+import { readRuntimeKnowledgeRevisions, readRuntimeSkillCatalog } from '@/server/storage/runtime-knowledge-store';
+import { retrievalQueryTexts } from '@/lib/fuzzy-retrieval';
+
 import { isBrowserChatDomObservationText, normalizeBrowserChatFinalReplyText } from '@/server/ai/agents/browser-chat-reply-text';
 import { officeDraftCatalogForPrompt } from '@webpilot/capability-file/node/workspace';
 import {
   extractPersonalMemoryFromTurn,
-  formatPersonalMemoryForPrompt,
+  formatPersonalMemoryForRuntime,
   markPersonalMemoryItemsUsed,
   normalizePersonalMemoryDomain,
   personalMemoryEnabled,
@@ -154,7 +155,7 @@ import {
 } from '@/server/storage/database-record-store';
 import {
   BROWSER_CHAT_MESSAGE_PAGE_SIZE,
-  readAllBrowserChatMessages,
+  readBrowserChatFileMessages,
   readBrowserChatSessionHeader,
   readBrowserChatSessionOwner,
   readBrowserChatSessionWindow,
@@ -541,8 +542,8 @@ function browserChatMemoryDiagnostics() {
     totals.outputCycles += session.outputCycles.length;
     totals.subagents += session.subagents.length;
     totals.queuedTurns += session.queuedTurns.length;
-    totals.modelTranscriptMessages += session.modelContext.transcript.length;
-    totals.activeModelMessages += session.modelContext.activeMessages.length;
+    totals.modelTranscriptMessages += browserChatTranscript(session.modelContext).length;
+    totals.activeModelMessages += browserChatActiveMessages(session.modelContext).length;
     estimateBrowserChatRetainedValue(session.messages, estimate);
     estimateBrowserChatRetainedValue(session.steps, estimate);
     estimateBrowserChatRetainedValue(session.logs, estimate);
@@ -997,53 +998,6 @@ function browserChatMemoryUrl(browser: BrowserSession | undefined, session: Pick
   return currentUrl || session.targetUrl || '';
 }
 
-async function browserChatPersonalMemoryContext(input: {
-  session: BrowserChatSessionRecord;
-  browser: BrowserSession;
-  text: string;
-  modelText: string;
-  currentUrl?: string;
-  domainOnly?: boolean;
-  excludedIds?: ReadonlySet<string>;
-  logPhase?: string;
-  retrievalQueries?: string[];
-}) {
-  const currentUrl = input.currentUrl || browserChatMemoryUrl(input.browser, input.session);
-  const currentDomain = normalizePersonalMemoryDomain(currentUrl || input.session.targetUrl);
-  if (!personalMemoryEnabled()) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  const results = (await searchPersonalMemory({
-    userId: input.session.userId,
-    query: input.retrievalQueries?.length
-      ? input.retrievalQueries
-      : [input.text, input.modelText, input.session.title].filter(Boolean).join('\n'),
-    domain: currentUrl || input.session.targetUrl,
-  })).filter((result) => (
-    (!input.domainOnly || result.item.scope === 'domain')
-    && !input.excludedIds?.has(result.item.id)
-  ));
-  if (!results.length) return { context: '', itemIds: [] as string[], domain: currentDomain };
-  appendLog(input.session, input.logPhase || 'memory:prompt', `已注入 ${results.length} 条个性化短记忆。`, {
-    details: {
-      currentDomain,
-      items: results.map((result) => ({
-        id: result.item.id,
-        scope: result.item.scope,
-        domain: result.item.domain,
-        type: result.item.type,
-        key: result.item.key,
-        score: result.score,
-        reasons: result.reasons,
-      })),
-    },
-    deferPersist: true,
-  });
-  return {
-    context: formatPersonalMemoryForPrompt(results),
-    itemIds: results.map((result) => result.item.id),
-    domain: currentDomain,
-  };
-}
-
 function personalMemoryExtractionConcurrency() {
   const value = Number(process.env.AI_PERSONAL_MEMORY_EXTRACTION_CONCURRENCY || 2);
   return Number.isFinite(value) ? Math.max(1, Math.min(8, Math.floor(value))) : 2;
@@ -1100,6 +1054,7 @@ function queuePersonalMemoryExtraction(input: {
     .filter((message) => message.role === 'user' || message.role === 'assistant')
     .slice(-24)
     .map((message) => ({
+      id: message.id,
       role: message.role,
       content: compactText(message.content, 4_000),
     }));
@@ -1394,7 +1349,7 @@ function normalizeBrowserUrl(url: string) {
 
 function isEmbeddedBrowserPlaceholderUrl(url: string) {
   return /^data:text\/html/i.test(url)
-    && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url);
+    && /data-webpilot-embedded-browser|(?:Orbit|WebPilot)(?:%20|\+)Embedded(?:%20|\+)Browser|(?:Orbit|WebPilot) embedded browser/i.test(url);
 }
 
 function isBlankBrowserUrl(url: string) {
@@ -1455,10 +1410,11 @@ function normalizeAttachments(value: unknown, userId?: unknown): BrowserChatAtta
 
 function normalizeSkillIds(value: unknown) {
   if (!Array.isArray(value)) return [];
-  return Array.from(new Set(value
+  const ids = Array.from(new Set(value
     .map((item) => typeof item === 'string' ? item.trim() : '')
-    .filter(Boolean)))
-    .slice(0, 8);
+    .filter(Boolean)));
+  if (ids.length > 200) throw new Error('A message can select at most 200 Skills.');
+  return ids;
 }
 
 function artifactAttachmentForSession(session: BrowserChatSessionRecord, artifactId: string): BrowserChatAttachment | undefined {
@@ -1484,6 +1440,7 @@ async function readFileForSession(
   session: BrowserChatSessionRecord,
   input: BrowserChatReadFileInput,
   historicalMessages: BrowserChatMessage[] = [],
+  abortSignal?: AbortSignal,
 ) {
   const attachment = input.attachmentId
     ? mergePersistedMessages(historicalMessages, session.messages)
@@ -1506,6 +1463,11 @@ async function readFileForSession(
     limit: input.limit,
     offset: input.offset,
     pages: input.pages,
+    sheet: input.sheet,
+    range: input.range,
+    contentPages: input.contentPages,
+    section: input.section,
+    abortSignal,
     previewRoot: artifactPath(session.id, 'attachment-previews'),
   });
   return isBrowserChatImageAttachment(attachment) && result.ok
@@ -1588,78 +1550,70 @@ async function createBrowserChatRuntimeOperationalContext(input: {
   text: string;
   modelText: string;
   explicitlySelectedSkills?: SkillRecord[];
+  explicitlySelectedSkillIds?: string[];
   usedMemoryIds?: Set<string>;
   historicalMessages?: BrowserChatMessage[];
+  branchId?: string;
 }) {
-  const loadedSkills = new Map<string, SkillRecord>();
   const credentialReferences = new Map<string, { passwordRef: string; usernameRef: string }>();
   const usedMemoryIds = input.usedMemoryIds || new Set<string>();
-  const explicitlySelectedSkillIds = new Set((input.explicitlySelectedSkills || []).map((skill) => skill.id));
-  const query = [input.text, input.modelText, input.session.title].filter(Boolean).join('\n');
-  const retrievalQueries = await expandMultilingualRetrievalQuery(query);
-  let availableSkillIds = new Set<string>();
+  const query = retrievalQueryTexts(input.text || input.modelText || input.session.title);
+  const scopeId = input.branchId ? input.session.id + ':' + input.branchId : input.session.id;
+  const getState = () => input.branchId
+    ? input.session.modelContext.branches?.[input.branchId]?.knowledge : input.session.modelContext.knowledge;
+  const saveState = async (knowledge: RuntimeKnowledgeState) => {
+    if (input.branchId) {
+      const previous = input.session.modelContext.branches?.[input.branchId];
+      input.session.modelContext = { ...input.session.modelContext, branches: {
+        ...input.session.modelContext.branches, [input.branchId]: {
+          recordIds: [], active: [], history: [], ...previous, knowledge,
+        },
+      } };
+    } else input.session.modelContext = { ...input.session.modelContext, knowledge };
+    if (!(await persistBrowserChatCheckpoint(input.session.id))) throw new Error('Failed to persist active Skill versions.');
+  };
+  const resolver = createRuntimeKnowledgeResolver({
+    scopeId, query, selectedSkillIds: input.explicitlySelectedSkillIds || (input.explicitlySelectedSkills || []).map((skill) => skill.id),
+    getState, saveState,
+    revisions: (domain) => readRuntimeKnowledgeRevisions(normalizeUserId(input.session.userId), domain),
+    listSkills: () => readRuntimeSkillCatalog(normalizeUserId(input.session.userId)),
+    getSkill: (id) => store.getSkill(id, input.session.userId),
+    searchMemory: (domain) => searchPersonalMemory({ userId: input.session.userId, query, domain }),
+    formatMemory: formatPersonalMemoryForRuntime,
+  });
+  let lastMemorySelection = '';
   const getContext = async () => {
-    const currentUrl = browserChatMemoryUrl(input.browser, input.session);
-    const allSkills = (await store.listSkills(undefined, input.session.userId)).filter((skill) => skill.status === 'ready');
-    const activeLoadedSkills = [...loadedSkills.values()];
-    const activeLoadedSkillIds = new Set(activeLoadedSkills.map((skill) => skill.id));
-    const explicitlySelectedSkills = allSkills.filter((skill) => explicitlySelectedSkillIds.has(skill.id));
-    const skills = runtimeSkills(
-      allSkills,
-      explicitlySelectedSkills,
-      activeLoadedSkillIds,
-      retrievalQueries,
-    );
-    availableSkillIds = new Set(skills.map((skill) => skill.id));
-    const memory = await browserChatPersonalMemoryContext({
-      session: input.session,
-      browser: input.browser,
-      text: input.text,
-      modelText: input.modelText,
-      currentUrl,
-      logPhase: 'memory:prompt:runtime-refresh',
-      retrievalQueries,
-    });
-    const unusedMemoryIds = memory.itemIds.filter((memoryId) => !usedMemoryIds.has(memoryId));
-    if (unusedMemoryIds.length) {
-      await markPersonalMemoryItemsUsed(unusedMemoryIds);
-      unusedMemoryIds.forEach((memoryId) => usedMemoryIds.add(memoryId));
-    }
-    const credentials = await browserChatCredentialContext(
-      input.session,
-      credentialReferences,
-    );
+    const domain = normalizePersonalMemoryDomain(browserChatMemoryUrl(input.browser, input.session));
+    const knowledge = await resolver.refresh(domain, JSON.stringify([
+      personalMemoryEnabled(), process.env.AI_PERSONAL_MEMORY_PROMPT_LIMIT,
+    ]));
+    const credentials = await browserChatCredentialContext(input.session, credentialReferences);
     const officeDraftCatalog = await officeDraftCatalogForPrompt(input.session.id);
     return {
-      operationalContext: [
-        formatLoadedSkillsForPrompt(activeLoadedSkills),
-        formatSkillSummariesForPrompt(skills),
-        memory.context,
-        conversationFileRegistry(input.session, input.historicalMessages),
-        officeDraftCatalog,
-        browserChatCredentialPrompt(credentials.credentials),
-      ].filter(Boolean).join('\n\n'),
+      operationalContext: [conversationFileRegistry(input.session, input.historicalMessages), officeDraftCatalog,
+        browserChatCredentialPrompt(credentials.credentials)].filter(Boolean).join('\n\n'),
+      knowledge,
       credentialBindings: credentials.bindings,
+      onKnowledgeSelected: async (entries: NonNullable<import('./runtime-context-assembler').RuntimeContextManifest['knowledge']>) => {
+        await resolver.markSelected(entries);
+        const selected = entries.filter((entry) => entry.kind === 'memory' && entry.selected);
+        const unused = selected.map((entry) => entry.id).filter((id) => !usedMemoryIds.has(id));
+        if (unused.length) {
+          await markPersonalMemoryItemsUsed(unused);
+          unused.forEach((id) => usedMemoryIds.add(id));
+        }
+        const signature = JSON.stringify(selected.map((entry) => [entry.id, entry.digest]));
+        if (signature !== lastMemorySelection) {
+          lastMemorySelection = signature;
+          appendLog(input.session, 'memory:prompt', 'Memory selection finalized for model input.', {
+            details: { domain, branchId: input.branchId, selectedCount: selected.length,
+              items: entries.filter((entry) => entry.kind === 'memory') }, deferPersist: true,
+          });
+        }
+      },
     };
   };
-  return Object.assign(getContext, {
-    readSkill: async (skillId: string): Promise<BrowserActionResult> => {
-      const normalizedSkillId = skillId.trim();
-      const skill = await store.getSkill(normalizedSkillId, input.session.userId);
-      if (!availableSkillIds.has(normalizedSkillId) || !skill || skill.status !== 'ready') {
-        return { ok: false, actual: 'Skill is not available in the current runtime candidate list.' };
-      }
-      if (loadedSkills.has(skill.id)) {
-        return { ok: false, actual: 'Skill is already loaded in the current runtime context.' };
-      }
-      loadedSkills.set(skill.id, skill);
-      availableSkillIds.delete(skill.id);
-      return {
-        ok: true,
-        actual: `Skill loaded into the current runtime context: ${skill.id}.`,
-      };
-    },
-  });
+  return Object.assign(getContext, { readSkill: resolver.readSkill });
 }
 
 function attachmentKindLabel(attachment: BrowserChatAttachment) {
@@ -1879,6 +1833,8 @@ function compactHistoricalAiRequest(
     'imageCount',
     'modelContextSegmentation',
     'modelContextStats',
+    'contextManifest',
+    'contextProfile',
   ];
   if (
     aiRequest.systemPrompt === undefined
@@ -2008,8 +1964,8 @@ function browserChatContextUsage(session: BrowserChatSessionRecord): BrowserChat
       toolTokens: Number.isFinite(toolTokens) && toolTokens > 0 ? Math.round(toolTokens) : 0,
     };
   }
-  const activeMessages = session.modelContext.activeMessages.length
-    ? session.modelContext.activeMessages
+  const activeMessages = browserChatActiveMessages(session.modelContext).length
+    ? browserChatActiveMessages(session.modelContext)
     : session.messages.map((message) => ({
         role: message.role,
         content: message.content,
@@ -2041,7 +1997,7 @@ function browserChatContextUsageFromDebugDetails(
 }
 
 function refreshBrowserChatTerminalContextUsage(session: BrowserChatSessionRecord) {
-  const estimated = estimateRuntimeMessageContext(session.modelContext.activeMessages);
+  const estimated = estimateRuntimeMessageContext(browserChatActiveMessages(session.modelContext));
   const toolTokens = Math.max(0, browserChatContextUsage(session).toolTokens);
   session.contextUsage = {
     currentTokens: estimated.totalTokens + toolTokens,
@@ -2403,11 +2359,11 @@ function preserveInterruptedModelContext(
   if (!userMessage) return;
   session.modelContext = normalizeBrowserChatModelContext({
     ...session.modelContext,
-    version: 1,
+    version: 2,
     transcript: compactBrowserChatModelTranscript(
-      appendInterruptedBrowserChatTurn(session.modelContext.transcript, userMessage.content, assistantContent),
+      appendInterruptedBrowserChatTurn(browserChatTranscript(session.modelContext), userMessage.content, assistantContent),
     ),
-    activeMessages: appendInterruptedBrowserChatTurn(session.modelContext.activeMessages, userMessage.content, assistantContent),
+    activeMessages: appendInterruptedBrowserChatTurn(browserChatActiveMessages(session.modelContext), userMessage.content, assistantContent),
   });
 }
 
@@ -4039,7 +3995,7 @@ async function startNextQueuedBrowserChatTurn(session: BrowserChatSessionRecord)
     ...queuedUserMessage,
     parts: [{ type: 'text', text: queuedUserMessage.content }],
     status: undefined,
-    skillIds: selectedSkills.map((skill) => skill.id),
+    skillIds: queuedUserMessage.skillIds,
     updatedAt: timestamp,
   };
   session.messages[userMessageIndex] = userMessage;
@@ -4112,6 +4068,7 @@ export async function sendBrowserChatMessage(
   const attachments = normalizeAttachments(attachmentsInput, session.userId);
   const skillIds = normalizeSkillIds(skillIdsInput);
   const selectedSkills = (await store.getSkills(skillIds, session.userId)).filter((skill) => skill.status === 'ready');
+  if (selectedSkills.length !== skillIds.length) throw new ApiRequestError('选择的 Skill 已停用、已删除或无权访问，请重新选择。');
   if (!text && !attachments.length && !selectedSkills.length) throw new Error('Message is empty');
   const messageText = text || (selectedSkills.length ? '请结合已选择的 Skills 继续处理当前任务。' : '请结合我提供的引用继续处理当前任务。');
   const firstMessageTitleText = text || (attachments.length ? '' : messageText);
@@ -5222,6 +5179,50 @@ function browserChatSubagentAuthPrompt(authMode: BrowserChatSubagentBrowserAuthM
   return '当前没有正在运行的父级浏览器上下文；独立浏览器会复用当前用户的持久化浏览器配置。请先直接访问目标地址验证登录态，不要猜测页面内容。';
 }
 
+/** A branch shares durable storage with its owner, but receives only its own context records. */
+function browserChatBranchContextOptions(session: BrowserChatSessionRecord, branchId: string, ownsBranch: () => boolean) {
+  const branch = session.modelContext.branches?.[branchId];
+  let context = normalizeBrowserChatModelContext({
+    ...branch,
+    records: Object.fromEntries((branch?.recordIds || []).flatMap((id) => session.modelContext.records[id] ? [[id, session.modelContext.records[id]]] : [])),
+  });
+  const turnBase = browserChatTranscript(context);
+  const save = async () => {
+    if (!ownsBranch()) return;
+    session.modelContext = {
+      ...session.modelContext,
+      records: { ...session.modelContext.records, ...context.records },
+      branches: { ...session.modelContext.branches, [branchId]: {
+        knowledge: session.modelContext.branches?.[branchId]?.knowledge,
+        recordIds: Object.keys(context.records), active: context.active, history: context.history,
+        taskState: context.taskState, lastRequest: context.lastRequest, continuationSummary: context.continuationSummary,
+      } },
+    };
+    if (!(await persistBrowserChatCheckpoint(session.id))) throw new Error('Failed to persist subagent context checkpoint.');
+  };
+  const options: Pick<Parameters<typeof executeInteractiveBrowserTurn>[0],
+    'conversation' | 'contextRecords' | 'taskState' | 'continuationSummary' | 'onContextCheckpoint' | 'onActiveModelCheckpoint' | 'onModelMessages' | 'onContinuationSummary' | 'onContextCompression'> = {
+    conversation: browserChatActiveMessages(context), contextRecords: context.records, taskState: context.taskState,
+    continuationSummary: context.continuationSummary,
+    onContextCheckpoint: async ({ records, taskState, manifest }) => {
+      if (manifest) manifest.sessionId = session.id;
+      context = { ...context, records: { ...context.records, ...records }, taskState, lastRequest: manifest || context.lastRequest };
+      await save();
+    },
+    onActiveModelCheckpoint: async (messages) => {
+      context = normalizeBrowserChatModelContext({ ...context, activeMessages: messages });
+      await save();
+    },
+    onModelMessages: async ({ activeMessages, turnMessages }) => {
+      context = normalizeBrowserChatModelContext({ ...context, activeMessages, transcript: [...turnBase, ...turnMessages] });
+      await save();
+    },
+    onContinuationSummary: async (continuationSummary) => { context = { ...context, continuationSummary }; await save(); },
+    onContextCompression: async ({ contextCompression }) => { context = { ...context, continuationSummary: contextCompression.continuationSummary }; await save(); },
+  };
+  return options;
+}
+
 async function executeBrowserChatSubagentBatch(input: {
   session: BrowserChatSessionRecord;
   assistantMessageId: string;
@@ -5355,6 +5356,7 @@ async function executeBrowserChatSubagentBatch(input: {
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
         browser: activeChild,
+        branchId: task.id,
         text: task.instruction,
         modelText: task.instruction,
         usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
@@ -5385,7 +5387,7 @@ async function executeBrowserChatSubagentBatch(input: {
           task.instruction,
         ].filter(Boolean).join('\n\n'),
         operationalContext: initialRuntimeContext.operationalContext,
-        conversation: [],
+        ...browserChatBranchContextOptions(session, task.id, ownsTask),
         completedSteps: [],
         safetyMode: session.safetyMode,
         useToolLoopAgent: true,
@@ -5587,6 +5589,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
     () => createBrowserChatRuntimeOperationalContext({
       session,
       browser: binding.browser,
+      branchId: binding.id,
       text: binding.task.instruction,
       modelText: binding.task.instruction,
       usedMemoryIds: browserChatTurnUsedMemoryIds(session, assistantMessageId),
@@ -5624,7 +5627,7 @@ async function resumeBlockedBrowserChatSubagent(input: {
         binding.task.instruction,
       ].filter(Boolean).join('\n\n'),
       operationalContext: initialRuntimeContext.operationalContext,
-      conversation: [],
+      ...browserChatBranchContextOptions(session, binding.id, ownsTurn),
       completedSteps: binding.steps,
       safetyMode: session.safetyMode,
       useToolLoopAgent: true,
@@ -5811,7 +5814,7 @@ async function runBrowserChatMessage(
       // acquiring a shared child page; ordinary chat, file, and skill work does not.
       const browser = await browserForTurnDecision(session, assertTurnActive, { preferExistingPage: true });
       assertTurnActive();
-      const historicalMessages = await readAllBrowserChatMessages<BrowserChatMessage>(session.id);
+      const historicalMessages = await readBrowserChatFileMessages<BrowserChatMessage>(session.id);
       const usedMemoryIds = browserChatTurnUsedMemoryIds(session, assistantMessageId);
       const getRuntimeOperationalContext = await createBrowserChatRuntimeOperationalContext({
         session,
@@ -5819,6 +5822,7 @@ async function runBrowserChatMessage(
         text,
         modelText,
         explicitlySelectedSkills: skills,
+        explicitlySelectedSkillIds: session.messages.find((message) => message.id === userMessageId)?.skillIds,
         usedMemoryIds,
         historicalMessages,
       });
@@ -5829,9 +5833,9 @@ async function runBrowserChatMessage(
         .map((attachment) => uploadedBrowserChatAttachmentPath(attachment, session.userId))
         .filter((item): item is string => Boolean(item));
       const requestTurnToolConfirmation = session.safetyMode === 'strict'
-        ? createBrowserChatTurnToolConfirmation(session, assistantMessageId, abortController.signal)
+        ? createBrowserChatTurnToolConfirmation(session, assistantMessageId, abortController.signal, { serialize: true })
         : undefined;
-      const turnTranscriptBase = [...session.modelContext.transcript];
+      const turnTranscriptBase = [...browserChatTranscript(session.modelContext)];
       const result = await executeInteractiveBrowserTurn({
         session: browser,
         runId: session.id,
@@ -5841,7 +5845,16 @@ async function runBrowserChatMessage(
         instruction: text,
         modelInstruction: modelText,
         operationalContext: initialRuntimeContext.operationalContext,
-        conversation: session.modelContext.activeMessages,
+        conversation: browserChatActiveMessages(session.modelContext),
+        contextRecords: session.modelContext.records,
+        taskState: session.modelContext.taskState,
+        onContextCheckpoint: async ({ records, taskState, manifest }) => {
+          assertTurnActive();
+          if (manifest) manifest.sessionId = session.id;
+          session.modelContext = { ...session.modelContext, records: { ...session.modelContext.records, ...records }, taskState, lastRequest: manifest || session.modelContext.lastRequest };
+          if (!(await persistBrowserChatCheckpoint(session.id))) throw new Error('Failed to persist context records before model request.');
+          assertTurnActive();
+        },
         continuationSummary: session.modelContext.continuationSummary || session.modelContext.lastCompression?.continuationSummary,
         completedSteps: session.steps,
         safetyMode: session.safetyMode,
@@ -5849,12 +5862,9 @@ async function runBrowserChatMessage(
           userId: session.userId,
           getCurrentUrl: () => browserChatMemoryUrl(browser, session),
           sourceSessionId: session.id,
-          sourceMessageIds: [userMessageId, assistantMessageId],
+          sourceMessageIds: [userMessageId],
           usedMemoryIds,
-          userMessages: session.messages
-            .filter((message) => message.role === 'user')
-            .slice(-64)
-            .map((message) => compactText(message.content, 2_000)),
+          userMessages: [text],
         }),
         referenceImagePaths,
         credentialBindings: initialRuntimeContext.credentialBindings,
@@ -5871,7 +5881,7 @@ async function runBrowserChatMessage(
         },
         runSubagents: (tasks, _abortSignal, toolCallId) => runBrowserChatSubagents({ session, assistantMessageId, abortController, tasks, toolCallId }),
         readSubagent: readBrowserChatSubagent(session.id),
-        readFile: (input) => readFileForSession(session, input, historicalMessages),
+        readFile: (input, context) => readFileForSession(session, input, historicalMessages, context?.abortSignal),
         readFileVisuals: (input) => readFileVisualsForSession(session, input),
         attachmentBindings: browserCodeAttachmentBindingsForSession(session, historicalMessages),
         onTextStream: ({ agentStepIndex, blocks, runtimeStepIndex, text: streamedText }) => {
@@ -5912,19 +5922,19 @@ async function runBrowserChatMessage(
           scheduleBrowserChatTextStreamPublish(session.id, assistantMessageId);
           persistAndNotify(session.id, { defer: true, mergePersisted: false });
         },
-        onActiveModelCheckpoint: (activeMessages) => {
+        onActiveModelCheckpoint: async (activeMessages) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           session.modelContext = normalizeBrowserChatModelContext({
             ...session.modelContext,
             activeMessages: serializableBrowserChatModelMessages(activeMessages),
           });
-          persistAndNotify(session.id, { defer: true, mergePersisted: false });
+          if (!(await persistBrowserChatCheckpoint(session.id))) throw new Error('Failed to persist active context checkpoint.');
         },
         onModelMessages: ({ activeMessages, turnMessages }) => {
           if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
           session.modelContext = normalizeBrowserChatModelContext({
             ...session.modelContext,
-            version: 1,
+            version: 2,
             transcript: compactBrowserChatModelTranscript([
               ...turnTranscriptBase,
               ...serializableBrowserChatModelMessages(turnMessages),
@@ -5937,9 +5947,10 @@ async function runBrowserChatMessage(
           assertTurnActive();
           session.modelContext = normalizeBrowserChatModelContext({
             ...session.modelContext,
-            version: 1,
+            version: 2,
             activeMessages: serializableBrowserChatModelMessages(activeMessages),
             lastCompression: contextCompression,
+            continuationSummary: contextCompression.continuationSummary,
           });
           if (!(await persistBrowserChatCheckpoint(session.id))) {
             throw new Error('Failed to persist the browser-chat context compression checkpoint.');
@@ -6044,7 +6055,8 @@ async function runBrowserChatMessage(
       if (!isActiveBrowserChatTurn(session, assistantMessageId, abortController)) return;
       const turnMessages = serializableBrowserChatModelMessages(result.turnMessages);
       session.modelContext = normalizeBrowserChatModelContext({
-        version: 1,
+        ...session.modelContext,
+        version: 2,
         transcript: compactBrowserChatModelTranscript([
           ...turnTranscriptBase,
           ...turnMessages,
@@ -6169,8 +6181,8 @@ async function runBrowserChatMessage(
       if (!interrupted) {
         session.modelContext = normalizeBrowserChatModelContext({
           ...session.modelContext,
-          transcript: appendTerminalBrowserChatTurn(session.modelContext.transcript, modelText, terminalReply),
-          activeMessages: appendTerminalBrowserChatTurn(session.modelContext.activeMessages, modelText, terminalReply),
+          transcript: appendTerminalBrowserChatTurn(browserChatTranscript(session.modelContext), modelText, terminalReply),
+          activeMessages: appendTerminalBrowserChatTurn(browserChatActiveMessages(session.modelContext), modelText, terminalReply),
         });
       }
       refreshBrowserChatTerminalContextUsage(session);

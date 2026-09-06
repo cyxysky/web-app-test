@@ -10,11 +10,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
   try {
     requestApplicationUserId(request);
     const kind = (await context.params).kind;
-    const fileName = kind === 'docx' ? 'WebPilot-新手示例.docx' : kind === 'xlsx' ? 'WebPilot-新手示例.xlsx' : '';
+    const fileName = kind === 'docx' ? 'Orbit-新手示例.docx' : kind === 'xlsx' ? 'Orbit-新手示例.xlsx' : '';
     if (!fileName) return new NextResponse('Not found', { status: 404 });
     const generated = kind === 'docx'
       ? await generateFileBuffer({
-          blocks: [{ id: 'intro', type: 'text', markdown: '# WebPilot 文件演示\n\n这是一个安全的示例文档。请让 WebPilot 总结文档主题，并列出两条要点。' }],
+          blocks: [{ id: 'intro', type: 'text', markdown: '# Orbit 文件演示\n\n这是一个安全的示例文档。请让 Orbit 总结文档主题，并列出两条要点。' }],
           document: {},
           documentType: 'word',
           fileName,

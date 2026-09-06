@@ -173,6 +173,10 @@ export function classifyRuntimeRetry(error: unknown, signal?: AbortSignal): Runt
   const privateToolProtocolFailure = records.some((record) => record.privateToolProtocolRetryable === false)
     || name === 'AI_PrivateToolProtocolError';
 
+  if (name === 'RuntimeContextBudgetError') {
+    return { category: 'configuration', reason: message, retryable: false };
+  }
+
   if (signal?.aborted || name === 'AbortError' || /\b(aborted|cancelled|canceled)\b/.test(normalizedMessage)) {
     return { category: 'aborted', reason: 'request was aborted', retryable: false, statusCode };
   }

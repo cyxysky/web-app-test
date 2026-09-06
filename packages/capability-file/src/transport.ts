@@ -74,6 +74,8 @@ export function normalizeFileToolInput(value: unknown) {
   }
   if ('pages' in input) input.pages = arrayFromJsonString(input.pages);
   if (Array.isArray(input.pages)) input.pages = input.pages.map(numberFromString);
+  if ('contentPages' in input) input.contentPages = arrayFromJsonString(input.contentPages);
+  if (Array.isArray(input.contentPages)) input.contentPages = input.contentPages.map(numberFromString);
   if ('screenshotIds' in input) input.screenshotIds = arrayFromJsonString(input.screenshotIds);
   if ('reviews' in input) input.reviews = arrayFromJsonString(input.reviews);
   if ('replacements' in input) input.replacements = arrayFromJsonString(input.replacements);

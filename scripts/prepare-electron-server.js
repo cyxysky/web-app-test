@@ -43,7 +43,7 @@ if (
   || !fs.existsSync(path.join(serverOutput, 'realtime-refresh-hub.js'))
   || !fs.existsSync(path.join(serverOutput, 'node_modules', 'next', 'package.json'))
 ) {
-  throw new Error('The complete production runtime required by the WebPilot custom server was not found. Run npm run build before packaging.');
+  throw new Error('The complete production runtime required by the Orbit custom server was not found. Run npm run build before packaging.');
 }
 assertSensitiveDataRuntime(path.join(serverOutput, 'sensitive-data-runtime'));
 

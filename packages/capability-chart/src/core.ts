@@ -1,3 +1,6 @@
+import { normalizeThreeChartOption } from './three-core.js';
+export * from './three-core.js';
+
 export type EChartsMapRegistration = {
   geoJson: Record<string, unknown> | string;
   name: string;
@@ -13,10 +16,13 @@ export type ChartRecord = {
   option: Record<string, unknown>;
   renderer: 'canvas' | 'svg';
   title?: string;
-  version: 2;
+  version: 2 | 3;
+  engine?: 'echarts' | 'three';
+  revision?: number;
+  updatedAt?: string;
 };
 
-export type CreateChartRecordInput = Omit<ChartRecord, 'chartId' | 'createdAt'>;
+export type CreateChartRecordInput = Omit<ChartRecord, 'chartId' | 'createdAt' | 'revision' | 'updatedAt'>;
 
 export type ChartOptionValidationInput = {
   height: number;
@@ -61,7 +67,33 @@ const linesCoordinateComponents = Object.freeze({
   polar: ['polar', 'radiusAxis', 'angleAxis'],
 } satisfies Record<string, readonly string[]>);
 
-export function normalizeChartOption(value: unknown) {
+function isFunctionSource(value: string) {
+  const source = value.replace(/^(?:\s|\/\*[\s\S]*?\*\/|\/\/[^\r\n]*(?:\r?\n|$))+/, '');
+  return /^(?:\(\s*)*(?:async\s+)?(?:function(?:\s*\*)?(?:\s+[$\w]+)?\s*\(|(?:[$A-Z_a-z][$\w]*|\([^)]*\))\s*=>|(?:new\s+)?Function\s*\()/.test(source);
+}
+
+const formatterComponents = new Set(['tooltip', 'label', 'axisLabel', 'edgeLabel', 'upperLabel', 'endLabel', 'detail', 'legend', 'visualMap', 'dayLabel', 'monthLabel', 'yearLabel']);
+
+function checkChartFormatters(value: unknown, omit: boolean, path = 'option', component = '') {
+  if (!value || typeof value !== 'object') return;
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => checkChartFormatters(item, omit, `${path}[${index}]`, component));
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  for (const [key, entry] of Object.entries(record)) {
+    // Dataset columns are user data, even when a column is named "formatter".
+    if (component === 'dataset' && key === 'source') continue;
+    const entryPath = `${path}.${key}`;
+    if (formatterComponents.has(component) && (key === 'formatter' || key === 'valueFormatter')
+      && (typeof entry === 'function' || (typeof entry === 'string' && isFunctionSource(entry)))) {
+      if (!omit) throw new Error(`${entryPath} 不能使用 JavaScript 函数或函数字符串。请移除此字段以使用默认提示，或将 formatter 改为 ECharts 字符串模板（例如 "{b}: {c}"）；多系列提示可省略 formatter。`);
+      delete record[key];
+    } else checkChartFormatters(entry, omit, entryPath, ['normal', 'emphasis', 'blur', 'select'].includes(key) ? component : key);
+  }
+}
+
+export function normalizeChartOption(value: unknown, options: { invalidFormatters?: 'reject' | 'omit' } = {}) {
   const option = recordFromUnknown(value);
   if (!option) throw new Error('action=create requires option as an ECharts option object.');
   const series = option.series;
@@ -113,7 +145,12 @@ export function normalizeChartOption(value: unknown) {
       }
     }
   }
-  return serializableClone(option, 'option');
+  // Old artifacts may contain serialized callbacks. Omit those only when reading
+  // or rendering; new writes must surface an actionable error to the caller.
+  if (options.invalidFormatters !== 'omit') checkChartFormatters(option, false);
+  const normalized = serializableClone(option, 'option');
+  if (options.invalidFormatters === 'omit') checkChartFormatters(normalized, true);
+  return normalized;
 }
 
 export function normalizeChartMaps(value: unknown): EChartsMapRegistration[] | undefined {
@@ -141,7 +178,7 @@ export function echartsMapDefinition(map: EChartsMapRegistration) {
 
 export function parseChartRecord(value: unknown, expectedChartId?: string): ChartRecord {
   const record = recordFromUnknown(value);
-  if (!record || record.version !== 2 || typeof record.chartId !== 'string') {
+  if (!record || (record.version !== 2 && record.version !== 3) || typeof record.chartId !== 'string') {
     throw new Error('Chart artifact has an unsupported or invalid record format.');
   }
   if (expectedChartId && record.chartId !== expectedChartId) {
@@ -158,15 +195,34 @@ export function parseChartRecord(value: unknown, expectedChartId?: string): Char
   }
   if (record.title !== undefined && typeof record.title !== 'string') throw new Error('Chart artifact has an invalid title.');
   if (record.description !== undefined && typeof record.description !== 'string') throw new Error('Chart artifact has an invalid description.');
+  if (record.engine !== undefined && record.engine !== 'echarts' && record.engine !== 'three') throw new Error('Unknown chart engine.');
+  if (record.revision !== undefined && (typeof record.revision !== 'number' || !Number.isSafeInteger(record.revision) || record.revision < 0)) throw new Error('Invalid chart revision.');
   return {
     chartId: record.chartId,
     createdAt: record.createdAt,
     description: record.description,
     height: record.height,
     maps: normalizeChartMaps(record.maps),
-    option: normalizeChartOption(record.option),
+    option: record.engine === 'three' ? normalizeThreeChartOption(record.option) : normalizeChartOption(record.option, { invalidFormatters: 'omit' }),
     renderer: record.renderer,
     title: record.title,
-    version: 2,
+    version: record.version as 2 | 3,
+    engine: record.engine === 'three' ? 'three' : 'echarts',
+    revision: typeof record.revision === 'number' ? record.revision : 0,
+    updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : record.createdAt,
   };
+}
+
+export class ChartRevisionConflict extends Error {
+  constructor() { super('图表已在其他页面更新，请重新加载后再保存。'); this.name = 'ChartRevisionConflict'; }
+}
+
+export type ChartUpdateInput = Pick<ChartRecord, 'option'> & Partial<Pick<ChartRecord, 'title' | 'description' | 'height' | 'renderer' | 'maps' | 'engine'>>;
+
+export function normalizeChartUpdate(previous: ChartRecord, input: ChartUpdateInput): ChartRecord {
+  if ((input.engine ?? previous.engine) !== 'three') normalizeChartOption(input.option ?? previous.option);
+  const next = parseChartRecord({ ...previous, ...input, chartId: previous.chartId, createdAt: previous.createdAt,
+    version: 3, revision: (previous.revision || 0) + 1, updatedAt: new Date().toISOString() }, previous.chartId);
+  if (new TextEncoder().encode(JSON.stringify(next)).byteLength > maxChartBytes) throw new Error('Chart configuration must be no larger than 4 MB.');
+  return next;
 }

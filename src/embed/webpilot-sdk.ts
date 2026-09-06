@@ -1,4 +1,4 @@
-export const WEBPILOT_EMBED_SDK = String.raw`
+export const ORBIT_EMBED_SDK = String.raw`
 (function () {
   'use strict';
 
@@ -9,7 +9,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
   function scriptBaseUrl(script) {
     if (!script || !script.src) return window.location.origin;
     var url = new URL(script.src, window.location.href);
-    var suffix = '/embed/webpilot.js';
+    var suffix = url.pathname.endsWith('/embed/orbit.js') ? '/embed/orbit.js' : '/embed/webpilot.js';
     if (url.pathname.endsWith(suffix)) {
       url.pathname = url.pathname.slice(0, -suffix.length) || '/';
     } else {
@@ -46,6 +46,11 @@ export const WEBPILOT_EMBED_SDK = String.raw`
   }
 
   function dispatch(element, name, detail) {
+    element.dispatchEvent(new CustomEvent('orbit:' + name, {
+      bubbles: true,
+      composed: true,
+      detail: detail
+    }));
     element.dispatchEvent(new CustomEvent('webpilot:' + name, {
       bubbles: true,
       composed: true,
@@ -67,7 +72,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
   }
 
   function frameTitle(config) {
-    return config.title || 'WebPilot QA';
+    return config.title || 'Orbit';
   }
 
   class WebPilotBrowserChatElement extends HTMLElement {
@@ -137,7 +142,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
   function init(options) {
     options = Object.assign({ targetUrl: window.location.href }, options || {});
     if (!String(options.userId || '').trim()) {
-      return Promise.reject(new Error('WebPilot mount requires userId.'));
+      return Promise.reject(new Error('Orbit mount requires userId.'));
     }
     var apiBaseUrl = normalizeBaseUrl(options.apiBaseUrl);
     return fetch(joinUrl(apiBaseUrl, '/api/embed/browser-chat/init'), {
@@ -164,7 +169,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
       target = null;
     }
     var container = resolveTarget(target, options);
-    if (!container) return Promise.reject(new Error('WebPilot mount target was not found.'));
+    if (!container) return Promise.reject(new Error('Orbit mount target was not found.'));
     var ready = options && options.iframeUrl
       ? Promise.resolve(options)
       : init(Object.assign({}, options, { mountId: options.mountId || container.id || undefined }));
@@ -188,7 +193,7 @@ export const WEBPILOT_EMBED_SDK = String.raw`
     return true;
   }
 
-  var WebPilotQA = Object.assign(window.WebPilotQA || {}, {
+  var Orbit = Object.assign(window.Orbit || window.WebPilotQA || {}, {
     version: VERSION,
     elementName: ELEMENT_NAME,
     apiBaseUrl: defaultBaseUrl,
@@ -198,7 +203,8 @@ export const WEBPILOT_EMBED_SDK = String.raw`
     unmount: unmount
   });
 
-  window.WebPilotQA = WebPilotQA;
+  window.Orbit = Orbit;
+  window.WebPilotQA = Orbit;
   define();
 
   if (currentScript && currentScript.dataset && currentScript.dataset.mount) {
@@ -207,8 +213,10 @@ export const WEBPILOT_EMBED_SDK = String.raw`
       userId: currentScript.dataset.userId || '',
       targetUrl: currentScript.dataset.targetUrl || window.location.href
     }).catch(function (error) {
-      console.error('[WebPilotQA] auto mount failed:', error);
+      console.error('[Orbit] auto mount failed:', error);
     });
   }
 })();
 `;
+
+export const WEBPILOT_EMBED_SDK = ORBIT_EMBED_SDK;

@@ -26,6 +26,20 @@ function markAppShell() {
 
 markAppShell();
 
+// Native menus follow the language selected in the application, including live changes.
+window.addEventListener('DOMContentLoaded', () => {
+  const syncLanguage = () => {
+    try {
+      const language = window.localStorage.getItem('webpilotqa.language');
+      if (language === 'en' || language === 'zh') ipcRenderer.send('webpilot:system:language', language);
+    } catch {
+      // Startup data URLs have no local storage.
+    }
+  };
+  syncLanguage();
+  if (document.documentElement) new MutationObserver(syncLanguage).observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
+}, { once: true });
+
 contextBridge.exposeInMainWorld('webPilotEmbeddedBrowser', {
   activateTab(input) {
     return ipcRenderer.invoke('webpilot:embedded-browser:activate-tab', input);

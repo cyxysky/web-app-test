@@ -18,3 +18,5 @@ when the Agent only needs public URL fetching. Register the provider with
 TypeScript Agent framework, and inject the package Skill before use. See the
 complete
 [TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
+The default Node HTTP transport connects to the DNS address checked by the public-network policy while preserving hostname and TLS verification. Redirect bodies are cancelled before the next target is checked. A custom `fetchImpl` owns its connection policy and must provide equivalent address pinning when required.

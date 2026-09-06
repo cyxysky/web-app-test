@@ -61,11 +61,12 @@ export function createNodeBrowserOperations(
     }));
   };
   return {
-    async readBrowserState(_input: ReadBrowserStateInput, context) {
+    async readBrowserState(input: ReadBrowserStateInput, context) {
       await ensureStarted();
       return browserOperationToCapabilityResult(await options.session.readBrowserState({
+        ...input,
         abortSignal: context.abortSignal,
-        maxOutputChars: 40_000,
+        maxOutputChars: input.maxOutputChars ?? 40_000,
       }));
     },
     browserCode: (input: BrowserCodeInput, context) => execute(input, context),

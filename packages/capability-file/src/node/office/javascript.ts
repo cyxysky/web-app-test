@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { CapabilityTaskQueue } from '@webpilot/capability-sdk';
+import { runCapabilityProcess } from '@webpilot/capability-sdk/node';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, copyFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -53,14 +54,7 @@ export async function resolveOfficeJsProgramWorker(
   throw new Error('JavaScript Office worker is missing from the application runtime.');
 }
 
-function terminate(child: ChildProcess) {
-  if (!child.pid || child.exitCode !== null) return;
-  if (process.platform !== 'win32') {
-    child.kill('SIGKILL');
-    return;
-  }
-  spawn('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore', windowsHide: true });
-}
+const officeJsQueue = new CapabilityTaskQueue({ concurrency: 2, maxQueued: 32, queueTimeoutMs: 120_000 });
 
 function runWorker(
   worker: string,
@@ -68,69 +62,32 @@ function runWorker(
   abortSignal?: AbortSignal,
   onProgress?: (progress: { phase: string; message: string; current?: number; total?: number }) => void | Promise<void>,
 ) {
-  return new Promise<Record<string, unknown>>((resolve, reject) => {
-    if (abortSignal?.aborted) {
-      reject(abortSignal.reason instanceof Error ? abortSignal.reason : new Error('JavaScript Office generation was aborted.'));
-      return;
-    }
-    const child = spawn(process.execPath, [worker, ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    let settled = false;
-    let idleTimeout: ReturnType<typeof setTimeout> | undefined;
-    const hardTimeout = setTimeout(() => finish(() => {
-      terminate(child);
-      reject(new Error(`JavaScript Office worker exceeded the ${WORKER_HARD_TIMEOUT_MS}ms hard limit.`));
-    }), WORKER_HARD_TIMEOUT_MS);
-    const resetIdleTimeout = () => {
-      if (idleTimeout) clearTimeout(idleTimeout);
-      idleTimeout = setTimeout(() => finish(() => {
-        terminate(child);
-        reject(new Error(`JavaScript Office worker made no progress for ${WORKER_IDLE_TIMEOUT_MS}ms.`));
-      }), WORKER_IDLE_TIMEOUT_MS);
-      idleTimeout.unref?.();
+  return officeJsQueue.run(async (signal) => {
+    const idle = new AbortController();
+    const combined = AbortSignal.any([signal, idle.signal]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let pending = '';
+    const reset = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => idle.abort(new Error(`JavaScript Office worker made no progress for ${WORKER_IDLE_TIMEOUT_MS}ms.`)), WORKER_IDLE_TIMEOUT_MS);
     };
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      if (idleTimeout) clearTimeout(idleTimeout);
-      clearTimeout(hardTimeout);
-      abortSignal?.removeEventListener('abort', onAbort);
-      callback();
-    };
-    const onAbort = () => finish(() => {
-      terminate(child);
-      reject(abortSignal?.reason instanceof Error ? abortSignal.reason : new Error('JavaScript Office generation was aborted.'));
-    });
-    child.stdout?.on('data', (chunk: Buffer) => stdout.push(chunk));
-    let stderrPending = '';
-    child.stderr?.on('data', (chunk: Buffer) => {
-      stderrPending += chunk.toString('utf8');
-      const lines = stderrPending.split(/\r?\n/);
-      stderrPending = lines.pop() || '';
-      for (const line of lines) {
-        if (line.startsWith(PROGRESS_PREFIX)) {
-          resetIdleTimeout();
-          try { void Promise.resolve(onProgress?.(JSON.parse(line.slice(PROGRESS_PREFIX.length)))).catch(() => undefined); } catch { /* Ignore malformed progress only. */ }
-        } else stderr.push(Buffer.from(`${line}\n`, 'utf8'));
-      }
-    });
-    child.once('error', (error) => finish(() => reject(error)));
-    child.once('close', (code) => finish(() => {
-      if (code !== 0) {
-        reject(new Error(`${Buffer.concat(stderr).toString('utf8')}${stderrPending}` || `JavaScript Office worker exited with code ${code}.`));
-        return;
-      }
-      try {
-        resolve(JSON.parse(Buffer.concat(stdout).toString('utf8')) as Record<string, unknown>);
-      } catch (error) {
-        reject(new Error(`JavaScript Office worker returned invalid diagnostics: ${error instanceof Error ? error.message : String(error)}`));
-      }
-    }));
-    resetIdleTimeout();
-    hardTimeout.unref?.();
-    abortSignal?.addEventListener('abort', onAbort, { once: true });
-  });
+    reset();
+    try {
+      const result = await runCapabilityProcess({ executable: process.execPath, args: [worker, ...args],
+        signal: combined, timeoutMs: WORKER_HARD_TIMEOUT_MS, maxOutputChars: 10 * 1024 * 1024,
+        onStderr: (chunk) => {
+          pending += chunk;
+          const lines = pending.split(/\r?\n/);
+          pending = lines.pop() || '';
+          for (const line of lines) if (line.startsWith(PROGRESS_PREFIX)) {
+            reset();
+            try { void Promise.resolve(onProgress?.(JSON.parse(line.slice(PROGRESS_PREFIX.length)))).catch(() => undefined); } catch { /* Ignore malformed progress. */ }
+          }
+        },
+      });
+      return JSON.parse(result.stdout) as Record<string, unknown>;
+    } finally { if (timer) clearTimeout(timer); }
+  }, { abortSignal });
 }
 
 export async function generateOfficeJsProgramDocument(input: {

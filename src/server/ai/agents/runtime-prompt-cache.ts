@@ -28,6 +28,7 @@ function latestMarkedMessageContent(messages: ModelMessage[], marker: string) {
 
 export function isRuntimePromptCacheMetadataMessage(message: ModelMessage) {
   return markedMessageContent(message, runtimeOperationalContextMarker) !== undefined
+    || markedMessageContent(message, '[WebPilot knowledge context]') !== undefined
     || markedMessageContent(message, runtimeCurrentTimeMarker) !== undefined;
 }
 

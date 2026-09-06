@@ -17,6 +17,7 @@ import {
 } from '@/server/ai/personal-memory';
 import { store } from '@/server/db/store';
 import type { ModelProvider, ModelProviderSettings } from '@/server/ai/schemas/runtime.schema';
+import { skillResourceSchema } from '@/server/ai/schemas/runtime.schema';
 import { normalizeApplicationUserId } from '@/server/auth/user-context';
 
 export type PortableDataKind = 'credentials' | 'skills' | 'memory' | 'model';
@@ -41,7 +42,8 @@ const skillItemSchema = z.object({
   description: z.string().trim().max(4_000),
   triggerPhrases: z.array(z.string().trim().max(500)).max(100),
   content: z.object({
-    details: z.string().max(30_000),
+    details: z.string().max(100_000),
+    resources: z.array(skillResourceSchema).max(20).optional(),
   }).strict(),
   status: z.enum(['draft', 'ready', 'disabled']),
   shared: z.boolean(),
@@ -54,6 +56,9 @@ const memoryItemSchema = z.object({
   key: z.string().trim().min(1).max(120),
   aliases: z.array(z.string().trim().max(80)).max(20),
   value: z.string().trim().min(1).max(260),
+  recall: z.enum(['always', 'relevant']).optional(),
+  evidence: z.array(z.string().max(500)).max(8).optional(),
+  durability: z.string().max(100).optional(),
   confidence: z.number().min(0).max(1),
   sourceUrl: z.string().trim().max(2_000).optional(),
   status: z.enum(['active', 'disabled']),
@@ -76,6 +81,7 @@ const modelProviderSettingsSchema = z.object({
 
 const rawModelConfigSchema = z.object({
   provider: z.string(),
+  providerOrder: z.array(z.string()).optional(),
   providers: z.record(z.string(), modelProviderSettingsSchema),
 }).strict();
 
@@ -198,7 +204,7 @@ async function decryptSecretPayload(bundleValue: unknown, kind: SecretDataKind, 
   }
 }
 
-function parseModelConfig(value: unknown): Pick<Awaited<ReturnType<typeof store.saveModelConfig>>, 'provider' | 'providers'> {
+function parseModelConfig(value: unknown): Pick<Awaited<ReturnType<typeof store.saveModelConfig>>, 'provider' | 'providers' | 'providerOrder'> {
   const parsed = rawModelConfigSchema.parse(value);
   if (!isModelProvider(parsed.provider)) throw new Error('模型服务商无效');
   const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
@@ -206,7 +212,10 @@ function parseModelConfig(value: unknown): Pick<Awaited<ReturnType<typeof store.
     if (!isModelProvider(providerValue)) throw new Error(`未知模型服务商：${providerValue}`);
     providers[providerValue as ModelProvider] = settings;
   }
-  return { provider: parsed.provider as ModelProvider, providers };
+  const providerOrder = parsed.providerOrder === undefined
+    ? undefined
+    : modelProviderDefinitionsForConfig(providers, parsed.providerOrder).map(({ value }) => value);
+  return { provider: parsed.provider as ModelProvider, providers, providerOrder };
 }
 
 function fileTimestamp(value: string) {
@@ -250,7 +259,7 @@ export async function exportPortableData(input: {
         extraRequestParameters: current.extraRequestParameters,
       }];
     }).filter((entry) => entry[1] !== undefined));
-    const config = parseModelConfig({ provider: saved.provider, providers });
+    const config = parseModelConfig({ provider: saved.provider, providers, providerOrder: saved.providerOrder });
     return {
       fileName: `webpilot-model-config-${suffix}.json`,
       bundle: await encryptSecretPayload('model', { config }, input.passphrase, exportedAt),
@@ -287,6 +296,9 @@ export async function exportPortableData(input: {
     key: item.key,
     aliases: item.aliases,
     value: item.value,
+    recall: item.recall,
+    evidence: item.evidence,
+    durability: item.durability,
     confidence: item.confidence,
     sourceUrl: item.sourceUrl,
     status: item.status,

@@ -20,6 +20,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useI18n } from '@/i18n/I18nProvider';
 import type { WebPilotOnboardingReadiness, WebPilotOnboardingState, WebPilotOnboardingStep } from '@/lib/onboarding';
+import { OrbitIcon } from '@/components/OrbitIcon';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { TextAnimate } from '@/components/ui/text-animate';
@@ -347,7 +348,7 @@ export function BrowserChatOnboarding({
         <div className="browser-chat-onboarding-practice">
           <strong>{t('这次演练会自动完成')}</strong>
           <ol>
-            <li>{t('打开 WebPilot 内置演练页')}</li>
+            <li>{t('打开 Orbit 内置演练页')}</li>
             <li>{t('读取真实页面状态并定位姓名和部门字段')}</li>
             <li>{t('填写测试内容，但不点击提交')}</li>
             <li>{t('再次读取页面并验证填写结果')}</li>
@@ -366,8 +367,9 @@ export function BrowserChatOnboarding({
     return (
       <section className="browser-chat-empty-start" aria-label={t('开始新对话')}>
         <div className="browser-chat-empty-heading">
+          <div className="browser-chat-empty-icon"><OrbitIcon size={64} /></div>
           <TextAnimate animation="blurIn" as="span" by="character" duration={0.48} once>
-            DOMP WEBPILOT
+            Orbit
           </TextAnimate>
           <TextAnimate animation="blurInUp" as="h1" by="character" delay={0.1} duration={0.72} once>
             {t('今天想让浏览器帮你做什么？')}
@@ -381,10 +383,10 @@ export function BrowserChatOnboarding({
   }
 
   return (
-    <section className="browser-chat-onboarding" aria-label={t('WebPilot 新手教程')}>
+    <section className="browser-chat-onboarding" aria-label={t('Orbit 新手教程')}>
       <header className="browser-chat-onboarding-header">
         <div>
-          <span className="browser-chat-onboarding-kicker">DOMP WEBPILOT · {t('新手引导')}</span>
+          <span className="browser-chat-onboarding-kicker"><OrbitIcon size={24} /> Orbit · {t('新手引导')}</span>
           <strong>{t('第 {current} 步，共 {total} 步', { current: activeStepIndex + 1, total: guideSteps.length })}</strong>
         </div>
         <div className="browser-chat-onboarding-progress" aria-hidden="true"><span style={{ width: `${((activeStepIndex + 1) / guideSteps.length) * 100}%` }} /></div>

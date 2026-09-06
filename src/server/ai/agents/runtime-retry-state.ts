@@ -29,6 +29,7 @@ export function attachRuntimeFailureRecovery<TMessage extends ModelMessage>(
   state: RuntimeRetryState<TMessage> | undefined,
   historicalMessageCount: number,
   fallbackTurnMessages: readonly TMessage[] = [],
+  explicitTurnMessages?: readonly TMessage[],
 ) {
   if (!error || typeof error !== 'object' || !state?.messages.length) return;
   const offset = Math.max(0, Math.min(state.messages.length, Math.floor(historicalMessageCount)));
@@ -36,7 +37,7 @@ export function attachRuntimeFailureRecovery<TMessage extends ModelMessage>(
   (error as Record<string, unknown>)[runtimeFailureRecoveryKey] = {
     agentStepOffset: state.agentStepOffset,
     messages: [...state.messages],
-    turnMessages: recoveredTurnMessages.length
+    turnMessages: explicitTurnMessages ? [...explicitTurnMessages] : recoveredTurnMessages.length
       ? recoveredTurnMessages
       : [...fallbackTurnMessages],
   } satisfies RuntimeFailureRecovery<TMessage>;

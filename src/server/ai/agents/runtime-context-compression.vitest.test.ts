@@ -1,6 +1,6 @@
 import type { ModelMessage } from 'ai';
 import { describe, expect, it } from 'vitest';
-import { normalizeBrowserChatModelContext } from './browser-chat-model-context';
+import { normalizeBrowserChatModelContext, browserChatActiveMessages } from './browser-chat-model-context';
 import {
   mergeRuntimeModelMessageChain,
   runtimeContinuationSummaryMarker,
@@ -51,7 +51,7 @@ describe('runtime tool transcript integrity', () => {
       ],
     });
 
-    expect(context.activeMessages).toEqual([
+    expect(browserChatActiveMessages(context)).toEqual([
       { role: 'user', content: 'continue' },
       { role: 'assistant', content: 'ready' },
     ]);

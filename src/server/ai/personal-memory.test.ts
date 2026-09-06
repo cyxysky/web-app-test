@@ -6,8 +6,25 @@ import {
   formatPersonalMemoryForPrompt,
   normalizePersonalMemoryValue,
   parsePersonalMemoryExtractionOutput,
+  rankPersonalMemory,
   type PersonalMemoryItem,
 } from './personal-memory';
+
+test('recall selects scoped relevant facts, reserves standing preferences, and suppresses stale/conflicting copies', () => {
+  const base: PersonalMemoryItem = { id: 'old', userId: 'owner', shared: false, scope: 'global', domain: '', type: 'preference',
+    key: 'report output format', aliases: ['report format'], value: 'PDF', text: '', confidence: 1,
+    createdAt: '2026-01-01', updatedAt: '2026-01-01', status: 'active', useCount: 999 };
+  const items: PersonalMemoryItem[] = [base,
+    { ...base, id: 'new', key: 'report format', aliases: [], value: 'XLSX', updatedAt: '2026-02-01', useCount: 0 },
+    { ...base, id: 'shared', userId: 'other', shared: true, value: 'CSV', updatedAt: '2026-03-01' },
+    { ...base, id: 'language', key: 'reply language', aliases: [], value: 'Chinese', recall: 'always' },
+    { ...base, id: 'music', scope: 'domain', domain: 'example.com', key: 'music playback', aliases: [], value: 'repeat album' },
+    { ...base, id: 'private', userId: 'other' },
+  ];
+  const results = rankPersonalMemory(items, { userId: 'owner', domain: 'example.com', query: 'download financial report', limit: 6 });
+  assert.deepEqual(new Set(results.map((result) => result.item.id)), new Set(['language', 'new']));
+  assert.deepEqual(rankPersonalMemory(items, { userId: 'owner', domain: '', query: 'weather tomorrow', limit: 6 }).map((result) => result.item.id), ['language']);
+});
 
 test('parses plain or fenced personal-memory JSON and treats an empty response as no candidates', () => {
   const item = {

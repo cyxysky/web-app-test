@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createCapabilityDocumentDatabase } from '@webpilot/capability-sdk/node';
 import path from 'node:path';
 import type { AgentConnector } from '@webpilot/capability-connectors';
 import type { CapabilityExecutionContext, CapabilityRunContext } from '@webpilot/capability-sdk';
@@ -62,7 +62,7 @@ export function createJsonWebhookChannel(input: {
       const response = await (input.fetchImpl || fetch)(input.url, {
         method: 'POST',
         signal,
-        headers: { 'content-type': 'application/json', ...input.headers },
+        headers: { 'content-type': 'application/json', ...input.headers, 'idempotency-key': draft.id },
         body: JSON.stringify(input.mapBody ? input.mapBody(draft) : {
           targets: draft.targets,
           content: draft.content,
@@ -378,39 +378,42 @@ export function discoverWeComAiBotConversation(input: {
 }
 
 export function createFileCommunicationDraftStore(input: { directory: string }): CommunicationDraftStore {
-  const directory = path.resolve(input.directory);
-  const file = path.join(directory, 'drafts.json');
-  let queue = Promise.resolve();
-  const read = async (): Promise<CommunicationDraft[]> => {
-    try {
-      const value = JSON.parse(await readFile(file, 'utf8')) as { version?: number; drafts?: CommunicationDraft[] };
-      return value?.version === 2 && Array.isArray(value.drafts) ? value.drafts : [];
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw error;
-    }
-  };
-  const save = async (drafts: CommunicationDraft[]) => {
-    await mkdir(directory, { recursive: true });
-    const temporary = path.join(directory, `.drafts-${randomUUID()}.tmp`);
-    await writeFile(temporary, `${JSON.stringify({ version: 2, drafts }, null, 2)}\n`, 'utf8');
-    await rename(temporary, file);
-  };
+  const store = createCapabilityDocumentDatabase<CommunicationDraft>({
+    directory: input.directory, filename: 'drafts.db', legacyFilename: 'drafts.json',
+    readLegacy(value) {
+      const file = value as { version?: number; drafts?: CommunicationDraft[] };
+      if (file.version !== 2 || !Array.isArray(file.drafts)) throw new Error('Invalid legacy communication store.');
+      return file.drafts;
+    },
+  });
   return {
-    create(input) {
-      const pending = queue.then(async () => {
-        const drafts = await read();
-        const draft = { ...input, id: randomUUID(), createdAt: new Date().toISOString() };
-        drafts.push(draft);
-        await save(drafts);
-        return draft;
+    async create(input) {
+      const draft: CommunicationDraft = { ...input, delivery: undefined, id: randomUUID(), createdAt: new Date().toISOString() };
+      store.transaction(() => store.save(draft));
+      return draft;
+    },
+    async get(id) { return store.get(id); },
+    async claimDelivery(id) {
+      return store.transaction(() => {
+        const draft = store.get(id);
+        if (!draft) throw new Error(`Unknown draft: ${id}.`);
+        const claimed = !draft.delivery;
+        if (claimed) {
+          draft.delivery = { status: 'sending', updatedAt: new Date().toISOString() };
+          store.save(draft);
+        }
+        return { claimed, draft };
       });
-      queue = pending.then(() => undefined, () => undefined);
-      return pending;
     },
-    async get(id) {
-      return (await read()).find((draft) => draft.id === id);
+    async finishDelivery(id, delivery) {
+      store.transaction(() => {
+        const draft = store.get(id);
+        if (!draft) throw new Error(`Unknown draft: ${id}.`);
+        draft.delivery = delivery;
+        store.save(draft);
+      });
     },
+    dispose: store.dispose,
   };
 }
 

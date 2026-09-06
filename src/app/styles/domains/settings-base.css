@@ -452,6 +452,10 @@
   align-items: start;
 }
 
+.settings-extra-parameters-control {
+  container: settings-extra-parameters / inline-size;
+}
+
 .settings-extra-parameters-control,
 .settings-extra-parameters-list {
   display: grid;
@@ -464,14 +468,20 @@
   align-items: center;
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(110px, 0.72fr) minmax(170px, 1.28fr) 38px;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr) 38px;
   min-width: 0;
 }
 
-.settings-extra-parameter-input-row .settings-control {
+.settings-extra-parameter-input-row > [data-slot="input-group"],
+.settings-extra-parameter-input-row input {
   justify-self: stretch;
   min-width: 0;
   width: 100%;
+}
+
+.settings-extra-parameter-input-row input {
+  font-family: var(--app-font-mono);
+  font-size: 13px;
 }
 
 .settings-extra-parameters-empty {

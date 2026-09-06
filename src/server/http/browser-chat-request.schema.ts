@@ -29,7 +29,7 @@ export const sendBrowserChatMessageRequestSchema = browserChatSettingsSchema.ext
   content: text(100_000).default(''),
   clientMessageId: optionalText(120),
   attachments: z.array(browserChatAttachmentSchema).max(8).default([]),
-  skillIds: z.array(text(120)).max(8).default([]),
+  skillIds: z.array(text(120)).max(200).default([]),
 }).strict();
 
 export const deleteBrowserChatSessionsRequestSchema = z.object({

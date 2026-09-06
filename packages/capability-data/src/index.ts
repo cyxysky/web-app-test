@@ -1,3 +1,4 @@
+import { isReadOnlyStatement } from './sql.js';
 import { z } from 'zod';
 import { defineCapabilityInput, defineCapabilityTool, normalizeBoundedInteger, type CapabilityExecutionContext, type CapabilityHealth, type CapabilityManifest, type CapabilityProvider, type CapabilityRunContext } from '@webpilot/capability-sdk';
 import { dataRuntimeSkill } from './runtime-skill.js'; import { dataCapabilitySettings } from './settings.js';
@@ -15,7 +16,7 @@ export interface AgentDataSource {
 }
 export interface DataSourceRegistry { list(): readonly AgentDataSource[]; get(id: string): AgentDataSource | undefined; }
 export function createDataSourceRegistry(sources: readonly AgentDataSource[]): DataSourceRegistry { const byId = new Map<string, AgentDataSource>(); for (const source of sources) { if (!source.id.trim()) throw new Error('Data source id is required.'); if (byId.has(source.id)) throw new Error(`Duplicate data source id: ${source.id}.`); byId.set(source.id, source); } return Object.freeze({ list: () => Object.freeze([...byId.values()]), get: (id: string) => byId.get(id) }); }
-export function isReadOnlyStatement(statement: string) { const normalized = statement.replace(/^\s*(?:--[^\n]*\n|\/\*[\s\S]*?\*\/\s*)*/g, '').trim().toLowerCase(); return /^(select|with|explain|show|describe|pragma)\b/.test(normalized) && !/\b(insert|update|delete|merge|alter|drop|create|truncate|grant|revoke|replace|vacuum|attach|detach)\b/.test(normalized); }
+export { isReadOnlyStatement } from './sql.js';
 
 const parser = z.object({ action: z.enum(['sources', 'schema', 'query']), reason: z.string().trim().min(1).max(300), sourceId: z.string().trim().min(1).max(200).optional(), statement: z.string().trim().min(1).max(100_000).optional(), parameters: z.array(z.unknown()).max(500).optional(), maxRows: z.number().int().min(1).max(10000).optional() }).strict().superRefine((input, context) => { if ((input.action === 'schema' || input.action === 'query') && !input.sourceId) context.addIssue({ code: 'custom', path: ['sourceId'], message: `${input.action} requires sourceId.` }); if (input.action === 'query' && !input.statement) context.addIssue({ code: 'custom', path: ['statement'], message: 'query requires statement.' }); });
 export type DataToolInput = z.infer<typeof parser>;

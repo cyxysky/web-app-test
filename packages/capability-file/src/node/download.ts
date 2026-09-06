@@ -1,3 +1,4 @@
+import { CapabilityTaskQueue } from '@webpilot/capability-sdk';
 import { createHash } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir, readFile, stat, unlink, writeFile } from 'node:fs/promises';
@@ -55,6 +56,8 @@ export type NodeFileDownloaderOptions = {
   formatForMimeType?: (mimeType: string) => NodeFileDownloadFormat | undefined;
   maxBytes?: number;
   maxConcurrentPerOrigin?: number;
+  maxQueuedPerOrigin?: number;
+  queueTimeoutMs?: number;
   maxRetryAfterMs?: number;
   retryDelaysMs?: readonly number[];
   timeoutMs?: number;
@@ -202,7 +205,7 @@ export function createNodeFileDownloader(
   );
   const activeDownloads = new Map<string, Promise<FileArtifactOperationResult>>();
   const activeControllers = new Set<AbortController>();
-  const originStates = new Map<string, { active: number; waiters: Array<() => void> }>();
+  const originStates = new Map<string, CapabilityTaskQueue>();
   let disposed = false;
 
   const formatForExtension = (extension: string) => (
@@ -273,7 +276,7 @@ export function createNodeFileDownloader(
       redirect: 'follow',
       headers: {
         Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-        'User-Agent': options.userAgent || 'WebPilot-Office-Artifact/1.0 (local user-requested media fetch)',
+        'User-Agent': options.userAgent || 'Orbit-Office-Artifact/1.0 (local user-requested media fetch)',
         ...(wikimedia ? { Referer: 'https://commons.wikimedia.org/' } : {}),
       },
     };
@@ -322,44 +325,23 @@ export function createNodeFileDownloader(
     }
   }
 
-  function originKey(url: string) {
-    try {
-      return new URL(url).origin.toLowerCase();
-    } catch {
-      return url;
+  async function withOriginSlot<T>(url: string, operation: (signal: AbortSignal) => Promise<T>, abortSignal?: AbortSignal) {
+    const origin = new URL(url).origin.toLowerCase();
+    let queue = originStates.get(origin);
+    if (!queue) {
+      queue = new CapabilityTaskQueue({ concurrency: maxConcurrentPerOrigin, maxQueued: options.maxQueuedPerOrigin ?? 64, queueTimeoutMs: options.queueTimeoutMs ?? timeoutMs });
+      originStates.set(origin, queue);
     }
-  }
-
-  async function acquireOriginSlot(url: string) {
-    const origin = originKey(url);
-    const state = originStates.get(origin) || { active: 0, waiters: [] };
-    originStates.set(origin, state);
-    if (state.active >= maxConcurrentPerOrigin) {
-      await new Promise<void>((resolve) => state.waiters.push(resolve));
-    } else {
-      state.active += 1;
-    }
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      const next = state.waiters.shift();
-      if (next) {
-        next();
-        return;
-      }
-      state.active -= 1;
-      if (state.active === 0) originStates.delete(origin);
-    };
-  }
-
-  async function withOriginSlot<T>(url: string, operation: () => Promise<T>) {
-    const release = await acquireOriginSlot(url);
+    const current = queue;
     try {
-      if (disposed) throw new Error('File downloader has been disposed.');
-      return await operation();
+      return await current.run(async (signal) => {
+        if (disposed) throw new Error('File downloader has been disposed.');
+        return operation(signal);
+      }, { abortSignal });
     } finally {
-      release();
+      void current.idle().then(() => {
+        if (originStates.get(origin) === current && !current.snapshot().active && !current.snapshot().queued) originStates.delete(origin);
+      });
     }
   }
 
@@ -516,8 +498,8 @@ export function createNodeFileDownloader(
     const key = cacheKey(input, url);
     const activeKey = `${sanitizeNodeArtifactFileName(input.runId, 'adhoc')}:${key}`;
     const existing = activeDownloads.get(activeKey);
-    if (existing) return existing;
-    const pending = withOriginSlot(url, () => downloadUnlocked(input, url, key, execution));
+    if (existing) return raceWithAbort(existing, execution.abortSignal);
+    const pending = withOriginSlot(url, (signal) => downloadUnlocked(input, url, key, { abortSignal: signal }), execution.abortSignal);
     activeDownloads.set(activeKey, pending);
     try {
       return await pending;
@@ -540,7 +522,7 @@ export function createNodeFileDownloader(
         controller.abort(new Error('File downloader disposed.'));
       }
       for (const state of originStates.values()) {
-        for (const resume of state.waiters.splice(0)) resume();
+        state.cancel(new Error('File downloader disposed.'));
       }
       await Promise.allSettled(activeDownloads.values());
       activeControllers.clear();

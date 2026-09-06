@@ -1,6 +1,9 @@
 import type { DataSource, EntityMetadata } from 'typeorm';
 import { createDataCapability, createDataSourceRegistry, isReadOnlyStatement, type AgentDataSource, type DataQueryResult, type DataTable } from './index.js';
 import type { CapabilityExecutionContext, CapabilityRunContext } from '@webpilot/capability-sdk';
+import { boundedReadStatement, sqlTokens } from './sql.js';
+import { querySqliteFile } from './sqlite-query.js';
+import { cancelPostgresQuery, type PostgresCancelableClient } from './postgres-cancel.js';
 
 function tableFromMetadata(metadata: EntityMetadata): DataTable {
   return {
@@ -57,16 +60,58 @@ async function introspectSchema(source: DataSource): Promise<DataTable[]> {
   }
   return source.entityMetadatas.map(tableFromMetadata);
 }
-export function createTypeOrmAgentDataSource(input: { id: string; name?: string; source: DataSource; readOnly?: boolean }): AgentDataSource {
+export function createTypeOrmAgentDataSource(input: { id: string; name?: string; source: DataSource; readOnly?: boolean; timeoutMs?: number }): AgentDataSource {
   return {
     id: input.id, name: input.name || input.id, dialect: input.source.options.type, readOnly: input.readOnly !== false,
     async schema() { return introspectSchema(input.source); },
     async query(statement, parameters, options, context: CapabilityExecutionContext): Promise<DataQueryResult> {
       if (!input.source.isInitialized) throw new Error('TypeORM DataSource is not initialized.');
-      if (!isReadOnlyStatement(statement) && (!options.allowWrite || input.readOnly !== false)) throw new Error('Data source rejected a write statement.');
-      if (context.abortSignal?.aborted) throw context.abortSignal.reason;
-      const startedAt = Date.now(); const raw = await input.source.query(statement, parameters); const rows = Array.isArray(raw) ? raw.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
-      const bounded = rows.slice(0, options.maxRows); return { columns: [...new Set(bounded.flatMap((row) => Object.keys(row)))], rows: bounded, rowCount: rows.length, truncated: rows.length > bounded.length, elapsedMs: Date.now() - startedAt };
+      const readOnly = isReadOnlyStatement(statement);
+      const allowWrite = options.allowWrite && input.readOnly === false;
+      if (!readOnly && !allowWrite) throw new Error('Data source rejected a write statement.');
+      if (!sqlTokens(statement).length) throw new Error('Exactly one valid SQL statement is required.');
+      context.abortSignal?.throwIfAborted();
+      const maxRows = Math.max(1, Math.min(10_000, Math.floor(options.maxRows) || 500));
+      const timeoutMs = Math.max(100, Math.min(300_000, Math.floor(input.timeoutMs || 15_000)));
+      const sql = readOnly ? boundedReadStatement(statement, maxRows) : statement;
+      const startedAt = Date.now();
+      let raw: unknown;
+      const driver = input.source.options.type as string;
+      if (driver === 'sqlite' || driver === 'better-sqlite3') {
+        const database = String(input.source.options.database || '');
+        if (!database || database === ':memory:' || database.startsWith('file:')) throw new Error('Bounded SQLite queries require a file-backed database.');
+        raw = await querySqliteFile({ database, statement: sql, parameters, readOnly: !allowWrite, maxRows, timeoutMs, signal: context.abortSignal });
+      } else if (driver === 'postgres') {
+        const runner = input.source.createQueryRunner();
+        let cancel: (() => void) | undefined;
+        let cancelling: Promise<unknown> | undefined;
+        try {
+          const client = await runner.connect() as PostgresCancelableClient;
+          await runner.startTransaction();
+          if (!allowWrite) await runner.query('SET TRANSACTION READ ONLY');
+          await runner.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
+          cancel = () => { cancelling ||= cancelPostgresQuery(client); };
+          context.abortSignal?.addEventListener('abort', cancel, { once: true });
+          context.abortSignal?.throwIfAborted();
+          raw = await runner.query(sql, parameters);
+          context.abortSignal?.throwIfAborted();
+          context.abortSignal?.removeEventListener('abort', cancel);
+          await runner.commitTransaction();
+        } catch (error) {
+          if (cancel) context.abortSignal?.removeEventListener('abort', cancel);
+          await cancelling;
+          if (runner.isTransactionActive) await runner.rollbackTransaction();
+          throw error;
+        } finally {
+          if (cancel) context.abortSignal?.removeEventListener('abort', cancel);
+          // Do not return a connection to the pool while cancellation is still in flight.
+          await cancelling;
+          await runner.release();
+        }
+      } else throw new Error('Bounded TypeORM queries support PostgreSQL and file-backed SQLite. Supply a driver-specific AgentDataSource for other engines.');
+      const rows = Array.isArray(raw) ? raw.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item)) : [];
+      const bounded = rows.slice(0, maxRows);
+      return { columns: [...new Set(bounded.flatMap((row) => Object.keys(row)))], rows: bounded, rowCount: bounded.length, truncated: rows.length > maxRows, elapsedMs: Date.now() - startedAt };
     },
     async health() { return input.source.isInitialized ? { status: 'healthy' } : { status: 'unhealthy', message: 'TypeORM DataSource is not initialized.' }; },
   };

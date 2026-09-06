@@ -9,6 +9,9 @@ import {
 import { serveStdio, type StdioServerHandle } from '@modelcontextprotocol/server/stdio';
 import {
   capabilitySkillReadJsonSchema,
+  createCapabilityExecutor,
+  disposeOnce,
+  type CapabilityExecutionPolicyOptions,
   type CapabilityContent,
   type CapabilityProvider,
   type CapabilityResult,
@@ -22,6 +25,8 @@ import {
 } from '@webpilot/capability-host';
 
 export type CapabilityMcpServerOptions = {
+  policy?: CapabilityExecutionPolicyOptions;
+  resolveImage?: (content: Extract<CapabilityContent, { type: 'image' }>) => Promise<{ data: string; mimeType: string }>;
   providers: readonly CapabilityProvider[];
   name?: string;
   version?: string;
@@ -48,6 +53,7 @@ function resolvedContext(options: CapabilityMcpServerOptions): CapabilityRunCont
 
 function mcpContent(content: CapabilityContent): CallToolResult['content'][number] {
   if (content.type === 'text') return content;
+  if (content.type === 'image' && content.data) return { type: 'image', data: content.data, mimeType: content.mediaType || 'image/png' };
   if (content.type === 'artifact' && content.downloadUrl) {
     return {
       type: 'resource_link',
@@ -92,6 +98,7 @@ export async function createCapabilityMcpServer(
   options: CapabilityMcpServerOptions,
 ) {
   const runContext = resolvedContext(options);
+  const executeCapability = createCapabilityExecutor(options.policy);
   const snapshot = await mountCapabilities({
     providers: options.providers,
     context: runContext,
@@ -162,16 +169,38 @@ export async function createCapabilityMcpServer(
       }, async (input: unknown, context) => {
         try {
           const parsed = resolved.tool.input.parse(input);
-          const abortSignal = runContext.abortSignal
-            ? AbortSignal.any([runContext.abortSignal, context.mcpReq.signal])
+          const abortSignal = snapshot.abortSignal
+            ? AbortSignal.any([snapshot.abortSignal, context.mcpReq.signal])
             : context.mcpReq.signal;
-          const result = await resolved.tool.execute(parsed, {
+          const progressToken = context.mcpReq._meta?.progressToken;
+          let progress = 0;
+          const executionContext = {
             invocationId: randomUUID(),
             abortSignal,
             metadata: {
               transport: context.http ? 'streamable-http' : 'stdio',
             },
-          });
+          };
+          let result = await executeCapability(resolved, {
+            ...executionContext,
+            reportProgress: async (event) => {
+              await options.policy?.reportProgress?.(event, executionContext);
+              if (typeof progressToken !== 'string' && typeof progressToken !== 'number') return;
+              progress = Math.max(progress + 1, event.current ?? 0);
+              await context.mcpReq.notify({ method: 'notifications/progress', params: {
+                progressToken, progress, message: event.message,
+                ...(event.total !== undefined ? { total: Math.max(progress, event.total) } : {}),
+              } });
+            },
+          }, (execution) => resolved.tool.execute(parsed, execution));
+          if (result.ok && result.content?.some((item) => item.type === 'image' && !item.data) && options.resolveImage) {
+            const content = await Promise.all(result.content.map(async (item): Promise<CapabilityContent> => {
+              if (item.type !== 'image' || item.data) return item;
+              const image = await options.resolveImage!(item);
+              return { ...item, data: image.data, mediaType: image.mimeType };
+            }));
+            result = { ...result, content };
+          }
           return capabilityResultToMcpResult(result);
         } catch (error) {
           return {
@@ -186,15 +215,15 @@ export async function createCapabilityMcpServer(
     }
 
     const close = server.close.bind(server);
-    let disposed = false;
-    server.close = async () => {
-      if (disposed) return;
-      disposed = true;
-      await Promise.allSettled([snapshot.dispose(), close()]);
-    };
+    server.close = disposeOnce(async () => {
+      const settled = await Promise.allSettled([snapshot.dispose(), close()]);
+      const errors = settled.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+      if (errors.length) throw new AggregateError(errors, 'MCP server cleanup failed.');
+    });
     return server;
   } catch (error) {
-    await snapshot.dispose();
+    try { await snapshot.dispose(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'MCP mount and cleanup failed.', { cause: error }); }
     throw error;
   }
 }

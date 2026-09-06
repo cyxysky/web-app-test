@@ -1,5 +1,7 @@
 export * from './node/ax-snapshot.js';
 export * from './node/browser-code-runner.js';
+export * from './node/browser-state-reader.js';
+export * from './node/browser-downloads.js';
 export * from './node/capability.js';
 export * from './node/browser-dom-observation-pagination.js';
 export * from './node/browser-page-runtime.js';

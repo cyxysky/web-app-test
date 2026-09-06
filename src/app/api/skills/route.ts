@@ -46,7 +46,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await parseJsonRequest(request, skillRequestSchema, { maxBytes: 256 * 1024 });
+    const body = await parseJsonRequest(request, skillRequestSchema, { maxBytes: 8 * 1024 * 1024 });
     const userId = requestUserId(request);
     return runIdempotentJson(request, {
       fingerprint: idempotencyFingerprint(body),

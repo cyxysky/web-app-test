@@ -3,7 +3,9 @@ import { copyFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import ffmpegStaticPath from 'ffmpeg-static';
 import type { CapabilityProvider, CapabilityRunContext } from '@webpilot/capability-sdk';
-import { createNodeCodeSandboxCapability } from '@webpilot/capability-code-sandbox/node';
+import { createCodeSandboxCapability } from '@webpilot/capability-code-sandbox';
+import { createNodeProcessCodeSandbox } from '@webpilot/capability-code-sandbox/node';
+import { createHttpCodeSandboxExecutor } from '@webpilot/capability-code-sandbox/remote';
 import { createResearchCapability } from '@webpilot/capability-research';
 import { createNodeResearchOperations } from '@webpilot/capability-research/node';
 import type { ResearchSource } from '@webpilot/capability-research';
@@ -20,7 +22,7 @@ import { createNodeComputerCapability } from '@webpilot/capability-computer/node
 import { createNodeWorkflowCapability } from '@webpilot/capability-workflow/node';
 import type { BrowserCodeAttachmentBinding } from '@webpilot/capability-browser/node';
 import { artifactApiUrl } from '@/lib/artifacts';
-import { artifactPath, artifactsRoot } from '@/server/storage/paths';
+import { artifactPath, artifactsRoot, codeSandboxRoot } from '@/server/storage/paths';
 import { resolveExternalIntegrations } from '@/server/integrations/external-integration-vault';
 import {
   createExternalCommunicationChannel,
@@ -32,6 +34,24 @@ import {
 function safeSegment(value: unknown, fallback: string) {
   const normalized = String(value || '').trim().replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   return normalized.slice(0, 160) || fallback;
+}
+
+function createAgentCodeSandboxCapability(): CapabilityProvider {
+  return createCodeSandboxCapability({
+    createExecutor(context) {
+      const backend = context.configuration.AGENT_CODE_SANDBOX_BACKEND === 'local' ? 'local' : 'remote';
+      if (backend === 'remote') {
+        return createHttpCodeSandboxExecutor({
+          url: String(context.configuration.AGENT_CODE_SANDBOX_RUNNER_URL || '').trim(),
+          token: String(context.configuration.AGENT_CODE_SANDBOX_RUNNER_TOKEN || '').trim() || undefined,
+        });
+      }
+      return createNodeProcessCodeSandbox({
+        workspaceDirectory: codeSandboxRoot('agent-infrastructure', 'code', safeSegment(context.userId, 'shared'), safeSegment(context.runId, 'run'), randomUUID()),
+        maxConcurrent: Number(context.configuration.AGENT_CODE_SANDBOX_MAX_CONCURRENCY) || 2,
+      });
+    },
+  });
 }
 
 async function configuredConnectors(context: CapabilityRunContext): Promise<AgentConnector[]> {
@@ -121,7 +141,7 @@ export function createAgentInfrastructureProviders(input: {
   attachmentBindings?: readonly BrowserCodeAttachmentBinding[];
 } = {}): CapabilityProvider[] {
   return [
-    createNodeCodeSandboxCapability({ workspaceDirectory: (context) => artifactPath('agent-infrastructure', 'code', safeSegment(context.userId, 'shared'), safeSegment(context.runId, 'run')) }),
+    createAgentCodeSandboxCapability(),
     createResearchCapability({ createOperations: async (context) => createNodeResearchOperations({ search: await configuredResearchSearch(context), timeoutMs: Number(context.configuration.AGENT_RESEARCH_TIMEOUT_MS) || 20_000 }) }),
     createNodeConnectorsCapability({ connectors: configuredConnectors }),
     createNodeKnowledgeCapability({ directory: (context) => artifactPath('agent-infrastructure', 'knowledge', safeSegment(context.userId, 'shared')) }),

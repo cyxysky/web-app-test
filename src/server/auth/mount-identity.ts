@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 
 function identitySecret() {
   const secret = String(process.env.WEBPILOT_IDENTITY_SECRET || '');
-  if (!secret) throw new Error('WebPilot identity runtime is unavailable');
+  if (!secret) throw new Error('Orbit identity runtime is unavailable');
   return secret;
 }
 

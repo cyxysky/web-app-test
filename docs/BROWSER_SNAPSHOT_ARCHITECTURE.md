@@ -14,7 +14,7 @@ For DOM-only logic, the program can call `page.evaluate(...)`; that callback run
 
 Each call has a whole-program timeout, process memory limits, bounded serialized output, execution logs, and pre-execution risk analysis for actions that may affect external systems or sensitive data. The process starts with Node permissions enabled, no filesystem write access, read access only to the packaged Playwright modules, no child-process or nested-worker permission, and a sanitized environment. The submitted program receives only `page`, `context`, and the bounded console in its VM scope.
 
-The process connects to the exact active page using a one-time execution marker. Browser sessions launched by WebPilot expose a private Playwright or loopback CDP endpoint for this connection; externally connected and Electron-embedded sessions reuse their existing CDP endpoint.
+The process connects to the exact active page using a one-time execution marker. Browser sessions launched by Orbit expose a private Playwright or loopback CDP endpoint for this connection; externally connected and Electron-embedded sessions reuse their existing CDP endpoint.
 
 ## Independent capabilities
 

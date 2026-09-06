@@ -29,6 +29,9 @@
       "@webpilot/capability-sdk": [
         "./packages/capability-sdk/src/index.ts"
       ],
+      "@webpilot/capability-sdk/node": [
+        "./packages/capability-sdk/src/node.ts"
+      ],
       "@webpilot/capability-host": [
         "./packages/capability-host/src/index.ts"
       ],
@@ -91,6 +94,9 @@
       ],
       "@webpilot/capability-code-sandbox/node": [
         "./packages/capability-code-sandbox/src/node.ts"
+      ],
+      "@webpilot/capability-code-sandbox/remote": [
+        "./packages/capability-code-sandbox/src/remote.ts"
       ],
       "@webpilot/capability-code-sandbox/runtime-skill": [
         "./packages/capability-code-sandbox/src/runtime-skill.ts"

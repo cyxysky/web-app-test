@@ -2,6 +2,7 @@
 
 import {
   type CSSProperties,
+  type PointerEventHandler,
   type ReactNode,
   type RefObject,
   useCallback,
@@ -12,8 +13,8 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 
-type FloatingLayerPlacement = 'auto' | 'bottom' | 'top';
-type FloatingLayerAlign = 'end' | 'start';
+export type FloatingLayerPlacement = 'auto' | 'bottom' | 'right' | 'top';
+export type FloatingLayerAlign = 'center' | 'end' | 'start';
 
 type FloatingLayerProps = {
   active?: boolean;
@@ -23,20 +24,22 @@ type FloatingLayerProps = {
   ariaLabel?: string;
   children: ReactNode;
   className: string;
+  gap?: number;
   id?: string;
   layerRef?: RefObject<HTMLDivElement | null>;
   matchAnchorWidth?: boolean;
   maxHeight?: number;
   onDismiss: () => void;
+  onPointerEnter?: PointerEventHandler<HTMLDivElement>;
+  onPointerLeave?: PointerEventHandler<HTMLDivElement>;
   placement?: FloatingLayerPlacement;
   preferredWidth?: number;
   present: boolean;
-  role?: 'dialog' | 'listbox' | 'menu';
+  role?: 'dialog' | 'listbox' | 'menu' | 'tooltip';
   style?: CSSProperties;
 };
 
 const floatingInset = 8;
-const floatingGap = 6;
 const modalFloatingLayerZIndex = 2147483003;
 const hiddenLayoutStyle: CSSProperties = {
   left: 0,
@@ -76,11 +79,14 @@ export function FloatingLayer({
   ariaLabel,
   children,
   className,
+  gap = 6,
   id,
   layerRef,
   matchAnchorWidth = false,
   maxHeight = 520,
   onDismiss,
+  onPointerEnter,
+  onPointerLeave,
   placement = 'auto',
   preferredWidth,
   present,
@@ -91,7 +97,7 @@ export function FloatingLayer({
   const dismissRef = useRef(onDismiss);
   const [portalReady, setPortalReady] = useState(false);
   const [layoutStyle, setLayoutStyle] = useState<CSSProperties>(hiddenLayoutStyle);
-  const [resolvedPlacement, setResolvedPlacement] = useState<'bottom' | 'top'>('bottom');
+  const [resolvedPlacement, setResolvedPlacement] = useState<'bottom' | 'left' | 'right' | 'top'>('bottom');
 
   useEffect(() => {
     dismissRef.current = onDismiss;
@@ -123,26 +129,39 @@ export function FloatingLayer({
     const availableWidth = Math.max(0, bounds.width - floatingInset * 2);
     const naturalWidth = preferredWidth || (matchAnchorWidth ? anchorRect.width : Math.max(layer.offsetWidth, layer.scrollWidth));
     const width = Math.min(Math.max(0, naturalWidth), availableWidth);
-    const spaceBelow = Math.max(0, bounds.bottom - anchorRect.bottom - floatingGap - floatingInset);
-    const spaceAbove = Math.max(0, anchorRect.top - bounds.top - floatingGap - floatingInset);
+    const spaceBelow = Math.max(0, bounds.bottom - anchorRect.bottom - gap - floatingInset);
+    const spaceAbove = Math.max(0, anchorRect.top - bounds.top - gap - floatingInset);
+    const spaceRight = Math.max(0, bounds.right - anchorRect.right - gap - floatingInset);
+    const spaceLeft = Math.max(0, anchorRect.left - bounds.left - gap - floatingInset);
     const desiredHeight = Math.min(maxHeight, layer.scrollHeight);
-    const nextPlacement = placement === 'top'
+    const nextPlacement = placement === 'right' && Math.max(spaceRight, spaceLeft) >= width
+      ? (spaceRight >= width ? 'right' : 'left')
+      : placement === 'top'
       ? (spaceAbove >= Math.min(desiredHeight, 120) || spaceAbove >= spaceBelow ? 'top' : 'bottom')
       : placement === 'bottom'
         ? (spaceBelow >= Math.min(desiredHeight, 120) || spaceBelow >= spaceAbove ? 'bottom' : 'top')
         : spaceBelow >= desiredHeight || spaceBelow >= spaceAbove
           ? 'bottom'
           : 'top';
-    const availableHeight = Math.max(80, Math.min(maxHeight, nextPlacement === 'bottom' ? spaceBelow : spaceAbove));
+    const horizontal = nextPlacement === 'left' || nextPlacement === 'right';
+    const availableHeight = Math.max(80, Math.min(maxHeight, horizontal ? bounds.height - floatingInset * 2 : nextPlacement === 'bottom' ? spaceBelow : spaceAbove));
     const renderedHeight = Math.min(desiredHeight, availableHeight);
-    const preferredLeft = align === 'start' ? anchorRect.left : anchorRect.right - width;
+    const preferredLeft = nextPlacement === 'right' ? anchorRect.right + gap
+      : nextPlacement === 'left' ? anchorRect.left - width - gap
+        : align === 'center' ? anchorRect.left + (anchorRect.width - width) / 2
+          : align === 'start' ? anchorRect.left : anchorRect.right - width;
     const left = Math.min(
       Math.max(preferredLeft, bounds.left + floatingInset),
       Math.max(bounds.left + floatingInset, bounds.right - width - floatingInset),
     );
-    const top = nextPlacement === 'bottom'
-      ? Math.min(anchorRect.bottom + floatingGap, bounds.bottom - renderedHeight - floatingInset)
-      : Math.max(bounds.top + floatingInset, anchorRect.top - renderedHeight - floatingGap);
+    const preferredTop = horizontal
+      ? (align === 'center' ? anchorRect.top + (anchorRect.height - renderedHeight) / 2 : align === 'start' ? anchorRect.top : anchorRect.bottom - renderedHeight)
+      : nextPlacement === 'bottom' ? anchorRect.bottom + gap : anchorRect.top - renderedHeight - gap;
+    const top = horizontal
+      ? Math.min(Math.max(preferredTop, bounds.top + floatingInset), bounds.bottom - renderedHeight - floatingInset)
+      : nextPlacement === 'bottom'
+        ? Math.min(preferredTop, bounds.bottom - renderedHeight - floatingInset)
+        : Math.max(bounds.top + floatingInset, preferredTop);
     const portalledIntoDialog = portalTarget !== document.body;
     const portalRect = portalledIntoDialog ? portalTarget.getBoundingClientRect() : null;
     const positionedLeft = portalRect
@@ -169,7 +188,7 @@ export function FloatingLayer({
       if (zIndex) next.zIndex = zIndex;
       return JSON.stringify(current) === JSON.stringify(next) ? current : next;
     });
-  }, [align, anchorRef, matchAnchorWidth, maxHeight, placement, preferredWidth]);
+  }, [align, anchorRef, gap, matchAnchorWidth, maxHeight, placement, preferredWidth]);
 
   useLayoutEffect(() => {
     if (!portalReady || !present) return undefined;
@@ -208,7 +227,7 @@ export function FloatingLayer({
       if (event.key !== 'Escape' || event.defaultPrevented) return;
       event.preventDefault();
       dismissRef.current();
-      anchorRef.current?.focus({ preventScroll: true });
+      if (role !== 'tooltip') anchorRef.current?.focus({ preventScroll: true });
     };
     document.addEventListener('pointerdown', closeOnPointerDown, true);
     document.addEventListener('keydown', closeOnEscape, true);
@@ -216,7 +235,7 @@ export function FloatingLayer({
       document.removeEventListener('pointerdown', closeOnPointerDown, true);
       document.removeEventListener('keydown', closeOnEscape, true);
     };
-  }, [active, allowNestedFloatingLayers, anchorRef, present]);
+  }, [active, allowNestedFloatingLayers, anchorRef, present, role]);
 
   if (!portalReady || !present) return null;
   const portalTarget = floatingLayerPortalTarget(anchorRef.current);
@@ -227,6 +246,8 @@ export function FloatingLayer({
       className={`ui-floating-layer ${className}`}
       data-floating-placement={resolvedPlacement}
       id={id}
+      onPointerEnter={onPointerEnter}
+      onPointerLeave={onPointerLeave}
       ref={setLayerNode}
       role={role}
       style={{ ...style, ...layoutStyle }}

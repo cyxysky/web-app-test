@@ -1,6 +1,6 @@
 # @webpilot/capability-data
 
-Structured data discovery and bounded querying for agents. Sources are injected and default to read-only. The optional TypeORM adapter works with any initialized TypeORM DataSource, including SQLite and PostgreSQL. The WebPilot host manages concrete database connections through its structured data-source settings and encrypted credential vault instead of exposing serialized connection definitions to users.
+Structured data discovery and bounded querying for agents. Sources are injected and default to read-only. The optional TypeORM adapter supports PostgreSQL and file-backed SQLite. SELECT/CTE queries receive a database-side row limit. PostgreSQL uses read-only transactions, statement timeouts and cancellation; SQLite runs in a cancellable worker process with a read-only connection. The default timeout is 15 seconds (`timeoutMs` overrides it). In-memory SQLite and other TypeORM engines require a driver-specific `AgentDataSource` implementation.
 
 ## TypeScript Agent framework integration
 

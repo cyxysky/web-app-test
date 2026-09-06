@@ -1,7 +1,19 @@
 import type { CapabilitySettingDefinition } from '@webpilot/capability-sdk';
 
 export const codeSandboxCapabilitySettings = [
-  { key: 'AGENT_CODE_SANDBOX_ENABLED', label: '代码沙箱', description: '启用本地受限代码执行。', section: 'runtime', group: '代码沙箱', defaultValue: 'false', control: 'boolean', applyMode: 'runtime' },
+  { key: 'AGENT_CODE_SANDBOX_ENABLED', label: '代码沙箱', description: '启用受限代码执行。生产环境推荐使用独立 runner。', section: 'runtime', group: '代码沙箱', defaultValue: 'false', control: 'boolean', applyMode: 'runtime' },
+  { key: 'AGENT_CODE_SANDBOX_BACKEND', label: '执行后端', description: 'remote 通过独立 runner 执行；local 仅适合可信的单机开发环境。', section: 'runtime', group: '代码沙箱', defaultValue: 'remote', control: 'select', applyMode: 'runtime', options: [{ label: '独立 Runner（推荐）', value: 'remote' }, { label: '本地进程（仅可信环境）', value: 'local' }] },
+  { key: 'AGENT_CODE_SANDBOX_RUNNER_URL', label: 'Runner 地址', description: '独立代码 runner 的内部 HTTP 地址。', section: 'runtime', group: '代码沙箱', defaultValue: 'http://webpilot-code-sandbox:18100', control: 'text', applyMode: 'runtime' },
+  { key: 'AGENT_CODE_SANDBOX_RUNNER_TOKEN', label: 'Runner Token', description: '主服务调用 runner 使用的共享认证令牌。', section: 'runtime', group: '代码沙箱', defaultValue: '', control: 'secret', secret: true, applyMode: 'runtime' },
   { key: 'AGENT_CODE_SANDBOX_TIMEOUT_MS', label: '执行超时', description: '最长执行时间（毫秒）。', section: 'runtime', group: '代码沙箱', defaultValue: '30000', control: 'number', applyMode: 'runtime', min: 1000, max: 300000, step: 1000 },
+  { key: 'AGENT_CODE_SANDBOX_INSTALL_TIMEOUT_MS', label: '依赖安装超时', description: '依赖安装与代码执行共享总超时预算。', section: 'runtime', group: '代码沙箱', defaultValue: '120000', control: 'number', applyMode: 'runtime', min: 5000, max: 300000, step: 1000 },
   { key: 'AGENT_CODE_SANDBOX_MAX_OUTPUT_CHARS', label: '输出上限', description: '标准输出与标准错误的合计字符上限。', section: 'runtime', group: '代码沙箱', defaultValue: '30000', control: 'number', applyMode: 'runtime', min: 1000, max: 200000, step: 1000 },
+  { key: 'AGENT_CODE_SANDBOX_NETWORK_MODE', label: '网络模式', description: 'full 允许 runner 访问网络；none 需要单独部署无网络 runner，local 后端无法实现隔离。', section: 'runtime', group: '代码沙箱', defaultValue: 'full', control: 'select', applyMode: 'runtime', options: [{ label: '允许网络', value: 'full' }, { label: '禁止网络（需独立部署）', value: 'none' }] },
+  { key: 'AGENT_CODE_SANDBOX_ALLOW_PACKAGE_INSTALL', label: '允许安装依赖', description: '允许任务在临时环境中安装固定版本的 Python/npm 包。', section: 'runtime', group: '代码沙箱', defaultValue: 'true', control: 'boolean', applyMode: 'runtime' },
+  { key: 'AGENT_CODE_SANDBOX_MAX_PACKAGES', label: '单次依赖数量', description: '单次执行最多安装的依赖数量。只接受固定版本。', section: 'runtime', group: '代码沙箱', defaultValue: '16', control: 'number', applyMode: 'runtime', min: 0, max: 32, step: 1 },
+  { key: 'AGENT_CODE_SANDBOX_MAX_CONCURRENCY', label: '沙箱并发数', description: '单机 local 后端同时运行的最大任务数；remote runner 由 runner 容器统一限制。', section: 'runtime', group: '代码沙箱', defaultValue: '2', control: 'number', applyMode: 'runtime', min: 1, max: 16, step: 1 },
+  { key: 'AGENT_CODE_SANDBOX_MEMORY_MB', label: '内存策略值', description: '发送给 runner 的任务策略值；真正的硬上限由 runner 容器 mem_limit 决定。', section: 'runtime', group: '代码沙箱', defaultValue: '512', control: 'number', applyMode: 'runtime', min: 64, max: 4096, step: 64 },
+  { key: 'AGENT_CODE_SANDBOX_CPU_LIMIT', label: 'CPU 策略值', description: '发送给 runner 的任务策略值；真正的硬上限由 runner 容器 cpus 决定。', section: 'runtime', group: '代码沙箱', defaultValue: '1', control: 'number', applyMode: 'runtime', min: 0.1, max: 4, step: 0.1 },
+  { key: 'AGENT_CODE_SANDBOX_PIDS_LIMIT', label: '进程数策略值', description: '发送给 runner 的任务策略值；真正的硬上限由 runner 容器 pids_limit 决定。', section: 'runtime', group: '代码沙箱', defaultValue: '128', control: 'number', applyMode: 'runtime', min: 16, max: 512, step: 16 },
+  { key: 'AGENT_CODE_SANDBOX_WORKSPACE_MB', label: '临时空间策略值', description: '发送给 runner 的任务策略值；真正的硬上限由 runner 容器 tmpfs 决定。', section: 'runtime', group: '代码沙箱', defaultValue: '256', control: 'number', applyMode: 'runtime', min: 32, max: 4096, step: 32 },
 ] as const satisfies readonly CapabilitySettingDefinition[];

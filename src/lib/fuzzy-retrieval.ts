@@ -7,7 +7,7 @@ const bilingualConcepts = [
   ['save', 'submit', 'confirm', '保存', '提交', '确认'],
   ['export', 'download', '导出', '下载'],
   ['import', 'upload', 'attach', '导入', '上传', '附件'],
-  ['login', 'signin', 'authenticate', '登录', '登陆', '认证'],
+  ['login', 'signin', 'sign in', 'authenticate', '登录', '登陆', '认证'],
   ['logout', 'signout', '退出登录', '注销'],
   ['browser', 'webpage', 'page', '浏览器', '网页', '页面'],
   ['tab', 'tabs', 'tabgroup', '标签页', '标签组', '页签'],
@@ -112,21 +112,48 @@ function conceptIds(value: string) {
   return result;
 }
 
+const genericTerms = new Set(['open', 'search', 'create', 'edit', 'delete', 'save', 'export', 'import',
+  'browser', 'setting', 'detail', 'list', 'filter', 'sort', 'click', 'type', 'select', 'copy', 'move', 'refresh', 'test']);
+const generic = new Set(normalizedBilingualConcepts.flatMap((terms, index) => genericTerms.has(terms[0]) ? [index] : []));
+
+function withoutGeneric(value: string) {
+  let result = ` ${value} `;
+  for (const index of generic) for (const term of normalizedBilingualConcepts[index]) {
+    result = /^[a-z0-9 ]+$/.test(term)
+      ? result.replaceAll(` ${term} `, ' ')
+      : result.replaceAll(term, '');
+  }
+  return result.trim();
+}
+
 function pairScore(query: string, candidate: string) {
   const queryCompact = compact(query);
   const candidateCompact = compact(candidate);
   if (!queryCompact || !candidateCompact) return 0;
   if (queryCompact === candidateCompact) return 1;
-  if (queryCompact.length >= 2 && candidateCompact.includes(queryCompact)) return 0.98;
-  if (candidateCompact.length >= 2 && queryCompact.includes(candidateCompact)) return 0.94;
+  if (withoutGeneric(query) && queryCompact.length >= 2 && candidateCompact.includes(queryCompact)) return 0.98;
+  if (withoutGeneric(candidate) && candidateCompact.length >= 2 && queryCompact.includes(candidateCompact)) return 0.94;
 
   const queryConcepts = conceptIds(query);
   const candidateConcepts = conceptIds(candidate);
-  if ([...queryConcepts].some((concept) => candidateConcepts.has(concept))) return 0.96;
+  // A shared action ("open", "edit") is not a shared task. Compare the
+  // specific concepts and remaining entities as well, in either language.
+  const shared = [...queryConcepts].filter((concept) => candidateConcepts.has(concept));
+  const specificShared = shared.filter((concept) => !generic.has(concept));
+  const conceptScore = specificShared.length
+    ? 0.55 + 0.35 * shared.length / Math.max(queryConcepts.size, candidateConcepts.size, 1)
+    : shared.length ? 0.18 : 0;
 
   const tokenScore = tokenCoverage(wordTokens(query), wordTokens(candidate));
   const gramScore = dice(grams(query), grams(candidate));
-  return Math.max(tokenScore * 0.9, gramScore * 0.86);
+  // Remove shared generic vocabulary before allowing lexical overlap to win.
+  const meaningfulQuery = withoutGeneric(query);
+  const meaningfulCandidate = withoutGeneric(candidate);
+  const lexicalScore = shared.length && !specificShared.length
+    ? Math.max(tokenCoverage(wordTokens(meaningfulQuery), wordTokens(meaningfulCandidate)) * 0.9,
+      dice(grams(meaningfulQuery), grams(meaningfulCandidate)) * 0.86)
+    : Math.max(tokenScore * 0.9, gramScore * 0.86);
+  return Math.max(conceptScore, lexicalScore);
 }
 
 export function fuzzyRetrievalScore(query: unknown, candidates: unknown[]) {

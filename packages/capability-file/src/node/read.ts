@@ -9,7 +9,7 @@ import type {
 } from '../office/types.js';
 import { inspectDocxTemplateBuffer } from './office/docx-template.js';
 import { renderFilePreview } from './office/preview.js';
-import { extractFileTextInWorker } from './text-extraction.js';
+import { extractFileTextInWorker, type FileTextSelection } from './text-extraction.js';
 
 export type FileReadableAttachment = {
   id: string;
@@ -114,7 +114,10 @@ export function fileAttachmentMetadata(attachment: FileReadableAttachment) {
   return `[文件] ${attachment.name} | attachmentId: ${attachment.id} | 类型: ${attachment.type || 'unknown'} | 大小: ${formatSize(attachment.size)} | 仅在任务需要分析文件内容时调用 file action=read；纯上传不要读取或重建内容，使用浏览器运行时提供的受控附件上传接口。`;
 }
 
-async function extractAttachmentText(attachment: FileReadableAttachment, absolutePath?: string, reusableBuffer?: Buffer) {
+const docxStructureCache = new Map<string, string>();
+let docxStructureCacheCharacters = 0;
+
+async function extractAttachmentText(attachment: FileReadableAttachment, absolutePath?: string, reusableBuffer?: Buffer, selection: FileTextSelection & { abortSignal?: AbortSignal } = {}) {
   const kind = attachmentKind(attachment);
   if (kind === 'image') {
     if (!absolutePath) throw new Error('Could not locate the saved image artifact.');
@@ -138,15 +141,19 @@ async function extractAttachmentText(attachment: FileReadableAttachment, absolut
   }
   if (kind === 'tab') return `[标签页引用：${attachment.sourceUrl || attachment.url || attachment.name}]`;
   if (!absolutePath) throw new Error('无法定位文件，无法解析。');
-  const extracted = await extractFileTextInWorker({ extension: extensionOf(attachment), kind, path: absolutePath });
-  if (extensionOf(attachment) !== '.docx') return extracted;
+  const extracted = await extractFileTextInWorker({ extension: extensionOf(attachment), kind, path: absolutePath, ...selection });
+  if (extensionOf(attachment) !== '.docx' || selection.section) return extracted;
   const buffer = reusableBuffer || await readFile(absolutePath);
   if (!buffer.byteLength) throw new Error('文件内容为空，无法解析。');
+  selection.abortSignal?.throwIfAborted();
+  const structureKey = createHash('sha256').update(buffer).digest('hex');
+  const cachedStructure = docxStructureCache.get(structureKey);
+  if (cachedStructure !== undefined) return cachedStructure + extracted;
   const structure = await inspectDocxTemplateBuffer(buffer);
   const rows = structure.rows.map((row) => (
     `表格行 ${row.index}: ${row.cells.map((cell, index) => `单元格${index + 1}=${cell ? JSON.stringify(cell) : '[空]'}`).join(' | ')}`
   ));
-  return [
+  const structureText = [
     '[DOCX 模板结构]',
     `包部件 ${structure.partCount}；节 ${structure.sectionCount}；表格 ${structure.tableCount}；段落 ${structure.paragraphCount}；样式 ${structure.styleCount}；关系 ${structure.relationshipCount}`,
     `视觉对象：绘图 ${structure.drawingCount}；文本框 ${structure.textBoxCount}；内容控件 ${structure.contentControlCount}；内嵌媒体 ${structure.mediaCount}`,
@@ -164,11 +171,22 @@ async function extractAttachmentText(attachment: FileReadableAttachment, absolut
     ] : []),
     '',
     '[DOCX 正文文本]',
-    extracted,
+    '',
   ].join('\n');
+  if (structureText.length <= 1_000_000) {
+    while (docxStructureCache.size && (docxStructureCache.size >= 16 || docxStructureCacheCharacters + structureText.length > 2_000_000)) {
+      const oldest = docxStructureCache.keys().next().value!;
+      docxStructureCacheCharacters -= docxStructureCache.get(oldest)!.length;
+      docxStructureCache.delete(oldest);
+    }
+    docxStructureCache.set(structureKey, structureText);
+    docxStructureCacheCharacters += structureText.length;
+  }
+  return structureText + extracted;
 }
 
-export async function readFileAttachment(input: {
+export async function readFileAttachment(input: FileTextSelection & {
+  abortSignal?: AbortSignal;
   attachment: FileReadableAttachment;
   absolutePath?: string;
   includeVisuals?: boolean;
@@ -182,6 +200,7 @@ export async function readFileAttachment(input: {
     return { ok: false, actual: `无法定位上传文件：${attachment.name}` };
   }
   try {
+    input.abortSignal?.throwIfAborted();
     const size = attachment.kind === 'tab' ? attachment.size : (await stat(input.absolutePath!)).size;
     const resolvedAttachment = size === attachment.size ? attachment : { ...attachment, size };
     if (attachment.kind !== 'tab' && size === 0) throw new Error('文件内容为空，无法解析。');
@@ -190,7 +209,9 @@ export async function readFileAttachment(input: {
       ? await readFile(input.absolutePath!)
       : undefined;
     const [content, visuals] = await Promise.all([
-      extractAttachmentText(resolvedAttachment, input.absolutePath, buffer),
+      extractAttachmentText(resolvedAttachment, input.absolutePath, buffer, {
+        sheet: input.sheet, range: input.range, contentPages: input.contentPages, section: input.section, abortSignal: input.abortSignal,
+      }),
       input.includeVisuals && buffer
         ? renderFilePreview({
             absolutePath: input.absolutePath!,
@@ -203,6 +224,7 @@ export async function readFileAttachment(input: {
         : undefined,
     ]);
     const offset = normalizedOffset(input.offset);
+    input.abortSignal?.throwIfAborted();
     const limit = normalizeFileReadLimit(input.limit);
     const slice = content.slice(offset, offset + limit);
     const nextOffset = offset + slice.length;

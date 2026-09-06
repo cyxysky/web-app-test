@@ -125,7 +125,10 @@ export async function POST(request: NextRequest) {
           extraRequestParameters: normalizeExtraRequestParameters(body.extraRequestParameters),
         };
       }
-      await store.saveModelConfig({ provider, providers: providersInput });
+      const providerOrder = body.providerOrder === undefined
+        ? undefined
+        : modelProviderDefinitionsForConfig(providersInput, body.providerOrder).map(({ value }) => value);
+      await store.saveModelConfig({ provider, providers: providersInput, providerOrder });
       await store.applyRuntimeEnv();
       return apiJson(request, { ok: true, ...await readModelSettingsState() });
     });

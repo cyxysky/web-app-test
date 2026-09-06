@@ -25,7 +25,7 @@ through `FileCapabilityOperations` and `@webpilot/capability-sdk`.
   generation, attachment reading, and bounded worker-based text extraction.
 
 The default converter runs local LibreOffice. Hosts may instead inject a remote
-conversion function, so consumers are not tied to WebPilot, AI SDK, or a local
+conversion function, so consumers are not tied to Orbit, AI SDK, or a local
 Office installation.
 
 ## Source, content, and visual reads
@@ -45,6 +45,30 @@ The model-facing actions deliberately use different names and identities:
 code to patch. Its limits count characters, not source lines; the default is
 8,000 characters, and an explicit smaller limit is honored. Page previews are
 opt-in (`includeVisuals: true`), not a side effect of ordinary text reads.
+
+Content reads can select `sheet` and an A1 `range` for spreadsheets, `contentPages`
+for one-based PDF text pages, or `section` for an exact, unique DOCX heading.
+`pages` retains its visual-preview meaning. Character offsets apply within the
+selected content. A range requires a sheet name for multi-sheet workbooks and is
+limited to 100,000 cells; ambiguous headings return an error instead of choosing one.
+
+Text extraction caches results by SHA-256, parser version and content selection.
+Changing only offset/limit reuses the extraction. Worker slots remain warm for
+`CPU_WORKER_IDLE_TIMEOUT_MS` (default 30 seconds). Limits are configurable through
+`CPU_WORKER_COUNT`, `CPU_WORKER_MAX_QUEUED`, `CPU_WORKER_QUEUE_TIMEOUT_MS`,
+`CPU_WORKER_TASK_TIMEOUT_MS`, `CPU_WORKER_MAX_FILE_BYTES`, `CPU_WORKER_MAX_HEAP_MB`
+and `CPU_WORKER_TEXT_CACHE_BYTES`. Queued reads support cancellation, and running
+reads release their slot only after worker cleanup. The worker ships in `runtime/`.
+
+UNO and JavaScript authoring, draft locks and per-origin downloads also use bounded,
+cancellable queues. Host resources, draft transactions, source editing, result
+formatting and visual QA are implemented in separate internal modules while keeping
+the existing workspace exports.
+
+`createNodeFileDownloadReceiver` accepts browser download streams and persists them
+under the run's `downloads/` directory. It does not refetch the source URL. The Node
+provider's default `readContent` reads artifacts within its run and explicitly
+registered attachments; a host `readFile` adapter can override that behavior.
 
 Source reads return one copy of the exact code, source coordinates, the patch
 digest, validation status and diagnostic counts. Use `includeDiagnostics: true`

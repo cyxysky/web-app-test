@@ -29,6 +29,9 @@
 }
 
 .browser-chat-onboarding-kicker {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
   color: var(--muted-strong);
   font-size: 12px;
   font-weight: 750;
@@ -70,6 +73,13 @@
   font: inherit;
   font-size: 13px;
   padding: 5px;
+}
+
+.browser-chat-empty-icon {
+  align-items: center;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 16px;
 }
 
 .browser-chat-tutorial-skip:hover { color: var(--foreground); }
@@ -590,6 +600,7 @@
 }
 
 .webpilot-help-drawer > header span { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .1em; text-transform: uppercase; }
+.webpilot-help-brand { align-items: center; display: inline-flex; gap: 8px; }
 .webpilot-help-drawer > header h2 { font-size: 20px; margin: 3px 0 0; }
 .webpilot-help-content { flex: 1 1 auto; overflow-y: auto; padding: 16px 24px; }
 .webpilot-help-content section { border-bottom: 1px solid color-mix(in srgb, var(--border) 74%, transparent); padding: 24px 0; }

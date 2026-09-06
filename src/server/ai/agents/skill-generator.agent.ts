@@ -159,6 +159,7 @@ export async function generateSkillFromBrowserHistory(input: {
     triggerPhrases: distinctText(generated.triggerPhrases, 8),
     content: {
       details: generated.content.details.trim(),
+      ...(generated.content.resources ? { resources: generated.content.resources } : {}),
     },
     sourceSessionId: input.sourceId,
   };

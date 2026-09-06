@@ -14,6 +14,7 @@ const {
 } = require('./webpilot-identity');
 const { createRealtimeRefreshHub } = require('./realtime-refresh-hub');
 const { startProcessMemoryMonitor } = require('./process-memory-monitor');
+const { applyOrbitEnvironment } = require('./orbit-environment');
 
 const DEVELOPMENT_CHILD_FLAG = '--development-child';
 const DEVELOPMENT_RESTART_EXIT_CODE = 77;
@@ -132,7 +133,7 @@ function applicationBasePath(dev, compiledConfig, environment = process.env) {
   // Next.js emits basePath into the route and client manifests at build time.
   // Production request and WebSocket routing must use that same value rather
   // than a possibly edited runtime .env file.
-  return normalizeBasePath(dev ? environment.WEBPILOT_BASE_PATH : compiledConfig?.basePath);
+  return normalizeBasePath(dev ? (environment.ORBIT_BASE_PATH ?? environment.WEBPILOT_BASE_PATH) : compiledConfig?.basePath);
 }
 
 function stripBasePath(pathname, basePath) {
@@ -143,11 +144,14 @@ function stripBasePath(pathname, basePath) {
 
 function publicPath(pathname) {
   return pathname === '/favicon.ico'
+    || pathname === '/icon.png'
+    || pathname === '/apple-icon.png'
     || pathname === '/robots.txt'
     || pathname.startsWith('/_next/')
     || pathname.startsWith('/assets/')
     || pathname === '/api/embed/browser-chat/init'
-    || pathname === '/embed/webpilot.js';
+    || pathname === '/embed/webpilot.js'
+    || pathname === '/embed/orbit.js';
 }
 
 function removeUntrustedProxyHeaders(request) {
@@ -560,6 +564,7 @@ function proxyUpgrade(request, clientSocket, head, port, targetPath) {
 }
 
 async function main() {
+  applyOrbitEnvironment();
   const dev = process.argv.includes('--dev');
   const runtimeChildMode = process.argv.includes('--runtime-child');
   configureNextDevelopmentRuntime(dev);
@@ -569,6 +574,8 @@ async function main() {
   const appDir = path.resolve(process.env.WEBPILOT_APP_DIR || process.cwd());
   const { loadEnvConfig, updateInitialEnv } = requireRuntimeDependency(appDir, '@next/env');
   loadEnvConfig(appDir, dev);
+  const orbitEnvironment = applyOrbitEnvironment();
+  updateInitialEnv(orbitEnvironment);
   // App modules may bundle another @next/env instance. Route all persisted
   // setting updates to the same snapshot used by this native Next server.
   globalThis[Symbol.for('webpilot.updateInitialRuntimeEnv')] = updateInitialEnv;

@@ -7,6 +7,8 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
+const { translateDesktopText } = require('./translations');
+const { product } = require('./product-brand');
 const {
   compiledServerBasePath,
   loadDevelopmentEnvironment,
@@ -20,13 +22,26 @@ if (!app.isPackaged) {
   // both processes use the same WEBPILOT_BASE_PATH and runtime settings.
   loadDevelopmentEnvironment(process.cwd());
 }
+const { applyOrbitEnvironment } = require(app.isPackaged
+  ? path.join(process.resourcesPath, 'server', 'orbit-environment.js')
+  : '../server/orbit-environment');
+applyOrbitEnvironment();
 
-const APP_NAME = 'WebPilot';
+const APP_NAME = product.name;
 const APP_TITLE = APP_NAME;
+let desktopLanguage = 'zh';
+const desktopText = (text, params) => translateDesktopText(desktopLanguage, text, params);
 const DEFAULT_PORT = 17890;
 const EMBEDDED_BROWSER_CDP_PORT = Number(process.env.WEBPILOT_ELECTRON_CDP_PORT || process.env.ELECTRON_EMBEDDED_BROWSER_CDP_PORT || 19333);
 
 app.setName(APP_NAME);
+// Keep existing desktop data and Chromium sessions when upgrading the product name.
+const legacyUserData = path.join(app.getPath('appData'), 'WebPilot');
+const orbitUserData = path.join(app.getPath('appData'), APP_NAME);
+const desktopUserData = fs.existsSync(legacyUserData) && !fs.existsSync(orbitUserData) ? legacyUserData : orbitUserData;
+fs.mkdirSync(desktopUserData, { recursive: true });
+app.setPath('userData', desktopUserData);
+app.setPath('sessionData', desktopUserData);
 app.commandLine.appendSwitch('remote-debugging-port', String(EMBEDDED_BROWSER_CDP_PORT));
 
 let serverProcess;
@@ -277,9 +292,9 @@ function embeddedBrowserPlaceholderUrl() {
   const html = [
     '<!doctype html>',
     '<html data-webpilot-embedded-browser="true">',
-    '<head><meta charset="utf-8"><title>新建标签页</title></head>',
+    `<head><meta charset="utf-8"><title>${desktopText('新建标签页')}</title></head>`,
     '<body style="margin:0;font:14px system-ui;background:#f8fafc;color:#334155;display:grid;place-items:center;height:100vh">',
-    '<div>新建标签页</div>',
+    `<div>${desktopText('新建标签页')}</div>`,
     '</body>',
     '</html>',
   ].join('');
@@ -670,7 +685,7 @@ async function chooseDownloadDirectory(input = {}) {
   const result = await dialog.showOpenDialog(mainWindow, {
     defaultPath,
     properties: ['openDirectory', 'createDirectory'],
-    title: '选择下载位置',
+    title: desktopText('选择下载位置'),
   });
   if (result.canceled || !result.filePaths?.[0]) return { ok: true, canceled: true };
   lastDownloadDirectory = result.filePaths[0];
@@ -780,8 +795,8 @@ async function openAppShellUrlInEmbeddedBrowser(url) {
 function embeddedBrowserTabTitle(webContents) {
   const url = webContents.getURL() || '';
   const title = webContents.getTitle() || '';
-  if (!url || /^data:text\/html/i.test(url) || /^WebPilot Embedded Browser$/i.test(title)) return '新建标签页';
-  return title || url || '新建标签页';
+  if (!url || /^data:text\/html/i.test(url) || /^(?:Orbit|WebPilot) Embedded Browser$/i.test(title)) return desktopText('新建标签页');
+  return title || url || desktopText('新建标签页');
 }
 
 function sanitizeEmbeddedBounds(bounds) {
@@ -1363,7 +1378,7 @@ function ensureEmbeddedBrowserGroup(input = {}) {
 }
 
 function createManualEmbeddedBrowserGroup(input = {}) {
-  const label = embeddedBrowserRecordTitle(input.label) || '新建标签组';
+  const label = embeddedBrowserRecordTitle(input.label) || desktopText('新建标签组');
   const id = `group:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
   ensureEmbeddedBrowserGroup({ groupId: id, label });
   setActiveEmbeddedBrowserGroup(id);
@@ -2191,24 +2206,24 @@ function showEmbeddedBrowserTabContextMenu(input = {}) {
     .filter((item) => item.id !== tab.id && !item.pinned);
   const menu = Menu.buildFromTemplate([
     {
-      label: '复制标签页',
+      label: desktopText('复制标签页'),
       click: () => duplicateEmbeddedBrowserTab(tab.id),
     },
     {
-      label: tab.pinned ? '取消固定标签页' : '固定标签页',
+      label: desktopText(tab.pinned ? '取消固定标签页' : '固定标签页'),
       click: () => setEmbeddedBrowserTabPinned({ id: tab.id, pinned: !tab.pinned }),
     },
     {
       enabled: closeableOtherTabs.length > 0,
-      label: '关闭其他标签页',
+      label: desktopText('关闭其他标签页'),
       click: () => closeOtherEmbeddedBrowserTabs(tab.id),
     },
     { type: 'separator' },
     {
       enabled: moveTargets.length > 0,
-      label: '移动到分组',
+      label: desktopText('移动到分组'),
       submenu: moveTargets.map((group) => ({
-        label: labels.get(group.id) || `标签组 ${String(group.sessionId || group.id).slice(-6)}`,
+        label: labels.get(group.id) || desktopText('标签组 {id}', { id: String(group.sessionId || group.id).slice(-6) }),
         click: () => moveEmbeddedBrowserTab({
           id: tab.id,
           position: 'end',
@@ -2234,6 +2249,20 @@ function registerIpcHandler(channel, handler, onError) {
 }
 
 function registerEmbeddedBrowserIpc() {
+  ipcMain.on('webpilot:system:language', (event, language) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents || !['zh', 'en'].includes(language)) return;
+    if (desktopLanguage === language) return;
+    desktopLanguage = language;
+    try {
+      getElectronStateDatabase().prepare(`
+        INSERT INTO electron_state (key, value_json, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+      `).run('interface-language', JSON.stringify(language), new Date().toISOString());
+    } catch (error) {
+      appendLog(`Language preference save failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    notifyEmbeddedBrowserStateChange();
+  });
   ipcMain.on('webpilot:embedded-browser:client-navigation', (event, payload = {}) => {
     const tab = embeddedBrowserTabForWebContents(event.sender);
     if (!tab) return;
@@ -2494,6 +2523,7 @@ async function startServer(appDataDir) {
     WEBPILOT_INTERNAL_SHUTDOWN_TOKEN: serverShutdownToken,
     WEBPILOT_DEFAULT_USER_ID: process.env.WEBPILOT_DEFAULT_USER_ID || '1',
     WEBPILOT_REQUIRE_MOUNT_USER_ID: 'false',
+    ORBIT_REQUIRE_MOUNT_USER_ID: 'false',
   };
 
   const args = [serverScript];
@@ -2602,7 +2632,7 @@ function createWindow() {
   }
   const loadingMark = loadingIconDataUrl
     ? `<img src="${loadingIconDataUrl}" alt="" />`
-    : '<span>W</span>';
+    : '<span>O</span>';
   const loadingHtml = `
     <style>
       * { box-sizing: border-box; }
@@ -2746,16 +2776,16 @@ function createWindow() {
         </div>
         <div>
           <div class="eyebrow">${APP_NAME}</div>
-          <h2>智能浏览器测试工作区</h2>
-          <p><span class="status-dot"></span><span id="startup-status">正在初始化工作区…</span></p>
+          <h2>${desktopText("智能浏览器测试工作区")}</h2>
+          <p><span class="status-dot"></span><span id="startup-status">${desktopText("正在初始化工作区…")}</span></p>
         </div>
-        <div class="slow-note" id="startup-slow">首次启动可能需要更长时间，请稍候。</div>
+        <div class="slow-note" id="startup-slow">${desktopText("首次启动可能需要更长时间，请稍候。")}</div>
         <div class="startup-error" id="startup-error">
-          <strong id="startup-error-message">启动失败</strong>
+          <strong id="startup-error-message">${desktopText("启动失败")}</strong>
           <div class="startup-actions">
-            <button onclick="location.href='webpilot-startup://retry'">重新启动</button>
-            <button onclick="location.href='webpilot-startup://logs'">查看日志</button>
-            <button onclick="location.href='webpilot-startup://quit'">退出</button>
+            <button onclick="location.href='webpilot-startup://retry'">${desktopText("重新启动")}</button>
+            <button onclick="location.href='webpilot-startup://logs'">${desktopText("查看日志")}</button>
+            <button onclick="location.href='webpilot-startup://quit'">${desktopText("退出")}</button>
           </div>
         </div>
       </main>
@@ -2771,8 +2801,8 @@ function createWindow() {
           },
           fail(message) {
             document.querySelector('.status-dot').style.background = '#d65c5c';
-            document.getElementById('startup-status').textContent = '未能完成启动';
-            document.getElementById('startup-error-message').textContent = message || '启动失败，请重试或查看日志。';
+            document.getElementById('startup-status').textContent = ${JSON.stringify(desktopText('未能完成启动'))};
+            document.getElementById('startup-error-message').textContent = message || ${JSON.stringify(desktopText('启动失败，请重试或查看日志。'))};
             document.getElementById('startup-error').classList.add('visible');
             document.getElementById('startup-slow').classList.remove('visible');
           },
@@ -2788,7 +2818,7 @@ async function updateStartupScreen(input) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   try {
     await startupScreenReady;
-    await mainWindow.webContents.executeJavaScript(`window.__webPilotStartup?.update(${JSON.stringify(input)})`);
+    await mainWindow.webContents.executeJavaScript(`window.__webPilotStartup?.update(${JSON.stringify({ ...input, message: desktopText(input.message || '') })})`);
   } catch {
     // Startup progress is cosmetic and must never prevent the app from opening.
   }
@@ -2821,6 +2851,12 @@ async function boot() {
   appendLog(`resourcesPath=${process.resourcesPath}`);
   appendLog(`WEBPILOT_ELECTRON_CDP_PORT=${EMBEDDED_BROWSER_CDP_PORT}`);
   if (restoreDownloadSettings()) appendLog(`Download directory restored: ${lastDownloadDirectory}`);
+  try {
+    const saved = getElectronStateDatabase().prepare('SELECT value_json FROM electron_state WHERE key = ?').get('interface-language');
+    desktopLanguage = saved && JSON.parse(saved.value_json) === 'en' ? 'en' : 'zh';
+  } catch (error) {
+    appendLog(`Language preference restore failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   createWindow();
   await updateStartupScreen({ message: '正在恢复浏览器工作区…', progress: 18 });
   const slowStartupTimer = setTimeout(() => {

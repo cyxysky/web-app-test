@@ -1,39 +1,39 @@
+# syntax=docker/dockerfile:1.7
 ARG WEBPILOT_CAPABILITY_SOURCE=workspace
+ARG ORBIT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
+
+FROM mcr.microsoft.com/playwright:v1.60.0-noble AS manifests
+RUN --mount=type=bind,target=/source node /source/scripts/stage-workspace-manifests.mjs /source /metadata
 
 FROM mcr.microsoft.com/playwright:v1.60.0-noble AS build
 
 WORKDIR /app
 
-ARG WEBPILOT_CAPABILITY_SOURCE
-ENV WEBPILOT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
+ARG ORBIT_CAPABILITY_SOURCE
+ENV WEBPILOT_CAPABILITY_SOURCE=${ORBIT_CAPABILITY_SOURCE}
 
 COPY package*.json ./
 COPY scripts/prepare-capability-install.mjs ./scripts/prepare-capability-install.mjs
-COPY packages/capability-sdk/package.json ./packages/capability-sdk/package.json
-COPY packages/capability-host/package.json ./packages/capability-host/package.json
-COPY packages/capability-adapter-ai-sdk/package.json ./packages/capability-adapter-ai-sdk/package.json
-COPY packages/capability-adapter-mcp/package.json ./packages/capability-adapter-mcp/package.json
-COPY packages/capability-browser/package.json ./packages/capability-browser/package.json
-COPY packages/capability-chart/package.json ./packages/capability-chart/package.json
-COPY packages/capability-file/package.json ./packages/capability-file/package.json
-COPY packages/capability-sensitive-data/package.json ./packages/capability-sensitive-data/package.json
+COPY --from=manifests /metadata/packages ./packages
 RUN if [ "$WEBPILOT_CAPABILITY_SOURCE" = "npm" ]; then node scripts/prepare-capability-install.mjs npm && npm install && cp package.json /tmp/webpilot-package.json && cp package-lock.json /tmp/webpilot-package-lock.json; else npm ci; fi
 
 COPY . .
 RUN if [ "$WEBPILOT_CAPABILITY_SOURCE" = "npm" ]; then cp /tmp/webpilot-package.json package.json && cp /tmp/webpilot-package-lock.json package-lock.json; else node scripts/prepare-capability-install.mjs workspace; fi
 RUN node scripts/stage-capability-runtime.mjs "$WEBPILOT_CAPABILITY_SOURCE"
-ARG WEBPILOT_BASE_PATH
-# The image includes .env. An explicitly supplied build argument can override
-# its base path, while an omitted argument leaves Next.js to load .env.
-RUN if [ -n "$WEBPILOT_BASE_PATH" ]; then WEBPILOT_BASE_PATH="$WEBPILOT_BASE_PATH" npm run build; else npm run build; fi
+ARG WEBPILOT_BASE_PATH=
+ARG ORBIT_BASE_PATH=${WEBPILOT_BASE_PATH}
+ARG ORBIT_BRAND_PREFIX=
+ARG ORBIT_BRAND_TEXT=Orbit
+# Only public build-time settings belong in the image. Runtime values arrive via env_file / --env-file.
+RUN ORBIT_BASE_PATH="$ORBIT_BASE_PATH" ORBIT_BRAND_PREFIX="$ORBIT_BRAND_PREFIX" ORBIT_BRAND_TEXT="$ORBIT_BRAND_TEXT" npm run build
 RUN npm prune --omit=dev
 
 FROM mcr.microsoft.com/playwright:v1.60.0-noble AS runner
 
 WORKDIR /app
 
-ARG WEBPILOT_CAPABILITY_SOURCE
-ENV WEBPILOT_CAPABILITY_SOURCE=${WEBPILOT_CAPABILITY_SOURCE}
+ARG ORBIT_CAPABILITY_SOURCE
+ENV WEBPILOT_CAPABILITY_SOURCE=${ORBIT_CAPABILITY_SOURCE}
 
 ARG GLINER_MODEL=fastino/gliner2.5-multi-v1
 ARG GLINER_CHINESE_NER_MODEL=uer/roberta-base-finetuned-cluener2020-chinese
@@ -83,8 +83,8 @@ ENV GLINER_BATCH_SIZE=8
 COPY --from=build /app/package*.json ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next
-COPY --from=build /app/.env ./.env
 COPY --from=build /app/next.config.ts ./next.config.ts
+COPY --from=build /app/electron/product.json /app/electron/product-brand.js ./electron/
 COPY --from=build /app/server ./server
 COPY --from=build /app/.capability-runtime/file ./capability-runtime/file
 COPY --from=build /app/.capability-runtime/browser ./capability-runtime/browser
@@ -98,4 +98,4 @@ EXPOSE 3000
 CMD ["node", "server/webpilot-server.js"]
 
 
-# docker build --platform linux/amd64 -t webpilot-qa:20260806 .
+# docker build --platform linux/amd64 -t orbit:20260806 .

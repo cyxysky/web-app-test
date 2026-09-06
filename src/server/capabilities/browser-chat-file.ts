@@ -26,7 +26,7 @@ import { createWebPilotFileWorkspace } from './webpilot-file-workspace';
 export type BrowserChatFileCapabilityOptions = {
   attachmentBindings?: FileAttachmentBinding[];
   currentPageUrl?: () => string;
-  readFile?: (input: FileReadInput) => Promise<BrowserActionResult>;
+  readFile?: (input: FileReadInput, context?: CapabilityExecutionContext) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: FileVisualToolInput) => Promise<BrowserActionResult>;
   visualInputAvailable: boolean;
 };
@@ -52,9 +52,10 @@ function createBrowserChatFileOperations(
       await workspace.listOfficeDrafts({ runId }),
       'file-list-failed',
     ),
-    read: async (input: FileToolInput) => {
+    read: async (input: FileToolInput, context: CapabilityExecutionContext) => {
       if (input.documentId) {
         return fileOperationToCapabilityResult(await workspace.readUnoDraft({
+          abortSignal: context.abortSignal,
           documentId: input.documentId,
           path: input.path,
           startLine: input.startLine,
@@ -77,7 +78,11 @@ function createBrowserChatFileOperations(
         limit: normalizeBrowserChatFileReadLimit(input.limit),
         offset: input.offset,
         pages: input.pages,
-      }));
+        sheet: input.sheet,
+        range: input.range,
+        contentPages: input.contentPages,
+        section: input.section,
+      }, context));
     },
     download: async (input: FileToolInput, context: CapabilityExecutionContext) => fileOperationToCapabilityResult(
       await workspace.downloadFileArtifact({
@@ -96,16 +101,17 @@ function createBrowserChatFileOperations(
       }, { abortSignal: context.abortSignal }),
       'file-convert-failed',
     ),
-    plan: async (input: FileToolInput) => fileOperationToCapabilityResult(
+    plan: async (input: FileToolInput, context: CapabilityExecutionContext) => fileOperationToCapabilityResult(
       await workspace.planFileArtifact({
+        abortSignal: context.abortSignal,
         ...input,
         runId,
         attachmentBindings: options.attachmentBindings,
       }),
       'file-plan-failed',
     ),
-    unoApi: async (input: FileToolInput) => fileOperationToCapabilityResult(
-      await workspace.getUnoApi({ ...input, runId }),
+    unoApi: async (input: FileToolInput, context: CapabilityExecutionContext) => fileOperationToCapabilityResult(
+      await workspace.getUnoApi({ ...input, runId, abortSignal: context.abortSignal }),
       'file-uno-api-failed',
     ),
     jsApi: async (input: FileToolInput) => fileOperationToCapabilityResult(

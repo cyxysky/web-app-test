@@ -7,7 +7,7 @@ credentials remain host-managed.
 
 The Node adapter includes:
 
-- a canonical HTTP webhook channel for services that accept WebPilot's standard
+- a canonical HTTP webhook channel for services that accept Orbit's standard
   `{ targets, content, metadata }` envelope;
 - a provider-neutral connector-operation channel for turning an MCP or other
   connector operation into an outbound channel;
@@ -62,3 +62,5 @@ Register this provider with `mountCapabilities()` and expose the resolved
 must keep credentials outside model input and approve `send` separately from
 draft creation. See the complete
 [TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
+The Node draft store imports version 2 `drafts.json` once into `drafts.db` and uses SQLite transactions to claim delivery across local processes. A sent draft returns its original receipt when called again. Failed or interrupted sends remain `unknown` (or `sending` after a crash); verify the remote receipt before creating a replacement. The draft id is passed as an idempotency key to channel context metadata and JSON webhooks. Custom stores must implement atomic `claimDelivery` and `finishDelivery` to send. Call `dispose()` when directly managing a store.

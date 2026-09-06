@@ -59,8 +59,9 @@ test('compiles multiple selected messages from one conversation', () => {
     assistantMessageIds: ['assistant-1', 'assistant-2'],
   });
 
-  assert.equal(compiled.operations.length, 2);
-  assert.deepEqual(compiled.operations.map((item) => item.index), [1, 2]);
+  assert.deepEqual(compiled.operations, []);
+  assert.equal(compiled.guidance, '1. 填写并提交\n2. 检查需求');
+  assert.equal(compiled.completionCriteria, '1. 创建成功\n2. 需求存在');
   assert.deepEqual(compiled.sourceMessageIds, ['user-1', 'assistant-1', 'user-2', 'assistant-2']);
   assert.match(compiled.instruction, /1\. 创建需求/);
   assert.match(compiled.instruction, /2\. 检查结果/);
@@ -72,8 +73,21 @@ test('does not include unselected messages from the same conversation', () => {
     assistantMessageIds: ['assistant-2'],
   });
 
-  assert.equal(compiled.operations.length, 1);
-  assert.equal(compiled.operations[0]?.input && (compiled.operations[0].input as { code?: string }).code, 'check()');
+  assert.deepEqual(compiled.operations, []);
+  assert.equal(compiled.guidance, '1. 检查需求');
+  assert.equal(compiled.completionCriteria, '1. 需求存在');
   assert.deepEqual(compiled.sourceMessageIds, ['user-2', 'assistant-2']);
   assert.equal(compiled.instruction, '检查结果');
+});
+
+test('supports content tasks without recorded tools and does not copy historical answers as results', () => {
+  const session = sessionFixture();
+  session.steps = [];
+  session.messages[0].content = '整理今天的行业新闻';
+  session.messages[1].content = '昨天的新闻汇总';
+  const task = compileConversationMessagesCase({ session, assistantMessageIds: ['assistant-1'] });
+  assert.equal(task.instruction, '整理今天的行业新闻');
+  assert.equal(task.guidance, '');
+  assert.deepEqual(task.operations, []);
+  assert.doesNotMatch(JSON.stringify(task), /昨天的新闻汇总/);
 });

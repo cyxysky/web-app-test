@@ -1,3 +1,4 @@
+import { hydrateBrowserChatContextSnapshot, splitBrowserChatContextSnapshot, markBrowserChatContextWritten } from './browser-chat-context-store';
 import type { EntityManager } from 'typeorm';
 import type { SkillRecord } from '@/server/ai/schemas/runtime.schema';
 import {
@@ -311,7 +312,6 @@ export async function markPersonalMemoryRecordsUsed<T extends PersonalMemoryReco
       .map((item) => ({
         ...item,
         lastUsedAt: timestamp,
-        updatedAt: timestamp,
         useCount: Math.max(0, Number(item.useCount) || 0) + 1,
       }));
     for (const item of items) await upsertPersonalMemoryRecord(manager, item);
@@ -355,7 +355,7 @@ export async function readBrowserChatSessionRecord<T extends { logs?: unknown[];
     readBrowserChatSteps(sessionId),
     readBrowserChatLogs(sessionId),
   ]);
-  return { ...snapshot, messages, steps, logs };
+  return { ...await hydrateBrowserChatContextSnapshot(sessionId, snapshot), messages, steps, logs };
 }
 
 export async function readBrowserChatSessionSummaries<T>(input: {
@@ -419,10 +419,12 @@ async function upsertSessionRows<
   removedStepIndexes?: number[];
   removedLogIds?: string[];
 }) {
+  const contextWrite = splitBrowserChatContextSnapshot(snapshot.id, snapshot);
   await executeDatabase(sessionUpsertSql, [
     snapshot.id, snapshot.userId || null, snapshot.title, snapshot.status,
-    JSON.stringify(snapshot), JSON.stringify(summary), snapshot.createdAt, snapshot.updatedAt,
+    JSON.stringify(contextWrite.snapshot), JSON.stringify(summary), snapshot.createdAt, snapshot.updatedAt,
   ], manager);
+  for (const statement of contextWrite.statements) await executeDatabase(statement.sql, statement.params, manager);
   for (const message of delta.messages || []) await executeDatabase(`
     INSERT INTO browser_chat_message (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
     ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json
@@ -453,6 +455,7 @@ export async function writeBrowserChatSessionRecord<
     await pruneBrowserChatRows(manager, 'browser_chat_step', 'step_index', snapshot.id, steps.map((step) => step.index));
     await pruneBrowserChatRows(manager, 'browser_chat_log', 'id', snapshot.id, logs.map((log) => log.id));
   });
+  markBrowserChatContextWritten(snapshot.id, snapshot);
 }
 
 type BrowserChatSessionDelta<
@@ -474,7 +477,8 @@ export function writeBrowserChatSessionDelta<
   TStep extends { index: number },
   TLog extends { id: string; messageId?: string; time: string },
 >(snapshot: TSnapshot, summary: unknown, delta: BrowserChatSessionDelta<TMessage, TStep, TLog>) {
-  return runDatabaseTransaction((manager) => upsertSessionRows(manager, snapshot, summary, delta));
+  return runDatabaseTransaction((manager) => upsertSessionRows(manager, snapshot, summary, delta))
+    .then(() => markBrowserChatContextWritten(snapshot.id, snapshot));
 }
 
 export async function readReferencedUploadPaths(userId?: string) {
@@ -497,13 +501,15 @@ export function writeBrowserChatSessionDeltaQueued<
   TStep extends { index: number },
   TLog extends { id: string; messageId?: string; time: string },
 >(snapshot: TSnapshot, summary: unknown, delta: BrowserChatSessionDelta<TMessage, TStep, TLog>) {
+  const contextWrite = splitBrowserChatContextSnapshot(snapshot.id, snapshot);
   const statements: DatabaseWriteStatement[] = [{
     sql: sessionUpsertSql,
     params: [
       snapshot.id, snapshot.userId || null, snapshot.title, snapshot.status,
-      JSON.stringify(snapshot), JSON.stringify(summary), snapshot.createdAt, snapshot.updatedAt,
+      JSON.stringify(contextWrite.snapshot), JSON.stringify(summary), snapshot.createdAt, snapshot.updatedAt,
     ],
   }];
+  statements.push(...contextWrite.statements);
   for (const message of delta.messages || []) statements.push({
     sql: `INSERT INTO browser_chat_message (session_id, id, time, record_json) VALUES (?, ?, ?, ?)
       ON CONFLICT(session_id, id) DO UPDATE SET time = excluded.time, record_json = excluded.record_json`,
@@ -522,7 +528,7 @@ export function writeBrowserChatSessionDeltaQueued<
   for (const id of delta.removedMessageIds || []) statements.push({ sql: 'DELETE FROM browser_chat_message WHERE session_id = ? AND id = ?', params: [snapshot.id, id] });
   for (const index of delta.removedStepIndexes || []) statements.push({ sql: 'DELETE FROM browser_chat_step WHERE session_id = ? AND step_index = ?', params: [snapshot.id, index] });
   for (const id of delta.removedLogIds || []) statements.push({ sql: 'DELETE FROM browser_chat_log WHERE session_id = ? AND id = ?', params: [snapshot.id, id] });
-  return queueDatabaseWrite(statements);
+  return queueDatabaseWrite(statements).then(() => markBrowserChatContextWritten(snapshot.id, snapshot));
 }
 
 async function pruneBrowserChatRows(

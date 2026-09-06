@@ -308,7 +308,7 @@ function weComRecentSessions(result: unknown) {
         : session?.chat_type === 'single'
           ? 'user' as const
           : undefined;
-      if (!id || !kind) return [];
+      if (!session || !id || !kind) return [];
       const name = typeof session.chat_name === 'string' ? session.chat_name.trim() : '';
       return [{ kind, id, ...(name ? { name } : {}) }];
     });
@@ -460,13 +460,13 @@ function sqliteDataDriver(): ExternalIntegrationDriver {
     id: 'sqlite',
     category: 'data',
     label: 'SQLite',
-    description: '连接 WebPilot 运行主机上的 SQLite 数据库文件。',
+    description: '连接 Orbit 运行主机上的 SQLite 数据库文件。',
     testLabel: '测试并读取表结构',
     fields: [
       {
         key: 'database',
         label: '数据库文件',
-        description: '填写运行 WebPilot 的这台主机上的 .db、.sqlite 或 .sqlite3 文件路径；桌面版可直接选择文件。',
+        description: '填写运行 Orbit 的这台主机上的 .db、.sqlite 或 .sqlite3 文件路径；桌面版可直接选择文件。',
         control: 'text',
         placeholder: 'C:\\data\\analytics.db',
         required: true,
@@ -487,7 +487,7 @@ function sqliteDataDriver(): ExternalIntegrationDriver {
     summarize(configuration) {
       return `${path.basename(configuration.database)} · ${configuration.access === 'read-write' ? '可写' : '只读'}`;
     },
-    async createDataSource(integration) {
+    async createDataSource(integration, timeoutMs) {
       const readOnly = integration.configuration.access !== 'read-write';
       const databaseStat = await stat(integration.configuration.database).catch(() => undefined);
       if (!databaseStat?.isFile()) throw new Error('找不到所选 SQLite 数据库文件。');
@@ -504,6 +504,7 @@ function sqliteDataDriver(): ExternalIntegrationDriver {
         name: integration.name,
         source,
         readOnly,
+        timeoutMs,
       });
       return {
         ...adapter,
@@ -588,7 +589,7 @@ function postgresDataDriver(): ExternalIntegrationDriver {
         password: integration.configuration.password,
         ssl: sslMode === 'disable' ? false : { rejectUnauthorized: sslMode === 'verify-full' },
         connectTimeoutMS: timeoutMs,
-        applicationName: 'WebPilot',
+        applicationName: 'Orbit',
         logging: false,
         synchronize: false,
       });
@@ -598,6 +599,7 @@ function postgresDataDriver(): ExternalIntegrationDriver {
         name: integration.name,
         source,
         readOnly,
+        timeoutMs,
       });
       return {
         ...adapter,
@@ -690,7 +692,7 @@ function jsonResearchDriver(): ExternalIntegrationDriver {
     },
     async test(integration, timeoutMs, abortSignal) {
       const results = await this.createResearchSearch!(integration, timeoutMs)(
-        { query: 'WebPilot', limit: 3 },
+        { query: 'Orbit', limit: 3 },
         { invocationId: `settings-test-${randomUUID()}`, abortSignal },
       );
       return {
@@ -707,7 +709,7 @@ function canonicalWebhookDriver(): ExternalIntegrationDriver {
     id: 'canonical-http-webhook',
     category: 'communication',
     label: '标准消息 Webhook',
-    description: '向能够接收 WebPilot 标准消息结构的 HTTP 服务发送消息。',
+    description: '向能够接收 Orbit 标准消息结构的 HTTP 服务发送消息。',
     testLabel: '发送测试消息',
     fields: [
       { key: 'endpoint', label: 'Webhook 地址', control: 'url', placeholder: 'https://example.com/webhook', required: true, secret: true },
@@ -744,7 +746,7 @@ function canonicalWebhookDriver(): ExternalIntegrationDriver {
         id: randomUUID(),
         channelId: integration.id,
         targets: [],
-        content: { format: 'text', title: 'WebPilot 渠道测试', body: '这是一条由管理员主动发送的 WebPilot 渠道测试消息。' },
+        content: { format: 'text', title: 'Orbit 渠道测试', body: '这是一条由管理员主动发送的 Orbit 渠道测试消息。' },
         metadata: { type: 'configuration-test' },
         createdAt: new Date().toISOString(),
       };
@@ -916,7 +918,7 @@ function weComAiBotDriver(): ExternalIntegrationDriver {
             targets: [target],
             content: {
               format: 'text',
-              body: 'WebPilot 企业微信发送渠道已连接成功。',
+              body: 'Orbit 企业微信发送渠道已连接成功。',
             },
             metadata: { type: 'configuration-test' },
             createdAt: new Date().toISOString(),

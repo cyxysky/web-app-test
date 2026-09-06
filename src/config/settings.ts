@@ -211,17 +211,26 @@ export function isModelProvider(value: unknown): value is ModelProvider {
     || isOpenAICompatibleProvider(provider);
 }
 
-export function modelProviderDefinitionsForConfig(providers?: object | null) {
+export function modelProviderDefinitionsForConfig(providers?: object | null, order?: unknown) {
   const known = new Set(modelProviderDefinitions.map((definition) => definition.value));
   const custom = Object.keys(providers || {})
     .filter((provider): provider is ModelProvider => isOpenAICompatibleProvider(provider) && !known.has(provider))
     .sort((left, right) => (
       (openAICompatibleProviderIndex(left) || 0) - (openAICompatibleProviderIndex(right) || 0)
     ));
-  return [
+  const definitions = [
     ...modelProviderDefinitions,
     ...custom.map((provider) => modelProviderDefinition(provider)),
   ];
+  const remaining = new Map(definitions.map((definition) => [definition.value, definition]));
+  const ordered: typeof definitions = [];
+  for (const value of Array.isArray(order) ? order : []) {
+    const definition = remaining.get(value);
+    if (!definition) continue;
+    ordered.push(definition);
+    remaining.delete(value);
+  }
+  return [...ordered, ...remaining.values()];
 }
 
 export const defaultModelByProvider = modelProviderDefinitions.reduce((acc, item) => {
@@ -319,6 +328,10 @@ const applicationRuntimeEnvDefinitions: RuntimeEnvDefinition[] = [
   { key: 'AI_PERSONAL_MEMORY_PROMPT_MAX_CHARS', label: '个性化记忆注入字符预算', description: '单轮注入提示词的记忆字符预算，只限制本次 AI 上下文，不截断数据库保存的原文。', tab: 'runtime', defaultValue: '12000', control: 'number', min: 1000, max: 120000, step: 1000 },
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_CONCURRENCY', label: '记忆提取并发数', description: '不同用户可并发提取记忆的全局上限；同一用户始终串行，避免并发写入相互覆盖。', tab: 'runtime', defaultValue: '2', control: 'number', min: 1, max: 8, step: 1 },
   { key: 'AI_PERSONAL_MEMORY_EXTRACTION_QUEUE_LIMIT', label: '记忆提取队列上限', description: '等待提取的对话轮次上限；同一会话轮次会自动去重。', tab: 'runtime', defaultValue: '100', control: 'number', min: 10, max: 1000, step: 10 },
+  { key: 'AI_CONTEXT_MODEL_PROFILES', label: '模型上下文配置', description: 'JSON：按 provider/model 或 model 配置 windowTokens、outputReserveTokens、imageTokens。仅用于上下文预算，不会添加生成长度参数。例如 {"openai-compatible-2/minimax-m3":{"windowTokens":1000000,"outputReserveTokens":524288}}。', tab: 'runtime', defaultValue: '{}', control: 'textarea' },
+  { key: 'AI_CONTEXT_COMPRESSION_TRIGGER_TOKENS', label: '上下文压缩触发量', description: '工作上下文达到此估算 token 数时整理任务状态；实际触发量不会超过模型安全输入预算。', tab: 'runtime', defaultValue: '200000', control: 'number' },
+  { key: 'AI_CONTEXT_COMPRESSION_TARGET_RATIO', label: '压缩后建议比例', description: '相对于触发量的建议比例，范围 0–1。优先保留任务信息，不为凑比例截断约束；系统提示和刚读取的必要内容可能使结果高于建议量。', tab: 'runtime', defaultValue: '0.25', control: 'number', min: 0.01, max: 0.99, step: 0.01 },
+  { key: 'AI_CONTEXT_SKILL_INLINE_TOKENS', label: 'Skill 全文保留阈值', description: '压缩时优先完整保留小于此估算 token 数的有效 Skill；较大 Skill 保留引用，使用前重新读取。', tab: 'runtime', defaultValue: '2000', control: 'number' },
   { key: 'AI_CONTEXT_WINDOW_TOKENS', label: '上下文窗口大小', description: '估算模型上下文窗口大小。', tab: 'runtime', defaultValue: '256000', control: 'number' },
   { key: 'AI_GLM_CONTEXT_WINDOW_TOKENS', label: 'GLM 上下文窗口大小', description: 'GLM 模型使用的上下文窗口估算值；默认 1000000，覆盖通用上下文窗口配置。', tab: 'runtime', defaultValue: '1000000', control: 'number' },
   { key: 'AI_IMAGE_CONTEXT_ESTIMATE_TOKENS', label: '单张图片估算 Token', description: '估算每张截图占用的上下文 token。', tab: 'runtime', defaultValue: '1200', control: 'number' },

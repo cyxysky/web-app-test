@@ -1,106 +1,33 @@
+import { acquireSharedBrowser, connectOrLaunchPersistentBrowserOverCdp, launchPersistentContextWithBrowserCodeConnection, connectExistingBrowserOverCdp, launchBrowserServerWithConnection, sleep, closeConnectedBrowserProcess, type BrowserOwnership } from './browser-shared-runtime.js';
+import { BrowserDownloadManager, type BrowserDownloadReceiver, type BrowserDownloadResult } from './browser-downloads.js';
+import { BrowserStateReader, type BrowserStateReadOptions } from './browser-state-reader.js';
+import { BrowserSessionScheduler } from './browser-session-scheduler.js';
+import { BrowserNetworkDiagnostics } from './browser-network-diagnostics.js';
 import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+
 import { randomUUID } from 'node:crypto';
-import { createConnection, createServer } from 'node:net';
-import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, BrowserType, ConsoleMessage, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Request, Response, Worker as PlaywrightWorker } from 'playwright';
+
+import type { Browser, BrowserContext, BrowserContextOptions, BrowserServer, ConsoleMessage, Dialog, Download as PlaywrightDownload, ElementHandle, FileChooser, Frame, LaunchOptions, Locator, Page, Worker as PlaywrightWorker } from 'playwright';
 import { raceWithAbort, type CapabilityConfiguration } from '@webpilot/capability-sdk';
-import {
-  resolveBrowserOutputPixelRatio,
-  resolveBrowserPreviewImageFormat,
-} from '../output-settings.js';
+import { resolveBrowserOutputPixelRatio, resolveBrowserPreviewImageFormat } from '../output-settings.js';
 import { browserSessionGroupLabel } from '../session-group.js';
 import { browserPreviewFrameIntervalMs, browserPreviewFramesPerSecond } from './browser-preview-cadence.js';
-import {
-  BrowserPreviewFramePump,
-  type BrowserPreviewFramePumpMetrics,
-} from './browser-preview-frame-pump.js';
+import { BrowserPreviewFramePump, type BrowserPreviewFramePumpMetrics } from './browser-preview-frame-pump.js';
 import { browserPreviewVideoMaximumDimensions } from './browser-preview-video-settings.js';
-import {
-  boundedNonNegativeIntegerEnv,
-  boundedPositiveIntegerEnv,
-  browserHeadlessEnabled,
-  browserTabTitlePrefixEnabled,
-  cdpEndpointForPort,
-  cdpPortFromEndpoint,
-  electronEmbeddedBrowserCdpEndpoint,
-  electronEmbeddedBrowserEnabled,
-  clearManagedBrowserProfileCaches,
-  normalizePageGroupId,
-  numericLimitFromEnv,
-  positiveIntegerEnv,
-  sessionTabGrouperDebugPort,
-  sessionTabGrouperEnabled,
-  sessionTabGrouperProfileDir,
-  sharedBrowserTabsEnabled,
-  withSessionTabGrouperArgs,
-  type BrowserRuntimeEnvironment,
-} from './browser-session-runtime.js';
-import type {
-  BrowserPageObservation,
-} from './browser-page-observation.js';
-import {
-  applyEditableTextSelection,
-  readEditableText,
-  resolveEditableTextSelection,
-  type BrowserTextSelectionSpec,
-} from './editable-text-selection.js';
-import {
-  buildSnapshotViews,
-  captureAxSnapshot,
-  snapshotRoleIsActionable,
-  type CapturedSnapshotFrame,
-  type SnapshotNodeWithUid,
-  type SnapshotRecord,
-  type SnapshotView,
-} from './ax-snapshot.js';
+import { boundedNonNegativeIntegerEnv, boundedPositiveIntegerEnv, browserHeadlessEnabled, browserTabTitlePrefixEnabled, cdpEndpointForPort, electronEmbeddedBrowserCdpEndpoint, electronEmbeddedBrowserEnabled, clearManagedBrowserProfileCaches, normalizePageGroupId, numericLimitFromEnv, positiveIntegerEnv, sessionTabGrouperDebugPort, sessionTabGrouperEnabled, sessionTabGrouperProfileDir, sharedBrowserTabsEnabled, withSessionTabGrouperArgs, type BrowserRuntimeEnvironment } from './browser-session-runtime.js';
+import type { BrowserPageObservation } from './browser-page-observation.js';
+import { applyEditableTextSelection, readEditableText, resolveEditableTextSelection, type BrowserTextSelectionSpec } from './editable-text-selection.js';
+import { buildSnapshotViews, captureAxSnapshot, snapshotRoleIsActionable, type CapturedSnapshotFrame, type SnapshotNodeWithUid, type SnapshotRecord, type SnapshotView } from './ax-snapshot.js';
 import { captureDomSnapshot } from './dom-snapshot.js';
-import {
-  BROWSER_CODE_KERNEL_RUNTIME_REVISION,
-  browserCodePolicyViolation,
-  browserCodeReportedFailure,
-  BrowserCodeKernel,
-  type BrowserCodeAttachmentBinding,
-  type BrowserCodeActivity,
-  type BrowserCodeConnection,
-  type BrowserCodeCredentialBinding,
-  type BrowserCodeRuntimeStateOperation,
-  type BrowserCodeUidReference,
-} from './browser-code-runner.js';
+import { BROWSER_CODE_KERNEL_RUNTIME_REVISION, browserCodePolicyViolation, browserCodeReportedFailure, BrowserCodeKernel, type BrowserCodeAttachmentBinding, type BrowserCodeActivity, type BrowserCodeConnection, type BrowserCodeCredentialBinding, type BrowserCodeRuntimeStateOperation, type BrowserCodeUidReference } from './browser-code-runner.js';
 import { resolveBrowserSessionSurface, type BrowserSessionSurface } from './browser-session-surface.js';
-import {
-  compactDiagnosticText,
-  isAlreadyHandledJavaScriptDialogError,
-  shouldIgnoreConsoleError,
-  shouldIgnoreNetworkFailure,
-  snapshotFrameUrl,
-  stringifyDiagnosticValue,
-  unknownErrorMessage,
-} from './browser-session-diagnostics.js';
+import { compactDiagnosticText, isAlreadyHandledJavaScriptDialogError, shouldIgnoreConsoleError, snapshotFrameUrl, stringifyDiagnosticValue, unknownErrorMessage } from './browser-session-diagnostics.js';
 import { isBlankBrowserUrlLike, isBlankPage } from './browser-session-page-policy.js';
-import {
-  AI_DOM_RUNTIME_VERSION,
-  applyPageGroupMarker,
-  collectAiDomObservation,
-  installAccessibilitySnapshotExportControl,
-  installAiBrowserPageRuntime,
-} from './browser-page-runtime.js';
-import {
-  domObservationPageCharLimit,
-  domObservationPageStarts,
-  parseDomObservationCursor,
-  readDomObservationPage,
-  type DomObservationPageRecord,
-} from './browser-dom-observation-pagination.js';
-import {
-  resolveBrowserSessionTransportAdapter,
-  type BrowserSessionTransportKind,
-} from './browser-session-transport-adapter.js';
-import {
-  closeManagedBrowserSessions,
-  registerBrowserSession,
-  unregisterBrowserSession,
-} from './browser-session-lifecycle.js';
+import { AI_DOM_RUNTIME_VERSION, applyPageGroupMarker, collectAiDomObservation, installAccessibilitySnapshotExportControl, installAiBrowserPageRuntime } from './browser-page-runtime.js';
+import { domObservationPageCharLimit, domObservationPageStarts, parseDomObservationCursor, readDomObservationPage, type DomObservationPageRecord } from './browser-dom-observation-pagination.js';
+import { resolveBrowserSessionTransportAdapter, type BrowserSessionTransportKind } from './browser-session-transport-adapter.js';
+import { closeManagedBrowserSessions, registerBrowserSession, unregisterBrowserSession } from './browser-session-lifecycle.js';
 
 
 const DEFAULT_SCREENSHOT_TIMEOUT_MS = 15000;
@@ -153,6 +80,7 @@ export type BrowserSessionOptions = {
 };
 
 export type BrowserSessionHost = {
+  receiveDownload?: BrowserDownloadReceiver;
   artifactPath?: (runId: string) => string;
   runtimeState?: (
     sessionId: string,
@@ -978,6 +906,7 @@ export type BrowserLiveDialog = {
 };
 
 export type BrowserLiveDownload = {
+  artifactId?: string;
   bytes?: number;
   error?: string;
   fileName: string;
@@ -1049,19 +978,7 @@ type ManualVerificationDetails = {
   captchaAppearsFilled?: boolean;
 };
 
-type HttpRequestRecord = {
-  id: string;
-  sequence: number;
-  startedAt: string;
-  method: string;
-  url: string;
-  resourceType: string;
-  status?: number;
-  statusText?: string;
-  ok?: boolean;
-  failed?: boolean;
-  errorText?: string;
-};
+
 
 type InterActionChangeJournal = {
   id: string;
@@ -1093,10 +1010,6 @@ const manualVerificationTextPatterns = [
   /拖动滑块|滑块验证/,
   /身份验证/,
 ];
-
-
-type BrowserOwnership = 'launched' | 'connected' | 'persistent' | 'shared';
-type SharedBrowserOwnership = Exclude<BrowserOwnership, 'shared'>;
 
 export type BrowserTabSnapshot = {
   id: string;
@@ -1150,15 +1063,6 @@ type NativeTabGroupActivation = {
   lookup?: NativeTabGroupLookup;
 };
 
-type SharedBrowserLease = {
-  browser?: Browser;
-  browserServer?: BrowserServer;
-  browserCodeConnection: BrowserCodeConnection;
-  context: BrowserContext;
-  ownership: SharedBrowserOwnership;
-  release: (force?: boolean) => Promise<void>;
-};
-
 const preparedContextInitScripts = new WeakSet<BrowserContext>();
 const sharedPageOwners = new WeakMap<Page, string>();
 const livePreviewVisibilityRuntime = ((globalThis as typeof globalThis & {
@@ -1186,61 +1090,8 @@ function installLivePreviewVisibilityReporter() {
   document.addEventListener('visibilitychange', report, { passive: true });
   report();
 }
-type SharedBrowserState = {
-  key?: string;
-  browser?: Browser;
-  browserServer?: BrowserServer;
-  browserCodeConnection?: BrowserCodeConnection;
-  context?: BrowserContext;
-  ownership?: SharedBrowserOwnership;
-  refCount: number;
-  initPromise?: Promise<{
-    browser?: Browser;
-    browserServer?: BrowserServer;
-    browserCodeConnection: BrowserCodeConnection;
-    context: BrowserContext;
-    ownership: SharedBrowserOwnership;
-  }>;
-  idleTimer?: ReturnType<typeof setTimeout>;
-  closingPromise?: Promise<void>;
-  generation: number;
-  lifecycle: 'idle' | 'initializing' | 'ready' | 'closing' | 'failed';
-  managedProfileDir?: string;
-  environment?: BrowserRuntimeEnvironment;
-};
 
 export type BrowserSessionLifecycleState = 'idle' | 'starting' | 'ready' | 'closing' | 'closed' | 'failed';
-const sharedBrowserStates = ((globalThis as typeof globalThis & {
-  __webPilotSharedBrowserStates?: Map<string, SharedBrowserState>;
-}).__webPilotSharedBrowserStates ??= new Map<string, SharedBrowserState>());
-
-function sharedBrowserStateFor(runtimeKey: string) {
-  let state = sharedBrowserStates.get(runtimeKey);
-  if (!state) {
-    state = { generation: 0, lifecycle: 'idle', refCount: 0 };
-    sharedBrowserStates.set(runtimeKey, state);
-  }
-  state.generation ??= 0;
-  state.lifecycle ??= state.context ? 'ready' : state.initPromise ? 'initializing' : 'idle';
-  return state;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 async function timedBrowserStep<T>(
   timings: Record<string, number> | undefined,
@@ -1274,533 +1125,6 @@ async function mapWithConcurrency<T, TResult>(
   return results;
 }
 
-function sharedBrowserKey(input: {
-  cdpEndpoint: string;
-  userDataDir: string;
-  launchOptions: LaunchOptions;
-  contextOptions: BrowserContextOptions;
-}) {
-  if (input.cdpEndpoint) return `cdp:${input.cdpEndpoint}`;
-  if (input.userDataDir) return `persistent:${path.resolve(input.userDataDir)}`;
-  return `launch:${JSON.stringify({ launch: input.launchOptions, context: input.contextOptions })}`;
-}
-
-async function availableLoopbackPort() {
-  const server = createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => resolve());
-  });
-  const address = server.address();
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-  if (!address || typeof address === 'string') throw new Error('Unable to allocate a browserCode CDP port.');
-  return address.port;
-}
-
-async function launchPersistentContextWithBrowserCodeConnection(input: {
-  chromium: BrowserType;
-  userDataDir: string;
-  launchOptions: LaunchOptions;
-  contextOptions: BrowserContextOptions;
-}) {
-  const port = await availableLoopbackPort();
-  const endpoint = cdpEndpointForPort(port);
-  const context = await input.chromium.launchPersistentContext(input.userDataDir, {
-    ...input.launchOptions,
-    ...input.contextOptions,
-    args: [
-      ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
-      `--remote-debugging-port=${port}`,
-    ],
-  });
-  return {
-    browser: context.browser() || undefined,
-    browserCodeConnection: { protocol: 'cdp', endpoint } satisfies BrowserCodeConnection,
-    context,
-    ownership: 'persistent' as const,
-  };
-}
-
-async function launchBrowserServerWithConnection(input: {
-  chromium: BrowserType;
-  launchOptions: LaunchOptions;
-  contextOptions: BrowserContextOptions;
-}) {
-  const port = await availableLoopbackPort();
-  const cdpEndpoint = cdpEndpointForPort(port);
-  const browserServer = await input.chromium.launchServer({
-    ...input.launchOptions,
-    args: [
-      ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
-      `--remote-debugging-port=${port}`,
-    ],
-  });
-  const endpoint = browserServer.wsEndpoint();
-  try {
-    const browser = await input.chromium.connect(endpoint);
-    const context = await browser.newContext(input.contextOptions);
-    return {
-      browser,
-      browserServer,
-      browserCodeConnection: { protocol: 'cdp', endpoint: cdpEndpoint } satisfies BrowserCodeConnection,
-      context,
-      ownership: 'launched' as const,
-    };
-  } catch (error) {
-    await browserServer.close().catch(() => undefined);
-    throw error;
-  }
-}
-
-async function connectExistingBrowserOverCdp(input: {
-  chromium: BrowserType;
-  endpoint: string;
-  contextOptions: BrowserContextOptions;
-  timeoutMs?: number;
-}) {
-  if (!input.endpoint) return undefined;
-  const browser = await input.chromium.connectOverCDP(input.endpoint, { timeout: input.timeoutMs || 800 });
-  const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
-  return {
-    browser,
-    browserCodeConnection: { protocol: 'cdp', endpoint: input.endpoint } satisfies BrowserCodeConnection,
-    context,
-    ownership: 'connected' as const,
-  };
-}
-
-async function tryConnectExistingBrowserOverCdp(input: Parameters<typeof connectExistingBrowserOverCdp>[0]) {
-  try {
-    return {
-      connection: await connectExistingBrowserOverCdp(input),
-      error: '',
-    };
-  } catch (error) {
-    return {
-      connection: undefined,
-      error: unknownErrorMessage(error).replace(/\s+/g, ' ').trim().slice(0, 2_000),
-    };
-  }
-}
-
-async function tcpEndpointIsListening(endpoint: string) {
-  let url: URL;
-  try {
-    url = new URL(endpoint);
-  } catch {
-    return false;
-  }
-  const port = Number(url.port);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return false;
-  return new Promise<boolean>((resolve) => {
-    const socket = createConnection({ host: url.hostname, port });
-    let settled = false;
-    const finish = (listening: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(listening);
-    };
-    socket.setTimeout(600);
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
-    socket.once('timeout', () => finish(false));
-  });
-}
-
-async function windowsPersistentChromeDiagnostics(userDataDir: string, port: number) {
-  if (process.platform !== 'win32') return '';
-  const script = [
-    '$ErrorActionPreference = "Stop"',
-    '$diagnosticProfile = [IO.Path]::GetFullPath($env:WEBPILOT_CHROME_DIAGNOSTIC_PROFILE)',
-    '$port = [int]$env:WEBPILOT_CHROME_DIAGNOSTIC_PORT',
-    '$profileProcesses = @(Get-CimInstance Win32_Process | Where-Object {',
-    '  ($_.Name -eq "chrome.exe" -or $_.Name -eq "chromium.exe") -and',
-    '  $_.CommandLine -and $_.CommandLine.IndexOf($diagnosticProfile, [StringComparison]::OrdinalIgnoreCase) -ge 0',
-    '} | ForEach-Object {',
-    '  $match = [regex]::Match($_.CommandLine, "--remote-debugging-port(?:=|\\s+)(\\d+)")',
-    '  [pscustomobject]@{ processId = $_.ProcessId; cdpPort = $(if ($match.Success) { [int]$match.Groups[1].Value } else { $null }) }',
-    '})',
-    '$listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | ForEach-Object {',
-    '  [pscustomobject]@{ address = $_.LocalAddress; processId = $_.OwningProcess }',
-    '})',
-    '[pscustomobject]@{ profileProcesses = $profileProcesses; expectedPortListeners = $listeners } | ConvertTo-Json -Compress -Depth 4',
-  ].join('\n');
-  const encodedScript = Buffer.from(script, 'utf16le').toString('base64');
-  return new Promise<string>((resolve) => {
-    const diagnosticProcess = spawn('powershell.exe', [
-      '-NoLogo',
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy',
-      'Bypass',
-      '-EncodedCommand',
-      encodedScript,
-    ], {
-      env: {
-        ...process.env,
-        WEBPILOT_CHROME_DIAGNOSTIC_PORT: String(port),
-        WEBPILOT_CHROME_DIAGNOSTIC_PROFILE: userDataDir,
-      },
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-    });
-    let output = '';
-    const timer = setTimeout(() => {
-      diagnosticProcess.kill();
-      resolve('');
-    }, 5_000);
-    timer.unref?.();
-    diagnosticProcess.stdout?.on('data', (chunk: Buffer) => {
-      output = `${output}${chunk.toString('utf8')}`.slice(-12_000);
-    });
-    diagnosticProcess.once('error', () => {
-      clearTimeout(timer);
-      resolve('');
-    });
-    diagnosticProcess.once('exit', () => {
-      clearTimeout(timer);
-      resolve(output.trim());
-    });
-  });
-}
-
-function externalChromiumExecutablePath(chromium: BrowserType, launchOptions: LaunchOptions) {
-  const explicit = typeof launchOptions.executablePath === 'string' ? launchOptions.executablePath.trim() : '';
-  if (explicit) return explicit;
-  if (launchOptions.channel) {
-    throw new Error('BROWSER_CHANNEL cannot be used with automatic tab-group reuse unless AI_WEB_TEST_CHROMIUM_EXECUTABLE_PATH points to the browser executable.');
-  }
-  return chromium.executablePath();
-}
-
-async function connectOrLaunchPersistentBrowserOverCdp(input: {
-  chromium: BrowserType;
-  endpoint: string;
-  userDataDir: string;
-  launchOptions: LaunchOptions;
-  contextOptions: BrowserContextOptions;
-  environment: BrowserRuntimeEnvironment;
-}) {
-  const connectTimeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_CONNECT_TIMEOUT_MS', 1_200, 500, 10_000, input.environment);
-  const connectErrors: string[] = [];
-  const connect = async () => {
-    const attempt = await tryConnectExistingBrowserOverCdp({
-      chromium: input.chromium,
-      endpoint: input.endpoint,
-      contextOptions: input.contextOptions,
-      timeoutMs: connectTimeoutMs,
-    });
-    if (attempt.error && connectErrors.at(-1) !== attempt.error) connectErrors.push(attempt.error);
-    return attempt.connection;
-  };
-  const existing = await connect();
-  if (existing) return existing;
-
-  const port = cdpPortFromEndpoint(input.endpoint);
-  if (!port) throw new Error(`Automatic tab-group browser reuse needs a CDP port endpoint, got: ${input.endpoint || '[empty]'}`);
-  const timeoutMs = boundedPositiveIntegerEnv('BROWSER_CDP_LAUNCH_TIMEOUT_MS', 15_000, 3_000, 120_000, input.environment);
-
-  if (await tcpEndpointIsListening(input.endpoint)) {
-    const existingDeadline = Date.now() + timeoutMs;
-    while (Date.now() < existingDeadline) {
-      const connected = await connect();
-      if (connected) return connected;
-      await sleep(250);
-    }
-    const windowsDiagnostics = await windowsPersistentChromeDiagnostics(input.userDataDir, port);
-    throw new Error([
-      `The expected Chrome CDP port ${input.endpoint} is already listening but did not complete a Playwright CDP handshake.`,
-      `profile=${input.userDataDir}`,
-      connectErrors.length ? `cdpConnectErrors=${JSON.stringify(connectErrors.slice(-3))}` : '',
-      windowsDiagnostics ? `chromeProcessDiagnostics=${windowsDiagnostics}` : '',
-      'A second Chrome was not launched because the expected port is already occupied. Inspect the listener process and its remote-debugging configuration.',
-    ].filter(Boolean).join('\n'));
-  }
-
-  const executablePath = externalChromiumExecutablePath(input.chromium, input.launchOptions);
-  const launchArgs = [
-    ...(input.launchOptions.args || []).filter((arg) => !/^--remote-debugging-(?:pipe|port)(?:=|$)/.test(arg)),
-    `--user-data-dir=${input.userDataDir}`,
-    `--remote-debugging-port=${port}`,
-    '--no-startup-window',
-  ];
-  const launchLogPath = path.join(input.userDataDir, 'chrome-cdp-launch.log');
-  let launchLogOffset = 0;
-  let launchLogHandle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    launchLogHandle = await open(launchLogPath, 'a+');
-    launchLogOffset = (await launchLogHandle.stat()).size;
-    await launchLogHandle.write(`\n[${new Date().toISOString()}] launch endpoint=${input.endpoint}\n`);
-  } catch {
-    await launchLogHandle?.close().catch(() => undefined);
-    launchLogHandle = undefined;
-  }
-
-  let launchError = '';
-  let launchExit = '';
-  let child: ReturnType<typeof spawn>;
-  try {
-    child = spawn(executablePath, launchArgs, {
-      detached: true,
-      stdio: ['ignore', 'ignore', launchLogHandle ? launchLogHandle.fd : 'ignore'],
-      windowsHide: false,
-    });
-  } catch (error) {
-    await launchLogHandle?.close().catch(() => undefined);
-    throw new Error(`Failed to launch test Chrome for tab-group reuse: ${unknownErrorMessage(error)}`);
-  }
-  await launchLogHandle?.close().catch(() => undefined);
-  child.once('error', (error) => {
-    launchError = unknownErrorMessage(error);
-  });
-  child.once('exit', (code, signal) => {
-    launchExit = `code=${code ?? 'none'}, signal=${signal || 'none'}`;
-  });
-  child.unref();
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!launchError) {
-      const connected = await connect();
-      if (connected) return connected;
-    }
-    if (launchError) break;
-    await sleep(250);
-  }
-
-  const [expectedPortListening, windowsDiagnostics, launchLog] = await Promise.all([
-    tcpEndpointIsListening(input.endpoint),
-    windowsPersistentChromeDiagnostics(input.userDataDir, port),
-    readFile(launchLogPath, 'utf8')
-      .then((content) => content.slice(launchLogOffset).trim().slice(-4_000))
-      .catch(() => ''),
-  ]);
-  throw new Error([
-    `Failed to connect to persistent test Chrome at ${input.endpoint}.`,
-    `profile=${input.userDataDir}`,
-    `executable=${executablePath}`,
-    child.pid ? `launchedPid=${child.pid}` : '',
-    launchError ? `launchError=${launchError}` : '',
-    launchExit ? `launchExit=${launchExit}` : '',
-    `expectedPortListening=${expectedPortListening}`,
-    connectErrors.length ? `cdpConnectErrors=${JSON.stringify(connectErrors.slice(-3))}` : '',
-    windowsDiagnostics ? `chromeProcessDiagnostics=${windowsDiagnostics}` : '',
-    launchLog ? `chromeLaunchLog=${launchLog}` : '',
-    expectedPortListening
-      ? 'The expected port is listening but did not complete a Playwright CDP handshake; inspect chromeProcessDiagnostics for a port-owner or stale-process conflict.'
-      : 'No CDP listener appeared before the launch timeout; inspect launchExit and chromeLaunchLog for a profile lock or Chrome startup failure.',
-  ].filter(Boolean).join('\n'));
-}
-
-function isPersistentProfileAlreadyOpenError(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /Target page, context or browser has been closed|browser session|user data directory|profile.*in use|already.*open/i.test(message);
-}
-
-async function closeConnectedBrowserProcess(browser?: Browser) {
-  if (!browser) return false;
-  const client = await browser.newBrowserCDPSession().catch(() => undefined);
-  if (!client) return false;
-  const closed = await Promise.race([
-    client.send('Browser.close').then(() => true).catch(() => false),
-    sleep(1000).then(() => false),
-  ]);
-  await Promise.race([
-    client.detach().catch(() => undefined),
-    sleep(500),
-  ]);
-  return closed;
-}
-
-async function closeIdleSharedBrowser(runtimeKey: string, sharedBrowserState: SharedBrowserState, force = false) {
-  if (sharedBrowserState.refCount > 0) {
-    if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
-    sharedBrowserState.idleTimer = undefined;
-    return;
-  }
-  const environment = sharedBrowserState.environment || process.env;
-  const closeImmediately = force || environment.BROWSER_CLOSE_SHARED_WHEN_IDLE === 'true';
-  if (!closeImmediately) {
-    if (!sharedBrowserState.idleTimer) {
-      const configured = Number(environment.BROWSER_USER_BROWSER_IDLE_TIMEOUT_MS || 3 * 60 * 1000);
-      const timeoutMs = Number.isFinite(configured)
-        ? Math.min(24 * 60 * 60 * 1000, Math.max(60_000, Math.floor(configured)))
-        : 3 * 60 * 1000;
-      sharedBrowserState.idleTimer = setTimeout(() => {
-        sharedBrowserState.idleTimer = undefined;
-        void closeIdleSharedBrowser(runtimeKey, sharedBrowserState, true);
-      }, timeoutMs);
-      sharedBrowserState.idleTimer.unref?.();
-    }
-    return;
-  }
-
-  if (sharedBrowserState.closingPromise) return sharedBrowserState.closingPromise;
-
-  if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
-  sharedBrowserState.idleTimer = undefined;
-  const closeGeneration = sharedBrowserState.generation;
-  sharedBrowserState.lifecycle = 'closing';
-  const closingPromise = (async () => {
-    const { browser, browserServer, context, ownership } = sharedBrowserState;
-    const managedProfileDir = sharedBrowserState.managedProfileDir;
-    let managedProfileBrowserClosed = false;
-    if (ownership === 'persistent') {
-      await context?.close().catch(() => undefined);
-      managedProfileBrowserClosed = true;
-    } else if (ownership === 'launched') {
-      await browser?.close().catch(() => undefined);
-      managedProfileBrowserClosed = true;
-    } else if (ownership === 'connected' && (force || environment.BROWSER_CLOSE_CONNECTED_ON_SHARED_RESET === 'true')) {
-      if (force) managedProfileBrowserClosed = await closeConnectedBrowserProcess(browser);
-      await browser?.close({ reason: 'Shared browser launch settings changed.' }).catch(() => undefined);
-    }
-    await browserServer?.close().catch(() => undefined);
-    if (sharedBrowserState.generation !== closeGeneration) return;
-    sharedBrowserState.browser = undefined;
-    sharedBrowserState.browserServer = undefined;
-    sharedBrowserState.browserCodeConnection = undefined;
-    sharedBrowserState.context = undefined;
-    sharedBrowserState.ownership = undefined;
-    sharedBrowserState.initPromise = undefined;
-    sharedBrowserState.key = undefined;
-    sharedBrowserState.managedProfileDir = undefined;
-    sharedBrowserState.environment = undefined;
-    sharedBrowserState.generation += 1;
-    sharedBrowserState.lifecycle = 'idle';
-    if (managedProfileDir && managedProfileBrowserClosed) await clearManagedBrowserProfileCaches(managedProfileDir, environment);
-  })();
-  sharedBrowserState.closingPromise = closingPromise;
-  try {
-    await closingPromise;
-  } catch (error) {
-    sharedBrowserState.lifecycle = 'failed';
-    throw error;
-  } finally {
-    if (sharedBrowserState.closingPromise === closingPromise) sharedBrowserState.closingPromise = undefined;
-  }
-}
-
-async function acquireSharedBrowser(input: {
-  runtimeKey?: string;
-  chromium: BrowserType;
-  cdpEndpoint: string;
-  reconnectCdpEndpoint?: string;
-  userDataDir: string;
-  launchOptions: LaunchOptions;
-  contextOptions: BrowserContextOptions;
-  managedProfileDir?: string;
-  environment: BrowserRuntimeEnvironment;
-}): Promise<SharedBrowserLease> {
-  const runtimeKey = input.runtimeKey?.trim() || 'global';
-  const sharedBrowserState = sharedBrowserStateFor(runtimeKey);
-  await sharedBrowserState.closingPromise?.catch(() => undefined);
-  if (sharedBrowserState.idleTimer) clearTimeout(sharedBrowserState.idleTimer);
-  sharedBrowserState.idleTimer = undefined;
-  const key = input.runtimeKey ? `runtime:${runtimeKey}` : sharedBrowserKey(input);
-  if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount > 0) {
-    throw new Error('A shared browser is already running with different launch settings. Stop active runs or set BROWSER_SHARED_TABS=false.');
-  }
-  if (sharedBrowserState.key && sharedBrowserState.key !== key && sharedBrowserState.refCount === 0) {
-    await closeIdleSharedBrowser(runtimeKey, sharedBrowserState, true);
-  }
-
-  const browserStillConnected = !sharedBrowserState.browser || sharedBrowserState.browser.isConnected();
-  if (!sharedBrowserState.initPromise || sharedBrowserState.key !== key || !browserStillConnected || !sharedBrowserState.context) {
-    const initGeneration = ++sharedBrowserState.generation;
-    sharedBrowserState.lifecycle = 'initializing';
-    sharedBrowserState.key = key;
-    sharedBrowserState.managedProfileDir = input.managedProfileDir;
-    sharedBrowserState.environment = input.environment;
-    sharedBrowserState.initPromise = (async () => {
-      if (input.cdpEndpoint) {
-        const browser = await input.chromium.connectOverCDP(input.cdpEndpoint);
-        const context = browser.contexts()[0] || await browser.newContext(input.contextOptions);
-        return {
-          browser,
-          browserCodeConnection: { protocol: 'cdp', endpoint: input.cdpEndpoint } satisfies BrowserCodeConnection,
-          context,
-          ownership: 'connected' as const,
-        };
-      }
-
-      if (input.userDataDir) {
-        if (input.reconnectCdpEndpoint) {
-          return connectOrLaunchPersistentBrowserOverCdp({
-            chromium: input.chromium,
-            endpoint: input.reconnectCdpEndpoint,
-            userDataDir: input.userDataDir,
-            launchOptions: input.launchOptions,
-            contextOptions: input.contextOptions,
-            environment: input.environment,
-          });
-        }
-        try {
-          return await launchPersistentContextWithBrowserCodeConnection({
-            chromium: input.chromium,
-            userDataDir: input.userDataDir,
-            launchOptions: input.launchOptions,
-            contextOptions: input.contextOptions,
-          });
-        } catch (error) {
-          const retryConnected = await connectExistingBrowserOverCdp({
-            chromium: input.chromium,
-            endpoint: input.reconnectCdpEndpoint || '',
-            contextOptions: input.contextOptions,
-          });
-          if (retryConnected) return retryConnected;
-          if (input.reconnectCdpEndpoint && isPersistentProfileAlreadyOpenError(error)) {
-            throw new Error([
-              '无法接管上一次的浏览器 tab 组：该 persistent profile 已经被一个旧浏览器进程占用，但旧进程没有可连接的 CDP 端口。',
-              `profile=${input.userDataDir}`,
-              `expectedCdp=${input.reconnectCdpEndpoint}`,
-              '请关闭这个旧的自动化浏览器窗口一次；之后新启动的窗口会带 CDP 端口，继续时会优先连接并接管旧 tab 组。',
-              error instanceof Error ? error.message : String(error),
-            ].join('\n'));
-          }
-          throw error;
-        }
-      }
-
-      return launchBrowserServerWithConnection({
-        chromium: input.chromium,
-        launchOptions: input.launchOptions,
-        contextOptions: input.contextOptions,
-      });
-    })().then((lease) => {
-      if (sharedBrowserState.generation !== initGeneration) throw new Error('Shared browser initialization was superseded.');
-      sharedBrowserState.browser = lease.browser;
-      sharedBrowserState.browserServer = 'browserServer' in lease ? lease.browserServer : undefined;
-      sharedBrowserState.browserCodeConnection = lease.browserCodeConnection;
-      sharedBrowserState.context = lease.context;
-      sharedBrowserState.ownership = lease.ownership;
-      sharedBrowserState.lifecycle = 'ready';
-      return lease;
-    }).catch((error) => {
-      if (sharedBrowserState.generation === initGeneration) {
-        sharedBrowserState.lifecycle = 'failed';
-        sharedBrowserState.initPromise = undefined;
-        sharedBrowserState.key = undefined;
-      }
-      throw error;
-    });
-  }
-
-  const lease = await sharedBrowserState.initPromise;
-  sharedBrowserState.refCount += 1;
-  let released = false;
-  return {
-    ...lease,
-    release: async (force = false) => {
-      if (released) return;
-      released = true;
-      sharedBrowserState.refCount = Math.max(0, sharedBrowserState.refCount - 1);
-      await closeIdleSharedBrowser(runtimeKey, sharedBrowserState, force);
-    },
-  };
-}
-
 function normalizedOriginSet(values: readonly string[]) {
   return new Set(values.flatMap((value) => {
     try {
@@ -1813,6 +1137,24 @@ function normalizedOriginSet(values: readonly string[]) {
 }
 
 export class BrowserSession {
+  private downloadManager?: BrowserDownloadManager;
+  private browserDownloads() {
+    const receiver = this.options.host?.receiveDownload;
+    if (!receiver) return undefined;
+    return this.downloadManager ||= new BrowserDownloadManager(receiver, this.options.runId || this.pageGroupId, (result) => {
+      this.notifyLivePreviewNative(result.ok ? {
+        kind: 'downloadReady', download: { id: result.artifact.artifactId, artifactId: result.artifact.artifactId,
+          fileName: result.artifact.fileName, url: result.artifact.downloadUrl || result.artifact.url },
+      } : { kind: 'downloadFailed', download: { id: randomUUID(), fileName: result.fileName, error: result.error } });
+    });
+  }
+  private stateReader?: BrowserStateReader;
+  private sessionScheduler?: BrowserSessionScheduler;
+  private withSessionOperation<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (this.closePromise) return Promise.reject(new Error('Browser session is closing.'));
+    return (this.sessionScheduler ||= new BrowserSessionScheduler()).run(operation, signal);
+  }
+
   private browser?: Browser;
   private browserServer?: BrowserServer;
   private browserCodeConnection?: BrowserCodeConnection;
@@ -1823,16 +1165,19 @@ export class BrowserSession {
   private closePromise?: Promise<void>;
   private context?: BrowserContext;
   private page?: Page;
-  private networkErrors: string[] = [];
+
+  private readonly networkDiagnostics = new BrowserNetworkDiagnostics(
+    (key) => this.configuredValue(key), (page, source, message) => this.recordDomChangeError(page, source, message),
+  );
   private domChangeErrors: string[] = [];
   private domChangeErrorFingerprintsByPage = new WeakMap<Page, Set<string>>();
   private attachedPages = new WeakSet<Page>();
-  private httpRequestsByPage = new WeakMap<Page, HttpRequestRecord[]>();
-  private httpRequestByRequest = new WeakMap<Request, HttpRequestRecord>();
-  private httpRequestById = new Map<string, Request>();
-  private httpRequestSequence = 0;
-  private pendingBrowserCodeDependencyFailures = new Map<Request, BrowserDependencyFailure>();
-  private deliveredBrowserCodeDependencyRequests = new WeakSet<Request>();
+
+
+
+
+
+
   private lastScreenshotMetrics?: ScreenshotMetrics;
   private screenshotGenerationSequence = 0;
   private lastInteractiveCandidates: InteractiveCandidate[] = [];
@@ -2036,10 +1381,14 @@ export class BrowserSession {
   }
 
   async injectCookies(cookies: BrowserSessionCookie[]) {
+    return this.withSessionOperation(async () => {
+
     if (!this.context) throw new Error('Browser session has not started');
     if (!cookies.length) return 0;
     await this.context.addCookies(cookies);
     return cookies.length;
+
+    });
   }
 
   // 启动 Playwright 浏览器并注入事件监听记录脚本，用于后续识别可交互元素。
@@ -2878,6 +2227,8 @@ export class BrowserSession {
   }
 
   async restoreTabsFromSnapshot(savedTabs: BrowserTabSnapshot[]): Promise<BrowserTabRestoreResult> {
+    return this.withSessionOperation(async () => {
+
     this.ensureLivePreviewState();
     const context = this.context;
     if (!context) {
@@ -2951,6 +2302,8 @@ export class BrowserSession {
       failedUrls,
       tabs: this.getTabsSnapshot(),
     };
+
+    });
   }
 
   private async refreshSessionGroupPages(options: { forceNativeRefresh?: boolean } = {}) {
@@ -3065,6 +2418,8 @@ export class BrowserSession {
   }
 
   async switchLivePreviewTab(tabId: string): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     let page = this.sessionPages().find((candidate) => this.livePreviewTabId(candidate) === tabId);
     if (!page) {
       const refreshedPages = await this.refreshSessionGroupPages({ forceNativeRefresh: true });
@@ -3073,6 +2428,8 @@ export class BrowserSession {
     if (!page) return { ok: false, actual: 'The selected live-preview tab no longer exists.' };
     await this.activateSessionPage(page);
     return { ok: true, actual: `Switched live preview to ${page.url()}` };
+
+    });
   }
 
   async startScreencast(options: {
@@ -3369,8 +2726,7 @@ export class BrowserSession {
       await stopScreencast(false);
       throw error;
     }
-    let handle: BrowserScreencastHandle;
-    handle = {
+    const handle: BrowserScreencastHandle = {
       metrics: () => {
         const metrics = framePump.metrics();
         return {
@@ -3716,6 +3072,8 @@ export class BrowserSession {
   }
 
   async dispatchLiveInput(input: BrowserLiveInput): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     if (input.kind === 'tab') return this.switchLivePreviewTab(input.tabId);
     if (input.kind === 'files') return this.applyLiveFiles(input);
     if (input.kind === 'dialog') return this.resolveLiveDialog(input);
@@ -3893,6 +3251,8 @@ export class BrowserSession {
     }
 
     return { ok: false, actual: 'Live browser input kind is unsupported.' };
+
+    });
   }
 
   private async closeOwnedPages() {
@@ -4021,54 +3381,24 @@ export class BrowserSession {
         this.recordDomChangeError(page, 'dialog', message);
       });
     };
-    const onRequest = (request: Request) => {
-      this.recordHttpRequest(page, request);
-    };
-    const onResponse = (response: Response) => {
-      const request = response.request();
-      const record = this.httpRequestByRequest.get(request) || this.recordHttpRequest(page, request);
-      record.status = response.status();
-      record.statusText = response.statusText();
-      record.ok = response.ok();
-      if (record.status === 408 || record.status === 429 || record.status >= 500) {
-        this.queueBrowserCodeDependencyFailure(request, record);
-      }
-    };
-    const onRequestFailed = (request: Request) => {
-      const record = this.httpRequestByRequest.get(request) || this.recordHttpRequest(page, request);
-      const errorText = request.failure()?.errorText || '';
-      record.failed = true;
-      record.ok = false;
-      record.errorText = errorText;
-      if (shouldIgnoreNetworkFailure(request.url(), errorText)) return;
-      const message = `${request.method()} ${request.url()} ${errorText}`;
-      this.networkErrors.push(message);
-      if (this.networkErrors.length > 200) this.networkErrors.splice(0, this.networkErrors.length - 200);
-      this.recordDomChangeError(page, 'network', message);
-      this.queueBrowserCodeDependencyFailure(request, record);
-    };
+    this.networkDiagnostics.attach(page);
     page.on('framenavigated', onFrameNavigated);
     page.on('domcontentloaded', onDomContentLoaded);
     page.on('console', onConsole);
     page.on('pageerror', onPageError);
     page.on('dialog', onDialog);
-    page.on('request', onRequest);
-    page.on('response', onResponse);
-    page.on('requestfailed', onRequestFailed);
     this.pageListenerDisposers.set(page, () => {
       page.off('framenavigated', onFrameNavigated);
       page.off('domcontentloaded', onDomContentLoaded);
       page.off('console', onConsole);
       page.off('pageerror', onPageError);
       page.off('dialog', onDialog);
-      page.off('request', onRequest);
-      page.off('response', onResponse);
-      page.off('requestfailed', onRequestFailed);
       this.attachedPages.delete(page);
     });
   }
 
   private detachPageListeners(page: Page) {
+    this.networkDiagnostics.detach(page);
     this.pageListenerDisposers ||= new Map<Page, () => void>();
     this.livePreviewDownloadListeners ||= new Map<Page, (download: PlaywrightDownload) => void>();
     this.pageListenerDisposers.get(page)?.();
@@ -4082,6 +3412,8 @@ export class BrowserSession {
   }
 
   private async captureLivePreviewDownload(page: Page, download: PlaywrightDownload) {
+    const receiver = this.browserDownloads();
+    if (receiver) { receiver.capture(download); return; }
     if (!this.livePreviewNativeListeners.size) return;
     let gesturePage = page;
     let gestureUntil = this.livePreviewDownloadGestureUntil.get(page) || 0;
@@ -4152,65 +3484,13 @@ export class BrowserSession {
     if (this.domChangeErrors.length > 100) this.domChangeErrors.splice(0, this.domChangeErrors.length - 100);
   }
 
-  private recordHttpRequest(page: Page, request: Request) {
-    const existing = this.httpRequestByRequest.get(request);
-    if (existing) return existing;
-    const records = this.httpRequestsByPage.get(page) || [];
-    const record: HttpRequestRecord = {
-      id: `${Date.now().toString(36)}-${records.length + 1}`,
-      sequence: ++this.httpRequestSequence,
-      startedAt: new Date().toISOString(),
-      method: request.method(),
-      url: request.url(),
-      resourceType: request.resourceType(),
-    };
-    records.push(record);
-    const rawMaxRecords = Number(this.configuredValue('BROWSER_HTTP_REQUEST_HISTORY_LIMIT') || 400);
-    const maxRecords = Math.max(50, Math.floor(Number.isFinite(rawMaxRecords) ? rawMaxRecords : 400));
-    if (records.length > maxRecords) {
-      const removed = records.splice(0, records.length - maxRecords);
-      for (const item of removed) this.httpRequestById.delete(item.id);
-    }
-    this.httpRequestsByPage.set(page, records);
-    this.httpRequestByRequest.set(request, record);
-    this.httpRequestById.set(record.id, request);
-    return record;
-  }
 
-  private dependencyFailureFromHttpRecord(record: HttpRequestRecord): BrowserDependencyFailure {
-    let url = record.url;
-    let path = record.url;
-    try {
-      const parsed = new URL(record.url);
-      url = `${parsed.pathname}${parsed.search}`;
-      path = parsed.pathname;
-    } catch {
-      path = record.url.split('?')[0] || record.url;
-    }
-    return {
-      category: record.failed ? 'network_error' : 'external_service',
-      key: `${record.method.toUpperCase()}:${path}`,
-      method: record.method.toUpperCase(),
-      ...(record.status !== undefined ? { status: record.status } : {}),
-      ...(record.errorText ? { errorText: record.errorText } : {}),
-      url,
-    };
-  }
 
-  private queueBrowserCodeDependencyFailure(request: Request, record: HttpRequestRecord) {
-    if (
-      this.deliveredBrowserCodeDependencyRequests.has(request)
-      || this.pendingBrowserCodeDependencyFailures.has(request)
-    ) return;
-    this.pendingBrowserCodeDependencyFailures.set(request, this.dependencyFailureFromHttpRecord(record));
-  }
 
-  private drainBrowserCodeDependencyFailures() {
-    const failures = [...this.pendingBrowserCodeDependencyFailures.entries()];
-    this.pendingBrowserCodeDependencyFailures.clear();
-    for (const [request] of failures) this.deliveredBrowserCodeDependencyRequests.add(request);
-    return failures.map(([, failure]) => failure);
-  }
+
+
+
+  private drainBrowserCodeDependencyFailures() { return this.networkDiagnostics.drainDependencyFailures(); }
 
   // 获取当前可用页面；如果活动页关闭，会从浏览器上下文中寻找替代页面。
   private get activePage() {
@@ -4227,6 +3507,10 @@ export class BrowserSession {
 
   // 打开目标页面先等待导航提交，再在有限的 DOM 静默窗口后生成新快照。
   async open(url: string, options: { abortSignal?: AbortSignal; timeoutMs?: number } = {}): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async (signal) => {
+      this.stateReader?.clear();
+      options = { ...options, abortSignal: signal };
+
     const previousGeneration = this.snapshotGeneration;
     const page = this.activePage;
     const beforeUrl = page.url();
@@ -4259,81 +3543,21 @@ export class BrowserSession {
       previousGeneration,
       { postNavigation: true },
     );
+
+    }, options.abortSignal);
   }
 
-  async readBrowserState(options: { abortSignal?: AbortSignal; maxOutputChars?: number } = {}): Promise<BrowserActionResult> {
-    const maxOutputChars = Math.min(200_000, Math.max(1_000, Math.floor(options.maxOutputChars ?? 40_000)));
-    const page = this.activePage;
-    options.abortSignal?.throwIfAborted();
-    const [observation, title] = await raceWithAbort(Promise.all([
-      this.readPageObservation(),
-      page.title().catch(() => ''),
-    ]), options.abortSignal);
-
-    let targetFrame = page.mainFrame();
-    if (observation.activeSurface?.framePath) {
-      targetFrame = page.frames().find((frame) => this.getFramePath(frame) === observation.activeSurface?.framePath) || targetFrame;
-    }
-    let target = targetFrame.locator('body');
-    if (observation.activeSurface?.selector) {
-      const surface = targetFrame.locator(observation.activeSurface.selector).filter({ visible: true }).first();
-      if (await surface.count().catch(() => 0)) target = surface;
-    }
-    const ariaSnapshot = await raceWithAbort(
-      target.ariaSnapshot({ timeout: 5_000 }).catch(async () => {
-        const text = await target.innerText({ timeout: 1_500 }).catch(() => '');
-        return text ? `[text-fallback]\n${text.slice(0, 12_000)}` : '[snapshot unavailable]';
-      }),
-      options.abortSignal,
-    );
-    const pageState = [
-      `[page-state] ${JSON.stringify(observation)}`,
-      '[ax-tree scope=active]',
-      ariaSnapshot,
-    ].join('\n');
-
-    let tabs = this.getTabsSnapshot()
-      .slice(0, 100)
-      .map((tab) => ({ ...tab, url: tab.url.slice(0, 4_000) }));
-    let payload: BrowserStateSnapshot = {
-      tabs,
-      activePage: { url: page.url().slice(0, 4_000), title: title.slice(0, 2_000) },
-      pageState,
-    };
-    let actual = JSON.stringify(payload, null, 2);
-    if (actual.length > maxOutputChars) {
-      const overflow = actual.length - maxOutputChars;
-      payload = {
-        ...payload,
-        pageState: payload.pageState.slice(0, Math.max(0, payload.pageState.length - overflow - 200)),
-        truncated: true,
-      };
-      actual = JSON.stringify(payload, null, 2);
-    }
-    while (actual.length > maxOutputChars && tabs.length > 1) {
-      tabs = tabs.slice(0, Math.max(1, Math.floor(tabs.length / 2)));
-      payload = { ...payload, tabs, truncated: true };
-      actual = JSON.stringify(payload, null, 2);
-    }
-    if (actual.length > maxOutputChars) {
-      payload = {
-        ...payload,
-        tabs: payload.tabs.slice(0, 1).map((tab) => ({ ...tab, url: tab.url.slice(0, 200) })),
-        activePage: {
-          url: payload.activePage.url.slice(0, 300),
-          title: payload.activePage.title.slice(0, 200),
-        },
-        pageState: '',
-        truncated: true,
-      };
-      actual = JSON.stringify(payload, null, 2);
-    }
-    return {
-      ok: true,
-      actual,
-      data: payload,
-      summary: `Read ${payload.tabs.length} browser tab${payload.tabs.length === 1 ? '' : 's'} and the active page state.`,
-    };
+  async readBrowserState(options: BrowserStateReadOptions = {}): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async (signal) => {
+      const reader = this.stateReader ||= new BrowserStateReader({
+        page: () => this.activePage,
+        revision: (page) => this.navigationSequenceByPage.get(page) || 0,
+        framePath: (frame) => this.getFramePath(frame) || 'main',
+        observation: () => this.readPageObservation(),
+        tabs: () => this.getTabsSnapshot(),
+      });
+      return reader.read({ ...options, abortSignal: signal });
+    }, options.abortSignal);
   }
 
 
@@ -4712,6 +3936,8 @@ export class BrowserSession {
 
   // Capture the current viewport. Candidate marker overlays are no longer captured automatically.
   async takeScreenshot(runId: string, stepIndex: number, phase: 'before' | 'after' | 'manual' | `visual-${number}` | `tool-${number}` = 'after', options: ScreenshotCaptureOptions = {}) {
+    return this.withSessionOperation(async () => {
+
     const totalStartedAt = Date.now();
     const timingSteps: ScreenshotTimingStep[] = [];
     const timed = async <T>(
@@ -4787,10 +4013,14 @@ export class BrowserSession {
       steps: timingSteps,
     };
     return filePath;
+
+    });
   }
 
   // Minimal takeScreenshot path: save the browser screenshot without DOM, overlay, metadata, or visual-context work.
   async takeCurrentScreenshotOnly(runId: string, stepIndex: number, phase: `visual-${number}`, options: ScreenshotCaptureOptions = {}) {
+    return this.withSessionOperation(async () => {
+
     const capture: ScreenshotCaptureMode = options.capture === 'fullPage' ? 'fullPage' : 'viewport';
     const dir = this.artifactDirectory(runId);
     await mkdir(dir, { recursive: true });
@@ -4810,6 +4040,8 @@ export class BrowserSession {
     });
     await this.updateLastScreenshotMetrics(filePath, capture, options.outputPixelRatio);
     return filePath;
+
+    });
   }
 
 
@@ -4880,7 +4112,7 @@ export class BrowserSession {
       id: `changes-${++this.interActionChangeJournalSequence}`,
       page,
       startedAt: new Date().toISOString(),
-      requestStartSequence: this.httpRequestSequence,
+      requestStartSequence: this.networkDiagnostics.sequence,
       added: [],
       updated: [],
       removed: [],
@@ -4924,7 +4156,7 @@ export class BrowserSession {
       journal.overflow ||= entry.delta.overflow;
     }
     journal.errors.push(...this.domChangeErrors.splice(0));
-    const requests = (this.httpRequestsByPage.get(this.activePage) || [])
+    const requests = this.networkDiagnostics.records(this.activePage)
       .filter((record) => record.sequence > journal.requestStartSequence);
     const requestLines = requests.map((record) => {
       const outcome = record.failed
@@ -4950,53 +4182,7 @@ export class BrowserSession {
     return { journal, lines };
   }
 
-  async getCurrentTabHttpRequests(options: { ids?: string[] } = {}): Promise<BrowserActionResult> {
-    const rawLimit = Number(this.configuredValue('AI_HTTP_REQUEST_TOOL_LIMIT') || 80);
-    const limit = Math.max(1, Math.floor(Number.isFinite(rawLimit) ? rawLimit : 80));
-    const requestedIds = new Set((options.ids || []).filter((id) => typeof id === 'string' && id));
-    const detailed = requestedIds.size > 0;
-    const records = detailed
-      ? (this.httpRequestsByPage.get(this.activePage) || []).filter((record) => requestedIds.has(record.id))
-      : (this.httpRequestsByPage.get(this.activePage) || []).slice(-limit);
-    if (!records.length) {
-      return { ok: true, actual: detailed ? 'None of the requested HTTP request IDs are available in the current tab history.' : 'Current tab has no captured HTTP requests yet.' };
-    }
-    const detailLimit = Math.max(1000, Math.floor(Number(this.configuredValue('AI_HTTP_REQUEST_DETAIL_MAX_CHARS') || 12000)));
-    const output = await Promise.all(records.map(async (record) => {
-      const summary = {
-        id: record.id,
-        time: record.startedAt,
-        method: record.method,
-        url: record.url,
-        resourceType: record.resourceType,
-        status: record.status ?? null,
-        statusText: record.statusText ?? null,
-        ok: record.ok ?? null,
-        failed: record.failed || false,
-        errorText: record.errorText || null,
-      } as Record<string, unknown>;
-      if (!detailed) return summary;
-      const request = this.httpRequestById.get(record.id);
-      if (!request) return { ...summary, detailUnavailable: true };
-      const requestBody = request.postData();
-      if (requestBody) summary.requestBody = compactDiagnosticText(requestBody, detailLimit);
-      if (record.status !== undefined) {
-        const response = await request.response().catch(() => null);
-        const contentType = response?.headers()['content-type'] || '';
-        if (response && /(?:json|text|xml|javascript|graphql|urlencoded)/i.test(contentType)) {
-          const responseBody = await response.text().catch(() => '');
-          if (responseBody) summary.responseBody = compactDiagnosticText(responseBody, detailLimit);
-        }
-      }
-      return summary;
-    }));
-    return {
-      ok: true,
-      actual: JSON.stringify(output, null, 2),
-      data: output,
-      summary: `Read ${output.length} HTTP request record${output.length === 1 ? '' : 's'} from the active tab.`,
-    };
-  }
+  async getCurrentTabHttpRequests(options: { ids?: string[] } = {}): Promise<BrowserActionResult> { return this.networkDiagnostics.read(this.activePage, options); }
 
   // 切换到指定标签页，并把它设为后续操作的活动页。
 
@@ -5079,6 +4265,10 @@ export class BrowserSession {
     credentials?: BrowserCodeCredentialBinding[];
     abortSignal?: AbortSignal;
   }): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async (signal) => {
+      this.stateReader?.clear();
+      input = { ...input, abortSignal: signal };
+
     const code = String(input.code || '');
     if (!code.trim()) return { ok: false, actual: 'browserCode requires non-empty JavaScript.' };
     if (code.length > 40_000) return { ok: false, actual: 'browserCode JavaScript exceeds the 40000 character limit.' };
@@ -5129,6 +4319,9 @@ export class BrowserSession {
       this.claimPage(candidate, { makeActive: false });
     };
     executionContext?.on('page', claimCodeCreatedPage);
+    const downloads = this.browserDownloads();
+    const downloadStart = downloads?.begin(input.runId, input.abortSignal) ?? 0;
+    let downloaded: BrowserDownloadResult[] = [];
     let execution: Awaited<ReturnType<BrowserCodeKernel['execute']>>;
     try {
       execution = await kernel.execute({
@@ -5141,6 +4334,7 @@ export class BrowserSession {
         abortSignal: input.abortSignal,
       });
     } finally {
+      try { downloaded = await downloads?.collect(downloadStart) || []; } finally { downloads?.end(); }
       executionContext?.off('page', claimCodeCreatedPage);
       for (const candidate of executionContext?.pages() || []) claimCodeCreatedPage(candidate);
       await Promise.all([
@@ -5225,6 +4419,8 @@ export class BrowserSession {
       error: effectiveError ?? null,
       aborted: execution.aborted === true,
       elapsedMs: execution.elapsedMs,
+      executionState: execution.executionState,
+      downloads: downloaded,
       ...(execution.kernelReset ? {
         kernelReset: {
           ...execution.kernelReset,
@@ -5239,6 +4435,7 @@ export class BrowserSession {
     };
     const result: BrowserActionResult = {
       ok: effectiveOk,
+      ...(!effectiveOk ? { failureCategory: reportedFailure ? 'browser-result-failed' : `browser-${execution.executionState?.status || 'code-failed'}` } : {}),
       actual: JSON.stringify(payload, null, 2),
       data: payload,
       summary: effectiveOk
@@ -5250,6 +4447,8 @@ export class BrowserSession {
       ...(dependencyFailures.length ? { dependencyFailures } : {}),
     };
     return result;
+
+    }, input.abortSignal);
   }
 
   async waitForManualVerification(maxMs?: number, abortSignal?: AbortSignal): Promise<BrowserActionResult> {
@@ -5284,7 +4483,7 @@ export class BrowserSession {
 
   // 返回本次会话采集到的关键网络失败。
   getNetworkErrors() {
-    return [...this.networkErrors];
+    return this.networkDiagnostics.errors();
   }
 
   // 关闭浏览器；调试场景可选择保留窗口。
@@ -5292,6 +4491,7 @@ export class BrowserSession {
     if (this.closePromise) return this.closePromise;
     const pendingStart = this.startPromise;
     const closeAttempt = (async () => {
+      await this.sessionScheduler?.cancelAndDrain();
       await pendingStart?.catch(() => undefined);
       this.lifecycle = 'closing';
       await this.closeNow(options);
@@ -5317,6 +4517,9 @@ export class BrowserSession {
     this.activeScreencasts ||= new Set<BrowserScreencastHandle>();
     this.activeScreencasts.clear();
     await Promise.all(activeScreencasts.map((handle) => handle.stop().catch(() => undefined)));
+    await this.downloadManager?.dispose();
+    this.downloadManager = undefined;
+    this.stateReader?.clear();
     await this.browserCodeKernel?.close();
     this.browserCodeKernel = undefined;
     this.browserCodeKernelRevision = undefined;
@@ -5336,6 +4539,7 @@ export class BrowserSession {
         this.pageDiscoveryListener = undefined;
       }
       for (const page of [...(this.pageListenerDisposers?.keys() || [])]) this.detachPageListeners(page);
+      this.networkDiagnostics.dispose();
       if (this.browserOwnership === 'shared') {
         if ((this.parentBrowserSession || this.browserSurface !== 'electron-embedded') && !shouldKeepOpen && !options.preservePages) {
           await this.closeOwnedPages();
@@ -6884,6 +6088,8 @@ export class BrowserSession {
     refresh?: boolean;
     mode?: SnapshotView;
   } = {}) {
+    return this.withSessionOperation(async () => {
+
     const startedAt = Date.now();
     const mode = options.mode === 'full' || options.mode === 'text' ? options.mode : 'actionable';
     const maxChars = Math.max(20000, Math.floor(Number(options.maxChars) || 20000));
@@ -6924,9 +6130,13 @@ export class BrowserSession {
       captureSource: generation.captureSource,
       timings: { ...generation.timings, readSliceMs: Date.now() - startedAt },
     };
+
+    });
   }
 
   async searchSnapshot(input: { query?: string; tag?: string; roles?: string[]; limit?: number }): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     const query = normalizeDomSearchText(input.query);
     const tag = normalizeDomSearchText(input.tag);
     if (!query && !tag) return { ok: false, actual: 'Snapshot search requires a non-empty query or tag.' };
@@ -6991,6 +6201,8 @@ export class BrowserSession {
       ok: false,
       actual: 'searchSnapshot requires an active DOM baseline. Call takeSnapshot first; searchSnapshot never creates or searches a separate CDP UID namespace.',
     };
+
+    });
   }
 
   private currentSnapshotReference(uid: string) {
@@ -7397,6 +6609,8 @@ export class BrowserSession {
   }
 
   async mouse(input: BrowserMouseAction): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     const throwIfAborted = () => {
       if (!input.abortSignal?.aborted) return;
       throw input.abortSignal.reason instanceof Error
@@ -7698,9 +6912,13 @@ export class BrowserSession {
     clickTimings.resultAssemblyMs = Date.now() - resultAssemblyStartedAt;
     clickTimings.totalMs = Date.now() - targetResolutionStartedAt;
     return { ...result, clickTimings };
+
+    });
   }
 
   async selectOption(input: BrowserSelectOptionAction): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     const throwIfAborted = () => {
       if (!input.abortSignal?.aborted) return;
       throw input.abortSignal.reason instanceof Error
@@ -7813,9 +7031,13 @@ export class BrowserSession {
         };
       },
     );
+
+    });
   }
 
   async keyboard(input: BrowserKeyboardAction): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     const page = this.activePage;
     const previousGeneration = this.snapshotGeneration;
     if (input.action === 'editText' && !input.target) {
@@ -8059,6 +7281,8 @@ export class BrowserSession {
       const eventsAfter = await this.readInteractionCounts();
       const keyEvents = this.interactionDelta(eventsBefore, eventsAfter, 'keydown');
       return { ok: keyEvents > 0, detail: `${keyEvents} keydown event(s) observed for the shortcut.` };
+    });
+
     });
   }
 
@@ -8471,6 +7695,8 @@ export class BrowserSession {
    * tools and is never run after every action.
    */
   async readDomObservationSnapshot(options: { cursor?: string; mode?: BrowserSnapshotView } = {}) {
+    return this.withSessionOperation(async () => {
+
     const startedAt = Date.now();
     const cursor = options.cursor ? parseDomObservationCursor(options.cursor) : undefined;
     if (options.cursor && !cursor) throw new Error('Invalid DOM-observation snapshot cursor. Capture a fresh takeSnapshot instead.');
@@ -8577,6 +7803,8 @@ export class BrowserSession {
       observation,
       timings: { ...result.observation.timings, readDomObservationMs: Date.now() - startedAt },
     };
+
+    });
   }
 
   /**
@@ -8585,6 +7813,8 @@ export class BrowserSession {
    * returned, so a later UID action cannot silently target a stale element.
    */
   async readDomChanges(): Promise<BrowserActionResult> {
+    return this.withSessionOperation(async () => {
+
     const mainFrame = this.activePage.mainFrame();
     const frames = this.actionFrames();
     const added: string[] = [];
@@ -8719,6 +7949,8 @@ export class BrowserSession {
         observation,
       },
     };
+
+    });
   }
 
   private async discardDomChanges() {

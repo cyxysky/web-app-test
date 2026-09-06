@@ -6,13 +6,13 @@ export const chartRuntimeSkillId = 'system-chart-runtime';
 export const chartRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${chartRuntimeSkillId}</id>`,
-  '<title>Apache ECharts Runtime</title>',
-  '<description>Hidden built-in operating manual for reading modular ECharts API guidance, creating inline charts, and placing chart identifiers in final replies.</description>',
+  '<title>ECharts and Three.js Chart Runtime</title>',
+  '<description>Operating manual for creating, reading and updating persistent 2D/3D charts with fullscreen, downloads and manual data editing.</description>',
   '<required>true</required>',
   '</system_skill>',
 ].join('\n');
 
-export const chartRuntimeSkillContent = `# Apache ECharts Runtime
+export const chartRuntimeSkillContent = `# ECharts and Three.js Chart Runtime
 
 This Skill is authoritative for the chart model tool and is supplied by the chart package. The consuming Agent is responsible for loading it and deciding when the chart tool becomes available.
 
@@ -21,7 +21,7 @@ This Skill is authoritative for the chart model tool and is supplied by the char
 1. When a visual chart materially improves the answer, explicitly read this Skill and wait for that read to succeed before calling chart.
 2. Before creating a chart, call chart with action \`api\` and no query to read the compact API module index.
 3. Call action \`api\` again with the exact module id needed for the requested chart. Read more than one module when the design combines series, coordinates, datasets, maps, or interactions.
-4. Call action \`create\` with one complete JSON-serializable Apache ECharts \`option\`. The renderer imports the full \`echarts\` package, so no series whitelist is imposed.
+4. Call action \`create\` with one complete JSON-serializable \`option\`. For 2D, engine defaults to \`echarts\` and loads the full ECharts package. For native 3D, read module \`three\`, set engine to \`three\`, and follow its separate data schema.
 5. Read the successful result and copy its exact chartId into a \`finalResponse\` chart block at the intended response position.
 6. Never invent an identifier and never reference one after a failed call. The standalone \`chart_000001\` text-line renderer remains available, but structured Agent replies must use chart blocks.
 
@@ -39,6 +39,16 @@ Map charts may pass \`maps\`; each map is registered before \`setOption\`. The \
 
 Tool arguments are JSON. ECharts features that specifically require executable JavaScript callbacks—such as function formatters, arbitrary \`custom.renderItem\`, external event handlers, or third-party series registration—cannot be embedded in the persisted option. Use string templates and built-in JSON options when available. This is an executable-callback boundary, not a chart-type whitelist.
 
+Never put \`"function(params){...}"\` or \`"(params) => ..."\` strings into \`formatter\` or \`valueFormatter\`. ECharts treats formatter strings as text templates, not JavaScript, and chart create/update rejects function source with its exact option path. For tooltips prefer \`{ trigger: "axis" }\` (default formatting) or a template such as \`"{b}: {c}"\`; indexed templates such as \`"{b0}<br/>{a0}: {c0}<br/>{a1}: {c1}"\` support fixed multiple series. A waterfall's invisible spacer series should use \`tooltip: { show: false }\` so its offset is not reported as business data.
+
+## Editing, export and 3D
+
+Each rendered chart provides fullscreen, PNG and JSON downloads, CSV downloads for data arrays, and manual data editing through a table or complete option JSON. SVG-rendered ECharts additionally supports SVG downloads. In Orbit, saving persists to the original chart ID; refreshes and later tool reads see the saved version. Standalone React hosts must supply onSave to persist edits.
+
+Before modifying an existing chart, call action \`read\` with its chartId. Use the returned chart.option and revision, preserve unrelated settings and user edits, then call action \`update\` with the complete option and expectedRevision. On chart-revision-conflict, read again and merge; do not blindly retry with a newer revision. A failed update leaves the saved chart unchanged.
+
+Three.js supports \`bar3D\`, \`scatter3D\`, \`line3D\` and \`surface3D\`. Each point is [x,y,z], with z representing height. Surface data is row-major and requires grid.rows × grid.columns to equal the point count. Read module \`three\` for complete limits and examples. The viewport supports rotation, zoom, pan and PNG export. Simple 2D bar/line/scatter charts offer a temporary view toggle labeled "3D 视图" / "2D 视图"; complex coordinate encodings remain in their original 2D form. Data editing opens a modal with table and JSON modes. Native 3D requires WebGL2.
+
 ## API signature
 
 \`\`\`ts
@@ -53,7 +63,8 @@ type ChartApiInput = {
 type ChartCreateInput = {
   action: "create";
   reason: string;
-  option: Record<string, unknown>; // Complete ECharts option.
+  engine?: "echarts" | "three";
+  option: Record<string, unknown>; // Complete option for the selected engine.
   title?: string;
   description?: string;
   height?: number;                // 240..720, default 380.
@@ -65,7 +76,10 @@ type ChartCreateInput = {
   }>;
 };
 
-declare function chart(input: ChartApiInput | ChartCreateInput): Promise<{
+type ChartReadInput = { action: "read"; reason: string; chartId: string };
+type ChartUpdateInput = Omit<ChartCreateInput, "action"> & { action: "update"; chartId: string; expectedRevision: number };
+
+declare function chart(input: ChartApiInput | ChartCreateInput | ChartReadInput | ChartUpdateInput): Promise<{
   ok: boolean;
   actual: string;
   failureCategory?: string;
@@ -160,7 +174,7 @@ finalResponse({
 
 export const chartCapabilityRuntimeSkill = Object.freeze({
   id: chartRuntimeSkillId,
-  title: 'Apache ECharts Runtime',
+  title: 'ECharts and Three.js Chart Runtime',
   summary: chartRuntimeSkillSummary,
   content: chartRuntimeSkillContent,
   required: true,

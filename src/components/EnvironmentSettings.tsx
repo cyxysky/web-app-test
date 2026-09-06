@@ -53,6 +53,10 @@ import type { SensitiveDataEvaluationCase } from '@/lib/sensitive-data-evaluatio
 import { WorkspaceSidebarArchiveRow } from '@/components/WorkspaceSidebarArchive';
 import { useWorkspaceBrand } from '@/brand/WorkspaceBrandProvider';
 import { ExternalIntegrationSettings } from '@/components/ExternalIntegrationSettings';
+import { DndContext, KeyboardSensor, PointerSensor, closestCenter, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
+import { SortableContext, arrayMove, rectSortingStrategy, sortableKeyboardCoordinates, useSortable } from '@dnd-kit/sortable';
+import { CSS as DndCSS } from '@dnd-kit/utilities';
+import { GripVertical } from 'lucide-react';
 
 export {
   environmentSettingsTabs,
@@ -65,7 +69,46 @@ export type EnvRow = Pick<RuntimeEnvRecord, 'key' | 'value' | 'enabled' | 'secre
   updatedAt?: string;
 };
 
-export type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'updatedAt'>;
+export type ModelConfig = Pick<ModelConfigRecord, 'provider' | 'providers' | 'providerOrder' | 'updatedAt'>;
+
+function SortableProviderRow({ provider, active, label, children, onSelect }: {
+  provider: ModelProvider;
+  active: boolean;
+  label: string;
+  children: ReactNode;
+  onSelect: () => void;
+}) {
+  const { t } = useI18n();
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({ id: provider });
+  return (
+    <div
+      ref={setNodeRef}
+      className={`settings-provider-row${active ? ' active' : ''}${isDragging ? ' is-dragging' : ''}`}
+      style={{ transform: DndCSS.Transform.toString(transform), transition }}
+    >
+      <button
+        {...attributes}
+        {...listeners}
+        ref={setActivatorNodeRef}
+        aria-label={t('拖拽排序：{name}', { name: label })}
+        className="settings-provider-drag-handle"
+        title={t('拖拽排序')}
+        type="button"
+      >
+        <GripVertical size={16} />
+      </button>
+      <button
+        aria-current={active ? 'true' : undefined}
+        className="settings-provider-select"
+        data-provider={provider}
+        onClick={onSelect}
+        type="button"
+      >
+        {children}
+      </button>
+    </div>
+  );
+}
 
 export type EnvironmentSettingsInitialData = {
   envItems: EnvRow[];
@@ -77,6 +120,8 @@ type PersonalMemoryType = 'alias' | 'preference' | 'workflow' | 'domain_fact';
 type PersonalMemoryStatus = 'active' | 'disabled';
 
 type PersonalMemoryItem = {
+  recall?: 'always' | 'relevant';
+  durability?: string;
   id: string;
   userId: string;
   shared: boolean;
@@ -97,6 +142,7 @@ type PersonalMemoryItem = {
 };
 
 type PersonalMemoryDraft = {
+  recall: 'always' | 'relevant';
   id?: string;
   userId?: string;
   shared: boolean;
@@ -329,13 +375,13 @@ function envItemsFingerprint(items: EnvRow[]) {
   return JSON.stringify(items.map(({ key, value, enabled, secret }) => ({ key, value, enabled, secret })));
 }
 
-function displayDefaultValue(key: string, value: string) {
-  if (!value) return '未设置';
+function displayDefaultValue(key: string, value: string, t: (value: string, params?: Record<string, string | number>) => string) {
+  if (!value) return t('未设置');
   if (key.endsWith('_MS') && Number.isFinite(Number(value))) {
     const milliseconds = Number(value);
-    if (milliseconds >= 60_000 && milliseconds % 60_000 === 0) return `${milliseconds / 60_000} 分钟`;
-    if (milliseconds >= 1_000 && milliseconds % 1_000 === 0) return `${milliseconds / 1_000} 秒`;
-    return `${milliseconds} 毫秒`;
+    if (milliseconds >= 60_000 && milliseconds % 60_000 === 0) return t('{count} 分钟', { count: milliseconds / 60_000 });
+    if (milliseconds >= 1_000 && milliseconds % 1_000 === 0) return t('{count} 秒', { count: milliseconds / 1_000 });
+    return t('{count} 毫秒', { count: milliseconds });
   }
   return value;
 }
@@ -375,6 +421,7 @@ const personalMemoryTypeOptions: Array<{ label: string; value: PersonalMemoryTyp
 
 function createPersonalMemoryDraft(): PersonalMemoryDraft {
   return {
+    recall: 'relevant',
     shared: false,
     scope: 'global',
     domain: '',
@@ -388,6 +435,7 @@ function createPersonalMemoryDraft(): PersonalMemoryDraft {
 
 function personalMemoryDraftFromItem(item: PersonalMemoryItem): PersonalMemoryDraft {
   return {
+    recall: item.recall || (item.durability === 'explicit_preference' ? 'always' : 'relevant'),
     id: item.id,
     userId: item.userId,
     shared: item.shared,
@@ -448,6 +496,7 @@ function createModelConfig(input?: Partial<ModelConfig>): ModelConfig {
   return {
     provider: input?.provider || 'openrouter',
     providers,
+    providerOrder: modelProviderDefinitionsForConfig(providers, input?.providerOrder).map(({ value }) => value),
     updatedAt: input?.updatedAt || '',
   };
 }
@@ -562,8 +611,8 @@ function sensitiveEvaluationTagStatus(
   return 'pending';
 }
 
-function evaluationCaseDisplayName(name: string, index: number) {
-  return name.trim().replace(/^综合业务场景\s*[·・]\s*/, '') || `用例 ${index + 1}`;
+function evaluationCaseDisplayName(name: string, index: number, t: (value: string, params?: Record<string, string | number>) => string) {
+  return name.trim().replace(/^综合业务场景\s*[·・]\s*/, '') || t('用例 {index}', { index: index + 1 });
 }
 
 function isSecret(item: EnvRow) {
@@ -617,6 +666,10 @@ export function EnvironmentSettings({
   ));
   const modelDraftRef = useRef(modelDraft);
   const providerListRef = useRef<HTMLDivElement>(null);
+  const providerDragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
   const [extraRequestParameterRows, setExtraRequestParameterRows] = useState<Partial<Record<ModelProvider, ExtraRequestParameterDraft[]>>>(() => (
     extraRequestParameterDrafts(createModelConfig(initialData?.modelConfig))
   ));
@@ -813,6 +866,17 @@ export function EnvironmentSettings({
     setSelectedModelProvider(provider);
   }
 
+  function reorderProviders({ active, over }: DragEndEvent) {
+    if (!over || active.id === over.id) return;
+    setModelDraft((current) => {
+      const order = modelProviderDefinitionsForConfig(current.providers, current.providerOrder).map(({ value }) => value);
+      const from = order.indexOf(active.id as ModelProvider);
+      const to = order.indexOf(over.id as ModelProvider);
+      if (from < 0 || to < 0) return current;
+      return { ...current, providerOrder: arrayMove(order, from, to) };
+    });
+  }
+
   function selectDefaultProvider(provider: ModelProvider) {
     setModelDraft((current) => ({
       ...createModelConfig(current),
@@ -915,7 +979,7 @@ export function EnvironmentSettings({
         ...next.providers,
         [provider]: {
           ...providerSettings(next, provider),
-          displayName: `OpenAI 兼容供应商 ${sequence}`,
+          displayName: t('OpenAI 兼容供应商 {index}', { index: sequence }),
           enabled: true,
         },
       },
@@ -1292,6 +1356,7 @@ export function EnvironmentSettings({
 
   function personalMemoryPayload() {
     return {
+      recall: personalMemoryDraft.scope === 'global' && personalMemoryDraft.type === 'preference' ? personalMemoryDraft.recall : 'relevant',
       shared: personalMemoryDraft.shared,
       scope: personalMemoryDraft.scope,
       domain: personalMemoryDraft.scope === 'domain' ? personalMemoryDraft.domain.trim() : '',
@@ -1402,7 +1467,7 @@ export function EnvironmentSettings({
       ? Math.round(((selectedEvaluationValues.length - (selectedEvaluationResult?.missingValues.length || 0)) / selectedEvaluationValues.length) * 100)
       : 0;
     const visibleEvaluationCases = sensitiveDataEvaluationCases.filter((item, index) => (
-      evaluationCaseDisplayName(item.name, index).toLocaleLowerCase().includes(sensitiveDataEvaluationSearch.trim().toLocaleLowerCase())
+      evaluationCaseDisplayName(item.name, index, t).toLocaleLowerCase().includes(sensitiveDataEvaluationSearch.trim().toLocaleLowerCase())
     ));
     return (
       <div className="settings-sensitive-data-tools">
@@ -1509,7 +1574,7 @@ export function EnvironmentSettings({
                     return (
                       <WorkspaceSidebarArchiveRow
                         active={item.id === selectedEvaluationCase.id}
-                        ariaLabel={evaluationCaseDisplayName(item.name, index)}
+                        ariaLabel={evaluationCaseDisplayName(item.name, index, t)}
                         collapsed={false}
                         collapsedIcon={null}
                         expandedAction={(
@@ -1536,7 +1601,7 @@ export function EnvironmentSettings({
                           </span>
                         )}
                         onOpen={() => setSelectedSensitiveDataEvaluationCaseId(item.id)}
-                        title={evaluationCaseDisplayName(item.name, index)}
+                        title={evaluationCaseDisplayName(item.name, index, t)}
                       />
                     );
                   })}
@@ -1544,7 +1609,7 @@ export function EnvironmentSettings({
               </aside>
               <section className="evaluation-editor-pane">
                 <div className="evaluation-editor-toolbar">
-                  <input aria-label={t('用例名称')} className="evaluation-case-name-input" onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { name: event.target.value })} value={evaluationCaseDisplayName(selectedEvaluationCase.name, selectedEvaluationIndex)} />
+                  <input aria-label={t('用例名称')} className="evaluation-case-name-input" onChange={(event) => updateSensitiveDataEvaluationCase(selectedEvaluationCase.id, { name: event.target.value })} value={evaluationCaseDisplayName(selectedEvaluationCase.name, selectedEvaluationIndex, t)} />
                   <div>
                     <button aria-label={t('复制')} onClick={() => void navigator.clipboard?.writeText(selectedEvaluationCase.text)} type="button"><Copy size={16} /></button>
                     <button aria-label={t('全屏')} onClick={() => setSensitiveDataEvaluationExpanded((current) => !current)} type="button"><Maximize2 size={16} /></button>
@@ -1747,6 +1812,15 @@ export function EnvironmentSettings({
                 onChange={(value) => updatePersonalMemoryDraft({ type: value as PersonalMemoryType })}
                 options={personalMemoryTypeOptions.map((option) => ({ label: t(option.label), value: option.value }))}
               />
+            </label>
+            <label className="personal-memory-field">
+              <span>{t('使用时机')}</span>
+              <CustomSelect className="settings-control"
+                value={personalMemoryDraft.scope === 'global' && personalMemoryDraft.type === 'preference' ? personalMemoryDraft.recall : 'relevant'}
+                onChange={(value) => updatePersonalMemoryDraft({ recall: value as 'always' | 'relevant' })}
+                options={personalMemoryDraft.scope === 'global' && personalMemoryDraft.type === 'preference'
+                  ? [{ label: t('任务相关时'), value: 'relevant' }, { label: t('优先作为常用偏好'), value: 'always' }]
+                  : [{ label: t('任务相关时'), value: 'relevant' }]} />
             </label>
             <div className="personal-memory-field personal-memory-status-field">
               <span>{t('状态')}</span>
@@ -1965,7 +2039,7 @@ export function EnvironmentSettings({
                 label: t('最近更新'),
                 className: 'management-table-date-column',
                 filter: { getValue: (item) => item.updatedAt, type: 'datetime' },
-                render: (item) => <span className="management-table-muted">{new Date(item.updatedAt).toLocaleString()}</span>,
+                render: (item) => <span className="management-table-muted">{new Date(item.updatedAt).toLocaleString(language === 'en' ? 'en-US' : 'zh-CN')}</span>,
               },
               {
                 key: 'actions',
@@ -2119,7 +2193,7 @@ export function EnvironmentSettings({
                 label: t('最近更新'),
                 className: 'management-table-date-column',
                 filter: { getValue: (account) => account.updatedAt, type: 'datetime' },
-                render: (account) => <span className="management-table-muted">{new Date(account.updatedAt).toLocaleString()}</span>,
+                render: (account) => <span className="management-table-muted">{new Date(account.updatedAt).toLocaleString(language === 'en' ? 'en-US' : 'zh-CN')}</span>,
               },
               {
                 key: 'actions',
@@ -2190,7 +2264,7 @@ export function EnvironmentSettings({
             <small className={`settings-apply-badge is-${definition?.applyMode || 'runtime'}`}>{t(definition?.applyMode === 'startup' ? '重启后生效' : '即时生效')}</small>
           </span>
           <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
-          <small className="settings-field-default" title={item.key}>{t('默认值')}：{t(displayDefaultValue(item.key, definition?.defaultValue || ''))}</small>
+          <small className="settings-field-default" title={item.key}>{t('默认值')}：{displayDefaultValue(item.key, definition?.defaultValue || '', t)}</small>
         </div>
         <div className="settings-row-control">{renderRuntimeControl(item, index)}</div>
       </div>
@@ -2261,7 +2335,7 @@ export function EnvironmentSettings({
   const activeProviderSupportsExtraRequestParameters = activeProvider === 'minimax' || activeProvider.startsWith('openai-compatible');
   const activeProviderExtraRequestParameterRows = extraRequestParameterRows[activeProvider] || [];
   const activeProviderDuplicateExtraRequestParameterKeys = duplicateExtraRequestParameterKeys(activeProviderExtraRequestParameterRows);
-  const configuredModelProviderDefinitions = modelProviderDefinitionsForConfig(editingModelConfig.providers);
+  const configuredModelProviderDefinitions = modelProviderDefinitionsForConfig(editingModelConfig.providers, editingModelConfig.providerOrder);
   const visibleModelProviders = configuredModelProviderDefinitions.filter((provider) => {
     const compatibleIndex = openAICompatibleProviderIndex(provider.value);
     if (!compatibleIndex || compatibleIndex === 1) return true;
@@ -2548,24 +2622,27 @@ export function EnvironmentSettings({
                     </button>
                   </div>
                   <div className="settings-provider-list" ref={providerListRef}>
-                    {visibleModelProviders.map((provider) => {
-                      const settings = editingModelConfig.providers?.[provider.value];
-                      const enabled = settings?.enabled === true;
-                      return (
-                        <button
-                          aria-current={activeProvider === provider.value ? 'true' : undefined}
-                          className={activeProvider === provider.value ? 'active' : undefined}
-                          data-provider={provider.value}
-                          key={provider.value}
-                          onClick={() => selectProvider(provider.value)}
-                          type="button"
-                        >
-                          <span className="settings-provider-icon"><ModelBrandIcon model={settings?.defaultModel || provider.defaultModel} provider={provider.value} /></span>
-                          <span><strong>{settings?.displayName?.trim() || t(provider.label)}</strong><small>{enabled ? t('已启用') : t('未启用')}</small></span>
-                          <i className={enabled ? 'is-enabled' : undefined} />
-                        </button>
-                      );
-                    })}
+                    <DndContext sensors={providerDragSensors} collisionDetection={closestCenter} onDragEnd={reorderProviders}>
+                      <SortableContext items={visibleModelProviders.map(({ value }) => value)} strategy={rectSortingStrategy}>
+                        {visibleModelProviders.map((provider) => {
+                          const settings = editingModelConfig.providers?.[provider.value];
+                          const enabled = settings?.enabled === true;
+                          return (
+                            <SortableProviderRow
+                              active={activeProvider === provider.value}
+                              provider={provider.value}
+                              label={settings?.displayName?.trim() || t(provider.label)}
+                              key={provider.value}
+                              onSelect={() => selectProvider(provider.value)}
+                            >
+                              <span className="settings-provider-icon"><ModelBrandIcon model={settings?.defaultModel || provider.defaultModel} provider={provider.value} /></span>
+                              <span><strong>{settings?.displayName?.trim() || t(provider.label)}</strong><small>{enabled ? t('已启用') : t('未启用')}</small></span>
+                              <i className={enabled ? 'is-enabled' : undefined} />
+                            </SortableProviderRow>
+                          );
+                        })}
+                      </SortableContext>
+                    </DndContext>
                   </div>
                 </aside>
                 <div className="settings-model-detail">
@@ -2720,14 +2797,19 @@ export function EnvironmentSettings({
                               <AppInput
                                 aria-invalid={activeProviderDuplicateExtraRequestParameterKeys.includes(row.key.trim()) || undefined}
                                 aria-label={t('参数名')}
+                                autoCapitalize="none"
                                 onChange={(event) => updateActiveProviderExtraRequestParameter(row.id, { key: event.target.value })}
                                 placeholder={t('参数名')}
+                                spellCheck={false}
+                                title={row.key || t('参数名')}
                                 value={row.key}
                               />
                               <AppInput
                                 aria-label={t('参数值')}
                                 onChange={(event) => updateActiveProviderExtraRequestParameter(row.id, { value: event.target.value })}
                                 placeholder={t('参数值，例如 true、0.2、"priority" 或 {"type":"adaptive"}')}
+                                spellCheck={false}
+                                title={row.value || t('参数值')}
                                 value={row.value}
                               />
                               <button
@@ -2792,7 +2874,7 @@ export function EnvironmentSettings({
                                 <small className={`settings-apply-badge is-${definition?.applyMode || 'runtime'}`}>{t(definition?.applyMode === 'startup' ? '重启后生效' : '即时生效')}</small>
                               </span>
                               <span>{definition?.description ? t(definition.description) : t('网页配置项。')}</span>
-                              <small className="settings-field-default">{t('默认值')}：{t(displayDefaultValue(item.key, definition?.defaultValue || ''))}</small>
+                              <small className="settings-field-default">{t('默认值')}：{displayDefaultValue(item.key, definition?.defaultValue || '', t)}</small>
                             </div>
                             <div className="settings-row-control">{renderRuntimeControl(item, index)}</div>
                           </div>

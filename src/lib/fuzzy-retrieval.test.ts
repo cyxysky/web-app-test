@@ -34,3 +34,10 @@ test('fuzzy retrieval tolerates punctuation, spacing, and minor wording differen
   assert.ok(fuzzyRetrievalScore('project-status!', ['Project status workflow']) >= 0.8);
   assert.ok(fuzzyRetrievalScore('交 付 日 期', ['修改交付日期']) >= 0.8);
 });
+
+test('a shared generic action does not match unrelated business entities', () => {
+  assert.ok(fuzzyRetrievalScore('open financial report', ['open music player']) < 0.38);
+  assert.ok(fuzzyRetrievalScore('open financial report', ['open']) < 0.38);
+  assert.ok(fuzzyRetrievalScore('修改客户地址', ['修改音乐播放列表']) < 0.38);
+  assert.ok(fuzzyRetrievalScore('download financial report', ['导出财务报表']) >= 0.38);
+});

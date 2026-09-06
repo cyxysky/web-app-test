@@ -23,3 +23,5 @@ expose the resolved `media` tool through the consuming TypeScript Agent
 framework, inject the package Skill, and preserve returned image/artifact
 content. See the complete
 [TypeScript Agent framework integration guide](../capability-sdk/FRAMEWORK_INTEGRATION.md).
+
+`createFfmpegMediaOperations` accepts an optional `ffprobePath` for structured metadata inspection. Without it, FFmpeg inspects stream headers with zero output duration. Cancellation and timeouts terminate the child process tree and reject the operation; partial stderr is not treated as successful inspection.

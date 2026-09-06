@@ -11,6 +11,7 @@ import {
   Clock3,
   Download,
   ExternalLink,
+  Pencil,
   Globe2,
   History,
   ListChecks,
@@ -19,7 +20,6 @@ import {
   Plus,
   RefreshCw,
   SlidersHorizontal,
-  Sparkles,
   StopCircle,
   Trash2,
   Workflow,
@@ -52,10 +52,12 @@ import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 import { useTheme } from '@/theme/ThemeProvider';
 import { AppInput } from '@/components/ui/app-input';
 import { AppModal } from '@/components/ui/app-modal';
+import { BrowserChatOrderedResponse, BrowserChatAutomationRunIdContext } from '@/components/BrowserChatMarkdown';
+import { browserChatFinalBlockSchema, browserChatFinalBlocksToParts, type BrowserChatFinalBlock } from '@/lib/browser-chat-ui-message';
 
 type AutomationFrequency = 'daily' | 'weekly';
 type AutomationRunStatus = 'queued' | 'running' | 'passed' | 'failed' | 'blocked' | 'interrupted';
-type AutomationRunStepStatus = 'fixed' | 'repaired' | 'failed';
+type AutomationRunStepStatus = 'running' | 'passed' | 'fixed' | 'repaired' | 'failed' | 'blocked';
 type AutomationDialog = 'case' | 'schedule' | 'deleteCase' | 'deleteSchedule' | null;
 type Translate = (value: string, params?: Record<string, string | number>) => string;
 
@@ -64,8 +66,10 @@ type AutomationCase = {
   name: string;
   description: string;
   prompt: string;
+  guidance: string;
+  completionCriteria: string;
+  outputRequirements: string;
   targetUrl?: string;
-  enabled: boolean;
   updatedAt?: string;
 };
 
@@ -114,6 +118,8 @@ type AutomationRun = {
   finishedAt?: string;
   error?: string;
   steps: AutomationRunStep[];
+  output?: string;
+  outputBlocks?: BrowserChatFinalBlock[];
 };
 
 type CaseDraft = {
@@ -121,6 +127,9 @@ type CaseDraft = {
   description: string;
   prompt: string;
   targetUrl: string;
+  guidance: string;
+  completionCriteria: string;
+  outputRequirements: string;
 };
 
 type ScheduleDraft = {
@@ -137,6 +146,9 @@ const emptyCaseDraft: CaseDraft = {
   description: '',
   prompt: '',
   targetUrl: '',
+  guidance: '',
+  completionCriteria: '',
+  outputRequirements: '',
 };
 
 const weekdayOptions = [
@@ -186,7 +198,7 @@ function normalizeCase(value: unknown, t: Translate): AutomationCase | undefined
   if (!record) return undefined;
   const id = recordText(record, ['id', 'caseId']);
   if (!id) return undefined;
-  const name = recordText(record, ['name', 'title']) || t('自动化用例 {id}', { id });
+  const name = recordText(record, ['name', 'title']) || t('自动化任务 {id}', { id });
   const description = recordText(record, ['description', 'summary']);
   const prompt = recordText(record, ['prompt', 'instruction', 'task', 'content']) || description;
   return {
@@ -194,8 +206,10 @@ function normalizeCase(value: unknown, t: Translate): AutomationCase | undefined
     name,
     description,
     prompt,
+    guidance: recordText(record, ['guidance']),
+    completionCriteria: recordText(record, ['completionCriteria']),
+    outputRequirements: recordText(record, ['outputRequirements']),
     targetUrl: recordText(record, ['targetUrl', 'url']) || undefined,
-    enabled: record.enabled !== false && recordText(record, ['status']) !== 'disabled',
     updatedAt: recordText(record, ['updatedAt', 'createdAt']) || undefined,
   };
 }
@@ -245,11 +259,9 @@ function normalizeRunSteps(value: unknown, t: Translate): AutomationRunStep[] {
     const record = asRecord(item);
     if (!record) return [];
     const rawStatus = recordText(record, ['status']).toLowerCase();
-    const status: AutomationRunStepStatus = rawStatus === 'repaired'
-      ? 'repaired'
-      : rawStatus === 'failed'
-        ? 'failed'
-        : 'fixed';
+    const status: AutomationRunStepStatus = ['running', 'passed', 'repaired', 'failed', 'blocked'].includes(rawStatus)
+      ? rawStatus as AutomationRunStepStatus
+      : 'fixed';
     const screenshotPath = recordText(record, ['screenshotPath', 'evidencePath']);
     return [{
       index: Number.isFinite(Number(record.operationIndex)) ? Number(record.operationIndex) : index,
@@ -295,6 +307,11 @@ function normalizeRun(value: unknown, t: Translate): AutomationRun | undefined {
     finishedAt: recordText(record, ['finishedAt', 'endedAt', 'completedAt']) || undefined,
     error: recordText(record, ['error', 'message']) || undefined,
     steps: normalizeRunSteps(record.steps, t),
+    output: recordText(record, ['output']) || undefined,
+    outputBlocks: Array.isArray(record.outputBlocks) ? record.outputBlocks.flatMap((block) => {
+      const parsed = browserChatFinalBlockSchema.safeParse(block);
+      return parsed.success ? [parsed.data] : [];
+    }) : undefined,
   };
 }
 
@@ -322,7 +339,7 @@ async function fetchAutomationCasePage(
   params: Record<string, string> = { limit: '10' },
 ) {
   const response = await fetch(apiUrl('/api/automation/cases', userId, params), { cache: 'no-store' });
-  const payload = await readApiJson<unknown>(response, t('加载自动化用例失败'));
+  const payload = await readApiJson<unknown>(response, t('加载自动化任务失败'));
   const record = asRecord(payload);
   return {
     cases: collectionItems(payload, ['cases'])
@@ -509,17 +526,15 @@ function RunTimeline({ language, steps, t }: { language: Language; steps: Automa
         const title = finalVerification ? t('AI 最终验收') : step.name;
         const phaseLabel = finalVerification
           ? (step.status === 'failed' ? t('验收失败') : t('AI 验收'))
-          : step.status === 'repaired'
-            ? t('AI 已修复')
-            : step.status === 'failed'
-              ? t('执行失败')
-              : t('固定回放');
+          : step.status === 'running' ? t('执行中')
+            : step.status === 'blocked' ? t('需要处理')
+              : step.status === 'failed' ? t('执行失败') : t('已完成');
         return (
           <li className={`automation-timeline-item is-${step.status}`} key={`${step.index}:${step.name}:${position}`}>
             <span className="automation-timeline-marker" aria-hidden="true">
-              {step.status === 'repaired'
-                ? <Sparkles size={14} />
-                : step.status === 'failed'
+              {step.status === 'running'
+                ? <Loader2 className="spin" size={14} />
+                : step.status === 'failed' || step.status === 'blocked'
                   ? <XCircle size={14} />
                   : <CheckCircle2 size={14} />}
             </span>
@@ -595,6 +610,7 @@ export function AutomationWorkspace({
   const [loading, setLoading] = useState(true);
   const loadSequenceRef = useRef(0);
   const [savingCase, setSavingCase] = useState(false);
+  const [editingCaseId, setEditingCaseId] = useState<string | null>(null);
   const [savingSchedule, setSavingSchedule] = useState(false);
   const [runningCaseId, setRunningCaseId] = useState<string | null>(null);
   const [abortingRunId, setAbortingRunId] = useState<string | null>(null);
@@ -651,7 +667,7 @@ export function AutomationWorkspace({
       });
       setCaseListPage(page.page || {});
     } catch (loadError) {
-      setError(loadError instanceof Error ? t(loadError.message) : t('加载自动化用例失败'));
+      setError(loadError instanceof Error ? t(loadError.message) : t('加载自动化任务失败'));
     } finally {
       setLoadingMoreCases(false);
     }
@@ -774,6 +790,19 @@ export function AutomationWorkspace({
 
   function openCaseDialog() {
     setFormError('');
+    setEditingCaseId(null);
+    setCaseDraft(emptyCaseDraft);
+    setDialog('case');
+  }
+
+  function openEditCaseDialog(task: AutomationCase) {
+    setFormError('');
+    setEditingCaseId(task.id);
+    setCaseDraft({
+      name: task.name, description: task.description, prompt: task.prompt,
+      targetUrl: task.targetUrl === 'about:blank' ? '' : task.targetUrl || '',
+      guidance: task.guidance, completionCriteria: task.completionCriteria, outputRequirements: task.outputRequirements,
+    });
     setDialog('case');
   }
 
@@ -807,7 +836,7 @@ export function AutomationWorkspace({
     const prompt = caseDraft.prompt.trim();
     const targetUrl = caseDraft.targetUrl.trim();
     if (!name || !prompt) {
-      setFormError(t('请填写用例名称和执行指令。'));
+      setFormError(t('请填写任务名称和执行指令。'));
       return;
     }
     if (targetUrl) {
@@ -823,26 +852,30 @@ export function AutomationWorkspace({
     setFormError('');
     setSavingCase(true);
     try {
-      const response = await fetch(apiUrl('/api/automation/cases', userId), {
-        method: 'POST',
+      const response = await fetch(apiUrl(editingCaseId ? `/api/automation/cases/${encodeURIComponent(editingCaseId)}` : '/api/automation/cases', userId), {
+        method: editingCaseId ? 'PATCH' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           title: name,
           description: caseDraft.description.trim(),
           targetUrl,
           instruction: prompt,
+          guidance: caseDraft.guidance.trim(),
+          completionCriteria: caseDraft.completionCriteria.trim(),
+          outputRequirements: caseDraft.outputRequirements.trim(),
         }),
       });
-      const payload = await readApiJson<unknown>(response, t('创建自动化用例失败'));
+      const payload = await readApiJson<unknown>(response, t('创建自动化任务失败'));
       const payloadRecord = asRecord(payload);
       const created = normalizeCase(payloadRecord?.automationCase ?? payloadRecord?.case ?? payload, t);
       setCaseDraft(emptyCaseDraft);
       setDialog(null);
-      setNotice(t('已创建用例“{name}”。', { name }));
+      setNotice(t(editingCaseId ? '已保存任务“{name}”。' : '已创建任务“{name}”。', { name }));
+      setEditingCaseId(null);
       if (created) setSelectedCaseId(created.id);
       await loadAll(true);
     } catch (mutationError) {
-      setFormError(mutationError instanceof Error ? t(mutationError.message) : t('创建自动化用例失败'));
+      setFormError(mutationError instanceof Error ? t(mutationError.message) : t('创建自动化任务失败'));
     } finally {
       setSavingCase(false);
     }
@@ -857,7 +890,7 @@ export function AutomationWorkspace({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
-      const payload = await readApiJson<unknown>(response, t('启动自动化用例失败'));
+      const payload = await readApiJson<unknown>(response, t('启动自动化任务失败'));
       const payloadRecord = asRecord(payload);
       const createdRun = normalizeRun(payloadRecord?.run ?? payload, t);
       setNotice(t('“{name}”已进入执行队列。', { name: item.name }));
@@ -865,7 +898,7 @@ export function AutomationWorkspace({
       if (createdRun) setOpenRunIds((current) => current.includes(createdRun.id) ? current : [...current, createdRun.id]);
       await loadAll(true);
     } catch (mutationError) {
-      setError(mutationError instanceof Error ? t(mutationError.message) : t('启动自动化用例失败'));
+      setError(mutationError instanceof Error ? t(mutationError.message) : t('启动自动化任务失败'));
     } finally {
       setRunningCaseId(null);
     }
@@ -891,7 +924,7 @@ export function AutomationWorkspace({
   async function createSchedule(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!scheduleDraft.caseId) {
-      setFormError(t('请先选择一个自动化用例。'));
+      setFormError(t('请先选择一个自动化任务。'));
       return;
     }
     try {
@@ -900,7 +933,7 @@ export function AutomationWorkspace({
       setFormError(t('请输入有效的 IANA 时区，例如 Asia/Hong_Kong。'));
       return;
     }
-    const selectedCaseName = caseNameById.get(scheduleDraft.caseId) || t('自动化用例');
+    const selectedCaseName = caseNameById.get(scheduleDraft.caseId) || t('自动化任务');
     const name = scheduleDraft.name.trim() || t('{caseName} · {frequency}', {
       caseName: selectedCaseName,
       frequency: t(scheduleDraft.frequency === 'daily' ? '每日' : '每周'),
@@ -973,7 +1006,7 @@ export function AutomationWorkspace({
       const response = await fetch(apiUrl(`/api/automation/cases/${encodeURIComponent(automationCase.id)}`, userId), {
         method: 'DELETE',
       });
-      await readApiJson<unknown>(response, t('删除自动化用例失败'));
+      await readApiJson<unknown>(response, t('删除自动化任务失败'));
       setSelectedCaseId(nextSelectedCaseId);
       setScheduleDraft((current) => current.caseId === automationCase.id
         ? { ...current, caseId: replacementCase?.id || '' }
@@ -983,10 +1016,10 @@ export function AutomationWorkspace({
       )));
       setDialog(null);
       setCasePendingDelete(null);
-      setNotice(t('已删除用例“{name}”。', { name: automationCase.name }));
+      setNotice(t('已删除任务“{name}”。', { name: automationCase.name }));
       await loadAll(true);
     } catch (mutationError) {
-      setError(mutationError instanceof Error ? t(mutationError.message) : t('删除自动化用例失败'));
+      setError(mutationError instanceof Error ? t(mutationError.message) : t('删除自动化任务失败'));
     } finally {
       setDeletingCaseId(null);
     }
@@ -1005,6 +1038,17 @@ export function AutomationWorkspace({
   const selectedCaseSchedules = selectedCase ? schedulesByCase.get(selectedCase.id) || [] : [];
   const selectedCaseRuns = selectedCase ? runsByCase.get(selectedCase.id) || [] : [];
   const selectedCaseActiveRuns = selectedCaseRuns.filter((run) => activeRunStatuses.has(run.status));
+  const latestRun = selectedCaseRuns[0];
+  const latestVerification = latestRun?.steps.find((step) => step.name === 'finalVerification');
+  const latestRunSummary = latestRun?.output || (latestRun?.error
+    ? t(latestRun.error)
+    : latestRun?.status === 'queued'
+      ? t('任务已排队，开始后会自动更新。')
+      : latestRun?.status === 'running'
+        ? t('正在执行，结果会在完成后显示。')
+        : latestVerification
+          ? summarizeStep(latestVerification, t).text
+          : t('本次运行未记录结果摘要，可展开执行记录查看详情。'));
 
   return (
     <section className={sidebarCollapsed ? 'browser-chat-layout sidebar-collapsed automation-layout' : 'browser-chat-layout automation-layout'}>
@@ -1024,11 +1068,11 @@ export function AutomationWorkspace({
               actions={(
                 <>
                 <button
-                  aria-label={t('新建用例')}
+                  aria-label={t('新建任务')}
                   className="ui-icon-button browser-chat-section-create"
                   disabled={loading}
                   onClick={openCaseDialog}
-                  title={t('新建用例')}
+                  title={t('新建任务')}
                   type="button"
                 >
                   <Plus size={18} />
@@ -1055,20 +1099,20 @@ export function AutomationWorkspace({
               )}
             >
               <WorkspaceSidebarArchiveFilter
-                ariaLabel={t('筛选用例历史')}
-                clearLabel={t('清空用例筛选')}
+                ariaLabel={t('筛选任务历史')}
+                clearLabel={t('清空任务筛选')}
                 clearTitle={t('清空筛选')}
                 disabled={loading}
                 onChange={setCaseFilter}
-                placeholder={t('筛选用例')}
+                placeholder={t('筛选任务')}
                 value={caseFilter}
               />
             </WorkspaceSidebarArchiveHeader>
             <div className={loading ? 'browser-chat-history-stage is-loading' : 'browser-chat-history-stage'} aria-busy={loading}>
             {loading ? (
-              <div className="browser-chat-history-loading" role="status" aria-live="polite" aria-label={t('正在加载用例')}>
+              <div className="browser-chat-history-loading" role="status" aria-live="polite" aria-label={t('正在加载任务')}>
                 <Loader2 className="spin" size={16} />
-                <span>{t('正在加载用例')}</span>
+                <span>{t('正在加载任务')}</span>
               </div>
             ) : filteredCases.length ? (
               <WorkspaceHistoryList
@@ -1110,11 +1154,11 @@ export function AutomationWorkspace({
                       collapsed={sidebarCollapsed}
                       collapsedAction={(
                         <button
-                          aria-label={t('删除用例“{name}”', { name: item.name })}
+                          aria-label={t('删除任务“{name}”', { name: item.name })}
                           className="workspace-sidebar-archive-row-delete browser-chat-collapsed-delete"
                           disabled={Boolean(deletingCaseId)}
                           onClick={() => openDeleteCaseDialog(item)}
-                          title={t('删除用例')}
+                          title={t('删除任务')}
                           type="button"
                         >
                           <X size={12} />
@@ -1123,18 +1167,18 @@ export function AutomationWorkspace({
                       collapsedIcon={<ListChecks aria-hidden="true" size={17} />}
                       expandedAction={(
                         <button
-                          aria-label={t('删除用例“{name}”', { name: item.name })}
+                          aria-label={t('删除任务“{name}”', { name: item.name })}
                           className="workspace-sidebar-archive-row-delete"
                           disabled={Boolean(deletingCaseId)}
                           onClick={() => openDeleteCaseDialog(item)}
-                          title={t('删除用例')}
+                          title={t('删除任务')}
                           type="button"
                         >
                           <Trash2 size={14} />
                         </button>
                       )}
                       id={`automation-case-${item.id}`}
-                      iconTone={itemActiveRuns.length ? 'running' : item.enabled ? 'enabled' : 'muted'}
+                      iconTone={itemActiveRuns.length ? 'running' : itemLatestRun?.status === 'passed' ? 'enabled' : 'muted'}
                       meta={formatTime(item.updatedAt, language)}
                       onOpen={() => setSelectedCaseId(item.id)}
                       title={item.name}
@@ -1144,9 +1188,9 @@ export function AutomationWorkspace({
                 }}
               />
             ) : cases.length ? (
-              <p className="browser-chat-history-filter-empty">{t('没有匹配的用例')}</p>
+              <p className="browser-chat-history-filter-empty">{t('没有匹配的任务')}</p>
             ) : (
-              <p className="browser-chat-history-filter-empty">{t('暂无用例')}</p>
+              <p className="browser-chat-history-filter-empty">{t('暂无任务')}</p>
             )}
           </div>
           </div>
@@ -1159,19 +1203,32 @@ export function AutomationWorkspace({
           <header className="automation-page-header">
             <div>
               <h1>{t('自动化')}</h1>
-              <p>{t('让对话中的工具操作按计划运行，失败时由 AI 自动修复并完成验收。')}</p>
+              <p>{t('设定任务，交给 AI 按时执行并交付结果。')}</p>
             </div>
             <div className="automation-header-actions">
-              <button className="automation-icon-action" onClick={openCaseDialog} type="button">
+              <button className="automation-icon-action automation-secondary-action" onClick={openCaseDialog} type="button">
                 <Plus size={16} />
-                {t('新建用例')}
+                <span>{t('新建任务')}</span>
               </button>
               <button className="automation-icon-action" disabled={loading} onClick={() => void loadAll()} type="button">
                 <RefreshCw className={loading ? 'spin' : undefined} size={16} />
-                {t('刷新')}
+                <span>{t('刷新')}</span>
               </button>
             </div>
           </header>
+
+          {cases.length ? (
+            <div className="automation-mobile-case-picker">
+              <label htmlFor="automation-mobile-case">{t('自动化任务')}</label>
+              <CustomSelect
+                id="automation-mobile-case"
+                onChange={setSelectedCaseId}
+                options={cases.map((item) => ({ value: item.id, label: item.name }))}
+                searchable
+                value={selectedCase?.id || ''}
+              />
+            </div>
+          ) : null}
 
           <div className="automation-feedback" aria-live="polite">
             {error ? <p className="error">{error}</p> : null}
@@ -1183,127 +1240,101 @@ export function AutomationWorkspace({
               <LiquidGlassLoader />
               <div>
                 <h2>{t('正在加载自动化任务')}</h2>
-                <p>{t('同步用例、执行计划与运行状态。')}</p>
+                <p>{t('同步任务、执行计划与运行状态。')}</p>
               </div>
             </section>
           ) : cases.length ? (
-            <section className="automation-case-section" aria-label={t('自动化用例')}>
+            <section className="automation-case-section" aria-label={t('自动化任务')}>
               <div className="automation-case-workbench">
                 {selectedCase ? (
                   <article className="automation-case-detail">
-                    <header className="automation-case-detail-header">
-                      <div className="automation-case-detail-heading">
-                        <div className="automation-case-status-row">
-                          <span className={selectedCase.enabled ? 'automation-case-status is-enabled' : 'automation-case-status'}>
-                            <span aria-hidden="true" />
-                            {t(selectedCase.enabled ? '已启用' : '已停用')}
-                          </span>
-                          {selectedCaseActiveRuns.length ? (
-                            <span className="automation-case-status is-running">
-                              <Loader2 className="spin" size={12} />
-                              {t('{count} 个执行中', { count: selectedCaseActiveRuns.length })}
-                            </span>
-                          ) : null}
-                        </div>
-                        <h2>{selectedCase.name}</h2>
-                        <p>{selectedCase.description || selectedCase.prompt || t('暂无用例说明')}</p>
-                      </div>
-                      <div className="automation-case-actions">
-                        <Link
-                          className="automation-icon-action"
-                          download
-                          href={apiUrl(`/api/automation/cases/${encodeURIComponent(selectedCase.id)}`, userId, { download: '1' })}
-                          title={t('导出用例')}
-                        >
-                          <Download size={16} />
-                          <span>{t('导出')}</span>
-                        </Link>
-                        <button
-                          className="automation-icon-action automation-run-action"
-                          disabled={runningCaseId === selectedCase.id}
-                          onClick={() => void runCase(selectedCase)}
-                          type="button"
-                        >
-                          {runningCaseId === selectedCase.id ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
-                          <span>{t('立即运行')}</span>
-                        </button>
-                      </div>
-                    </header>
-
-                    <div className="automation-case-context">
-                      {selectedCase.targetUrl ? (
-                        <a href={selectedCase.targetUrl} rel="noreferrer" target="_blank" title={selectedCase.targetUrl}>
-                          <Globe2 size={14} />
-                          <span>{selectedCase.targetUrl}</span>
-                        </a>
-                      ) : <span>{t('未设置目标页面')}</span>}
-                      <span><Clock3 size={13} /> {t('更新于 {time}', { time: formatDateTime(selectedCase.updatedAt, language) })}</span>
-                    </div>
-
-                    {selectedCase.prompt
-                      && selectedCase.prompt !== selectedCase.description
-                      && selectedCase.prompt !== selectedCase.name ? (
-                        <div className="automation-case-instruction">
-                          <span>{t('执行目标')}</span>
-                          <p>{selectedCase.prompt}</p>
-                        </div>
-                      ) : null}
-
-                    <div className="automation-case-detail-sections">
-                      <section className="automation-case-subsection">
-                        <div className="automation-subsection-heading">
-                          <div>
-                            <CalendarDays size={15} />
-                            <h3>{t('执行计划')}</h3>
+                    <section className="automation-case-overview" aria-label={t('任务概览')}>
+                      <header className="automation-case-detail-header">
+                        <div className="automation-case-detail-heading">
+                          <div className="automation-case-title-row">
+                            <h2>{selectedCase.name}</h2>
+                            {selectedCaseActiveRuns.length ? (
+                              <span className="automation-case-status is-running">
+                                <Loader2 className="spin" size={12} />
+                                {t('{count} 个执行中', { count: selectedCaseActiveRuns.length })}
+                              </span>
+                            ) : null}
                           </div>
-                          <button
-                            aria-label={t('为 {name} 新建计划', { name: selectedCase.name })}
+                          {selectedCase.description ? <p>{selectedCase.description}</p> : null}
+                        </div>
+                        <div className="automation-case-actions">
+                          <button className="automation-icon-action" onClick={() => openEditCaseDialog(selectedCase)} type="button">
+                            <Pencil size={15} />
+                            <span>{t('编辑任务')}</span>
+                          </button>
+                          <Link
                             className="automation-icon-action"
-                            onClick={() => openScheduleDialog(selectedCase.id)}
+                            download
+                            href={apiUrl(`/api/automation/cases/${encodeURIComponent(selectedCase.id)}`, userId, { download: '1' })}
+                            title={t('导出任务')}
+                          >
+                            <Download size={16} />
+                            <span>{t('导出')}</span>
+                          </Link>
+                          <button
+                            className="automation-icon-action automation-primary-action automation-run-action"
+                            disabled={runningCaseId === selectedCase.id}
+                            onClick={() => void runCase(selectedCase)}
                             type="button"
                           >
-                            <Plus size={15} />
-                            {t('新建计划')}
+                            {runningCaseId === selectedCase.id ? <Loader2 className="spin" size={16} /> : <Play size={16} />}
+                            <span>{t(runningCaseId === selectedCase.id ? '正在启动' : '立即运行')}</span>
                           </button>
                         </div>
-                        {selectedCaseSchedules.length ? (
-                          <div className="automation-schedule-list">
-                            {selectedCaseSchedules.map((schedule) => (
-                              <div className="automation-schedule-row" key={schedule.id}>
-                                <span className={schedule.enabled ? 'automation-state-dot is-enabled' : 'automation-state-dot'} aria-hidden="true" />
-                                <div>
-                                  <strong>{schedule.name}</strong>
-                                  <p>{scheduleDescription(schedule, t)} · {schedule.timezone}</p>
-                                </div>
-                                <span className="automation-next-run">
-                                  <Clock3 size={13} />
-                                  {t('下次 {time}', { time: formatDateTime(schedule.nextRunAt, language) })}
-                                </span>
-                                <button
-                                  aria-label={t('删除计划 {name}', { name: schedule.name })}
-                                  className="automation-icon-action is-danger"
-                                  disabled={Boolean(deletingScheduleId)}
-                                  onClick={() => openDeleteScheduleDialog(schedule)}
-                                  title={t('删除计划')}
-                                  type="button"
-                                >
-                                  {deletingScheduleId === schedule.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
-                                </button>
-                              </div>
-                            ))}
+                      </header>
+
+                      <div className="automation-case-context">
+                        {selectedCase.targetUrl ? (
+                          <a href={selectedCase.targetUrl} rel="noreferrer" target="_blank" title={selectedCase.targetUrl}>
+                            <Globe2 size={14} />
+                            <span>{selectedCase.targetUrl}</span>
+                          </a>
+                        ) : <span><Globe2 size={14} />{t('未设置目标页面')}</span>}
+                        <span><Clock3 size={13} /> {t('更新于 {time}', { time: formatDateTime(selectedCase.updatedAt, language) })}</span>
+                      </div>
+
+                    </section>
+
+                    <div className="automation-case-detail-sections">
+                      <section className="automation-case-subsection automation-run-history">
+                        <div className="automation-results-heading">
+                          <h3>{t('运行结果')}</h3>
+                          <span>{t('最近一次运行')}</span>
+                        </div>
+                        {latestRun ? (
+                          <div className={`automation-latest-result automation-run-state-${latestRun.status}`}>
+                            <div className="automation-result-status">
+                              <span className="automation-run-status-dot" aria-hidden="true" />
+                              <h4>{statusLabel(latestRun.status, t)}</h4>
+                              <span>{formatDateTime(latestRun.finishedAt || latestRun.startedAt, language)}</span>
+                            </div>
+                            <div className="automation-result-content">
+                              <BrowserChatAutomationRunIdContext.Provider value={latestRun.id}>
+                                <BrowserChatOrderedResponse fallbackText={latestRunSummary} parts={browserChatFinalBlocksToParts(latestRun.outputBlocks || [])} />
+                              </BrowserChatAutomationRunIdContext.Provider>
+                            </div>
                           </div>
                         ) : (
-                          <div className="automation-inline-empty">{t('尚未设置自动执行计划。')}</div>
+                          <div className="automation-results-empty">
+                            <History size={28} aria-hidden="true" />
+                            <h4>{t('等待第一次运行')}</h4>
+                            <p>{t('点击“立即运行”，结果和执行轨迹会显示在这里。')}</p>
+                          </div>
                         )}
-                      </section>
-
-                      <section className="automation-case-subsection automation-run-history">
                         <div className="automation-subsection-heading">
                           <div>
                             <History size={15} />
-                            <h3>{t('运行历史')}</h3>
+                            <h3>{t('执行记录')}</h3>
+                            <span className="automation-section-count">{selectedCaseRuns.length}</span>
                           </div>
-                          <span>{t('{count} 次', { count: selectedCaseRuns.length })}</span>
+                          {selectedCaseActiveRuns.length ? (
+                            <span className="automation-history-live"><span aria-hidden="true" />{t('执行中')}</span>
+                          ) : null}
                         </div>
                         {selectedCaseRuns.length ? (
                           <WorkspaceHistoryList
@@ -1316,7 +1347,6 @@ export function AutomationWorkspace({
                               const runExpanded = openRunIds.includes(run.id);
                               const runTraceId = `automation-run-trace-${run.id.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
                               const active = activeRunStatuses.has(run.status);
-                              const repairedSteps = run.steps.filter((step) => step.status === 'repaired' && step.name !== 'finalVerification').length;
                               const duration = formatDuration(t, run.startedAt, run.finishedAt);
                               return (
                                 <article className={`automation-run-item automation-run-state-${run.status}`}>
@@ -1335,9 +1365,8 @@ export function AutomationWorkspace({
                                         <small>
                                           {run.error
                                             ? compactText(t(run.error), 72)
-                                            : t(repairedSteps ? '{steps} 步 · AI 修复 {repairs} 次' : '{steps} 步', {
+                                            : t('{steps} 步', {
                                               steps: run.steps.length,
-                                              repairs: repairedSteps,
                                             })}
                                         </small>
                                       </span>
@@ -1356,7 +1385,7 @@ export function AutomationWorkspace({
                                           type="button"
                                         >
                                           {abortingRunId === run.id ? <Loader2 className="spin" size={15} /> : <StopCircle size={15} />}
-                                          {t('中止')}
+                                          <span>{t('中止')}</span>
                                         </button>
                                       ) : null}
                                       {run.sessionId ? (
@@ -1373,6 +1402,14 @@ export function AutomationWorkspace({
                                   </div>
                                   {runExpanded ? (
                                     <div className="automation-run-trace" id={runTraceId}>
+                                      {run.output || run.outputBlocks?.length ? (
+                                        <div className="automation-result-content automation-record-output">
+                                          <h4>{t('任务输出')}</h4>
+                                          <BrowserChatAutomationRunIdContext.Provider value={run.id}>
+                                            <BrowserChatOrderedResponse fallbackText={run.output || ''} parts={browserChatFinalBlocksToParts(run.outputBlocks || [])} />
+                                          </BrowserChatAutomationRunIdContext.Provider>
+                                        </div>
+                                      ) : null}
                                       <div className="automation-trace-heading">
                                         <h4>{t('执行轨迹')}</h4>
                                         <span>{run.finishedAt
@@ -1387,9 +1424,79 @@ export function AutomationWorkspace({
                             }}
                           />
                         ) : (
-                          <div className="automation-inline-empty">{t('还没有运行记录，点击“立即运行”开始第一次执行。')}</div>
+                          <p className="automation-history-empty">{t('运行后，可在这里查看每一步操作与验收详情。')}</p>
                         )}
                       </section>
+                      <aside className="automation-case-configuration" aria-label={t('执行配置')}>
+                        {selectedCase.prompt ? (
+                          <div className="automation-case-instruction">
+                            <span><ListChecks size={15} aria-hidden="true" />{t('执行目标')}</span>
+                            <p>{selectedCase.prompt}</p>
+                          </div>
+                        ) : null}
+                        {([
+                          ['操作指引', selectedCase.guidance],
+                          ['完成条件', selectedCase.completionCriteria],
+                          ['输出要求', selectedCase.outputRequirements],
+                        ] as const).filter(([, value]) => value).map(([label, value]) => (
+                          <div className="automation-case-instruction" key={label}>
+                            <span>{t(label)}</span>
+                            <p>{value}</p>
+                          </div>
+                        ))}
+                        <section className="automation-case-subsection automation-schedules">
+                          <div className="automation-subsection-heading">
+                            <div>
+                              <CalendarDays size={15} />
+                              <h3>{t('执行计划')}</h3>
+                              <span className="automation-section-count">{selectedCaseSchedules.length}</span>
+                            </div>
+                            <button
+                              aria-label={t('为 {name} 新建计划', { name: selectedCase.name })}
+                              className="automation-icon-action"
+                              onClick={() => openScheduleDialog(selectedCase.id)}
+                              type="button"
+                            >
+                              <Plus size={15} />
+                              <span>{t('新建计划')}</span>
+                            </button>
+                          </div>
+                          {selectedCaseSchedules.length ? (
+                            <div className="automation-schedule-list">
+                              {selectedCaseSchedules.map((schedule) => (
+                                <div className="automation-schedule-row" key={schedule.id}>
+                                  <span className={schedule.enabled ? 'automation-state-dot is-enabled' : 'automation-state-dot'} aria-hidden="true" />
+                                  <div>
+                                    <strong>{schedule.name}</strong>
+                                    <p>{scheduleDescription(schedule, t)} · {schedule.timezone}</p>
+                                  </div>
+                                  <span className="automation-next-run">
+                                    <Clock3 size={13} />
+                                    {schedule.enabled
+                                      ? t('下次 {time}', { time: formatDateTime(schedule.nextRunAt, language) })
+                                      : t('已停用')}
+                                  </span>
+                                  <button
+                                    aria-label={t('删除计划 {name}', { name: schedule.name })}
+                                    className="automation-icon-action is-danger"
+                                    disabled={Boolean(deletingScheduleId)}
+                                    onClick={() => openDeleteScheduleDialog(schedule)}
+                                    title={t('删除计划')}
+                                    type="button"
+                                  >
+                                    {deletingScheduleId === schedule.id ? <Loader2 className="spin" size={15} /> : <Trash2 size={15} />}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="automation-schedule-empty">
+                              <strong>{t('尚未设置自动执行计划。')}</strong>
+                              <p>{t('添加计划，让任务按时自动执行。')}</p>
+                            </div>
+                          )}
+                        </section>
+                      </aside>
                     </div>
                   </article>
                 ) : null}
@@ -1398,11 +1505,11 @@ export function AutomationWorkspace({
           ) : (
             <section className="automation-empty-state">
               <Workflow size={24} />
-              <h2>{t('还没有自动化用例')}</h2>
-              <p>{t('从对话中的工具执行生成用例，或在这里新建一条执行指令。')}</p>
-              <button className="automation-icon-action" onClick={openCaseDialog} type="button">
+              <h2>{t('还没有自动化任务')}</h2>
+              <p>{t('从对话生成任务，或设定目标、操作指引和完成条件。')}</p>
+              <button className="automation-icon-action automation-primary-action" onClick={openCaseDialog} type="button">
                 <Plus size={16} />
-                {t('新建用例')}
+                <span>{t('新建任务')}</span>
               </button>
             </section>
           )}
@@ -1421,8 +1528,8 @@ export function AutomationWorkspace({
           <form className="webpilot-modal-form" onSubmit={createCase}>
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
-                <h2 className="ui-modal-title" id="automation-case-dialog-title">{t('新建自动化用例')}</h2>
-                <p className="ui-modal-subtitle">{t('描述浏览器需要完成的任务和验收目标。')}</p>
+                <h2 className="ui-modal-title" id="automation-case-dialog-title">{t(editingCaseId ? '编辑自动化任务' : '新建自动化任务')}</h2>
+                <p className="ui-modal-subtitle">{t('设定目标和完成条件，AI 会按照指引持续操作并交付结果。')}</p>
               </div>
               <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={savingCase} onClick={closeDialog} type="button">
                 <X size={17} />
@@ -1431,7 +1538,7 @@ export function AutomationWorkspace({
             <div className="ui-modal-body automation-dialog-fields">
               {formError ? <p className="error">{formError}</p> : null}
               <div className="field modal-field">
-                <label htmlFor="automation-case-name">{t('用例名称')}</label>
+                <label htmlFor="automation-case-name">{t('任务名称')}</label>
                 <AppInput
                   autoFocus
                   id="automation-case-name"
@@ -1442,7 +1549,7 @@ export function AutomationWorkspace({
                 />
               </div>
               <div className="field modal-field">
-                <label htmlFor="automation-case-description">{t('用例说明（可选）')}</label>
+                <label htmlFor="automation-case-description">{t('任务说明（可选）')}</label>
                 <AppInput
                   id="automation-case-description"
                   maxLength={500}
@@ -1463,22 +1570,36 @@ export function AutomationWorkspace({
                 />
               </div>
               <div className="field modal-field">
-                <label htmlFor="automation-case-prompt">{t('执行指令')}</label>
+                <label htmlFor="automation-case-prompt">{t('任务目标')}</label>
                 <TextArea
                   fullWidth
                   id="automation-case-prompt"
                   maxLength={100_000}
                   onChange={(event) => setCaseDraft((current) => ({ ...current, prompt: event.target.value }))}
-                  placeholder={t('说明要完成的操作，以及如何判断执行成功。')}
-                  rows={6}
+                  placeholder={t('例如：检查今日新增订单，整理异常订单及处理建议。')}
+                  rows={3}
                   value={caseDraft.prompt}
                 />
               </div>
+              {([
+                ['guidance', '操作指引', '例如：打开订单列表，筛选今日新增订单，检查付款与发货状态，汇总异常。', 100_000],
+                ['completionCriteria', '完成条件', '例如：检查完全部新增订单，每条异常均包含订单号、原因和处理建议。', 20_000],
+                ['outputRequirements', '输出要求', '例如：先给出汇总，再输出异常明细表；生成 Excel 并附下载链接。', 20_000],
+              ] as const).map(([field, label, placeholder, maxLength]) => (
+                <div className="field modal-field" key={field}>
+                  <label htmlFor={`automation-case-${field}`}>{t(label)}</label>
+                  <TextArea
+                    fullWidth id={`automation-case-${field}`} maxLength={maxLength} rows={3}
+                    onChange={(event) => setCaseDraft((current) => ({ ...current, [field]: event.target.value }))}
+                    placeholder={t(placeholder)} value={caseDraft[field]}
+                  />
+                </div>
+              ))}
             </div>
             <footer className="ui-modal-footer">
               <button className="ui-button ui-button--neutral" disabled={savingCase} onClick={closeDialog} type="button">{t('取消')}</button>
               <button className="ui-button ui-button--primary" disabled={savingCase} type="submit">
-                {t(savingCase ? '创建中…' : '创建用例')}
+                {t(savingCase ? '保存中…' : editingCaseId ? '保存任务' : '创建任务')}
               </button>
             </footer>
           </form>
@@ -1498,7 +1619,7 @@ export function AutomationWorkspace({
             <header className="ui-modal-header">
               <div className="ui-modal-heading">
                 <h2 className="ui-modal-title" id="automation-schedule-dialog-title">{t('新建执行计划')}</h2>
-                <p className="ui-modal-subtitle">{t('按本地时区每日或每周自动执行用例。')}</p>
+                <p className="ui-modal-subtitle">{t('按本地时区每日或每周自动执行任务。')}</p>
               </div>
               <button aria-label={t('关闭')} className="ui-icon-button ui-modal-close" disabled={savingSchedule} onClick={closeDialog} type="button">
                 <X size={17} />
@@ -1507,15 +1628,15 @@ export function AutomationWorkspace({
             <div className="ui-modal-body automation-dialog-fields">
               {formError ? <p className="error">{formError}</p> : null}
               <div className="field modal-field">
-                <label htmlFor="automation-schedule-case">{t('自动化用例')}</label>
+                <label htmlFor="automation-schedule-case">{t('自动化任务')}</label>
                 <CustomSelect
                   id="automation-schedule-case"
                   onChange={(value) => setScheduleDraft((current) => ({ ...current, caseId: value }))}
                   options={[
-                    { label: t('请选择用例'), value: '' },
+                    { label: t('请选择任务'), value: '' },
                     ...cases.map((item) => ({ label: item.name, value: item.id })),
                   ]}
-                  title={t('自动化用例')}
+                  title={t('自动化任务')}
                   value={scheduleDraft.caseId}
                 />
               </div>
@@ -1599,7 +1720,7 @@ export function AutomationWorkspace({
           itemTitle={casePendingDelete.name}
           onClose={closeDialog}
           onConfirm={deleteCase}
-          title={t('删除自动化用例')}
+          title={t('删除自动化任务')}
         />
       ) : null}
 

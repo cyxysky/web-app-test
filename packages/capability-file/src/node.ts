@@ -13,5 +13,6 @@ export * from './node/office/semantic.js';
 export * from './node/office/uno.js';
 export * from './node/office/validation.js';
 export * from './node/read.js';
+export * from './node/receive-download.js';
 export * from './node/text-extraction.js';
 export * from './node/workspace.js';

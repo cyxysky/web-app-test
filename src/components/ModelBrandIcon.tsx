@@ -3,6 +3,7 @@
 import { Bot } from 'lucide-react';
 import type { StaticImageData } from 'next/image';
 import type { ModelProvider } from '@/server/ai/schemas/runtime.schema';
+import { useI18n } from '@/i18n/I18nProvider';
 
 import anthropicDark from '@lobehub/icons-static-png/dark/claude-color.png';
 import anthropicLight from '@lobehub/icons-static-png/light/claude-color.png';
@@ -133,9 +134,10 @@ export function modelBrandName(model: string, provider: ModelProvider): BrandNam
 }
 
 export function ModelBrandIcon({ model, provider }: { model: string; provider: ModelProvider }) {
+  const { t } = useI18n();
   const brandName = modelBrandName(model, provider);
   const brand = brandName ? brands[brandName] : undefined;
-  if (!brand) return <Bot aria-label="AI model" size={16} />;
+  if (!brand) return <Bot aria-label={t('AI 模型')} size={16} />;
   return (
     <span aria-label={brand.label} className="model-brand-icon-images" role="img">
       <img alt="" className="model-brand-icon-light" src={brand.light.src} />

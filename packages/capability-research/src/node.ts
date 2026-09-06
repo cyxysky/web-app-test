@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import { lookup } from 'node:dns/promises';
+import { raceWithAbort } from '@webpilot/capability-sdk';
+import { fetchPinnedPublicUrl } from './public-fetch.js';
 import { createResearchCapability, ResearchOperationError, type ResearchOperations, type ResearchSource } from './index.js';
 import type { CapabilityExecutionContext, CapabilityRunContext } from '@webpilot/capability-sdk';
 
@@ -8,18 +10,22 @@ function sourceId(url: string) { return `source_${createHash('sha256').update(ur
 function privateAddress(address: string) {
   const normalized = address.toLowerCase().replace(/^\[|\]$/g, '');
   return normalized === '::' || normalized === '::1' || normalized.startsWith('::ffff:')
-    || normalized.startsWith('fe80:') || normalized.startsWith('fc') || normalized.startsWith('fd')
+    || /^fe[89ab][0-9a-f]:/.test(normalized) || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('ff')
     || /^127\./.test(normalized) || /^10\./.test(normalized) || /^192\.168\./.test(normalized)
-    || /^169\.254\./.test(normalized) || /^172\.(1[6-9]|2\d|3[01])\./.test(normalized) || /^0\./.test(normalized);
+    || /^169\.254\./.test(normalized) || /^172\.(1[6-9]|2\d|3[01])\./.test(normalized) || /^0\./.test(normalized)
+    || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(normalized)
+    || /^198\.(18|19)\./.test(normalized) || Number(normalized.split('.')[0]) >= 224;
 }
-async function assertPublicUrl(value: string) {
+async function assertPublicUrl(value: string, signal: AbortSignal) {
   const url = new URL(value);
   if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('Research fetch accepts only HTTP(S) URLs.');
   if (url.username || url.password) throw new Error('Credential-bearing URLs are not allowed.');
   if (url.hostname === 'localhost') throw new Error('Local research targets are not allowed.');
-  const addresses = isIP(url.hostname) ? [{ address: url.hostname }] : await lookup(url.hostname, { all: true });
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
+  const family = isIP(hostname);
+  const addresses = family ? [{ address: hostname, family }] : await raceWithAbort(lookup(hostname, { all: true }), signal);
   if (!addresses.length || addresses.some((entry) => privateAddress(entry.address))) throw new Error('Private or unresolved research targets are not allowed.');
-  return url;
+  return { url, address: addresses[0] };
 }
 function decodeEntities(value: string) { return value.replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'"); }
 function htmlText(value: string) {
@@ -48,6 +54,7 @@ async function boundedResponseText(response: Response, maximum: number) {
   const decoder = new TextDecoder();
   let output = '';
   let truncated = false;
+  try {
   while (output.length < maximum) {
     const chunk = await reader.read();
     if (chunk.done) {
@@ -62,6 +69,7 @@ async function boundedResponseText(response: Response, maximum: number) {
     }
   }
   return { text: output.slice(0, maximum), truncated };
+  } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
 }
 
 export function createNodeResearchOperations(input: {
@@ -70,22 +78,26 @@ export function createNodeResearchOperations(input: {
   timeoutMs?: number;
   allowUrl?: (url: URL) => boolean | Promise<boolean>;
 } = {}): ResearchOperations {
-  const fetchImpl = input.fetchImpl || fetch;
   return {
     search: input.search,
     async fetch(request, context: CapabilityExecutionContext): Promise<ResearchSource> {
-      let url = await assertPublicUrl(request.url);
       const timeout = AbortSignal.timeout(input.timeoutMs || 20_000);
       const signal = context.abortSignal ? AbortSignal.any([context.abortSignal, timeout]) : timeout;
+      let target = await assertPublicUrl(request.url, signal);
+      let url = target.url;
       let response: Response | undefined;
       for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
         if (input.allowUrl && !(await input.allowUrl(url))) throw new Error('The host network policy rejected this URL.');
-        response = await fetchImpl(url, { redirect: 'manual', signal, headers: { accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.2', 'user-agent': 'WebPilotResearch/0.1' } });
+        response = input.fetchImpl
+          ? await input.fetchImpl(url, { redirect: 'manual', signal, headers: { accept: 'text/html,application/xhtml+xml,text/plain,application/json;q=0.9,*/*;q=0.2', 'user-agent': 'WebPilotResearch/0.1' } })
+          : await fetchPinnedPublicUrl(url, target.address, signal);
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
         const location = response.headers.get('location');
+        await response.body?.cancel().catch(() => undefined);
         if (!location) throw new Error(`Research redirect ${response.status} did not include a location.`);
         if (redirectCount === 5) throw new Error('Research fetch exceeded the redirect limit.');
-        url = await assertPublicUrl(new URL(location, url).href);
+        target = await assertPublicUrl(new URL(location, url).href, signal);
+        url = target.url;
       }
       if (!response) throw new Error('Research fetch did not return a response.');
       if (!response.ok) {

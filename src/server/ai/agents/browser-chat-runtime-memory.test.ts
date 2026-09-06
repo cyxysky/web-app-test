@@ -15,6 +15,22 @@ test('compacts oversized log details into bounded valid JSON', () => {
   assert.ok(parsed.originalCharacters > 20_000);
 });
 
+test('oversized input logs retain an inspectable request and durable context manifest id', () => {
+  const compacted = compactBrowserChatLogDetails(JSON.stringify({
+    aiInput: { provider: 'minimax', model: 'MiniMax-M3', system: 'rules'.repeat(10000), messages: [{ role: 'tool', content: 'evidence'.repeat(20000) }],
+      options: { contextManifest: { id: 'ctxreq-test', entries: Array.from({ length: 300 }, (_, index) => ({ ref: `ctx-${index}`, reason: 'archived' })),
+        knowledge: Array.from({ length: 300 }, (_, index) => ({ id: `skill-${index}`, reason: 'selected complete operating rules', selected: true })) } } },
+    aiInputTokens: { estimatedTotalTokens: 120000 },
+  }), 2000);
+  const parsed = JSON.parse(compacted!);
+  assert.ok(compacted!.length <= 2000);
+  assert.equal(parsed.aiInput.options.contextManifest.id, 'ctxreq-test');
+  assert.equal(parsed.aiInput.options.contextManifest.entriesArchived, true);
+  assert.equal(parsed.aiInput.options.contextManifest.knowledgeCount, 300);
+  assert.deepEqual(parsed.aiInput.options.contextManifest.knowledge, []);
+  assert.equal(parsed.aiInputTokens.estimatedTotalTokens, 120000);
+});
+
 test('retains newest logs within both count and character budgets', () => {
   const logs = Array.from({ length: 10 }, (_, index) => ({
     id: String(index),

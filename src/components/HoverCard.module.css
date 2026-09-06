@@ -1,0 +1,55 @@
+.card {
+  animation: appear 120ms ease;
+  background: var(--panel);
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lg);
+  box-sizing: border-box;
+  color: var(--foreground);
+  display: grid;
+  font-family: var(--app-font-sans);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  gap: 8px;
+  line-height: 1.55;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 14px 16px;
+  pointer-events: auto;
+  text-align: start;
+  white-space: normal;
+}
+
+.header {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.title {
+  display: -webkit-box;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.45;
+  min-width: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.aside {
+  color: var(--muted);
+  flex: 0 0 auto;
+  font-family: var(--app-font-mono);
+  font-size: 12px;
+}
+
+@keyframes appear {
+  from { opacity: 0; transform: translateX(6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card { animation: none; }
+}

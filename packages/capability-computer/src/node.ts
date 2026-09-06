@@ -1,4 +1,5 @@
-import { execFile } from 'node:child_process';
+import { runCapabilityProcess } from '@webpilot/capability-sdk/node';
+import { readBoundedResponseText } from '@webpilot/capability-sdk';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -6,11 +7,9 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
 import { createComputerCapability, type ComputerDriver } from './index.js';
 import type { CapabilityRunContext } from '@webpilot/capability-sdk';
 
-const execFileAsync = promisify(execFile);
 const COMPUTER_PATH = '/v1/computer';
 const MAX_REQUEST_BYTES = 256 * 1024;
 const MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024;
@@ -88,6 +87,7 @@ function readJsonRequest(request: IncomingMessage) {
       }
     });
     request.once('error', reject);
+    request.once('aborted', () => reject(new Error('Computer request cancelled.')));
   });
 }
 
@@ -111,7 +111,8 @@ function windowsDriverScriptPath() {
   return scriptPath;
 }
 
-async function executeWindowsAction(input: Record<string, unknown>) {
+async function executeWindowsAction(input: Record<string, unknown>, signal: AbortSignal) {
+  signal.throwIfAborted();
   const action = String(input.action || '').trim();
   if (!['observe', 'launch', 'click', 'type', 'key', 'scroll', 'wait'].includes(action)) {
     throw new Error(`Unsupported computer action: ${action || '(empty)'}.`);
@@ -124,7 +125,7 @@ async function executeWindowsAction(input: Record<string, unknown>) {
   const screenshotPath = temporaryDirectory ? path.join(temporaryDirectory, `${randomUUID()}.png`) : '';
   const encodedAction = Buffer.from(JSON.stringify(input), 'utf8').toString('base64');
   try {
-    const { stdout } = await execFileAsync(windowsPowerShellPath(), [
+    const { stdout } = await runCapabilityProcess({ executable: windowsPowerShellPath(), args: [
       '-NoLogo',
       '-NoProfile',
       '-NonInteractive',
@@ -136,11 +137,10 @@ async function executeWindowsAction(input: Record<string, unknown>) {
       '-ActionBase64',
       encodedAction,
       ...(screenshotPath ? ['-ScreenshotPath', screenshotPath] : []),
-    ], {
-      encoding: 'utf8',
-      maxBuffer: 2 * 1024 * 1024,
-      timeout: timeoutMs + 5_000,
-      windowsHide: true,
+    ],
+      signal,
+      maxOutputChars: 2 * 1024 * 1024,
+      timeoutMs: timeoutMs + 5_000,
     });
     const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const result = record(JSON.parse(lines.at(-1) || '{}')) || {};
@@ -176,8 +176,11 @@ async function startBuiltInWindowsDriverService(): Promise<BuiltInDriverService>
   }
   const authorization = `Bearer ${randomBytes(32).toString('base64url')}`;
   let queue = Promise.resolve<unknown>(undefined);
+  let pendingCount = 0;
   const serial = <T>(operation: () => Promise<T>) => {
-    const pending = queue.then(operation, operation);
+    if (pendingCount >= 32) throw new Error('Computer driver queue is full.');
+    pendingCount++;
+    const pending = queue.then(operation, operation).finally(() => { pendingCount--; });
     queue = pending.then(() => undefined, () => undefined);
     return pending;
   };
@@ -202,9 +205,19 @@ async function startBuiltInWindowsDriverService(): Promise<BuiltInDriverService>
         response.end();
         return;
       }
-      const payload = await readJsonRequest(request);
-      json(response, 200, await serial(() => executeWindowsAction(payload)));
+      const controller = new AbortController();
+      const cancel = () => { if (!response.writableEnded) controller.abort(new Error('Computer request cancelled.')); };
+      request.once('aborted', cancel);
+      response.once('close', cancel);
+      try {
+        const payload = await readJsonRequest(request);
+        const result = await serial(() => executeWindowsAction(payload, controller.signal));
+        if (!response.destroyed) json(response, 200, result);
+      } finally {
+        request.off('aborted', cancel); response.off('close', cancel);
+      }
     })().catch((error) => {
+      if (response.destroyed) return;
       if (!response.headersSent) {
         json(response, 500, { error: error instanceof Error ? error.message : String(error) });
       } else {
@@ -253,6 +266,7 @@ async function resolveContextValue<T>(value: ContextValue<T> | undefined, contex
 function screenshotBuffer(value: unknown) {
   if (typeof value !== 'string' || !value.trim()) return undefined;
   const base64 = value.trim().replace(/^data:image\/(?:png|jpeg);base64,/i, '');
+  if (base64.length > Math.ceil(MAX_SCREENSHOT_BYTES / 3) * 4) throw new Error('Computer screenshot exceeds its size limit.');
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) throw new Error('Computer driver returned invalid screenshot base64.');
   const buffer = Buffer.from(base64, 'base64');
   if (!buffer.length || buffer.length > MAX_SCREENSHOT_BYTES) {
@@ -356,13 +370,13 @@ export function createRemoteComputerDriver(input: {
         headers: { 'content-type': 'application/json', accept: 'application/json', ...input.headers },
         body: JSON.stringify(action),
       });
-      const text = await response.text();
+      const text = await readBoundedResponseText(response, 48 * 1024 * 1024);
       if (!response.ok) throw new Error(`Computer driver returned HTTP ${response.status}: ${text.slice(0, 1000)}`);
       return JSON.parse(text) as Record<string, unknown>;
     },
     async health() {
       try {
-        const response = await (input.fetchImpl || fetch)(input.endpoint, { method: 'HEAD', headers: input.headers });
+        const response = await (input.fetchImpl || fetch)(input.endpoint, { method: 'HEAD', headers: input.headers, signal: AbortSignal.timeout(3000) });
         return response.ok
           ? { status: 'healthy' }
           : { status: 'unhealthy', message: `Driver returned HTTP ${response.status}.` };

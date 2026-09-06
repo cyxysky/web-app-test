@@ -1,7 +1,7 @@
 # Capability packages
 
 Each folder is an independently versioned and publishable npm package. Concrete
-capability cores do not import WebPilot application code; framework-specific
+capability cores do not import Orbit application code; framework-specific
 dependencies are isolated behind explicit adapter entrypoints.
 
 ## TypeScript Agent framework integration

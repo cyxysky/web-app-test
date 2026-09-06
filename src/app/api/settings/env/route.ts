@@ -52,7 +52,7 @@ export async function POST(request: NextRequest) {
         return {
           key: definition.key,
           value: secret && !submittedValue
-            ? savedByKey.get(definition.key)?.value ?? definition.defaultValue
+            ? savedByKey.get(definition.key)?.value ?? process.env[definition.key] ?? definition.defaultValue
             : typeof item?.value === 'string' ? normalizeRuntimeEnvValue(definition, submittedValue) : definition.defaultValue,
           enabled: true,
           secret,

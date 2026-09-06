@@ -20,6 +20,8 @@ import { formatLogTime, formatToolPayload, parseJsonObjectText, phaseLabel } fro
 import { useI18n } from '@/i18n/I18nProvider';
 import { asRecord, finiteNumber } from '@/lib/unknown-value';
 import { AppModal } from '@/components/ui/app-modal';
+import { readApiJson } from '@/lib/api-client';
+import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
 
 type Translator = ReturnType<typeof useI18n>['t'];
 type BrowserChatLogFilter = 'all' | 'ai' | 'tool' | 'context' | 'screenshot';
@@ -349,6 +351,44 @@ function screenshotPerformancePayload(details: Record<string, unknown>) {
   return lines.join('\n');
 }
 
+function ContextManifestDetails({ manifest }: { manifest?: Record<string, unknown> }) {
+  const { t } = useI18n();
+  const [loaded, setLoaded] = useState<Record<string, unknown>>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  if (!manifest) return null;
+  const current = loaded || manifest;
+  const knowledge = Array.isArray(current.knowledge) ? current.knowledge.map(asRecord).filter((entry): entry is Record<string, unknown> => Boolean(entry)) : [];
+  const load = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const response = await fetch(withWebPilotBasePath(`/api/browser-chat/${encodeURIComponent(String(manifest.sessionId))}/context?requestId=${encodeURIComponent(String(manifest.id))}`));
+      const data = await readApiJson<{ manifest: Record<string, unknown> }>(response, t('读取上下文清单失败'));
+      setLoaded(data.manifest);
+    } catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
+    finally { setLoading(false); }
+  };
+  return <>
+    {knowledge.length ? <details className="browser-chat-log-detail-block">
+      <summary>{t('记忆与 Skill 选取')} ({knowledge.filter((entry) => entry.selected === true).length}/{knowledge.length})</summary>
+      <div style={{ overflowX: 'auto' }}><table>
+        <thead><tr><th>{t('名称')}</th><th>{t('版本')}</th><th>{t('状态')}</th><th>Tokens</th><th>{t('原因')}</th><th>{t('缓存')}</th></tr></thead>
+        <tbody>{knowledge.map((entry) => <tr key={String(entry.ref)}>
+          <td>{String(entry.title || entry.id)}<br /><small>{String(entry.kind)} · {String(entry.id)}</small></td>
+          <td>{String(entry.version || '')}</td><td>{t(entry.selected === true ? '已注入' : '未注入')}</td>
+          <td>{String(entry.estimatedTokens || 0)}</td><td>{String(entry.reason || '')}</td>
+          <td>{t(entry.cacheHit === true ? '命中' : '刷新')}</td>
+        </tr>)}</tbody>
+      </table></div>
+    </details> : null}
+    <BrowserChatPayloadDetails key={`${manifest.id}-${Boolean(loaded)}`} className="browser-chat-log-detail-block" defaultOpen={Boolean(loaded)} payload={formatToolPayload(loaded || manifest)} title={t('上下文选取清单')} />
+    {!loaded && manifest.entriesArchived === true && typeof manifest.sessionId === 'string'
+      ? <button type="button" disabled={loading} onClick={() => void load()}>{t(loading ? '正在读取…' : '读取完整上下文清单')}</button> : null}
+    {error ? <p role="alert">{error}</p> : null}
+  </>;
+}
+
 function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded: boolean; log: BrowserChatLogDialogRecord; nextAiInputTokens?: number }) {
   const { t } = useI18n();
   if (!expanded || !log.details) return null;
@@ -365,6 +405,7 @@ function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded:
     </div>
   );
   const payloadDetails = aiLogPayloadDetails(parsed) || parsed;
+  const contextManifest = asRecord(asRecord(asRecord(payloadDetails.aiInput)?.options)?.contextManifest);
   const requestPayload = isAiRequestLog
     ? aiLogRequestPayload(payloadDetails)
     : isConversationSummaryRequest
@@ -401,6 +442,7 @@ function BrowserChatLogDetails({ expanded, log, nextAiInputTokens }: { expanded:
     <div className="browser-chat-log-details">
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={fallbackPayload} title={t('日志详情')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-timing" defaultOpen payload={timingPayload} title={t('耗时明细')} />
+      <ContextManifestDetails key={String(contextManifest?.id || '')} manifest={contextManifest} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block" defaultOpen payload={requestPayload} title={t('AI 输入 JSON')} />
       <BrowserChatPayloadDetails className="browser-chat-log-detail-block is-response" defaultOpen payload={responsePayload} title={t('AI 输出 JSON')} />
       {isAiResponseLog ? (

@@ -4,16 +4,17 @@ import { Activity, CircleStop, Gauge, MemoryStick, RefreshCw } from 'lucide-reac
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { useI18n } from '@/i18n/I18nProvider';
 import type { BackendRuntimeStatus } from '@/server/observability/backend-runtime-status';
 
 function mb(value?: number) {
   return `${Number(value || 0).toFixed(1)} MB`;
 }
 
-function chartTime(value: string) {
+function chartTime(value: string, language: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(language === 'en' ? 'en-US' : 'zh-CN', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
@@ -21,6 +22,7 @@ function chartTime(value: string) {
 }
 
 export function BackendRuntimePanel() {
+  const { t, language } = useI18n();
   const [data, setData] = useState<BackendRuntimeStatus>();
   const [loading, setLoading] = useState(true);
   const [closing, setClosing] = useState('');
@@ -85,68 +87,68 @@ export function BackendRuntimePanel() {
       points,
       width,
       x,
-      xTicks: xTickIndexes.map((index) => ({ index, label: chartTime(points[index]!.time), x: x(index) })),
+      xTicks: xTickIndexes.map((index) => ({ index, label: chartTime(points[index]!.time, language), x: x(index) })),
       y,
       yTicks,
       rss: line((point) => point.rssMb),
       heap: line((point) => point.heapUsedMb),
     };
-  }, [data?.memoryTrend]);
+  }, [data?.memoryTrend, language]);
 
-  if (!data && loading) return <div className="ai-runtime-loading"><RefreshCw className="spin" size={18} /> 正在读取后端状态…</div>;
+  if (!data && loading) return <div className="ai-runtime-loading"><RefreshCw className="spin" size={18} /> {t("正在读取后端状态…")}</div>;
 
   return (
     <div className="ai-runtime-status" aria-busy={loading}>
       <div className="ai-runtime-toolbar">
-        <div><strong>当前后端状态</strong><span>每 10 秒自动刷新，仅管理员 1 可见</span></div>
-        <button onClick={() => void load()} type="button"><RefreshCw className={loading ? 'spin' : undefined} size={15} />刷新</button>
+        <div><strong>{t("当前后端状态")}</strong><span>{t("每 10 秒自动刷新，仅管理员 1 可见")}</span></div>
+        <button onClick={() => void load()} type="button"><RefreshCw className={loading ? 'spin' : undefined} size={15} />{t("刷新")}</button>
       </div>
-      {error ? <p className="ai-runtime-error" role="alert">{error}</p> : null}
+      {error ? <p className="ai-runtime-error" role="alert">{t(error)}</p> : null}
       <section className="ai-runtime-metrics">
-        <article><MemoryStick size={18} /><span>RSS 内存</span><strong>{mb(data?.process.memoryMb.rss)}</strong><small>堆 {mb(data?.process.memoryMb.heapUsed)} / {mb(data?.process.memoryMb.heapLimit)}</small></article>
-        <article><MemoryStick size={18} /><span>原生与缓冲区</span><strong>{mb(data?.process.memoryMb.external)}</strong><small>ArrayBuffer {mb(data?.process.memoryMb.arrayBuffers)}</small></article>
-        <article><Gauge size={18} /><span>堆使用率</span><strong>{Number(data?.process.utilizationPercent.heap || 0).toFixed(1)}%</strong><small>压力：{data?.process.pressure || 'normal'}</small></article>
-        <article><Activity size={18} /><span>活跃对话</span><strong>{data?.activeConversations || 0}</strong><small>当前正在执行或排队</small></article>
-        <article><CircleStop size={18} /><span>测试浏览器</span><strong>{data?.browserCount || 0}</strong><small>主会话与子 Agent 浏览器</small></article>
+        <article><MemoryStick size={18} /><span>{t("RSS 内存")}</span><strong>{mb(data?.process.memoryMb.rss)}</strong><small>{t('堆 {used} / {limit}', { used: mb(data?.process.memoryMb.heapUsed), limit: mb(data?.process.memoryMb.heapLimit) })}</small></article>
+        <article><MemoryStick size={18} /><span>{t("原生与缓冲区")}</span><strong>{mb(data?.process.memoryMb.external)}</strong><small>ArrayBuffer {mb(data?.process.memoryMb.arrayBuffers)}</small></article>
+        <article><Gauge size={18} /><span>{t("堆使用率")}</span><strong>{Number(data?.process.utilizationPercent.heap || 0).toFixed(1)}%</strong><small>{t('压力：{pressure}', { pressure: t(data?.process.pressure === 'critical' ? '严重' : data?.process.pressure === 'high' ? '偏高' : '正常') })}</small></article>
+        <article><Activity size={18} /><span>{t("活跃对话")}</span><strong>{data?.activeConversations || 0}</strong><small>{t("当前正在执行或排队")}</small></article>
+        <article><CircleStop size={18} /><span>{t("测试浏览器")}</span><strong>{data?.browserCount || 0}</strong><small>{t("主会话与子 Agent 浏览器")}</small></article>
       </section>
       <section className="ai-operations-panel ai-runtime-chart-panel">
         <header className="ai-operations-panel-header">
-          <div><h2>内存趋势</h2><p>最多保留最近 180 个采样点，悬停采样点可查看精确值</p></div>
-          {chart ? <div className="ai-runtime-chart-current"><span>当前 RSS <strong>{mb(chart.latest.rssMb)}</strong></span><span>当前 V8 堆 <strong>{mb(chart.latest.heapUsedMb)}</strong></span></div> : null}
+          <div><h2>{t("内存趋势")}</h2><p>{t("最多保留最近 180 个采样点，悬停采样点可查看精确值")}</p></div>
+          {chart ? <div className="ai-runtime-chart-current"><span>{t("当前 RSS")} <strong>{mb(chart.latest.rssMb)}</strong></span><span>{t("当前 V8 堆")} <strong>{mb(chart.latest.heapUsedMb)}</strong></span></div> : null}
         </header>
         <div className="ai-runtime-chart">
           {chart ? (
-            <svg aria-label="RSS 与 V8 堆内存趋势，单位 MB" role="img" viewBox={`0 0 ${chart.width} ${chart.height}`}>
+            <svg aria-label={t("RSS 与 V8 堆内存趋势，单位 MB")} role="img" viewBox={`0 0 ${chart.width} ${chart.height}`}>
               {chart.yTicks.map((tick) => <g className="ai-runtime-chart-y-tick" key={tick.value}><line x1="72" x2="980" y1={tick.y} y2={tick.y} /><text x="62" y={tick.y + 4}>{tick.value.toFixed(0)} MB</text></g>)}
               {chart.xTicks.map((tick) => <text className="ai-runtime-chart-x-label" key={tick.index} textAnchor={tick.index === 0 ? 'start' : tick.index === chart.points.length - 1 ? 'end' : 'middle'} x={tick.x} y="250">{tick.label}</text>)}
               <polyline className="is-rss" points={chart.rss} />
               <polyline className="is-heap" points={chart.heap} />
               {chart.points.map((point, index) => (
                 <g key={`${point.time}-${index}`}>
-                  <circle className="ai-runtime-chart-hit is-rss" cx={chart.x(index)} cy={chart.y(point.rssMb)} r="7"><title>{`${chartTime(point.time)} · RSS ${mb(point.rssMb)}`}</title></circle>
-                  <circle className="ai-runtime-chart-hit is-heap" cx={chart.x(index)} cy={chart.y(point.heapUsedMb)} r="7"><title>{`${chartTime(point.time)} · V8 堆 ${mb(point.heapUsedMb)}`}</title></circle>
+                  <circle className="ai-runtime-chart-hit is-rss" cx={chart.x(index)} cy={chart.y(point.rssMb)} r="7"><title>{`${chartTime(point.time, language)} · RSS ${mb(point.rssMb)}`}</title></circle>
+                  <circle className="ai-runtime-chart-hit is-heap" cx={chart.x(index)} cy={chart.y(point.heapUsedMb)} r="7"><title>{t('{time} · V8 堆 {memory}', { time: chartTime(point.time, language), memory: mb(point.heapUsedMb) })}</title></circle>
                 </g>
               ))}
               <circle className="ai-runtime-chart-point is-rss" cx={chart.x(chart.points.length - 1)} cy={chart.y(chart.latest.rssMb)} r="4" />
               <circle className="ai-runtime-chart-point is-heap" cx={chart.x(chart.points.length - 1)} cy={chart.y(chart.latest.heapUsedMb)} r="4" />
             </svg>
-          ) : <span>等待更多采样点</span>}
+          ) : <span>{t("等待更多采样点")}</span>}
         </div>
-        <div className="ai-runtime-chart-legend"><span><i className="is-rss" />RSS {chart ? mb(chart.latest.rssMb) : ''}</span><span><i className="is-heap" />V8 堆使用 {chart ? mb(chart.latest.heapUsedMb) : ''}</span></div>
+        <div className="ai-runtime-chart-legend"><span><i className="is-rss" />RSS {chart ? mb(chart.latest.rssMb) : ''}</span><span><i className="is-heap" />{t("V8 堆使用")} {chart ? mb(chart.latest.heapUsedMb) : ''}</span></div>
       </section>
       <section className="ai-operations-panel ai-runtime-browser-panel">
-        <header className="ai-operations-panel-header"><div><h2>当前测试浏览器</h2><p>展示所属用户、会话、页面与实时状态</p></div><span>{data?.browsers.length || 0}</span></header>
+        <header className="ai-operations-panel-header"><div><h2>{t("当前测试浏览器")}</h2><p>{t("展示所属用户、会话、页面与实时状态")}</p></div><span>{data?.browsers.length || 0}</span></header>
         {data?.browsers.length ? (
           <div className="ai-runtime-browser-list">
             {data.browsers.map((browser) => (
               <article key={browser.id}>
-                <div><strong>{browser.title || browser.sessionId}</strong><span>用户 {browser.userId || '未知'} · {browser.kind === 'subagent' ? '子 Agent' : '主会话'} · {browser.tabCount} 个标签页</span><code title={browser.currentUrl}>{browser.currentUrl || 'about:blank'}</code></div>
-                <span className={browser.busy ? 'is-busy' : undefined}>{browser.busy ? '使用中' : browser.status}</span>
-                <button disabled={closing === browser.id} onClick={() => void closeBrowser(browser.id)} type="button"><CircleStop size={15} />{closing === browser.id ? '关闭中…' : '关闭浏览器'}</button>
+                <div><strong>{browser.title || browser.sessionId}</strong><span>{t('用户 {id} · {kind} · {count} 个标签页', { id: browser.userId || t('未知'), kind: t(browser.kind === 'subagent' ? '子 Agent' : '主会话'), count: browser.tabCount })}</span><code title={browser.currentUrl}>{browser.currentUrl || 'about:blank'}</code></div>
+                <span className={browser.busy ? 'is-busy' : undefined}>{browser.busy ? t('使用中') : t(({ initializing: '正在初始化', ready: '就绪', running: '执行中', completed: '已完成', interrupted: '已中断', failed: '失败', closed: '已结束', blocked: '阻塞' } as Record<string, string>)[browser.status] || browser.status)}</span>
+                <button disabled={closing === browser.id} onClick={() => void closeBrowser(browser.id)} type="button"><CircleStop size={15} />{t(closing === browser.id ? '关闭中…' : '关闭浏览器')}</button>
               </article>
             ))}
           </div>
-        ) : <div className="ai-operations-empty">当前没有测试浏览器</div>}
+        ) : <div className="ai-operations-empty">{t("当前没有测试浏览器")}</div>}
       </section>
     </div>
   );

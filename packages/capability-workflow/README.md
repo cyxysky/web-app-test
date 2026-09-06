@@ -1,6 +1,8 @@
 # @webpilot/capability-workflow
 
-Durable dependency-aware workflow records and checkpoints for long-running agents. The core uses an injected store and the Node adapter provides a per-workspace JSON store with serialized writes.
+Durable dependency-aware workflow records and checkpoints for long-running agents. The Node adapter uses per-workspace SQLite transactions across local processes. It imports `workflows.json` once into `workflows.db` and preserves the original JSON.
+
+Completed, failed and cancelled steps are terminal. Repeating an identical checkpoint is idempotent; changing a terminal step or workflow is rejected. Create a new workflow to retry failed work. Dependencies must be completed before starting or completing a dependent step. Dispose directly created stores when finished.
 
 ## TypeScript Agent framework integration
 

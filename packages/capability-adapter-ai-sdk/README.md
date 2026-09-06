@@ -39,6 +39,8 @@ requires a successful read before exposing or executing related tools. Set
 `toAISDKToolSet(snapshot)` remains the low-level adapter for hosts that mount
 and manage configuration themselves.
 
+`toAISDKToolSet(snapshot, { policy, abortSignal })` serializes tools sharing a serial concurrency group and combines the mounted run, adapter and individual invocation cancellation signals. `policy.authorize`, `policy.prerequisite` and `policy.reportProgress` connect host authorization, prerequisites and progress reporting, including calls using a custom `execute` wrapper. Without an authorization callback the host remains responsible for granting access; declared prerequisites require a callback.
+
 The adapter depends on `@webpilot/capability-host`, so consumers do not install
 the host package separately unless they want to import its framework-neutral
 APIs directly. The `/node` and `/typeorm` adapter entrypoints re-export the

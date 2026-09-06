@@ -1,8 +1,26 @@
-# Web App Test
+# Orbit
 
-AI browser workspace built with Next.js, AI SDK, and Playwright.
+An agent workspace built with Next.js and AI SDK, with capabilities for browsers, files, code, knowledge, data, and connected tools.
 
-The project is focused on persistent browser conversations, live browser control, reusable domain skills, personal memory, credentials, and observable Agent execution.
+Orbit combines an Agent Harness for persistent sessions, context management, tool execution, and recovery with a workspace for reviewing results and controlling tasks.
+
+The product name is **Orbit**, with no brand prefix. Shared product metadata lives
+in `electron/product.json`. `ORBIT_BRAND_PREFIX` (empty by default) and
+`ORBIT_BRAND_TEXT` (`Orbit` by default) configure the initial sidebar name;
+General settings can still customize it. Saved legacy default branding migrates
+automatically while custom names are preserved.
+
+Public host settings accept the `ORBIT_*` prefix; the corresponding `WEBPILOT_*`
+settings remain supported, and an explicitly supplied Orbit setting takes precedence.
+The `@webpilot/*` npm names, capability IDs, service identity, database filenames,
+and existing storage keys remain compatible. Desktop upgrades reuse an existing
+legacy profile when no Orbit profile exists. The server installer retains its
+existing data directory. Docker Compose service keys remain stable for upgrades;
+the application and sandbox images are named `orbit` and `orbit-code-sandbox`.
+
+New embeddings use `/embed/orbit.js` and `Orbit.mount()`; `/embed/webpilot.js`,
+`WebPilotQA.mount()`, and existing custom-element/event names remain supported.
+The SDK also emits matching `orbit:*` events.
 
 ## Generated conversation files
 
@@ -13,7 +31,7 @@ Browser chat can create new downloadable files with the `generateFile` tool:
 - Excel (`.xlsx`) from structured worksheets and rows.
 - PowerPoint (`.pptx`) from structured slides or Markdown-like content.
 
-These are real PDF and Office files, not renamed text files. `downloadFile` remains a separate tool for saving an existing remote file. PDF generation automatically uses an available CJK font on supported Windows and Linux images; set `WEBPILOT_DOCUMENT_FONT` and optionally `WEBPILOT_DOCUMENT_FONT_FAMILY` when a custom deployment stores its font elsewhere.
+These are real PDF and Office files, not renamed text files. `downloadFile` remains a separate tool for saving an existing remote file. PDF generation automatically uses an available CJK font on supported Windows and Linux images; set `ORBIT_DOCUMENT_FONT` and optionally `ORBIT_DOCUMENT_FONT_FAMILY` when a custom deployment stores its font elsewhere.
 
 ## Run
 
@@ -22,7 +40,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Local direct access uses user ID `1` by default; set `WEBPILOT_DEFAULT_USER_ID` in `.env.local` to switch the development identity. There is no application login or local account initialization. For Docker, create `.env` in the project root.
+Open `http://localhost:3000`. Local direct access uses user ID `1` by default; set `ORBIT_DEFAULT_USER_ID` in `.env.local` to switch the development identity. There is no application login or local account initialization. For Docker, create `.env` in the project root.
 
 The app uses DeepSeek by default:
 
@@ -37,59 +55,59 @@ Browser execution accepts `http` and `https` target URLs. Configure its operatio
 
 ## User initialization and same-port WebSockets
 
-`npm run dev` and `npm start` use WebPilot's custom server. It serves Next.js and both WebSocket upgrade paths on the same public port (`3000` by default). Nginx is not required and the internal WebSocket ports must not be exposed.
+`npm run dev` and `npm start` use Orbit's custom server. It serves Next.js and both WebSocket upgrade paths on the same public port (`3000` by default). Nginx is not required and the internal WebSocket ports must not be exposed.
 
 There are two user ID sources:
 
-- Local direct access: `WEBPILOT_DEFAULT_USER_ID`, defaulting to `1`.
-- Online embedding: the `userId` passed once to `WebPilotQA.mount()`.
+- Local direct access: `ORBIT_DEFAULT_USER_ID`, defaulting to `1`.
+- Online embedding: the `userId` passed once to `Orbit.mount()`.
 
 The mount endpoint converts the supplied ID into a signed, short-lived initialization ticket. The iframe consumes that ticket and receives an `HttpOnly` identity session cookie; ordinary APIs cannot submit or switch user IDs. Before opening a WebSocket, the frontend requests a short-lived, one-time ticket bound to the initialized user, purpose, public origin, and—for browser preview—the browser-chat session.
 
 For online deployment, require the mounted ID:
 
 ```bash
-WEBPILOT_REQUIRE_MOUNT_USER_ID=true
+ORBIT_REQUIRE_MOUNT_USER_ID=true
 ```
 
-For a cross-site iframe over HTTPS, also set `WEBPILOT_CROSS_SITE_MOUNT=true`; this changes the identity cookie to `SameSite=None; Secure`.
+For a cross-site iframe over HTTPS, also set `ORBIT_CROSS_SITE_MOUNT=true`; this changes the identity cookie to `SameSite=None; Secure`.
 
-WebPilot can also be published below one path. The path is part of the Next.js build, so set it before starting development or building a package:
+Orbit can also be published below one path. The path is part of the Next.js build, so set it before starting development or building a package:
 
 ```bash
-WEBPILOT_BASE_PATH=/webpilot
+ORBIT_BASE_PATH=/orbit
 ```
 
-Docker images include the project `.env`, so set `WEBPILOT_BASE_PATH` there before building. After changing it, recreate the image instead of only restarting the existing container:
+Docker Compose passes `ORBIT_BASE_PATH` from `.env` as a build argument. The image excludes `.env`; Compose injects runtime settings through `env_file`. After changing the base path, recreate the image:
 
 ```bash
 docker compose build --no-cache webpilot-qa
 docker compose up -d webpilot-qa
 ```
 
-For a direct Docker build, the `.env` value is used by default. You can override it explicitly when needed:
+For a direct Docker build, pass the base path explicitly (the default is the root path). Supply runtime settings when starting the container, for example with `docker run --env-file .env`:
 
 ```bash
-docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t webpilot-qa:latest .
+docker build --build-arg ORBIT_BASE_PATH=/orbit -t orbit:latest .
 ```
 
 The host page initializes the online user ID while mounting:
 
 ```html
 <div id="web-app-xxxx"></div>
-<script src="/webpilot/embed/webpilot.js"></script>
+<script src="/orbit/embed/orbit.js"></script>
 <script>
   WebPilotQA.mount('#web-app-xxxx', {
-    apiBaseUrl: '/webpilot',
+    apiBaseUrl: '/orbit',
     userId: 'u001',
     targetUrl: location.href
   });
 </script>
 ```
 
-The SDK also derives `/webpilot` from its own script URL, so `apiBaseUrl` may be omitted when the script and API use the same public path.
+The SDK also derives `/orbit` from its own script URL, so `apiBaseUrl` may be omitted when the script and API use the same public path.
 
-If a reverse proxy is added later for TLS or routing, proxy only the single public application port and preserve WebSocket upgrades. Set `WEBPILOT_TRUST_PROXY=true` only when requests can reach WebPilot exclusively through that trusted proxy; otherwise forwarded headers are deliberately discarded.
+If a reverse proxy is added later for TLS or routing, proxy only the single public application port and preserve WebSocket upgrades. Set `ORBIT_TRUST_PROXY=true` only when requests can reach Orbit exclusively through that trusted proxy; otherwise forwarded headers are deliberately discarded.
 
 ## Personal Memory
 
@@ -175,7 +193,7 @@ To distribute the backend without Electron as a single Windows installer, run:
 npm run server:installer
 ```
 
-This produces `dist-server/WebPilot-Server-Setup-<version>-x64.exe`. The installer:
+This produces `dist-server/Orbit-Server-Setup-<version>-x64.exe`. The installer:
 
 - bundles the build machine's compatible Node.js runtime, so Node.js is not required on the target machine;
 - installs the complete Next.js server, Playwright Chromium, and LibreOffice under `Program Files`;
@@ -191,7 +209,7 @@ To create only the unpacked server directory on the build machine, run:
 npm run server:package
 ```
 
-This produces `dist-server/WebPilot-Server`. When copied directly instead of installed through the EXE, the target machine needs Node.js 22.16 or later and starts it with `start.cmd`. It includes the complete production dependency tree, Playwright Chromium, and LibreOffice, so the target machine does not need `npm install`, `npx playwright install chromium`, or a separate LibreOffice installation.
+This produces `dist-server/Orbit-Server`. When copied directly instead of installed through the EXE, the target machine needs Node.js 22.16 or later and starts it with `start.cmd`. It includes the complete production dependency tree, Playwright Chromium, and LibreOffice, so the target machine does not need `npm install`, `npx playwright install chromium`, or a separate LibreOffice installation.
 
 By default it listens on all network interfaces at port `3000` (locally: `http://127.0.0.1:3000`), stores application data under `runtime/`, and runs the browser headlessly. Set `PORT`, `APP_DATA_DIR`, `ARTIFACTS_DIR`, or `HEADLESS_BROWSER` before `start.cmd` to override those defaults.
 
@@ -200,23 +218,23 @@ By default it listens on all network interfaces at port `3000` (locally: `http:/
 Start the Next.js server first, then launch Electron in another PowerShell window:
 
 ```powershell
-$env:WEBPILOT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
+$env:ORBIT_ELECTRON_SERVER_URL="http://127.0.0.1:3000"
 npx electron .
 ```
 
 ## Publish a Docker Hub image
 
-Set the Docker Hub namespace before constructing the image tag. An empty namespace produces an invalid tag such as `/webpilot-qa:1.0.0`.
+Set the Docker Hub namespace before constructing the image tag. An empty namespace produces an invalid tag such as `/orbit:1.0.0`.
 
 ```powershell
 $DockerHubUser = (Read-Host "Docker Hub username").Trim()
 $ImageVersion = "1.0.0"
 if (-not $DockerHubUser) { throw "Docker Hub username is required." }
 
-docker build --build-arg WEBPILOT_BASE_PATH=/webpilot -t "${DockerHubUser}/webpilot-qa:${ImageVersion}" -t "${DockerHubUser}/webpilot-qa:latest" .
+docker build --build-arg ORBIT_BASE_PATH=/orbit -t "${DockerHubUser}/orbit:${ImageVersion}" -t "${DockerHubUser}/orbit:latest" .
 docker login
-docker push "${DockerHubUser}/webpilot-qa:${ImageVersion}"
-docker push "${DockerHubUser}/webpilot-qa:latest"
+docker push "${DockerHubUser}/orbit:${ImageVersion}"
+docker push "${DockerHubUser}/orbit:latest"
 ```
 
 
@@ -595,7 +613,7 @@ const hiddenRuntimeSkillPolicies = {
 
 方向是对的，而且值得做。但我建议把目标定义为：
 
-> 保留 AI SDK Agent Loop 作为宿主核心，建立统一的 Capability SDK/Registry；File、Chart、Browser Code 是三个独立能力包，Node、MCP、WebPilot 插件只是同一能力内核的不同适配器。
+> 保留 AI SDK Agent Loop 作为宿主核心，建立统一的 Capability SDK/Registry；File、Chart、Browser Code 是三个独立能力包，Node、MCP、Orbit 插件只是同一能力内核的不同适配器。
 
 不要把 MCP 本身当成内部核心抽象。AI SDK 官方也建议生产应用优先使用原生 AI SDK Tool，以获得类型安全、性能和完整控制；MCP 更适合外部接入和用户自带工具。[AI SDK Tools 与 MCP Tools](https://ai-sdk.dev/docs/ai-sdk-core/tools-and-tool-calling)
 
@@ -654,7 +672,7 @@ const hiddenRuntimeSkillPolicies = {
                                 │
            ┌────────────────────┼────────────────────┐
            │                    │                    │
-      AI SDK Adapter       MCP Adapter        WebPilot Plugin
+      AI SDK Adapter       MCP Adapter        Orbit Plugin
 ```
 
 AI SDK 的 `ToolLoopAgent` 本身已经支持 `tools`、`activeTools`、`prepareStep`、`stopWhen` 等机制，所以 Agent Loop 不需要重写，只需要把静态工具表改为 Registry 动态装配。[AI SDK ToolLoopAgent](https://ai-sdk.dev/docs/reference/ai-sdk-core/tool-loop-agent)
@@ -692,7 +710,7 @@ packages/
 - React
 - Browser Chat
 - TypeORM, SQLite, PostgreSQL
-- WebPilot 的具体 API 路由
+- Orbit 的具体 API 路由
 - Playwright、LibreOffice、ECharts
 
 建议的核心接口：
@@ -802,7 +820,7 @@ Manifest 声明运行时要求：
 }
 ```
 
-WebPilot 安装器负责检测或安装运行时；离线桌面包继续携带固定版本的 LibreOffice 和 Python Worker。
+Orbit 安装器负责检测或安装运行时；离线桌面包继续携带固定版本的 LibreOffice 和 Python Worker。
 
 ### `@webpilot/capability-chart`
 
@@ -831,7 +849,7 @@ Chart 的 MCP 版本必须考虑宿主能力差异：
 
 - 支持 MCP Apps/自定义 UI 的宿主：显示交互式 ECharts
 - 普通 MCP Client：返回 ECharts JSON、SVG/PNG Artifact 或 Resource Link
-- Node/WebPilot 插件：使用完整交互式 Renderer
+- Node/Orbit 插件：使用完整交互式 Renderer
 
 所以可以“同一能力多格式发布”，但不能承诺每种宿主都有完全相同的 UI。
 
@@ -860,10 +878,10 @@ Chart 的 MCP 版本必须考虑宿主能力差异：
 - Agent Loop
 - 用户会话数据库
 - 缺陷数据库
-- WebPilot 权限体系
+- Orbit 权限体系
 - 模型配置
 
-`reportDefect` 建议留在 WebPilot 宿主。它属于测试产品工作流，只是消费 Browser Capability 的截图证据，不属于通用浏览器自动化库。
+`reportDefect` 建议留在 Orbit 宿主。它属于测试产品工作流，只是消费 Browser Capability 的截图证据，不属于通用浏览器自动化库。
 
 Browser MCP 不能继续隐式依赖 `runId`。对外应显式提供句柄：
 
@@ -874,7 +892,7 @@ browser.snapshot -> browserSessionId
 browser.close    -> browserSessionId
 ```
 
-WebPilot 内部仍然可以将这些能力合并成模型看到的 `browserCode` Tool。
+Orbit 内部仍然可以将这些能力合并成模型看到的 `browserCode` Tool。
 
 ## 四、同一内核如何发布成三种格式
 
@@ -886,7 +904,7 @@ WebPilot 内部仍然可以将这些能力合并成模型看到的 `browserCode`
     ".": "./dist/core/index.js",
     "./ai-sdk": "./dist/adapters/ai-sdk.js",
     "./mcp": "./dist/adapters/mcp.js",
-    "./webpilot": "./dist/adapters/webpilot.js",
+    "./orbit": "./dist/adapters/orbit.js",
     "./client": "./dist/client/index.js"
   },
   "bin": {
@@ -898,13 +916,13 @@ WebPilot 内部仍然可以将这些能力合并成模型看到的 `browserCode`
 | 格式 | 用途 | 执行方式 |
 |---|---|---|
 | Node 包 | 其他 Node/AI SDK 项目直接调用 | 进程内 |
-| WebPilot 插件 | 设置页导入，具备完整宿主能力和 UI | Worker/独立进程 |
+| Orbit 插件 | 设置页导入，具备完整宿主能力和 UI | Worker/独立进程 |
 | MCP stdio | 本地客户端、桌面应用 | 子进程 |
 | MCP Streamable HTTP | 远程部署、多用户 | 独立服务 |
 
 MCP 当前标准传输主要是 stdio 和 Streamable HTTP；stdio 适合本地子进程，远程服务使用 Streamable HTTP，并需要认证、Origin 校验等保护。[MCP Transports](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)
 
-## 五、WebPilot 插件格式
+## 五、Orbit 插件格式
 
 建议定义 `.wpp`，本质是签名 ZIP：
 
@@ -996,7 +1014,7 @@ unhealthy
 1. 上传到临时目录。
 2. 校验文件大小、ZIP 路径、Manifest Schema。
 3. 校验 SHA-256 和签名。
-4. 检查 WebPilot/Node/平台版本。
+4. 检查 Orbit/Node/平台版本。
 5. 显示权限确认。
 6. 解压到版本目录。
 7. 执行 `health()`，不执行包内 `postinstall`。
@@ -1012,7 +1030,7 @@ unhealthy
 - 版本化目录、原子切换
 - 在 Worker/子进程中执行
 - Secret 单独保存，只向插件传引用
-- 禁止插件直接访问 WebPilot 数据库
+- 禁止插件直接访问 Orbit 数据库
 - 限制解压路径，防止 Zip Slip
 
 ## 七、Agent Loop 的改造方式

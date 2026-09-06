@@ -9,6 +9,7 @@ import { WebPilotHelpCenter } from '@/components/WebPilotHelpCenter';
 import { AnimatedThemeToggler } from '@/components/ui/animated-theme-toggler';
 import { AuroraText } from '@/components/ui/aurora-text';
 import { useWorkspaceBrand } from '@/brand/WorkspaceBrandProvider';
+import { OrbitIcon } from '@/components/OrbitIcon';
 
 type WorkspaceSidebarProps = {
   children: ReactNode;
@@ -121,6 +122,7 @@ export function WorkspaceSidebar({
     <aside className={className ? `browser-chat-sidebar ${className}` : 'browser-chat-sidebar'}>
       <div className="browser-chat-brand">
         <strong className="browser-chat-brand-title">
+          <OrbitIcon size={16} />
           {brandPrefix ? <AuroraText className="browser-chat-brand-aurora" speed={1.2}>{brandPrefix}</AuroraText> : null}
           {brandText ? <span>{brandText}</span> : null}
         </strong>
@@ -131,7 +133,7 @@ export function WorkspaceSidebar({
           title={collapseLabel}
           type="button"
         >
-          <PanelLeft aria-hidden="true" size={18} />
+          {collapsed ? <OrbitIcon size={16} /> : <PanelLeft aria-hidden="true" size={18} />}
         </button>
       </div>
 

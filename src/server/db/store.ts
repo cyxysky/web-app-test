@@ -179,7 +179,8 @@ function normalizeStoredModelConfig(input?: ModelConfigRecord): ModelConfigRecor
       extraRequestParameters: normalizeExtraRequestParameters(current?.extraRequestParameters),
     };
   }
-  return { provider, providers, updatedAt: input.updatedAt || now() };
+  const providerOrder = modelProviderDefinitionsForConfig(providers, input.providerOrder).map(({ value }) => value);
+  return { provider, providers, providerOrder, updatedAt: input.updatedAt || now() };
 }
 
 function updateInitialEnv(values: Record<string, string | undefined>) {
@@ -244,7 +245,8 @@ function normalizeSkillItems(items: string[] | undefined, limit: number) {
 
 function normalizeSkillContent(content?: Partial<SkillContent>): SkillContent {
   return {
-    details: String(content?.details || '').trim().slice(0, 30_000),
+    details: String(content?.details || '').trim(),
+    ...(content?.resources ? { resources: content.resources.map((resource) => ({ name: resource.name.trim(), content: resource.content })) } : {}),
   };
 }
 
@@ -386,7 +388,7 @@ export const store = {
   async getModelConfig() {
     return normalizeStoredModelConfig((await readConfigData()).modelConfig);
   },
-  async saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers'>) {
+  async saveModelConfig(input: Pick<ModelConfigRecord, 'provider' | 'providers' | 'providerOrder'>) {
     const data = await readConfigData();
     const existing = normalizeStoredModelConfig(data.modelConfig);
     const providers: Partial<Record<ModelProvider, ModelProviderSettings>> = {};
@@ -419,7 +421,8 @@ export const store = {
         updatedAt: current ? timestamp : previous?.updatedAt,
       };
     }
-    const config: ModelConfigRecord = { provider: input.provider, providers, updatedAt: timestamp };
+    const providerOrder = modelProviderDefinitionsForConfig(providers, input.providerOrder ?? existing?.providerOrder).map(({ value }) => value);
+    const config: ModelConfigRecord = { provider: input.provider, providers, providerOrder, updatedAt: timestamp };
     await writeConfigData({ ...data, modelConfig: config });
     applyModelConfig(config);
     return config;

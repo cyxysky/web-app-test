@@ -7,6 +7,7 @@ export const fileArtifactRuntimeSkillSummary = [
   '<system_skill>',
   `<id>${fileArtifactRuntimeSkillId}</id>`,
   '<title>File Artifact Runtime</title>',
+
   '<description>Required built-in operating manual for the unified file tool. Read this Skill before the first file call. readSource + documentId reads generation code; readContent + artifactId/attachmentId reads file data; visualRead reads page images.</description>',
   '<required>true</required>',
   '</system_skill>',
@@ -15,6 +16,8 @@ export const fileArtifactRuntimeSkillSummary = [
 export const fileArtifactRuntimeSkillContent = `# File Artifact Runtime
 
 This Skill is authoritative for the unified file artifact workflow and is supplied by the file package. The consuming Agent is responsible for loading it and deciding when the file tool becomes available.
+
+Content selection: readContent accepts sheet plus range (A1:D20) for spreadsheets, contentPages for PDF text pages, or an exact unique DOCX section heading. These select content before character offset/limit pagination. pages remains for visual previews. Reuse artifact IDs from browser downloads directly.
 
 ## Required sequence
 

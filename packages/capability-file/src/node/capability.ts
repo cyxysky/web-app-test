@@ -3,6 +3,11 @@ import type {
   CapabilityResult,
   CapabilityRunContext,
 } from '@webpilot/capability-sdk';
+import { realpath } from 'node:fs/promises';
+import path from 'node:path';
+import { nodeArtifactRelativePath, sanitizeNodeArtifactFileName } from './artifacts.js';
+import { readFileAttachment } from './read.js';
+import { fileFormatForName } from '../formats.js';
 import {
   createFileCapability,
   type FileArtifactOperationResult,
@@ -149,7 +154,8 @@ export async function createNodeFileOperations(
       await workspace.listOfficeDrafts({ runId }),
       'file-list-failed',
     ),
-    readSource: async (input) => fileOperationToCapabilityResult(await workspace.readUnoDraft({
+    readSource: async (input, context) => fileOperationToCapabilityResult(await workspace.readUnoDraft({
+      abortSignal: context.abortSignal,
       runId,
       documentId: input.documentId,
       path: input.path,
@@ -159,7 +165,28 @@ export async function createNodeFileOperations(
     }), 'file-read-source-failed'),
     readContent: async (input, context) => {
       if (!options.readFile) {
-        return unavailable('Reading external attachments requires a host-provided readFile adapter.');
+        try {
+          const binding = input.attachmentId ? attachmentBindings?.find((item) => item.ref === input.attachmentId) : undefined;
+          let absolutePath: string;
+          let name: string;
+          if (binding) { absolutePath = binding.path; name = binding.name; }
+          else if (input.artifactId && !input.attachmentId) {
+            const root = await realpath(workspaceHost.artifactsRoot);
+            const candidate = path.resolve(root, input.artifactId);
+            nodeArtifactRelativePath(root, candidate);
+            absolutePath = await realpath(candidate);
+            const relative = nodeArtifactRelativePath(root, absolutePath).relativePath;
+            if (!relative.startsWith(`${sanitizeNodeArtifactFileName(runId, 'adhoc')}/`)) throw new Error('Artifact does not belong to this run.');
+            name = path.basename(absolutePath);
+          } else return unavailable('Use an artifactId from this run or a registered attachmentId.');
+          return fileOperationToCapabilityResult(await readFileAttachment({ ...input, absolutePath,
+            abortSignal: context.abortSignal, previewRoot: path.join(workspaceHost.artifactsRoot, sanitizeNodeArtifactFileName(runId, 'adhoc'), 'attachment-previews'),
+            attachment: { id: input.artifactId || input.attachmentId!, name, path: absolutePath,
+              type: fileFormatForName(name)?.mimeType || 'application/octet-stream', url: '' },
+          }), 'file-read-content-failed');
+        } catch (error) {
+          return fileOperationToCapabilityResult({ ok: false, actual: error instanceof Error ? error.message : String(error) }, 'file-read-content-failed');
+        }
       }
       return fileOperationToCapabilityResult(await options.readFile({
         ...input, includeVisuals: input.includeVisuals === true,
@@ -186,8 +213,9 @@ export async function createNodeFileOperations(
       }, { abortSignal: context.abortSignal }),
       'file-convert-failed',
     ),
-    plan: async (input: FileToolInput) => fileOperationToCapabilityResult(
+    plan: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.planFileArtifact({
+        abortSignal: context.abortSignal,
         runId,
         documentId: input.documentId,
         fileName: input.fileName,
@@ -200,8 +228,9 @@ export async function createNodeFileOperations(
       }),
       'file-plan-failed',
     ),
-    unoApi: async (input: FileToolInput) => fileOperationToCapabilityResult(
+    unoApi: async (input: FileToolInput, context) => fileOperationToCapabilityResult(
       await workspace.getUnoApi({
+        abortSignal: context.abortSignal,
         runId,
         documentId: input.documentId,
         documentType: input.documentType,

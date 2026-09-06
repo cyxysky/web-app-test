@@ -4,6 +4,7 @@ import { copyFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse } from 'acorn';
+import { raceWithAbort } from '@webpilot/capability-sdk';
 import {
   applyEditableTextSelection,
   readEditableText,
@@ -62,10 +63,22 @@ export type BrowserCodeRunResult = {
   selectedExecutionId?: string;
   activity?: BrowserCodeActivity;
   aborted?: boolean;
+  executionState?: BrowserCodeExecutionState;
   kernelReset?: {
-    reason: 'age-limit' | 'execution-limit' | 'heap-limit' | 'rss-limit';
+    reason: 'age-limit' | 'execution-limit' | 'heap-limit' | 'rss-limit' | 'timeout' | 'aborted' | 'crashed';
     memoryUsage?: BrowserCodeKernelMemoryUsage;
   };
+};
+
+export type BrowserCodeExecutionState = {
+  status: 'completed' | 'failed' | 'timeout' | 'aborted' | 'crashed';
+  phase: 'startup' | 'running' | 'finished';
+  attemptedActions: string[];
+  /** Playwright calls whose observation completed; does not assert business success. */
+  completedActions: string[];
+  outcome: 'not-started' | 'returned' | 'unknown';
+  requiresStateRefresh: boolean;
+  safeToRetry: boolean;
 };
 
 function browserCodeFailureText(value: unknown) {
@@ -295,6 +308,8 @@ export type BrowserCodeKernelOptions = {
 };
 
 type PendingExecution = {
+  attemptedActions: string[];
+  completedActions: string[];
   abortSignal?: AbortSignal;
   onAbort: () => void;
   requestId: string;
@@ -507,6 +522,7 @@ function browserCodeKernelMain() {
 
   const recordAction = (action: string) => {
     activeExecution?.actions.push(action);
+    if (activeExecution) send({ type: 'action-progress', requestId: activeExecution.requestId, action, completed: false });
   };
 
   const send = (payload: Record<string, unknown>) => {
@@ -989,6 +1005,7 @@ function browserCodeKernelMain() {
     const after = await readUnifiedPageObservation(page);
     lastActionObservationByPage.set(page, { action, before, after });
     activeExecution.observationsBeforeAction.set(page, after);
+    send({ type: 'action-progress', requestId: activeExecution.requestId, action, completed: true });
   };
 
   const locatorIntentTerms = (selector: string) => {
@@ -3092,7 +3109,7 @@ export class BrowserCodeKernel {
     this.closed = true;
     this.rejectReady(new Error('browserCode JavaScript kernel was closed.'));
     if (this.pending) {
-      this.finishPending({ ok: false, error: 'browserCode execution was aborted.', aborted: true, logs: [] });
+      this.finishPending(this.interrupted('aborted', 'browserCode execution was aborted.'));
     }
     this.stopChild();
     await this.tail.catch(() => undefined);
@@ -3101,24 +3118,26 @@ export class BrowserCodeKernel {
   private async executeNow(input: BrowserCodeExecutionInput): Promise<BrowserCodeRunResult> {
     const startedAt = Date.now();
     if (input.abortSignal?.aborted) {
-      return { ok: false, error: 'browserCode execution was aborted.', aborted: true, elapsedMs: 0, logs: [] };
+      return { ...this.interrupted('aborted', 'browserCode execution was aborted.', 'startup'), kernelReset: undefined, elapsedMs: 0 };
     }
 
     try {
-      await this.ensureReady();
+      await raceWithAbort(this.ensureReady(), input.abortSignal);
     } catch (error) {
+      const normalized = error instanceof Error ? error : new Error(String(error));
+      this.rejectReady(normalized);
+      this.stopChild();
       return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
+        ...this.interrupted(input.abortSignal?.aborted ? 'aborted' : normalized.name === 'TimeoutError' ? 'timeout' : 'crashed', normalized.message, 'startup'),
         elapsedMs: Date.now() - startedAt,
-        logs: [],
       };
     }
     if (input.abortSignal?.aborted) {
-      return { ok: false, error: 'browserCode execution was aborted.', aborted: true, elapsedMs: Date.now() - startedAt, logs: [] };
+      return { ...this.interrupted('aborted', 'browserCode execution was aborted.', 'startup'), kernelReset: undefined, elapsedMs: Date.now() - startedAt };
     }
     if (!this.child?.connected) {
-      return { ok: false, error: 'browserCode JavaScript kernel is not connected.', elapsedMs: Date.now() - startedAt, logs: [] };
+      this.stopChild();
+      return { ...this.interrupted('crashed', 'browserCode JavaScript kernel is not connected.', 'startup'), elapsedMs: Date.now() - startedAt };
     }
 
     const maxOutputChars = typeof input.maxOutputChars === 'number'
@@ -3142,16 +3161,20 @@ export class BrowserCodeKernel {
           error: `Unable to stage the registered user attachment: ${error instanceof Error ? error.message : String(error)}`,
           elapsedMs: Date.now() - startedAt,
           logs: [],
+          executionState: { status: 'failed', phase: 'startup', attemptedActions: [], completedActions: [],
+            outcome: 'not-started', requiresStateRefresh: false, safeToRetry: false },
         };
       }
     }
     const requestId = randomUUID();
     return new Promise<BrowserCodeRunResult>((resolve) => {
       const onAbort = () => {
-        this.finishPending({ ok: false, error: 'browserCode execution was aborted.', aborted: true, logs: [] });
+        this.finishPending(this.interrupted('aborted', 'browserCode execution was aborted.'));
         this.stopChild();
       };
       this.pending = {
+        attemptedActions: [],
+        completedActions: [],
         abortSignal: input.abortSignal,
         onAbort,
         requestId,
@@ -3167,11 +3190,7 @@ export class BrowserCodeKernel {
       );
       this.executionTimer = setTimeout(() => {
         if (this.pending?.requestId !== requestId) return;
-        this.finishPending({
-          ok: false,
-          error: `browserCode execution timed out after ${executionTimeoutMs}ms; the JavaScript kernel was restarted.`,
-          logs: [],
-        });
+        this.finishPending(this.interrupted('timeout', `browserCode execution timed out after ${executionTimeoutMs}ms; the JavaScript kernel was stopped and will restart on the next cell.`));
         this.stopChild();
       }, executionTimeoutMs);
       this.child?.send({
@@ -3205,7 +3224,7 @@ export class BrowserCodeKernel {
         requestId,
       }, (error) => {
         if (!error) return;
-        this.finishPending({ ok: false, error: error.message, logs: [] });
+        this.finishPending(this.interrupted('crashed', error.message));
         this.stopChild();
       });
     });
@@ -3253,11 +3272,11 @@ export class BrowserCodeKernel {
     child.stderr?.on('data', (chunk: Buffer) => {
       this.stderr = `${this.stderr}${chunk.toString('utf8')}`.slice(-maxDiagnosticChars);
     });
-    child.on('message', (message: unknown) => this.handleMessage(message));
+    child.on('message', (message: unknown) => { if (this.child === child) this.handleMessage(message); });
     child.on('error', (error) => {
       if (this.child !== child) return;
       this.rejectReady(error);
-      this.finishPending({ ok: false, error: error.message, logs: [] });
+      this.finishPending(this.interrupted('crashed', error.message));
       this.stopChild();
     });
     child.on('exit', (code, signal) => {
@@ -3268,7 +3287,7 @@ export class BrowserCodeKernel {
       this.child = undefined;
       this.readyPromise = undefined;
       this.rejectReady(error);
-      this.finishPending({ ok: false, error: error.message, logs: [] });
+      this.finishPending(this.interrupted('crashed', error.message));
     });
     const readyTimeoutMs = boundedInteger(
       this.options.readyTimeoutMs ?? this.options.environment?.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS ?? process.env.AI_BROWSER_CODE_KERNEL_READY_TIMEOUT_MS,
@@ -3279,6 +3298,7 @@ export class BrowserCodeKernel {
     this.readyTimer = setTimeout(() => {
       if (this.child !== child) return;
       const error = new Error(`browserCode JavaScript kernel startup timed out after ${readyTimeoutMs}ms.`);
+      error.name = 'TimeoutError';
       this.rejectReady(error);
       this.stopChild();
     }, readyTimeoutMs);
@@ -3360,6 +3380,13 @@ export class BrowserCodeKernel {
       return;
     }
     if (!this.pending || record.requestId !== this.pending.requestId) return;
+    if (record.type === 'action-progress') {
+      if (typeof record.action === 'string') {
+        const actions = record.completed === true ? this.pending.completedActions : this.pending.attemptedActions;
+        if (actions.length < 1000) actions.push(record.action.slice(0, 200));
+      }
+      return;
+    }
     if (record.type !== 'result') return;
     const logs = Array.isArray(record.logs) ? record.logs as BrowserCodeExecutionLog[] : [];
     const images = Array.isArray(record.images) ? record.images as BrowserCodeImage[] : [];
@@ -3431,7 +3458,22 @@ export class BrowserCodeKernel {
     this.pending = undefined;
     this.clearExecutionTimer();
     pending.abortSignal?.removeEventListener('abort', pending.onAbort);
-    pending.resolve({ ...result, elapsedMs: Date.now() - pending.startedAt });
+    pending.resolve({ ...result,
+      executionState: result.executionState || {
+        status: result.ok ? 'completed' : 'failed', phase: 'finished',
+        attemptedActions: pending.attemptedActions, completedActions: pending.completedActions,
+        outcome: result.ok ? 'returned' : 'unknown', requiresStateRefresh: !result.ok, safeToRetry: false,
+      }, elapsedMs: Date.now() - pending.startedAt });
+  }
+
+  private interrupted(reason: 'timeout' | 'aborted' | 'crashed', error: string, phase: 'startup' | 'running' = 'running'): Omit<BrowserCodeRunResult, 'elapsedMs'> {
+    const attemptedActions = this.pending?.attemptedActions || [];
+    const completedActions = this.pending?.completedActions || [];
+    return { ok: false, error, logs: [], aborted: reason === 'aborted', kernelReset: { reason },
+      activity: { actions: attemptedActions, navigationChanged: false, tabChanged: false },
+      executionState: { status: reason, phase, attemptedActions, completedActions,
+        outcome: phase === 'startup' ? 'not-started' : 'unknown', requiresStateRefresh: phase !== 'startup', safeToRetry: phase === 'startup' && reason !== 'aborted' },
+    };
   }
 
   private rejectReady(error: Error) {

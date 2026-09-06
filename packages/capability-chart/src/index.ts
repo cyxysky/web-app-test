@@ -12,6 +12,10 @@ import {
   maxChartBytes,
   normalizeChartMaps,
   normalizeChartOption,
+  normalizeThreeChartOption,
+  normalizeChartUpdate,
+  ChartRevisionConflict,
+  type ChartUpdateInput,
   type ChartOptionValidator,
   type ChartRecord,
   type CreateChartRecordInput,
@@ -38,12 +42,16 @@ type EChartsApiModule = {
 export interface ChartArtifactStore {
   create(input: CreateChartRecordInput): Promise<ChartRecord>;
   read(chartId: string): Promise<ChartRecord | undefined>;
+  update?(chartId: string, input: ChartUpdateInput, expectedRevision: number): Promise<ChartRecord | undefined>;
   health?(): Promise<CapabilityHealth>;
   dispose?(): Promise<void>;
 }
 
 const chartToolInputParser = z.object({
-  action: z.enum(['api', 'create']).describe('api reads the indexed ECharts catalog; create persists one complete chart option.'),
+  action: z.enum(['api', 'create', 'read', 'update']).describe('Read API guidance, create a chart, read its latest saved data, or update it using expectedRevision.'),
+  engine: z.enum(['echarts', 'three']).optional().describe('Defaults to echarts. For native Three.js 3D charts read API module three.'),
+  chartId: z.string().regex(/^chart_\d{6}$/).optional(),
+  expectedRevision: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1).optional().describe('For update: revision returned by the latest read; prevents overwriting manual edits.'),
   reason: z.string().trim().min(1).max(300).describe('Concise reason for this tool call.'),
   query: z.string().trim().min(1).max(120).optional().describe('For action=api: omit for the index or pass an exact module id returned by the index.'),
   offset: z.number().int().min(0).optional().describe('For action=api index pagination.'),
@@ -52,16 +60,18 @@ const chartToolInputParser = z.object({
   description: z.string().trim().min(1).max(1_000).optional().describe('Accessible plain-language chart summary.'),
   height: z.number().int().min(240).max(720).optional().describe('Rendered height in pixels. Defaults to 380.'),
   renderer: z.enum(['canvas', 'svg']).optional().describe('ECharts renderer. Defaults to canvas.'),
-  option: z.record(z.string(), z.unknown()).optional().describe('For action=create: complete JSON-serializable ECharts option.'),
+  option: z.record(z.string(), z.unknown()).optional().describe('For create/update: complete JSON option for the chosen engine. ECharts formatter must be a string template, never a function-source string; omit it for default tooltips. Read the three API module for 3D schema.'),
   maps: z.array(z.object({
     name: z.string().trim().min(1).max(160),
     geoJson: z.union([z.record(z.string(), z.unknown()), z.string().min(1)]),
     specialAreas: z.record(z.string(), z.unknown()).optional(),
   })).max(12).optional().describe('Optional GeoJSON or SVG maps registered before rendering.'),
 }).strict().superRefine((input, context) => {
-  if (input.action === 'create' && !input.option) {
-    context.addIssue({ code: 'custom', message: 'action=create requires option.', path: ['option'] });
+  if ((input.action === 'create' || input.action === 'update') && !input.option) {
+    context.addIssue({ code: 'custom', message: 'create/update requires option.', path: ['option'] });
   }
+  if ((input.action === 'read' || input.action === 'update') && !input.chartId) context.addIssue({ code: 'custom', message: 'read/update requires chartId.', path: ['chartId'] });
+  if (input.action === 'update' && input.expectedRevision === undefined) context.addIssue({ code: 'custom', message: 'update requires expectedRevision from a current read.', path: ['expectedRevision'] });
 });
 
 export type ChartToolInput = z.infer<typeof chartToolInputParser>;
@@ -76,7 +86,7 @@ export const chartCapabilityManifest = Object.freeze({
   id: 'com.webpilot.chart',
   name: 'Chart',
   version: '0.1.0',
-  description: 'Create and render persistent Apache ECharts resources.',
+  description: 'Create, read and update persistent ECharts and Three.js charts with interactive editing and export.',
   permissions: ['artifact:read', 'artifact:write', 'renderer:chart'],
   runtimeRequirements: {
     node: '>=22.16',
@@ -130,6 +140,19 @@ const seriesApiModules: EChartsApiModule[] = [
 ];
 
 const apiModules: EChartsApiModule[] = [
+  {
+    id: 'three', title: 'Three.js 3D 图表', summary: '原生三维柱状、散点、折线和网格曲面；旋转、缩放、全屏、下载与数据编辑。',
+    optionPaths: ['axes', 'series', 'background'],
+    notes: [
+      '创建时设置 engine: "three"。option 只接受 background、axes、series；不是 ECharts option。',
+      'series[].type 为 bar3D、scatter3D、line3D 或 surface3D；data 每项严格为有限数字 [x,y,z]，z 为高度。可选 name、color（六位十六进制色）、size（0.02..2）。',
+      'axes 可包含 x/y/z，每轴可设 name 和 categories；分类坐标使用从 0 开始的索引。',
+      'surface3D 必须设置 grid: {rows,columns}，数据按行排列，数量等于 rows*columns。line3D 至少两个点。总计最多 50,000 点、32 个系列。',
+      '用户编辑持久保存；修改已有图表前先 action=read，随后 action=update 携带当前 expectedRevision 和完整 option。发生冲突需重新读取并合并。',
+      '界面支持 PNG、JSON 和数据 CSV 下载。3D 视图需要浏览器 WebGL2。',
+    ],
+    examples: [{ action: 'create', reason: '展示三维销售数据', engine: 'three', title: '销售分布', option: { axes: { x: { name: '季度', categories: ['Q1', 'Q2'] }, y: { name: '地区', categories: ['东区', '西区'] }, z: { name: '销售额' } }, series: [{ type: 'bar3D', name: '销售额', color: '#2563eb', data: [[0, 0, 12], [1, 0, 18], [0, 1, 9], [1, 1, 22]] }] } }],
+  },
   ...seriesApiModules,
   {
     id: 'option.core',
@@ -240,7 +263,7 @@ const apiModules: EChartsApiModule[] = [
     title: '标题、图例、提示与工具栏',
     summary: 'title、legend、tooltip、axisPointer、toolbox 与 graphic。',
     optionPaths: ['title', 'legend', 'tooltip', 'axisPointer', 'toolbox', 'graphic'],
-    notes: ['tooltip.formatter 若为字符串模板可直接使用；函数 formatter 不能通过 JSON 传递。', 'toolbox 可配置 saveAsImage、dataView、dataZoom、magicType 与 restore。', 'graphic 支持 group、image、text、rect、circle、ring、sector、arc、polygon、polyline、line、bezierCurve 等图形。'],
+    notes: ['tooltip.formatter 支持 "{b}: {c}" 等字符串模板，省略时显示默认提示；多系列固定模板可使用 "{b0}<br/>{a0}: {c0}<br/>{a1}: {c1}"。', 'formatter/valueFormatter 不能传入函数或 "function(...) {...}"、"(...) => ..." 这样的函数字符串，create/update 会拒绝并指出字段路径。瀑布图的透明辅助系列应设 tooltip: { show: false }。', 'toolbox 可配置 saveAsImage、dataView、dataZoom、magicType 与 restore。', 'graphic 支持 group、image、text、rect、circle、ring、sector、arc、polygon、polyline、line、bezierCurve 等图形。'],
     examples: [{ title: { text: '季度趋势', left: 'center' }, tooltip: { trigger: 'axis' }, legend: { top: 30 }, toolbox: { feature: { saveAsImage: {}, restore: {} } } }],
   },
   {
@@ -282,7 +305,7 @@ export async function readChartApi(
       ok: true,
       summary: 'Apache ECharts API module index.',
       data: {
-        engine: 'Apache ECharts',
+        engine: 'Apache ECharts / Three.js',
         installedVersion: echartsVersion,
         instruction: '使用 chart action=api，并把某个 modules[].id 原样作为 query，再读取该模块的配置路径、注意事项和例子。读取足够信息后再调用 action=create。',
         kind: 'echarts-api-index',
@@ -306,11 +329,11 @@ export async function readChartApi(
   }
   return {
     ok: true,
-    summary: `Apache ECharts API module: ${apiModule.title}.`,
+    summary: `Chart API module: ${apiModule.title}.`,
     data: {
-      createSignature: { action: 'create', description: 'string?', height: 'number? (240..720)', maps: 'Array<{name, geoJson, specialAreas?}>?', option: 'EChartsOption', reason: 'string', renderer: 'canvas | svg?', title: 'string?' },
-      engine: 'Apache ECharts',
-      installedVersion: echartsVersion,
+      createSignature: { action: 'create', engine: 'echarts | three (default echarts)', description: 'string?', height: 'number? (240..720)', maps: 'Array<{name, geoJson, specialAreas?}>?', option: query === 'three' ? 'ThreeChartOption (see module)' : 'EChartsOption', reason: 'string', renderer: 'canvas | svg?', title: 'string?' },
+      engine: query === 'three' ? 'Three.js' : 'Apache ECharts',
+      installedVersion: query === 'three' ? undefined : echartsVersion,
       kind: 'echarts-api-module',
       module: apiModule,
     },
@@ -318,6 +341,7 @@ export async function readChartApi(
 }
 
 export async function createChart(store: ChartArtifactStore, input: {
+  engine?: unknown;
   description?: unknown;
   height?: unknown;
   maps?: unknown;
@@ -326,14 +350,16 @@ export async function createChart(store: ChartArtifactStore, input: {
   title?: unknown;
 }, options: { validateOption?: ChartOptionValidator } = {}): Promise<CapabilityResult<{ chartId: string }>> {
   try {
-    const option = normalizeChartOption(input.option);
+    if (input.engine !== undefined && input.engine !== 'echarts' && input.engine !== 'three') throw new Error('Unknown chart engine.');
+    const engine = input.engine === 'three' ? 'three' : 'echarts';
+    const option = engine === 'three' ? normalizeThreeChartOption(input.option) : normalizeChartOption(input.option);
     const maps = normalizeChartMaps(input.maps);
     if (new TextEncoder().encode(JSON.stringify({ maps, option })).byteLength > maxChartBytes) {
       throw new Error('option and maps must be no larger than 4 MB in total.');
     }
     const height = normalizedHeight(input.height);
     const renderer = input.renderer === 'svg' ? 'svg' : 'canvas';
-    await options.validateOption?.({ height, maps, option, renderer });
+    if (engine === 'echarts') await options.validateOption?.({ height, maps, option, renderer });
     const record = await store.create({
       description: normalizedText(input.description, 1_000),
       height,
@@ -341,7 +367,8 @@ export async function createChart(store: ChartArtifactStore, input: {
       option,
       renderer,
       title: normalizedText(input.title, 200),
-      version: 2,
+      version: 3,
+      engine,
     });
     return {
       ok: true,
@@ -349,7 +376,7 @@ export async function createChart(store: ChartArtifactStore, input: {
       data: { chartId: record.chartId },
       content: [{
         type: 'ui',
-        renderer: 'com.webpilot.chart/echarts',
+        renderer: `com.webpilot.chart/${engine}`,
         resourceId: record.chartId,
       }],
     };
@@ -364,13 +391,37 @@ export async function createChart(store: ChartArtifactStore, input: {
   }
 }
 
+export async function updateChart(store: ChartArtifactStore, chartId: string, input: ChartUpdateInput, expectedRevision: number,
+  options: { validateOption?: ChartOptionValidator } = {}) {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision >= Number.MAX_SAFE_INTEGER) throw new Error('Invalid expectedRevision.');
+  if (!store.update) throw new Error('This chart store does not support persistent updates.');
+  const previous = await store.read(chartId);
+  if (!previous) return undefined;
+  if ((previous.revision || 0) !== expectedRevision) throw new ChartRevisionConflict();
+  const next = normalizeChartUpdate(previous, input);
+  if (next.engine !== 'three') await options.validateOption?.(next);
+  return store.update(chartId, input, expectedRevision);
+}
+
+async function readOrUpdateChart(store: ChartArtifactStore, input: ChartToolInput, options: { validateOption?: ChartOptionValidator }): Promise<CapabilityResult<Record<string, unknown>>> {
+  try {
+    const update = Object.fromEntries(['option', 'title', 'description', 'height', 'renderer', 'maps', 'engine'].filter((key) => input[key as keyof ChartToolInput] !== undefined).map((key) => [key, input[key as keyof ChartToolInput]])) as ChartUpdateInput;
+    const chart = input.action === 'read' ? await store.read(input.chartId!) : await updateChart(store, input.chartId!, update, input.expectedRevision!, options);
+    if (!chart) return { ok: false, error: { code: 'chart-not-found', message: 'Chart not found.' } };
+    return { ok: true, summary: `Chart ${chart.chartId} ${input.action === 'read' ? 'read' : 'updated'} at revision ${chart.revision || 0}.`, data: { chartId: chart.chartId, chart, revision: chart.revision || 0 },
+      content: input.action === 'update' ? [{ type: 'ui', renderer: `com.webpilot.chart/${chart.engine || 'echarts'}`, resourceId: chart.chartId }] : undefined };
+  } catch (error) {
+    return { ok: false, error: { code: error instanceof ChartRevisionConflict ? 'chart-revision-conflict' : 'chart-operation-failed', message: error instanceof Error ? error.message : String(error) } };
+  }
+}
+
 export function createChartTool(
   store: ChartArtifactStore,
   options: { echartsVersion?: string; validateOption?: ChartOptionValidator } = {},
 ) {
   return defineCapabilityTool<ChartToolInput, Record<string, unknown> | { chartId: string }>({
     name: chartCapabilityToolNames.chart,
-    description: 'Read modular Apache ECharts API guidance or create one persistent chart resource. Read the API index and relevant modules before action=create. A successful create returns a chartId and a structured UI resource.',
+    description: 'Create, read and update persistent ECharts or Three.js charts. Read the API index and relevant modules (three for 3D) before create. Users can edit data, go fullscreen and download charts. Read the latest chart before update and pass expectedRevision to preserve manual changes.',
     input: chartToolInput,
     inputExamples: [
       { action: 'api', reason: '查看 ECharts API 模块索引' },
@@ -397,7 +448,7 @@ export function createChartTool(
           { limit: input.limit, offset: input.offset, query: input.query },
           { echartsVersion: options.echartsVersion },
         )
-      : createChart(store, input, { validateOption: options.validateOption }),
+      : input.action === 'create' ? createChart(store, input, options) : readOrUpdateChart(store, input, options),
   });
 }
 

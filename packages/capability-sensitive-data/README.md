@@ -1,7 +1,7 @@
 # @webpilot/capability-sensitive-data
 
 Provider-boundary sensitive-data redaction that can be installed independently
-from WebPilot. The package contains:
+from Orbit. The package contains:
 
 - a framework-neutral HTTP redaction client;
 - an AI SDK v4 prompt adapter;

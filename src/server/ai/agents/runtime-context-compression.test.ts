@@ -26,7 +26,7 @@ import {
 } from './runtime-prompt-cache';
 
 test('runtime context uses an eighty-five percent trigger and a ten-to-twenty percent compression target', () => {
-  assert.equal(runtimeContextWindowTokens(), 256000);
+  assert.equal(runtimeContextWindowTokens(), 128000);
   assert.equal(runtimeContextWindowTokens({ provider: 'openai-compatible', model: 'glm-5.3' }), 1_000_000);
   assert.equal(runtimeContextCompressionThresholdRatio(), 0.85);
   assert.equal(runtimeContextCompressionThresholdRatio({ provider: 'openai-compatible', model: 'glm-5.3' }), 0.85);

@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, memo, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createContext, memo, type CSSProperties, type DragEvent as ReactDragEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject, type WheelEvent as ReactWheelEvent, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   closestCenter,
   DndContext,
@@ -31,6 +31,7 @@ import { Chat, useChat } from '@ai-sdk/react';
 import { Button } from '@heroui/react/button';
 import { Checkbox } from '@heroui/react/checkbox';
 import { Popover } from '@heroui/react/popover';
+import { HoverCard } from '@/components/HoverCard';
 import { TextArea } from '@heroui/react/textarea';
 import dynamic from 'next/dynamic';
 import {
@@ -110,6 +111,7 @@ import {
 } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { CustomSelect } from '@/components/CustomSelect';
+import { BrowserChatHistoryRow } from '@/components/BrowserChatHistoryRow';
 import { ConfirmDeleteModal } from '@/components/ConfirmDeleteModal';
 import { FileTypeIcon } from '@/components/FileTypeIcon';
 import { ModelBrandIcon } from '@/components/ModelBrandIcon';
@@ -915,8 +917,27 @@ function isRecoveredTransientTool(tool: BrowserChatToolCall | undefined) {
   return tool?.recovered === true && tool.transient === true;
 }
 
+function isRuntimeSkillReadRequired(value: unknown): boolean {
+  if (!value) return false;
+  if (typeof value === 'string') {
+    try {
+      return isRuntimeSkillReadRequired(JSON.parse(value));
+    } catch {
+      return value.includes('RUNTIME_SKILL_CONTENT_RETURNED') || value.includes('RUNTIME_SKILL_READ_REQUIRED');
+    }
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (record.failureCategory === 'skill-read-required' || record.code === 'RUNTIME_SKILL_CONTENT_RETURNED' || record.code === 'RUNTIME_SKILL_READ_REQUIRED') {
+    return true;
+  }
+  return isRuntimeSkillReadRequired(record.actual) || isRuntimeSkillReadRequired(record.error) || isRuntimeSkillReadRequired(record.value);
+}
+
 function toolStatusLabel(tool: BrowserChatToolCall) {
-  const outcome = browserChatToolOutcomeLabel(tool.rawResult ?? tool.error ?? tool.result);
+  const rawResult = tool.rawResult ?? tool.error ?? tool.result;
+  if (isRuntimeSkillReadRequired(rawResult)) return '需先读取 Skill';
+  const outcome = browserChatToolOutcomeLabel(rawResult);
   if (outcome) return outcome;
   if (isRecoveredTransientTool(tool)) return '已恢复';
   if (tool.ok === true) return '已完成';
@@ -933,8 +954,10 @@ function browserChatToolPresentation(
   if (!tool || !step) return { isActive: false, stateClass: '', status: '已请求' };
   const isActive = turnRunning && step.status === 'running' && tool.ok === undefined && !supersededByLaterRequest;
   const inferredFailed = !isActive && tool.ok === undefined && step.status === 'failed';
-  const failed = Boolean(browserChatToolOutcomeLabel(tool.rawResult ?? tool.error ?? tool.result))
-    || (tool.ok === false && !isRecoveredTransientTool(tool)) || inferredFailed;
+  const rawResult = tool.rawResult ?? tool.error ?? tool.result;
+  const skillReadRequired = isRuntimeSkillReadRequired(rawResult);
+  const failed = !skillReadRequired && (Boolean(browserChatToolOutcomeLabel(rawResult))
+    || (tool.ok === false && !isRecoveredTransientTool(tool)) || inferredFailed);
   return {
     isActive,
     stateClass: failed ? ' is-failed' : isActive ? ' is-running' : '',
@@ -2520,7 +2543,7 @@ function browserChatTabReferenceFromPayload(payload?: EmbeddedBrowserTabDragPayl
   const rawUrl = String(payload.url || '').trim();
   const sourceUrl = rawUrl && !/^data:text\/html/i.test(rawUrl) ? rawUrl : '';
   const title = String(payload.title || '').trim();
-  const name = title && !/^WebPilot Embedded Browser$/i.test(title) ? title : (sourceUrl || '新建标签页');
+  const name = title && !/^(?:Orbit|WebPilot) Embedded Browser$/i.test(title) ? title : (sourceUrl || '新建标签页');
   return {
     id: temporaryId('tab_ref'),
     kind: 'tab' as const,
@@ -2735,7 +2758,7 @@ function BrowserChatToolCardContent({
         <span className="browser-chat-tool-name">{label}</span>
         <BrowserChatToolUserActionTag action={userAction} />
       </span>
-      {meta ? <span className="browser-chat-tool-meta">{meta}</span> : null}
+      {meta ? <span className="browser-chat-tool-meta"><span>{meta}</span></span> : null}
     </>
   );
   return (
@@ -3419,7 +3442,7 @@ const BrowserChatStepToolCards = memo(function BrowserChatStepToolCards({
           <span className="browser-chat-tool-label">
             <span className="browser-chat-tool-name">{t('准备工具')}</span>
           </span>
-          <small className="browser-chat-tool-meta">{t('正在选择下一步浏览器动作')}</small>
+          <small className="browser-chat-tool-meta"><span>{t('正在选择下一步浏览器动作')}</span></small>
         </span>
       </div>
     );
@@ -4407,6 +4430,13 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
     });
   }, [logs, onSelectTool]);
   const finalText = stringFromUnknown(message.content);
+  const isInterruptedNotice = message.status === 'interrupted' && finalText === browserChatInterruptedReply;
+  const displayFinalText = isInterruptedNotice ? t(finalText) : finalText;
+  const displayResponseParts = isInterruptedNotice
+    ? message.parts?.map((part) => part.type === 'text' && part.text === browserChatInterruptedReply
+      ? { ...part, text: t(part.text) }
+      : part)
+    : message.parts;
   const textStreaming = browserChatMessageIsTextStreaming(message);
   const normalizedFinalText = finalText.replace(/\s+/g, ' ').trim();
   const rawAiOutputCycles = useMemo(() => (
@@ -4676,7 +4706,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
           ))}
           {running && hasFinalResponse && !finalTextAnchoredToToolCycle ? (
             <div className={`browser-chat-answer${textStreaming ? ' is-streaming' : ''}`}>
-              <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : finalText} parts={message.parts} />
+              <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : displayFinalText} parts={displayResponseParts} />
             </div>
           ) : null}
           {currentTimelineEntries.length ? (
@@ -4730,7 +4760,7 @@ const BrowserChatAssistantTimeline = memo(function BrowserChatAssistantTimeline(
       ) : null}
       {!running && hasFinalResponse && (message.status === 'passed' || !finalTextAnchoredToToolCycle) ? (
         <div className="browser-chat-answer">
-          <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : finalText} parts={message.parts} />
+          <BrowserChatOrderedResponse fallbackText={hideManualVerificationStatusText ? '' : displayFinalText} parts={displayResponseParts} />
         </div>
       ) : null}
       {!hasFinalResponse && !hasProcessContent && !manualVerificationPaused ? (
@@ -4896,7 +4926,7 @@ const BrowserChatMessageItem = memo(function BrowserChatMessageItem({
                 type="button"
               >
                 {generatingAutomationMessageId === item.id ? <Loader2 className="spin" size={14} /> : <Workflow size={14} />}
-                {t('生成用例')}
+                {t('生成任务')}
               </button>
             ) : null}
           </div>
@@ -4958,11 +4988,12 @@ const BrowserChatTurnNavigator = memo(function BrowserChatTurnNavigator({
   items: BrowserChatTurnNavigationItem[];
   onSelect: (messageId: string) => void;
 }) {
+  const { t } = useI18n();
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   if (!items.length) return null;
   return (
     <nav
-      aria-label="对话轮次导航"
+      aria-label={t('对话轮次导航')}
       className="browser-chat-turn-navigator"
       onMouseLeave={() => setHoveredIndex(null)}
     >
@@ -4972,24 +5003,30 @@ const BrowserChatTurnNavigator = memo(function BrowserChatTurnNavigator({
           ? 12 + Math.min(18, Math.round(Math.sqrt(item.contentSize) / 2))
           : [40, 30, 23, 18, 14][Math.min(distance, 4)];
         return (
-          <button
-            aria-label={`第 ${index + 1} 轮：${item.prompt}`}
+          <HoverCard
+            align="center"
+            content={item.response ? <p className="browser-chat-turn-preview-text">{item.response}</p> : undefined}
             key={item.messageId}
-            onBlur={() => setHoveredIndex(null)}
-            onClick={() => onSelect(item.messageId)}
-            onFocus={() => setHoveredIndex(index)}
-            onMouseEnter={() => setHoveredIndex(index)}
-            style={{
-              '--browser-chat-turn-marker-width': `${markerWidth}px`,
-            } as CSSProperties}
-            type="button"
+            placement="right"
+            title={item.prompt}
           >
-            <span aria-hidden="true" className="browser-chat-turn-marker" />
-            <span aria-hidden="true" className="browser-chat-turn-preview">
-              <strong>{item.prompt}</strong>
-              {item.response ? <span>{item.response}</span> : null}
-            </span>
-          </button>
+            {(hoverProps) => (
+              <button
+                {...hoverProps}
+                aria-label={t('第 {index} 轮：{prompt}', { index: index + 1, prompt: item.prompt })}
+                onBlur={(event) => { hoverProps.onBlur(event); setHoveredIndex(null); }}
+                onClick={() => onSelect(item.messageId)}
+                onFocus={(event) => { hoverProps.onFocus(event); setHoveredIndex(index); }}
+                onMouseEnter={() => setHoveredIndex(index)}
+                style={{
+                  '--browser-chat-turn-marker-width': `${markerWidth}px`,
+                } as CSSProperties}
+                type="button"
+              >
+                <span aria-hidden="true" className="browser-chat-turn-marker" />
+              </button>
+            )}
+          </HoverCard>
         );
       })}
     </nav>
@@ -5532,13 +5569,14 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         {historyHasMore && historyLoading ? (
           <div aria-live="polite" className="browser-chat-history-loader" role="status">
             <Loader2 className="spin" size={15} />
-            <span>正在加载更早记录…</span>
+            <span>{t("正在加载更早记录…")}</span>
           </div>
         ) : null}
         <div className="browser-chat-message-list-content">
-        {renderEntries.map((entry) => {
+        {renderEntries.map((entry, entryIndex) => {
         if (entry.kind === 'executed-group') {
           return (
+            <BrowserChatHistoryRow key={entry.id} keepMounted={entryIndex >= renderEntries.length - 2 || entry.items.some((item) => item.id === expandedArtifactMessageId || item.id === pendingToolConfirmation?.messageId)}>
             <BrowserChatExecutedGroup
               expandedArtifactMessageId={expandedArtifactMessageId}
               items={entry.items}
@@ -5558,6 +5596,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
               subagents={subagents}
               stepsByIndex={stepsByIndex}
             />
+            </BrowserChatHistoryRow>
           );
         }
         const item = entry.item;
@@ -5566,6 +5605,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
         const itemOutputCycles = outputCyclesByMessageId.get(item.id) || emptyBrowserChatOutputCycles;
         const itemSubagents = subagentsByMessageId.get(item.id) || emptyBrowserChatSubagents;
         return (
+          <BrowserChatHistoryRow key={item.id} turnId={item.role === 'user' ? item.id : undefined} keepMounted={entryIndex >= renderEntries.length - 2 || item.id === expandedArtifactMessageId || item.id === pendingToolConfirmation?.messageId || item.id === generatingAutomationMessageId || item.id === generatingSkillMessageId}>
           <BrowserChatMessageItem
             artifactFilesExpanded={item.id === expandedArtifactMessageId}
             deletingQueuedMessage={deletingQueuedMessageIds.has(item.id)}
@@ -5593,6 +5633,7 @@ const BrowserChatMessageList = memo(function BrowserChatMessageList({
             resumingHumanVerification={resumingHumanVerification}
             skillsById={skillsById}
           />
+          </BrowserChatHistoryRow>
         );
         })}
           <div aria-hidden="true" className="browser-chat-message-list-end" />
@@ -5686,61 +5727,69 @@ function BrowserChatSafetySelector({
         </span>
       </Button>
 
-      <div
-        aria-label={t('当前上下文 {current} / 最大上下文 {max}', {
-          current: currentTokens.toLocaleString('zh-CN'),
-          max: maxTokens.toLocaleString('zh-CN'),
-        })}
-        aria-valuemax={maxTokens}
-        aria-valuemin={0}
-        aria-valuenow={Math.min(currentTokens, maxTokens)}
-        className="browser-chat-context-usage"
-        role="meter"
-        tabIndex={0}
+      <HoverCard
+        align="center"
+        title={t('上下文')}
+        width={300}
+        headerAside={`${contextPercent}%`}
+        content={(
+          <>
+            <div
+              className="browser-chat-context-progress"
+              style={{ '--browser-chat-context-progress': `${contextPercent}%` } as CSSProperties}
+            >
+              <span />
+            </div>
+            <div className="browser-chat-context-breakdown">
+              <div className="is-text">
+                <span>{t('消息与系统')}</span>
+                <strong><NumberTicker {...textDisplay} value={textDisplay.value} /></strong>
+              </div>
+              <div className="is-tools">
+                <span>{t('工具')}</span>
+                <strong><NumberTicker {...toolDisplay} value={toolDisplay.value} /></strong>
+              </div>
+              <div className="is-images">
+                <span>{t('图片')}</span>
+                <strong><NumberTicker {...imageDisplay} value={imageDisplay.value} /></strong>
+              </div>
+            </div>
+            <footer className="browser-chat-context-card-total">
+              <span>{t('总计')}</span>
+              <strong>
+                <NumberTicker {...currentDisplay} value={currentDisplay.value} />
+                <span aria-hidden="true"> / </span>
+                <NumberTicker {...maxDisplay} value={maxDisplay.value} />
+              </strong>
+            </footer>
+          </>
+        )}
       >
-        <AnimatedCircularProgressBar
-          className="browser-chat-context-ring"
-          max={maxTokens}
-          min={0}
-          size={22}
-          strokeWidth={2.4}
-          value={currentTokens}
-        />
-        <div aria-hidden="true" className="browser-chat-context-card">
-          <header className="browser-chat-context-card-header">
-            <strong>{t('上下文')}</strong>
-            <span>{contextPercent}%</span>
-          </header>
+        {(hoverProps) => (
           <div
-            className="browser-chat-context-progress"
-            style={{ '--browser-chat-context-progress': `${contextPercent}%` } as CSSProperties}
+            {...hoverProps}
+            aria-label={t('当前上下文 {current} / 最大上下文 {max}', {
+              current: currentTokens.toLocaleString('zh-CN'),
+              max: maxTokens.toLocaleString('zh-CN'),
+            })}
+            aria-valuemax={maxTokens}
+            aria-valuemin={0}
+            aria-valuenow={Math.min(currentTokens, maxTokens)}
+            className="browser-chat-context-usage"
+            role="meter"
+            tabIndex={0}
           >
-            <span />
+            <AnimatedCircularProgressBar
+              className="browser-chat-context-ring"
+              max={maxTokens}
+              min={0}
+              size={22}
+              strokeWidth={2.4}
+              value={currentTokens}
+            />
           </div>
-          <div className="browser-chat-context-breakdown">
-            <div className="is-text">
-              <span>{t('消息与系统')}</span>
-              <strong><NumberTicker {...textDisplay} value={textDisplay.value} /></strong>
-            </div>
-            <div className="is-tools">
-              <span>{t('工具')}</span>
-              <strong><NumberTicker {...toolDisplay} value={toolDisplay.value} /></strong>
-            </div>
-            <div className="is-images">
-              <span>{t('图片')}</span>
-              <strong><NumberTicker {...imageDisplay} value={imageDisplay.value} /></strong>
-            </div>
-          </div>
-          <footer className="browser-chat-context-card-total">
-            <span>{t('总计')}</span>
-            <strong>
-              <NumberTicker {...currentDisplay} value={currentDisplay.value} />
-              <span aria-hidden="true"> / </span>
-              <NumberTicker {...maxDisplay} value={maxDisplay.value} />
-            </strong>
-          </footer>
-        </div>
-      </div>
+        )}
+      </HoverCard>
 
     </div>
   );
@@ -6478,7 +6527,9 @@ const BrowserChatComposer = memo(function BrowserChatComposer({
                 options={compactModelSelectionOptions.length ? compactModelSelectionOptions : [{ label: t('未启用模型服务商'), value: modelSelection }]}
                 searchable
                 searchPlaceholder={t('搜索模型')}
-                title={modelSelectionTitle}
+                tooltip={<p className="browser-chat-model-details">{modelSelectionTitle}</p>}
+                tooltipTitle={t('当前模型')}
+                tooltipWidth={280}
                 value={modelSelection}
               />
             </div>
@@ -6817,1237 +6868,7 @@ function EmbeddedBrowserTabGroupDropZone({
   );
 }
 
-type BrowserChatPreviewTab = {
-  id: string;
-  index: number;
-  url: string;
-  active: boolean;
-};
-
-type BrowserChatPreviewFrame = {
-  capturedAt: string;
-  contentType: 'image/jpeg' | 'image/png';
-  imageUrl: string;
-  sequence?: number;
-  tabs: BrowserChatPreviewTab[];
-  url: string;
-  viewport: { width: number; height: number };
-};
-
-type BrowserChatPreviewServerMetrics = {
-  activeCaptures?: number;
-  backpressureDrops?: number;
-  bitrateKbps?: number;
-  captureDurationMs?: number;
-  captureDurationMsAverage?: number;
-  captureFps?: number;
-  height?: number;
-  h264Level?: string;
-  h264Profile?: string;
-  imageFormat?: 'jpeg' | 'png';
-  imageQuality?: number;
-  maxConcurrentCaptures?: number;
-  mimeType?: string;
-  pendingClientFrames?: number;
-  sendFps?: number;
-  targetFps?: number;
-  transport?: 'image' | 'video';
-  width?: number;
-};
-
-type BrowserChatPreviewDisplayMetrics = BrowserChatPreviewServerMetrics & {
-  displayedFps: number;
-  receivedFps: number;
-};
-
-const BROWSER_CHAT_PREVIEW_VIDEO_MIME_TYPE = 'video/mp4; codecs="avc1.42C029"';
-
-type BrowserChatPreviewInput =
-  | { kind: 'tab'; tabId: string }
-  | { kind: 'move'; xRatio: number; yRatio: number }
-  | { kind: 'click'; xRatio: number; yRatio: number; button: 'left' | 'right' | 'middle'; clickCount: number }
-  | { kind: 'drag'; xRatio: number; yRatio: number; toXRatio: number; toYRatio: number; button: 'left' | 'right' | 'middle' }
-  | { kind: 'scroll'; xRatio: number; yRatio: number; deltaX: number; deltaY: number }
-  | { kind: 'key'; key: string }
-  | { kind: 'text'; text: string }
-  | { kind: 'select'; xRatio: number; yRatio: number; value: string }
-  | { controlKind: 'datalist' | 'picker'; kind: 'controlValue'; value: string; xRatio: number; yRatio: number }
-  | { controlId: string; files: Array<{ mimeType: string; name: string; path: string }>; kind: 'files' }
-  | { accept: boolean; dialogId: string; kind: 'dialog'; promptText?: string };
-
-type BrowserChatPreviewNativeControlPosition = {
-  label: string;
-  openUpwards: boolean;
-  targetXRatio: number;
-  targetYRatio: number;
-  topRatio: number;
-  widthRatio: number;
-  xRatio: number;
-  yRatio: number;
-};
-
-type BrowserChatPreviewNativeControl = BrowserChatPreviewNativeControlPosition & ({
-  kind: 'select';
-  options: Array<{
-    disabled: boolean;
-    group?: string;
-    label: string;
-    selected: boolean;
-    value: string;
-  }>;
-  selectedValue: string;
-} | {
-  kind: 'datalist';
-  options: Array<{ label: string; value: string }>;
-  value: string;
-} | {
-  inputType: 'color' | 'date' | 'datetime-local' | 'month' | 'time' | 'week';
-  kind: 'picker';
-  max?: string;
-  min?: string;
-  step?: string;
-  value: string;
-} | {
-  accept: string;
-  capture?: string;
-  controlId: string;
-  kind: 'file';
-  multiple: boolean;
-});
-
-type BrowserChatPreviewDialog = {
-  defaultValue: string;
-  dialogType: 'alert' | 'beforeunload' | 'confirm' | 'prompt';
-  id: string;
-  message: string;
-};
-
-type BrowserChatPreviewDownload = {
-  bytes?: number;
-  delivery?: 'pending' | 'started';
-  error?: string;
-  fileName: string;
-  id: string;
-  status: 'preparing' | 'ready';
-  url?: string;
-};
-
-function BrowserChatWebPreviewModal({
-  onClose,
-  sessionId,
-  userId,
-}: {
-  onClose: () => void;
-  sessionId: string;
-  userId: string;
-}) {
-  const { t } = useI18n();
-  const streamRef = useRef<WebSocket | null>(null);
-  const reconnectEnabledRef = useRef(true);
-  const previewImageRef = useRef<HTMLImageElement | null>(null);
-  const previewVideoRef = useRef<HTMLVideoElement | null>(null);
-  const previewStageRef = useRef<HTMLDivElement | null>(null);
-  const previewFileInputRef = useRef<HTMLInputElement | null>(null);
-  const handledPreviewDownloadIdsRef = useRef(new Set<string>());
-  const mediaSourceRef = useRef<MediaSource | null>(null);
-  const sourceBufferRef = useRef<SourceBuffer | null>(null);
-  const videoChunkQueueRef = useRef<Uint8Array[]>([]);
-  const videoObjectUrlRef = useRef('');
-  const forceImageTransportRef = useRef(false);
-  const pumpVideoChunksRef = useRef<() => void>(() => undefined);
-  const pendingFrameRef = useRef<BrowserChatPreviewFrame | null>(null);
-  const frameObjectUrlRef = useRef('');
-  const staleFrameObjectUrlRef = useRef('');
-  const decodingFrameObjectUrlRef = useRef('');
-  const frameDecodeActiveRef = useRef(false);
-  const framePipelineDisposedRef = useRef(false);
-  const frameCountersRef = useRef({
-    displayed: 0,
-    received: 0,
-    sampledAt: Date.now(),
-    sampledDisplayed: 0,
-    sampledReceived: 0,
-  });
-  const frameStateRef = useRef<Pick<BrowserChatPreviewFrame, 'tabs' | 'url' | 'viewport'>>({
-    tabs: [],
-    url: '',
-    viewport: { height: 720, width: 1280 },
-  });
-  const pendingMoveRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'move' }> | null>(null);
-  const pointerGestureRef = useRef<{
-    button: 'left' | 'middle';
-    clickCount: number;
-    current: { xRatio: number; yRatio: number };
-    dragged: boolean;
-    pointerId: number;
-    start: { xRatio: number; yRatio: number };
-    startClientX: number;
-    startClientY: number;
-  } | null>(null);
-  const moveFlushTimerRef = useRef<number | undefined>(undefined);
-  const pendingScrollRef = useRef<Extract<BrowserChatPreviewInput, { kind: 'scroll' }> | null>(null);
-  const scrollFlushTimerRef = useRef<number | undefined>(undefined);
-  const [frame, setFrame] = useState<BrowserChatPreviewFrame | null>(null);
-  const [previewTransport, setPreviewTransport] = useState<'image' | 'video'>('video');
-  const [videoObjectUrl, setVideoObjectUrl] = useState('');
-  const [videoDisplayReady, setVideoDisplayReady] = useState(false);
-  const [status, setStatus] = useState<'connecting' | 'live' | 'reconnecting' | 'unavailable'>('connecting');
-  const [streamError, setStreamError] = useState('');
-  const [inputError, setInputError] = useState('');
-  const [previewMetrics, setPreviewMetrics] = useState<BrowserChatPreviewDisplayMetrics | null>(null);
-  const [nativeControl, setNativeControl] = useState<BrowserChatPreviewNativeControl | null>(null);
-  const [nativeControlPosition, setNativeControlPosition] = useState<CSSProperties | null>(null);
-  const [nativeControlBusy, setNativeControlBusy] = useState(false);
-  const [nativePickerValue, setNativePickerValue] = useState('');
-  const [nativeDialog, setNativeDialog] = useState<BrowserChatPreviewDialog | null>(null);
-  const [nativeDialogPrompt, setNativeDialogPrompt] = useState('');
-  const [previewDownload, setPreviewDownload] = useState<BrowserChatPreviewDownload | null>(null);
-  const videoPipelineErrorRef = useRef<(message: string) => void>(() => undefined);
-  const previewViewportWidth = frame?.viewport.width;
-  const previewViewportHeight = frame?.viewport.height;
-
-  useLayoutEffect(() => {
-    const stage = previewStageRef.current;
-    if (!nativeControl || !previewViewportWidth || !previewViewportHeight || !stage) {
-      setNativeControlPosition(null);
-      return undefined;
-    }
-    const updatePosition = () => {
-      const stageRect = stage.getBoundingClientRect();
-      if (!stageRect.width || !stageRect.height) return;
-      const sourceRatio = Math.max(1, previewViewportWidth) / Math.max(1, previewViewportHeight);
-      const stageRatio = stageRect.width / stageRect.height;
-      const contentWidth = stageRatio > sourceRatio ? stageRect.height * sourceRatio : stageRect.width;
-      const contentHeight = stageRatio > sourceRatio ? stageRect.height : stageRect.width / sourceRatio;
-      const contentLeft = (stageRect.width - contentWidth) / 2;
-      const contentTop = (stageRect.height - contentHeight) / 2;
-      const menuWidth = Math.min(
-        Math.max(nativeControl.widthRatio * contentWidth, Math.min(220, contentWidth - 16)),
-        Math.max(0, contentWidth - 16),
-      );
-      const desiredLeft = contentLeft + nativeControl.xRatio * contentWidth;
-      const left = Math.min(
-        Math.max(contentLeft + 8, desiredLeft),
-        Math.max(contentLeft + 8, contentLeft + contentWidth - menuWidth - 8),
-      );
-      setNativeControlPosition({
-        left,
-        width: menuWidth,
-        ...(nativeControl.openUpwards
-          ? { bottom: stageRect.height - (contentTop + nativeControl.topRatio * contentHeight) }
-          : { top: contentTop + nativeControl.yRatio * contentHeight }),
-      });
-    };
-    updatePosition();
-    const resizeObserver = new ResizeObserver(updatePosition);
-    resizeObserver.observe(stage);
-    return () => resizeObserver.disconnect();
-  }, [nativeControl, previewViewportHeight, previewViewportWidth]);
-
-  useEffect(() => {
-    setNativePickerValue(nativeControl?.kind === 'picker' ? nativeControl.value : '');
-    setNativeControlBusy(false);
-  }, [nativeControl]);
-
-  useEffect(() => {
-    if (nativeControl?.kind !== 'file') return undefined;
-    const animationFrame = window.requestAnimationFrame(() => {
-      try {
-        previewFileInputRef.current?.click();
-      } catch (error) {
-        setNativeControl(null);
-        setInputError(error instanceof Error ? error.message : '无法打开系统文件选择器');
-      }
-    });
-    return () => window.cancelAnimationFrame(animationFrame);
-  }, [nativeControl]);
-
-  const disposeVideoPipeline = useCallback((updateState = true) => {
-    const sourceBuffer = sourceBufferRef.current;
-    sourceBufferRef.current = null;
-    videoChunkQueueRef.current = [];
-    if (sourceBuffer?.updating) {
-      try { sourceBuffer.abort(); } catch { /* MediaSource may already be closed. */ }
-    }
-    const mediaSource = mediaSourceRef.current;
-    mediaSourceRef.current = null;
-    if (mediaSource?.readyState === 'open') {
-      try { mediaSource.endOfStream(); } catch { /* Decoder teardown is best-effort. */ }
-    }
-    if (videoObjectUrlRef.current) URL.revokeObjectURL(videoObjectUrlRef.current);
-    videoObjectUrlRef.current = '';
-    if (updateState) {
-      setVideoObjectUrl('');
-      setVideoDisplayReady(false);
-    }
-  }, []);
-
-  const pumpVideoChunks = useCallback(() => {
-    const sourceBuffer = sourceBufferRef.current;
-    if (!sourceBuffer || sourceBuffer.updating) return;
-    const next = videoChunkQueueRef.current.shift();
-    if (next) {
-      try {
-        const copy = new Uint8Array(next.byteLength);
-        copy.set(next);
-        sourceBuffer.appendBuffer(copy.buffer);
-      } catch (error) {
-        videoPipelineErrorRef.current(error instanceof Error ? error.message : '视频缓冲区写入失败');
-      }
-      return;
-    }
-    const video = previewVideoRef.current;
-    if (!video || !sourceBuffer.buffered.length) return;
-    const lastRange = sourceBuffer.buffered.length - 1;
-    const start = sourceBuffer.buffered.start(0);
-    const end = sourceBuffer.buffered.end(lastRange);
-    if (end - video.currentTime > 0.6) video.currentTime = Math.max(start, end - 0.12);
-    if (end - start > 8) {
-      try { sourceBuffer.remove(0, Math.max(0, end - 3)); } catch { /* A later update trims again. */ }
-    }
-    void video.play().catch(() => undefined);
-  }, []);
-  pumpVideoChunksRef.current = pumpVideoChunks;
-
-  const beginVideoPipeline = useCallback((contentType: string, initialization: Uint8Array) => {
-    disposeVideoPipeline();
-    if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported(contentType)) return false;
-    setVideoDisplayReady(false);
-    const mediaSource = new MediaSource();
-    const objectUrl = URL.createObjectURL(mediaSource);
-    mediaSourceRef.current = mediaSource;
-    videoObjectUrlRef.current = objectUrl;
-    videoChunkQueueRef.current = [initialization];
-    mediaSource.addEventListener('sourceopen', () => {
-      if (mediaSourceRef.current !== mediaSource) return;
-      try {
-        const sourceBuffer = mediaSource.addSourceBuffer(contentType);
-        sourceBuffer.mode = 'segments';
-        sourceBufferRef.current = sourceBuffer;
-        sourceBuffer.addEventListener('updateend', () => {
-          if (sourceBufferRef.current === sourceBuffer) pumpVideoChunksRef.current();
-        });
-        sourceBuffer.addEventListener('error', () => {
-          if (sourceBufferRef.current === sourceBuffer) videoPipelineErrorRef.current('H.264 视频解码失败');
-        });
-        pumpVideoChunksRef.current();
-      } catch (error) {
-        videoPipelineErrorRef.current(error instanceof Error ? error.message : '无法创建 H.264 视频缓冲区');
-      }
-    }, { once: true });
-    setVideoObjectUrl(objectUrl);
-    setPreviewTransport('video');
-    return true;
-  }, [disposeVideoPipeline]);
-
-  const enqueueVideoChunk = useCallback((chunk: Uint8Array) => {
-    if (!mediaSourceRef.current) return;
-    if (videoChunkQueueRef.current.length >= 240) {
-      videoPipelineErrorRef.current('视频缓冲积压过多，正在回退到图片预览');
-      return;
-    }
-    videoChunkQueueRef.current.push(chunk);
-    pumpVideoChunksRef.current();
-  }, []);
-
-  const fallbackToImagePreview = useCallback((message: string) => {
-    forceImageTransportRef.current = true;
-    setPreviewTransport('image');
-    disposeVideoPipeline();
-    setStreamError(message);
-    const stream = streamRef.current;
-    if (stream?.readyState === WebSocket.OPEN || stream?.readyState === WebSocket.CONNECTING) stream.close();
-  }, [disposeVideoPipeline]);
-  videoPipelineErrorRef.current = fallbackToImagePreview;
-
-  const deliverPreviewDownload = useCallback(async (
-    download: BrowserChatPreviewDownload,
-    options: { repeat?: boolean; userInitiated?: boolean } = {},
-  ) => {
-    if (!download.url) return;
-    const bridge = typeof window === 'undefined' ? undefined : window.webPilotSystem;
-    // Chromium blocks repeated downloads started from asynchronous WebSocket
-    // callbacks. On the web, wait for the user to click the notice button so
-    // anchor.click() runs inside a real user-activation handler.
-    if (!bridge?.downloadUrl && !options.userInitiated) return;
-    if (!options.repeat && handledPreviewDownloadIdsRef.current.has(download.id)) return;
-    handledPreviewDownloadIdsRef.current.add(download.id);
-    try {
-      const url = withWebPilotBasePath(download.url);
-      if (bridge?.downloadUrl) {
-        const result = await bridge.downloadUrl({ fileName: download.fileName, url });
-        if (!result.ok) throw new Error(result.error || '下载文件失败');
-      } else {
-        const anchor = document.createElement('a');
-        anchor.download = download.fileName;
-        anchor.href = url;
-        anchor.style.display = 'none';
-        document.body.appendChild(anchor);
-        anchor.click();
-        anchor.remove();
-      }
-      setPreviewDownload((current) => current?.id === download.id
-        ? { ...current, delivery: 'started' }
-        : current);
-    } catch (error) {
-      handledPreviewDownloadIdsRef.current.delete(download.id);
-      setInputError(error instanceof Error ? error.message : '下载文件失败');
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!previewDownload) return undefined;
-    const timeoutMs = previewDownload.delivery === 'started'
-      ? 4_000
-      : previewDownload.status === 'ready' ? 15_000 : 20_000;
-    const timer = window.setTimeout(() => {
-      setPreviewDownload((current) => current?.id === previewDownload.id ? null : current);
-    }, timeoutMs);
-    return () => window.clearTimeout(timer);
-  }, [previewDownload]);
-
-  const commitPendingPreviewFrame = useCallback(async function commitPendingPreviewFrame() {
-    if (framePipelineDisposedRef.current || frameDecodeActiveRef.current) return;
-    const nextFrame = pendingFrameRef.current;
-    if (!nextFrame) return;
-    pendingFrameRef.current = null;
-    frameDecodeActiveRef.current = true;
-    decodingFrameObjectUrlRef.current = nextFrame.imageUrl;
-    let committed = false;
-    try {
-      const decodedImage = new Image();
-      decodedImage.decoding = 'async';
-      decodedImage.src = nextFrame.imageUrl;
-      await decodedImage.decode();
-      if (framePipelineDisposedRef.current) return;
-
-      if (staleFrameObjectUrlRef.current.startsWith('blob:')) {
-        URL.revokeObjectURL(staleFrameObjectUrlRef.current);
-      }
-      staleFrameObjectUrlRef.current = frameObjectUrlRef.current;
-      frameObjectUrlRef.current = nextFrame.imageUrl;
-      decodingFrameObjectUrlRef.current = '';
-      committed = true;
-      frameCountersRef.current.displayed += 1;
-      setFrame(nextFrame);
-      setStatus('live');
-      setStreamError('');
-    } catch {
-      // A newer frame remains queued and will be decoded below.
-    } finally {
-      if (!committed && nextFrame.imageUrl.startsWith('blob:')) {
-        URL.revokeObjectURL(nextFrame.imageUrl);
-      }
-      if (decodingFrameObjectUrlRef.current === nextFrame.imageUrl) {
-        decodingFrameObjectUrlRef.current = '';
-      }
-      frameDecodeActiveRef.current = false;
-      if (!framePipelineDisposedRef.current && pendingFrameRef.current) {
-        void commitPendingPreviewFrame();
-      }
-    }
-  }, []);
-
-  const queuePreviewFrame = useCallback((nextFrame: BrowserChatPreviewFrame) => {
-    if (framePipelineDisposedRef.current) {
-      if (nextFrame.imageUrl.startsWith('blob:')) URL.revokeObjectURL(nextFrame.imageUrl);
-      return;
-    }
-    const previousPending = pendingFrameRef.current?.imageUrl;
-    if (previousPending?.startsWith('blob:')) URL.revokeObjectURL(previousPending);
-    pendingFrameRef.current = nextFrame;
-    void commitPendingPreviewFrame();
-  }, [commitPendingPreviewFrame]);
-
-  useEffect(() => {
-    let disposed = false;
-    let reconnectTimer: number | undefined;
-    reconnectEnabledRef.current = true;
-    const connect = async () => {
-      try {
-        const response = await fetch(
-          `${withWebPilotBasePath('/api/browser-chat/preview-stream')}?sessionId=${encodeURIComponent(sessionId)}`,
-          { cache: 'no-store', method: 'POST' },
-        );
-        const data = await response.json() as { error?: string; transport?: 'image' | 'video'; url?: string };
-        if (!response.ok || !data.url) throw new Error(data.error || '实时界面连接失败');
-        if (disposed) return;
-        const videoSupported = typeof MediaSource !== 'undefined'
-          && MediaSource.isTypeSupported(BROWSER_CHAT_PREVIEW_VIDEO_MIME_TYPE);
-        const requestedTransport = data.transport === 'image' || forceImageTransportRef.current || !videoSupported
-          ? 'image'
-          : 'video';
-        setPreviewTransport(requestedTransport);
-        disposeVideoPipeline();
-        const url = new URL(data.url);
-        url.searchParams.set('sessionId', sessionId);
-        url.searchParams.set('transport', requestedTransport);
-        const stream = new WebSocket(url);
-        stream.binaryType = 'arraybuffer';
-        streamRef.current = stream;
-        stream.onopen = () => {
-          const counters = frameCountersRef.current;
-          counters.sampledAt = Date.now();
-          counters.sampledDisplayed = counters.displayed;
-          counters.sampledReceived = counters.received;
-          frameStateRef.current = { tabs: [], url: '', viewport: { height: 720, width: 1280 } };
-          setPreviewMetrics(null);
-          setStatus('connecting');
-          setStreamError('');
-        };
-        stream.onmessage = (event) => {
-          try {
-            if (event.data instanceof ArrayBuffer) {
-              const bytes = new Uint8Array(event.data);
-              if (bytes.byteLength < 4) throw new Error('Invalid binary frame');
-              const metadataLength = new DataView(event.data).getUint32(0, false);
-              if (metadataLength <= 0 || metadataLength + 4 > bytes.byteLength) throw new Error('Invalid binary metadata');
-              const metadata = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + metadataLength))) as {
-                capturedAt?: string;
-                contentType?: string;
-                sequence?: number;
-                type?: 'frame' | 'videoChunk' | 'videoInit';
-              };
-              const payload = bytes.slice(4 + metadataLength);
-              if (metadata.type === 'videoInit') {
-                if (!metadata.contentType || !beginVideoPipeline(metadata.contentType, payload)) {
-                  fallbackToImagePreview('当前客户端不支持该 H.264 视频流，正在回退到图片预览');
-                }
-                return;
-              }
-              if (metadata.type === 'videoChunk') {
-                frameCountersRef.current.received += 1;
-                enqueueVideoChunk(payload);
-                return;
-              }
-              if (metadata.type !== 'frame' || (metadata.contentType !== 'image/jpeg' && metadata.contentType !== 'image/png')) {
-                throw new Error('Unknown binary preview payload');
-              }
-              frameCountersRef.current.received += 1;
-              const imageUrl = URL.createObjectURL(new Blob(
-                [payload],
-                { type: metadata.contentType },
-              ));
-              queuePreviewFrame({
-                ...frameStateRef.current,
-                capturedAt: metadata.capturedAt || new Date().toISOString(),
-                contentType: metadata.contentType,
-                imageUrl,
-                sequence: metadata.sequence,
-              });
-              return;
-            }
-            const message = JSON.parse(String(event.data)) as BrowserChatPreviewFrame & {
-              error?: string;
-              height?: number;
-              metrics?: BrowserChatPreviewServerMetrics;
-              control?: BrowserChatPreviewNativeControl;
-              dialog?: BrowserChatPreviewDialog;
-              dialogId?: string;
-              download?: Omit<BrowserChatPreviewDownload, 'status'>;
-              transport?: 'image' | 'video';
-              type?: string;
-              width?: number;
-            };
-            if (message.type === 'tabsChanged' && Array.isArray(message.tabs)) {
-              setNativeControl(null);
-              frameStateRef.current = { ...frameStateRef.current, tabs: message.tabs };
-              setFrame((current) => current ? { ...current, tabs: message.tabs } : current);
-            } else if (message.type === 'navigationChanged' && typeof message.url === 'string') {
-              setNativeControl(null);
-              frameStateRef.current = { ...frameStateRef.current, url: message.url };
-              setFrame((current) => current ? { ...current, url: message.url } : current);
-            } else if (message.type === 'viewportChanged' && message.viewport) {
-              frameStateRef.current = { ...frameStateRef.current, viewport: message.viewport };
-              setFrame((current) => current ? { ...current, viewport: message.viewport } : current);
-            } else if (
-              message.type === 'videoReady'
-              && typeof message.width === 'number'
-              && typeof message.height === 'number'
-            ) {
-              frameStateRef.current = {
-                ...frameStateRef.current,
-                viewport: { width: message.width, height: message.height },
-              };
-            } else if (message.type === 'frameHeartbeat' && message.metrics) {
-              const counters = frameCountersRef.current;
-              const sampledAt = Date.now();
-              const sampleSeconds = Math.max(0.001, (sampledAt - counters.sampledAt) / 1_000);
-              setPreviewMetrics({
-                ...message.metrics,
-                displayedFps: (counters.displayed - counters.sampledDisplayed) / sampleSeconds,
-                receivedFps: (counters.received - counters.sampledReceived) / sampleSeconds,
-              });
-              counters.sampledAt = sampledAt;
-              counters.sampledDisplayed = counters.displayed;
-              counters.sampledReceived = counters.received;
-            } else if (message.type === 'transportChanged' && message.transport) {
-              setPreviewTransport(message.transport);
-              if (message.transport === 'image') {
-                forceImageTransportRef.current = true;
-                disposeVideoPipeline();
-                if (message.error) setStreamError(message.error);
-              }
-            } else if (message.type === 'activeTabChanged') {
-              setNativeControl(null);
-              setStatus('reconnecting');
-            } else if (message.type === 'nativeControlOpened' && message.control) {
-              setNativeControl(message.control);
-            } else if (message.type === 'nativeControlClosed') {
-              setNativeControl(null);
-              setNativeControlBusy(false);
-            } else if (message.type === 'nativeDialogOpened' && message.dialog) {
-              setNativeDialog(message.dialog);
-              setNativeDialogPrompt(message.dialog.defaultValue || '');
-            } else if (message.type === 'nativeDialogClosed') {
-              setNativeDialog((current) => current?.id === message.dialogId ? null : current);
-            } else if (message.type === 'browserDownloadStarted' && message.download) {
-              setPreviewDownload({ ...message.download, status: 'preparing' });
-            } else if (message.type === 'browserDownloadReady' && message.download?.url) {
-              const readyDownload: BrowserChatPreviewDownload = { ...message.download, delivery: 'pending', status: 'ready' };
-              setPreviewDownload(readyDownload);
-              void deliverPreviewDownload(readyDownload);
-            } else if (message.type === 'browserDownloadFailed' && message.download) {
-              setPreviewDownload(null);
-              setInputError(message.download.error || '测试浏览器文件下载失败');
-            } else if (message.type === 'ready') {
-              setStatus('live');
-              setStreamError('');
-            } else if (message.type === 'inputError') {
-              setNativeControlBusy(false);
-              setInputError(message.error || '实时界面操作失败');
-            } else if (message.type === 'unavailable') {
-              reconnectEnabledRef.current = false;
-              setStatus('unavailable');
-              setStreamError(message.error || '当前会话没有运行中的测试浏览器');
-            } else if (message.type === 'error') {
-              setStreamError(message.error || '实时界面连接失败');
-            }
-          } catch {
-            setStreamError('实时画面数据无效');
-          }
-        };
-        stream.onerror = () => setStreamError((current) => current || '实时界面连接中断，正在重连');
-        stream.onclose = () => {
-          if (streamRef.current === stream) streamRef.current = null;
-          if (disposed || !reconnectEnabledRef.current) return;
-          setStatus('reconnecting');
-          reconnectTimer = window.setTimeout(() => void connect(), 600);
-        };
-      } catch (error) {
-        if (disposed) return;
-        setStatus('reconnecting');
-        setStreamError(error instanceof Error ? error.message : '实时界面连接失败');
-        reconnectTimer = window.setTimeout(() => void connect(), 600);
-      }
-    };
-    void connect();
-    return () => {
-      disposed = true;
-      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
-      const stream = streamRef.current;
-      streamRef.current = null;
-      stream?.close();
-    };
-  }, [beginVideoPipeline, deliverPreviewDownload, disposeVideoPipeline, enqueueVideoChunk, fallbackToImagePreview, queuePreviewFrame, sessionId, userId]);
-
-  useEffect(() => {
-    // React Strict Mode mounts effects again after a simulated cleanup. Reset
-    // this flag on every setup so the remounted preview continues accepting frames.
-    framePipelineDisposedRef.current = false;
-    return () => {
-      framePipelineDisposedRef.current = true;
-      if (frameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(frameObjectUrlRef.current);
-      if (staleFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(staleFrameObjectUrlRef.current);
-      if (decodingFrameObjectUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(decodingFrameObjectUrlRef.current);
-      const pendingUrl = pendingFrameRef.current?.imageUrl;
-      if (pendingUrl?.startsWith('blob:')) URL.revokeObjectURL(pendingUrl);
-      frameObjectUrlRef.current = '';
-      staleFrameObjectUrlRef.current = '';
-      decodingFrameObjectUrlRef.current = '';
-      pendingFrameRef.current = null;
-      pendingMoveRef.current = null;
-      pointerGestureRef.current = null;
-      if (moveFlushTimerRef.current !== undefined) window.clearTimeout(moveFlushTimerRef.current);
-      if (scrollFlushTimerRef.current !== undefined) window.clearTimeout(scrollFlushTimerRef.current);
-      disposeVideoPipeline(false);
-    };
-  }, [disposeVideoPipeline]);
-
-  useEffect(() => {
-    const video = previewVideoRef.current;
-    if (!videoObjectUrl || !video) return undefined;
-    let stopped = false;
-    let callbackId = 0;
-    const markLive = () => {
-      if (stopped) return;
-      setStatus('live');
-      setStreamError('');
-    };
-    const frameCallback = () => {
-      if (stopped) return;
-      frameCountersRef.current.displayed += 1;
-      markLive();
-      callbackId = video.requestVideoFrameCallback(frameCallback);
-    };
-    video.addEventListener('playing', markLive);
-    callbackId = video.requestVideoFrameCallback(frameCallback);
-    void video.play().catch(() => undefined);
-    return () => {
-      stopped = true;
-      video.removeEventListener('playing', markLive);
-      if (callbackId) video.cancelVideoFrameCallback(callbackId);
-    };
-  }, [videoObjectUrl]);
-
-  const postInput = useCallback((input: BrowserChatPreviewInput, reportError: boolean) => {
-    const stream = streamRef.current;
-    if (!stream || stream.readyState !== WebSocket.OPEN) {
-      if (reportError) setInputError('实时界面正在重连，请稍后重试');
-      return false;
-    }
-    stream.send(JSON.stringify({ event: input, type: 'input' }));
-    return true;
-  }, []);
-
-  const sendInput = useCallback((input: BrowserChatPreviewInput) => {
-    setInputError('');
-    return postInput(input, true);
-  }, [postInput]);
-
-  const relativePoint = useCallback((clientX: number, clientY: number, element: HTMLElement, clamp = false) => {
-    if (!frame) return undefined;
-    const mediaRect = previewVideoRef.current?.getBoundingClientRect()
-      || previewImageRef.current?.getBoundingClientRect()
-      || element.getBoundingClientRect();
-    if (!mediaRect.width || !mediaRect.height) return undefined;
-    const sourceWidth = Math.max(1, frame.viewport.width);
-    const sourceHeight = Math.max(1, frame.viewport.height);
-    const sourceRatio = sourceWidth / sourceHeight;
-    const mediaRatio = mediaRect.width / mediaRect.height;
-    const contentWidth = mediaRatio > sourceRatio ? mediaRect.height * sourceRatio : mediaRect.width;
-    const contentHeight = mediaRatio > sourceRatio ? mediaRect.height : mediaRect.width / sourceRatio;
-    const rect = {
-      bottom: mediaRect.top + (mediaRect.height + contentHeight) / 2,
-      height: contentHeight,
-      left: mediaRect.left + (mediaRect.width - contentWidth) / 2,
-      right: mediaRect.left + (mediaRect.width + contentWidth) / 2,
-      top: mediaRect.top + (mediaRect.height - contentHeight) / 2,
-      width: contentWidth,
-    };
-    if (!clamp && (
-      clientX < rect.left
-      || clientX > rect.right
-      || clientY < rect.top
-      || clientY > rect.bottom
-    )) return undefined;
-    return {
-      xRatio: Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)),
-      yRatio: Math.min(1, Math.max(0, (clientY - rect.top) / rect.height)),
-    };
-  }, [frame]);
-
-  const beginPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0 && event.button !== 1) return;
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
-    if (!point) return;
-    setNativeControl(null);
-    event.currentTarget.focus();
-    event.preventDefault();
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    pointerGestureRef.current = {
-      button: event.button === 1 ? 'middle' : 'left',
-      clickCount: Math.min(2, Math.max(1, event.detail || 1)),
-      current: point,
-      dragged: false,
-      pointerId: event.pointerId,
-      start: point,
-      startClientX: event.clientX,
-      startClientY: event.clientY,
-    };
-  }, [relativePoint]);
-
-  const movePreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const gesture = pointerGestureRef.current;
-    if (!gesture && event.pointerType === 'touch') return;
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget, Boolean(gesture));
-    if (!point) return;
-    if (gesture && gesture.pointerId === event.pointerId) {
-      gesture.current = point;
-      if (Math.hypot(event.clientX - gesture.startClientX, event.clientY - gesture.startClientY) >= 4) {
-        gesture.dragged = true;
-      }
-      return;
-    }
-    pendingMoveRef.current = { kind: 'move', ...point };
-    if (moveFlushTimerRef.current !== undefined) return;
-    moveFlushTimerRef.current = window.setTimeout(() => {
-      moveFlushTimerRef.current = undefined;
-      const input = pendingMoveRef.current;
-      pendingMoveRef.current = null;
-      if (input) postInput(input, false);
-    }, 16);
-  }, [postInput, relativePoint]);
-
-  const endPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const gesture = pointerGestureRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId) return;
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget, true) || gesture.current;
-    pointerGestureRef.current = null;
-    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-      event.currentTarget.releasePointerCapture?.(event.pointerId);
-    }
-    event.preventDefault();
-    if (gesture.dragged) {
-      sendInput({
-        kind: 'drag',
-        ...gesture.start,
-        toXRatio: point.xRatio,
-        toYRatio: point.yRatio,
-        button: gesture.button,
-      });
-      return;
-    }
-    sendInput({
-      kind: 'click',
-      ...point,
-      button: gesture.button,
-      clickCount: gesture.clickCount,
-    });
-  }, [relativePoint, sendInput]);
-
-  const cancelPreviewPointer = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (pointerGestureRef.current?.pointerId !== event.pointerId) return;
-    pointerGestureRef.current = null;
-    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-      event.currentTarget.releasePointerCapture?.(event.pointerId);
-    }
-  }, []);
-
-  const openPreviewContextMenu = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
-    if (!point) return;
-    event.preventDefault();
-    event.currentTarget.focus();
-    sendInput({ kind: 'click', ...point, button: 'right', clickCount: 1 });
-  }, [relativePoint, sendInput]);
-
-  const scrollPreview = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
-    const point = relativePoint(event.clientX, event.clientY, event.currentTarget);
-    if (!point) return;
-    event.preventDefault();
-    const current = pendingScrollRef.current;
-    pendingScrollRef.current = {
-      kind: 'scroll',
-      ...point,
-      deltaX: (current?.deltaX || 0) + event.deltaX,
-      deltaY: (current?.deltaY || 0) + event.deltaY,
-    };
-    if (scrollFlushTimerRef.current !== undefined) return;
-    scrollFlushTimerRef.current = window.setTimeout(() => {
-      scrollFlushTimerRef.current = undefined;
-      const input = pendingScrollRef.current;
-      pendingScrollRef.current = null;
-      if (input) sendInput(input);
-    }, 16);
-  }, [relativePoint, sendInput]);
-
-  const pressPreviewKey = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.nativeEvent.isComposing || event.key === 'Process') return;
-    if (nativeControl && event.key === 'Escape') {
-      event.preventDefault();
-      event.stopPropagation();
-      setNativeControl(null);
-      return;
-    }
-    const modifierShortcut = event.ctrlKey || event.metaKey || event.altKey;
-    let key = event.key;
-    if (modifierShortcut) {
-      const parts = [
-        event.ctrlKey ? 'Control' : '',
-        event.metaKey ? 'Meta' : '',
-        event.altKey ? 'Alt' : '',
-        event.shiftKey ? 'Shift' : '',
-        key.length === 1 ? key.toUpperCase() : key,
-      ].filter(Boolean);
-      key = parts.join('+');
-    } else if (event.shiftKey && key.length > 1) {
-      key = `Shift+${key}`;
-    } else if (key === ' ') {
-      key = 'Space';
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    sendInput({ kind: 'key', key });
-  }, [nativeControl, sendInput]);
-
-  const pastePreviewText = useCallback((event: ReactClipboardEvent<HTMLDivElement>) => {
-    const text = event.clipboardData.getData('text');
-    if (!text) return;
-    event.preventDefault();
-    sendInput({ kind: 'text', text });
-  }, [sendInput]);
-
-  const switchPreviewTab = useCallback((tabId: string) => {
-    setNativeControl(null);
-    setFrame((current) => current ? {
-      ...current,
-      tabs: current.tabs.map((tab) => ({ ...tab, active: tab.id === tabId })),
-    } : current);
-    setStatus('reconnecting');
-    sendInput({ kind: 'tab', tabId });
-  }, [sendInput]);
-
-  const selectPreviewNativeOption = useCallback((value: string) => {
-    if (!nativeControl || (nativeControl.kind !== 'select' && nativeControl.kind !== 'datalist')) return;
-    setNativeControl(null);
-    if (nativeControl.kind === 'select') {
-      sendInput({
-        kind: 'select',
-        value,
-        xRatio: nativeControl.targetXRatio,
-        yRatio: nativeControl.targetYRatio,
-      });
-      return;
-    }
-    sendInput({
-      controlKind: 'datalist',
-      kind: 'controlValue',
-      value,
-      xRatio: nativeControl.targetXRatio,
-      yRatio: nativeControl.targetYRatio,
-    });
-  }, [nativeControl, sendInput]);
-
-  const applyPreviewNativePicker = useCallback(() => {
-    if (nativeControl?.kind !== 'picker') return;
-    setNativeControl(null);
-    sendInput({
-      controlKind: 'picker',
-      kind: 'controlValue',
-      value: nativePickerValue,
-      xRatio: nativeControl.targetXRatio,
-      yRatio: nativeControl.targetYRatio,
-    });
-  }, [nativeControl, nativePickerValue, sendInput]);
-
-  const uploadPreviewNativeFiles = useCallback(async (files: FileList | null) => {
-    if (nativeControl?.kind !== 'file' || !files?.length || nativeControlBusy) return;
-    const selected = Array.from(files).slice(0, nativeControl.multiple ? 8 : 1);
-    setNativeControlBusy(true);
-    setInputError('');
-    try {
-      const uploaded: Array<{ mimeType: string; name: string; path: string }> = [];
-      for (const file of selected) {
-        const response = await fetch(withWebPilotBasePath('/api/uploads'), {
-          body: file,
-          headers: {
-            'Content-Type': file.type || 'application/octet-stream',
-            'x-webpilot-file-name': encodeURIComponent(file.name),
-            'x-webpilot-upload': 'raw',
-          },
-          method: 'POST',
-        });
-        const data = await readApiJson<Record<string, unknown>>(response, '文件上传失败');
-        uploaded.push({
-          mimeType: String(data.type || file.type || 'application/octet-stream'),
-          name: String(data.name || file.name),
-          path: String(data.path || ''),
-        });
-      }
-      if (!uploaded.every((file) => file.path)) throw new Error('文件上传结果无效');
-      if (!sendInput({ controlId: nativeControl.controlId, files: uploaded, kind: 'files' })) {
-        setNativeControlBusy(false);
-      }
-    } catch (error) {
-      setNativeControlBusy(false);
-      setInputError(error instanceof Error ? error.message : '文件上传失败');
-    } finally {
-      if (previewFileInputRef.current) previewFileInputRef.current.value = '';
-    }
-  }, [nativeControl, nativeControlBusy, sendInput]);
-
-  const respondPreviewNativeDialog = useCallback((accept: boolean) => {
-    if (!nativeDialog) return;
-    sendInput({
-      accept,
-      dialogId: nativeDialog.id,
-      kind: 'dialog',
-      ...(nativeDialog.dialogType === 'prompt' ? { promptText: nativeDialogPrompt } : {}),
-    });
-  }, [nativeDialog, nativeDialogPrompt, sendInput]);
-
-  const statusLabelSource = status === 'live'
-    ? '实时'
-    : status === 'reconnecting'
-      ? '正在重连'
-      : status === 'unavailable'
-        ? '浏览器未运行'
-        : '正在连接';
-  const statusLabel = t(statusLabelSource);
-  const previewMetricsLabel = previewMetrics
-    ? t('{transport} · 目标 {target} · 截图 {capture} · 发送 {send} · 接收 {received} · 显示 {displayed} FPS', {
-        transport: previewTransport === 'video' ? 'H.264' : t('图片'),
-        target: Math.round(previewMetrics.targetFps || 0),
-        capture: (previewMetrics.captureFps || 0).toFixed(1),
-        send: (previewMetrics.sendFps || 0).toFixed(1),
-        received: previewMetrics.receivedFps.toFixed(1),
-        displayed: previewMetrics.displayedFps.toFixed(1),
-      })
-    : '';
-  const previewMetricsTitle = previewMetrics
-    ? [
-        previewTransport === 'video'
-          ? t('传输：H.264 fragmented MP4')
-          : previewMetrics.imageFormat === 'jpeg' ? t('JPEG 质量：{quality}', { quality: previewMetrics.imageQuality ?? '-' }) : 'PNG',
-        ...(previewTransport === 'video' ? [
-          t('编码：{profile} / Level {level} / {mime}', { profile: previewMetrics.h264Profile || '-', level: previewMetrics.h264Level || '-', mime: previewMetrics.mimeType || '-' }),
-          t('视频：{width}×{height} / {bitrate} Kbps', { width: previewMetrics.width || '-', height: previewMetrics.height || '-', bitrate: previewMetrics.bitrateKbps || '-' }),
-        ] : []),
-        t('最近一次截图耗时：{time} ms', { time: (previewMetrics.captureDurationMs || 0).toFixed(1) }),
-        t('平均截图耗时：{time} ms', { time: (previewMetrics.captureDurationMsAverage || 0).toFixed(1) }),
-        t('在途截图：{active}/{maximum}', { active: previewMetrics.activeCaptures || 0, maximum: previewMetrics.maxConcurrentCaptures || 1 }),
-        t('网络背压丢帧：{count}', { count: previewMetrics.backpressureDrops || 0 }),
-        t('待发送客户端帧：{count}', { count: previewMetrics.pendingClientFrames || 0 }),
-      ].join('\n')
-    : '';
-  const hasPreviewVisual = videoDisplayReady || Boolean(frame?.imageUrl);
-
-  return (
-    <AppModal
-      ariaLabel={t('实时界面')}
-      backdropClassName="browser-chat-web-preview-overlay"
-      dialogClassName="browser-chat-web-preview-modal"
-      onClose={onClose}
-      size="full"
-    >
-        <header className="ui-modal-header browser-chat-web-preview-header">
-          <div className="ui-modal-heading">
-            <div className="browser-chat-web-preview-title-row">
-              <h2 className="ui-modal-title">{t('实时界面')}</h2>
-              <span className={`browser-chat-web-preview-status is-${status}`}>
-                <span />
-                {statusLabel}
-              </span>
-              {previewMetricsLabel ? (
-                <span className="browser-chat-web-preview-metrics" title={previewMetricsTitle}>
-                  {previewMetricsLabel}
-                </span>
-              ) : null}
-              <span className="browser-chat-web-preview-url" title={frame?.url || ''}>
-                {frame?.url || t('等待会话浏览器启动')}
-              </span>
-            </div>
-          </div>
-          <button aria-label={t('关闭实时界面')} className="browser-chat-web-preview-close" onClick={onClose} title={t('关闭')} type="button">
-            <X size={18} />
-          </button>
-        </header>
-
-        {frame?.tabs?.length ? (
-          <div className="browser-chat-web-preview-tabs">
-            {frame.tabs.map((tab) => (
-              <button
-                className={tab.active ? 'active' : ''}
-                key={tab.id}
-                onClick={() => void switchPreviewTab(tab.id)}
-                title={tab.url}
-                type="button"
-              >
-                <Globe size={13} />
-                <span>{tab.url || t('标签页 {index}', { index: tab.index + 1 })}</span>
-              </button>
-            ))}
-          </div>
-        ) : null}
-
-        <div className="browser-chat-web-preview-body">
-          <div
-            aria-label={t('可操作的浏览器实时画面')}
-            className={hasPreviewVisual ? 'browser-chat-web-preview-stage has-frame' : 'browser-chat-web-preview-stage'}
-            onContextMenu={openPreviewContextMenu}
-            onKeyDown={pressPreviewKey}
-            onPaste={pastePreviewText}
-            onPointerCancel={cancelPreviewPointer}
-            onPointerDown={beginPreviewPointer}
-            onPointerMove={movePreviewPointer}
-            onPointerUp={endPreviewPointer}
-            onWheel={scrollPreview}
-            ref={previewStageRef}
-            role="application"
-            tabIndex={0}
-          >
-            {frame?.imageUrl && !videoDisplayReady ? (
-              <img
-                alt={t('浏览器实时画面')}
-                draggable={false}
-                height={frame.viewport.height}
-                ref={previewImageRef}
-                src={frame.imageUrl}
-                width={frame.viewport.width}
-              />
-            ) : null}
-            {videoObjectUrl ? (
-              <video
-                autoPlay
-                className={videoDisplayReady ? 'is-ready' : 'is-loading'}
-                disablePictureInPicture
-                height={frame?.viewport.height || 720}
-                muted
-                onLoadedData={() => {
-                  setVideoDisplayReady(true);
-                  setStatus('live');
-                  setStreamError('');
-                }}
-                playsInline
-                ref={previewVideoRef}
-                src={videoObjectUrl}
-                width={frame?.viewport.width || 1280}
-              />
-            ) : null}
-            {nativeControl?.kind === 'file' ? (
-              <input
-                accept={nativeControl.accept || undefined}
-                capture={nativeControl.capture === 'environment' || nativeControl.capture === 'user'
-                  ? nativeControl.capture
-                  : nativeControl.capture ? true : undefined}
-                className="browser-chat-web-preview-native-file-input"
-                multiple={nativeControl.multiple}
-                onChange={(event) => void uploadPreviewNativeFiles(event.target.files)}
-                ref={previewFileInputRef}
-                type="file"
-              />
-            ) : null}
-            {nativeControl && nativeControl.kind !== 'file' && nativeControlPosition ? (
-              <div
-                aria-label={nativeControl.label}
-                className={`browser-chat-web-preview-native-select is-${nativeControl.kind}`}
-                onClick={(event) => event.stopPropagation()}
-                onKeyDown={(event) => event.stopPropagation()}
-                onPointerDown={(event) => event.stopPropagation()}
-                role={nativeControl.kind === 'select' || nativeControl.kind === 'datalist' ? 'listbox' : 'dialog'}
-                style={nativeControlPosition}
-              >
-                {nativeControl.kind === 'select' || nativeControl.kind === 'datalist' ? (
-                  nativeControl.options.map((option, index) => {
-                    const selected = nativeControl.kind === 'select'
-                      ? option.value === nativeControl.selectedValue
-                      : option.value === nativeControl.value;
-                    const disabled = 'disabled' in option ? option.disabled : false;
-                    const group = 'group' in option ? option.group : undefined;
-                    return (
-                      <button
-                        aria-selected={selected}
-                        className={selected ? 'is-selected' : undefined}
-                        disabled={disabled}
-                        key={`${option.value}:${index}`}
-                        onClick={() => selectPreviewNativeOption(option.value)}
-                        role="option"
-                        type="button"
-                      >
-                        <span>{option.label}</span>
-                        {group ? <small>{group}</small> : null}
-                        {selected ? <Check size={15} /> : null}
-                      </button>
-                    );
-                  })
-                ) : null}
-                {nativeControl.kind === 'picker' ? (
-                  <div className="browser-chat-web-preview-native-control-form">
-                    <strong>{nativeControl.label}</strong>
-                    <input
-                      autoFocus
-                      max={nativeControl.max}
-                      min={nativeControl.min}
-                      onChange={(event) => setNativePickerValue(event.target.value)}
-                      step={nativeControl.step}
-                      type={nativeControl.inputType}
-                      value={nativePickerValue}
-                    />
-                    <div className="browser-chat-web-preview-native-control-actions">
-                      <button onClick={() => setNativeControl(null)} type="button">{t('取消')}</button>
-                      <button className="is-primary" onClick={applyPreviewNativePicker} type="button">{t('应用')}</button>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            {nativeDialog ? (
-              <div
-                className="browser-chat-web-preview-native-dialog-backdrop"
-                onClick={(event) => event.stopPropagation()}
-                onKeyDown={(event) => {
-                  event.stopPropagation();
-                  if (event.key === 'Escape') {
-                    event.preventDefault();
-                    respondPreviewNativeDialog(false);
-                  }
-                }}
-                onPointerDown={(event) => event.stopPropagation()}
-              >
-                <section aria-labelledby="browser-chat-native-dialog-title" aria-modal="true" role="dialog">
-                  <strong id="browser-chat-native-dialog-title">
-                    {nativeDialog.dialogType === 'prompt' ? t('请输入内容') : t('浏览器提示')}
-                  </strong>
-                  <p>{nativeDialog.message}</p>
-                  {nativeDialog.dialogType === 'prompt' ? (
-                    <AppInput
-                      autoFocus
-                      onChange={(event) => setNativeDialogPrompt(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') respondPreviewNativeDialog(true);
-                      }}
-                      value={nativeDialogPrompt}
-                    />
-                  ) : null}
-                  <div className="browser-chat-web-preview-native-dialog-actions">
-                    {nativeDialog.dialogType !== 'alert' ? (
-                      <button onClick={() => respondPreviewNativeDialog(false)} type="button">
-                        {nativeDialog.dialogType === 'beforeunload' ? t('留在此页') : t('取消')}
-                      </button>
-                    ) : null}
-                    <button className="is-primary" onClick={() => respondPreviewNativeDialog(true)} type="button">
-                      {nativeDialog.dialogType === 'beforeunload' ? t('离开页面') : t('确定')}
-                    </button>
-                  </div>
-                </section>
-              </div>
-            ) : null}
-            {!hasPreviewVisual ? (
-              <div className="browser-chat-web-preview-empty">
-                <Loader2 className="spin" size={22} />
-                <strong>{streamError ? t(streamError) : t('正在等待浏览器画面')}</strong>
-                <span>{t('发送一条需要访问网页的消息后，画面会自动出现。')}</span>
-              </div>
-            ) : null}
-          </div>
-          {streamError && hasPreviewVisual ? <div className="browser-chat-web-preview-alert">{t(streamError)}</div> : null}
-          {inputError ? <div className="browser-chat-web-preview-alert">{t(inputError)}</div> : null}
-          {previewDownload ? (
-            <div className="browser-chat-web-preview-download-notice" role="status">
-              {previewDownload.status === 'preparing' ? <Loader2 className="spin" size={14} /> : <Download size={14} />}
-              <span>{previewDownload.status === 'preparing'
-                ? '正在识别下载文件'
-                : previewDownload.delivery === 'started' ? '已开始下载' : '检测到下载文件'}：{previewDownload.fileName}</span>
-              {previewDownload.status === 'ready' ? (
-                <button
-                  onClick={() => void deliverPreviewDownload(previewDownload, { repeat: true, userInitiated: true })}
-                  type="button"
-                >{previewDownload.delivery === 'started' ? '重新下载' : '下载到本机'}</button>
-              ) : null}
-              <button
-                aria-label="关闭下载提示"
-                className="browser-chat-web-preview-download-dismiss"
-                onClick={() => setPreviewDownload(null)}
-                type="button"
-              ><X size={13} /></button>
-            </div>
-          ) : null}
-        </div>
-
-    </AppModal>
-  );
-}
+const BrowserChatWebPreviewModal = dynamic(() => import('@/components/BrowserChatWebPreviewModal').then((module) => module.BrowserChatWebPreviewModal), { ssr: false });
 
 const BrowserChatEmbeddedBrowser = memo(function BrowserChatEmbeddedBrowser({
   active,
@@ -10758,7 +9579,7 @@ export function BrowserChatWorkspace({
     else setGeneratingAutomationMessageId(firstMessageId);
     setMessageGenerationError('');
     setError('');
-    startGlobalLoading(t(isSkill ? '正在生成 Skill' : '正在生成测试用例'));
+    startGlobalLoading(t(isSkill ? '正在生成 Skill' : '正在生成自动化任务'));
     try {
       const endpoint = isSkill ? 'skills' : 'automation-cases';
       const response = await fetch(browserChatApiUrl(`/api/browser-chat/${sessionId}/${endpoint}`), {
@@ -10771,7 +9592,7 @@ export function BrowserChatWorkspace({
         await loadSkills();
         setMessageGenerationDialog(null);
       } else {
-        const data = await readApiJson<{ automationCase?: { id?: string }; case?: { id?: string } }>(response, t('生成测试用例失败'));
+        const data = await readApiJson<{ automationCase?: { id?: string }; case?: { id?: string } }>(response, t('生成自动化任务失败'));
         const caseId = data.automationCase?.id || data.case?.id || '';
         const search = new URLSearchParams();
         if (caseId) search.set('caseId', caseId);
@@ -10781,7 +9602,7 @@ export function BrowserChatWorkspace({
     } catch (generationError) {
       setMessageGenerationError(generationError instanceof Error
         ? generationError.message
-        : t(isSkill ? '生成 Skill 失败' : '生成测试用例失败'));
+        : t(isSkill ? '生成 Skill 失败' : '生成自动化任务失败'));
     } finally {
       setGeneratingSkillMessageId(null);
       setGeneratingAutomationMessageId(null);
@@ -11617,7 +10438,7 @@ export function BrowserChatWorkspace({
                 </span>
                 <div className="ui-modal-heading-copy">
                   <h2 className="ui-modal-title" id="browser-chat-message-generation-title">
-                    {messageGenerationDialog.kind === 'skill' ? t('生成 Skill') : t('生成用例')}
+                    {messageGenerationDialog.kind === 'skill' ? t('生成 Skill') : t('生成任务')}
                   </h2>
                   <p className="ui-modal-subtitle">{t('从当前对话中选择要提炼的消息')}</p>
                 </div>
@@ -11722,7 +10543,7 @@ export function BrowserChatWorkspace({
                     : messageGenerationDialog.kind === 'skill' ? <Sparkles size={15} /> : <Workflow size={15} />}
                   {messageGenerationSubmitting
                     ? t('正在生成')
-                    : messageGenerationDialog.kind === 'skill' ? t('生成 Skill') : t('生成用例')}
+                    : messageGenerationDialog.kind === 'skill' ? t('生成 Skill') : t('生成任务')}
                 </button>
               </div>
             </footer>

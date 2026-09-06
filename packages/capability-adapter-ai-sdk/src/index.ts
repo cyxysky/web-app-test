@@ -7,6 +7,8 @@ import {
 } from '@webpilot/capability-host';
 import {
   capabilitySkillReadJsonSchema,
+  createCapabilityExecutor,
+  type CapabilityExecutionPolicyOptions,
   type CapabilityExecutionContext,
   type CapabilityRunSnapshot,
   type ResolvedCapabilityTool,
@@ -37,6 +39,8 @@ export type AISDKCapabilitySkillOptions = {
 };
 
 export type AISDKCapabilityAdapterOptions = {
+  policy?: CapabilityExecutionPolicyOptions;
+  abortSignal?: AbortSignal;
   metadata?: Readonly<Record<string, unknown>>;
   execute?: (invocation: AISDKCapabilityInvocation) => Promise<unknown>;
   skills?: AISDKCapabilitySkillOptions;
@@ -104,6 +108,7 @@ export function toAISDKToolSet(
   snapshot: CapabilityRunSnapshot | MountedCapabilities,
   options: AISDKCapabilityAdapterOptions = {},
 ): ToolSet {
+  const executeCapability = createCapabilityExecutor(options.policy);
   const skillMode = options.skills?.mode || 'disabled';
   const loadedSkillIds = options.skills?.loadedSkillIds || new Set<string>();
   const entries: Array<readonly [string, ToolSet[string]]> = Object.entries(snapshot.tools).map(([publicName, resolvedTool]) => [
@@ -113,15 +118,16 @@ export function toAISDKToolSet(
       inputSchema: inputSchema(resolvedTool),
       inputExamples: resolvedTool.tool.inputExamples?.map((input) => ({ input })),
       execute: async (input, execution) => {
+        const signals = [snapshot.abortSignal, options.abortSignal, execution.abortSignal].filter((signal): signal is AbortSignal => Boolean(signal));
         const context: CapabilityExecutionContext = {
           invocationId: execution.toolCallId,
-          abortSignal: execution.abortSignal,
+          abortSignal: signals.length ? AbortSignal.any(signals) : undefined,
           metadata: options.metadata,
         };
-        const invoke = () => resolvedTool.tool.execute(input, context);
-        return options.execute
-          ? options.execute({ resolvedTool, input, context, execution, invoke })
-          : invoke();
+        return executeCapability(resolvedTool, context, (context) => {
+          const invoke = () => resolvedTool.tool.execute(input, context);
+          return options.execute ? options.execute({ resolvedTool, input, context, execution, invoke }) : invoke();
+        });
       },
     }),
   ] as const);
@@ -168,6 +174,7 @@ export async function mountAISDKCapabilities(
       .filter(Boolean)
       .join('\n\n');
     return Object.freeze({
+      abortSignal: mounted.abortSignal,
       manifests: mounted.manifests,
       skills: mounted.skills,
       configurations: mounted.configurations,
@@ -179,7 +186,8 @@ export async function mountAISDKCapabilities(
       dispose: mounted.dispose,
     });
   } catch (error) {
-    await mounted.dispose();
+    try { await mounted.dispose(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'AI SDK mount and cleanup failed.', { cause: error }); }
     throw error;
   }
 }

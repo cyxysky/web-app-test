@@ -1,6 +1,6 @@
 # @webpilot/capability-host
 
-Framework-neutral mounting for WebPilot Capability providers. It owns the
+Framework-neutral mounting for Orbit Capability providers. It owns the
 three pieces that every Agent host otherwise has to rebuild:
 
 - load and normalize package-owned settings;

@@ -1,3 +1,4 @@
+import { hydrateBrowserChatContextSnapshot } from './browser-chat-context-store';
 import { queryDatabase, queryDatabaseOne } from '@/server/db/database';
 
 export type BrowserChatHistoryKind = 'logs' | 'messages' | 'steps';
@@ -127,6 +128,14 @@ export async function readAllBrowserChatMessages<T>(sessionId: string) {
     .filter((item): item is T => item !== undefined);
 }
 
+/** Only attachment/artifact metadata is needed for tool bindings, not the full conversation. */
+export async function readBrowserChatFileMessages<T>(sessionId: string) {
+  const rows = await queryDatabase<{ record_json: string }>(`
+    SELECT record_json FROM browser_chat_file_message WHERE session_id = ? ORDER BY time ASC, id ASC
+  `, [sessionId]);
+  return rows.map((row) => parseJson<T>(row.record_json)).filter((item): item is T => item !== undefined);
+}
+
 export async function readBrowserChatLatestActiveAssistantMessage<T>(sessionId: string) {
   const rows = await queryDatabase<{ record_json: string }>(`
     SELECT record_json
@@ -245,7 +254,7 @@ export async function readBrowserChatSessionWindow<
     readBrowserChatLogsPage<TLog>(sessionId, { limit: options.logLimit }),
   ]);
   return {
-    ...snapshot,
+    ...await hydrateBrowserChatContextSnapshot(sessionId, snapshot),
     messages: messages.items,
     steps: steps.items,
     logs: logs.items,
@@ -261,7 +270,8 @@ export async function readBrowserChatSessionHeader<TSession>(sessionId: string) 
   const row = await queryDatabaseOne<{ snapshot_json?: string }>(`
     SELECT snapshot_json FROM browser_chat_session WHERE id = ?
   `, [sessionId]);
-  return row?.snapshot_json ? parseJson<TSession>(row.snapshot_json) : undefined;
+  const snapshot = row?.snapshot_json ? parseJson<TSession>(row.snapshot_json) : undefined;
+  return snapshot ? hydrateBrowserChatContextSnapshot(sessionId, snapshot) : undefined;
 }
 
 export async function readBrowserChatSessionOwner(sessionId: string) {

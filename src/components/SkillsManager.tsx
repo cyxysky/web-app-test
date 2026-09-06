@@ -24,6 +24,7 @@ type SkillDraft = {
   status: SkillRecord['status'];
   triggerPhrases: string;
   details: string;
+  resources: Array<{ name: string; content: string }>;
 };
 
 type EditorMode = 'create' | 'edit' | null;
@@ -43,6 +44,7 @@ const emptyDraft: SkillDraft = {
   status: 'ready',
   triggerPhrases: '',
   details: '',
+  resources: [],
 };
 
 function draftFromSkill(skill: SkillRecord): SkillDraft {
@@ -53,6 +55,7 @@ function draftFromSkill(skill: SkillRecord): SkillDraft {
     status: skill.status,
     triggerPhrases: skill.triggerPhrases.join('\n'),
     details: skill.content.details,
+    resources: skill.content.resources || [],
   };
 }
 
@@ -69,6 +72,7 @@ function payloadFromDraft(draft: SkillDraft) {
     triggerPhrases: splitList(draft.triggerPhrases),
     content: {
       details: draft.details.trim(),
+      resources: draft.resources,
     },
   };
 }
@@ -88,7 +92,7 @@ export function SkillsManager({
   showTitle?: boolean;
   userId?: string;
 } = {}) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const normalizedUserId = userId.trim() || '1';
   const skillsApiUrl = useCallback((path: string) => withWebPilotBasePath(path), []);
   const [skills, setSkills] = useState<SkillRecord[]>([]);
@@ -180,6 +184,10 @@ export function SkillsManager({
     }
     if (!payload.content.details) {
       window.alert(t('请输入 Skill 详细内容'));
+      return;
+    }
+    if (draft.resources.some((resource) => !resource.name.trim() || !resource.content.trim())) {
+      window.alert(t('请填写参考资料的名称和内容'));
       return;
     }
 
@@ -330,7 +338,7 @@ export function SkillsManager({
                     label: t('最近更新'),
                     className: 'management-table-date-column',
                     filter: { getValue: (skill) => skill.updatedAt, type: 'datetime' },
-                    render: (skill) => <span className="management-table-muted">{new Date(skill.updatedAt).toLocaleString()}</span>,
+                    render: (skill) => <span className="management-table-muted">{new Date(skill.updatedAt).toLocaleString(language === 'en' ? 'en-US' : 'zh-CN')}</span>,
                   },
                   {
                     key: 'actions',
@@ -405,12 +413,16 @@ export function SkillsManager({
                           {skill.content.details
                             ? <div className="skills-manager-details">{skill.content.details}</div>
                             : <p className="skills-manager-muted">{t('暂无内容')}</p>}
+                          {skill.content.resources?.map((resource, index) => <details key={index}>
+                            <summary>{t('参考资料')} · {resource.name}</summary>
+                            <div className="skills-manager-details">{resource.content}</div>
+                          </details>)}
                         </div>
                       </div>
 
                       <div className="skills-manager-footnote">
                         <Clock3 size={13} />
-                        <span>{t('最近更新')}：{new Date(skill.updatedAt).toLocaleString()}</span>
+                        <span>{t('最近更新')}：{new Date(skill.updatedAt).toLocaleString(language === 'en' ? 'en-US' : 'zh-CN')}</span>
                       </div>
                     </div>
                   ) : null}
@@ -470,8 +482,18 @@ export function SkillsManager({
               </label>
               <label className="skills-manager-field wide">
                 <span>{t('详细内容')}</span>
-                <TextArea fullWidth maxLength={30_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作说明，支持多段文本和 Markdown')} />
+                <TextArea fullWidth maxLength={100_000} value={draft.details} onChange={(event) => update({ details: event.target.value })} placeholder={t('填写完整操作规则；示例、文档和附录可以放入下方参考资料')} />
               </label>
+              <div className="skills-manager-field wide">
+                <span>{t('参考资料')}</span>
+                <small>{t('按需读取。必须遵守的规则请保留在详细内容中。')}</small>
+                {draft.resources.map((resource, index) => <div key={index} className="skills-manager-field wide">
+                  <AppInput aria-label={t('资料名称')} maxLength={120} value={resource.name} onChange={(event) => update({ resources: draft.resources.map((item, i) => i === index ? { ...item, name: event.target.value } : item) })} />
+                  <TextArea aria-label={t('资料内容')} fullWidth maxLength={100_000} value={resource.content} onChange={(event) => update({ resources: draft.resources.map((item, i) => i === index ? { ...item, content: event.target.value } : item) })} />
+                  <button type="button" className="ui-button ui-button--neutral" onClick={() => update({ resources: draft.resources.filter((_, i) => i !== index) })}>{t('移除资料')}</button>
+                </div>)}
+                <button type="button" className="ui-button ui-button--neutral" disabled={draft.resources.length >= 20} onClick={() => update({ resources: [...draft.resources, { name: '', content: '' }] })}><Plus size={15} />{t('添加参考资料')}</button>
+              </div>
               <div className="resource-sharing-field wide">
                 <div>
                   <strong>{t('所有 ID 共享')}</strong>

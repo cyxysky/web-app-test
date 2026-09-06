@@ -104,7 +104,7 @@ const panelDefinitions: Record<IntegrationCategory, {
     description: '连接业务系统后，Agent 才能发现和调用这些系统提供的操作。',
     emptyTitle: '尚未连接外部系统',
     emptyDescription: '选择一种连接驱动，填写必要信息后测试连接。',
-    namePlaceholder: '例如：DOMP 业务系统',
+    namePlaceholder: '例如：企业业务系统',
     typeLabel: '连接类型',
     editLabel: '编辑连接器',
     deleteTitle: '删除连接器',

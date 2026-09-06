@@ -4,6 +4,7 @@ import { EmptyState } from '@heroui/react/empty-state';
 import { Table } from '@heroui/react/table';
 import type { SortDescriptor } from 'react-aria-components';
 import { useDeferredValue, useMemo, useState, type ReactNode } from 'react';
+import { useI18n } from '@/i18n/I18nProvider';
 
 export type DataTableColumn<T> = {
   accessor?: (item: T) => number | string | null | undefined;
@@ -58,6 +59,7 @@ export function DataTable<T>({
   renderExpandedRow?: (item: T) => ReactNode;
   rowClassName?: (item: T) => string | undefined;
 }) {
+  const { t } = useI18n();
   const [sortDescriptor, setSortDescriptor] = useState<SortDescriptor>();
   const deferredSortDescriptor = useDeferredValue(sortDescriptor);
   const sortedData = useMemo(() => {
@@ -88,7 +90,7 @@ export function DataTable<T>({
     <Table className={['app-data-table', compact ? 'is-compact' : '', className || ''].filter(Boolean).join(' ')}>
       <Table.ScrollContainer>
         <Table.Content
-          aria-label="Data table"
+          aria-label={t('数据表')}
           onSortChange={setSortDescriptor}
           sortDescriptor={sortDescriptor}
           style={minWidth ? { minWidth } : undefined}

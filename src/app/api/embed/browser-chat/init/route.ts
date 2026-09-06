@@ -73,7 +73,7 @@ export async function POST(request: NextRequest) {
       ok: true,
       version: 2,
       elementName: 'webpilot-browser-chat',
-      entryUrl: joinWebPilotUrl(baseUrl, '/embed/webpilot.js'),
+      entryUrl: joinWebPilotUrl(baseUrl, '/embed/orbit.js'),
       iframeUrl: iframeUrl.toString(),
       apiBaseUrl: baseUrl,
       sessionId: session?.id,

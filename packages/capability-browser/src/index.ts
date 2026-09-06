@@ -19,10 +19,19 @@ export * from './settings.js';
 export * from './session-group.js';
 
 const reason = z.string().trim().min(1).max(300);
+const stateOptions = {
+  scope: z.enum(['active', 'all']).optional(),
+  frame: z.string().trim().min(1).max(200).optional(),
+  selector: z.string().trim().min(1).max(2000).optional(),
+  query: z.string().trim().min(1).max(300).optional(),
+  cursor: z.string().min(1).max(1000).optional(),
+};
 
 const readBrowserStateParser = z.object({
   action: z.literal('state'),
   reason,
+  ...stateOptions,
+  maxOutputChars: z.number().int().min(1_000).max(200_000).optional(),
 }).strict();
 const browserCodeParser = z.object({
   action: z.literal('code'),
@@ -40,14 +49,15 @@ const waitForHumanVerificationParser = z.object({
 // even when their reason describes a code/iframe operation. Runtime parsing
 // below still validates the exact action-specific shape.
 const browserParser = z.object({
+  ...stateOptions,
   action: z.enum(['code', 'state', 'waitForHumanVerification']).describe(
-    'Required operation. Use code for Playwright reads/interactions, including iframe or targeted DOM inspection. Use state only for the fixed top-level snapshot.',
+    'Required operation. Use code for Playwright interaction. Use state for an active-surface snapshot, or narrow it with scope/frame/selector/query and continue with the returned nextCursor.',
   ),
   reason,
   code: z.string().min(1).max(40_000).optional().describe(
     'Required only when action=code. JavaScript executed in the persistent Playwright runtime.',
   ),
-  maxOutputChars: z.number().int().min(1_000).optional().describe('Optional only when action=code.'),
+  maxOutputChars: z.number().int().min(1_000).max(200_000).optional().describe('Output budget for code/state. State supports scope, frame, selector, query and nextCursor continuation.'),
   maxMs: z.number().int().min(1_000).max(30 * 60_000).optional().describe('Optional only when action=waitForHumanVerification.'),
 }).strict();
 
@@ -60,7 +70,9 @@ export function normalizeBrowserToolInput(value: unknown) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
   const input = value as Record<string, unknown>;
   if (input.action === 'state') {
-    return { action: 'state', reason: input.reason };
+    return { action: 'state', reason: input.reason,
+      ...Object.fromEntries(['scope', 'frame', 'selector', 'query', 'cursor', 'maxOutputChars'].filter((key) => input[key] !== undefined).map((key) => [key, input[key]])),
+    };
   }
   if (input.action === 'code') {
     return {
@@ -187,7 +199,7 @@ export function createBrowserTools(operations: BrowserCapabilityOperations): Cap
   return Object.freeze({
     [browserCapabilityToolNames.browser]: defineCapabilityTool<BrowserToolInput, unknown>({
       name: browserCapabilityToolNames.browser,
-      description: 'Execute one bounded Playwright JavaScript cell, read a fresh fixed top-level browser snapshot, or pause for human verification. Use action=code for iframe/DOM inspection and interaction. The action field is authoritative and unrelated fields are discarded before validation.',
+      description: 'Execute one bounded Playwright JavaScript cell, read scoped browser state with cursor continuation, or pause for human verification. State accepts scope/frame/selector/query; pass nextCursor as cursor to continue the same capture. The action field is authoritative and unrelated fields are discarded before validation.',
       input: browserToolInput,
       inputExamples: [
         { action: 'code', reason: 'Read the current page URL and title', code: 'nodeRepl.write({ url: page.url(), title: await page.title() })' },

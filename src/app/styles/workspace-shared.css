@@ -109,7 +109,8 @@
 }
 
 .browser-chat-brand-title {
-  gap: 5px !important;
+  gap: 8px !important;
+  line-height: 22px;
   overflow-wrap: normal !important;
   white-space: nowrap !important;
 }
@@ -670,16 +671,6 @@
 
 
 
-
-.automation-case-workbench {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  display: grid;
-  min-height: 360px;
-  overflow: clip;
-  grid-template-columns: minmax(0, 1fr);
-}
 
 .browser-chat-layout.sidebar-collapsed .browser-chat-history-filter {
   display: none;

@@ -1,8 +1,8 @@
 {
-  "name": "webpilot-qa-electron",
+  "name": "orbit-desktop",
   "version": "0.1.0",
-  "description": "WebPilot desktop application",
-  "author": "WebPilot",
+  "description": "Orbit desktop application",
+  "author": "Orbit",
   "private": true,
   "main": "main.js"
 }

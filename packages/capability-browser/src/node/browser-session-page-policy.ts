@@ -6,7 +6,7 @@ export function isBlankBrowserUrlLike(url: string) {
     || /^(about:newtab|chrome:\/\/new-tab-page|edge:\/\/newtab)/i.test(url)
     || (
       /^data:text\/html/i.test(url)
-      && /data-webpilot-embedded-browser|WebPilot(?:%20|\+)Embedded(?:%20|\+)Browser|WebPilot embedded browser/i.test(url)
+      && /data-webpilot-embedded-browser|(?:Orbit|WebPilot)(?:%20|\+)Embedded(?:%20|\+)Browser|(?:Orbit|WebPilot) embedded browser/i.test(url)
     );
 }
 

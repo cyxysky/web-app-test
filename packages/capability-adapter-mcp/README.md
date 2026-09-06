@@ -44,3 +44,7 @@ const handler = createCapabilityMcpHandler(options);
 Capability JSON Schemas become MCP input schemas, AbortSignal is propagated to
 the capability execution context, artifact URLs become resource links, and all
 resolved runtimes are disposed when the MCP server closes.
+
+Pass `policy.authorize` and `policy.prerequisite` to connect the host's execution checks. Serial concurrency groups are enforced across calls. Progress events are forwarded to a supplied MCP progress token and to `policy.reportProgress`. Inline `image.data` is returned as native MCP image content; for stored images provide `resolveImage(content)` returning `{ data: base64, mimeType }`. The adapter does not fetch arbitrary artifact URLs itself.
+
+Closing is idempotent, cancels the mounted run and reports aggregated cleanup errors.

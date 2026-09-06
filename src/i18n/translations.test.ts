@@ -33,10 +33,30 @@ test('all settings copy has an English translation', () => {
     ...runtimeEnvDefinitions.flatMap((definition) => [
       definition.label,
       definition.description,
+      definition.group,
       ...(definition.options || []).map((option) => option.label),
     ]),
   ].filter((value): value is string => typeof value === 'string' && hasChinese(value));
 
-  const missing = [...new Set(copy.filter((value) => translateText('en', value) === value))];
+  // A translated prefix such as "Select CPU 或 CUDA 推理。" is still incomplete.
+  const missing = [...new Set(copy.filter((value) => hasChinese(translateText('en', value))))];
   assert.deepEqual(missing, []);
+});
+
+test('dynamic settings units and UI templates respect language without translating user content', () => {
+  for (const [source, english] of [['10 分钟', '10 min'], ['1 秒', '1 s'], ['250 毫秒', '250 ms']]) {
+    assert.equal(translateText('en', source), english);
+    assert.equal(translateText('zh', source), source);
+  }
+  for (const [source, english] of [['{count} 分钟', '30 min'], ['{count} 秒', '30 s'], ['{count} 毫秒', '30 ms']]) {
+    assert.equal(translateText('en', source, { count: 30 }), english);
+  }
+  for (const source of ['研究高级设置', '连接器高级设置', '数据高级设置', '通信高级设置']) {
+    assert.equal(hasChinese(translateText('en', source)), false);
+    assert.equal(translateText('zh', source), source);
+  }
+  assert.equal(translateText('en', '{count} 项设置，修改后自动保存。', { count: 1 }), 'Settings: 1. Changes save automatically.');
+  assert.equal(translateText('en', '打开文件 {name}', { name: '订单汇总.xlsx' }), 'Open file 订单汇总.xlsx');
+  assert.equal(translateText('en', '第 {index} 轮：{prompt}', { index: 2, prompt: '查询订单' }), 'Turn 2: 查询订单');
+  assert.equal(translateText('zh', 'Edit chart data'), '编辑图表数据');
 });

@@ -12,6 +12,7 @@ import {
   type CreateAutomationRunInput,
   type CreateAutomationScheduleInput,
   type UpdateAutomationRunInput,
+  type UpdateAutomationCaseInput,
 } from '@/server/automation/automation.schema';
 import {
   executeDatabase,
@@ -23,6 +24,7 @@ import {
   type DatabaseExecutor,
 } from '@/server/db/database';
 import { publishRealtimeRefreshEvent, type RefreshEntityType } from '@/server/realtime/ws-refresh';
+import { automationTaskGuidance } from '@/server/automation/automation-task';
 
 type JsonRow = { record_json: string };
 
@@ -58,10 +60,10 @@ function definedValues<T extends object>(value: T) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined));
 }
 
-function parseCaseRow(row?: JsonRow) {
+function parseCaseRow(row?: JsonRow): AutomationCaseRecord | undefined {
   if (!row) return undefined;
   const parsed = automationCaseRecordSchema.safeParse(parseDatabaseJson<unknown>(row.record_json, undefined));
-  return parsed.success ? parsed.data : undefined;
+  return parsed.success ? { ...parsed.data, guidance: automationTaskGuidance(parsed.data) } : undefined;
 }
 
 function parseRunRow(row?: JsonRow) {
@@ -160,6 +162,25 @@ export async function createAutomationCase(input: CreateAutomationCaseInput) {
   `, [record.id, record.userId, record.sourceSessionId, record.title, record.targetUrl,
     JSON.stringify(record), record.createdAt, record.updatedAt]);
   publishAutomationRecord('automationCase', record);
+  return record;
+}
+
+export async function updateAutomationCase(id: string, userId: string, patch: UpdateAutomationCaseInput) {
+  const record = await runDatabaseTransaction(async (manager) => {
+    const current = await readCase(manager, id, userId);
+    if (!current) return undefined;
+    const next = automationCaseRecordSchema.parse({
+      ...current, ...definedValues(patch),
+      targetUrl: patch.targetUrl === '' ? 'about:blank' : patch.targetUrl ?? current.targetUrl,
+      updatedAt: now(),
+    });
+    await executeDatabase(`
+      UPDATE automation_case SET title = ?, target_url = ?, record_json = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?
+    `, [next.title, next.targetUrl, JSON.stringify(next), next.updatedAt, id, userId], manager);
+    return next;
+  });
+  if (record) publishAutomationRecord('automationCase', record);
   return record;
 }
 

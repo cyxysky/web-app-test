@@ -16,6 +16,9 @@ const createCaseSchema = z.object({
   description: z.union([z.string(), z.number()]).optional(),
   targetUrl: z.union([z.string(), z.number()]).optional(),
   url: z.union([z.string(), z.number()]).optional(),
+  guidance: z.string().max(100_000).optional(),
+  completionCriteria: z.string().max(20_000).optional(),
+  outputRequirements: z.string().max(20_000).optional(),
 }).strict();
 
 function text(value: unknown) {
@@ -46,7 +49,7 @@ export async function GET(request: NextRequest) {
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await parseJsonRequest(request, createCaseSchema, { maxBytes: 64 * 1024 });
+    const body = await parseJsonRequest(request, createCaseSchema, { maxBytes: 1024 * 1024 });
     const title = text(body.title ?? body.name);
     const instruction = text(body.instruction ?? body.prompt);
     if (!title) throw new ApiRequestError('自动化用例标题不能为空', { code: 'title_required' });
@@ -65,6 +68,9 @@ export async function POST(request: NextRequest) {
         sourceMessageIds: [],
         targetUrl: text(body.targetUrl ?? body.url) || 'about:blank',
         instruction,
+        guidance: text(body.guidance),
+        completionCriteria: text(body.completionCriteria),
+        outputRequirements: text(body.outputRequirements),
         operations: [],
       });
       return apiJson(request, {

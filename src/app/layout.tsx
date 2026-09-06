@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import '@open-file-viewer/core/style.css';
 import { WorkspaceBrandProvider } from '@/brand/WorkspaceBrandProvider';
+import { product } from '@/brand/product';
 import { InterfaceMotion } from '@/components/InterfaceMotion';
 import { FilePreviewProvider } from '@/components/FilePreviewProvider';
 import { NavigationLoading } from '@/components/NavigationLoading';
@@ -9,8 +10,8 @@ import { ThemeProvider } from '@/theme/ThemeProvider';
 import './styles/foundation.css';
 
 export const metadata: Metadata = {
-  title: 'WebPilot',
-  description: 'Persistent AI browser conversations and live browser control.',
+  title: product.name,
+  description: product.description,
 };
 
 const themeBootScript = `

@@ -10,6 +10,7 @@ import {
   type ReactNode,
 } from 'react';
 import { normalizeLanguage, type Language } from '@/i18n/language';
+import { translateText } from '@/i18n/translations';
 
 const STORAGE_KEY = 'webpilotqa.language';
 const COOKIE_KEY = 'WEBPILOTQA_LANGUAGE';
@@ -17,15 +18,6 @@ type I18nContextValue = {
   language: Language;
   setLanguage: (language: Language) => void;
   t: (value: string, params?: Record<string, string | number>) => string;
-};
-
-type Translator = (language: Language, value: string, params?: Record<string, string | number>) => string;
-
-const fallbackTranslator: Translator = (_language, value, params) => {
-  if (!params) return value;
-  return value.replace(/\{(\w+)\}/g, (match, key) => (
-    params[key] === undefined ? match : String(params[key])
-  ));
 };
 
 const I18nContext = createContext<I18nContextValue | undefined>(undefined);
@@ -37,7 +29,6 @@ function readInitialLanguage(): Language {
 
 export function I18nProvider({ children }: { children: ReactNode }) {
   const [language, setLanguageState] = useState<Language>('zh');
-  const [translator, setTranslator] = useState<Translator>(() => fallbackTranslator);
 
   useEffect(() => {
     setLanguageState(readInitialLanguage());
@@ -51,21 +42,9 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     document.cookie = `${COOKIE_KEY}=${normalized}; path=/; max-age=31536000; SameSite=Lax`;
   }, []);
 
-  useEffect(() => {
-    if (language !== 'en') {
-      setTranslator(() => fallbackTranslator);
-      return;
-    }
-    let active = true;
-    void import('@/i18n/translations').then((module) => {
-      if (active) setTranslator(() => module.translateText);
-    });
-    return () => { active = false; };
-  }, [language]);
-
   const t = useCallback((value: string, params?: Record<string, string | number>) => (
-    translator(language, value, params)
-  ), [language, translator]);
+    translateText(language, value, params)
+  ), [language]);
 
   useEffect(() => {
     document.documentElement.lang = language === 'en' ? 'en' : 'zh-CN';

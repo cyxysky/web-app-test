@@ -34,6 +34,35 @@ export function compactBrowserChatLogDetails(details: string | undefined, maxCha
   // usage and timings by turning the entire AI response into a text preview.
   try {
     const parsed = JSON.parse(details);
+    if (parsed?.aiInput && typeof parsed.aiInput === 'object') {
+      for (let textLimit = Math.max(64, Math.floor(limit / 8)); textLimit >= 64; textLimit = Math.floor(textLimit / 2)) {
+        const compacted = JSON.stringify({
+          ...parsed,
+          aiInput: {
+            ...parsed.aiInput,
+            messages: compactLogStrings(parsed.aiInput.messages, textLimit),
+            system: compactLogStrings(parsed.aiInput.system, textLimit),
+          },
+          truncated: true,
+          originalCharacters: parsed.originalCharacters ?? details.length,
+        });
+        if (compacted.length <= limit) return compacted;
+      }
+      // Keep an inspectable request and durable manifest id even for very large histories.
+      const manifest = parsed.aiInput.options?.contextManifest;
+      const compacted = JSON.stringify({
+        aiInput: {
+          provider: parsed.aiInput.provider, model: parsed.aiInput.model,
+          options: { contextProfile: parsed.aiInput.options?.contextProfile, contextManifest: manifest ? {
+            ...manifest, entries: [], knowledge: [], entriesArchived: true, entryCount: manifest.entries?.length,
+            knowledgeCount: manifest.knowledge?.length,
+          } : undefined },
+          messages: '[Input preview omitted; original messages are stored by the context manifest references.]',
+        },
+        aiInputTokens: parsed.aiInputTokens, truncated: true, originalCharacters: details.length,
+      });
+      if (compacted.length <= limit) return compacted;
+    }
     if (parsed?.aiOutput && typeof parsed.aiOutput === 'object') {
       for (let textLimit = Math.max(64, Math.floor(limit / 8)); textLimit >= 64; textLimit = Math.floor(textLimit / 2)) {
         const compacted = JSON.stringify({

@@ -163,7 +163,6 @@ export function requireHiddenRuntimeSkillRead(
   const requiredSkillId = requiredHiddenRuntimeSkillId(toolName, input);
   if (!requiredSkillId || loadedSkillIds.has(requiredSkillId)) return undefined;
   const skillContent = hiddenRuntimeSkillContent(requiredSkillId);
-  if (skillContent) loadedSkillIds.add(requiredSkillId);
   return {
     ok: false,
     actual: JSON.stringify({

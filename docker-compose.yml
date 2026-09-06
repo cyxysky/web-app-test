@@ -3,11 +3,13 @@ services:
     build:
       context: .
       args:
-        WEBPILOT_BASE_PATH: ${WEBPILOT_BASE_PATH:-}
+        ORBIT_BASE_PATH: ${ORBIT_BASE_PATH-${WEBPILOT_BASE_PATH:-}}
+        ORBIT_BRAND_PREFIX: ${ORBIT_BRAND_PREFIX-${WEBPILOT_BRAND_PREFIX:-}}
+        ORBIT_BRAND_TEXT: ${ORBIT_BRAND_TEXT-${WEBPILOT_BRAND_TEXT:-Orbit}}
         GLINER_MODEL: fastino/gliner2.5-multi-v1
         GLINER_CHINESE_NER_MODEL: uer/roberta-base-finetuned-cluener2020-chinese
         GLINER_PII_MODEL: LiquidAI/LFM2.5-Encoder-350M-PII-Detector
-    image: webpilot-qa:latest
+    image: orbit:latest
     ports:
       - "3000:3000"
     env_file:
@@ -20,14 +22,40 @@ services:
       APP_DATA_DIR: /app
       ARTIFACTS_DIR: /app/artifacts
       BROWSER_CHAT_PREVIEW_WS_PORT: "${BROWSER_CHAT_PREVIEW_WS_PORT:-18021}"
-      WEBPILOT_DEFAULT_USER_ID: "${WEBPILOT_DEFAULT_USER_ID:-1}"
-      WEBPILOT_REQUIRE_MOUNT_USER_ID: "${WEBPILOT_REQUIRE_MOUNT_USER_ID:-true}"
+      ORBIT_DEFAULT_USER_ID: "${ORBIT_DEFAULT_USER_ID-${WEBPILOT_DEFAULT_USER_ID:-1}}"
+      ORBIT_REQUIRE_MOUNT_USER_ID: "${ORBIT_REQUIRE_MOUNT_USER_ID-${WEBPILOT_REQUIRE_MOUNT_USER_ID:-true}}"
       AI_SENSITIVE_DATA_FILTER_ENABLED: "${AI_SENSITIVE_DATA_FILTER_ENABLED:-true}"
       AI_SENSITIVE_DATA_FILTER_FAILURE_MODE: "${AI_SENSITIVE_DATA_FILTER_FAILURE_MODE:-closed}"
       GLINER_RUNTIME_MODE: "local"
       GLINER_SERVICE_URL: "http://127.0.0.1:18001"
       GLINER_SERVICE_API_KEY: "${GLINER_SERVICE_API_KEY:-}"
+      AGENT_CODE_SANDBOX_BACKEND: "${AGENT_CODE_SANDBOX_BACKEND:-remote}"
+      AGENT_CODE_SANDBOX_RUNNER_URL: "${AGENT_CODE_SANDBOX_RUNNER_URL:-http://webpilot-code-sandbox:18100}"
+      AGENT_CODE_SANDBOX_RUNNER_TOKEN: "${CODE_SANDBOX_RUNNER_TOKEN:?CODE_SANDBOX_RUNNER_TOKEN must be set}"
     volumes:
       - ./.data:/app/.data
       - ./artifacts:/app/artifacts
+    restart: unless-stopped
+
+  webpilot-code-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.code-sandbox
+    image: orbit-code-sandbox:latest
+    environment:
+      CODE_SANDBOX_RUNNER_TOKEN: "${CODE_SANDBOX_RUNNER_TOKEN:?CODE_SANDBOX_RUNNER_TOKEN must be set}"
+      CODE_SANDBOX_RUNNER_CONCURRENCY: "${CODE_SANDBOX_RUNNER_CONCURRENCY:-2}"
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    mem_limit: ${CODE_SANDBOX_RUNNER_MEMORY_LIMIT:-768m}
+    cpus: ${CODE_SANDBOX_RUNNER_CPU_LIMIT:-2.0}
+    pids_limit: ${CODE_SANDBOX_RUNNER_PIDS_LIMIT:-128}
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped

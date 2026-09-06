@@ -6,6 +6,8 @@ import {
   appendTerminalBrowserChatTurn,
   compactBrowserChatModelTranscript,
   normalizeBrowserChatModelContext,
+  browserChatActiveMessages,
+  browserChatTranscript,
   serializableBrowserChatModelMessages,
 } from './browser-chat-model-context';
 
@@ -37,11 +39,13 @@ test('keeps the native AI SDK user, tool call, tool result, and final assistant 
 
   const stored = serializableBrowserChatModelMessages(messages);
   assert.deepEqual(stored, messages);
-  assert.deepEqual(normalizeBrowserChatModelContext({ version: 1, transcript: stored, activeMessages: stored }), {
-    version: 1,
-    transcript: messages,
-    activeMessages: messages,
-  });
+  const context = normalizeBrowserChatModelContext({ version: 1, transcript: stored, activeMessages: stored });
+  assert.equal(context.version, 2);
+  assert.deepEqual(browserChatTranscript(context), messages);
+  assert.deepEqual(browserChatActiveMessages(context), messages);
+  assert.equal(Object.keys(context.records).length, messages.length);
+  assert.equal('transcript' in context, false);
+  assert.equal('activeMessages' in context, false);
 });
 
 test('omits binary AI SDK file parts from persistent model context', () => {
@@ -72,8 +76,8 @@ test('removes legacy persisted data URL file parts while loading model context',
     }],
   });
 
-  assert.equal(Array.isArray(context.activeMessages[0]?.content), true);
-  assert.equal(Array.isArray(context.activeMessages[0]?.content) ? context.activeMessages[0].content.length : 0, 1);
+  assert.equal(Array.isArray(browserChatActiveMessages(context)[0]?.content), true);
+  assert.equal(Array.isArray(browserChatActiveMessages(context)[0]?.content) ? browserChatActiveMessages(context)[0].content.length : 0, 1);
   assert.doesNotMatch(JSON.stringify(context), /base64/);
 });
 
@@ -82,7 +86,7 @@ test('falls back to the transcript when an active chain was not stored', () => {
     version: 1,
     transcript: [{ role: 'user', content: '继续' }],
   });
-  assert.deepEqual(context.activeMessages, context.transcript);
+  assert.deepEqual(browserChatActiveMessages(context), browserChatTranscript(context));
 });
 
 test('retains the complete active model working set', () => {
@@ -91,9 +95,9 @@ test('retains the complete active model working set', () => {
     content: `active-${index}`,
   }));
   const context = normalizeBrowserChatModelContext({ version: 1, transcript: [], activeMessages });
-  assert.equal(context.activeMessages.length, 220);
-  assert.equal(context.activeMessages[0]?.content, 'active-0');
-  assert.equal(context.activeMessages.at(-1)?.content, 'active-219');
+  assert.equal(browserChatActiveMessages(context).length, 220);
+  assert.equal(browserChatActiveMessages(context)[0]?.content, 'active-0');
+  assert.equal(browserChatActiveMessages(context).at(-1)?.content, 'active-219');
 });
 
 test('a failed terminal turn remains available to the next model cycle without duplicating its user message', () => {
@@ -173,7 +177,7 @@ test('drops a persisted orphan tool result before the next provider request', ()
     ],
   });
 
-  assert.deepEqual(context.activeMessages, [
+  assert.deepEqual(browserChatActiveMessages(context), [
     { role: 'user', content: 'continue' },
     { role: 'assistant', content: 'ready' },
   ]);

@@ -38,6 +38,12 @@ export type CommunicationDraft = {
   content: CommunicationContent;
   metadata?: Record<string, unknown>;
   createdAt: string;
+  delivery?: {
+    status: 'sending' | 'sent' | 'unknown';
+    updatedAt: string;
+    receipt?: CommunicationReceipt;
+    error?: string;
+  };
 };
 
 export type CommunicationReceipt = {
@@ -66,18 +72,33 @@ export interface CommunicationChannel {
 export interface CommunicationDraftStore {
   create(input: Omit<CommunicationDraft, 'id' | 'createdAt'>): Promise<CommunicationDraft>;
   get(id: string): Promise<CommunicationDraft | undefined>;
+  claimDelivery?(id: string): Promise<{ claimed: boolean; draft: CommunicationDraft }>;
+  finishDelivery?(id: string, delivery: NonNullable<CommunicationDraft['delivery']>): Promise<void>;
+  dispose?(): Promise<void>;
 }
 
 export function createMemoryCommunicationDraftStore(): CommunicationDraftStore {
   const drafts = new Map<string, CommunicationDraft>();
   return {
     async create(input) {
-      const draft = { ...input, id: globalThis.crypto.randomUUID(), createdAt: new Date().toISOString() };
+      const draft = { ...structuredClone(input), delivery: undefined, id: globalThis.crypto.randomUUID(), createdAt: new Date().toISOString() };
       drafts.set(draft.id, draft);
-      return draft;
+      return structuredClone(draft);
     },
     async get(id) {
-      return drafts.get(id);
+      return structuredClone(drafts.get(id));
+    },
+    async claimDelivery(id) {
+      const draft = drafts.get(id);
+      if (!draft) throw new Error(`Unknown draft: ${id}.`);
+      const claimed = !draft.delivery;
+      if (claimed) draft.delivery = { status: 'sending', updatedAt: new Date().toISOString() };
+      return { claimed, draft: structuredClone(draft) };
+    },
+    async finishDelivery(id, delivery) {
+      const draft = drafts.get(id);
+      if (!draft) throw new Error(`Unknown draft: ${id}.`);
+      draft.delivery = structuredClone(delivery);
     },
   };
 }
@@ -199,7 +220,25 @@ export function createCommunicationTool(
         if (!channel) {
           return { ok: false, error: { code: 'communication-channel-not-found', message: `Unknown channel: ${draft.channelId}.` } };
         }
-        const receipt = await channel.send(draft, context);
+        context.abortSignal?.throwIfAborted();
+        if (!drafts.claimDelivery || !drafts.finishDelivery) throw new Error('The draft store must support atomic delivery tracking before sending.');
+        const claim = await drafts.claimDelivery(draft.id);
+        if (!claim.claimed) {
+          if (claim.draft.delivery?.status === 'sent' && claim.draft.delivery.receipt) {
+            return { ok: true, summary: 'This draft was already sent; returning its original receipt.', data: claim.draft.delivery.receipt };
+          }
+          return { ok: false, error: { code: 'communication-delivery-pending', retryable: false,
+            message: 'This draft is sending or its delivery is uncertain. Verify the channel receipt before creating a replacement draft.' } };
+        }
+        let receipt: CommunicationReceipt;
+        try {
+          receipt = await channel.send(claim.draft, { ...context, metadata: { ...context.metadata, idempotencyKey: draft.id } });
+          await drafts.finishDelivery(draft.id, { status: 'sent', updatedAt: new Date().toISOString(), receipt });
+        } catch (error) {
+          // A timeout cannot prove that the remote side did not accept the message.
+          await drafts.finishDelivery(draft.id, { status: 'unknown', updatedAt: new Date().toISOString(), error: error instanceof Error ? error.message : String(error) });
+          throw error;
+        }
         return { ok: true, summary: `Message accepted by ${channel.name}.`, data: receipt };
       } catch (error) {
         return {
@@ -229,7 +268,9 @@ export function createCommunicationCapability(options: {
             : { status: 'healthy' };
         },
         dispose: async () => {
-          await Promise.allSettled(channels.map((channel) => channel.dispose?.()));
+          const results = await Promise.allSettled([...channels.map((channel) => channel.dispose?.()), drafts.dispose?.()]);
+          const errors = results.flatMap((result) => result.status === 'rejected' ? [result.reason] : []);
+          if (errors.length) throw new AggregateError(errors, 'Communication cleanup failed.');
         },
       };
     },

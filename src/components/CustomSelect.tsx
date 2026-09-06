@@ -3,6 +3,7 @@
 import { Fragment, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import { Check, ChevronDown, Search } from 'lucide-react';
 import { FloatingLayer } from '@/components/FloatingLayer';
+import { HoverCard } from '@/components/HoverCard';
 import { useI18n } from '@/i18n/I18nProvider';
 
 export type CustomSelectOption = {
@@ -26,6 +27,9 @@ export function CustomSelect({
   searchable = false,
   searchPlaceholder,
   title,
+  tooltip,
+  tooltipTitle,
+  tooltipWidth,
   value,
 }: {
   className?: string;
@@ -36,6 +40,9 @@ export function CustomSelect({
   searchable?: boolean;
   searchPlaceholder?: string;
   title?: string;
+  tooltip?: ReactNode;
+  tooltipTitle?: ReactNode;
+  tooltipWidth?: number;
   value: string;
 }) {
   const { t } = useI18n();
@@ -168,25 +175,29 @@ export function CustomSelect({
 
   return (
     <div className={className ? `custom-select ${className}` : 'custom-select'}>
-      <button
-        aria-controls={menuId}
-        aria-expanded={open}
-        aria-haspopup="listbox"
-        className="custom-select-button"
-        disabled={disabled}
-        id={id}
-        onClick={toggleMenu}
-        onKeyDown={handleKeyDown}
-        ref={buttonRef}
-        title={title}
-        type="button"
-      >
-        <div className="custom-select-button-content">
-          {selectedOption?.icon ? <span className="custom-select-icon">{selectedOption.icon}</span> : null}
-          <span className="custom-select-button-label">{selectedOption?.selectedLabel || selectedOption?.label || value}</span>
-        </div>
-        <ChevronDown className={open ? 'open' : undefined} size={16} />
-      </button>
+      <HoverCard anchorRef={buttonRef} content={tooltip} disabled={open} title={tooltipTitle} width={tooltipWidth}>
+        {(hoverProps) => (
+          <button
+            {...hoverProps}
+            aria-controls={menuId}
+            aria-expanded={open}
+            aria-haspopup="listbox"
+            className="custom-select-button"
+            disabled={disabled}
+            id={id}
+            onClick={toggleMenu}
+            onKeyDown={handleKeyDown}
+            title={tooltip || tooltipTitle ? undefined : title}
+            type="button"
+          >
+            <div className="custom-select-button-content">
+              {selectedOption?.icon ? <span className="custom-select-icon">{selectedOption.icon}</span> : null}
+              <span className="custom-select-button-label">{selectedOption?.selectedLabel || selectedOption?.label || value}</span>
+            </div>
+            <ChevronDown className={open ? 'open' : undefined} size={16} />
+          </button>
+        )}
+      </HoverCard>
       <FloatingLayer
         active={open}
         align={className?.includes('browser-chat-provider-select') ? 'end' : 'start'}

@@ -10,6 +10,8 @@ import {
 } from 'typeorm';
 import { appDataRoot } from '@/server/storage/paths';
 import { InitialBackendSchema1788307200000 } from './migrations/1788307200000-initial-backend-schema';
+import { BrowserChatContextRecords1788566400000 } from './migrations/1788566400000-browser-chat-context-records';
+import { RuntimeReadIndexes1788652800000 } from './migrations/1788652800000-runtime-read-indexes';
 
 export type DatabaseDriver = 'postgres' | 'sqlite';
 export type DatabaseExecutor = DataSource | EntityManager | QueryRunner;
@@ -72,7 +74,7 @@ function dataSourceOptions(): DataSourceOptions {
     synchronize: false,
     migrationsRun: true,
     migrationsTableName: 'typeorm_migration',
-    migrations: [InitialBackendSchema1788307200000],
+    migrations: [InitialBackendSchema1788307200000, BrowserChatContextRecords1788566400000, RuntimeReadIndexes1788652800000],
     logging: booleanEnv('DATABASE_LOGGING'),
   };
   if (driver === 'postgres') {

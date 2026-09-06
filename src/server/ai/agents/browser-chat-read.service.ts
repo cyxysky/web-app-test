@@ -11,7 +11,7 @@ import type {
 import { recoverOrphanedBrowserChatSession } from '@/server/ai/agents/browser-chat-session-recovery';
 // Session list/detail reads use database projections rather than the in-memory
 // service list, so reconcile persisted `running` flags with the live registry.
-import type { BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';
+import { browserChatActiveMessages, normalizeBrowserChatModelContext, type BrowserChatModelContext } from '@/server/ai/agents/browser-chat-model-context';
 import {
   estimateRuntimeMessageContext,
   runtimeContextWindowTokens,
@@ -180,7 +180,7 @@ function resolvedContextUsage(
     provider: session.modelProvider,
     model: session.model,
   });
-  const activeMessages = session.modelContext?.activeMessages || [];
+  const activeMessages = browserChatActiveMessages(normalizeBrowserChatModelContext(session.modelContext));
   const source = activeMessages.length
     ? activeMessages
     : messages.map((message) => ({

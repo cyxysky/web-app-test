@@ -13,6 +13,7 @@ import {
 } from '@/lib/onboarding';
 import { readApiJson } from '@/lib/api-client';
 import { withWebPilotBasePath } from '@/lib/webpilot-base-path';
+import { OrbitIcon } from '@/components/OrbitIcon';
 
 type HelpPayload = { readiness: WebPilotOnboardingReadiness; state: WebPilotOnboardingState };
 
@@ -83,9 +84,9 @@ export function WebPilotHelpCenter({ collapsed = false }: { collapsed?: boolean 
           inert={!open}
           onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false); }}
         >
-          <aside aria-label={t('WebPilot 帮助中心')} aria-modal="true" className="webpilot-help-drawer" id="webpilot-help-drawer" role="dialog">
+          <aside aria-label={t('Orbit 帮助中心')} aria-modal="true" className="webpilot-help-drawer" id="webpilot-help-drawer" role="dialog">
             <header>
-              <div><span>WebPilot</span><h2>{t('帮助与教程')}</h2></div>
+              <div><span className="webpilot-help-brand"><OrbitIcon size={24} /> Orbit</span><h2>{t('帮助与教程')}</h2></div>
               <button aria-label={t('关闭帮助中心')} className="ui-icon-button" onClick={() => setOpen(false)} type="button"><X size={18} /></button>
             </header>
 

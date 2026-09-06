@@ -185,6 +185,10 @@ const fileToolShape = {
     .describe('For readContent only: false by default; true explicitly attaches rendered pages. Text reading is not visual QA. Prefer visualIndex + visualRead for page inspection.'),
   offset: z.number().int().min(0).optional()
     .describe('readContent: zero-based character offset. visualIndex: zero-based screenshot-list offset. Never a source line number.'),
+  sheet: z.string().trim().min(1).max(200).optional().describe('readContent: exact spreadsheet worksheet name.'),
+  range: z.string().trim().min(1).max(40).optional().describe('readContent: A1 cell/range, for example A1:D20; specify sheet for multi-sheet files.'),
+  contentPages: z.array(z.number().int().min(1)).min(1).max(100).optional().describe('readContent: PDF text pages, one-based. Independent from visual-preview pages.'),
+  section: z.string().trim().min(1).max(300).optional().describe('readContent: exact, unique DOCX heading; reads through the next heading of the same or higher level.'),
   limit: z.number().int().min(1).max(FILE_READ_MAX_CHARS).optional()
     .describe('readContent: maximum text characters (default 8000, max 40000), NOT source lines. visualIndex: maximum index entries (default 100, max 200). readSource uses startLine/endLine instead.'),
   pages: z.array(z.number().int().min(1)).max(6).optional()

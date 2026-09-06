@@ -9,12 +9,17 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { resolveWorkspaceBrand } from './product';
 
-const PREFIX_STORAGE_KEY = 'webpilotqa.brandPrefix';
-const TEXT_STORAGE_KEY = 'webpilotqa.brandText';
+const PREFIX_STORAGE_KEY = 'orbit.brandPrefix';
+const TEXT_STORAGE_KEY = 'orbit.brandText';
+const LEGACY_PREFIX_STORAGE_KEY = 'webpilotqa.brandPrefix';
+const LEGACY_TEXT_STORAGE_KEY = 'webpilotqa.brandText';
 const MAX_BRAND_PART_LENGTH = 48;
-const DEFAULT_BRAND_PREFIX = String(process.env.NEXT_PUBLIC_WEBPILOT_BRAND_PREFIX || 'DOMP').trim() || 'DOMP';
-const DEFAULT_BRAND_TEXT = String(process.env.NEXT_PUBLIC_WEBPILOT_BRAND_TEXT || 'WebPilot').trim() || 'WebPilot';
+const { brandPrefix: DEFAULT_BRAND_PREFIX, brandText: DEFAULT_BRAND_TEXT } = resolveWorkspaceBrand({
+  prefix: process.env.NEXT_PUBLIC_ORBIT_BRAND_PREFIX ?? process.env.NEXT_PUBLIC_WEBPILOT_BRAND_PREFIX,
+  text: process.env.NEXT_PUBLIC_ORBIT_BRAND_TEXT ?? process.env.NEXT_PUBLIC_WEBPILOT_BRAND_TEXT,
+});
 
 type WorkspaceBrandContextValue = {
   brandPrefix: string;
@@ -29,19 +34,22 @@ function boundedBrandPart(value: string) {
   return value.slice(0, MAX_BRAND_PART_LENGTH);
 }
 
-function storedBrandPart(key: string, fallback: string) {
-  const stored = window.localStorage.getItem(key);
-  return stored === null ? fallback : boundedBrandPart(stored);
-}
-
 export function WorkspaceBrandProvider({ children }: { children: ReactNode }) {
   const [brandPrefix, setBrandPrefixState] = useState(DEFAULT_BRAND_PREFIX);
   const [brandText, setBrandTextState] = useState(DEFAULT_BRAND_TEXT);
 
   useEffect(() => {
     const syncStoredBrand = () => {
-      setBrandPrefixState(storedBrandPart(PREFIX_STORAGE_KEY, DEFAULT_BRAND_PREFIX));
-      setBrandTextState(storedBrandPart(TEXT_STORAGE_KEY, DEFAULT_BRAND_TEXT));
+      try {
+        const brand = resolveWorkspaceBrand({
+          prefix: window.localStorage.getItem(PREFIX_STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_PREFIX_STORAGE_KEY) ?? DEFAULT_BRAND_PREFIX,
+          text: window.localStorage.getItem(TEXT_STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_TEXT_STORAGE_KEY) ?? DEFAULT_BRAND_TEXT,
+        });
+        setBrandPrefixState(brand.brandPrefix);
+        setBrandTextState(brand.brandText);
+        if (window.localStorage.getItem(PREFIX_STORAGE_KEY) !== brand.brandPrefix) window.localStorage.setItem(PREFIX_STORAGE_KEY, brand.brandPrefix);
+        if (window.localStorage.getItem(TEXT_STORAGE_KEY) !== brand.brandText) window.localStorage.setItem(TEXT_STORAGE_KEY, brand.brandText);
+      } catch { /* Browser storage may be unavailable in embedded/private sessions. */ }
     };
     const handleStorage = (event: StorageEvent) => {
       if (event.key === null || event.key === PREFIX_STORAGE_KEY || event.key === TEXT_STORAGE_KEY) {

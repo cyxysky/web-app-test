@@ -4,7 +4,7 @@ export function normalizeWebPilotBasePath(value?: string) {
 }
 
 export const WEBPILOT_BASE_PATH = normalizeWebPilotBasePath(
-  process.env.NEXT_PUBLIC_WEBPILOT_BASE_PATH,
+  process.env.NEXT_PUBLIC_ORBIT_BASE_PATH ?? process.env.NEXT_PUBLIC_WEBPILOT_BASE_PATH,
 );
 
 export function withWebPilotBasePath(path: string, basePath = WEBPILOT_BASE_PATH) {

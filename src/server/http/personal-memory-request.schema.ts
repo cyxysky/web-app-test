@@ -12,6 +12,7 @@ export const personalMemoryRequestSchema = z.object({
   sourceUrl: z.string().trim().max(2_000).optional(),
   status: z.enum(['active', 'disabled']).default('active'),
   shared: z.boolean().optional(),
+  recall: z.enum(['always', 'relevant']).optional(),
 }).strict();
 
 export const personalMemoryPatchSchema = z.object({
@@ -25,4 +26,5 @@ export const personalMemoryPatchSchema = z.object({
   sourceUrl: z.string().trim().max(2_000).optional(),
   status: z.enum(['active', 'disabled']).optional(),
   shared: z.boolean().optional(),
+  recall: z.enum(['always', 'relevant']).optional(),
 }).strict();

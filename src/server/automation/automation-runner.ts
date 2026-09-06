@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import {
-  executeInteractiveBrowserTurn,
-  executeRecordedBrowserOperation,
-} from '@/server/ai/agents/browser-chat-executor.agent';
-import type { InteractiveBrowserTurnResult } from '@/server/ai/agents/browser-chat-executor.agent';
-import type { BrowserActionResult, BrowserSession } from '@webpilot/capability-browser/node';
+import { executeInteractiveBrowserTurn } from '@/server/ai/agents/browser-chat-executor.agent';
+import type { StepExecutionResult } from '@/server/ai/schemas/runtime.schema';
+import { store } from '@/server/db/store';
+import { createRuntimeKnowledgeResolver } from '@/server/ai/agents/runtime-knowledge-context';
+import { readRuntimeKnowledgeRevisions, readRuntimeSkillCatalog } from '@/server/storage/runtime-knowledge-store';
+import { automationTaskInstruction } from './automation-task';
+import type { BrowserSession } from '@webpilot/capability-browser/node';
 import type { BrowserCodeCredentialBinding } from '@webpilot/capability-browser/node';
 import { createWebPilotBrowserSession } from '@/server/capabilities/webpilot-browser';
 import {
@@ -22,7 +23,6 @@ import {
 } from '@/server/storage/automation-store';
 import type {
   AutomationCaseRecord,
-  AutomationOperationRecord,
   AutomationRunLogEntry,
   AutomationRunRecord,
   AutomationRunStepRecord,
@@ -119,24 +119,6 @@ function instructionMentionsAccount(instruction: string, account: LoginAccountMe
     || Boolean(account.loginUrl && normalized.includes(account.loginUrl.toLowerCase()));
 }
 
-function recordedCredentialRefs(automationCase: AutomationCaseRecord) {
-  const refs = new Set<string>();
-  for (const operation of automationCase.operations) {
-    let serialized = '';
-    try {
-      serialized = typeof operation.input === 'string'
-        ? operation.input
-        : JSON.stringify(operation.input ?? {});
-    } catch {
-      serialized = '';
-    }
-    for (const match of serialized.matchAll(/credential_[A-Za-z0-9_-]+_(?:username|password)/g)) {
-      refs.add(match[0]);
-    }
-  }
-  return Array.from(refs);
-}
-
 async function credentialContextForCase(automationCase: AutomationCaseRecord): Promise<AutomationCredentialContext> {
   const target = httpUrl(automationCase.targetUrl);
   const activeAccounts = (await listLoginAccounts({ userId: automationCase.userId }))
@@ -165,11 +147,6 @@ async function credentialContextForCase(automationCase: AutomationCaseRecord): P
     { ref: usernameRef, value: account.username, allowedOrigins },
     { ref: passwordRef, value: resolved.password, allowedOrigins },
   ];
-  for (const ref of recordedCredentialRefs(automationCase)) {
-    if (bindings.some((binding) => binding.ref === ref)) continue;
-    if (/_username$/i.test(ref)) bindings.push({ ref, value: account.username, allowedOrigins });
-    else if (/_password$/i.test(ref)) bindings.push({ ref, value: resolved.password, allowedOrigins });
-  }
   return {
     bindings,
     operationalContext: [
@@ -207,104 +184,6 @@ async function throwIfRunCannotContinue(
   }
 }
 
-async function captureAutomationStepEvidence(input: {
-  browser: BrowserSession;
-  runId: string;
-  stepNumber: number;
-  abortSignal?: AbortSignal;
-}): Promise<Pick<AutomationRunStepRecord, 'screenshotPath' | 'screenshotCapturedAt' | 'screenshotError'>> {
-  let screenshotError = '';
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    throwIfAborted(input.abortSignal);
-    try {
-      const screenshotPath = await input.browser.takeCurrentScreenshotOnly(
-        input.runId,
-        input.stepNumber,
-        `visual-${input.stepNumber}`,
-        { capture: 'viewport' },
-      );
-      return { screenshotPath, screenshotCapturedAt: now() };
-    } catch (error) {
-      screenshotError = errorMessage(error);
-      if (attempt === 0) await waitBeforeOperation(160, input.abortSignal);
-    }
-  }
-  return {
-    screenshotCapturedAt: now(),
-    screenshotError: screenshotError || 'Unable to capture the completed step.',
-  };
-}
-
-async function waitBeforeOperation(delayMs: unknown, signal?: AbortSignal) {
-  const milliseconds = typeof delayMs === 'number' && Number.isFinite(delayMs)
-    ? Math.max(0, Math.floor(delayMs))
-    : 0;
-  if (!milliseconds) return;
-  throwIfAborted(signal);
-  await new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-      reject(signal?.reason instanceof Error ? signal.reason : new Error('Automation run was cancelled.'));
-    };
-    const finish = () => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    };
-    const timer = setTimeout(finish, milliseconds);
-    signal?.addEventListener('abort', onAbort, { once: true });
-    if (!signal) return;
-    if (signal.aborted) {
-      clearTimeout(timer);
-      signal.removeEventListener('abort', onAbort);
-      reject(signal.reason instanceof Error ? signal.reason : new Error('Automation run was cancelled.'));
-    }
-  });
-}
-
-function operationDiagnostic(operation: AutomationOperationRecord) {
-  const result = typeof operation.recordedResult === 'string' ? operation.recordedResult.trim() : '';
-  return result || `The recorded ${operation.name} tool was not a successful fixed action.`;
-}
-
-function operationRepairInstruction(
-  automationCase: AutomationCaseRecord,
-  operation: AutomationOperationRecord,
-  fixedFailure: string,
-) {
-  const input = (() => {
-    try {
-      return JSON.stringify(operation.input ?? {}).slice(0, 6_000);
-    } catch {
-      return '[unserializable recorded input]';
-    }
-  })();
-  return [
-    '你正在修复一次无头自动化回放中的单个失败步骤。',
-    `完整用例目标：${automationCase.instruction}`,
-    `当前步骤：${operation.sourceStepAction || operation.reason || operation.name}`,
-    `步骤预期：${operation.sourceStepExpected || '达到该录制工具原本要实现的页面状态'}`,
-    `录制工具：${operation.name}`,
-    `录制输入：${input}`,
-    `固定回放失败证据：${fixedFailure}`,
-    '请先读取当前页面事实，使用任意必要浏览器工具修复并达到本步骤预期。不要重启浏览器；完成、失败或阻塞后明确报告状态。',
-  ].join('\n');
-}
-
-function finalVerificationInstruction(automationCase: AutomationCaseRecord, stepRecords: AutomationRunStepRecord[]) {
-  const failedSteps = stepRecords
-    .filter((step) => step.status === 'failed')
-    .map((step) => `- ${step.name}: ${step.actual}`)
-    .join('\n');
-  return [
-    '所有固定自动化步骤及其逐步修复均已执行完毕。现在必须进行最终验收，不可直接沿用历史结论。',
-    `完整用例目标：${automationCase.instruction}`,
-    `初始目标地址：${automationCase.targetUrl}`,
-    failedSteps ? `此前仍有失败记录：\n${failedSteps}` : '此前没有未修复的固定步骤失败记录。',
-    '请读取当前页面的最新事实，验证完整目标是否已经满足；如仍有缺口，立即使用浏览器工具补完。最后明确报告 passed、failed 或 blocked，并给出可追溯证据。',
-  ].join('\n\n');
-}
-
 async function persistRunProgress(
   run: AutomationRunRecord,
   steps: AutomationRunStepRecord[],
@@ -327,57 +206,19 @@ async function persistRunProgress(
   return transition.run;
 }
 
-async function runRepairAgent(input: {
-  automationCase: AutomationCaseRecord;
-  browser: BrowserSession;
-  runId: string;
-  instruction: string;
-  initialStepIndex: number;
-  credentialContext: AutomationCredentialContext;
-  abortSignal?: AbortSignal;
-}): Promise<InteractiveBrowserTurnResult> {
-  throwIfAborted(input.abortSignal);
-  return executeInteractiveBrowserTurn({
-    session: input.browser,
-    runId: input.runId,
-    initialStepIndex: input.initialStepIndex,
-    targetUrl: input.automationCase.targetUrl,
-    instruction: input.instruction,
-    operationalContext: input.credentialContext.operationalContext || undefined,
-    safetyMode: 'full',
-    abortSignal: input.abortSignal,
-    shouldContinue: () => !input.abortSignal?.aborted,
-    credentialBindings: input.credentialContext.bindings,
-    ensureBrowserStarted: async () => undefined,
-    allowedToolTypes: ['browser', 'finalResponse'],
-  });
-}
-
-async function repairFailedOperation(input: {
-  automationCase: AutomationCaseRecord;
-  browser: BrowserSession;
-  runId: string;
-  operation: AutomationOperationRecord;
-  fixedFailure: string;
-  initialStepIndex: number;
-  credentialContext: AutomationCredentialContext;
-  abortSignal?: AbortSignal;
-}) {
-  try {
-    const result = await runRepairAgent({
-      automationCase: input.automationCase,
-      browser: input.browser,
-      runId: input.runId,
-      instruction: operationRepairInstruction(input.automationCase, input.operation, input.fixedFailure),
-      initialStepIndex: input.initialStepIndex,
-      credentialContext: input.credentialContext,
-      abortSignal: input.abortSignal,
-    });
-    return { result };
-  } catch (error) {
-    if (input.abortSignal?.aborted) throw error;
-    return { error: errorMessage(error) };
-  }
+function agentStepRecord(step: StepExecutionResult, previous?: AutomationRunStepRecord): AutomationRunStepRecord {
+  const running = step.status === 'running' || step.status === 'queued';
+  return {
+    operationIndex: step.index,
+    name: step.action || 'AI 执行',
+    status: step.status === 'queued' ? 'running' : step.status,
+    actual: step.actual,
+    tools: step.tools,
+    screenshotPath: step.afterScreenshotPath || step.screenshotPath || step.visualContext?.current?.path,
+    startedAt: previous?.startedAt || now(),
+    finishedAt: running ? undefined : now(),
+    ...(step.status === 'failed' || step.status === 'blocked' ? { error: step.actual } : {}),
+  };
 }
 
 async function executeAutomationRunNow(runId: string, options: ExecuteAutomationRunOptions): Promise<AutomationRunRecord> {
@@ -394,7 +235,6 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
 
   const stepRecords: AutomationRunStepRecord[] = [];
   let browser: BrowserSession | undefined;
-  let aiStepIndex = 0;
   let run = claimedRun;
   const heartbeatIntervalMs = Math.max(5_000, Math.min(30_000, Math.floor(leaseTtlMs / 3)));
   const leaseHeartbeat = setInterval(async () => {
@@ -444,9 +284,11 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       status: 'running',
       steps: [],
       error: null,
+      output: '',
+      outputBlocks: [],
       startedAt: now(),
       finishedAt: null,
-      appendLog: [logEntry('info', 'Automation run started in a headless browser with the user browser profile.')],
+      appendLog: [logEntry('info', 'AI automation task started.')],
     };
     const runningTransition = await updateAutomationRunIfStatus(
       claimedRun.id,
@@ -473,207 +315,62 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       preferExistingPage: false,
       runId: run.id,
     });
-    await browser.start();
-    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-    if (automationCase.targetUrl && automationCase.targetUrl !== 'about:blank') {
-      let initialOpen: BrowserActionResult;
-      try {
-        initialOpen = await browser.open(automationCase.targetUrl);
-      } catch (error) {
-        if (options.abortSignal?.aborted) throw error;
-        initialOpen = { ok: false, actual: errorMessage(error) };
-      }
-      if (!initialOpen.ok) {
-        run = await persistRunProgress(
-          run,
-          stepRecords,
-          owner,
-          logEntry('warn', 'Initial target navigation did not pass; fixed operations and final Agent verification will continue.', initialOpen.actual),
-        );
-      }
-    }
-
-    const operations = [...automationCase.operations].sort((left, right) => left.index - right.index);
-    for (const operation of operations) {
-      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-      await waitBeforeOperation(operation.delayBeforeMs, options.abortSignal);
-      const startedAt = now();
-      let fixedResult: BrowserActionResult;
-      if (
-        operation.replayable === false
-        || operation.waitForManual === true
-        || (
-          operation.name === 'browser'
-          && operation.input
-          && typeof operation.input === 'object'
-          && !Array.isArray(operation.input)
-          && (operation.input as Record<string, unknown>).action === 'waitForHumanVerification'
-        )
-        || operation.recordedStatus === 'failed'
-        || operation.recordedStatus === 'cancelled'
-      ) {
-        fixedResult = { ok: false, actual: operationDiagnostic(operation) };
-      } else {
-        try {
-          fixedResult = await executeRecordedBrowserOperation(browser, operation, {
-            runId: run.id,
-            abortSignal: options.abortSignal,
-            credentialBindings: credentialContext.bindings,
-          });
-        } catch (error) {
-          if (options.abortSignal?.aborted) throw error;
-          fixedResult = { ok: false, actual: errorMessage(error) };
-        }
-      }
-
-      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-      if (fixedResult.ok) {
-        const evidence = await captureAutomationStepEvidence({
-          browser,
-          runId: run.id,
-          stepNumber: stepRecords.length + 1,
-          abortSignal: options.abortSignal,
-        });
-        stepRecords.push({
-          operationIndex: operation.index,
-          name: operation.name,
-          status: 'fixed',
-          actual: fixedResult.actual,
-          fixedResult: fixedResult.actual,
-          ...evidence,
-          startedAt,
-          finishedAt: now(),
-        });
-        run = await persistRunProgress(
-          run,
-          stepRecords,
-          owner,
-          logEntry(
-            evidence.screenshotPath ? 'info' : 'warn',
-            `Fixed operation ${operation.index} (${operation.name}) passed${evidence.screenshotPath ? ' with screenshot evidence' : ', but screenshot evidence failed'}.`,
-            evidence.screenshotPath || evidence.screenshotError,
-          ),
-        );
-        continue;
-      }
-
-      const repair = await repairFailedOperation({
-        automationCase,
-        browser,
-        runId: run.id,
-        operation,
-        fixedFailure: fixedResult.actual,
-        initialStepIndex: aiStepIndex,
-        credentialContext,
-        abortSignal: options.abortSignal,
-      });
-      await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-      const evidence = await captureAutomationStepEvidence({
-        browser,
-        runId: run.id,
-        stepNumber: stepRecords.length + 1,
-        abortSignal: options.abortSignal,
-      });
-      if (repair.result) {
-        const repairStepIndexes = repair.result.steps.map((step) => step.index);
-        if (repairStepIndexes.length) aiStepIndex = Math.max(aiStepIndex, ...repairStepIndexes);
-        const repaired = repair.result.status === 'passed';
-        stepRecords.push({
-          operationIndex: operation.index,
-          name: operation.name,
-          status: repaired ? 'repaired' : 'failed',
-          actual: repair.result.reply || fixedResult.actual,
-          fixedResult: fixedResult.actual,
-          repairSteps: repair.result.newSteps,
-          ...evidence,
-          ...(repaired ? {} : { error: `Repair Agent ended with ${repair.result.status}.` }),
-          startedAt,
-          finishedAt: now(),
-        });
-      } else {
-        stepRecords.push({
-          operationIndex: operation.index,
-          name: operation.name,
-          status: 'failed',
-          actual: repair.error || fixedResult.actual,
-          fixedResult: fixedResult.actual,
-          ...evidence,
-          error: repair.error || 'Repair Agent failed.',
-          startedAt,
-          finishedAt: now(),
-        });
-      }
-      run = await persistRunProgress(
-        run,
-        stepRecords,
-        owner,
-        logEntry(
-          stepRecords.at(-1)?.status === 'repaired' ? 'info' : 'warn',
-          `Fixed operation ${operation.index} (${operation.name}) failed and the mandatory repair Agent completed${evidence.screenshotPath ? ' with screenshot evidence' : ', but screenshot evidence failed'}.`,
-          {
-            actual: stepRecords.at(-1)?.actual,
-            screenshot: evidence.screenshotPath || evidence.screenshotError,
-          },
-        ),
-      );
-    }
-
-    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-    let verification: InteractiveBrowserTurnResult | undefined;
-    let verificationError = '';
-    const verificationStartedAt = now();
-    try {
-      verification = await runRepairAgent({
-        automationCase,
-        browser,
-        runId: run.id,
-        instruction: finalVerificationInstruction(automationCase, stepRecords),
-        initialStepIndex: aiStepIndex,
-        credentialContext,
-        abortSignal: options.abortSignal,
-      });
-    } catch (error) {
-      if (options.abortSignal?.aborted) throw error;
-      verificationError = errorMessage(error);
-    }
-
-    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
-    const verificationEvidence = await captureAutomationStepEvidence({
-      browser,
+    const taskInstruction = automationTaskInstruction(automationCase);
+    const knowledge = createRuntimeKnowledgeResolver({
+      scopeId: run.id,
+      query: taskInstruction,
+      selectedSkillIds: [],
+      getState: () => undefined,
+      saveState: () => undefined,
+      revisions: (domain) => readRuntimeKnowledgeRevisions(run.userId, domain),
+      listSkills: () => readRuntimeSkillCatalog(run.userId),
+      getSkill: (id) => store.getSkill(id, run.userId),
+      searchMemory: async () => [],
+      formatMemory: () => '',
+    });
+    const activeBrowser = browser;
+    let browserStart: Promise<unknown> | undefined;
+    let progressQueue = Promise.resolve();
+    const result = await executeInteractiveBrowserTurn({
+      session: activeBrowser,
       runId: run.id,
-      stepNumber: stepRecords.length + 1,
+      userId: run.userId,
+      targetUrl: automationCase.targetUrl,
+      instruction: taskInstruction,
+      safetyMode: 'full',
       abortSignal: options.abortSignal,
+      shouldContinue: () => !options.abortSignal?.aborted,
+      credentialBindings: credentialContext.bindings,
+      ensureBrowserStarted: async () => { await (browserStart ??= activeBrowser.start()); },
+      readSkill: knowledge.readSkill,
+      getRuntimeOperationalContext: async () => ({
+        operationalContext: credentialContext.operationalContext,
+        credentialBindings: credentialContext.bindings,
+        knowledge: await knowledge.refresh(httpUrl(automationCase.targetUrl)?.hostname || ''),
+        onKnowledgeSelected: knowledge.markSelected,
+      }),
+      onProgress: (step) => {
+        progressQueue = progressQueue.then(async () => {
+          await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
+          const index = stepRecords.findIndex((record) => record.operationIndex === step.index);
+          const record = agentStepRecord(step, index < 0 ? undefined : stepRecords[index]);
+          if (index < 0) stepRecords.push(record);
+          else stepRecords[index] = record;
+          run = await persistRunProgress(run, stepRecords, owner);
+        });
+        return progressQueue;
+      },
     });
-
-    const finalStatus = verification?.status === 'passed'
-      ? 'passed'
-      : verification?.status === 'blocked'
-        ? 'blocked'
-        : 'failed';
-    stepRecords.push({
-      operationIndex: operations.length + 1,
-      name: 'finalVerification',
-      status: finalStatus === 'passed' ? 'repaired' : 'failed',
-      actual: verification?.reply || verificationError || 'Final verification failed without a result.',
-      repairSteps: verification?.newSteps,
-      ...verificationEvidence,
-      ...(finalStatus === 'passed' ? {} : { error: verificationError || `Final Agent ended with ${verification?.status || 'failed'}.` }),
-      startedAt: verificationStartedAt,
-      finishedAt: now(),
-    });
+    await progressQueue;
+    await throwIfRunCannotContinue(run.id, run.userId, owner, options.abortSignal);
     const completedPatch: UpdateAutomationRunInput = {
-      status: finalStatus,
+      status: result.status,
       steps: stepRecords,
-      error: finalStatus === 'passed' ? null : stepRecords.at(-1)?.error || stepRecords.at(-1)?.actual,
+      output: result.reply,
+      outputBlocks: result.blocks,
+      error: result.status === 'passed' ? null : result.reply || 'AI task did not complete.',
       finishedAt: now(),
-      appendLog: [logEntry(
-        finalStatus === 'passed' ? 'info' : 'error',
-        `Mandatory final Agent verification ended with ${finalStatus}${verificationEvidence.screenshotPath ? ' with screenshot evidence' : ', but screenshot evidence failed'}.`,
-        {
-          actual: stepRecords.at(-1)?.actual,
-          screenshot: verificationEvidence.screenshotPath || verificationEvidence.screenshotError,
-        },
-      )],
+      appendLog: [logEntry(result.status === 'passed' ? 'info' : 'warn', `AI task finished with ${result.status}.`)],
     };
     const completion = await updateAutomationRunIfStatus(
       run.id,
@@ -682,7 +379,7 @@ async function executeAutomationRunNow(runId: string, options: ExecuteAutomation
       run.userId,
       owner,
     );
-    if (!completion) throw new Error('Automation run disappeared while saving the final verification.');
+    if (!completion) throw new Error('Automation run disappeared while saving the task result.');
     run = completion.run;
     if (!completion.updated && run.status === 'cancelled') {
       throw new AutomationRunCancelledError();

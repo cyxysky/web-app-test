@@ -30,7 +30,7 @@ export async function GET(request: NextRequest, context: RouteContext) {
     if (!await getBrowserChatSession(sessionId, userId)) {
       throw new ApiRequestError('Browser chat session not found', { code: 'not_found', status: 404 });
     }
-    return apiJson(request, { cases: listAutomationCases({ userId, sourceSessionId: sessionId }) });
+    return apiJson(request, { cases: await listAutomationCases({ userId, sourceSessionId: sessionId }) });
   } catch (error) {
     return apiError(request, error, { fallback: 'Failed to read automation cases' });
   }

@@ -280,6 +280,7 @@ export class CapabilitySkillCatalog {
 }
 
 export type MountCapabilitiesOptions = {
+  onDisposeError?: (error: AggregateError) => void;
   providers: readonly CapabilityProvider[];
   context: Omit<CapabilityRunContext, 'configuration'> & { configuration?: CapabilityConfiguration };
   configStore?: CapabilityConfigStore;
@@ -313,6 +314,7 @@ export async function mountCapabilities(
   }));
   const configurations = Object.freeze(Object.fromEntries(entries));
   const snapshot = await registry.resolve({
+    onDisposeError: options.onDisposeError,
     context: options.context,
     configurations,
     enabledCapabilityIds: options.enabledCapabilityIds,

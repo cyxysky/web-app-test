@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { assembleRuntimeContext, createRuntimeContextReadTool, contextReadToolName, deriveRuntimeTaskState, runtimeContextMessageRef, RuntimeContextBudgetError, type RuntimeContextManifest, type RuntimeTaskState } from './runtime-context-assembler';
+import { runtimeKnowledgeMessage, type RuntimeKnowledgeBlock } from './runtime-knowledge-context';
 import { generateText, hasToolCall, parsePartialJson, streamText, ToolLoopAgent, tool, type ModelMessage, type StopCondition, type ToolCallRepairFunction, type ToolSet } from 'ai';
 import { z } from 'zod';
 import { jsonRecordFromUnknown, type CapabilityProgressEvent } from '@webpilot/capability-sdk';
@@ -38,6 +40,8 @@ import {
   hiddenRuntimeSkillIdsInModelContext,
   runtimeToolTypesWithLoadedSkills,
 } from './hidden-runtime-skills';
+import { summarizeSemanticRecords } from './runtime-semantic-summary';
+import { runtimeSummaryRecord } from './runtime-context-materials';
 import { subagentRuntimeSkillId } from './subagent-runtime-skill';
 import { chartRuntimeSkillId } from '@webpilot/capability-chart/runtime-skill';
 import {
@@ -64,7 +68,6 @@ import { repairFileArtifactDownloadLinks } from '@/server/capabilities/browser-c
 import { browserChatCodeRules } from './runtime-prompt-rules';
 import {
   appendRuntimePromptCacheMetadata,
-  isRuntimePromptCacheMetadataMessage,
   runtimeCurrentTimeMarker,
   runtimeOperationalContextMarker,
   withoutRuntimePromptCacheMetadata,
@@ -104,27 +107,20 @@ import { withToolFailureGuidance } from './runtime-tool-failure-guidance';
 import {
   estimateRuntimeMessageContext,
   estimateRuntimeTextTokens,
-  runtimeContextCompressionTargetCeilingRatio,
-  runtimeContextCompressionTargetFloorRatio,
-  runtimeContextCompressionThresholdRatio,
-  runtimeContextWindowTokens,
+  runtimeContextProfile,
 } from './runtime-context-budget';
 import {
   appendTerminalBrowserChatTurn,
+  serializableBrowserChatModelMessages,
   type BrowserChatModelContextCompression,
 } from './browser-chat-model-context';
 import {
   atomicRuntimeModelMessageBlocks,
-  buildRuntimeContinuationSummaryPrompt,
   completeRuntimeModelToolChain,
   ensureRuntimeContinuationSummaryMessage,
   fallbackRuntimeContinuationSummary,
-  mergeRuntimeModelMessageChain,
-  normalizeRuntimeContinuationSummary,
   omitRuntimeModelToolExchange,
   sanitizeRuntimeContinuationSummary,
-  selectRecentRuntimeMessageBlocks,
-  runtimeContinuationDirectiveMarker,
   runtimeContinuationSummaryMarker,
 } from './runtime-context-compression';
 import {
@@ -230,6 +226,8 @@ type BrowserChatRuntimeRecord = {
 type BrowserChatOperationalContext = {
   operationalContext: string;
   credentialBindings?: BrowserCodeCredentialBinding[];
+  knowledge?: RuntimeKnowledgeBlock[];
+  onKnowledgeSelected?: (entries: NonNullable<RuntimeContextManifest['knowledge']>) => Promise<void>;
 };
 
 type BrowserAgentRuntimeContext = {
@@ -913,7 +911,7 @@ function continuationRuntimeStateFromTraces(traces: ToolTrace[]) {
 
 
 function imageTokenEstimatePerImage() {
-  return Math.max(0, Number(process.env.AI_IMAGE_CONTEXT_ESTIMATE_TOKENS || 1200));
+  return runtimeContextProfile(getModelSettings()).imageTokens;
 }
 
 function sanitizeHistoricalToolText(value: unknown, max = 180) {
@@ -1351,7 +1349,7 @@ async function makeBrowserTools(
     runSubagents?: BrowserChatSubagentRunner;
     readSubagent?: BrowserChatSubagentReader;
     requiredSubagentUuid?: string;
-    readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+    readFile?: (input: BrowserChatReadFileInput, context?: import('@webpilot/capability-sdk').CapabilityExecutionContext) => Promise<BrowserActionResult>;
     readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
     readSkill?: BrowserChatReadSkill;
     onReferenceImage?: (input: { path: string; source: string; label?: string }) => void;
@@ -1371,7 +1369,6 @@ async function makeBrowserTools(
   let toolExecutionQueue = Promise.resolve();
   const activeConcurrentDownloads = new Set<Promise<BrowserActionResult>>();
   const loadedHiddenRuntimeSkillIds = referenceOptions?.loadedHiddenRuntimeSkillIds || new Set<string>();
-  for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
   const toolTextRule = 'Do not include old tool params, candidate ids as business meaning, coordinates, screenshot ids/file names, or tool input JSON.';
   const toolReasonInput = z.string().min(1).max(300).describe(`Required: concise Chinese reason for this exact tool call. Name the visible target and expected page change; do not merely repeat a candidate ID. ${toolTextRule}`);
   const toolContextShape = {
@@ -1510,6 +1507,10 @@ async function makeBrowserTools(
       pending.finally(() => activeConcurrentDownloads.delete(pending)).catch(() => undefined);
       return pending;
     }
+    // Code Sandbox has its own bounded concurrency in the selected backend.
+    // Keep independent computations from being serialized behind browser/file
+    // operations so parallel tool calls can reach that limit as intended.
+    if (name === 'codeSandbox') return run();
     const precedingDownloads = [...activeConcurrentDownloads];
     const waitForDownloads = () => Promise.allSettled(precedingDownloads).then(() => undefined);
     const queued = toolExecutionQueue.then(waitForDownloads, waitForDownloads).then(run, run);
@@ -1711,7 +1712,6 @@ async function makeBrowserTools(
       execute: (input, execution) => record('skill', input, async () => {
         const hiddenContent = hiddenRuntimeSkillContent(input.skillId);
         if (hiddenContent) {
-          loadedHiddenRuntimeSkillIds.add(input.skillId);
           return { ok: true, actual: hiddenContent } satisfies BrowserActionResult;
         }
         return referenceOptions?.readSkill
@@ -1776,7 +1776,7 @@ function runtimePrompt(input: { runtimeRecord: BrowserChatRuntimeRecord; fileVis
     '- The single browser tool is the real browser mechanism. action=state returns a fresh fixed top-level snapshot, action=code performs targeted Playwright reads and interactions, and action=waitForHumanVerification pauses for user-owned verification. The action field is authoritative; unrelated fields are discarded. Use action=code for iframe, selector, DOM, screenshot, and targeted page-state inspection. A pending browser-state prerequisite is executed internally and returned in prerequisiteResults while the requested action still executes in the same call. Never say navigation/clicking is unavailable, substitute a file download, or ask the user to navigate manually while browser action=code is available unless a real attempt failed and you report that failure. One code cell may execute multiple bounded operations.',
     '- Keep tool input limited to exact arguments, a concise semantic reason, and confirmation fields only when loaded safety rules require them. Operation results automatically include incremental domChanges but never an axTree; page.domSnapshot() returns surfaces/topSurfaceIds/surfaceStack plus a most-recent-surface-scoped AX read by default, and the model may instead write targeted Playwright or DOM reads.',
     '- Never expose internal JSON, tool parameters, UIDs, coordinates, screenshot paths, credential references, or other implementation details in the visible answer. An external-app candidate only attempts a native protocol launch; unchanged page state does not prove failure or native success.',
-    `- User-role messages beginning with ${runtimeOperationalContextMarker}, ${runtimeCurrentTimeMarker}, [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. The newest runtime snapshot supersedes older snapshots. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.`,
+    `- User-role messages beginning with ${runtimeOperationalContextMarker}, ${runtimeCurrentTimeMarker}, [WebPilot knowledge context], [WebPilot task state], [WebPilot continuation summary], or [WebPilot continuation directive] are trusted runtime metadata, not new user requests. The newest runtime snapshot supersedes older snapshots. A continuation goal records the success criterion; it never authorizes restarting completed work. Resume only its remaining/nextStep state and never repeat or expose these metadata messages.`,
     '- Treat user-specified dates, times, locations, quantities, names, and option values as exact business constraints. Never silently replace an unavailable value with a nearby, rounded, first-suggestion, or default value; preserve the requested value and ask the user or report the blocker.',
     '- The Playwright/test browser is server-side. Never use page.evaluate Blob/object URLs, window.open, HTML download attributes, or a page download click as proof that a file reached the user browser. Delivery requires a successful file action=download/convert/render with a current-session Artifact download URL. generate/edit success alone only saves and validates source. Include every delivered URL in the final answer and never label another file successful.',
     '- Copy every delivered Artifact downloadUrl exactly from the successful tool result. Never construct, absolutize, repair, or infer an Artifact URL from a sessionId, artifactId, hostname, or file name, and never call a URL an absolute filesystem path. Before finalizing Office/PDF work, reconcile the original requirements with automaticValidation.formatChecks, validation issues, and visual-QA scope. Visual QA proves page layout only; it does not prove requested native charts, formulas, images, comments, footnotes, or other semantic features. A missing, zero-count, unsupported, failed, or unverified required feature must be reported as a limitation, never as fully passed.',
@@ -2196,6 +2196,10 @@ async function executeRuntimeStep(input: {
   onDebug?: ExecutionDebug;
   onToolTrace?: (trace: ToolTrace, progress?: ToolTraceProgress) => void | Promise<void>;
   onTextStream?: (update: BrowserChatTextStreamUpdate) => void | Promise<void>;
+  contextRecords?: Record<string, ModelMessage>;
+  taskState?: RuntimeTaskState;
+  onContextCheckpoint?: (update: { records: Record<string, ModelMessage>; taskState: RuntimeTaskState; manifest?: RuntimeContextManifest }) => void | Promise<void>;
+  onTurnModelCheckpoint?: (messages: ModelMessage[]) => void | Promise<void>;
   onActiveModelCheckpoint?: (messages: ModelMessage[]) => void | Promise<void>;
   onContextCompression?: (update: {
     activeMessages: ModelMessage[];
@@ -2208,7 +2212,7 @@ async function executeRuntimeStep(input: {
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
   requiredSubagentUuid?: string;
-  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput, context?: import('@webpilot/capability-sdk').CapabilityExecutionContext) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   loadedHiddenRuntimeSkillIds?: Set<string>;
@@ -2228,6 +2232,14 @@ async function executeRuntimeStep(input: {
     onToolTrace,
     onTextStream,
   } = input;
+  const contextRecords = { ...input.contextRecords };
+  let taskState = input.taskState;
+  async function checkpointContext(messages: ModelMessage[], manifest?: RuntimeContextManifest) {
+    for (const message of serializableBrowserChatModelMessages(messages)) contextRecords[runtimeContextMessageRef(message)] = message;
+    if (!manifest) taskState = deriveRuntimeTaskState(messages, taskState);
+    taskState ||= deriveRuntimeTaskState([]);
+    await input.onContextCheckpoint?.({ records: contextRecords, taskState, manifest });
+  }
   const imageInputAvailable = modelSupportsImageInput();
   const markerEnabled = false;
   const loadedHiddenRuntimeSkillIds = input.loadedHiddenRuntimeSkillIds || new Set<string>();
@@ -2263,6 +2275,8 @@ async function executeRuntimeStep(input: {
   const prompt = runtimePrompt({ runtimeRecord, fileVisualAvailable: Boolean(input.readFileVisuals) });
   const runtimeTimeLine = currentRuntimeTimePromptLine();
   let activeOperationalContext = input.operationalContext || '';
+  let activeKnowledge: RuntimeKnowledgeBlock[] = [];
+  let onKnowledgeSelected: BrowserChatOperationalContext['onKnowledgeSelected'];
   let activeCredentialBindings = input.credentialBindings || [];
   const promptMs = elapsedSince(promptStartedAt);
   await onDebug?.({
@@ -2285,6 +2299,7 @@ async function executeRuntimeStep(input: {
   let consecutiveRequestFailures = 0;
   let privateToolProtocolFailures = 0;
   const durableTraces: ToolTrace[] = [];
+  let durableTurnMessages: ModelMessage[] = [];
 
   function rememberRetryState(state: RuntimeRetryState) {
     lastRetryState = cloneRuntimeRetryState(state);
@@ -2313,7 +2328,7 @@ async function executeRuntimeStep(input: {
     const traces: ToolTrace[] = [...durableTraces];
     const codexMode = isCodexProvider();
     const retryAgentStepOffset = retryState?.agentStepOffset || 0;
-    const externalTools = codexMode ? {} : (input.memoryTools || {});
+    const externalTools: ToolSet = codexMode ? {} : { ...input.memoryTools, [contextReadToolName]: createRuntimeContextReadTool(() => contextRecords) };
     const externalToolNames = new Set(Object.keys(externalTools));
     const availableRuntimeToolNames = [...runtimeToolNames(), ...externalToolNames].filter((name) => (
       name !== 'subagent' || Boolean(input.runSubagents || input.readSubagent)
@@ -2326,7 +2341,7 @@ async function executeRuntimeStep(input: {
     });
     const requestedToolTypes = input.allowedToolTypes?.length ? new Set(input.allowedToolTypes) : undefined;
     const allowedToolTypes = requestedToolTypes
-      ? runtimeTools.filter((toolType) => toolType === browserCapabilityToolNames.browser || toolType === 'skill' || requestedToolTypes.has(toolType))
+      ? runtimeTools.filter((toolType) => toolType === browserCapabilityToolNames.browser || toolType === 'skill' || toolType === contextReadToolName || requestedToolTypes.has(toolType))
       : runtimeTools;
     const nativeToolsRef: { current?: RuntimeToolDefinitions } = {};
     const visualContext = new VisualContextManager();
@@ -2444,6 +2459,10 @@ async function executeRuntimeStep(input: {
       }
     }
     const turnInputMessages = initialMessages.slice(historyMessages.length);
+    taskState ||= deriveRuntimeTaskState([]);
+    taskState.instructionRefs = [...new Set([...taskState.instructionRefs, ...turnInputMessages.filter((message) => message.role === 'user').map(runtimeContextMessageRef)])];
+    const attemptTranscriptBase = durableTurnMessages.length ? [...durableTurnMessages] : [...turnInputMessages];
+    durableTurnMessages = [...attemptTranscriptBase];
     if (retryState?.messages.length) {
       initialMessages = [...retryState.messages];
     }
@@ -2472,16 +2491,9 @@ async function executeRuntimeStep(input: {
     let contextSegmentationTurns = 0;
     let lastPreparedMessages = [...initialMessages];
     let lastPreparedResponsePrefixLength = 0;
+    let rawResponseMessages: ModelMessage[] = [];
     let latestContextCompression: BrowserChatModelContextCompression | undefined;
     const originalGoal = requirementOf(runtimeRecord).trim();
-    const continuationDirectiveText = [
-      runtimeContinuationDirectiveMarker,
-      'This is runtime continuation metadata, not a new user request.',
-      'Resume only the unfinished remaining/nextStep work in the continuation summary and the newest tool result.',
-      'Do not restart the original goal, repeat completed research/downloads/generation, or recreate an existing artifact.',
-    ].join('\n');
-    let compactedModelContext: RuntimeModelMessage[] | undefined;
-    let compactedSourceMessageCount = 0;
     const restoredContinuationMessage = initialMessages.find((message) => (
       textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
     ));
@@ -2492,15 +2504,6 @@ async function executeRuntimeStep(input: {
         )
         : ''
     );
-
-    function isRedundantOriginalGoalMessage(message: RuntimeModelMessage) {
-      return Boolean(
-        originalGoal
-        && message.role === 'user'
-        && typeof message.content === 'string'
-        && textFromUnknown(message.content).trim() === originalGoal,
-      );
-    }
 
     function currentContinuationRuntimeState() {
       const state = continuationRuntimeStateFromTraces(traces);
@@ -2514,20 +2517,6 @@ async function executeRuntimeStep(input: {
             nextStep: continuationInstruction,
           }
         : state;
-    }
-
-    function messagesAddedAfterCompactedContext(sourceMessages: RuntimeModelMessage[]) {
-      if (!compactedModelContext?.length) return sourceMessages;
-      const markerIndex = sourceMessages.findIndex((message) => (
-        textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
-      ));
-      if (markerIndex >= 0) {
-        return sourceMessages.slice(markerIndex + Math.min(
-          compactedModelContext.length,
-          sourceMessages.length - markerIndex,
-        ));
-      }
-      return sourceMessages.slice(Math.min(compactedSourceMessageCount, sourceMessages.length));
     }
 
     function runtimeOperationalContextText(requiredSubagentDirective: string) {
@@ -2546,76 +2535,43 @@ async function executeRuntimeStep(input: {
     }
 
     const summarizeContinuation = async (
-      deltaModelMessages: unknown,
-      turnIndex: number,
-      estimatedTokens: number,
-      thresholdTokens: number,
+      assembled: ReturnType<typeof assembleRuntimeContext>,
       maximumSummaryInputTokens: number,
-      maxOutputTokens: number,
     ) => {
       ensureActive();
-      const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const startedAt = Date.now();
-      const fallback = () => fallbackRuntimeContinuationSummary({
-        goal: originalGoal,
-        stepIndex,
-        agentStep: agentStepIndex,
-        previousSummary: continuationSummaryText,
-        recentToolAttempts: formatCurrentToolAttemptSummary(traces, 5),
-        runtimeState: currentContinuationRuntimeState(),
-      });
-      // Never ask the same model to summarize an input already beyond its
-      // measured safe request size. That merely turns compression into one
-      // more full request timeout. The deterministic runtime-state summary is
-      // enough to recover an existing oversized session; future GLM sessions
-      // compress earlier and use the model-authored summary path normally.
-      if (estimatedTokens > maximumSummaryInputTokens) {
-        return { summary: fallback(), elapsedMs: Date.now() - startedAt, fallback: true };
-      }
+      const records = new Map(assembled.summaryRecords.map((record) => [record.ref, record]));
+      const groups = atomicRuntimeModelMessageBlocks(assembled.summaryMessages).map((block) => block.map((message) => records.get(runtimeContextMessageRef(message))!));
       try {
-        const result = await generateText({
-          model: getModel(),
-          messages: [{
-            role: 'user' as const,
-            content: buildRuntimeContinuationSummaryPrompt({
-              goal: originalGoal,
-              stepIndex,
-              agentStep: agentStepIndex,
-              estimatedTokens,
-              thresholdTokens,
-              previousSummary: continuationSummaryText,
-              deltaModelMessages,
-              runtimeState: currentContinuationRuntimeState(),
-            }),
-          }],
-          temperature: 0.1,
-          reasoning: aiReasoningEffort(),
-          maxOutputTokens,
-          maxRetries: 0,
-          abortSignal,
-          timeout: runtimeRequestTimeoutMs,
-          telemetry: aiTelemetry('browser-chat-continuation-summary'),
+        const result = await summarizeSemanticRecords({ groups, previousSummary: continuationSummaryText,
+          runtimeState: runtimeSummaryRecord({ role: 'user', content: JSON.stringify(currentContinuationRuntimeState()) }, 'runtime-state', []),
+          allowedRefs: new Set(Object.keys(contextRecords)), instructionRefs: new Set(assembled.taskState.instructionRefs),
+          maximumInputTokens: maximumSummaryInputTokens,
+          generate: async (content) => {
+            ensureActive();
+            const result = await generateText({ model: getModel(), messages: [{ role: 'user', content }],
+              temperature: 0.1, reasoning: aiReasoningEffort(), maxOutputTokens: 8192, maxRetries: 0,
+              abortSignal, timeout: runtimeRequestTimeoutMs, telemetry: aiTelemetry('browser-chat-continuation-summary') });
+            ensureActive();
+            return result.text || '';
+          },
         });
-        ensureActive();
-        const text = normalizeRuntimeContinuationSummary({
-          candidate: result.text || '',
-          goal: originalGoal,
-          previousSummary: continuationSummaryText,
-          runtimeState: currentContinuationRuntimeState(),
-        });
-        return { summary: text || fallback(), elapsedMs: Date.now() - startedAt, fallback: !text };
+        return { ...result, elapsedMs: Date.now() - startedAt };
       } catch (error) {
         if (isBrowserChatAbortError(error, abortSignal)) throw browserChatAbortError(abortSignal);
-        return { summary: fallback(), elapsedMs: Date.now() - startedAt, fallback: true };
+        return { summary: continuationSummaryText, summarizedRefs: [] as string[], elapsedMs: Date.now() - startedAt, incomplete: true, reason: 'Summary request failed; original instructions retained.' };
       }
     };
 
     async function prepareStep(turnIndex: number, previousMessages?: RuntimeModelMessage[]) {
       ensureActive();
-      // Promote successful reads only at the next model-step boundary. A model
-      // cannot bypass the gate by emitting skill and a governed tool together.
-      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) {
-        loadedHiddenRuntimeSkillIds.add(skillId);
+      // Visibility is a property of the request, not a lifetime read receipt.
+      if (codexMode) {
+        for (const id of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(id);
+      } else {
+        loadedHiddenRuntimeSkillIds.clear();
+        const unavailable = new Set([...(taskState?.archivedRefs || []), ...(taskState?.compactedRefs || [])]);
+        for (const id of hiddenRuntimeSkillIdsInModelContext((previousMessages || initialMessages).filter((message) => !unavailable.has(runtimeContextMessageRef(message))))) loadedHiddenRuntimeSkillIds.add(id);
       }
       if (input.getRuntimeOperationalContext) {
         try {
@@ -2623,6 +2579,9 @@ async function executeRuntimeStep(input: {
           ensureActive();
           activeOperationalContext = runtimeContext.operationalContext;
           activeCredentialBindings = runtimeContext.credentialBindings || [];
+          activeKnowledge = runtimeContext.knowledge || [];
+          onKnowledgeSelected = runtimeContext.onKnowledgeSelected;
+          await checkpointContext(activeKnowledge.map(runtimeKnowledgeMessage));
         } catch (error) {
           await onAttemptDebug?.({
             phase: 'runtime-context:refresh:error',
@@ -2630,6 +2589,7 @@ async function executeRuntimeStep(input: {
             message: `Unable to rebuild runtime context for the current page: ${infrastructureError(error)}`,
             details: serializeError(error),
           });
+          throw error;
         }
       }
       const pendingSubagentUuids = pendingSubagentUuidsFromTraces(traces);
@@ -2641,12 +2601,17 @@ async function executeRuntimeStep(input: {
       const stepAllowedToolTypes = runtimeToolTypesWithLoadedSkills(allowedToolTypes, loadedHiddenRuntimeSkillIds, {
         allowSubagentRead: Boolean(requiredSubagentUuid),
       });
+      const availableStepNames = browserStateGatePending || stepAllowedToolTypes.length !== allowedToolTypes.length
+        ? stepAllowedToolTypes : requiredSubagentUuid ? ['subagent'] : Object.keys(nativeToolsRef.current || {});
+      const stepTools = codexMode ? undefined : Object.fromEntries(Object.entries(nativeToolsRef.current || {})
+        .filter(([name]) => availableStepNames.includes(name)).sort(([left], [right]) => left.localeCompare(right)));
       const baseSystemPrompt = codexMode ? buildCodexObjectPrompt(prompt, stepAllowedToolTypes) : prompt;
       const agentStepIndex = retryAgentStepOffset + turnIndex + 1;
       const activeModelSettings = getModelSettings();
-      const windowTokens = runtimeContextWindowTokens(activeModelSettings);
-      const thresholdRatio = runtimeContextCompressionThresholdRatio(activeModelSettings);
-      const thresholdTokens = Math.floor(windowTokens * thresholdRatio);
+      const contextProfile = runtimeContextProfile(activeModelSettings);
+      const windowTokens = contextProfile.windowTokens;
+      const thresholdRatio = contextProfile.inputBudgetTokens / windowTokens;
+      const thresholdTokens = contextProfile.inputBudgetTokens;
       const appendedMessages: RuntimeModelMessage[] = [];
       const appendedImagePaths: string[] = [];
       while (pendingObservationMessages.length) {
@@ -2694,248 +2659,110 @@ async function executeRuntimeStep(input: {
           ? [...(retryState?.imagePaths || [])]
           : [...initialUserReferenceImagePaths];
       }
-      lastPreparedResponsePrefixLength = previousMessages?.length
-        ? Math.max(0, sourceMessages.length - initialMessages.length)
-        : 0;
-      let unsummarizedMessages = compactedModelContext?.length
-        ? messagesAddedAfterCompactedContext(sourceMessages)
-        : sourceMessages;
-      let messagesToSend = compactedModelContext?.length
-        ? [...compactedModelContext, ...unsummarizedMessages]
-        : unsummarizedMessages;
-      if (appendedMessages.length) {
-        messagesToSend = [...messagesToSend, ...appendedMessages];
-        unsummarizedMessages = [...unsummarizedMessages, ...appendedMessages];
-        messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
-      }
-
+      // Input is initialMessages + the SDK's explicit responseMessages, not the SDK's
+      // already projected messages. No marker search, overlap matching or source-count inference.
+      const candidates = [...sourceMessages, ...appendedMessages];
+      if (appendedMessages.length) messageImagePaths = [...messageImagePaths, ...appendedImagePaths];
+      await checkpointContext(candidates);
       const operationalContext = runtimeOperationalContextText(requiredSubagentDirective);
       requestSystemPrompt = baseSystemPrompt;
-      const runtimeMetadata = appendRuntimePromptCacheMetadata({
-        messages: withoutRuntimePromptCacheMetadata(messagesToSend),
-        operationalContext,
-        currentTimeLine: runtimeTimeLine,
+      const runtimeMetadata = appendRuntimePromptCacheMetadata({ messages: [], operationalContext, currentTimeLine: runtimeTimeLine });
+      const baseStats = modelMessagesTextAndImageStats(
+        sanitizeModelInputForStats(requestSystemPrompt, runtimeMetadata.metadataMessages, []),
+        stepTools,
+      );
+      const beforeStats = modelMessagesTextAndImageStats(
+        sanitizeModelInputForStats(requestSystemPrompt, [...candidates, ...runtimeMetadata.metadataMessages], messageImagePaths),
+        stepTools,
+      );
+      await attachContextAfterToCompletedTools(toolContextFromStats(beforeStats));
+      const assemble = (summary: string, planning = false, forceCompaction = false) => assembleRuntimeContext({
+        messages: candidates, records: contextRecords, previousState: taskState,
+        inputBudgetTokens: thresholdTokens, baseTokens: baseStats.estimatedTotalTokens + 1024,
+        estimateMessages: (messages) => modelMessagesTextAndImageStats(sanitizeModelInputForStats('', messages, []), undefined).estimatedTotalTokens,
+        continuationSummary: summary, allowArchival: !codexMode,
+        knowledge: activeKnowledge,
+        compressionTriggerTokens: contextProfile.compressionTriggerTokens,
+        compressionTargetTokens: contextProfile.compressionTargetTokens,
+        planning, forceCompaction,
       });
-      messagesToSend = runtimeMetadata.messages;
-      messagesToSend = completeRuntimeModelToolChain(messagesToSend);
-      let requestMessages = [...messagesToSend];
-      let attachedImagePaths = [...messageImagePaths];
-      let modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
+      let assembled = assemble(continuationSummaryText, true);
       let modelContextSegmentation: Record<string, unknown> | undefined;
-      const modelInputForStats = sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths);
-      const messageStats = modelMessagesTextAndImageStats(modelInputForStats, codexMode ? undefined : nativeToolsRef.current);
-      // Attribute the complete would-be next model input to the tool before a
-      // possible compression changes it. The compression trace below records
-      // that separate decrease, so it is never charged to the preceding tool.
-      await attachContextAfterToCompletedTools(toolContextFromStats(messageStats));
-      if ((previousMessages?.length || messagesToSend.length > 1) && messageStats.estimatedTotalTokens > thresholdTokens) {
-        const targetFloorTokens = Math.floor(windowTokens * runtimeContextCompressionTargetFloorRatio());
-        const targetCeilingTokens = Math.floor(windowTokens * runtimeContextCompressionTargetCeilingRatio());
-        const baseStats = modelMessagesTextAndImageStats(
-          sanitizeModelInputForStats(requestSystemPrompt, runtimeMetadata.metadataMessages, []),
-          codexMode ? undefined : nativeToolsRef.current,
-        );
-        const summarySourceMessages = messagesToSend.filter((message) => (
-          !isRuntimePromptCacheMetadataMessage(message)
-          &&
-          !textFromUnknown(message.content).startsWith(runtimeContinuationSummaryMarker)
-          && !isRedundantOriginalGoalMessage(message)
-        ));
-        const blocks = atomicRuntimeModelMessageBlocks(summarySourceMessages);
-        const rawTailBudget = Math.max(0, targetFloorTokens - baseStats.estimatedTotalTokens);
-        const selectedBlocks = selectRecentRuntimeMessageBlocks(
-          blocks,
-          (candidate) => modelMessagesTextAndImageStats(
-            sanitizeModelInputForStats('', candidate, []),
-            undefined,
-          ).estimatedTotalTokens,
-          rawTailBudget,
-        );
-        const olderBlocks = selectedBlocks.olderBlocks;
-        const retainedTokens = selectedBlocks.retainedTokens;
-        const retainedMessages = selectedBlocks.retainedBlocks.flat();
-        const deltaInputForSummary = sanitizeModelInputForStats('', summarySourceMessages, appendedImagePaths);
-        const deltaStats = modelMessagesTextAndImageStats(deltaInputForSummary, undefined);
-        const summaryOutputBudget = Math.max(256, Math.min(
-          8_192,
-          targetCeilingTokens - baseStats.estimatedTotalTokens - retainedTokens - 256,
-        ));
-        await onAttemptDebug?.({
-          phase: 'ai:context-compression:start',
-          stepIndex,
-          message: `Context compression started before agent step ${agentStepIndex}.`,
-          details: {
-            agentStepIndex,
-            estimatedTokensBefore: messageStats.estimatedTotalTokens,
-            summaryInputEstimatedTokens: deltaStats.estimatedTotalTokens,
-            targetFloorTokens,
-            targetCeilingTokens,
-            thresholdTokens,
-            modelContextStats: {
-              ...messageStats,
-              thresholdRatio,
-              thresholdTokens,
-              windowTokens,
-            },
-          },
-        });
+      const summarizedRefs = new Set(taskState?.summarizedRefs || []);
+      if (assembled.compacting) {
         const summaryResult = await summarizeContinuation(
-          deltaInputForSummary,
-          turnIndex,
-          deltaStats.estimatedTotalTokens,
-          thresholdTokens,
-          Math.floor(windowTokens * 0.9),
-          summaryOutputBudget,
+          assembled, Math.max(0, Math.min(64000, thresholdTokens - 12000)),
         );
-        const summary = summaryResult.summary;
-        const previousSummaryChars = continuationSummaryText.length;
-        continuationSummaryText = summary;
+        for (const ref of summaryResult.summarizedRefs) summarizedRefs.add(ref);
+        taskState = { ...deriveRuntimeTaskState(candidates, taskState), summarizedRefs: [...summarizedRefs] };
+        continuationSummaryText = summaryResult.summary;
+        assembled = assemble(continuationSummaryText, false, true);
         contextSegmentationTurns += 1;
-        messagesToSend = [
-          { role: 'user' as const, content: `${runtimeContinuationSummaryMarker}\n${summary}` },
-          ...retainedMessages,
-          { role: 'user' as const, content: continuationDirectiveText },
-        ];
-        requestMessages = [...messagesToSend];
-        attachedImagePaths = [];
-        messageImagePaths = [...attachedImagePaths];
-        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
-        let afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current);
-        while (afterStats.estimatedTotalTokens < targetFloorTokens && olderBlocks.length) {
-          const candidate = olderBlocks.pop()!;
-          const candidateMessages = candidate.concat(messagesToSend.slice(1));
-          const candidateContext = [messagesToSend[0], ...candidateMessages];
-          const candidateRequestMessages = [...candidateContext];
-          const candidateStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, candidateRequestMessages, []), codexMode ? undefined : nativeToolsRef.current);
-          if (candidateStats.estimatedTotalTokens > targetCeilingTokens) break;
-          messagesToSend = candidateContext;
-          requestMessages = candidateRequestMessages;
-          afterStats = candidateStats;
-        }
-        while (afterStats.estimatedTotalTokens > targetCeilingTokens && messagesToSend.length > 1) {
-          const removableBlocks = atomicRuntimeModelMessageBlocks(messagesToSend.slice(1));
-          removableBlocks.shift();
-          messagesToSend = [messagesToSend[0], ...removableBlocks.flat()];
-          requestMessages = [...messagesToSend];
-          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
-        }
-        if (messagesToSend.length === 1) {
-          messagesToSend.push({ role: 'user' as const, content: continuationDirectiveText });
-          requestMessages = [...messagesToSend];
-          afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
-        }
-        const compressedRuntimeMetadata = appendRuntimePromptCacheMetadata({
-          messages: withoutRuntimePromptCacheMetadata(messagesToSend),
-          operationalContext,
-          currentTimeLine: runtimeTimeLine,
-        });
-        messagesToSend = compressedRuntimeMetadata.messages;
-        messagesToSend = completeRuntimeModelToolChain(messagesToSend);
-        requestMessages = [...messagesToSend];
-        afterStats = modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, []), codexMode ? undefined : nativeToolsRef.current);
-        const retainedMessageCount = Math.max(0, messagesToSend.filter((message) => (
-          !isRuntimePromptCacheMetadataMessage(message)
-        )).length - 1);
-        modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
         latestContextCompression = {
-          compressedAt: new Date().toISOString(),
-          continuationSummary: summary,
-          estimatedTokensBefore: messageStats.estimatedTotalTokens,
-          estimatedTokensAfter: afterStats.estimatedTotalTokens,
-          retainedMessageCount,
-          summarizedMessageCount: summarySourceMessages.length,
-          targetCeilingTokens,
-          targetFloorTokens,
-          thresholdTokens,
-          windowTokens,
+          compressedAt: new Date().toISOString(), continuationSummary: continuationSummaryText,
+          estimatedTokensBefore: beforeStats.estimatedTotalTokens, estimatedTokensAfter: assembled.manifest.estimatedTokensAfter,
+          retainedMessageCount: assembled.messages.length, summarizedMessageCount: assembled.archived.length,
+          targetCeilingTokens: contextProfile.compressionTargetTokens, targetFloorTokens: 0, thresholdTokens: contextProfile.compressionTriggerTokens, windowTokens,
         };
-        const compressionCompletedAt = Date.now();
-        const compressionToolCallId = `context-compression:${input.runId}:${stepIndex}:${contextSegmentationTurns}`;
-        const compressionTrace: ToolTrace = {
-          id: compressionToolCallId,
-          name: 'contextCompression',
-          input: {
-            estimatedTokensBefore: messageStats.estimatedTotalTokens,
-            estimatedTokensAfter: afterStats.estimatedTotalTokens,
-            retainedMessageCount,
-            summarizedMessageCount: summarySourceMessages.length,
-            trigger: 'model context threshold exceeded',
-          },
-          result: {
-            ok: true,
-            actual: `Context compressed from ${messageStats.estimatedTotalTokens} to ${afterStats.estimatedTotalTokens} estimated tokens.`,
-          },
-          startedAt: compressionCompletedAt - summaryResult.elapsedMs,
-          completedAt: compressionCompletedAt,
-          elapsedMs: summaryResult.elapsedMs,
-          actionElapsedMs: summaryResult.elapsedMs,
-          contextBefore: toolContextFromStats(messageStats),
-          contextAfter: toolContextFromStats(afterStats),
-        };
-        await publishToolTrace(compressionTrace);
-        await input.onContextCompression?.({
-          activeMessages: [...messagesToSend],
-          contextCompression: latestContextCompression,
+        modelContextSegmentation = { ...latestContextCompression, strategy: 'semantic-state-with-source-and-skill-references', manifestId: assembled.manifest.id,
+          summaryIncomplete: summaryResult.incomplete, summaryNote: summaryResult.reason };
+        const completedAt = Date.now();
+        await publishToolTrace({
+          id: 'context-compression:' + input.runId + ':' + stepIndex + ':' + contextSegmentationTurns,
+          name: 'contextCompression', input: modelContextSegmentation,
+          result: { ok: true, actual: 'Archived historical exchanges; original evidence remains available through contextRead.' },
+          startedAt: completedAt - summaryResult.elapsedMs, completedAt, elapsedMs: summaryResult.elapsedMs,
+          actionElapsedMs: summaryResult.elapsedMs, contextBefore: toolContextFromStats(beforeStats),
+          contextAfter: toolContextFromStats({ estimatedTotalTokens: assembled.manifest.estimatedTokensAfter }),
         });
-        modelContextSegmentation = {
-          segment: contextSegmentationTurns,
-          reason: 'modelMessages exceeded context threshold',
-          estimatedTokensBefore: messageStats.estimatedTotalTokens,
-          estimatedTokensAfter: afterStats.estimatedTotalTokens,
-          summaryInputEstimatedTokens: deltaStats.estimatedTotalTokens,
-          summaryElapsedMs: summaryResult.elapsedMs,
-          summaryFallback: summaryResult.fallback,
-          previousSummaryChars,
-          summaryChars: summary.length,
-          unsummarizedMessageCount: unsummarizedMessages.length,
-          targetFloorTokens,
-          targetCeilingTokens,
-          retainedMessageCount,
-          thresholdTokens,
-        };
-        await onAttemptDebug?.({
-          phase: 'ai:context-compression:complete',
-          stepIndex,
-          message: `Context compression completed for agent step ${agentStepIndex}.`,
-          details: {
-            ...modelContextSegmentation,
-            toolCallId: compressionToolCallId,
-            modelContextStats: {
-              ...afterStats,
-              thresholdRatio,
-              thresholdTokens,
-              windowTokens,
-            },
-          },
-        });
-        await onAttemptDebug?.({
-          phase: 'ai:context-segmented',
-          stepIndex,
-          message: `Model message context exceeded threshold; inserted continuation summary segment ${contextSegmentationTurns}.`,
-          details: modelContextSegmentation,
-        });
+        await input.onContextCompression?.({ activeMessages: assembled.messages, contextCompression: latestContextCompression });
+        await onAttemptDebug?.({ phase: 'ai:context-compression:done', stepIndex, message: 'Context rebuilt from semantic state, material locators and visible Skills.', details: modelContextSegmentation });
+      } else assembled = assemble(continuationSummaryText);
+      const messagesToSend = appendRuntimePromptCacheMetadata({
+        messages: assembled.messages, operationalContext, currentTimeLine: runtimeTimeLine,
+      }).messages;
+      const requestMessages = messagesToSend;
+      const attachedImagePaths = [...messageImagePaths];
+      const modelMessagesForLog = sanitizeModelMessagesForLog(requestSystemPrompt, requestMessages, attachedImagePaths);
+      const finalStats = modelMessagesTextAndImageStats(
+        sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths),
+        stepTools,
+      );
+      if (finalStats.estimatedTotalTokens > thresholdTokens) throw new RuntimeContextBudgetError(finalStats.estimatedTotalTokens, thresholdTokens);
+      if (!codexMode) {
+        loadedHiddenRuntimeSkillIds.clear();
+        for (const id of hiddenRuntimeSkillIdsInModelContext(messagesToSend)) loadedHiddenRuntimeSkillIds.add(id);
       }
-      const finalStats = modelContextSegmentation
-        ? modelMessagesTextAndImageStats(sanitizeModelInputForStats(requestSystemPrompt, requestMessages, attachedImagePaths), codexMode ? undefined : nativeToolsRef.current)
-        : messageStats;
-      if (compactedModelContext?.length || modelContextSegmentation) {
-        // The SDK passes its full pre-segmentation history back to every prepareStep.
-        // Retain the compact form locally and append only newly produced SDK messages.
-        compactedModelContext = [...messagesToSend];
-        compactedSourceMessageCount = sourceMessages.length;
-      }
+      assembled.manifest.estimatedTokensAfter = finalStats.estimatedTotalTokens;
+      await onKnowledgeSelected?.(assembled.manifest.knowledge || []);
+      // Include runtime metadata in the manifest and durable record store as well.
+      for (const message of runtimeMetadata.metadataMessages) assembled.manifest.entries.push({
+        ref: runtimeContextMessageRef(message), role: message.role, disposition: 'selected', reason: 'current runtime metadata',
+      });
+      const systemRecord: ModelMessage = { role: 'system', content: requestSystemPrompt || '' };
+      const schemaRecord: ModelMessage = { role: 'system', content: JSON.stringify(toolSchemaEstimateInput(stepTools)) };
+      assembled.manifest.model = { provider: activeModelSettings.provider, model: activeModelSettings.model };
+      assembled.manifest.systemRef = runtimeContextMessageRef(systemRecord);
+      assembled.manifest.toolSchemaRef = runtimeContextMessageRef(schemaRecord);
+      await checkpointContext([systemRecord, schemaRecord]);
+      taskState = assembled.taskState;
       lastPreparedMessages = [...messagesToSend];
-      // A native tool loop can run for many minutes inside one runtime step.
-      // Persist completed exchanges BEFORE the next network request: waiting
-      // for executeRuntimeStep to return loses all of them on interruption.
+      await checkpointContext(messagesToSend, assembled.manifest);
       await input.onActiveModelCheckpoint?.(withoutRuntimePromptCacheMetadata(messagesToSend));
       ensureActive();
-      rememberRetryState({
-        messages: [...messagesToSend],
-        imagePaths: [...attachedImagePaths],
-        agentStepOffset: agentStepIndex - 1,
+      rememberRetryState({ messages: [...messagesToSend], imagePaths: [...attachedImagePaths], agentStepOffset: agentStepIndex - 1 });
+      const nextAiRequest = createAiRequestSnapshot({
+        kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt,
+        screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0,
+        tools: stepAllowedToolTypes, options: {
+          agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length,
+          explicitPageState: true, modelSupportsImageInput: imageInputAvailable,
+          promptCachePrefixStrategy: 'stable-tools-system-and-conversation-prefix',
+          runtimeOperationalContextCharacters: runtimeMetadata.operationalContextCharacters,
+          modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens },
+          contextProfile, contextManifest: assembled.manifest, modelContextSegmentation,
+        },
       });
-      const nextAiRequest = createAiRequestSnapshot({ kind: 'runtime', stepIndex, prompt: '[modelMessages logged separately]', systemPrompt: requestSystemPrompt, screenshotPath: undefined, imagePaths: attachedImagePaths, imageAttached: attachedImagePaths.length > 0, tools: stepAllowedToolTypes, options: { agentLoop: true, agentStepIndex, visualContext: visualContext.snapshot(), imageCount: attachedImagePaths.length, explicitPageState: true, modelSupportsImageInput: imageInputAvailable, promptCachePrefixStrategy: 'stable-tools-system-and-conversation-prefix', runtimeOperationalContextCharacters: runtimeMetadata.operationalContextCharacters, modelContextStats: { ...finalStats, windowTokens, thresholdRatio, thresholdTokens }, modelContextSegmentation } });
       aiRequest = nextAiRequest;
       lastAiRequest = aiRequest;
       const hiddenSkillGateActive = stepAllowedToolTypes.length !== allowedToolTypes.length;
@@ -3055,12 +2882,8 @@ async function executeRuntimeStep(input: {
         text: execution.text,
         traces,
         aiRequest,
-        modelMessages: mergeRuntimeModelMessageChain(
-          lastPreparedMessages,
-          result.responseMessages,
-          lastPreparedResponsePrefixLength,
-        ),
-        turnMessages: [...turnInputMessages, ...result.responseMessages],
+        modelMessages: [...lastPreparedMessages, ...result.responseMessages.slice(lastPreparedResponsePrefixLength)],
+        turnMessages: [...attemptTranscriptBase, ...result.responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
         finishReason: finishState.finishReason,
@@ -3213,10 +3036,14 @@ async function executeRuntimeStep(input: {
         credentialRefs: activeCredentialBindings.map((binding) => binding.ref),
         visualContext: visualContext.snapshot(),
       } satisfies BrowserAgentRuntimeContext;
-      const prepareAgentStep = async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
+      const prepareAgentStep = async ({ stepNumber, responseMessages }: { stepNumber: number; responseMessages: ModelMessage[] }) => {
         requestWatchdog.touch();
         ensureActive();
-        const prepared = await prepareStep(stepNumber, messages as RuntimeModelMessage[]);
+        rawResponseMessages = [...responseMessages];
+        durableTurnMessages = [...attemptTranscriptBase, ...rawResponseMessages];
+        await input.onTurnModelCheckpoint?.(durableTurnMessages);
+        lastPreparedResponsePrefixLength = responseMessages.length;
+        const prepared = await prepareStep(stepNumber, [...initialMessages, ...responseMessages]);
         ensureActive();
         stepModelMessagesForLog.set(stepNumber, prepared.modelMessagesForLog);
         toolExecutionGate.stepNumber = stepNumber;
@@ -3275,6 +3102,17 @@ async function executeRuntimeStep(input: {
         performance: { responseTimeMs: number };
       }) => {
         requestWatchdog.firstChunkReceived();
+        // Persist pending calls BEFORE any local tool can mutate external state. The
+        // SDK's completed step later supplies the canonical complete exchange.
+        const pendingContent = event.content.flatMap((part) => {
+          const item = recordFromUnknown(part);
+          if (!['text', 'reasoning', 'tool-call', 'custom'].includes(String(item.type))) return [];
+          const { providerMetadata, ...content } = item;
+          return [{ ...content, providerOptions: providerMetadata }];
+        });
+        if (pendingContent.length) await checkpointContext(serializableBrowserChatModelMessages([
+          { role: 'assistant', content: pendingContent } as ModelMessage,
+        ]));
         const responseTimeMs = finiteContextStat(event.performance.responseTimeMs);
         const turnIndex = toolExecutionGate.stepNumber;
         for (const part of event.content) {
@@ -3365,9 +3203,16 @@ async function executeRuntimeStep(input: {
         upsertToolTrace(durableTraces, trace);
         await onToolTrace?.(trace, { visualContext: visualContext.snapshot() });
       };
-      const onAgentStepEnd = async (event: { text?: string; stepNumber?: number; toolCalls?: unknown[]; toolResults?: unknown[] }) => {
+      const onAgentStepEnd = async (event: { text?: string; stepNumber?: number; response: { messages: ModelMessage[] }; toolCalls?: unknown[]; toolResults?: unknown[] }) => {
         requestWatchdog.touch();
         ensureActive();
+        rawResponseMessages.push(...event.response.messages);
+        durableTurnMessages = [...attemptTranscriptBase, ...rawResponseMessages];
+        await input.onTurnModelCheckpoint?.(durableTurnMessages);
+        await checkpointContext(event.response.messages);
+        const checkpoint = [...lastPreparedMessages, ...event.response.messages];
+        rememberRetryState({ messages: checkpoint, imagePaths: [...messageImagePaths], agentStepOffset: retryAgentStepOffset + (event.stepNumber || 0) + 1 });
+        await input.onActiveModelCheckpoint?.(withoutRuntimePromptCacheMetadata(checkpoint));
         latestText = event.text || '';
         const visibleText = containsPrivateToolProtocol(latestText)
           ? ''
@@ -3562,12 +3407,8 @@ async function executeRuntimeStep(input: {
         text: latestText,
         traces,
         aiRequest,
-        modelMessages: mergeRuntimeModelMessageChain(
-          lastPreparedMessages,
-          responseMessages,
-          lastPreparedResponsePrefixLength,
-        ),
-        turnMessages: [...turnInputMessages, ...responseMessages],
+        modelMessages: [...lastPreparedMessages, ...responseMessages.slice(lastPreparedResponsePrefixLength)],
+        turnMessages: [...attemptTranscriptBase, ...responseMessages],
         contextCompression: latestContextCompression,
         visualContext: visualContext.snapshot(),
         finishReason: finishState.finishReason,
@@ -3579,7 +3420,7 @@ async function executeRuntimeStep(input: {
       if (isBrowserChatAbortError(error, abortSignal) || (input.shouldContinue && !input.shouldContinue())) throw browserChatAbortError(abortSignal);
       if (error && typeof error === 'object') {
         (error as { aiRequest?: AiRequestSnapshot }).aiRequest = aiRequest;
-        attachRuntimeFailureRecovery(error, lastRetryState, historyMessages.length, turnInputMessages);
+        attachRuntimeFailureRecovery(error, lastRetryState, historyMessages.length, turnInputMessages, durableTurnMessages);
       }
       throw error;
     } finally {
@@ -3605,29 +3446,13 @@ async function executeRuntimeStep(input: {
       recentToolAttempts: formatCurrentToolAttemptSummary(durableTraces, 8),
       runtimeState: continuationRuntimeStateFromTraces(durableTraces),
     });
-    const messageBudgetTokens = recoveryAttempt <= 1 ? 8_000 : 3_000;
-    const candidateMessages = withoutRuntimePromptCacheMetadata(state.messages).filter((message) => {
-      const text = textFromUnknown(message.content).trim();
-      return !text.startsWith(runtimeContinuationSummaryMarker)
-        && !text.startsWith(runtimeContinuationDirectiveMarker)
-        && (!goal || text !== goal);
+    const profile = runtimeContextProfile(getModelSettings());
+    const messageBudgetTokens = Math.floor(profile.inputBudgetTokens * (recoveryAttempt <= 1 ? 0.75 : 0.5));
+    const selected = assembleRuntimeContext({
+      messages: state.messages, records: contextRecords, previousState: taskState,
+      inputBudgetTokens: messageBudgetTokens, baseTokens: 0, continuationSummary: summary,
     });
-    const selected = selectRecentRuntimeMessageBlocks(
-      atomicRuntimeModelMessageBlocks(candidateMessages),
-      (block) => estimateRuntimeMessageContext(block).totalTokens,
-      messageBudgetTokens,
-    );
-    const recoveryDirective = [
-      runtimeContinuationDirectiveMarker,
-      'The provider rejected the preceding request as InvalidParameter, so the runtime compacted older request context before retrying.',
-      'Continue from the summary and newest retained evidence. If visual evidence is missing or ambiguous, observe again.',
-      'Do not repeat a failed click unless fresh evidence clearly identifies the target and coordinates.',
-    ].join('\n');
-    const messages = completeRuntimeModelToolChain([
-      { role: 'user' as const, content: `${runtimeContinuationSummaryMarker}\n${summary}` },
-      ...selected.retainedBlocks.flat(),
-      { role: 'user' as const, content: recoveryDirective },
-    ]);
+    const messages = selected.messages;
     const retainedImageCount = estimateRuntimeMessageContext(messages).imageCount;
     return {
       state: {
@@ -3950,6 +3775,9 @@ export async function executeInteractiveBrowserTurn(input: {
     activeMessages: ModelMessage[];
     turnMessages: ModelMessage[];
   }) => void | Promise<void>;
+  contextRecords?: Record<string, ModelMessage>;
+  taskState?: RuntimeTaskState;
+  onContextCheckpoint?: (update: { records: Record<string, ModelMessage>; taskState: RuntimeTaskState; manifest?: RuntimeContextManifest }) => void | Promise<void>;
   onActiveModelCheckpoint?: (messages: ModelMessage[]) => void | Promise<void>;
   onContextCompression?: (update: {
     activeMessages: ModelMessage[];
@@ -3962,7 +3790,7 @@ export async function executeInteractiveBrowserTurn(input: {
   requestToolConfirmation?: (request: BrowserToolConfirmationRequest) => Promise<BrowserToolConfirmationDecision>;
   runSubagents?: BrowserChatSubagentRunner;
   readSubagent?: BrowserChatSubagentReader;
-  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput, context?: import('@webpilot/capability-sdk').CapabilityExecutionContext) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   attachmentBindings?: BrowserCodeAttachmentBinding[];
@@ -3977,6 +3805,8 @@ export async function executeInteractiveBrowserTurn(input: {
   const newSteps: StepExecutionResult[] = [];
   let activeModelMessages = [...(input.conversation || [])];
   let activeContinuationSummary = sanitizeRuntimeContinuationSummary(input.continuationSummary || '');
+  let contextRecords = { ...input.contextRecords };
+  let taskState = input.taskState;
   const turnModelMessages: ModelMessage[] = [];
   let contextCompression: BrowserChatModelContextCompression | undefined;
   const runtimeRecord = createInteractiveBrowserRuntimeRecord({
@@ -4007,6 +3837,7 @@ export async function executeInteractiveBrowserTurn(input: {
     const liveToolTraces: ToolTrace[] = [];
     let latestToolProgress: ToolTraceProgress | undefined;
     let actionResult: Awaited<ReturnType<typeof executeRuntimeStep>>;
+    const completedTurnMessages = [...turnModelMessages];
 
     try {
       const pendingSubagentUuids = pendingSubagentUuidsFromSteps(newSteps);
@@ -4030,6 +3861,11 @@ export async function executeInteractiveBrowserTurn(input: {
         operationalContext: input.operationalContext,
         conversation: activeModelMessages,
         continuationSummary: activeContinuationSummary,
+        contextRecords, taskState,
+        onContextCheckpoint: async (update) => {
+          contextRecords = update.records; taskState = update.taskState;
+          await input.onContextCheckpoint?.(update);
+        },
         referenceImagePaths: input.referenceImagePaths,
         getRuntimeOperationalContext: input.getRuntimeOperationalContext,
         browserStatePreflightComplete,
@@ -4050,6 +3886,9 @@ export async function executeInteractiveBrowserTurn(input: {
         memoryTools: input.memoryTools,
         useToolLoopAgent: input.useToolLoopAgent,
         onTextStream: input.onTextStream,
+        onTurnModelCheckpoint: async (messages) => {
+          await input.onModelMessages?.({ activeMessages: activeModelMessages, turnMessages: [...turnModelMessages, ...messages] });
+        },
         onActiveModelCheckpoint: async (messages) => {
           activeModelMessages = [...messages];
           await input.onActiveModelCheckpoint?.(messages);
@@ -4080,8 +3919,11 @@ export async function executeInteractiveBrowserTurn(input: {
       activeModelMessages = actionResult.modelMessages;
       turnModelMessages.push(...actionResult.turnMessages);
       const operationalTraces = actionResult.traces.filter((trace) => trace.name !== 'contextCompression');
-      for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(operationalTraces)) {
-        loadedHiddenRuntimeSkillIds.add(skillId);
+      if (isCodexProvider()) {
+        for (const id of hiddenRuntimeSkillIdsReadFromTraces(operationalTraces)) loadedHiddenRuntimeSkillIds.add(id);
+      } else {
+        loadedHiddenRuntimeSkillIds.clear();
+        for (const skillId of hiddenRuntimeSkillIdsInModelContext(activeModelMessages)) loadedHiddenRuntimeSkillIds.add(skillId);
       }
       await input.onModelMessages?.({
         activeMessages: [...activeModelMessages],
@@ -4108,7 +3950,7 @@ export async function executeInteractiveBrowserTurn(input: {
       const recovery = runtimeFailureRecoveryFromError(error);
       if (recovery?.messages.length) {
         activeModelMessages = [...recovery.messages];
-        turnModelMessages.splice(0, turnModelMessages.length, ...recovery.turnMessages);
+        turnModelMessages.splice(0, turnModelMessages.length, ...completedTurnMessages, ...recovery.turnMessages);
       }
       const operationalLiveToolTraces = liveToolTraces.filter((trace) => trace.name !== 'contextCompression');
       if (operationalLiveToolTraces.length) {
@@ -4534,7 +4376,7 @@ async function executeCodexRuntimeObject(input: {
   readSubagent?: BrowserChatSubagentReader;
   requiredSubagentUuid?: string;
   browserStatePreflightComplete?: boolean;
-  readFile?: (input: BrowserChatReadFileInput) => Promise<BrowserActionResult>;
+  readFile?: (input: BrowserChatReadFileInput, context?: import('@webpilot/capability-sdk').CapabilityExecutionContext) => Promise<BrowserActionResult>;
   readFileVisuals?: (input: BrowserChatFileVisualInput) => Promise<BrowserActionResult>;
   readSkill?: BrowserChatReadSkill;
   loadedHiddenRuntimeSkillIds?: Set<string>;
@@ -4547,7 +4389,7 @@ async function executeCodexRuntimeObject(input: {
 }) {
   const { session, runId, stepIndex, type, message, params, allowedTypes, traces, aiRequest, visualContext, abortSignal, shouldContinue, requestToolConfirmation, runSubagents, readSubagent, requiredSubagentUuid, browserStatePreflightComplete, readFile, readFileVisuals, readSkill, attachmentBindings, credentialBindings, ensureBrowserStarted, onVisualContextChange, onToolTrace, onReferenceImage } = input;
   const loadedHiddenRuntimeSkillIds = input.loadedHiddenRuntimeSkillIds || new Set<string>();
-  for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
+  if (!input.loadedHiddenRuntimeSkillIds) for (const skillId of hiddenRuntimeSkillIdsReadFromTraces(traces)) loadedHiddenRuntimeSkillIds.add(skillId);
   throwIfStopped(abortSignal, shouldContinue);
   if (!allowedTypes.includes(type)) {
     return {
